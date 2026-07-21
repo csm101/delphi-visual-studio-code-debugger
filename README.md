@@ -49,6 +49,17 @@ The three front ends are thin.
 
 ## Quick start
 
+> **Just want to use it?** Do not build anything. Grab
+> `delphi-win64-debugger-setup-*.zip` from the
+> [latest release](https://github.com/csm101/delphi-visual-studio-code-debugger/releases),
+> extract it anywhere and run `Setup.exe`. The debug adapter, the MCP server and
+> the VS Code extension are already compiled inside it, so no Delphi toolchain
+> and no build step are needed on that machine. Windows will warn that the
+> executables are unsigned — see the notes in the release.
+>
+> The rest of this section is for working **on** the debugger from a source
+> checkout.
+
 Assumes Delphi (Athens or later) is installed and `dcc64` is on PATH after
 `rsvars.bat`, plus VS Code.
 
