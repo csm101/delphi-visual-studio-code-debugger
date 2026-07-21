@@ -1,6 +1,27 @@
-# Delphi Win64 Debugger for VS Code
+# Delphi Win64 Debugger
 
-A minimal but functional **Debug Adapter Protocol (DAP)** implementation that lets VS Code debug Delphi Win64 executables natively, without Embarcadero's IDE.
+Debug Delphi Win64 applications outside the Embarcadero IDE — a real debugger
+built on the Windows Debug API, written in Delphi.
+
+The repository contains **three programs** that share one debugger engine:
+
+| | What it is | Where it lives |
+|---|---|---|
+| **Debug adapter** | A **Debug Adapter Protocol (DAP)** server. This is the debugger itself: breakpoints, stepping, call stacks, variables, expression evaluation. Any DAP client can drive it. | `VisualStudioCodeDelphiDebugger\` |
+| **VS Code extension** | The client that makes it usable in the editor: the `delphi-win64` debug type, the process picker for attaching, status-bar progress, and an editor for the exception rules. | `install\local.delphi-win64-debug\` |
+| **MCP server** | The same engine exposed to an **AI agent** over the Model Context Protocol — 31 tools (`set_breakpoint`, `step_into`, `get_locals`, `evaluate_expression`, `get_call_stack`, …). It lets an agent run a program, stop it, and read its actual state instead of guessing from the source. | `MCPDebugger\` |
+
+The engine is shared: `DebuggerCore\` holds the Windows Debug API loop, the
+symbol readers (`.rsm`, TD32, `.map`, `.dcp`, JCL) and the expression evaluator.
+The three front ends are thin.
+
+> **You will almost certainly also want the [Delphi IDE plugin](https://github.com/csm101/EditInVsCodeDelphiPlugin).**
+> It adds an *Open in VS Code* command to the Delphi IDE that generates the
+> workspace and the launch configuration for the current project: output paths,
+> source root, unit search paths, and the package list for a BPL project. A real
+> Delphi project carries a couple of hundred search paths, and nobody wants to
+> write that by hand. The debugger works without it if you write `launch.json`
+> yourself, but the plugin is what makes it practical — install it first.
 
 > **Status**: working and feature-rich. Launch and attach, breakpoints
 > (line / conditional / hit-count / log-points), stepping (over/into/out)
@@ -19,8 +40,9 @@ A minimal but functional **Debug Adapter Protocol (DAP)** implementation that le
 | Tool | Purpose |
 |---|---|
 | **Delphi 10.3 Rio or later** (`dcc64` in PATH after `rsvars.bat`) | Compiling the adapter and the debug target |
-| **VS Code** | The IDE |
-| **DelphiLSP extension** (`embarcaderotechnologies.delphilsp`) | Delphi language support in VS Code (syntax, autocomplete) |
+| **VS Code** | The editor the extension plugs into |
+| **[Delphi IDE plugin](https://github.com/csm101/EditInVsCodeDelphiPlugin)** | Generates the workspace and launch configuration from a Delphi project. Not strictly required, but see the note above |
+| **DelphiLSP extension** (`embarcaderotechnologies.delphilsp`) | Delphi language support in VS Code (syntax, autocomplete). A separate Embarcadero extension; this one only debugs |
 | **JCL sources** (optional) | Only for the default JCL debug-info support; build with `JCL_DEBUG_OFF` to omit it — see [Optional: JCL debug-info support](#optional-jcl-debug-info-support) |
 
 ---
@@ -594,25 +616,68 @@ read-only and offers **Copy JSON** instead.
 
 ---
 
+## MCP server: debugging from an AI agent
+
+The same engine is exposed over the **Model Context Protocol**, so an agent can
+debug a Delphi program the way a developer does — run it, stop it, and read the
+real state — instead of inferring behaviour from the source.
+
+```powershell
+cmd /c build_mcp.bat
+powershell -ExecutionPolicy Bypass -File register-mcp.ps1 MCPDebugger\Win64\Debug\DelphiDebuggerMcp.exe
+```
+
+The script registers the server as `delphi-win64-debugger` with Claude Code (via
+the `claude` CLI, user scope) and with VS Code by merging the user `mcp.json`.
+It is idempotent, and `-Unregister` removes it. `install\Install.exe` offers the
+same registration at the end of an install.
+
+The 31 tools cover the debugging cycle:
+
+| Group | Tools |
+|---|---|
+| Session | `launch_debuggee`, `launch_from_config`, `attach_to_process`, `attach_from_config`, `list_debuggable_processes`, `detach_debugger`, `terminate_debuggee`, `stop_debugging`, `get_debug_session_status` |
+| Breakpoints | `set_breakpoint`, `set_breakpoints`, `list_breakpoints`, `remove_all_breakpoints`, `set_exception_filters` |
+| Execution | `continue_and_wait`, `step_over`, `step_into`, `step_out`, `pause_execution`, `wait_until_stopped` |
+| State | `get_call_stack`, `get_threads`, `get_locals`, `get_variable`, `expand_variable`, `evaluate_expression`, `get_current_source_location`, `get_exception_details`, `get_compact_debug_snapshot` |
+| Output | `get_debuggee_output`, `get_debugger_output` |
+
+`launch_from_config` and `attach_from_config` read the `launch.json` the IDE
+plugin generated, so an agent starts a session with the project's real symbol
+and source paths rather than a hand-built approximation.
+`get_compact_debug_snapshot` returns location, stack and locals in one call,
+which is usually what an agent wants after a stop and costs far fewer tokens
+than three round trips.
+
+---
+
 ## Architecture
 
 ```
-VS Code
-  │  DAP (JSON over stdin/stdout)
-  ▼
-VisualStudioCodeDelphiDebugger.exe          ← this project's core: a DAP server written in Delphi
-  │  Windows Debug API  (CreateProcess, WaitForDebugEvent, INT3 breakpoints)
-  ▼
-Debugme.exe             ← the process being debugged
+VS Code                                  AI agent (Claude Code, …)
+  │  DAP (JSON over stdin/stdout)          │  MCP (JSON-RPC over stdin/stdout)
+  ▼                                        ▼
+VisualStudioCodeDelphiDebugger.exe     DelphiDebuggerMcp.exe
+  │                                        │
+  └────────────────┬───────────────────────┘
+                   ▼
+              DebuggerCore\            ← the engine: debug loop, symbols, evaluator
+                   │  Windows Debug API (CreateProcess, WaitForDebugEvent, INT3)
+                   ▼
+        the process being debugged
 ```
 
-Three components:
+Two front ends, one engine. Neither owns any debugging logic of its own: they
+translate a protocol into calls on the same core, so a fix to stepping or to
+symbol resolution reaches both.
 
 | Component | Description |
 |---|---|
-| `Debugme.dpr` | Trivial console program used as the debug target |
-| `VisualStudioCodeDelphiDebugger\VisualStudioCodeDelphiDebugger.dpr` | The DAP adapter: reads DAP from stdin, drives the Win32 debug API |
-| `install\local.delphi-win64-debug\` | VS Code extension that registers the `delphi-win64` debug type and bundles the adapter |
+| `DebuggerCore\` | The debugger proper: Windows debug loop, symbol readers (`.rsm`, TD32, `.map`, `.dcp`, JCL), expression evaluator, exception rules |
+| `VisualStudioCodeDelphiDebugger\` | DAP server: reads DAP from stdin, drives the engine |
+| `MCPDebugger\` | MCP server: the same engine as 32 tools an agent can call |
+| `install\local.delphi-win64-debug\` | VS Code extension: registers the `delphi-win64` debug type, the attach picker and the exception-rules editor, and bundles the adapter |
+| `Debugme.dpr` | A small program used as a debug target while developing the debugger |
 
 ### Key source files
 
