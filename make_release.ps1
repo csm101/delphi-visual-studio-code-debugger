@@ -120,7 +120,10 @@ $notes = $notes.Replace('{{VERSION}}', $version).
                 Replace('{{HIGHLIGHTS}}', $highlightText)
 
 # A placeholder that survives into a published release looks like neglect.
-$leftovers = [regex]::Matches($notes, '\{\{[A-Z_]+\}\}') | ForEach-Object { $_.Value } | Sort-Object -Unique
+# The character class includes digits on purpose: {{SHA256}} has one, and an
+# earlier version of this pattern silently could not see the single placeholder
+# most likely to matter.
+$leftovers = [regex]::Matches($notes, '\{\{[A-Z0-9_]+\}\}') | ForEach-Object { $_.Value } | Sort-Object -Unique
 if ($leftovers.Count -gt 0) { Fail "unresolved placeholder(s) in the notes: $($leftovers -join ', ')" }
 
 $notesPath = Join-Path $repo "dist\release-notes-v$version.md"
