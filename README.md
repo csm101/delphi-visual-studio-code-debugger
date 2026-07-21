@@ -23,6 +23,36 @@ The three front ends are thin.
 > write that by hand. The debugger works without it if you write `launch.json`
 > yourself, but the plugin is what makes it practical — install it first.
 
+> ⚠️ **Compile the program you want to debug with full debug information, or
+> most of this will not work.** A debugger can only show what the compiler
+> emitted. In the Delphi project options, for the **Win64 Debug** configuration:
+>
+> - *Compiling* → **Optimization off**, **Debug information** on, **Local symbols** on;
+> - *Linking* → **Debug information** on, **Include remote debug symbols** on
+>   (this is the `.rsm`), and **Map file: Detailed**.
+>
+> On the command line that is `-$O- -V -VN -VR`, which is what `Debugme.cfg` in
+> this repository uses. Measured on that project: those four flags alone already
+> emit the `.exe` with its TD32 section, the `.map` **and** the `.rsm` — `-GD`
+> (Map file: Detailed) turned out not to be required for a `.map` to appear,
+> though it is what the IDE sets and it does no harm. Keep the `.map` and `.rsm`
+> next to the `.exe`.
+>
+> To step **into the RTL and VCL** rather than over them, also enable
+> *Compiling* → **Use debug .dcus**.
+>
+> What each one buys you:
+>
+> | Artefact | Without it |
+> |---|---|
+> | TD32 section, `.map`, or JCL data — **any one** | no source lines: no breakpoints, no stepping |
+> | **`.rsm`** | breakpoints and stepping still work, but local variables, types and expression evaluation are severely limited |
+> | optimizations **off** | breakpoints land on the wrong line and locals read as garbage, because the code no longer matches the source |
+>
+> The same applies to every **runtime package** you want to step into: a BPL
+> compiled without debug information stays a black box even when the host has
+> full symbols.
+
 > **Status**: working and feature-rich. Launch and attach, breakpoints
 > (line / conditional / hit-count / log-points), stepping (over/into/out)
 > and set-next-statement, call stack with function names, variable
