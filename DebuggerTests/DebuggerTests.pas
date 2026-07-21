@@ -231,6 +231,15 @@ type
     [Test]
     procedure Test_InheritedGetter_ResolvesViaDeclClass;
 
+    // --- A plain inherited METHOD, called on a derived instance. Unlike the
+    //     getter above, nothing records its declaring class, so the symbol has
+    //     to be found by walking the ancestor chain. Live repro:
+    //     dataset.FieldByName('X') -> "<TAppDataSet.FieldByName not found>". ---
+    [Test]
+    procedure Test_InheritedMethod_CalledOnDerivedInstance;
+    [Test]
+    procedure Test_InheritedMethod_WithStringArgument;
+
     // --- Getter-backed STRING property on an RTL class (TStringList.Text):
     //     getter has no locals, var-out return ABI must come from the property
     //     type. Regression for SampleApp TApplication.ExeName / CurrentHelpFile. ---
@@ -1948,6 +1957,57 @@ begin
       'Cache.BaseScore (inherited getter) must resolve, got: ' + Res);
     Assert.AreEqual('70', ExtractDisplayValue(Res),
       'Cache.BaseScore must dispatch to TMenuCacheBase.GetBaseScore = BaseTag*10 = 70, got: ' + Res);
+  finally
+    Resp.Free;
+  end;
+end;
+
+procedure TDebuggerTests.Test_InheritedMethod_CalledOnDerivedInstance;
+// The inherited-GETTER case above already worked, because a property carries its
+// declaring class in the member table. A plain inherited METHOD does not: the
+// evaluator built the symbol name from the receiver's RUNTIME class only, so
+// `Cache.BaseEcho(21)` was looked up as TMenuCache.BaseEcho, which does not
+// exist -- the symbol is TMenuCacheBase.BaseEcho.
+//
+// Observed live as `dataset.FieldByName('X')` -> "<TAppDataSet.FieldByName not
+// found>": FieldByName is declared on TDataSet. Nothing inherited was callable,
+// on any class, and an explicit cast did not help either.
+var
+  FrameId, LocalsRef: Integer;
+  Resp: TJSONObject;
+  Res: string;
+begin
+  StartSession('NESTED_CLASS_METHOD_BODY', FrameId, LocalsRef);
+  Resp := FClient.Evaluate('Cache.BaseEcho(21)', FrameId);
+  try
+    Res := Resp.GetValue<string>('result', '');
+    Assert.IsFalse(Res.Contains('not found'),
+      'an inherited method must resolve through the ancestor chain, got: ' + Res);
+    Assert.AreEqual('49', ExtractDisplayValue(Res),
+      'Cache.BaseEcho(21) = 21*2 + BaseTag(7) = 49, got: ' + Res);
+  finally
+    Resp.Free;
+  end;
+end;
+
+procedure TDebuggerTests.Test_InheritedMethod_WithStringArgument;
+// Same resolution path, but the argument is a string. Kept separate because the
+// two can fail independently: on the live target the symbol for a string-taking
+// method resolved and the CALL still failed ("<method invocation failed>"), so a
+// passing BaseEcho would not prove this works.
+var
+  FrameId, LocalsRef: Integer;
+  Resp: TJSONObject;
+  Res: string;
+begin
+  StartSession('NESTED_CLASS_METHOD_BODY', FrameId, LocalsRef);
+  Resp := FClient.Evaluate('Cache.BaseLen(''abcd'')', FrameId);
+  try
+    Res := Resp.GetValue<string>('result', '');
+    Assert.IsFalse(Res.Contains('not found') or Res.Contains('failed'),
+      'an inherited method taking a string must be callable, got: ' + Res);
+    Assert.AreEqual('11', ExtractDisplayValue(Res),
+      'Cache.BaseLen(''abcd'') = 4 + BaseTag(7) = 11, got: ' + Res);
   finally
     Resp.Free;
   end;

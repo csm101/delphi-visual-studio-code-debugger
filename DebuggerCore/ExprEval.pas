@@ -950,6 +950,30 @@ begin
     FullName := ClassName + '.' + MethodName;
   end;
   if not FDebugger.TryResolveSymbolVA(FullName, FuncVA) then begin
+    // Inherited method: the symbol lives under the class that DECLARES it, not
+    // under the receiver's runtime class. `dataset.FieldByName('X')` on a
+    // TAppDataSet must resolve TDataSet.FieldByName; looking only under the
+    // runtime class made every inherited method uncallable, and an explicit
+    // cast did not help because the cast does not change the receiver's class.
+    //
+    // Walked over the RUNTIME chain rather than a debug-info one so it works
+    // for classes whose declaring module has no symbols of its own.
+    if (not IsFreeProc) and (not ForceClassMethod) and (FRtti <> nil) then
+      for var Ancestor in FRtti.GetClassChainNames(Base.RawValue) do begin
+        if SameText(Ancestor, ClassName) then
+          Continue;
+        var Inherited_ := Ancestor + '.' + MethodName;
+        if FDebugger.TryResolveSymbolVA(Inherited_, FuncVA) then begin
+          DapLog(Format('  inherited method HIT "%s" (receiver class "%s")',
+            [Inherited_, ClassName]));
+          FullName  := Inherited_;
+          ClassName := Ancestor;
+          Break;
+        end;
+      end;
+  end;
+
+  if FuncVA = 0 then begin
     // Indexed-property fallback: `Cache.Level[0]` parses to a `Level`
     // method call with [0] as arg. If `Level` is actually a read-only
     // property whose getter is a different method name (e.g. GetLevel),

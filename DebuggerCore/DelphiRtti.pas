@@ -161,6 +161,13 @@ type
     // match.
     function IsInstanceOf(ObjAddr: UInt64; const TargetClassName: string): Boolean;
 
+    // The instance's class name followed by each ancestor, up to TObject.
+    // Needed to CALL an inherited method: its symbol lives under the class that
+    // declares it (TDataSet.FieldByName), while the receiver's runtime class is
+    // some descendant (TAppDataSet), so a lookup by runtime class name alone
+    // finds nothing. Empty when ObjAddr is not a class instance.
+    function GetClassChainNames(ObjAddr: UInt64): TArray<string>;
+
     // Enumerates the published properties of the class at ObjAddr and all
     // ancestor classes. Properties declared at public/private/protected
     // levels are NOT included unless the class is `{$M+}` or descends from
@@ -603,6 +610,36 @@ begin
     if not ReadTypeInfoKindName(TypeInfoAddr, Kind, TypeName, TypeDataAddr) then Exit;
     if Kind <> TK_CLASS then Exit;
     if SameText(TypeName, TargetClassName) then Exit(True);
+    if not ReadU64(TypeDataAddr + 8, PPParent) then Exit;
+    if PPParent = 0 then Exit;
+    if not ReadU64(PPParent, PParent) then Exit;
+    TypeInfoAddr := PParent;
+  end;
+end;
+
+function TDelphiRtti.GetClassChainNames(ObjAddr: UInt64): TArray<string>;
+const
+  MAX_DEPTH = 32;
+var
+  VmtAddr, TypeInfoAddr, TypeDataAddr, PPParent, PParent: UInt64;
+  Kind: Byte;
+  TypeName: string;
+begin
+  SetLength(Result, 0);
+  if not IsClassInstance(ObjAddr) then Exit;
+  if not ReadU64(ObjAddr, VmtAddr) then Exit;
+  if not ReadU64(UInt64(Int64(VmtAddr) + VMT64_TYPEINFO), TypeInfoAddr) then Exit;
+
+  var Depth := 0;
+  while (TypeInfoAddr <> 0) and (Depth < MAX_DEPTH) do begin
+    Inc(Depth);
+    if not ReadTypeInfoKindName(TypeInfoAddr, Kind, TypeName, TypeDataAddr) then Exit;
+    if Kind <> TK_CLASS then Exit;
+    if TypeName <> '' then begin
+      SetLength(Result, Length(Result) + 1);
+      Result[High(Result)] := TypeName;
+    end;
+    // ParentInfo: PPTypeInfo at TypeDataAddr+8; TObject's is nil.
     if not ReadU64(TypeDataAddr + 8, PPParent) then Exit;
     if PPParent = 0 then Exit;
     if not ReadU64(PPParent, PParent) then Exit;

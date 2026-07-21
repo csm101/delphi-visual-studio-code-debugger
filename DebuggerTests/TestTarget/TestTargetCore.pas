@@ -207,6 +207,13 @@ type
     BaseTag: Integer;
     constructor Create;
     function GetBaseScore: Integer;
+    // Called on a DERIVED instance by the evaluator tests. The symbol is
+    // TMenuCacheBase.*, while the receiver's runtime class is TMenuCache, so
+    // resolving a method by the runtime class name alone cannot find it -- the
+    // shape of every inherited-method call (TDataSet.FieldByName on a
+    // TSomeDataSet, TComponent.FindComponent on a form, ...).
+    function BaseEcho(AValue: Integer): Integer;
+    function BaseLen(const AText: string): Integer;
     property BaseScore: Integer read GetBaseScore;
   end;
 
@@ -959,6 +966,16 @@ begin
   Result := BaseTag * 10;   // 70
 end;
 
+function TMenuCacheBase.BaseEcho(AValue: Integer): Integer;
+begin
+  Result := AValue * 2 + BaseTag;   // BaseEcho(21) = 49 with BaseTag = 7
+end;
+
+function TMenuCacheBase.BaseLen(const AText: string): Integer;
+begin
+  Result := Length(AText) + BaseTag;   // BaseLen('abcd') = 11 with BaseTag = 7
+end;
+
 constructor TMenuCache.Create;
 begin
   inherited Create;
@@ -995,6 +1012,10 @@ var
     LocalStr      := 'hello';
     GSink.Use([NodeId]);                                    // {BP:NESTED_CLASS_METHOD_BODY}
     GSink.Use([CurrentLevel, LocalStr, Cache.Items[0], FOwnerName, Cache.Level[0]]);
+    // Referenced so the linker keeps them: the evaluator tests call these two
+    // through the debugger, and a method nothing calls is smart-linked away -
+    // its symbol would be missing and the test would fail for the wrong reason.
+    GSink.Use([Cache.BaseEcho(0), Cache.BaseLen('')]);
     if CurrentParent <> nil then
       GSink.Use(['parent: ', CurrentParent.Items[0]]);
   end;
