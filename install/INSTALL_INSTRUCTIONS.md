@@ -3,16 +3,34 @@
 ## Prerequisites
 
 - **Visual Studio Code** 1.80 or later
-- A **Delphi Win64** application compiled with debug information:
-  - Map file (`.map`) — required for breakpoints and source stepping
-  - RSM file (`.rsm`) — required for local variable inspection
-  - Both files are produced automatically when you compile with `-V -VN -VR` flags
+- Windows x64
+- A **Delphi Win64** application compiled with debug information
+  (`-V -VN -VR`, optimizations off), which emits a `.map` and a `.rsm` beside
+  the `.exe`:
+  - **Source lines** for breakpoints and stepping come from any one of three
+    independent sources — the TD32 `.debug` section inside the executable, a
+    `.map` beside it, or JCL debug data (`JCLDEBUG` section or `.jdbg` sidecar).
+    Any one is enough.
+  - **The `.rsm`** is what local-variable and type inspection is built on.
+    Without it, breakpoints and stepping still work but variable inspection is
+    limited.
+- The [Delphi IDE plugin](https://github.com/csm101/EditInVsCodeDelphiPlugin) is
+  strongly recommended: it generates the workspace and launch configuration from
+  your Delphi project, which is otherwise a lot of paths to write by hand.
 
 ## Quick install (distributed zip)
 
 If you received the `delphi-win64-debugger-setup-*.zip`:
 
 1. Extract it anywhere.
+
+   > **Windows will warn you.** These executables are not code-signed, so
+   > SmartScreen shows "Windows protected your PC" and some browsers flag the
+   > download. If you obtained the zip from the project's GitHub releases page,
+   > choose *More info → Run anyway*. If you would rather not trust a binary
+   > from the internet — a reasonable position for a debugger, which by nature
+   > attaches to other processes — build it yourself from the repository
+   > instead: `build_setup_zip.bat` produces this exact zip.
 2. Run `Setup.exe`. It packages the extension into a `.vsix` and installs it
    through the VS Code CLI (`code --install-extension`), which registers it
    properly and updates any previous version in place. It then offers to install
@@ -36,7 +54,9 @@ powershell -ExecutionPolicy Bypass -File register-mcp.ps1 "%LOCALAPPDATA%\Delphi
 powershell -ExecutionPolicy Bypass -File register-mcp.ps1 -Unregister
 ```
 
-See `MCP_SERVER.md` for the tool surface.
+The tool surface is documented at
+<https://github.com/csm101/delphi-visual-studio-code-debugger/blob/main/MCP_SERVER.md>
+(`MCP_SERVER.md` is not bundled in this zip).
 
 > **`code` must be on PATH.** Recent VS Code builds (1.96+) no longer load
 > extensions that are merely copied into the extensions directory; a real VSIX
