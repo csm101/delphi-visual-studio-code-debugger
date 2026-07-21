@@ -1,0 +1,31 @@
+package TestSubject;
+
+// Runtime-loadable BPL that contains the SAME subject code as the monolithic
+// TestTarget.exe (TestTargetCore + the 13 shared subject units). The thin
+// TestHost.exe LoadPackages this BPL and calls its exported RunAllScenarios,
+// so every integration test that runs against TestTarget.exe can also run
+// against TestHost.exe + TestSubject.bpl -- exercising the debugger's
+// BPL/multi-module path with the identical source (same .pas, same {BP:} markers).
+
+{$RUNONLY}
+
+requires
+  rtl;
+
+contains
+  TestTargetCore     in '..\TestTarget\TestTargetCore.pas',
+  TestTargetCollider in '..\TestTarget\TestTargetCollider.pas',
+  TestTargetTypes    in '..\TestTarget\TestTargetTypes.pas',
+  TestTargetEdge     in '..\TestTarget\TestTargetEdge.pas',
+  TestTargetEdge2    in '..\TestTarget\TestTargetEdge2.pas',
+  TestTargetFlow     in '..\TestTarget\TestTargetFlow.pas',
+  TestTargetReal     in '..\TestTarget\TestTargetReal.pas',
+  TestTargetConflictSink in '..\TestTarget\TestTargetConflictSink.pas',
+  TestTargetConflict1 in '..\TestTarget\TestTargetConflict1.pas',
+  TestTargetConflict2 in '..\TestTarget\TestTargetConflict2.pas',
+  TestTargetUsesA    in '..\TestTarget\TestTargetUsesA.pas',
+  TestTargetUsesB    in '..\TestTarget\TestTargetUsesB.pas',
+  TestTargetUsesC    in '..\TestTarget\TestTargetUsesC.pas',
+  TestTargetUsesHost in '..\TestTarget\TestTargetUsesHost.pas';
+
+end.

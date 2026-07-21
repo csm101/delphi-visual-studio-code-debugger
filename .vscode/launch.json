@@ -1,0 +1,32 @@
+﻿{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Debug Debugme (Delphi DAP)",
+            "type": "delphi-win64",
+            "request": "launch",
+            "program": "${workspaceFolder}/Win64/Debug/Debugme.exe",
+            "mapFile": "${workspaceFolder}/Win64/Debug/Debugme.map",
+            "sourceRoot": "${workspaceFolder}",
+            "sourceSearchPaths": [
+                "${env:BDS}/source"
+            ],
+            "stopAtEntry": true
+        },
+        {
+            "name": "Debug Debugme + TestPlugin (BPL test)",
+            "type": "delphi-win64",
+            "request": "launch",
+            "program": "${workspaceFolder}/Win64/Debug/Debugme.exe",
+            "mapFile": "${workspaceFolder}/Win64/Debug/Debugme.map",
+            "sourceRoot": "${workspaceFolder}",
+            "stopAtEntry": false,
+            "modules": [
+                {
+                    "name": "testplugin.dll",
+                    "map": "${workspaceFolder}/Win64/Debug/TestPlugin.map"
+                }
+            ]
+        }
+    ]
+}

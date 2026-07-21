@@ -1,0 +1,536 @@
+{
+  "name": "delphi-win64-debug",
+  "displayName": "Delphi Win64 Debugger",
+  "description": "Debug Delphi Win64 applications in VS Code - breakpoints, stepping, call stacks, watches and exception rules, without the Embarcadero IDE.",
+  "version": "0.2.3",
+  "publisher": "local",
+  "license": "MIT",
+  "author": "Carlo Sirna",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/csm101/delphi-visual-studio-code-debugger.git"
+  },
+  "bugs": {
+    "url": "https://github.com/csm101/delphi-visual-studio-code-debugger/issues"
+  },
+  "homepage": "https://github.com/csm101/delphi-visual-studio-code-debugger#readme",
+  "icon": "icon.png",
+  "engines": {
+    "vscode": "^1.80.0"
+  },
+  "categories": [
+    "Debuggers"
+  ],
+  "keywords": [
+    "delphi",
+    "pascal",
+    "debugger",
+    "win64",
+    "dap"
+  ],
+  "main": "./extension.js",
+  "activationEvents": [
+    "onDebugResolve:delphi-win64",
+    "onDebugDynamicConfigurations:delphi-win64"
+  ],
+  "contributes": {
+    "commands": [
+      {
+        "command": "delphi-win64.editExceptionRules",
+        "title": "Edit Exception Rules...",
+        "category": "Delphi Win64",
+        "icon": "$(list-ordered)"
+      },
+      {
+        "command": "delphi-win64.createRuleForException",
+        "title": "Create a Rule for This Exception...",
+        "category": "Delphi Win64",
+        "icon": "$(law)"
+      },
+      {
+        "command": "delphi-win64.pickProcess",
+        "title": "Pick a Process to Attach To",
+        "category": "Delphi Win64"
+      }
+    ],
+    "menus": {
+      "commandPalette": [
+        {
+          "command": "delphi-win64.editExceptionRules"
+        },
+        {
+          "command": "delphi-win64.createRuleForException",
+          "when": "delphiWin64StoppedOnException"
+        },
+        {
+          "command": "delphi-win64.pickProcess",
+          "when": "false"
+        }
+      ],
+      "view/title": [
+        {
+          "command": "delphi-win64.editExceptionRules",
+          "when": "view == workbench.debug.breakPointsView",
+          "group": "navigation@99"
+        },
+        {
+          "command": "delphi-win64.editExceptionRules",
+          "when": "view == workbench.debug.callStackView",
+          "group": "navigation@99"
+        }
+      ],
+      "debug/toolBar": [
+        {
+          "command": "delphi-win64.createRuleForException",
+          "when": "debugType == 'delphi-win64' && delphiWin64StoppedOnException",
+          "group": "navigation@99"
+        }
+      ]
+    },
+    "breakpoints": [
+      {
+        "language": "objectpascal"
+      },
+      {
+        "language": "pascal"
+      },
+      {
+        "language": "delphi"
+      }
+    ],
+    "debuggers": [
+      {
+        "type": "delphi-win64",
+        "label": "Delphi Win64",
+        "program": "./VisualStudioCodeDelphiDebugger.exe",
+        "languages": [
+          "objectpascal",
+          "pascal"
+        ],
+        "configurationAttributes": {
+          "launch": {
+            "required": [
+              "program"
+            ],
+            "properties": {
+              "program": {
+                "type": "string",
+                "description": "Path to the .exe to debug"
+              },
+              "mapFile": {
+                "type": "string",
+                "description": "Path to the .map file (default: same as program with .map extension)"
+              },
+              "rsmFile": {
+                "type": "string",
+                "description": "Path to the .rsm file (default: same as program with .rsm extension). Needed for local variable inspection."
+              },
+              "sourceRoot": {
+                "type": "string",
+                "description": "Root directory for source file lookup"
+              },
+              "sourceSearchPaths": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "Extra directories (searched two levels deep) for resolving unit source files when stopped outside the project — typically used to point at the Delphi installation's source tree, e.g. \"${env:BDS}/source\". If the BDS environment variable is set, its \"source\" subdirectory is also searched automatically."
+              },
+              "stopAtEntry": {
+                "type": "boolean",
+                "default": false
+              },
+              "progressLocation": {
+                "type": "string",
+                "enum": [
+                  "statusBar",
+                  "notification"
+                ],
+                "enumDescriptions": [
+                  "Show long-running operations in the status bar (requires this extension; the adapter emits the custom `delphiProgress` event).",
+                  "Show long-running operations as notification toasts using the standard DAP progress events."
+                ],
+                "default": "statusBar",
+                "description": "Where the adapter reports long-running operations (symbol loading, evaluation, stepping). \"statusBar\" keeps them out of the way in the status bar; \"notification\" uses the standard DAP progress events, which VS Code renders as toasts. Only one of the two mechanisms is used at a time."
+              },
+              "diagnosticLog": {
+                "type": "boolean",
+                "default": false,
+                "description": "Write a detailed adapter log to %TEMP%\\dap_adapter.log. Verbose: every DAP request/response, every debug event (LoadDll, Exception, Output, Breakpoint), every command queued and processed. Use only for diagnosing adapter behavior issues; off by default."
+              },
+              "args": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "Command-line arguments passed to the debuggee."
+              },
+              "modules": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "name": {
+                      "type": "string",
+                      "description": "DLL/BPL filename (e.g. MyPackage.bpl)"
+                    },
+                    "map": {
+                      "type": "string",
+                      "description": "Path to the DLL/BPL .map file"
+                    },
+                    "rsm": {
+                      "type": "string",
+                      "description": "Path to the DLL/BPL .rsm file"
+                    },
+                    "dcp": {
+                      "type": "string",
+                      "description": "Path to the .dcp file (Delphi compiled package -- used for BPL locals)"
+                    }
+                  },
+                  "required": [
+                    "name"
+                  ]
+                },
+                "description": "Pre-binds debug-info files (.map / .rsm / .dcp) for DLLs and BPLs the target loads at runtime. Each entry names a module by filename and points the adapter at the matching debug files. Without this, the adapter probes for files alongside the loaded DLL/BPL on disk."
+              },
+              "exceptionRules": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "class": {
+                      "description": "Exact match on the runtime exception class (leaf only), or array of names (any-of), case-insensitive.",
+                      "anyOf": [
+                        {
+                          "type": "string"
+                        },
+                        {
+                          "type": "array",
+                          "items": {
+                            "type": "string"
+                          }
+                        }
+                      ]
+                    },
+                    "classIs": {
+                      "description": "Match the runtime class OR any ancestor (Delphi `is` semantics). Single name or array, case-insensitive.",
+                      "anyOf": [
+                        {
+                          "type": "string"
+                        },
+                        {
+                          "type": "array",
+                          "items": {
+                            "type": "string"
+                          }
+                        }
+                      ]
+                    },
+                    "code": {
+                      "description": "Win32 exception code: hexadecimal (\"0xC0000005\", \"$C0000005\") or decimal, one value or an array (any-of). This is the only criterion that can match a NATIVE Windows exception: such an exception has no Delphi object, so class/classIs/message/messageRegex never match it. Example: 0x406D1388, raised by TThread.NameThreadForDebugging.",
+                      "anyOf": [
+                        {
+                          "type": "string"
+                        },
+                        {
+                          "type": "integer"
+                        },
+                        {
+                          "type": "array",
+                          "items": {
+                            "anyOf": [
+                              {
+                                "type": "string"
+                              },
+                              {
+                                "type": "integer"
+                              }
+                            ]
+                          }
+                        }
+                      ]
+                    },
+                    "message": {
+                      "type": "string",
+                      "description": "Case-insensitive substring of the exception message."
+                    },
+                    "messageRegex": {
+                      "type": "string",
+                      "description": "Regular expression matched against the message (ignore-case)."
+                    },
+                    "unit": {
+                      "type": "string",
+                      "description": "Source unit where raised (e.g. \"OracleData\"). Use \"*unknown*\" to match raises with no resolvable source."
+                    },
+                    "line": {
+                      "type": "integer",
+                      "description": "Exact source line where raised."
+                    },
+                    "lineFrom": {
+                      "type": "integer",
+                      "description": "Inclusive lower bound of the source-line range."
+                    },
+                    "lineTo": {
+                      "type": "integer",
+                      "description": "Inclusive upper bound of the source-line range."
+                    },
+                    "action": {
+                      "type": "string",
+                      "enum": [
+                        "ignore",
+                        "log",
+                        "logStack",
+                        "break"
+                      ],
+                      "description": "ignore = resume silently; log = write class:message to the debug console then resume; logStack = log plus call stack; break = pause in the debugger."
+                    }
+                  },
+                  "required": [
+                    "action"
+                  ]
+                },
+                "description": "Per-exception rules, evaluated top-down (first match wins). A matching rule's action overrides the exception filters; with no match the filters decide. Criteria (class/classIs/code/message/messageRegex/unit/line range) are AND-ed; omitted criteria are wildcards."
+              },
+              "useGlobalExceptionRules": {
+                "type": "boolean",
+                "default": true,
+                "description": "Also load the shared machine-wide exception rules file (default %USERPROFILE%\\.DelphiWinDebugger\\exceptionRules.json). Project `exceptionRules` are evaluated first, then the shared rules as a fallback."
+              },
+              "globalExceptionRulesPath": {
+                "type": "string",
+                "description": "Override the shared exception-rules file location (default %USERPROFILE%\\.DelphiWinDebugger\\exceptionRules.json). JSON object with an `exceptionRules` array (or a bare array)."
+              }
+            }
+          },
+          "attach": {
+            "properties": {
+              "processId": {
+                "type": [
+                  "number",
+                  "string"
+                ],
+                "description": "PID of the running process to attach to. Use processName instead to match by executable name, or \"${command:delphi-win64.pickProcess}\" to choose from a list of running processes each time the session starts. When processName is also set, the picker lists only the instances of that executable — with their command lines, so two instances can be told apart — and skips the prompt entirely if there is just one.",
+                "default": 0
+              },
+              "processName": {
+                "type": "string",
+                "description": "Executable name of the process to attach to, e.g. \"MyApp.exe\". Used when processId is not given: the one running instance is attached to without asking, and when several are running the extension shows them with their command lines so you can pick. Set processId as well to name a fixed PID and skip that.",
+                "default": ""
+              },
+              "program": {
+                "type": "string",
+                "description": "Optional path to the target executable. Only needed when the debugger cannot derive the symbol files (.map/.rsm/TD32) from the running process image.",
+                "default": ""
+              },
+              "killOnDetach": {
+                "type": "boolean",
+                "description": "When stopping the debug session, terminate the attached process instead of leaving it running. Default false: detaching leaves the application alive.",
+                "default": false
+              },
+              "sourceRoot": {
+                "type": "string",
+                "description": "Root directory for source file lookup"
+              },
+              "sourceSearchPaths": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "Extra directories (searched two levels deep) for resolving unit source files when stopped outside the project — typically used to point at the Delphi installation's source tree, e.g. \"${env:BDS}/source\". If the BDS environment variable is set, its \"source\" subdirectory is also searched automatically."
+              },
+              "modules": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "name": {
+                      "type": "string",
+                      "description": "DLL/BPL filename (e.g. MyPackage.bpl)"
+                    },
+                    "map": {
+                      "type": "string",
+                      "description": "Path to the DLL/BPL .map file"
+                    },
+                    "rsm": {
+                      "type": "string",
+                      "description": "Path to the DLL/BPL .rsm file"
+                    },
+                    "dcp": {
+                      "type": "string",
+                      "description": "Path to the .dcp file (Delphi compiled package -- used for BPL locals)"
+                    }
+                  },
+                  "required": [
+                    "name"
+                  ]
+                },
+                "description": "Pre-binds debug-info files (.map / .rsm / .dcp) for DLLs and BPLs the target loads at runtime. Each entry names a module by filename and points the adapter at the matching debug files. Without this, the adapter probes for files alongside the loaded DLL/BPL on disk."
+              },
+              "exceptionRules": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "class": {
+                      "description": "Exact match on the runtime exception class (leaf only), or array of names (any-of), case-insensitive.",
+                      "anyOf": [
+                        {
+                          "type": "string"
+                        },
+                        {
+                          "type": "array",
+                          "items": {
+                            "type": "string"
+                          }
+                        }
+                      ]
+                    },
+                    "classIs": {
+                      "description": "Match the runtime class OR any ancestor (Delphi `is` semantics). Single name or array, case-insensitive.",
+                      "anyOf": [
+                        {
+                          "type": "string"
+                        },
+                        {
+                          "type": "array",
+                          "items": {
+                            "type": "string"
+                          }
+                        }
+                      ]
+                    },
+                    "code": {
+                      "description": "Win32 exception code: hexadecimal (\"0xC0000005\", \"$C0000005\") or decimal, one value or an array (any-of). This is the only criterion that can match a NATIVE Windows exception: such an exception has no Delphi object, so class/classIs/message/messageRegex never match it. Example: 0x406D1388, raised by TThread.NameThreadForDebugging.",
+                      "anyOf": [
+                        {
+                          "type": "string"
+                        },
+                        {
+                          "type": "integer"
+                        },
+                        {
+                          "type": "array",
+                          "items": {
+                            "anyOf": [
+                              {
+                                "type": "string"
+                              },
+                              {
+                                "type": "integer"
+                              }
+                            ]
+                          }
+                        }
+                      ]
+                    },
+                    "message": {
+                      "type": "string",
+                      "description": "Case-insensitive substring of the exception message."
+                    },
+                    "messageRegex": {
+                      "type": "string",
+                      "description": "Regular expression matched against the message (ignore-case)."
+                    },
+                    "unit": {
+                      "type": "string",
+                      "description": "Source unit where raised (e.g. \"OracleData\"). Use \"*unknown*\" to match raises with no resolvable source."
+                    },
+                    "line": {
+                      "type": "integer",
+                      "description": "Exact source line where raised."
+                    },
+                    "lineFrom": {
+                      "type": "integer",
+                      "description": "Inclusive lower bound of the source-line range."
+                    },
+                    "lineTo": {
+                      "type": "integer",
+                      "description": "Inclusive upper bound of the source-line range."
+                    },
+                    "action": {
+                      "type": "string",
+                      "enum": [
+                        "ignore",
+                        "log",
+                        "logStack",
+                        "break"
+                      ],
+                      "description": "ignore = resume silently; log = write class:message to the debug console then resume; logStack = log plus call stack; break = pause in the debugger."
+                    }
+                  },
+                  "required": [
+                    "action"
+                  ]
+                },
+                "description": "Per-exception rules, evaluated top-down (first match wins). A matching rule's action overrides the exception filters; with no match the filters decide. Criteria (class/classIs/code/message/messageRegex/unit/line range) are AND-ed; omitted criteria are wildcards."
+              },
+              "progressLocation": {
+                "type": "string",
+                "enum": [
+                  "statusBar",
+                  "notification"
+                ],
+                "enumDescriptions": [
+                  "Show long-running operations in the status bar (requires this extension; the adapter emits the custom `delphiProgress` event).",
+                  "Show long-running operations as notification toasts using the standard DAP progress events."
+                ],
+                "default": "statusBar",
+                "description": "Where the adapter reports long-running operations (symbol loading, evaluation, stepping). \"statusBar\" keeps them out of the way in the status bar; \"notification\" uses the standard DAP progress events, which VS Code renders as toasts. Only one of the two mechanisms is used at a time."
+              },
+              "diagnosticLog": {
+                "type": "boolean",
+                "default": false,
+                "description": "Write a detailed adapter log to %TEMP%\\dap_adapter.log. Verbose: every DAP request/response, every debug event (LoadDll, Exception, Output, Breakpoint), every command queued and processed. Use only for diagnosing adapter behavior issues; off by default."
+              }
+            }
+          }
+        },
+        "initialConfigurations": [
+          {
+            "type": "delphi-win64",
+            "request": "launch",
+            "name": "Debug Delphi Win64",
+            "program": "${workspaceFolder}/Win64/Debug/${workspaceFolderBasename}.exe",
+            "stopAtEntry": false
+          }
+        ],
+        "configurationSnippets": [
+          {
+            "label": "Delphi Win64: Launch",
+            "description": "Launch a Delphi Win64 executable under the debugger",
+            "body": {
+              "type": "delphi-win64",
+              "request": "launch",
+              "name": "Debug Delphi Win64",
+              "program": "^\"\\${workspaceFolder}/Win64/Debug/\\${workspaceFolderBasename}.exe\"",
+              "stopAtEntry": false
+            }
+          },
+          {
+            "label": "Delphi Win64: Attach (pick a process)",
+            "description": "Attach to a running Delphi Win64 process, choosing it from a list at start",
+            "body": {
+              "type": "delphi-win64",
+              "request": "attach",
+              "name": "Attach to a Delphi Win64 process",
+              "processId": "^\"\\${command:delphi-win64.pickProcess}\"",
+              "sourceRoot": "^\"\\${workspaceFolder}\""
+            }
+          },
+          {
+            "label": "Delphi Win64: Attach (pick an instance of one executable)",
+            "description": "Attach to a named executable; when several instances are running, choose between them by command line",
+            "body": {
+              "type": "delphi-win64",
+              "request": "attach",
+              "name": "Attach to ${1:MyApp.exe}",
+              "processName": "^\"${1:MyApp.exe}\"",
+              "processId": "^\"\\${command:delphi-win64.pickProcess}\"",
+              "sourceRoot": "^\"\\${workspaceFolder}\""
+            }
+          }
+        ]
+      }
+    ]
+  }
+}

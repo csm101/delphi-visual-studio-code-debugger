@@ -1,0 +1,2103 @@
+unit DebugSessionTests;
+
+// Protocol-free tests for the TDebugSession core facade. These construct a
+// TDebugSession directly (NO DAP client, NO JSON) and drive it against the same
+// TestTarget.exe fixture the DAP suite uses. They are the primary regression net
+// for the reusable core that both the DAP and MCP frontends sit on.
+
+interface
+
+uses
+  DUnitX.TestFramework;
+
+type
+  [TestFixture]
+  TDebugSessionTests = class
+  private
+    function RepoRoot: string;
+    function TargetDir: string;
+    function TargetExe: string;
+    function TargetMap: string;
+    function TargetRsm: string;
+    function NoDebugExe: string;
+    function TdsSampleExe: string;
+    function HostExe: string;
+    function HostMap: string;
+    function HostRsm: string;
+    function PackageSrc: string;
+    function MarkerLineInFile(const SourcePath, Marker: string): Integer;
+    function MarkerLine(const SourceBaseName, Marker: string): Integer;
+  public
+    [Test] procedure Launch_StopsAtBreakpoint;
+    [Test] procedure Locals_AtEvalBody_ExposeCaption;
+    [Test] procedure Evaluate_FieldAccess_ReturnsValue;
+    [Test] procedure Snapshot_HasLocationAndLocals;
+    [Test] procedure ExpandVariable_Widget_ExposesFields;
+    [Test] procedure ExpandVariable_NestedRecord;
+    [Test] procedure Breakpoint_Condition_True_Stops;
+    [Test] procedure Breakpoint_Condition_False_RunsToExit;
+    [Test] procedure Breakpoint_Logpoint_EmitsAndContinues;
+    [Test] procedure Breakpoint_HitCount_SkipsEarlyHits;
+    [Test] procedure ExpandVariable_DynArray_Elements;
+    [Test] procedure ExpandVariable_Widget_GroupsProperties;
+    [Test] procedure ExpandVariable_PropertyGetter_RunsGetter;
+    [Test] procedure ExpandVariable_IndexedProperty_IsLeaf;
+    [Test] procedure ExpandVariable_VariantArray1D_Elements;
+    [Test] procedure ExpandVariable_VariantArray2D_Elements;
+    [Test] procedure Bpl_Breakpoint_InPackageUnit_Stops;
+    // F22: ListBreakpoints (what the MCP frontend serialises) reported a
+    // breakpoint as unverified even after the owning package had loaded and the
+    // breakpoint had actually FIRED.
+    [Test] procedure Bpl_ListBreakpoints_ReportsVerified_AfterPackageLoads;
+    [Test] procedure Bpl_CallStack_ResolvesDeeperFrames;
+    [Test] procedure Bpl_StackWalk_AfterEarlyWalk_ResolvesFramesAndStepsOut;
+    [Test] procedure GetVariable_LocalAndExpression;
+    [Test] procedure Attach_ToRunningTarget_Stops;
+    [Test] procedure AttachConfig_ParsesSelectorAndPaths;
+    // Step-0 superset additions (frontend-neutral core superset of the DAP needs).
+    [Test] procedure Threads_StoppedThreadIsCurrent;
+    [Test] procedure PerThreadStep_StepsOnlySelectedThread;
+    // F19: a step-into used to report at the callee's ENTRY address, before the
+    // prologue had spilled the register arguments into their home slots, so Self
+    // and every by-register parameter read as the CALLER's leftover frame bytes
+    // -- with a correct-looking type and no warning.
+    [Test] procedure StepInto_Method_ReportsSpilledSelfAndParams;
+    // Wrong-place audit (2026-07-19): a frame INDEX is only meaningful together
+    // with its thread. Selecting a frame the client took from ANOTHER thread's
+    // stackTrace used to pair that index with the STOPPED thread's cached frames,
+    // so the Variables panel showed a complete, plausible set of locals belonging
+    // to a different thread.
+    [Test] procedure SelectFrame_OnOtherThread_ReadsThatThreadsLocals;
+    [Test] procedure Frames_RichFieldsPopulated;
+    [Test] procedure SelectFrame_CallerLocalsDiffer;
+    [Test] procedure Registers_HaveRipAndRsp;
+    [Test] procedure ResolveSourcePath_ResolvesCoreUnit;
+    [Test] procedure RemoveAllBreakpoints_ClearsPlantedInt3;
+    [Test] procedure EvaluateForFrame_ClassIsExpandable_ScalarIsLeaf;
+    // Step-5 write path (setVariable delegated onto the session core).
+    [Test] procedure SetLocalVariable_Integer_ReadsBackChanged;
+    [Test] procedure SetLocalVariable_EnumByName_ReadsBackChanged;
+    [Test] procedure SetLocalVariable_String_ReadsBackChanged;
+    [Test] procedure SetFieldVariable_ViaClassHandle_WritesField;
+    [Test] procedure Terminate_ReapsDebuggeeProcess;
+    [Test] procedure Terminate_ReleasesSymbolFileLock;
+    [Test] procedure Pause_RetargetsToUserThread;
+    [Test] procedure ExceptionFilters_ParseNames;
+    [Test] procedure DeepNested_LocalsResolveAtDepth2;
+    [Test] procedure DeepNested_LocalsResolveAtExceptionStop;
+    [Test] procedure MainModule_NoDebugInfo_ReportsDiagnostic;
+    // F23: a nameless frame used to be reported blank, so "unknown address",
+    // "module without debug info" and "index still building" were the same
+    // rendering. A frame in a module with no debug info must still name the
+    // module and say WHY it has no symbols.
+    [Test] procedure Frames_NoDebugInfoModule_ReportModuleAndSymbolState;
+    [Test] procedure Tds_MainModule_LoadsExternalTds;
+    [Test] procedure Tds_StaleTds_Ignored;
+    // Background symbol prefetch: with NO breakpoint anywhere -- the state a
+    // debugger is in right after attaching -- a runtime-loaded package used to be
+    // parsed for the first time at the stop that needed it, which is where the
+    // nameless frames and the multi-second pause came from. Its symbols must now
+    // already be there.
+    [Test] procedure Prefetch_NoBreakpoints_LoadsRuntimePackageSymbols;
+    // The prefetch worker must never parse a module the dispatch thread is also
+    // parsing: a second reader for the same module would register a duplicate
+    // provider (every local reported twice) or be built against a module record
+    // that has already moved on.
+    [Test] procedure Prefetch_ModuleLoadedSynchronously_IsNotParsedAgain;
+  end;
+
+implementation
+
+uses
+  Winapi.Windows, System.SysUtils, System.Classes, System.IOUtils,
+  DebugSession, DebugSessionTypes, DebugInfoTypes, DebugTarget, LaunchConfig,
+  ModuleSymbolLoader;
+
+const
+  EVAL_MARKER = 'EVAL_BODY';
+  EVAL_SOURCE = 'TestTargetCore.pas';
+
+function TDebugSessionTests.RepoRoot: string;
+begin
+  // RunTests.exe lives in <repo>\DebuggerTests\Win64\Debug\
+  Result := ExpandFileName(ExtractFilePath(ParamStr(0)) + '..\..\..\');
+end;
+
+function TDebugSessionTests.TargetDir: string;
+begin
+  Result := RepoRoot + 'DebuggerTests\TestTarget\';
+end;
+
+function TDebugSessionTests.TargetExe: string;
+begin
+  Result := TargetDir + 'Win64\Debug\TestTarget.exe';
+end;
+
+function TDebugSessionTests.TargetMap: string;
+begin
+  Result := TargetDir + 'Win64\Debug\TestTarget.map';
+end;
+
+function TDebugSessionTests.TargetRsm: string;
+begin
+  Result := TargetDir + 'Win64\Debug\TestTarget.rsm';
+end;
+
+function TDebugSessionTests.NoDebugExe: string;
+begin
+  Result := TargetDir + 'Win64\Debug\NoDebugExe.exe';
+end;
+
+function TDebugSessionTests.TdsSampleExe: string;
+begin
+  Result := TargetDir + 'Win64\Debug\TdsSample.exe';
+end;
+
+function TDebugSessionTests.HostExe: string;
+begin
+  Result := RepoRoot + 'DebuggerTests\TestHost\Win64\Debug\TestHost.exe';
+end;
+
+function TDebugSessionTests.HostMap: string;
+begin
+  Result := RepoRoot + 'DebuggerTests\TestHost\Win64\Debug\TestHost.map';
+end;
+
+function TDebugSessionTests.HostRsm: string;
+begin
+  Result := RepoRoot + 'DebuggerTests\TestHost\Win64\Debug\TestHost.rsm';
+end;
+
+function TDebugSessionTests.PackageSrc: string;
+begin
+  Result := RepoRoot + 'DebuggerTests\TestPackage\TestPkgUnit.pas';
+end;
+
+function TDebugSessionTests.MarkerLineInFile(const SourcePath, Marker: string): Integer;
+var
+  Lines: TStringList;
+begin
+  Result := 0;
+  Lines := TStringList.Create;
+  try
+    Lines.LoadFromFile(SourcePath);
+    var Tag := '{BP:' + Marker + '}';
+    for var I := 0 to Lines.Count - 1 do
+      if Lines[I].Contains(Tag) then
+        Exit(I + 1);  // 1-based
+  finally
+    Lines.Free;
+  end;
+end;
+
+function TDebugSessionTests.MarkerLine(const SourceBaseName, Marker: string): Integer;
+begin
+  Result := MarkerLineInFile(TargetDir + SourceBaseName, Marker);
+end;
+
+// Launches the target, plants a breakpoint at the marker, and pumps until the
+// session reports a stop (event-driven; the per-event 10 ms wait paces it -- no
+// arbitrary sleeps). Bounded by a wall-clock deadline so a hang fails the test
+// rather than blocking forever. The caller owns Session.Free.
+function OpenSessionAtMarker(const ExePath, MapPath, RsmPath, SourceRoot,
+  SourceBaseName: string; Line: Integer): TDebugSession;
+begin
+  Result := TDebugSession.Create;
+  var Opts: TLaunchOptions;
+  Opts             := Default(TLaunchOptions);
+  Opts.ExePath     := ExePath;
+  Opts.MapPath     := MapPath;
+  Opts.RsmPath     := RsmPath;
+  Opts.SourceRoot  := SourceRoot;
+  Opts.StopAtEntry := False;
+
+  Assert.IsTrue(Result.Launch(Opts), 'Launch returned False');
+
+  var LineSpec: TBpLineSpec;
+  LineSpec      := Default(TBpLineSpec);
+  LineSpec.Line := Line;
+  Result.SetBreakpoints(SourceBaseName, [LineSpec]);
+
+  var Deadline := GetTickCount64 + 60000;
+  while (Result.State <> dsStopped) and (not Result.HasExited) and
+        (GetTickCount64 < Deadline) do
+    Result.Pump;
+end;
+
+procedure TDebugSessionTests.Launch_StopsAtBreakpoint;
+begin
+  var Line := MarkerLine(EVAL_SOURCE, EVAL_MARKER);
+  Assert.IsTrue(Line > 0, 'marker not found: ' + EVAL_MARKER);
+  var Session := OpenSessionAtMarker(TargetExe, TargetMap, TargetRsm, TargetDir,
+    EVAL_SOURCE, Line);
+  try
+    Assert.AreEqual(Ord(dsStopped), Ord(Session.State), 'session did not stop');
+
+    var FnName, SrcFile: string;
+    var StopLine: Integer;
+    Assert.IsTrue(Session.GetCurrentLocation(FnName, SrcFile, StopLine),
+      'no current location');
+    Assert.AreEqual(EVAL_SOURCE, ExtractFileName(SrcFile), 'wrong source file');
+    Assert.AreEqual(Line, StopLine, 'stopped at wrong line');
+  finally
+    Session.Terminate;
+    Session.Free;
+  end;
+end;
+
+// Regression for the zombie-debuggee handle leak: after Terminate the debuggee
+// must be fully reaped -- not left as a zombie held by our still-open debug port
+// (which kept the .exe locked and blocked rebuilds). Asserts the process id is no
+// longer a live process shortly after Terminate.
+procedure TDebugSessionTests.Terminate_ReapsDebuggeeProcess;
+
+  function ProcessIsAlive(Pid: Cardinal): Boolean;
+  begin
+    Result := False;
+    if Pid = 0 then Exit;
+    var H := OpenProcess(PROCESS_QUERY_INFORMATION, False, Pid);
+    if H = 0 then Exit;   // gone (or access denied -- treated as not-our-live-zombie)
+    try
+      var Code: DWORD := 0;
+      if GetExitCodeProcess(H, Code) then
+        Result := (Code = STILL_ACTIVE);
+    finally
+      CloseHandle(H);
+    end;
+  end;
+
+begin
+  var Line := MarkerLine(EVAL_SOURCE, EVAL_MARKER);
+  var Session := OpenSessionAtMarker(TargetExe, TargetMap, TargetRsm, TargetDir,
+    EVAL_SOURCE, Line);
+  try
+    var Pid := Session.DebuggeeProcessId;
+    Assert.IsTrue(Pid <> 0, 'no debuggee pid while stopped');
+    Assert.IsTrue(ProcessIsAlive(Pid), 'debuggee should be alive before Terminate');
+
+    Session.Terminate;
+
+    // Terminate drains the exit event synchronously, so the process should be
+    // gone immediately; allow a short grace window against scheduler latency.
+    var Deadline := GetTickCount64 + 3000;
+    while ProcessIsAlive(Pid) and (GetTickCount64 < Deadline) do
+      Sleep(20);
+    Assert.IsFalse(ProcessIsAlive(Pid),
+      Format('debuggee pid %d survived Terminate as a zombie', [Pid]));
+  finally
+    Session.Free;
+  end;
+end;
+
+procedure TDebugSessionTests.Locals_AtEvalBody_ExposeCaption;
+begin
+  var Line := MarkerLine(EVAL_SOURCE, EVAL_MARKER);
+  var Session := OpenSessionAtMarker(TargetExe, TargetMap, TargetRsm, TargetDir,
+    EVAL_SOURCE, Line);
+  try
+    var Locals := Session.GetLocals;
+    Assert.IsTrue(Length(Locals) > 0, 'no locals returned');
+
+    var FoundCaption := False;
+    for var V in Locals do
+      if SameText(V.Name, 'Caption') then begin
+        FoundCaption := True;
+        Assert.IsTrue(V.Value.Contains('Hello'),
+          'Caption value mismatch: ' + V.Value);
+      end;
+    Assert.IsTrue(FoundCaption, 'local Caption not found');
+  finally
+    Session.Terminate;
+    Session.Free;
+  end;
+end;
+
+procedure TDebugSessionTests.Evaluate_FieldAccess_ReturnsValue;
+begin
+  var Line := MarkerLine(EVAL_SOURCE, EVAL_MARKER);
+  var Session := OpenSessionAtMarker(TargetExe, TargetMap, TargetRsm, TargetDir,
+    EVAL_SOURCE, Line);
+  try
+    var R := Session.Evaluate('W.FValue');
+    Assert.IsTrue(R.Success, 'evaluate failed: ' + R.ErrorText);
+    Assert.IsTrue(R.Value.Contains('42'), 'W.FValue mismatch: ' + R.Value);
+  finally
+    Session.Terminate;
+    Session.Free;
+  end;
+end;
+
+procedure TDebugSessionTests.Snapshot_HasLocationAndLocals;
+begin
+  var Line := MarkerLine(EVAL_SOURCE, EVAL_MARKER);
+  var Session := OpenSessionAtMarker(TargetExe, TargetMap, TargetRsm, TargetDir,
+    EVAL_SOURCE, Line);
+  try
+    var Snap := Session.Snapshot;
+    Assert.AreEqual(Ord(dsStopped), Ord(Snap.State), 'snapshot state not stopped');
+    Assert.AreEqual(EVAL_SOURCE, ExtractFileName(Snap.CurrentFile),
+      'snapshot current file mismatch');
+    Assert.AreEqual(Line, Snap.CurrentLine, 'snapshot current line mismatch');
+    Assert.IsTrue(Length(Snap.TopFrames) > 0, 'snapshot has no frames');
+    Assert.IsTrue(Length(Snap.Locals) > 0, 'snapshot has no locals');
+  finally
+    Session.Terminate;
+    Session.Free;
+  end;
+end;
+
+// Launches, plants ONE conditional/hit/logpoint breakpoint at a marker, and pumps
+// until the session stops or the target exits (event-driven, bounded). Caller owns
+// Session.Free.
+function OpenSessionWithBp(const ExePath, MapPath, RsmPath, SourceRoot,
+  SourceBaseName: string; Line: Integer;
+  const Cond, HitCond, LogMsg: string): TDebugSession;
+begin
+  Result := TDebugSession.Create;
+  var Opts: TLaunchOptions;
+  Opts             := Default(TLaunchOptions);
+  Opts.ExePath     := ExePath;
+  Opts.MapPath     := MapPath;
+  Opts.RsmPath     := RsmPath;
+  Opts.SourceRoot  := SourceRoot;
+  Opts.StopAtEntry := False;
+  Result.Launch(Opts);
+
+  var Spec: TBpLineSpec;
+  Spec              := Default(TBpLineSpec);
+  Spec.Line         := Line;
+  Spec.Condition    := Cond;
+  Spec.HitCondition := HitCond;
+  Spec.LogMessage   := LogMsg;
+  Result.SetBreakpoints(SourceBaseName, [Spec]);
+
+  var Deadline := GetTickCount64 + 60000;
+  while (Result.State <> dsStopped) and (not Result.HasExited) and
+        (GetTickCount64 < Deadline) do
+    Result.Pump;
+end;
+
+// True when the runner holds SeDebugPrivilege. DebugActiveProcess needs it on a
+// standard account, so the attach test skips (rather than fails) when absent.
+function HaveDebugPrivilege: Boolean;
+var
+  Tok: THandle;
+  Luid: TLargeInteger;
+  Got: DWORD;
+  Buf: array[0..1023] of Byte;
+  Privs: ^TTokenPrivileges;
+begin
+  Result := False;
+  if not OpenProcessToken(GetCurrentProcess, TOKEN_QUERY, Tok) then
+    Exit;
+  try
+    if not LookupPrivilegeValue(nil, 'SeDebugPrivilege', Luid) then
+      Exit;
+    Got := 0;
+    GetTokenInformation(Tok, TokenPrivileges, @Buf[0], SizeOf(Buf), Got);
+    if Got = 0 then
+      Exit;
+    Privs := @Buf[0];
+    for var I := 0 to Privs.PrivilegeCount - 1 do
+      if Int64(Privs.Privileges[I].Luid) = Int64(Luid) then
+        Exit(True);
+  finally
+    CloseHandle(Tok);
+  end;
+end;
+
+function FindVar(const Vars: TArray<TSessionVariable>; const Name: string;
+  out V: TSessionVariable): Boolean;
+begin
+  for var Each in Vars do
+    if SameText(Each.Name, Name) then begin
+      V := Each;
+      Exit(True);
+    end;
+  Result := False;
+end;
+
+// Returns the children of a named category ('properties'/'event handlers'/
+// 'fields') among a class node's expansion rows, or nil when absent.
+function GroupChildren(Session: TDebugSession;
+  const Rows: TArray<TSessionVariable>; const GroupName: string): TArray<TSessionVariable>;
+var G: TSessionVariable;
+begin
+  Result := nil;
+  if FindVar(Rows, GroupName, G) and (G.Kind = vkGroup) and G.Expandable then
+    Result := Session.GetChildren(G.Handle);
+end;
+
+// Finds a backing FIELD row of a class node regardless of whether the class
+// expands flat (no properties) or into groups (a 'fields' category).
+function FindMemberField(Session: TDebugSession; const Parent: TSessionVariable;
+  const FieldName: string; out V: TSessionVariable): Boolean;
+begin
+  var Rows := Session.GetChildren(Parent.Handle);
+  var Fields := GroupChildren(Session, Rows, 'fields');
+  if Length(Fields) > 0 then
+    Rows := Fields;
+  Result := FindVar(Rows, FieldName, V);
+end;
+
+procedure TDebugSessionTests.ExpandVariable_Widget_ExposesFields;
+begin
+  var Line := MarkerLine(EVAL_SOURCE, EVAL_MARKER);
+  var Session := OpenSessionAtMarker(TargetExe, TargetMap, TargetRsm, TargetDir,
+    EVAL_SOURCE, Line);
+  try
+    var Locals := Session.GetLocals;
+    var W: TSessionVariable;
+    Assert.IsTrue(FindVar(Locals, 'W', W), 'local W not found');
+    Assert.IsTrue(W.Expandable, 'W should be expandable');
+    Assert.IsTrue(W.Handle <> 0, 'W has no expansion handle');
+
+    var FName, FValue: TSessionVariable;
+    Assert.IsTrue(FindMemberField(Session, W, 'FName', FName), 'field FName not found');
+    Assert.IsTrue(FName.Value.Contains('hello'), 'FName mismatch: ' + FName.Value);
+    Assert.IsTrue(FindMemberField(Session, W, 'FValue', FValue), 'field FValue not found');
+    Assert.IsTrue(FValue.Value.Contains('42'), 'FValue mismatch: ' + FValue.Value);
+  finally
+    Session.Terminate;
+    Session.Free;
+  end;
+end;
+
+procedure TDebugSessionTests.ExpandVariable_NestedRecord;
+begin
+  var Line := MarkerLine(EVAL_SOURCE, EVAL_MARKER);
+  var Session := OpenSessionAtMarker(TargetExe, TargetMap, TargetRsm, TargetDir,
+    EVAL_SOURCE, Line);
+  try
+    var W: TSessionVariable;
+    Assert.IsTrue(FindVar(Session.GetLocals, 'W', W), 'local W not found');
+
+    var FPt: TSessionVariable;
+    Assert.IsTrue(FindMemberField(Session, W, 'FPt', FPt), 'record field FPt not found');
+    Assert.IsTrue(FPt.Expandable and (FPt.Handle <> 0), 'FPt should be an expandable record');
+
+    var PtFields := Session.GetChildren(FPt.Handle);
+    Assert.IsTrue(Length(PtFields) >= 3, 'FPt should expose >= 3 coordinate fields');
+
+    var AnyCoord := False;
+    for var C in PtFields do
+      if C.Value.Contains('1.5') or C.Value.Contains('2.5') or C.Value.Contains('3.5') then
+        AnyCoord := True;
+    Assert.IsTrue(AnyCoord, 'no expected coordinate value in FPt fields');
+  finally
+    Session.Terminate;
+    Session.Free;
+  end;
+end;
+
+procedure TDebugSessionTests.Breakpoint_Condition_True_Stops;
+begin
+  var Line := MarkerLine(EVAL_SOURCE, EVAL_MARKER);
+  var Session := OpenSessionWithBp(TargetExe, TargetMap, TargetRsm, TargetDir,
+    EVAL_SOURCE, Line, 'W.FValue = 42', '', '');
+  try
+    Assert.AreEqual(Ord(dsStopped), Ord(Session.State), 'condition true should have stopped');
+    var Fn, Src: string; var StopLine: Integer;
+    Session.GetCurrentLocation(Fn, Src, StopLine);
+    Assert.AreEqual(Line, StopLine, 'stopped at wrong line');
+  finally
+    if Session.State = dsStopped then Session.Terminate;
+    Session.Free;
+  end;
+end;
+
+procedure TDebugSessionTests.Breakpoint_Condition_False_RunsToExit;
+begin
+  var Line := MarkerLine(EVAL_SOURCE, EVAL_MARKER);
+  var Session := OpenSessionWithBp(TargetExe, TargetMap, TargetRsm, TargetDir,
+    EVAL_SOURCE, Line, 'W.FValue = 99', '', '');
+  try
+    Assert.IsTrue(Session.HasExited, 'condition false should NOT have stopped (target should exit)');
+    Assert.AreNotEqual(Ord(dsStopped), Ord(Session.State), 'must not be stopped');
+  finally
+    Session.Free;
+  end;
+end;
+
+procedure TDebugSessionTests.Breakpoint_Logpoint_EmitsAndContinues;
+begin
+  var Line := MarkerLine(EVAL_SOURCE, EVAL_MARKER);
+  var Session := OpenSessionWithBp(TargetExe, TargetMap, TargetRsm, TargetDir,
+    EVAL_SOURCE, Line, '', '', 'widget-value={W.FValue}');
+  try
+    Assert.IsTrue(Session.HasExited, 'logpoint must not stop; target should run to exit');
+    var Logs := Session.DrainDebuggerOutput;
+    var Joined := '';
+    for var L in Logs do
+      Joined := Joined + L + '|';
+    Assert.IsTrue(Joined.Contains('widget-value=42'), 'logpoint message not emitted: ' + Joined);
+  finally
+    Session.Free;
+  end;
+end;
+
+procedure TDebugSessionTests.Breakpoint_HitCount_SkipsEarlyHits;
+begin
+  var Line := MarkerLine(EVAL_SOURCE, 'CTOR_BODY');
+  Assert.IsTrue(Line > 0, 'CTOR_BODY marker not found');
+  // CTOR_BODY (TWidget.Create) is hit more than once per run. hitCondition ">=2"
+  // must skip the first hit and stop on the second.
+  var Session := OpenSessionWithBp(TargetExe, TargetMap, TargetRsm, TargetDir,
+    EVAL_SOURCE, Line, '', '>=2', '');
+  try
+    Assert.AreEqual(Ord(dsStopped), Ord(Session.State),
+      'hit-count >=2 should have stopped on a later hit');
+    var Fn, Src: string; var StopLine: Integer;
+    Session.GetCurrentLocation(Fn, Src, StopLine);
+    Assert.AreEqual(Line, StopLine, 'stopped at wrong line');
+  finally
+    if Session.State = dsStopped then Session.Terminate;
+    Session.Free;
+  end;
+end;
+
+procedure TDebugSessionTests.ExpandVariable_DynArray_Elements;
+begin
+  var Line := MarkerLine(EVAL_SOURCE, EVAL_MARKER);
+  var Session := OpenSessionAtMarker(TargetExe, TargetMap, TargetRsm, TargetDir,
+    EVAL_SOURCE, Line);
+  try
+    var Scores: TSessionVariable;
+    Assert.IsTrue(FindVar(Session.GetLocals, 'Scores', Scores), 'local Scores not found');
+    Assert.IsTrue(Scores.Expandable and (Scores.Handle <> 0),
+      'Scores (TArray<Integer>) should be expandable');
+
+    var Elems := Session.GetChildren(Scores.Handle);
+    Assert.AreEqual<Integer>(3, Length(Elems), 'expected 3 array elements');
+    Assert.AreEqual('[0]', Elems[0].Name, 'element name');
+    Assert.IsTrue(Elems[0].Value.Contains('10'), 'Scores[0] mismatch: ' + Elems[0].Value);
+    Assert.IsTrue(Elems[1].Value.Contains('20'), 'Scores[1] mismatch: ' + Elems[1].Value);
+    Assert.IsTrue(Elems[2].Value.Contains('30'), 'Scores[2] mismatch: ' + Elems[2].Value);
+  finally
+    Session.Terminate;
+    Session.Free;
+  end;
+end;
+
+procedure TDebugSessionTests.ExpandVariable_Widget_GroupsProperties;
+begin
+  var Line := MarkerLine(EVAL_SOURCE, EVAL_MARKER);
+  var Session := OpenSessionAtMarker(TargetExe, TargetMap, TargetRsm, TargetDir,
+    EVAL_SOURCE, Line);
+  try
+    var W: TSessionVariable;
+    Assert.IsTrue(FindVar(Session.GetLocals, 'W', W), 'local W not found');
+
+    // A property-bearing class expands into category rows, not a flat field list.
+    var Rows := Session.GetChildren(W.Handle);
+    var G: TSessionVariable;
+    Assert.IsTrue(FindVar(Rows, 'properties', G), 'no "properties" group');
+    Assert.AreEqual(Ord(vkGroup), Ord(G.Kind), 'properties row is not a group');
+    Assert.IsTrue(G.Expandable and (G.Handle <> 0), 'properties group not expandable');
+    Assert.IsTrue(FindVar(Rows, 'event handlers', G), 'no "event handlers" group');
+    Assert.IsTrue(FindVar(Rows, 'fields', G), 'no "fields" group');
+
+    // The event group carries the method-pointer property; fields carry backing.
+    var Events := GroupChildren(Session, Rows, 'event handlers');
+    var Dummy: TSessionVariable;
+    Assert.IsTrue(FindVar(Events, 'OnNotify', Dummy), 'OnNotify not in event handlers');
+    var Fields := GroupChildren(Session, Rows, 'fields');
+    Assert.IsTrue(FindVar(Fields, 'FValue', Dummy), 'FValue not in fields group');
+  finally
+    Session.Terminate;
+    Session.Free;
+  end;
+end;
+
+procedure TDebugSessionTests.ExpandVariable_PropertyGetter_RunsGetter;
+begin
+  var Line := MarkerLine(EVAL_SOURCE, EVAL_MARKER);
+  var Session := OpenSessionAtMarker(TargetExe, TargetMap, TargetRsm, TargetDir,
+    EVAL_SOURCE, Line);
+  try
+    var W: TSessionVariable;
+    Assert.IsTrue(FindVar(Session.GetLocals, 'W', W), 'local W not found');
+    var Props := GroupChildren(Session, Session.GetChildren(W.Handle), 'properties');
+    Assert.IsTrue(Length(Props) > 0, 'no properties enumerated');
+
+    // Field-backed property reads inline.
+    var PValue: TSessionVariable;
+    Assert.IsTrue(FindVar(Props, 'Value', PValue), 'property Value not found');
+    Assert.IsTrue(PValue.Value.Contains('42'), 'Value property mismatch: ' + PValue.Value);
+
+    // Getter-backed property defers, then runs the getter on expand.
+    // TWidget.Score = DoCalcScore = FValue*2 = 84.
+    var PScore: TSessionVariable;
+    Assert.IsTrue(FindVar(Props, 'Score', PScore), 'property Score not found');
+    Assert.IsTrue(PScore.Expandable and (PScore.Handle <> 0),
+      'Score getter should defer (be expandable)');
+    Assert.AreEqual('(expand to evaluate)', PScore.Value, 'Score placeholder mismatch');
+
+    var GetterRows := Session.GetChildren(PScore.Handle);
+    Assert.AreEqual<Integer>(1, Length(GetterRows), 'getter should yield one value leaf');
+    Assert.AreEqual('(value)', GetterRows[0].Name, 'getter leaf name');
+    Assert.IsTrue(GetterRows[0].Value.Contains('84'),
+      'Score getter value mismatch: ' + GetterRows[0].Value);
+  finally
+    Session.Terminate;
+    Session.Free;
+  end;
+end;
+
+procedure TDebugSessionTests.ExpandVariable_IndexedProperty_IsLeaf;
+begin
+  var Line := MarkerLine(EVAL_SOURCE, EVAL_MARKER);
+  var Session := OpenSessionAtMarker(TargetExe, TargetMap, TargetRsm, TargetDir,
+    EVAL_SOURCE, Line);
+  try
+    var W: TSessionVariable;
+    Assert.IsTrue(FindVar(Session.GetLocals, 'W', W), 'local W not found');
+    var Props := GroupChildren(Session, Session.GetChildren(W.Handle), 'properties');
+
+    var Slot: TSessionVariable;
+    Assert.IsTrue(FindVar(Props, 'Slot', Slot), 'indexed property Slot not found');
+    Assert.IsFalse(Slot.Expandable, 'indexed property must be a leaf');
+    Assert.AreEqual('(indexed property)', Slot.Value, 'indexed property placeholder mismatch');
+  finally
+    Session.Terminate;
+    Session.Free;
+  end;
+end;
+
+procedure TDebugSessionTests.ExpandVariable_VariantArray1D_Elements;
+begin
+  var Line := MarkerLine(EVAL_SOURCE, 'VARIANT_BODY');
+  Assert.IsTrue(Line > 0, 'VARIANT_BODY marker not found');
+  var Session := OpenSessionAtMarker(TargetExe, TargetMap, TargetRsm, TargetDir,
+    EVAL_SOURCE, Line);
+  try
+    var Arr: TSessionVariable;
+    Assert.IsTrue(FindVar(Session.GetLocals, 'Arr1D', Arr), 'local Arr1D not found');
+    Assert.IsTrue(Arr.Expandable and (Arr.Handle <> 0), 'Arr1D should be expandable');
+
+    var Elems := Session.GetChildren(Arr.Handle);
+    Assert.AreEqual<Integer>(5, Length(Elems), 'expected 5 variant-array elements');
+    Assert.AreEqual('[0]', Elems[0].Name, 'element name');
+    var Expected: TArray<string> := ['10', '20', '30', '40', '50'];
+    for var I := 0 to 4 do
+      Assert.IsTrue(Elems[I].Value.Contains(Expected[I]),
+        Format('Arr1D[%d] mismatch: %s', [I, Elems[I].Value]));
+  finally
+    Session.Terminate;
+    Session.Free;
+  end;
+end;
+
+procedure TDebugSessionTests.ExpandVariable_VariantArray2D_Elements;
+begin
+  var Line := MarkerLine(EVAL_SOURCE, 'VARIANT_BODY');
+  var Session := OpenSessionAtMarker(TargetExe, TargetMap, TargetRsm, TargetDir,
+    EVAL_SOURCE, Line);
+  try
+    var Mat: TSessionVariable;
+    Assert.IsTrue(FindVar(Session.GetLocals, 'Mat', Mat), 'local Mat not found');
+    Assert.IsTrue(Mat.Expandable and (Mat.Handle <> 0), 'Mat should be expandable');
+
+    // varDouble[1..3, 1..4] -> 12 cells named [r,c]; Mat[1,1]=1.5, Mat[2,3]=7.25.
+    var Elems := Session.GetChildren(Mat.Handle);
+    Assert.AreEqual<Integer>(12, Length(Elems), 'expected 12 matrix elements');
+    Assert.AreEqual('[1,1]', Elems[0].Name, 'first cell name');
+    var C11, C23: TSessionVariable;
+    Assert.IsTrue(FindVar(Elems, '[1,1]', C11), 'cell [1,1] not found');
+    Assert.IsTrue(C11.Value.Contains('1.5'), 'Mat[1,1] mismatch: ' + C11.Value);
+    Assert.IsTrue(FindVar(Elems, '[2,3]', C23), 'cell [2,3] not found');
+    Assert.IsTrue(C23.Value.Contains('7.25'), 'Mat[2,3] mismatch: ' + C23.Value);
+  finally
+    Session.Terminate;
+    Session.Free;
+  end;
+end;
+
+procedure TDebugSessionTests.Bpl_CallStack_ResolvesDeeperFrames;
+begin
+  // At a stop inside a runtime-loaded BPL unit, the call stack crosses module
+  // boundaries. Its symbols are loaded ON DEMAND (GetCallStack detects unresolved
+  // frames, EnsureModuleForPC's their module, then re-walks). This proves the
+  // resolution is NOT limited to the top/stop frame -- deeper frames resolve too,
+  // so expanding the stack does not give partial (address-only) results for a
+  // module that has debug info.
+  var Line := MarkerLine(EVAL_SOURCE, EVAL_MARKER);
+  var Session := OpenSessionAtMarker(HostExe, HostMap, HostRsm, TargetDir,
+    EVAL_SOURCE, Line);
+  try
+    Assert.AreEqual(Ord(dsStopped), Ord(Session.State), 'did not stop inside the BPL unit');
+    var Frames := Session.GetCallStack;
+    Assert.IsTrue(Length(Frames) >= 2, 'expected a multi-frame call stack');
+
+    // Top frame = the BPL unit at the stop line (BPL symbols loaded on demand).
+    Assert.AreEqual(EVAL_SOURCE, ExtractFileName(Frames[0].SourceFile), 'top frame source (BPL)');
+    Assert.AreEqual(Line, Frames[0].SourceLine, 'top frame line');
+
+    // At least one DEEPER frame must also carry a resolved source + line -- the
+    // whole visible chain resolves, not just the stop point.
+    var ResolvedBeyondTop := 0;
+    for var I := 1 to High(Frames) do
+      if (Frames[I].SourceFile <> '') and (Frames[I].SourceLine > 0) then
+        Inc(ResolvedBeyondTop);
+    Assert.IsTrue(ResolvedBeyondTop >= 1,
+      Format('no caller frame resolved a source line (of %d frames)', [Length(Frames)]));
+  finally
+    if Session.State = dsStopped then Session.Terminate;
+    Session.Free;
+  end;
+end;
+
+procedure TDebugSessionTests.Bpl_Breakpoint_InPackageUnit_Stops;
+begin
+  // TestHost.exe statically references NO subject unit; it LoadPackage's
+  // TestSubject.bpl (which contains TestTargetCore) at runtime. A breakpoint set
+  // in a BPL-only unit must plant once the BPL loads and its symbols resolve.
+  var Line := MarkerLine(EVAL_SOURCE, EVAL_MARKER);
+  var Session := OpenSessionAtMarker(HostExe, HostMap, HostRsm, TargetDir,
+    EVAL_SOURCE, Line);
+  try
+    Assert.AreEqual(Ord(dsStopped), Ord(Session.State),
+      'did not stop at a breakpoint inside the BPL unit');
+    var Fn, Src: string; var StopLine: Integer;
+    Assert.IsTrue(Session.GetCurrentLocation(Fn, Src, StopLine), 'no location in BPL frame');
+    Assert.AreEqual(EVAL_SOURCE, ExtractFileName(Src), 'wrong source file (BPL)');
+    Assert.AreEqual(Line, StopLine, 'stopped at wrong line');
+
+    var W: TSessionVariable;
+    Assert.IsTrue(FindVar(Session.GetLocals, 'W', W), 'W local not visible in the BPL frame');
+    Assert.IsTrue(W.Expandable, 'W should be expandable (BPL TD32/DCP loaded)');
+    var FV: TSessionVariable;
+    Assert.IsTrue(FindMemberField(Session, W, 'FValue', FV) and FV.Value.Contains('42'),
+      'FValue=42 not readable in the BPL object');
+  finally
+    if Session.State = dsStopped then Session.Terminate;
+    Session.Free;
+  end;
+end;
+
+// Regression: dbghelp must learn about modules mapped AFTER its initialisation.
+// SymInitialize(fInvadeProcess=True) enumerates only the modules present at that
+// instant, and it used to run lazily on the FIRST stack walk. A client that walks
+// the stack at the entry stop (VS Code does: the entry stop is a stop like any
+// other) therefore froze dbghelp's module list before any runtime-loaded package
+// existed. StackWalk64 then had no .pdata unwind info inside the BPL and fell back
+// to the AMD64 leaf convention (return address := [RSP]); just past a Delphi
+// prologue RSP == RBP == the bottom of the frame, so it read an uninitialised local
+// and the walk stopped after ONE frame. The same nil function table broke
+// CallerReturnAddress, so step-out silently degenerated into a single-instruction
+// step inside the SAME function and still reported success.
+procedure TDebugSessionTests.Bpl_StackWalk_AfterEarlyWalk_ResolvesFramesAndStepsOut;
+
+  procedure PumpUntilStopped(Session: TDebugSession; TimeoutMs: Cardinal);
+  begin
+    var Deadline := GetTickCount64 + TimeoutMs;
+    while (Session.State <> dsStopped) and (not Session.HasExited) and
+          (GetTickCount64 < Deadline) do
+      Session.Pump;
+  end;
+
+  function CurrentRsp(Session: TDebugSession): UInt64;
+  begin
+    Result := 0;
+    for var R in Session.GetRegisters do
+      if SameText(R.Name, 'RSP') then
+        Exit(R.Value);
+  end;
+
+begin
+  var Line := MarkerLineInFile(PackageSrc, 'PKG_INNER_BODY');
+  Assert.IsTrue(Line > 0, 'marker PKG_INNER_BODY not found in TestPkgUnit.pas');
+
+  var Session := TDebugSession.Create;
+  try
+    var Opts         := Default(TLaunchOptions);
+    Opts.ExePath     := TargetExe;
+    Opts.MapPath     := TargetMap;
+    Opts.RsmPath     := TargetRsm;
+    Opts.SourceRoot  := TargetDir;
+    Opts.StopAtEntry := True;
+    Opts.Args        := '--load-package';
+    Assert.IsTrue(Session.Launch(Opts), 'Launch returned False');
+    PumpUntilStopped(Session, 30000);
+    Assert.AreEqual(Ord(dsStopped), Ord(Session.State), 'did not stop at entry');
+
+    // THE TRIGGER: one stack walk while only the exe (and the system DLLs) is
+    // mapped. Everything below must behave exactly as if it had never run.
+    Session.GetCallStack;
+
+    var LineSpec  := Default(TBpLineSpec);
+    LineSpec.Line := Line;
+    Session.SetBreakpoints('TestPkgUnit.pas', [LineSpec]);
+    Session.ContinueExecution;
+    PumpUntilStopped(Session, 60000);
+    Assert.AreEqual(Ord(dsStopped), Ord(Session.State),
+      'did not stop at PKG_INNER_BODY inside the runtime-loaded package');
+
+    // PkgInner is call-free, so at its first statement RSP still equals RBP: the
+    // leaf-convention fallback reads a local here and truncates the walk to 1.
+    var Frames := Session.GetCallStack;
+    Assert.IsTrue(Length(Frames) >= 3,
+      Format('expected >= 3 frames inside the BPL, got %d (dbghelp has no unwind ' +
+        'info for a module mapped after SymInitialize)', [Length(Frames)]));
+    Assert.IsTrue(Frames[1].FunctionName.Contains('PkgAdd'),
+      'frame 1 must be the BPL caller PkgAdd, got: ' + Frames[1].FunctionName);
+
+    var FuncEntryBefore := Frames[0].FuncEntryVA;
+    var RspBefore       := CurrentRsp(Session);
+    Assert.IsTrue(RspBefore <> 0, 'no RSP before step-out');
+
+    Session.StepOut;
+    PumpUntilStopped(Session, 30000);
+    Assert.AreEqual(Ord(dsStopped), Ord(Session.State), 'step-out produced no stop');
+
+    var After := Session.GetCallStack;
+    Assert.IsTrue(Length(After) > 0, 'no frames after step-out');
+    Assert.IsFalse(After[0].FunctionName.Contains('PkgInner'),
+      'step-out must leave PkgInner, but stopped in: ' + After[0].FunctionName);
+    Assert.AreNotEqual(FuncEntryBefore, After[0].FuncEntryVA,
+      'step-out stayed inside the same function (it single-stepped a few bytes)');
+    Assert.IsTrue(CurrentRsp(Session) > RspBefore,
+      Format('step-out must unwind to a HIGHER RSP; before=$%x after=$%x',
+        [RspBefore, CurrentRsp(Session)]));
+  finally
+    if Session.State = dsStopped then
+      Session.Terminate;
+    Session.Free;
+  end;
+end;
+
+// F22 regression: the state a CLIENT is told must track reality.
+//
+// A breakpoint set in a unit that lives in a not-yet-loaded package is correctly
+// reported unverified at set time. When the package loads, the session re-posts the
+// spec, the line resolves, the INT3 is planted and the breakpoint fires -- but
+// ListBreakpoints (the array the MCP `list_breakpoints` tool serialises, and the
+// only thing a non-DAP client can see) kept returning the stale set-time value.
+// Observed live twice: two breakpoints reported unverified and then both hit.
+//
+// This asserts on the client-visible answer, not on any internal flip dictionary.
+procedure TDebugSessionTests.Bpl_ListBreakpoints_ReportsVerified_AfterPackageLoads;
+
+  procedure PumpUntilStopped(Session: TDebugSession; TimeoutMs: Cardinal);
+  begin
+    var Deadline := GetTickCount64 + TimeoutMs;
+    while (Session.State <> dsStopped) and (not Session.HasExited) and
+          (GetTickCount64 < Deadline) do
+      Session.Pump;
+  end;
+
+  function ReportedVerified(Session: TDebugSession; Line: Integer): Boolean;
+  begin
+    Result := False;
+    for var Bp in Session.ListBreakpoints do
+      if (Bp.Line = Line) and SameText(ExtractFileName(Bp.SourceFile), 'TestPkgUnit.pas') then
+        Exit(Bp.Verified);
+  end;
+
+begin
+  var Line := MarkerLineInFile(PackageSrc, 'PKG_BP');
+  Assert.IsTrue(Line > 0, 'marker PKG_BP not found in TestPkgUnit.pas');
+
+  var Session := TDebugSession.Create;
+  try
+    var Opts         := Default(TLaunchOptions);
+    Opts.ExePath     := TargetExe;
+    Opts.MapPath     := TargetMap;
+    Opts.RsmPath     := TargetRsm;
+    Opts.SourceRoot  := TargetDir;
+    Opts.StopAtEntry := True;   // stop BEFORE TestPackage.bpl is loaded
+    Opts.Args        := '--load-package';
+    Assert.IsTrue(Session.Launch(Opts), 'Launch returned False');
+    PumpUntilStopped(Session, 30000);
+    Assert.AreEqual(Ord(dsStopped), Ord(Session.State), 'did not stop at entry');
+
+    var LineSpec  := Default(TBpLineSpec);
+    LineSpec.Line := Line;
+    var Initial := Session.SetBreakpoints('TestPkgUnit.pas', [LineSpec]);
+    Assert.AreEqual<Integer>(1, Length(Initial), 'expected one breakpoint back');
+    Assert.IsFalse(Initial[0].Verified,
+      'precondition: the package is not loaded yet, so the breakpoint cannot be verified');
+    Assert.IsFalse(ReportedVerified(Session, Line),
+      'precondition: ListBreakpoints must agree it is unverified before the package loads');
+
+    // Run on: LoadPackage maps TestPackage.bpl, its symbols load, the spec is
+    // re-posted and the breakpoint plants -- and then HITS.
+    Session.ContinueExecution;
+    PumpUntilStopped(Session, 60000);
+    Assert.AreEqual(Ord(dsStopped), Ord(Session.State),
+      'did not stop at PKG_BP inside the runtime-loaded package');
+
+    var Fn, Src: string;
+    var StopLine: Integer;
+    Assert.IsTrue(Session.GetCurrentLocation(Fn, Src, StopLine), 'no location at the BPL stop');
+    Assert.AreEqual('TestPkgUnit.pas', ExtractFileName(Src), 'stopped in the wrong file');
+    Assert.AreEqual(Line, StopLine, 'stopped at the wrong line');
+
+    // The breakpoint just fired, so any client asking for its state must be told
+    // it is verified.
+    Assert.IsTrue(ReportedVerified(Session, Line),
+      'ListBreakpoints still reports the breakpoint unverified after it actually fired');
+  finally
+    if Session.State = dsStopped then
+      Session.Terminate;
+    Session.Free;
+  end;
+end;
+
+procedure TDebugSessionTests.GetVariable_LocalAndExpression;
+begin
+  var Line := MarkerLine(EVAL_SOURCE, EVAL_MARKER);
+  var Session := OpenSessionAtMarker(TargetExe, TargetMap, TargetRsm, TargetDir,
+    EVAL_SOURCE, Line);
+  try
+    // A local by name -> carries an expansion handle.
+    var W := Session.GetVariable('W');
+    Assert.AreEqual('W', W.Name, 'name');
+    Assert.IsTrue(W.Expandable and (W.Handle <> 0), 'W local should be expandable with a handle');
+
+    // An expression (not a bare local) -> evaluated.
+    var FV := Session.GetVariable('W.FValue');
+    Assert.IsTrue(FV.Value.Contains('42'), 'W.FValue mismatch: ' + FV.Value);
+  finally
+    Session.Terminate;
+    Session.Free;
+  end;
+end;
+
+// F1 regression: pausing a running target uses DebugBreakProcess, which injects a
+// transient thread that runs the INT3 -- so the stop lands on a thread with no user
+// stack. The engine must retarget the report to a real user thread (the main
+// thread), so the pause shows a usable location/stack instead of empty frames.
+// F17: while debugging, the session memory-maps the target .exe (TD32 symbols), so it
+// is locked. After Terminate the session must RELEASE those mappings, otherwise the
+// .exe stays locked (blocking a rebuild) until the next launch.
+procedure TDebugSessionTests.Terminate_ReleasesSymbolFileLock;
+
+  function CanOpenExclusive(const Path: string): Boolean;
+  begin
+    Result := False;
+    try
+      var FS := TFileStream.Create(Path, fmOpenReadWrite or fmShareExclusive);
+      FS.Free;
+      Result := True;
+    except
+      // still locked
+    end;
+  end;
+
+begin
+  var Line := MarkerLine(EVAL_SOURCE, EVAL_MARKER);
+  var Session := OpenSessionAtMarker(TargetExe, TargetMap, TargetRsm, TargetDir,
+    EVAL_SOURCE, Line);
+  try
+    Assert.AreEqual(Ord(dsStopped), Ord(Session.State), 'session did not stop');
+    // While stopped, the target is both running and symbol-mapped -> locked.
+    Assert.IsFalse(CanOpenExclusive(TargetExe),
+      'exe should be locked while a debug session holds its symbols');
+
+    Session.Terminate;
+
+    // The debuggee is reaped AND the symbol mappings released -> the exe unlocks.
+    // Allow a short window for the OS to drop the terminated process' image lock.
+    var Deadline := GetTickCount64 + 3000;
+    while (not CanOpenExclusive(TargetExe)) and (GetTickCount64 < Deadline) do
+      Sleep(30);
+    Assert.IsTrue(CanOpenExclusive(TargetExe),
+      'exe still locked after Terminate -- the session did not release its symbol files (F17)');
+  finally
+    Session.Free;
+  end;
+end;
+
+// F11 repro attempt: a breakpoint inside a TWO-level nested proc (Inner in Middle in
+// Outer) -- the shape of SampleApp's ParseLiteralDate. The innermost frame must expose
+// its OWN local and, via the scope chain, the enclosing procs' locals.
+procedure TDebugSessionTests.DeepNested_LocalsResolveAtDepth2;
+begin
+  var Line := MarkerLine(EVAL_SOURCE, 'DEEP_NESTED_BODY');
+  Assert.IsTrue(Line > 0, 'DEEP_NESTED_BODY marker not found');
+  var Session := OpenSessionAtMarker(TargetExe, TargetMap, TargetRsm, TargetDir,
+    EVAL_SOURCE, Line);
+  try
+    Assert.AreEqual(Ord(dsStopped), Ord(Session.State), 'did not stop at DEEP_NESTED_BODY');
+
+    var Locals := Session.GetLocals;
+    var HasInner := False;
+    for var L in Locals do
+      if SameText(L.Name, 'InnerVal') then
+        HasInner := True;
+    Assert.IsTrue(HasInner,
+      'InnerVal (own local of a 2-level nested proc) missing from get_locals (F11)');
+
+    var ROuter := Session.Evaluate('OuterVal');
+    Assert.IsTrue(ROuter.Success and ROuter.Value.Contains('314'),
+      'OuterVal (enclosing scope) not resolved: ' + ROuter.Value + ' / ' + ROuter.ErrorText);
+    var RMid := Session.Evaluate('MiddleStr');
+    Assert.IsTrue(RMid.Success and RMid.Value.Contains('middle'),
+      'MiddleStr (enclosing scope) not resolved: ' + RMid.Value + ' / ' + RMid.ErrorText);
+  finally
+    Session.Terminate;
+    Session.Free;
+  end;
+end;
+
+// F11 exception-stop variant: SampleApp's failing case stopped on a FIRST-CHANCE
+// exception inside a 2-level nested proc, not a breakpoint. This drives the target's
+// --run-deep-nested-raise scenario and asserts the nested frame's locals still
+// resolve at the raise site.
+procedure TDebugSessionTests.DeepNested_LocalsResolveAtExceptionStop;
+begin
+  var Session := TDebugSession.Create;
+  try
+    var Opts: TLaunchOptions;
+    Opts             := Default(TLaunchOptions);
+    Opts.ExePath     := TargetExe;
+    Opts.Args        := '--run-deep-nested-raise';
+    Opts.MapPath     := TargetMap;
+    Opts.RsmPath     := TargetRsm;
+    Opts.SourceRoot  := TargetDir;
+    Opts.StopAtEntry := True;
+    Assert.IsTrue(Session.Launch(Opts), 'Launch returned False');
+
+    // Pump to the entry stop, then continue; the default filters break on the
+    // first-chance raise inside InnerLevel.
+    var D0 := GetTickCount64 + 30000;
+    while (Session.State <> dsStopped) and (not Session.HasExited) and (GetTickCount64 < D0) do
+      Session.Pump;
+    Session.ContinueExecution;
+    var Deadline := GetTickCount64 + 30000;
+    while (Session.State <> dsStopped) and (not Session.HasExited) and (GetTickCount64 < Deadline) do
+      Session.Pump;
+    Assert.AreEqual(Ord(dsStopped), Ord(Session.State), 'did not stop on the first-chance raise');
+
+    var Fn, Src: string; var Ln: Integer;
+    Session.GetCurrentLocation(Fn, Src, Ln);
+    Assert.AreEqual(EVAL_SOURCE, ExtractFileName(Src),
+      'exception did not stop in the nested proc source: ' + Src);
+
+    var Locals := Session.GetLocals;
+    var HasInner := False;
+    for var L in Locals do
+      if SameText(L.Name, 'RnInnerVal') then
+        HasInner := True;
+    Assert.IsTrue(HasInner,
+      'RnInnerVal missing at an EXCEPTION stop in a 2-level nested proc (F11)');
+    var ROuter := Session.Evaluate('RnOuter');
+    Assert.IsTrue(ROuter.Success and ROuter.Value.Contains('271'),
+      'RnOuter (enclosing scope) not resolved at exception stop: ' + ROuter.Value + ' / ' + ROuter.ErrorText);
+  finally
+    Session.Terminate;
+    Session.Free;
+  end;
+end;
+
+// F13: the MCP frontend can configure exception break filters (which it did not
+// before). This covers the wire-name -> engine-filter mapping the launch arg and the
+// set_exception_filters tool both use.
+procedure TDebugSessionTests.ExceptionFilters_ParseNames;
+begin
+  Assert.IsTrue(TDebugSession.ParseExceptionFilters(['delphi', 'unhandled']) =
+    [efDelphi, efUnhandled], 'delphi+unhandled');
+  Assert.IsTrue(TDebugSession.ParseExceptionFilters(['av', 'all']) =
+    [efAccessViolation, efAllFirstChance], 'av+all');
+  Assert.IsTrue(TDebugSession.ParseExceptionFilters([]) = [],
+    'empty -> never break on first-chance');
+  Assert.IsTrue(TDebugSession.ParseExceptionFilters(['bogus']) = [],
+    'unknown names are ignored');
+end;
+
+procedure TDebugSessionTests.Pause_RetargetsToUserThread;
+begin
+  var Session := TDebugSession.Create;
+  try
+    var Opts: TLaunchOptions;
+    Opts             := Default(TLaunchOptions);
+    Opts.ExePath     := TargetExe;
+    Opts.Args        := '--attach-pause';   // main thread Sleep(5000)s at startup
+    Opts.MapPath     := TargetMap;
+    Opts.RsmPath     := TargetRsm;
+    Opts.SourceRoot  := TargetDir;
+    Opts.StopAtEntry := False;
+    Assert.IsTrue(Session.Launch(Opts), 'Launch returned False');
+
+    // Let the target start and settle into the Sleep before pausing.
+    var Warm := GetTickCount64 + 1000;
+    while (Session.State <> dsStopped) and (not Session.HasExited) and
+          (GetTickCount64 < Warm) do
+      Session.Pump;
+    Assert.AreEqual(Ord(dsRunning), Ord(Session.State), 'target not running before pause');
+
+    Session.Pause;
+    var Deadline := GetTickCount64 + 8000;
+    while (Session.State <> dsStopped) and (not Session.HasExited) and
+          (GetTickCount64 < Deadline) do
+      Session.Pump;
+    Assert.AreEqual(Ord(dsStopped), Ord(Session.State), 'pause did not stop the target');
+
+    // The pause must report a real user thread (the main thread, in Sleep) -- its
+    // stack resolves at least one user-code frame. The injected thread's stack is
+    // all ntdll, so before the fix no frame carried a source file.
+    var Frames := Session.GetCallStack;
+    var HasUserFrame := False;
+    for var F in Frames do
+      if F.SourceFile <> '' then
+        HasUserFrame := True;
+    Assert.IsTrue(HasUserFrame,
+      'pause reported a thread with no user frames -- the injected-thread bug (F1)');
+
+    // get_threads must list threads and mark exactly one as current.
+    var Threads := Session.GetThreads;
+    Assert.IsTrue(Length(Threads) > 0, 'GetThreads returned no threads');
+    var CurrentCount := 0;
+    for var T in Threads do
+      if T.IsCurrent then
+        Inc(CurrentCount);
+    Assert.AreEqual(1, CurrentCount, 'exactly one thread must be marked current');
+  finally
+    Session.Terminate;
+    Session.Free;
+  end;
+end;
+
+procedure TDebugSessionTests.Attach_ToRunningTarget_Stops;
+var
+  SI: TStartupInfo;
+  PI: TProcessInformation;
+begin
+  if not HaveDebugPrivilege then begin
+    Assert.Pass('Skipped: SeDebugPrivilege not held; run elevated to exercise attach.');
+    Exit;
+  end;
+
+  // Spawn the target with --attach-pause: it Sleep(5000)s at startup, giving us a
+  // window to attach before it races through MAIN_GCOUNTER.
+  SI := Default(TStartupInfo);
+  SI.cb := SizeOf(SI);
+  var CmdLine := '"' + TargetExe + '" --attach-pause';
+  Assert.IsTrue(CreateProcess(nil, PChar(CmdLine), nil, nil, False,
+    CREATE_NEW_CONSOLE, nil, nil, SI, PI), 'CreateProcess for attach target failed');
+  CloseHandle(PI.hThread);
+
+  var Session := TDebugSession.Create;
+  try
+    var Opts: TAttachOptions;
+    Opts             := Default(TAttachOptions);
+    Opts.ProgramPath := TargetExe;
+    Opts.MapPath     := TargetMap;
+    Opts.RsmPath     := TargetRsm;
+    Opts.SourceRoot  := TargetDir;
+    Session.Attach(PI.dwProcessId, True, Opts);   // killOnDetach = True (own the target)
+
+    var Line := MarkerLine('TestTarget.dpr', 'MAIN_GCOUNTER');
+    Assert.IsTrue(Line > 0, 'MAIN_GCOUNTER marker not found');
+    var Spec: TBpLineSpec;
+    Spec      := Default(TBpLineSpec);
+    Spec.Line := Line;
+    Session.SetBreakpoints('TestTarget.dpr', [Spec]);
+
+    var Deadline := GetTickCount64 + 25000;
+    while (Session.State <> dsStopped) and (not Session.HasExited) and
+          (GetTickCount64 < Deadline) do
+      Session.Pump;
+
+    Assert.AreEqual(Ord(dsStopped), Ord(Session.State), 'attach: did not stop at the breakpoint');
+    var Fn, Src: string; var StopLine: Integer;
+    Session.GetCurrentLocation(Fn, Src, StopLine);
+    Assert.AreEqual(Line, StopLine, 'attach: stopped at the wrong line');
+  finally
+    Session.Terminate;   // killOnDetach=True -> terminates the target
+    Session.Free;
+  end;
+end;
+
+procedure TDebugSessionTests.AttachConfig_ParsesSelectorAndPaths;
+begin
+  // A VS Code launch.json "attach" configuration (JSONC): the config reader must
+  // pull the process selector AND the source paths (this is how attach obtains its
+  // source-path configuration when driven from a project's launch.json).
+  var Content :=
+    '{' + sLineBreak +
+    '  // attach config' + sLineBreak +
+    '  "configurations": [' + sLineBreak +
+    '    {' + sLineBreak +
+    '      "name": "Attach MyApp",' + sLineBreak +
+    '      "type": "delphi-win64",' + sLineBreak +
+    '      "request": "attach",' + sLineBreak +
+    '      "processName": "MyApp.exe",' + sLineBreak +
+    '      "sourceRoot": "${workspaceFolder}",' + sLineBreak +
+    '      "sourceSearchPaths": [ "${workspaceFolder}\\lib", "${env:PUBLIC}" ],' + sLineBreak +
+    '    },' + sLineBreak +
+    '  ],' + sLineBreak +
+    '}';
+  var CfgPath := TPath.Combine(TPath.GetTempPath, 'mcp_test_attach.json');
+  TFile.WriteAllText(CfgPath, Content);
+
+  var Opts: TAttachOptions;
+  var Pid: Cardinal;
+  var PName, Err: string;
+  Assert.IsTrue(LaunchConfig.LoadAttachConfig(CfgPath, '', 'C:\Proj\Root', Opts, Pid, PName, Err),
+    'LoadAttachConfig failed: ' + Err);
+  Assert.AreEqual('MyApp.exe', PName, 'processName not extracted');
+  Assert.AreEqual('C:\Proj\Root', Opts.SourceRoot, '${workspaceFolder} not resolved for sourceRoot');
+  Assert.IsTrue(Length(Opts.ExtraSourcePaths) >= 1, 'sourceSearchPaths not parsed');
+  Assert.AreEqual('C:\Proj\Root\lib', Opts.ExtraSourcePaths[0], '${workspaceFolder} not resolved in a search path');
+end;
+
+procedure TDebugSessionTests.Threads_StoppedThreadIsCurrent;
+begin
+  var Line := MarkerLine(EVAL_SOURCE, EVAL_MARKER);
+  var Session := OpenSessionAtMarker(TargetExe, TargetMap, TargetRsm, TargetDir,
+    EVAL_SOURCE, Line);
+  try
+    var Threads := Session.GetThreads;
+    Assert.IsTrue(Length(Threads) >= 1, 'expected at least one thread');
+
+    var StoppedTid := Session.GetStoppedThreadId;
+    Assert.IsTrue(StoppedTid <> 0, 'GetStoppedThreadId returned 0');
+
+    var FoundCurrent := False;
+    for var T in Threads do
+      if T.IsCurrent then begin
+        FoundCurrent := True;
+        Assert.AreEqual(StoppedTid, T.OsThreadId,
+          'the current thread must be the stopped thread');
+        Assert.IsTrue(T.IsStopped, 'the current thread should be marked stopped');
+      end;
+    Assert.IsTrue(FoundCurrent, 'no thread marked IsCurrent at a stop');
+  finally
+    Session.Terminate;
+    Session.Free;
+  end;
+end;
+
+procedure TDebugSessionTests.SelectFrame_OnOtherThread_ReadsThatThreadsLocals;
+
+  procedure PumpUntilStopped(Session: TDebugSession; TimeoutMs: Cardinal);
+  begin
+    var Deadline := GetTickCount64 + TimeoutMs;
+    while (Session.State <> dsStopped) and (not Session.HasExited) and
+          (GetTickCount64 < Deadline) do
+      Session.Pump;
+  end;
+
+begin
+  var Line := MarkerLine(EVAL_SOURCE, 'STEPISO_MAIN');
+  Assert.IsTrue(Line > 0, 'marker STEPISO_MAIN not found');
+
+  var Session := TDebugSession.Create;
+  try
+    var Opts         := Default(TLaunchOptions);
+    Opts.ExePath     := TargetExe;
+    Opts.MapPath     := TargetMap;
+    Opts.RsmPath     := TargetRsm;
+    Opts.SourceRoot  := TargetDir;
+    Opts.StopAtEntry := False;
+    Opts.Args        := '--run-per-thread-step';
+    Assert.IsTrue(Session.Launch(Opts), 'Launch returned False');
+
+    var LineSpec  := Default(TBpLineSpec);
+    LineSpec.Line := Line;
+    Session.SetBreakpoints(EVAL_SOURCE, [LineSpec]);
+    PumpUntilStopped(Session, 60000);
+    Assert.AreEqual(Ord(dsStopped), Ord(Session.State), 'did not stop at STEPISO_MAIN');
+
+    // The stop is on the MAIN thread; find the spinner thread B.
+    var TidB: Cardinal := 0;
+    for var T in Session.GetThreads do begin
+      if T.Name.Contains('StepIsoSpinB') then begin TidB := T.OsThreadId; Break; end;
+      for var F in Session.GetCallStack(T.OsThreadId) do
+        if F.FunctionName.Contains('StepIsoSpinB') then begin TidB := T.OsThreadId; Break; end;
+      if TidB <> 0 then Break;
+    end;
+    Assert.IsTrue(TidB <> 0, 'spinner StepIsoSpinB not found');
+    Assert.AreNotEqual(Integer(Session.GetStoppedThreadId), Integer(TidB),
+      'the spinner must not be the stopped thread for this test');
+
+    // Walk B's stack (this deliberately does NOT clobber the stopped thread's
+    // cache) and then select B's own top frame, exactly as the client does.
+    var FramesB := Session.GetCallStack(TidB);
+    Assert.IsTrue(Length(FramesB) > 0, 'no frames for the spinner thread');
+    Session.SelectFrame(0, TidB);
+
+    // The locals must be StepIsoSpinB's -- TagB=12345 lives only on THAT stack.
+    var FoundTag := False;
+    for var V in Session.GetLocals do
+      if SameText(V.Name, 'TagB') then begin
+        FoundTag := True;
+        Assert.IsTrue(V.Value.Contains('12345'),
+          'TagB should read 12345 on the spinner''s frame, got: ' + V.Value);
+      end;
+    Assert.IsTrue(FoundTag,
+      'selecting a frame of another thread must read THAT thread''s locals ' +
+      '(TagB); without the thread-qualified frame cache the stopped thread''s ' +
+      'locals were returned under that frame');
+  finally
+    Session.Terminate;
+    Session.Free;
+  end;
+end;
+
+// Per-thread stepping: two worker threads spin on their own counters; the main
+// thread stops at STEPISO_MAIN with both live. Stepping the NON-stopped spinner
+// must advance ONLY it -- the other spinner's counter must not move at all (proof
+// every non-stepped thread was frozen) -- and run control must then target it.
+procedure TDebugSessionTests.PerThreadStep_StepsOnlySelectedThread;
+
+  procedure PumpUntilStopped(Session: TDebugSession; TimeoutMs: Cardinal);
+  begin
+    var Deadline := GetTickCount64 + TimeoutMs;
+    while (Session.State <> dsStopped) and (not Session.HasExited) and
+          (GetTickCount64 < Deadline) do
+      Session.Pump;
+  end;
+
+  function EvalInt(Session: TDebugSession; const Expr: string): Int64;
+  begin
+    var R := Session.Evaluate(Expr);
+    Assert.IsTrue(R.Success, Format('evaluate %s failed: %s', [Expr, R.ErrorText]));
+    var Digits := '';
+    for var Ch in R.Value do
+      if CharInSet(Ch, ['0'..'9']) then
+        Digits := Digits + Ch
+      else if Digits <> '' then
+        Break;
+    Assert.IsTrue(Digits <> '', Format('no integer in %s value: %s', [Expr, R.Value]));
+    Result := StrToInt64(Digits);
+  end;
+
+  // OS tid of the thread whose name or top frame identifies it as SpinName.
+  function FindSpinnerTid(Session: TDebugSession; const SpinName: string): Cardinal;
+  begin
+    Result := 0;
+    for var T in Session.GetThreads do begin
+      if T.Name.Contains(SpinName) then
+        Exit(T.OsThreadId);
+      for var F in Session.GetCallStack(T.OsThreadId) do
+        if F.FunctionName.Contains(SpinName) then
+          Exit(T.OsThreadId);
+    end;
+  end;
+
+begin
+  var Line := MarkerLine(EVAL_SOURCE, 'STEPISO_MAIN');
+  Assert.IsTrue(Line > 0, 'marker STEPISO_MAIN not found');
+
+  var Session := TDebugSession.Create;
+  try
+    var Opts         := Default(TLaunchOptions);
+    Opts.ExePath     := TargetExe;
+    Opts.MapPath     := TargetMap;
+    Opts.RsmPath     := TargetRsm;
+    Opts.SourceRoot  := TargetDir;
+    Opts.StopAtEntry := False;
+    Opts.Args        := '--run-per-thread-step';
+    Assert.IsTrue(Session.Launch(Opts), 'Launch returned False');
+
+    var LineSpec  := Default(TBpLineSpec);
+    LineSpec.Line := Line;
+    Session.SetBreakpoints(EVAL_SOURCE, [LineSpec]);
+    PumpUntilStopped(Session, 60000);
+    Assert.AreEqual(Ord(dsStopped), Ord(Session.State), 'did not stop at STEPISO_MAIN');
+
+    // Identify the two spinner threads, frozen at the stop.
+    var TidB := FindSpinnerTid(Session, 'StepIsoSpinB');
+    var TidC := FindSpinnerTid(Session, 'StepIsoSpinC');
+    Assert.IsTrue(TidB <> 0, 'spinner StepIsoSpinB not found');
+    Assert.IsTrue(TidC <> 0, 'spinner StepIsoSpinC not found');
+    Assert.AreNotEqual(Integer(TidB), Integer(TidC), 'spinners collapsed to one tid');
+
+    // The stopped thread is the main thread -- distinct from the one we step.
+    Assert.AreNotEqual(Integer(Session.GetStoppedThreadId), Integer(TidB),
+      'stopped thread must differ from the stepped thread for this test');
+
+    var B0 := EvalInt(Session, 'GStepIsoB');
+    var C0 := EvalInt(Session, 'GStepIsoC');
+
+    // Step the NON-stopped thread B repeatedly. With per-thread freezing only B
+    // runs during each step, so C's counter must not advance at all.
+    for var I := 1 to 6 do begin
+      Session.StepOver(TidB);
+      PumpUntilStopped(Session, 30000);
+      Assert.AreEqual(Ord(dsStopped), Ord(Session.State),
+        Format('step %d did not land', [I]));
+    end;
+
+    var B1 := EvalInt(Session, 'GStepIsoB');
+    var C1 := EvalInt(Session, 'GStepIsoC');
+
+    Assert.AreEqual(C0, C1,
+      Format('thread C advanced during B''s step (%d -> %d) -- freeze failed', [C0, C1]));
+    Assert.IsTrue(B1 > B0,
+      Format('stepped thread B did not advance (%d -> %d)', [B0, B1]));
+
+    // Run control now targets the stepped thread.
+    Assert.AreEqual(Integer(TidB), Integer(Session.GetStoppedThreadId),
+      'stopped thread should be the stepped thread after a per-thread step');
+  finally
+    Session.Terminate;
+    Session.Free;
+  end;
+end;
+
+// F19 regression. Stepping INTO a method stopped at the function's entry address,
+// which already maps to the method's first source line -- so the naive "we are on
+// a different source line" test was satisfied before a single prologue instruction
+// had run. At that point [rbp+N] still holds the CALLER's frame, so Self and the
+// by-register parameters are read out of stale bytes. A breakpoint on the same
+// statement is unaffected (it binds to the line-table address, past the prologue),
+// which is exactly what made this look like a value-decoding bug rather than a
+// stop-location bug.
+procedure TDebugSessionTests.StepInto_Method_ReportsSpilledSelfAndParams;
+
+  procedure PumpUntilStopped(Session: TDebugSession; TimeoutMs: Cardinal);
+  begin
+    var Deadline := GetTickCount64 + TimeoutMs;
+    while (Session.State <> dsStopped) and (not Session.HasExited) and
+          (GetTickCount64 < Deadline) do
+      Session.Pump;
+  end;
+
+  procedure AssertLocal(const Locals: TArray<TSessionVariable>;
+    const Name, Expected: string);
+  begin
+    var V: TSessionVariable;
+    Assert.IsTrue(FindVar(Locals, Name, V), 'parameter not visible after step-into: ' + Name);
+    Assert.IsTrue(V.Value.Contains(Expected),
+      Format('%s = %s (expected to contain %s) -- read from the caller''s frame?',
+        [Name, V.Value, Expected]));
+  end;
+
+  procedure AssertSelfField(Session: TDebugSession; const Slf: TSessionVariable;
+    const FieldName, Expected: string);
+  begin
+    var F: TSessionVariable;
+    Assert.IsTrue(FindMemberField(Session, Slf, FieldName, F),
+      'Self.' + FieldName + ' not readable after step-into');
+    Assert.IsTrue(F.Value.Contains(Expected),
+      Format('Self.%s = %s (expected to contain %s)', [FieldName, F.Value, Expected]));
+  end;
+
+begin
+  var CallSite := MarkerLine(EVAL_SOURCE, 'STEPIN_CALLSITE');
+  var BodyLine := MarkerLine(EVAL_SOURCE, 'STEPIN_PROBE_BODY');
+  Assert.IsTrue(CallSite > 0, 'marker STEPIN_CALLSITE not found');
+  Assert.IsTrue(BodyLine > 0, 'marker STEPIN_PROBE_BODY not found');
+
+  var Session := OpenSessionAtMarker(TargetExe, TargetMap, TargetRsm, TargetDir,
+    EVAL_SOURCE, CallSite);
+  try
+    Assert.AreEqual(Ord(dsStopped), Ord(Session.State), 'did not stop at STEPIN_CALLSITE');
+
+    Session.StepInto;
+    PumpUntilStopped(Session, 30000);
+    Assert.AreEqual(Ord(dsStopped), Ord(Session.State), 'step-into produced no stop');
+
+    var FnName, SrcFile: string;
+    var StopLine: Integer;
+    Assert.IsTrue(Session.GetCurrentLocation(FnName, SrcFile, StopLine),
+      'no location after step-into');
+    Assert.IsTrue(FnName.Contains('StepIntoProbe'),
+      'step-into did not land in StepIntoProbe, got: ' + FnName);
+
+    var Locals := Session.GetLocals;
+
+    // Self must be a real instance, not a stale stack value that merely carries
+    // the right static type.
+    var Slf: TSessionVariable;
+    Assert.IsTrue(FindVar(Locals, 'Self', Slf), 'Self not visible after step-into');
+    Assert.IsTrue(Slf.Expandable,
+      'Self is not a live instance after step-into (value: ' + Slf.Value + ')');
+    AssertSelfField(Session, Slf, 'FValue', '4242');
+    AssertSelfField(Session, Slf, 'FName',  'stepin-owner');
+
+    // Each by-register parameter must hold the value the caller passed.
+    AssertLocal(Locals, 'AInt', '1234');
+    AssertLocal(Locals, 'AStr', 'probe-str');
+    AssertLocal(Locals, 'ADbl', '2.5');
+
+    // Reported last: the entry address maps to the method's `begin` line, so a
+    // stop before the prologue completes is off by one line as well as wrong in
+    // its data.
+    Assert.AreEqual(BodyLine, StopLine, 'step-into reported the wrong line');
+  finally
+    Session.Terminate;
+    Session.Free;
+  end;
+end;
+
+procedure TDebugSessionTests.Frames_RichFieldsPopulated;
+begin
+  var Line := MarkerLine(EVAL_SOURCE, EVAL_MARKER);
+  var Session := OpenSessionAtMarker(TargetExe, TargetMap, TargetRsm, TargetDir,
+    EVAL_SOURCE, Line);
+  try
+    var Frames := Session.GetCallStack;
+    Assert.IsTrue(Length(Frames) >= 2, 'expected a nested stop (>= 2 frames)');
+    Assert.IsTrue(Frames[0].IP <> 0,          'top frame IP should be non-zero');
+    Assert.IsTrue(Frames[0].FrameRBP <> 0,    'top frame FrameRBP should be non-zero');
+    Assert.IsTrue(Frames[0].FuncEntryVA <> 0, 'top frame FuncEntryVA should be non-zero');
+    // The caller frame must also carry selection data (SelectFrame relies on it).
+    Assert.IsTrue(Frames[1].FrameRBP <> 0,    'caller frame FrameRBP should be non-zero');
+    Assert.IsTrue(Frames[1].FuncEntryVA <> 0, 'caller frame FuncEntryVA should be non-zero');
+  finally
+    Session.Terminate;
+    Session.Free;
+  end;
+end;
+
+procedure TDebugSessionTests.SelectFrame_CallerLocalsDiffer;
+begin
+  // At EVAL_BODY the top frame is RunEvalTests (which has a local `Caption`);
+  // its caller RunAllScenarios has no such local. Selecting frame 1 must re-root
+  // GetLocals on the caller, so `Caption` disappears -- and ClearFrame restores it.
+  var Line := MarkerLine(EVAL_SOURCE, EVAL_MARKER);
+  var Session := OpenSessionAtMarker(TargetExe, TargetMap, TargetRsm, TargetDir,
+    EVAL_SOURCE, Line);
+  try
+    var Frames := Session.GetCallStack;   // populates the frame cache SelectFrame uses
+    Assert.IsTrue(Length(Frames) >= 2, 'need >= 2 frames to select a caller');
+
+    var Dummy: TSessionVariable;
+    Assert.IsTrue(FindVar(Session.GetLocals, 'Caption', Dummy),
+      'top-frame local Caption not visible before frame selection');
+
+    Session.SelectFrame(1);
+    Assert.IsFalse(FindVar(Session.GetLocals, 'Caption', Dummy),
+      'caller frame must not expose the top-frame local Caption');
+
+    Session.ClearFrame;
+    Assert.IsTrue(FindVar(Session.GetLocals, 'Caption', Dummy),
+      'ClearFrame did not restore the stopped top-frame locals');
+  finally
+    Session.Terminate;
+    Session.Free;
+  end;
+end;
+
+procedure TDebugSessionTests.Registers_HaveRipAndRsp;
+begin
+  var Line := MarkerLine(EVAL_SOURCE, EVAL_MARKER);
+  var Session := OpenSessionAtMarker(TargetExe, TargetMap, TargetRsm, TargetDir,
+    EVAL_SOURCE, Line);
+  try
+    var Regs := Session.GetRegisters;
+    Assert.IsTrue(Length(Regs) > 0, 'no registers returned');
+
+    var FoundRip := False;
+    var FoundRsp := False;
+    for var R in Regs do begin
+      if SameText(R.Name, 'RIP') then begin
+        FoundRip := True;
+        Assert.IsTrue(R.Value <> 0, 'RIP is zero');
+      end;
+      if SameText(R.Name, 'RSP') then begin
+        FoundRsp := True;
+        Assert.IsTrue(R.Value <> 0, 'RSP is zero');
+      end;
+    end;
+    Assert.IsTrue(FoundRip, 'RIP not present in the register set');
+    Assert.IsTrue(FoundRsp, 'RSP not present in the register set');
+  finally
+    Session.Terminate;
+    Session.Free;
+  end;
+end;
+
+procedure TDebugSessionTests.ResolveSourcePath_ResolvesCoreUnit;
+begin
+  var Line := MarkerLine(EVAL_SOURCE, EVAL_MARKER);
+  var Session := OpenSessionAtMarker(TargetExe, TargetMap, TargetRsm, TargetDir,
+    EVAL_SOURCE, Line);
+  try
+    var Resolved := Session.ResolveSourcePath(EVAL_SOURCE);
+    Assert.AreEqual(EVAL_SOURCE, ExtractFileName(Resolved),
+      'resolved path is not the requested source unit');
+    Assert.IsTrue(TFile.Exists(Resolved),
+      'ResolveSourcePath did not resolve to an existing file: ' + Resolved);
+  finally
+    Session.Terminate;
+    Session.Free;
+  end;
+end;
+
+procedure TDebugSessionTests.RemoveAllBreakpoints_ClearsPlantedInt3;
+begin
+  // CTOR_BODY (TWidget.Create) is hit more than once per run. Stop on the first
+  // hit, RemoveAllBreakpoints, then continue: if the INT3 is truly cleared the
+  // target runs to exit; if RemoveAllBreakpoints failed to post the clear (the
+  // old bug) the second hit stops again.
+  var Line := MarkerLine(EVAL_SOURCE, 'CTOR_BODY');
+  Assert.IsTrue(Line > 0, 'CTOR_BODY marker not found');
+  var Session := OpenSessionAtMarker(TargetExe, TargetMap, TargetRsm, TargetDir,
+    EVAL_SOURCE, Line);
+  try
+    Assert.AreEqual(Ord(dsStopped), Ord(Session.State), 'should stop on the first CTOR hit');
+
+    Session.RemoveAllBreakpoints;
+    Session.ContinueExecution;
+
+    var Deadline := GetTickCount64 + 30000;
+    while (not Session.HasExited) and (Session.State <> dsStopped) and
+          (GetTickCount64 < Deadline) do
+      Session.Pump;
+
+    Assert.IsTrue(Session.HasExited,
+      'after RemoveAllBreakpoints the target must run to exit (INT3 not cleared)');
+  finally
+    if Session.State = dsStopped then
+      Session.Terminate;
+    Session.Free;
+  end;
+end;
+
+// Frame-scoped rich evaluate (the shared core the DAP evaluate handler now
+// delegates to): a class-instance result is expandable with a live handle whose
+// children expose the widget's members; a scalar result is a plain leaf value.
+procedure TDebugSessionTests.EvaluateForFrame_ClassIsExpandable_ScalarIsLeaf;
+begin
+  var Line := MarkerLine(EVAL_SOURCE, EVAL_MARKER);
+  var Session := OpenSessionAtMarker(TargetExe, TargetMap, TargetRsm, TargetDir,
+    EVAL_SOURCE, Line);
+  try
+    // Class instance: expandable + a non-zero handle; its children carry FValue=42.
+    var R := Session.EvaluateForFrame('W', 0);
+    Assert.IsTrue(R.Success, 'EvaluateForFrame(W) failed: ' + R.ErrorText);
+    Assert.IsTrue(R.Expandable, 'W should be expandable');
+    Assert.IsTrue(R.Handle <> 0, 'W has no expansion handle');
+
+    var WNode := Default(TSessionVariable);
+    WNode.Handle := R.Handle;
+    var FValue: TSessionVariable;
+    Assert.IsTrue(FindMemberField(Session, WNode, 'FValue', FValue),
+      'FValue not reachable from the EvaluateForFrame handle');
+    Assert.IsTrue(FValue.Value.Contains('42'), 'FValue mismatch: ' + FValue.Value);
+
+    // Scalar: plain '42', not expandable.
+    var S := Session.EvaluateForFrame('W.FValue', 0);
+    Assert.IsTrue(S.Success, 'EvaluateForFrame(W.FValue) failed: ' + S.ErrorText);
+    Assert.IsTrue(S.Value.Contains('42'), 'W.FValue mismatch: ' + S.Value);
+    Assert.IsFalse(S.Expandable, 'W.FValue should not be expandable');
+    Assert.AreEqual(UInt64(0), UInt64(S.Handle), 'scalar must not carry a handle');
+  finally
+    Session.Terminate;
+    Session.Free;
+  end;
+end;
+
+// A plain Integer local written through the session: the refreshed NewValue
+// reflects the write, and a follow-up Evaluate confirms it stuck in debuggee
+// memory. EDGE2_BODY exposes `SetLocal: Integer` for exactly this purpose.
+procedure TDebugSessionTests.SetLocalVariable_Integer_ReadsBackChanged;
+begin
+  var Line := MarkerLine('TestTargetEdge2.pas', 'EDGE2_BODY');
+  Assert.IsTrue(Line > 0, 'EDGE2_BODY marker not found');
+  var Session := OpenSessionAtMarker(TargetExe, TargetMap, TargetRsm, TargetDir,
+    'TestTargetEdge2.pas', Line);
+  try
+    var NewValue, NewType: string;
+    Assert.IsTrue(Session.SetLocalVariable('SetLocal', '99', NewValue, NewType),
+      'SetLocalVariable(SetLocal:=99) failed: ' + NewValue);
+    Assert.IsTrue(NewValue.Contains('99'),
+      'refreshed SetLocal should read back 99, got: ' + NewValue);
+    // Independent confirmation the bytes landed in the debuggee.
+    var R := Session.Evaluate('SetLocal');
+    Assert.IsTrue(R.Success and R.Value.Contains('99'),
+      'SetLocal must evaluate to 99 after the write, got: ' + R.Value);
+  finally
+    Session.Terminate;
+    Session.Free;
+  end;
+end;
+
+// An enum local set BY NAME (not ordinal): Mode:TWorkMode starts wmRunning and
+// is rewritten to wmPaused. The refreshed render must show the new member.
+procedure TDebugSessionTests.SetLocalVariable_EnumByName_ReadsBackChanged;
+begin
+  var Line := MarkerLine(EVAL_SOURCE, EVAL_MARKER);
+  var Session := OpenSessionAtMarker(TargetExe, TargetMap, TargetRsm, TargetDir,
+    EVAL_SOURCE, Line);
+  try
+    var NewValue, NewType: string;
+    Assert.IsTrue(Session.SetLocalVariable('Mode', 'wmPaused', NewValue, NewType),
+      'SetLocalVariable(Mode:=wmPaused) failed: ' + NewValue);
+    Assert.IsTrue(NewValue.Contains('wmPaused') or NewValue.Contains('2'),
+      'Mode should read back wmPaused/2, got: ' + NewValue);
+  finally
+    Session.Terminate;
+    Session.Free;
+  end;
+end;
+
+// A managed string local written through the RTL-helper path: Caption starts
+// 'Hello' and is rewritten to 'World'.
+procedure TDebugSessionTests.SetLocalVariable_String_ReadsBackChanged;
+begin
+  var Line := MarkerLine(EVAL_SOURCE, EVAL_MARKER);
+  var Session := OpenSessionAtMarker(TargetExe, TargetMap, TargetRsm, TargetDir,
+    EVAL_SOURCE, Line);
+  try
+    var NewValue, NewType: string;
+    Assert.IsTrue(Session.SetLocalVariable('Caption', 'World', NewValue, NewType),
+      'SetLocalVariable(Caption:=World) failed: ' + NewValue);
+    Assert.IsTrue(NewValue.Contains('World'),
+      'Caption should read back World, got: ' + NewValue);
+  finally
+    Session.Terminate;
+    Session.Free;
+  end;
+end;
+
+// Field write via a class expansion handle: W is a TWidget; its FValue:Integer
+// and FName:string are writable backing fields. Set both, then re-expand W to
+// confirm the change is visible through the normal read path too.
+procedure TDebugSessionTests.SetFieldVariable_ViaClassHandle_WritesField;
+begin
+  var Line := MarkerLine(EVAL_SOURCE, EVAL_MARKER);
+  var Session := OpenSessionAtMarker(TargetExe, TargetMap, TargetRsm, TargetDir,
+    EVAL_SOURCE, Line);
+  try
+    var W: TSessionVariable;
+    Assert.IsTrue(FindVar(Session.GetLocals, 'W', W), 'local W not found');
+    Assert.IsTrue(W.Handle <> 0, 'W has no expansion handle');
+
+    var NewValue, NewType: string;
+    Assert.IsTrue(Session.SetFieldVariable(W.Handle, 'FValue', '123', NewValue, NewType),
+      'SetFieldVariable(FValue:=123) failed: ' + NewValue);
+    Assert.IsTrue(NewValue.Contains('123'),
+      'FValue should read back 123, got: ' + NewValue);
+
+    Assert.IsTrue(Session.SetFieldVariable(W.Handle, 'FName', 'renamed', NewValue, NewType),
+      'SetFieldVariable(FName:=renamed) failed: ' + NewValue);
+    Assert.IsTrue(NewValue.Contains('renamed'),
+      'FName should read back renamed, got: ' + NewValue);
+
+    // Re-expand W through the normal read path: the field really changed.
+    var FValue: TSessionVariable;
+    Assert.IsTrue(FindMemberField(Session, W, 'FValue', FValue), 'FValue field not found');
+    Assert.IsTrue(FValue.Value.Contains('123'),
+      'FValue re-read after write should be 123, got: ' + FValue.Value);
+  finally
+    Session.Terminate;
+    Session.Free;
+  end;
+end;
+
+// The "no debug info in any format" diagnostic: launching a module with no
+// embedded TD32 / .map / .rsm / .jdbg must emit a clear one-time message instead
+// of silently producing no lines/locals. NoDebugExe.exe is built without any debug
+// switches specifically for this. Asserted through DrainDebuggerOutput -- the same
+// buffer the MCP frontend surfaces via get_debugger_output -- so this also proves
+// the loader console is routed to the session output when no frontend overrides it.
+procedure TDebugSessionTests.MainModule_NoDebugInfo_ReportsDiagnostic;
+
+  function DrainedContains(Session: TDebugSession; const Sub: string): Boolean;
+  begin
+    Result := False;
+    for var Line in Session.DrainDebuggerOutput do
+      if Line.Contains(Sub) then
+        Exit(True);
+  end;
+
+begin
+  if not TFile.Exists(NoDebugExe) then
+    Assert.Fail('NoDebugExe.exe not found at ' + NoDebugExe +
+      ' -- run build_target.bat first');
+  var Session := TDebugSession.Create;
+  try
+    var Opts: TLaunchOptions;
+    Opts             := Default(TLaunchOptions);
+    Opts.ExePath     := NoDebugExe;
+    Opts.StopAtEntry := True;   // hold at entry; the body never runs
+    Assert.IsTrue(Session.Launch(Opts), 'Launch returned False');
+
+    var Deadline := GetTickCount64 + 30000;
+    while (Session.State <> dsStopped) and (not Session.HasExited) and
+          (GetTickCount64 < Deadline) do
+      Session.Pump;
+
+    Assert.IsTrue(DrainedContains(Session, 'No debug info for'),
+      'expected the no-debug-info diagnostic in the debugger output buffer');
+  finally
+    Session.Terminate;
+    Session.Free;
+  end;
+end;
+
+// F23 regression: a frame whose address the providers cannot name must still
+// carry its owning module and an explicit symbol state. NoDebugExe.exe is built
+// without any debug switches, so every frame in it is unnameable -- previously
+// it produced an empty function name and nothing else, which is also what an
+// unmapped address and a still-indexing module produced.
+procedure TDebugSessionTests.Frames_NoDebugInfoModule_ReportModuleAndSymbolState;
+begin
+  if not TFile.Exists(NoDebugExe) then
+    Assert.Fail('NoDebugExe.exe not found at ' + NoDebugExe +
+      ' -- run build_target.bat first');
+  var Session := TDebugSession.Create;
+  try
+    var Opts: TLaunchOptions;
+    Opts             := Default(TLaunchOptions);
+    Opts.ExePath     := NoDebugExe;
+    Opts.StopAtEntry := True;   // hold at the entry point, inside NoDebugExe itself
+    Assert.IsTrue(Session.Launch(Opts), 'Launch returned False');
+
+    var Deadline := GetTickCount64 + 30000;
+    while (Session.State <> dsStopped) and (not Session.HasExited) and
+          (GetTickCount64 < Deadline) do
+      Session.Pump;
+    Assert.AreEqual(Ord(dsStopped), Ord(Session.State), 'expected a stop at the entry point');
+
+    var Frames := Session.GetCallStack;
+    Assert.IsTrue(Length(Frames) > 0, 'expected at least one frame');
+    var Top := Frames[0];
+    Assert.AreEqual('', Top.FunctionName,
+      'a module with no debug info cannot name its frames');
+    Assert.AreEqual('nodebugexe.exe', LowerCase(Top.ModuleName),
+      'the owning module must be reported even when the frame cannot be named');
+    Assert.AreEqual(Ord(saNoSymbols), Ord(Top.Symbols),
+      'the frame must be marked as lacking symbols, not left indistinguishable ' +
+      'from an unknown address');
+  finally
+    Session.Terminate;
+    Session.Free;
+  end;
+end;
+
+// Loader integration for external `.tds` (dcc64 -VT): TdsSample.exe has no embedded
+// `.debug`, so LoadMainModule must fall back to LoadFromTdsFile and register a
+// provider. Asserted via the debugger-output notice.
+procedure TDebugSessionTests.Tds_MainModule_LoadsExternalTds;
+
+  function DrainedContains(Session: TDebugSession; const Sub: string): Boolean;
+  begin
+    Result := False;
+    for var Line in Session.DrainDebuggerOutput do
+      if Line.Contains(Sub) then
+        Exit(True);
+  end;
+
+begin
+  if not TFile.Exists(TdsSampleExe) then
+    Assert.Fail('TdsSample.exe not found -- run build_target.bat first');
+  var Session := TDebugSession.Create;
+  try
+    var Opts: TLaunchOptions;
+    Opts             := Default(TLaunchOptions);
+    Opts.ExePath     := TdsSampleExe;
+    Opts.StopAtEntry := True;
+    Assert.IsTrue(Session.Launch(Opts), 'Launch returned False');
+    var Deadline := GetTickCount64 + 30000;
+    while (Session.State <> dsStopped) and (not Session.HasExited) and
+          (GetTickCount64 < Deadline) do
+      Session.Pump;
+    Assert.IsTrue(DrainedContains(Session, 'TDS (external'),
+      'the external .tds must be loaded as the main provider');
+  finally
+    Session.Terminate;
+    Session.Free;
+  end;
+end;
+
+// Staleness gate: a `.tds` older than the binary it describes must be IGNORED
+// (it belongs to a previous build). Runs on an isolated copy so the real fixture
+// is untouched; with the stale `.tds` skipped and no other debug info present, the
+// "no debug info" diagnostic fires.
+procedure TDebugSessionTests.Tds_StaleTds_Ignored;
+begin
+  if not TFile.Exists(TdsSampleExe) then
+    Assert.Fail('TdsSample.exe not found -- run build_target.bat first');
+  var Dir := TPath.Combine(TPath.GetTempPath, 'tdsstale_' + IntToStr(GetCurrentProcessId));
+  TDirectory.CreateDirectory(Dir);
+  var Exe := TPath.Combine(Dir, 'TdsSample.exe');
+  var Tds := TPath.Combine(Dir, 'TdsSample.tds');
+  try
+    TFile.Copy(TdsSampleExe, Exe, True);
+    TFile.Copy(ChangeFileExt(TdsSampleExe, '.tds'), Tds, True);
+    // Backdate the .tds well before the exe (past the SymbolFileIsStale grace).
+    TFile.SetLastWriteTime(Tds, TFile.GetLastWriteTime(Exe) - 1);  // 1 day earlier
+
+    var Session := TDebugSession.Create;
+    try
+      var Opts: TLaunchOptions;
+      Opts             := Default(TLaunchOptions);
+      Opts.ExePath     := Exe;
+      Opts.StopAtEntry := True;
+      Assert.IsTrue(Session.Launch(Opts), 'Launch returned False');
+      var Deadline := GetTickCount64 + 30000;
+      while (Session.State <> dsStopped) and (not Session.HasExited) and
+            (GetTickCount64 < Deadline) do
+        Session.Pump;
+      var Drained := Session.DrainDebuggerOutput;
+      var SawStale := False;
+      for var Line in Drained do
+        if Line.Contains('TDS is STALE') then
+          SawStale := True;
+      Assert.IsTrue(SawStale, 'a .tds older than the exe must be reported STALE and ignored');
+    finally
+      Session.Terminate;
+      Session.Free;
+    end;
+  finally
+    TDirectory.Delete(Dir, True);
+  end;
+end;
+
+procedure TDebugSessionTests.Prefetch_NoBreakpoints_LoadsRuntimePackageSymbols;
+// THE "when" REGRESSION TEST.
+//
+// With no breakpoints set, TDebugSession.HandleDllLoaded's eager gate never fires,
+// so before the background prefetcher NOTHING was parsed for any runtime-loaded
+// module: the first stop that touched one paid its whole TD32 parse synchronously,
+// and until that finished its frames had no names. Here the target runtime-loads
+// two packages and no breakpoint exists anywhere; both packages' symbols must
+// still become available.
+//
+// DrainPrefetch is called explicitly because publication is deliberately confined
+// to moments when the debuggee is not executing (see TDebugSession.Pump). In a
+// real session that moment is the stop; here, where there is no breakpoint to stop
+// at, the test provides it.
+begin
+  // The prefetcher ships DISABLED (see SetSymbolPrefetchEnabled); this test is
+  // what exercises it, so it turns it on for its own scope.
+  var WasEnabled := SymbolPrefetchEnabled;
+  SetSymbolPrefetchEnabled(True);
+  var Session := TDebugSession.Create;
+  try
+    var Opts         := Default(TLaunchOptions);
+    Opts.ExePath     := TargetExe;
+    Opts.MapPath     := TargetMap;
+    Opts.RsmPath     := TargetRsm;
+    Opts.SourceRoot  := TargetDir;
+    Opts.StopAtEntry := True;
+    Opts.Args        := '--load-package2';
+    Assert.IsTrue(Session.Launch(Opts), 'Launch returned False');
+
+    var Deadline := GetTickCount64 + 60000;
+    var Pkg1 := saUnknownModule;
+    var Pkg2 := saUnknownModule;
+
+    // Entry stop first, then run on. No breakpoints are ever set.
+    while (Session.State <> dsStopped) and (not Session.HasExited) and
+          (GetTickCount64 < Deadline) do
+      Session.Pump;
+    Assert.AreEqual(Ord(dsStopped), Ord(Session.State), 'did not stop at entry');
+    Assert.AreEqual(Ord(saUnknownModule), Ord(Session.ModuleSymbolState('testpackage.bpl')),
+      'the package must not be loaded yet at the entry stop');
+    Session.ContinueExecution;
+
+    // The debuggee is short-lived, so keep draining for a grace period after it
+    // exits: the point under test is that the prefetcher parses and publishes a
+    // module nobody set a breakpoint in, not how fast it does so. The module
+    // records survive process exit (no UNLOAD_DLL burst), so publication still
+    // finds them.
+    var Grace: UInt64 := 0;
+    while GetTickCount64 < Deadline do begin
+      if not Session.HasExited then
+        Session.Pump
+      else if Grace = 0 then
+        Grace := GetTickCount64 + 10000;
+      Session.Loader.DrainPrefetch;
+      if Pkg1 = saUnknownModule then begin
+        var S1 := Session.ModuleSymbolState('testpackage.bpl');
+        if S1 in [saLoaded, saIndexing] then Pkg1 := S1;
+      end;
+      if Pkg2 = saUnknownModule then begin
+        var S2 := Session.ModuleSymbolState('testpackage2.bpl');
+        if S2 in [saLoaded, saIndexing] then Pkg2 := S2;
+      end;
+      if (Pkg1 <> saUnknownModule) and (Pkg2 <> saUnknownModule) then
+        Break;
+      if (Grace <> 0) and (GetTickCount64 > Grace) then
+        Break;
+      if Session.HasExited then
+        Sleep(5);
+    end;
+
+    Assert.IsTrue(Pkg1 in [saLoaded, saIndexing],
+      'TestPackage.bpl symbols were never loaded although the package was mapped ' +
+      '(prefetch did not run: with no breakpoint set nothing else loads a module)');
+    var Dump := '';
+    for var M in Session.Loader.Modules do
+      if M.PrefetchRequested then
+        Dump := Dump + Format(' %s(avail=%d,inflight=%s)',
+          [M.Name, Ord(M.SymbolAvailability), BoolToStr(M.PrefetchInFlight, True)]);
+    Assert.IsTrue(Pkg2 in [saLoaded, saIndexing],
+      'TestPackage2.bpl symbols were never loaded although the package was mapped.' +
+      ' prefetched modules:' + Dump);
+  finally
+    if not Session.HasExited then Session.Terminate;
+    Session.Free;
+    SetSymbolPrefetchEnabled(WasEnabled);
+  end;
+end;
+
+procedure TDebugSessionTests.Prefetch_ModuleLoadedSynchronously_IsNotParsedAgain;
+// SINGLE-LOAD-PATH REGRESSION TEST.
+//
+// A breakpoint inside a package makes HandleDllLoaded load that module
+// synchronously at its LOAD_DLL event. The prefetcher must then leave it alone --
+// the previous background loader did not, so the worker and the dispatch thread
+// parsed the same file at the same time and one of the two readers was thrown
+// away after both had been built. The observable consequence of a double
+// registration is duplicated providers, i.e. every local reported twice, so that
+// is what is asserted here alongside the claim state.
+begin
+  var Line := MarkerLineInFile(PackageSrc, 'PKG_BP');
+  Assert.IsTrue(Line > 0, 'marker PKG_BP not found in TestPkgUnit.pas');
+
+  var Session := TDebugSession.Create;
+  try
+    var Opts         := Default(TLaunchOptions);
+    Opts.ExePath     := TargetExe;
+    Opts.MapPath     := TargetMap;
+    Opts.RsmPath     := TargetRsm;
+    Opts.SourceRoot  := TargetDir;
+    Opts.StopAtEntry := True;
+    Opts.Args        := '--load-package';
+    Assert.IsTrue(Session.Launch(Opts), 'Launch returned False');
+
+    var Deadline := GetTickCount64 + 60000;
+    while (Session.State <> dsStopped) and (not Session.HasExited) and
+          (GetTickCount64 < Deadline) do
+      Session.Pump;
+    Assert.AreEqual(Ord(dsStopped), Ord(Session.State), 'did not stop at entry');
+
+    var LineSpec  := Default(TBpLineSpec);
+    LineSpec.Line := Line;
+    Session.SetBreakpoints('TestPkgUnit.pas', [LineSpec]);
+    Session.ContinueExecution;
+    while (Session.State <> dsStopped) and (not Session.HasExited) and
+          (GetTickCount64 < Deadline) do
+      Session.Pump;
+    Assert.AreEqual(Ord(dsStopped), Ord(Session.State),
+      'did not stop at PKG_BP inside the runtime-loaded package');
+
+    // The synchronous gate owns this module, so no claim may be outstanding.
+    for var M in Session.Loader.Modules do
+      if M.Name = 'testpackage.bpl' then
+        Assert.IsFalse(M.PrefetchInFlight,
+          'the prefetcher claimed a module the dispatch thread had already loaded');
+
+    var Seen := TStringList.Create;
+    try
+      Seen.Sorted := True;
+      for var V in Session.GetLocals do begin
+        Assert.AreEqual(-1, Seen.IndexOf(V.Name),
+          'local "' + V.Name + '" reported twice -- the module registered its ' +
+          'providers more than once (double load)');
+        Seen.Add(V.Name);
+      end;
+      Assert.IsTrue(Seen.Count > 0, 'no locals at all in the BPL frame');
+    finally
+      Seen.Free;
+    end;
+  finally
+    if Session.State = dsStopped then Session.Terminate;
+    Session.Free;
+  end;
+end;
+
+initialization
+  TDUnitX.RegisterTestFixture(TDebugSessionTests);
+
+end.

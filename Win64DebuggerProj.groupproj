@@ -1,0 +1,66 @@
+<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+    <PropertyGroup>
+        <ProjectGuid>{395CF165-2971-4E28-9129-E287079DCFD4}</ProjectGuid>
+    </PropertyGroup>
+    <ItemGroup>
+        <Projects Include="Debugme.dproj">
+            <Dependencies/>
+        </Projects>
+        <Projects Include="VisualStudioCodeDelphiDebugger\VisualStudioCodeDelphiDebugger.dproj">
+            <Dependencies/>
+        </Projects>
+        <Projects Include="DevTools\RsmAnalyzer.dproj">
+            <Dependencies/>
+        </Projects>
+        <Projects Include="DevTools\ScanRsmMethods.dproj">
+            <Dependencies/>
+        </Projects>
+        <Projects Include="DevTools\DumpFunc.dproj">
+            <Dependencies/>
+        </Projects>
+        <Projects Include="DevTools\TestRsmParser.dproj">
+            <Dependencies/>
+        </Projects>
+        <Projects Include="DevTools\TestNested.dproj">
+            <Dependencies/>
+        </Projects>
+        <Projects Include="DevTools\HexDump.dproj">
+            <Dependencies/>
+        </Projects>
+    </ItemGroup>
+    <ProjectExtensions>
+        <Borland.Personality>Default.Personality.12</Borland.Personality>
+        <Borland.ProjectType/>
+        <BorlandProject>
+            <Default.Personality/>
+        </BorlandProject>
+    </ProjectExtensions>
+    <Target Name="Debugme">
+        <MSBuild Projects="Debugme.dproj"/>
+    </Target>
+    <Target Name="Debugme:Clean">
+        <MSBuild Projects="Debugme.dproj" Targets="Clean"/>
+    </Target>
+    <Target Name="Debugme:Make">
+        <MSBuild Projects="Debugme.dproj" Targets="Make"/>
+    </Target>
+    <Target Name="VisualStudioCodeDelphiDebugger">
+        <MSBuild Projects="VisualStudioCodeDelphiDebugger\VisualStudioCodeDelphiDebugger.dproj"/>
+    </Target>
+    <Target Name="VisualStudioCodeDelphiDebugger:Clean">
+        <MSBuild Projects="VisualStudioCodeDelphiDebugger\VisualStudioCodeDelphiDebugger.dproj" Targets="Clean"/>
+    </Target>
+    <Target Name="VisualStudioCodeDelphiDebugger:Make">
+        <MSBuild Projects="VisualStudioCodeDelphiDebugger\VisualStudioCodeDelphiDebugger.dproj" Targets="Make"/>
+    </Target>
+    <Target Name="Build">
+        <CallTarget Targets="Debugme;VisualStudioCodeDelphiDebugger"/>
+    </Target>
+    <Target Name="Clean">
+        <CallTarget Targets="Debugme:Clean;VisualStudioCodeDelphiDebugger:Clean"/>
+    </Target>
+    <Target Name="Make">
+        <CallTarget Targets="Debugme:Make;VisualStudioCodeDelphiDebugger:Make"/>
+    </Target>
+    <Import Project="$(BDS)\Bin\CodeGear.Group.Targets" Condition="Exists('$(BDS)\Bin\CodeGear.Group.Targets')"/>
+</Project>

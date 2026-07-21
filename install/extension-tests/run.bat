@@ -1,0 +1,40 @@
+@echo off
+REM Runs the VS Code extension's unit tests. Requires Node (any recent version);
+REM there is no build step, no bundler and no node_modules.
+cd /d %~dp0
+setlocal
+set FAILED=0
+
+echo === syntax check ===
+for %%F in (..\local.delphi-win64-debug\*.js ..\local.delphi-win64-debug\media\*.js *.js) do (
+  node --check "%%F" || set FAILED=1
+)
+echo.
+echo === manifest ===
+node test-manifest.js || set FAILED=1
+echo.
+echo === jsonc / launch.json editing ===
+node test-jsonc-edit.js || set FAILED=1
+echo.
+echo === shared (machine-wide) rules file ===
+node test-global-rules.js || set FAILED=1
+echo.
+echo === delphiProgress status bar ===
+node test-progress.js || set FAILED=1
+echo.
+echo === exception-rules webview ===
+node test-webview.js || set FAILED=1
+echo.
+echo === create a rule for this exception ===
+node test-exception-rule.js || set FAILED=1
+echo.
+echo === attach process picker ===
+node test-process-picker.js || set FAILED=1
+echo.
+
+if "%FAILED%"=="1" (
+  echo EXTENSION TESTS FAILED
+  exit /b 1
+)
+echo All extension tests passed.
+exit /b 0

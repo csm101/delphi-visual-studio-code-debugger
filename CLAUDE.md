@@ -1,0 +1,389 @@
+This file provides guidance to Claude Code when working in this repository.
+
+# Project purpose
+
+Build a real Delphi Win64 debugger for VS Code using DAP + Windows Debug API.
+
+Primary goal is progress on the debugger itself.
+The sample target app exists only for testing.
+It may be extended whenever needed to validate new debugger features.
+
+# Operating mode
+
+Use minimum tokens.
+
+Be concise.
+No filler.
+No praise.
+No motivational tone.
+No repeating the request.
+No long plans unless asked.
+No unnecessary explanations.
+
+If code requested: output code first.
+If uncertain: say uncertain.
+If idea is bad: say so directly.
+
+Prefer practical solutions over academic ones.
+
+# Critical token rules
+
+Assume context window and usage budget are scarce.
+
+Avoid re-reading many files unless necessary.
+Avoid broad repo scans.
+Inspect only files relevant to the current task.
+Do not restate known project context.
+
+Prefer direct edits over discussion.
+
+When multiple approaches exist:
+choose the smallest production-relevant step.
+Do not implement shortcuts that only work for Debugme.
+Every solution must be compatible with real Delphi Win64 applications unless explicitly marked as prototype-only.
+Prefer incremental progress, but never hardcode assumptions from the test project.
+
+# Prototype vs production
+
+Debugme is only a test target.
+
+Never design features around Debugme-specific assumptions.
+
+Allowed:
+- using Debugme to reproduce and validate behavior
+- extending Debugme to cover newly implemented debugger features
+- implementing narrow incremental pieces
+
+Not allowed:
+- hardcoded source paths
+- hardcoded module names
+- hardcoded symbol names
+- assumptions about one unit, one source file, one thread, one stack frame, or one module
+- solutions that work only because Debugme is trivial
+
+If a temporary shortcut is unavoidable:
+- mark it clearly with TODO PROTOTYPE
+- document what must change for real projects
+- update TASK_RESUME.md with the limitation
+
+# Session continuity rules
+
+Maintain these files:
+
+- PROJECT_STATE.md   (high-level permanent state)
+- TASK_RESUME.md     (exact current task state)
+
+Update TASK_RESUME.md continuously enough that work can resume after an interruption in the middle of a long step.
+
+Do not wait for a full step to finish.
+
+Update TASK_RESUME.md whenever restart cost is starting to rise, especially after:
+
+- a non-trivial discovery
+- a code edit
+- a test/build result
+- a local change of hypothesis
+- a switch of file, symbol, or investigation path
+- any sign that token budget may run out before the current step is complete
+
+If usage seems near limit:
+stop coding and update TASK_RESUME.md first.
+
+TASK_RESUME.md must contain:
+
+- current task
+- current substep
+- current files / symbols in focus
+- last completed action
+- next action if interrupted right now
+- files involved
+- what works
+- what is failing
+- last test result
+- exact next step
+- traps / hypotheses
+
+When a long step is still in progress, TASK_RESUME.md must describe the current cursor inside that step, not just the high-level milestone.
+
+The cursor should be brief but specific enough that a new session can continue without re-reading broad context.
+
+PROJECT_STATE.md must contain:
+
+- architecture status
+- implemented features
+- open milestones
+- important technical discoveries
+- stable build/run commands
+
+PROJECT_STATE.md must not duplicate transient task state that belongs in TASK_RESUME.md.
+
+# Living specifications
+
+The following documents at the repository root are living specifications.
+They describe state of knowledge about the project's formats and
+architecture and are maintained continuously alongside the code:
+
+- `RSM_FORMAT_NOTES.md` — overall structure of the Delphi `.rsm` file.
+- `RSM_RECORD_TYPES.md` — catalog of tags / record kinds with confirmed /
+  inferred / conjectured status.
+- `RSM_FIELD_OFFSETS.md` — byte-level layout of each record.
+- `DAP_DEBUGGER_ARCHITECTURE.md` — modules, threading model, breakpoint /
+  evaluate / setVariable flows, capability list.
+- `KNOWN_UNKNOWNS.md` — open questions that block or condition the work.
+
+Rules:
+
+- Before investigating anything related to `.rsm`, the adapter
+  architecture, or open questions: read the relevant document first. Do
+  not re-derive what is already written.
+- When you discover or confirm a fact: update the relevant document in
+  the same change set as the code or experiment that produced the fact.
+- When an entry in `KNOWN_UNKNOWNS.md` is resolved: move the answer into
+  whichever document now owns it (`RSM_*`, `DAP_DEBUGGER_*`,
+  `PROJECT_STATE.md`) and remove the entry from `KNOWN_UNKNOWNS.md`. Do
+  not leave resolved questions there for historical reference.
+- If a document disagrees with the code: the code wins. Correct the
+  document, do not bend the code to match the document.
+
+# Resume behavior
+
+When starting a new session:
+
+1. Read PROJECT_STATE.md
+2. Read TASK_RESUME.md
+3. Read the living specifications relevant to the next step:
+   - work on symbols / locals / globals / types → the `RSM_*` documents
+   - work on the adapter, debug loop, DAP requests, stepping → `DAP_DEBUGGER_ARCHITECTURE.md`
+   - in every session, regardless of focus → `KNOWN_UNKNOWNS.md`
+4. Inspect only referenced files first
+5. Resume exactly from next step
+
+Do not restart analysis from zero unless required.
+
+# Code generation rules
+
+Respect existing code style.
+
+Use 2-space indentation.
+
+For Delphi:
+
+- never use with
+- prefer explicit code
+- minimum supported Delphi version is Delphi Athens for both this project and debug targets
+- keep compatibility with Delphi Athens toolchain and generated binaries
+- prefer modern Delphi libraries and language features when they improve clarity or robustness
+- prefer current RTL facilities over old compatibility-era helpers
+- examples: System.SysUtils, System.Classes, System.IOUtils, System.Generics.Collections, System.Generics.Defaults, System.Math, System.DateUtils, System.JSON where appropriate
+- use generics where appropriate
+- use modern string helpers and extension-style helpers where available
+- use anonymous methods, records with methods/operators, class helpers, scoped enums, inline variables, type inference, and other modern Delphi features when they make the code clearer
+- avoid outdated pre-Unicode or legacy-era coding patterns
+- avoid unnecessary abstractions
+- prefer boring robust code
+
+For Windows debugger code:
+
+- correctness over cleverness
+- log failures clearly
+- keep state transitions understandable
+- avoid hidden magic
+
+# Documentation rules
+
+For generated files, comments, README, docs, commit messages:
+
+Use normal professional technical English.
+Do not use caveman style.
+Be concise but polished.
+
+# Response format after edits
+
+After coding work, respond with only:
+
+- files changed
+- what changed
+- build/test executed
+- result
+- next step
+
+# DevTools
+
+Diagnostic tools are in `DevTools\` (versioned, in project group).
+Build all:
+
+```powershell
+cmd /c "C:\Athens\GitHub\Win64Debugger\DevTools\build_all.bat" 2>&1
+```
+
+Run tools (after building):
+
+```powershell
+# Inspect RSM binary structure
+DevTools\Win64\Debug\RsmAnalyzer.exe     Win64\Debug\Debugme.rsm
+
+# Find a method/class name in RSM and show surrounding bytes
+DevTools\Win64\Debug\ScanRsmMethods.exe  Win64\Debug\Debugme.rsm TWidget.Create
+
+# Dump function bytes from PE at hex RVA
+DevTools\Win64\Debug\DumpFunc.exe        Win64\Debug\Debugme.exe 2CCA0 64
+
+# Smoke-test adapter RSM parser against any .rsm file
+DevTools\Win64\Debug\TestRsmParser.exe   Win64\Debug\Debugme.rsm
+
+# Test nested-proc detection in MAP reader
+DevTools\Win64\Debug\TestNested.exe      Win64\Debug\Debugme.map
+
+# Prebuild .idx symbol-index sidecars for a directory (offline warm-up),
+# or -verify that a parser change kept the sidecar format byte-identical
+DevTools\Win64\Debug\PrebuildIdx.exe     <dir> [-r] [-j N] [-verify] [-force]
+```
+
+See `DevTools\README.md` for full documentation.
+
+`build_all.bat` uses `cd /d %~dp0` internally — call it as:
+```powershell
+cmd /c "C:\Athens\GitHub\Win64Debugger\DevTools\build_all.bat" 2>&1
+```
+This pattern is pre-approved in `.claude/settings.json` (committed).
+
+# Shell command patterns
+
+A hook blocks any Bash or PowerShell command that starts with `cd <path> &&` or uses `cd` compounded with a path operation. **Never** generate that pattern.
+
+Instead, put `cd /d %~dp0` **inside** a `.bat` file and call the bat with its full path:
+
+```powershell
+# WRONG — triggers hook, requires manual approval every time
+PowerShell(cmd /c "cd /d C:\some\path && rsvars.bat && dcc64 Foo.dpr")
+
+# RIGHT — cd is inside the bat; call with full path; pre-approved by .claude/settings.json
+cmd /c "C:\Athens\GitHub\Win64Debugger\DevTools\build_all.bat" 2>&1
+```
+
+For one-off scripts: put them in the repo, add them to `.claude/settings.json` as a wildcard.
+Do NOT add individual command strings to `.claude/settings.local.json` — that file is
+machine-specific and would need to be recreated on every new computer.
+
+# Integration tests
+
+The automated test suite lives in `DebuggerTests\`. It launches the DAP adapter, exercises breakpoints/locals/step, and asserts correctness.
+
+Run from any working directory — scripts use `cd /d %~dp0` internally:
+
+```powershell
+# Build everything + run tests
+cmd /c "C:\Athens\GitHub\Win64Debugger\DebuggerTests\build_and_run.bat" 2>&1
+
+# Build only the test target (TestTarget.exe)
+cmd /c "C:\Athens\GitHub\Win64Debugger\DebuggerTests\build_target.bat" 2>&1
+
+# Build only the test runner (RunTests.exe)
+cmd /c "C:\Athens\GitHub\Win64Debugger\DebuggerTests\build_runner.bat" 2>&1
+
+# Run already-built tests
+cmd /c "C:\Athens\GitHub\Win64Debugger\DebuggerTests\run_tests.bat" 2>&1
+```
+
+These patterns are pre-approved in `.claude/settings.json` (committed).
+Run the full suite after every change to the adapter or RSM parser.
+
+# Build
+
+Use the existing build scripts when possible.
+
+Build everything:
+
+```bat
+call build_debug.bat
+```
+
+This initializes the Delphi compiler environment, compiles `Debugme.exe` (emitting its `.map` and `.rsm`), and compiles `VisualStudioCodeDelphiDebugger.exe`.
+
+Build adapter only:
+
+```powershell
+cmd /c "C:\Athens\GitHub\Win64Debugger\build_dap.bat" 2>&1
+```
+
+**Critical:** `build_dap.bat` does `pushd VisualStudioCodeDelphiDebugger` before compiling, so DCUs and EXE land in
+`VisualStudioCodeDelphiDebugger\Win64\Debug\`. Running `dcc64` directly from the repo root puts output in `Win64\Debug\`
+(wrong location — VS Code extension expects `VisualStudioCodeDelphiDebugger\Win64\Debug\VisualStudioCodeDelphiDebugger.exe`).
+Never invoke `dcc64 VisualStudioCodeDelphiDebugger\VisualStudioCodeDelphiDebugger.dpr` from the repo root without explicit `-E` and `-NU` overrides.
+
+Manual debug target build:
+
+```bat
+call rsvars.bat
+dcc64 Debugme.dpr
+```
+
+Debug target outputs:
+
+```text
+Win64\Debug\Debugme.exe
+Win64\Debug\Debugme.rsm
+Win64\Debug\Debugme.map
+```
+
+Compiler flags for debug targets:
+
+| Flag | Purpose |
+|---|---|
+| `-$O-` | Disable optimization |
+| `-V -VN -VR` | Generate debug info / MAP / RSM |
+| `-DDEBUG` | Define DEBUG conditional |
+| `-E.\Win64\Debug` | Output directory |
+
+`Debugme.cfg` contains direct command-line compiler options, one per line, without leading `-`.
+`Debugme.delphilsp.json` contains LSP-driven compiler options in `dccOptions`.
+In this workspace it is already wired through `delphiLsp.settingsFile` in `Win64DebuggerProj.code-workspace`.
+
+# VS Code setup
+
+Open `Win64DebuggerProj.code-workspace`, not the folder directly.
+
+Relevant files:
+
+- `Win64DebuggerProj.code-workspace`
+- `Debugme.delphilsp.json`
+- `.vscode/launch.json`
+- `install\local.delphi-win64-debug\package.json` (the single canonical extension manifest)
+
+Required extension:
+
+- `embarcaderotechnologies.delphilsp`
+
+Local debugger extension folder:
+
+```text
+%USERPROFILE%\.vscode\extensions\local.delphi-win64-debug\
+```
+
+Install (build first, then one of):
+
+- `install\Install.exe` — interactive: builds if needed, packages the extension
+  into a `.vsix` and installs it into every detected VS Code-family editor
+  (VS Code, Insiders, Cursor, Windsurf, VSCodium, Trae) via that editor's
+  `<cli> --install-extension` (required on 1.96+; a plain folder copy is no
+  longer loaded). Per editor it falls back to a folder copy only when the editor
+  is present but its CLI is not on PATH. When no editor is detected it prints
+  download links and the manual install command instead of blocking on a prompt
+  (the `FamilyEditors` table in `Install.dpr` is the editor list).
+- `install-dev.bat` — development: builds, then points the extension `program`
+  directly at the build output (no copy; fastest iteration).
+
+`install\local.delphi-win64-debug\package.json` is the single source of truth
+for the extension manifest. It registers the `delphi-win64` debug type, declares
+the full launch-config schema, and references the adapter via the relative path
+`./VisualStudioCodeDelphiDebugger.exe`. It has no `main`, so no `extension.js`
+is needed (a pure debug-type contribution that launches the external adapter).
+
+# Symbol/debug-info notes
+
+Delphi `.map` files provide line numbers and symbol addresses, but no full type/variable metadata.
+The `.rsm` file is Embarcadero's Win64 remote debug symbol map.
+It is not a GDB/WinDbg symbol format.
+Real variable inspection will require parsing richer debug/type information or deriving enough runtime metadata from other sources.
+
+Do not assume MAP-only debugging is enough for variables/watches.

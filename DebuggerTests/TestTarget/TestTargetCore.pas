@@ -1,0 +1,1583 @@
+unit TestTargetCore;
+// Subject code for the Win64Debugger integration tests, relocated out of
+// TestTarget.dpr's program body so the SAME code compiles BOTH into the
+// monolithic TestTarget.exe AND into TestSubject.bpl (BPL scenario parity).
+//
+// Breakpoint markers: lines containing {BP:<NAME>} are valid BP locations.
+//
+// Each former Writeln call site is a virtual method call on a global sink
+// (TSink.Use). The virtual dispatch is opaque to the compiler, so the passed
+// values are materialized and kept live, while producing no output / no window.
+//
+// RunAllScenarios is the single driver entry (exported) that the BPL host calls
+// after LoadPackage; the monolithic TestTarget.dpr calls it directly and then
+// runs its own exe-only program-main-block (RSM-only inline-var) scenario.
+
+interface
+
+uses
+  System.SysUtils, System.Variants, System.Classes, Winapi.Windows,
+  TestTargetCollider, TestTargetTypes, TestTargetEdge, TestTargetEdge2,
+  TestTargetFlow, TestTargetReal, TestTargetConflictSink, TestTargetConflict1,
+  TestTargetConflict2, TestTargetUsesA, TestTargetUsesB, TestTargetUsesC,
+  TestTargetUsesHost;
+
+type
+  TSink = class
+    procedure Use(const Args: array of const); overload; virtual;
+    procedure Use(const V: Variant);          overload; virtual;
+  end;
+
+  TPoint3D = record
+    X, Y, Z: Double;
+  end;
+
+  TSmallRec = record
+    A, B: SmallInt;   // 4 bytes total — fits in RAX
+  end;
+
+  // Replica of the Debugme.dpr TFoo: a class whose ALL members (fields AND
+  // constructor) live under a single `private` section, with no `public` /
+  // `published` at all.
+  TBareClass = class
+  private
+    Name:   string;
+    Value:  Integer;
+    Active: Boolean;
+    Pt:     TPoint3D;
+    constructor Create(const AName: string; AValue: Integer);
+  end;
+
+  TWorkMode  = (wmIdle, wmRunning, wmPaused, wmError);
+  TWorkModes = set of TWorkMode;
+
+  // $M- class wide enough that its trailing fields live BEYOND byte offset
+  // 127, exercising the RSM $2C field-offset decode for offsets that do not
+  // fit the single-byte `value*2` form.
+  TWideFields = class
+  private
+    FHead:  Integer;                 // offset 8
+    FPad:   array[0..29] of Int64;   // offset 16..255
+    FTailA: Integer;                 // offset 256
+    FTailB: Integer;                 // offset 260
+  public
+    constructor Create;
+  end;
+
+  TConQuestoTiFrego = type Integer;
+
+  // Deliberately NOT {$M+} and NOT a TPersistent descendant — its private/public
+  // members are NOT visible via the published TPropInfo table. The debugger must
+  // still see them (debug info, NOT RTTI, is the source of truth).
+  TStuff = class
+  private
+    FCount:     Integer;
+    FLabel:     string;
+    FMode:      TWorkMode;       // enum field — module-local odd typeId
+    FPoint:     TPoint3D;        // record field — module-local odd typeId
+    function    GetMyLabel:  string;
+    function    GetTriple:   TArray<Double>;
+    property    PrivCount:   Integer read FCount;
+    property    PrivLabel:   string  read GetMyLabel;
+  public
+    constructor Create(ACount: Integer; const ALabel: string);
+    property    PubCount:    Integer         read FCount;
+    property    PubMode:     TWorkMode       read FMode;     // enum prop
+    property    PubPoint:    TPoint3D        read FPoint;    // record prop
+    property    PubTriple:   TArray<Double>  read GetTriple; // dyn-array prop
+    function    PubBump:     Integer;
+    function    BumpCount:   Integer;
+    function    RaiseBoom:   Integer;
+  end;
+
+  // Indexed (array) property sampler.
+  TIndexedBag = class
+  private
+    FData: array[0..2] of Integer;
+    function GetItem(Index: Integer): Integer;
+    function GetCaption: string;
+  public
+    constructor Create;
+    property Item[Index: Integer]: Integer read GetItem;   // indexed array property
+    property Caption: string read GetCaption;              // scalar getter property
+  end;
+
+  // Event-handler (method-pointer) type.
+  TWidgetNotify = procedure(Sender: TObject) of object;
+
+  {$M+}
+  TWidget = class
+  private
+    FName:   string;
+    FValue:  Integer;
+    FActive: Boolean;
+    FPt:     TPoint3D;
+    FChild:  TWidget;  // deliberately never assigned -> stays nil
+    FBigHandle: UInt64;  // a plain UInt64 must be a leaf (never expandable)
+    FOnNotify: TWidgetNotify;  // backing field for the OnNotify event handler
+    function DoCalcScore:   Integer;     // deliberately NOT named GetScore
+    function DoCalcInt64:   Int64;
+    function DoCalcCard:    Cardinal;
+    function DoCalcBool:    Boolean;
+    function DoCalcEnum:    TWorkMode;
+    function DoCalcSet:     TWorkModes;
+    function DoCalcChar:    WideChar;
+    function DoCalcClass:   TObject;
+    function DoCalcNative:  NativeUInt;
+    function DoCalcSingle:  Single;
+    function DoCalcDouble:  Double;
+    function DoCalcDate:    TDateTime;
+    function DoCalcCurr:    Currency;
+    function DoCalcUStr:    UnicodeString;
+    function DoCalcAStr:    AnsiString;
+    function DoCalcWStr:    WideString;
+    function DoCalcUTF8:    UTF8String;
+    function DoCalcRBS:     RawByteString;
+    function DoCalcDynArr:  TArray<Integer>;
+    function DoCalcVariant: Variant;
+    function DoCalcSmallRec: TSmallRec;
+    function DoCalcBigRec:   TPoint3D;
+    function DoCalcBoom:    Integer;
+    function DoCalcAvBoom:  Integer;
+  public
+    constructor Create(const AName: string; AValue: Integer);
+    procedure Compute(var AResult: Integer);
+    function Mult(A, B: Integer): Integer;
+    function Sum5(A, B, C, D, E: Integer): Integer;
+    function Scale(X: Double): Double;
+    function Greet(const Who: string): string;
+    // Step-into prologue fixture (F19): a METHOD whose Self and three
+    // by-register parameters (RCX/RDX/R8/XMM3) only become readable once the
+    // prologue has spilled them into their home slots.
+    function StepIntoProbe(AInt: Integer; const AStr: string; ADbl: Double): Integer;
+    function GetSelf: TWidget;
+    function Items(Idx: Integer): Integer;
+    function GetSlot(Idx: Integer): Integer;
+    property Slot[Idx: Integer]: Integer read GetSlot; default;
+  published
+    property Name:     string        read FName;
+    property OnNotify: TWidgetNotify  read FOnNotify write FOnNotify;
+    property Child:    TWidget        read FChild;  // field-backed, nil
+    property Value:    Integer       read FValue;
+    property Active:   Boolean       read FActive;
+    property Score:    Integer       read DoCalcScore;
+    property AsInt64:  Int64         read DoCalcInt64;
+    property AsCard:   Cardinal      read DoCalcCard;
+    property AsBool:   Boolean       read DoCalcBool;
+    property AsEnum:   TWorkMode     read DoCalcEnum;
+    property AsSet:    TWorkModes    read DoCalcSet;
+    property AsChar:   WideChar      read DoCalcChar;
+    property AsClass:  TObject       read DoCalcClass;
+    property AsPtr:    NativeUInt    read DoCalcNative;
+    property AsSingle: Single        read DoCalcSingle;
+    property AsDouble: Double        read DoCalcDouble;
+    property AsDate:   TDateTime     read DoCalcDate;
+    property AsCurr:   Currency      read DoCalcCurr;
+    property AsUStr:   UnicodeString read DoCalcUStr;
+    property AsAStr:   AnsiString    read DoCalcAStr;
+    property AsWStr:   WideString    read DoCalcWStr;
+    property AsUTF8:   UTF8String    read DoCalcUTF8;
+    property AsRBS:    RawByteString read DoCalcRBS;
+    property AsDyn:    TArray<Integer> read DoCalcDynArr;
+    property AsVar:    Variant       read DoCalcVariant;
+    property AsSmall:  TSmallRec     read DoCalcSmallRec;
+    property AsBig:    TPoint3D      read DoCalcBigRec;
+    property AsBoom:   Integer       read DoCalcBoom;
+    property AsAvBoom: Integer       read DoCalcAvBoom;
+  end;
+  {$M-}
+
+  // Field layout designed to DETECT byte clobbering around 1-byte enum/set fields.
+  TEnumPack = class
+  private
+    FBefore: Integer;     // offset 8
+    FGap:    TWorkMode;   // offset 12 (1 byte)
+    FMark:   Byte;        // offset 13 -- clobber detector for FGap
+    FAfter:  Integer;     // offset 16 -- clobber detector for FGap
+    FModes:  TWorkModes;  // offset 20 (set of 4 -> 1 byte)
+    FMark2:  Byte;        // offset 21 -- clobber detector for FModes
+    FAfter2: Integer;     // offset 24 -- clobber detector for FModes
+  public
+    constructor Create;
+  end;
+
+  // Class method with a nested local procedure (TreeMenu repro).
+  TMenuCacheBase = class
+  public
+    BaseTag: Integer;
+    constructor Create;
+    function GetBaseScore: Integer;
+    property BaseScore: Integer read GetBaseScore;
+  end;
+
+  TMenuCache = class(TMenuCacheBase)
+  private
+    FLevels: array of Integer;
+    function GetLevel(Idx: Integer): Integer;
+  public
+    Items: TArray<string>;
+    constructor Create;
+    property Level[Idx: Integer]: Integer read GetLevel;
+  end;
+
+  TMenuRepro = class
+  public
+    FOwnerName: string;
+    constructor Create(const AOwnerName: string);
+    procedure LoadMenu;
+  end;
+
+  TSetThreadDescription = function(hThread: THandle; lpThreadDescription: PWideChar): HRESULT; stdcall;
+
+var
+  GSink: TSink;
+  // Holds a TPkgWidget created inside TestPackage.bpl; kept past UnloadPackage so
+  // the debugger can inspect an instance whose class lives in an unloaded module.
+  GPkgObj: TObject;
+  // Uses-graph collision twin: same name as TestPackage's GUsesGraph (333).
+  GUsesGraph: Integer;
+  GCounter: Integer;
+  // Per-thread stepping isolation fixture (see RunPerThreadStepFixture): two
+  // worker threads spin incrementing their OWN counter until GStepIsoStop is set.
+  // While the debugger single-steps ONE of them the other must stay frozen, so
+  // its counter must not move across the step.
+  GStepIsoStop: Boolean;
+  GStepIsoB:    Int64;
+  GStepIsoC:    Int64;
+
+procedure ComputeNested(var X: Integer);
+procedure RunAllScenarios;
+
+implementation
+
+procedure TSink.Use(const Args: array of const);
+begin
+  // intentionally empty: only here to anchor breakpoints and to force the
+  // compiler to keep the arguments live across the call site.
+end;
+
+procedure TSink.Use(const V: Variant);
+begin
+  // see above; dedicated Variant overload mirrors Writeln(V) keep-alive semantics.
+end;
+
+constructor TWidget.Create(const AName: string; AValue: Integer);
+begin
+  inherited Create;
+  FName   := AName;   // {BP:CTOR_BODY}
+  FValue  := AValue;
+  FActive := True;
+  FPt.X   := 1.5;
+  FPt.Y   := 2.5;
+  FPt.Z   := 3.5;
+  FBigHandle := $00ABCDEF12345678;  // UInt64 leaf: must show inline, never expand
+end;
+
+procedure TWidget.Compute(var AResult: Integer);
+var
+  Factor: Integer;
+  FName:  Integer;   // deliberately shadows the field of the same name on TWidget
+begin
+  Factor  := FValue * 2;
+  FName   := 7;
+  AResult := Factor + 10;  // {BP:COMPUTE_BODY}
+end;
+
+function TWidget.DoCalcScore: Integer;     begin Result := FValue * 2;       end; // 84
+function TWidget.DoCalcInt64: Int64;       begin Result := Int64($1122334455667788); end;
+function TWidget.DoCalcCard:  Cardinal;    begin Result := Cardinal($DEADBEEF); end;
+function TWidget.DoCalcBool:  Boolean;     begin Result := True;             end;
+function TWidget.DoCalcEnum:  TWorkMode;   begin Result := wmPaused;         end;
+function TWidget.DoCalcSet:   TWorkModes;  begin Result := [wmRunning, wmPaused]; end;
+function TWidget.DoCalcChar:  WideChar;    begin Result := 'Z';              end;
+function TWidget.DoCalcClass: TObject;     begin Result := Self;             end;
+function TWidget.DoCalcNative: NativeUInt; begin Result := NativeUInt(FValue); end;
+function TWidget.DoCalcSingle: Single;     begin Result := 1.5;              end;
+function TWidget.DoCalcDouble: Double;     begin Result := 3.25;             end;
+function TWidget.DoCalcDate:   TDateTime;  begin Result := 45000.5;          end;
+function TWidget.DoCalcCurr:   Currency;   begin Result := 19.95;            end;
+function TWidget.DoCalcUStr:   UnicodeString; begin Result := 'u_' + FName;  end;
+function TWidget.DoCalcAStr:   AnsiString;    begin Result := AnsiString('a_' + FName); end;
+function TWidget.DoCalcWStr:   WideString;    begin Result := WideString('w_' + FName); end;
+function TWidget.DoCalcUTF8:   UTF8String;    begin Result := UTF8String('8_' + FName); end;
+function TWidget.DoCalcRBS:    RawByteString; begin Result := RawByteString('r_' + FName); end;
+function TWidget.DoCalcDynArr: TArray<Integer>; begin Result := [10, 20, 30]; end;
+function TWidget.DoCalcVariant: Variant;       begin Result := FValue + 100; end; // 142
+function TWidget.DoCalcSmallRec: TSmallRec;
+begin
+  Result.A := 7;
+  Result.B := 11;
+end;
+function TWidget.DoCalcBigRec: TPoint3D;
+begin
+  Result.X := 1.5;
+  Result.Y := 2.5;
+  Result.Z := 3.5;
+end;
+
+// Callee of the step-into prologue fixture. The first statement is the FIRST
+// source line of the method, so a step-into that reports at the function's entry
+// address (before the prologue spilled RCX/RDX/R8/XMM3) still claims to be here
+// while Self and every parameter still hold the CALLER's frame bytes.
+function TWidget.StepIntoProbe(AInt: Integer; const AStr: string; ADbl: Double): Integer;
+begin
+  Result := AInt + FValue;                  // {BP:STEPIN_PROBE_BODY}
+  GSink.Use([AStr, ADbl, Result]);
+end;
+
+function TWidget.Mult(A, B: Integer): Integer;
+begin
+  Result := A * B + FValue;     // (3*5)+42 = 57
+end;
+
+function TWidget.Sum5(A, B, C, D, E: Integer): Integer;
+begin
+  Result := A * 10000 + B * 1000 + C * 100 + D * 10 + E;
+end;
+
+function TWidget.DoCalcBoom: Integer;
+begin
+  raise Exception.Create('boom-from-getter');
+  Result := 0;  // unreachable; keeps the function-result contract explicit
+end;
+
+function TWidget.DoCalcAvBoom: Integer;
+begin
+  PInteger(nil)^ := 1;  // deliberate access violation
+  Result := 0;
+end;
+
+function TWidget.Scale(X: Double): Double;
+begin
+  Result := X * 2 + 0.5;        // 1.5*2 + 0.5 = 3.5
+end;
+
+function TWidget.Greet(const Who: string): string;
+begin
+  Result := 'hi_' + Who + '!_' + FName;  // 'hi_world!_hello'
+end;
+
+function TWidget.GetSelf: TWidget;
+begin
+  Result := Self;
+end;
+
+function TWidget.Items(Idx: Integer): Integer;
+begin
+  Result := FValue + Idx;  // 42 + 3 = 45
+end;
+
+function TWidget.GetSlot(Idx: Integer): Integer;
+begin
+  Result := FValue * 10 + Idx;  // 42*10 + 3 = 423
+end;
+
+constructor TBareClass.Create(const AName: string; AValue: Integer);
+begin
+  inherited Create;
+  Name   := AName;
+  Value  := AValue;
+  Active := True;
+  Pt.X   := 1.5;
+  Pt.Y   := 2.5;
+  Pt.Z   := 3.5;
+end;
+
+constructor TStuff.Create(ACount: Integer; const ALabel: string);
+begin
+  inherited Create;
+  FCount   := ACount;
+  FLabel   := ALabel;
+  FMode    := wmPaused;
+  FPoint.X := 1.5;
+  FPoint.Y := 2.5;
+  FPoint.Z := 3.5;
+  Inc(FCount, 0);   // {BP:STUFF_CTOR_END}
+  if Length(PrivLabel) < 0 then ;
+  if Length(PubTriple) < 0 then ;
+end;
+
+function TStuff.GetMyLabel: string;
+begin
+  Result := '<' + FLabel + '>';
+end;
+
+function TStuff.GetTriple: TArray<Double>;
+begin
+  Result := [10.5, 20.5, 30.5];
+end;
+
+function TStuff.PubBump: Integer;
+begin
+  Result := FCount + 1;  // {BP:STUFF_PUBBUMP}
+end;
+
+function TStuff.BumpCount: Integer;
+begin
+  Inc(FCount);
+  Result := FCount;
+end;
+
+function TStuff.RaiseBoom: Integer;
+begin
+  raise Exception.Create('boom-from-watch');
+  Result := 0;  // unreachable; keeps the function-result contract explicit
+end;
+
+procedure ComputeNested(var X: Integer);
+var
+  D1: TDateTime;
+
+  procedure Inner;
+  var
+    S: string;
+  begin
+    S := 'inner_' + IntToStr(X);  // {BP:INNER_BODY}
+    GSink.Use([S]);
+  end;
+
+begin
+  var D := Now;
+  D1 := D;
+  Inc(X);    // {BP:NESTED_INC}
+  Inner;     // {BP:NESTED_CALL_INNER}
+end;
+
+procedure RunAliasLocalTest;
+var
+  Aliased: TConQuestoTiFrego;
+begin
+  Aliased := 42;
+  GSink.Use([Aliased]); // {BP:ALIAS_LOCAL}
+end;
+
+// Anonymous-method closure capture. Clo captures CapInt + CapStr, so the compiler
+// moves them into a heap $ActRec object that Clo (a refcounted interface) points
+// to. In its OWN dedicated proc: capturing relocates the enclosing frame, which
+// would break a shared proc's other local tests. Exercises closure inspection:
+//  * CLOSURE_EXPAND: Clo is a live closure value -- expanding it must reveal the
+//    captured fields (CapInt=42, CapStr='captured') from debug info (the $ActRec
+//    class members), NOT runtime RTTI ($ActRec has no runtime field table).
+//  * CLOSURE_BODY: stopped INSIDE the anon method body (future increment B).
+procedure RunClosureSampler;
+type
+  TCloProc = reference to procedure(X: Integer);
+var
+  CapInt: Integer;
+  CapStr: string;
+  Clo:    TCloProc;
+begin
+  CapInt := 42;
+  CapStr := 'captured';
+  Clo := procedure(X: Integer)
+         begin
+           GSink.Use([X + CapInt, CapStr]);   // {BP:CLOSURE_BODY}
+         end;
+  GSink.Use([CapInt, CapStr]);   // {BP:CLOSURE_EXPAND} -- Clo is a live closure here
+  Clo(7);
+end;
+
+// Anon-method PARAMETER coverage. Each closure captures Cap (so it is a real
+// $ActRec with a recoverable Self), takes differently-typed parameters, and is
+// invoked so its body runs. Stopping inside each body, the debugger must surface
+// the anon method's own declared params (arg1..argN) from the method signature +
+// Win64 ABI home slots. Own dedicated proc: a capturing closure relocates its host
+// proc's frame, so this must not share with locals-under-test procs. Bodies are
+// multi-line so each {BP} binds to the body line, not the construction site.
+// Marker-free helper class for the object-parameter case. NOT TWidget: TWidget's
+// constructor carries the CTOR_BODY marker, so creating one here would steal a
+// ctor breakpoint from Test_ClassCtor_ParamsVisible.
+type
+  TParamObj = class
+  public
+    Name: string;
+    constructor Create(const AName: string);
+  end;
+
+constructor TParamObj.Create(const AName: string);
+begin
+  Name := AName;
+end;
+
+procedure RunClosureParamSampler;
+type
+  TTwo  = reference to procedure(A: Integer; B: Integer);
+  TStr  = reference to procedure(S: string);
+  TDbl  = reference to procedure(D: Double);
+  TWide = reference to procedure(Q: Int64);
+  TBool = reference to procedure(F: Boolean);
+  TObj  = reference to procedure(W: TParamObj);
+  TMix  = reference to procedure(N: Integer; S: string; D: Double; F: Boolean);
+  TSix  = reference to procedure(A, B, C, D, E, F: Integer);
+var
+  Cap:  Integer;
+  Wg:   TParamObj;
+  Two:  TTwo;
+  Str:  TStr;
+  Dbl:  TDbl;
+  Wide: TWide;
+  Bl:   TBool;
+  Ob:   TObj;
+  Mix:  TMix;
+  Six:  TSix;
+begin
+  Cap := 100;
+  Two := procedure(A: Integer; B: Integer)
+         begin
+           GSink.Use([A, B, Cap]);   // {BP:CLOP_TWO}
+         end;
+  Str := procedure(S: string)
+         begin
+           GSink.Use([S, Cap]);      // {BP:CLOP_STR}
+         end;
+  Dbl := procedure(D: Double)
+         begin
+           GSink.Use([D, Cap]);      // {BP:CLOP_DBL}
+         end;
+  Wide := procedure(Q: Int64)
+          begin
+            GSink.Use([Q, Cap]);     // {BP:CLOP_WIDE}
+          end;
+  Bl := procedure(F: Boolean)
+        begin
+          GSink.Use([F, Cap]);       // {BP:CLOP_BOOL}
+        end;
+  Ob := procedure(W: TParamObj)
+        begin
+          GSink.Use([W.Name, Cap]);  // {BP:CLOP_OBJ}
+        end;
+  Mix := procedure(N: Integer; S: string; D: Double; F: Boolean)
+         begin
+           GSink.Use([N, S, D, F, Cap]);   // {BP:CLOP_MIX}
+         end;
+  Six := procedure(A, B, C, D, E, F: Integer)
+         begin
+           GSink.Use([A, B, C, D, E, F, Cap]);   // {BP:CLOP_SIX}
+         end;
+  Wg := TParamObj.Create('wparam');
+  Two(11, 22);
+  Str('hello-param');
+  Dbl(3.5);
+  Wide(9876543210);
+  Bl(True);
+  Ob(Wg);
+  Mix(7, 'mixed', 2.5, True);
+  Six(1, 2, 3, 4, 5, 6);
+  Wg.Free;
+end;
+
+// Two-level nested procedure (Inner in Middle in Outer) -- mirrors SampleApp's
+// FilterTranslations.ParseLiteralDate (nested in ParseDate in GetSQL). The
+// innermost body reads its OWN local AND locals from both enclosing scopes, so it
+// exercises nested-proc local resolution at depth 2 (F11).
+procedure RunDeepNestedTest;
+var
+  OuterVal: Integer;
+
+  procedure MiddleLevel;
+  var
+    MiddleStr: string;
+
+    procedure InnerLevel;
+    var
+      InnerVal: Integer;
+    begin
+      InnerVal := OuterVal + Length(MiddleStr);
+      GSink.Use([InnerVal, OuterVal, Length(MiddleStr)]);  // {BP:DEEP_NESTED_BODY}
+    end;
+
+  begin
+    MiddleStr := 'middle';
+    InnerLevel;
+  end;
+
+begin
+  OuterVal := 314;
+  MiddleLevel;
+end;
+
+// Same 2-level nesting, but the innermost body RAISES, so the F11 exception-stop
+// hypothesis can be tested: does get_locals resolve a nested proc's locals when the
+// stop is a first-chance exception (as in SampleApp's ParseLiteralDate) rather than a
+// breakpoint? Gated by a switch so it does not perturb other scenarios.
+procedure RunDeepNestedRaise;
+var
+  RnOuter: Integer;
+
+  procedure RnMiddle;
+  var
+    RnMid: string;
+
+    procedure RnInner;
+    var
+      RnInnerVal: Integer;
+    begin
+      RnInnerVal := RnOuter + Length(RnMid);
+      GSink.Use([RnInnerVal]);
+      raise Exception.Create('deep nested raise');  // {BP:DEEP_NESTED_RAISE}
+    end;
+
+  begin
+    RnMid := 'middle';
+    RnInner;
+  end;
+
+begin
+  RnOuter := 271;
+  try
+    RnMiddle;
+  except
+    // Swallowed: the debugger sees the FIRST-CHANCE raise inside InnerLevel; the
+    // app itself handles it so the process continues normally afterwards.
+  end;
+end;
+
+procedure RunEvalTests;
+var
+  Caption: string;
+  Scores:  TArray<Integer>;
+  Mode:    TWorkMode;
+  Modes:   TWorkModes;
+  W:       TWidget;   // portable object receivers for the eval/property/method tests:
+  S:       TStuff;    // present as NAMED-proc locals so TD32 resolves them WITHOUT .rsm
+begin
+  Caption := 'Hello';
+  Scores  := TArray<Integer>.Create(10, 20, 30);
+  Mode    := wmRunning;
+  Modes   := [wmRunning, wmPaused];
+  W := TWidget.Create('hello', 42);   // same canonical values the .dpr main block used
+  S := TStuff.Create(7, 'tag');
+  GSink.Use([Caption, W.Name, S.PubCount]);  // {BP:EVAL_BODY} -- W and S are live here
+  S.Free;
+  W.Free;
+end;
+
+constructor TIndexedBag.Create;
+begin
+  inherited Create;
+  FData[0] := 10;
+  FData[1] := 20;
+  FData[2] := 30;
+end;
+
+constructor TWideFields.Create;
+begin
+  inherited Create;
+  FHead  := 11;
+  FTailA := 4242;   // at offset 256 -- decoder must not truncate the offset
+  FTailB := 8484;   // at offset 260
+end;
+
+procedure RunWideFieldsProbe;
+var
+  WF: TWideFields;
+begin
+  WF := TWideFields.Create;
+  try
+    GSink.Use([WF.FHead, WF.FTailA, WF.FTailB]);  // {BP:WIDE_FIELDS_BODY}
+  finally
+    WF.Free;
+  end;
+end;
+
+procedure RunDynArrayDisplayProbe;
+var
+  EmptyDyn: TArray<Integer>;
+  FullDyn:  TArray<Integer>;
+begin
+  FullDyn := [10, 20, 30];
+  GSink.Use([Length(EmptyDyn), Length(FullDyn)]);  // {BP:DYNARR_DISPLAY_BODY}
+end;
+
+procedure RunGotoProbe;
+var
+  A, B: Integer;
+begin
+  A := 1;            // runs before the stop
+  A := 2;            // {BP:GOTO_START} stop here (A=1); this line is skipped
+  B := A;            // {BP:GOTO_LAND}  jump target -- A must still be 1
+  GSink.Use([A, B]);
+end;
+
+constructor TEnumPack.Create;
+begin
+  inherited Create;
+  FBefore := 111;
+  FGap    := wmRunning;
+  FMark   := 77;
+  FAfter  := 999;
+  FModes  := [wmIdle];
+  FMark2  := 88;
+  FAfter2 := 777;
+end;
+
+procedure RunEnumPackProbe;
+var
+  EP: TEnumPack;
+begin
+  EP := TEnumPack.Create;
+  try
+    GSink.Use([EP.FBefore, Ord(EP.FGap), EP.FMark, EP.FAfter]); // {BP:ENUM_PACK_BODY}
+    GSink.Use([EP.FMark, EP.FAfter, Byte(EP.FModes), EP.FMark2, EP.FAfter2]);
+  finally
+    EP.Free;
+  end;
+end;
+
+procedure RunBigVarArrayProbe;
+var
+  Big: Variant;
+begin
+  Big := VarArrayCreate([0, 1499], varInteger);
+  Big[0]    := 5;
+  Big[1499] := 6;
+  GSink.Use(Big);  // {BP:BIG_VARARRAY_BODY}
+end;
+
+procedure RunOdsProbe;
+begin
+  OutputDebugStringA('ods-ansi-clean');
+  GSink.Use(['ods-done']);
+end;
+
+function TIndexedBag.GetItem(Index: Integer): Integer;
+begin
+  Result := FData[Index];
+end;
+
+function TIndexedBag.GetCaption: string;
+begin
+  Result := 'bag';
+end;
+
+procedure RunStepManagedClear;
+var
+  Arr: TArray<string>;
+  N:   Integer;
+begin
+  Arr := ['x', 'y', 'z'];   // {BP:STEP_MGCLEAR_START}
+  Arr := nil;               // managed clear -- step over THIS line
+  N   := 7;                 // {BP:STEP_MGCLEAR_END}
+  GSink.Use([N, Length(Arr)]);
+end;
+
+procedure NoArgStepA; begin GSink.Use(['sa']); end;
+procedure NoArgStepB; begin GSink.Use(['sb']); end;
+procedure NoArgStepC; begin GSink.Use(['sc']); end;
+
+procedure RunStepConsecutiveCalls;
+begin
+  NoArgStepA;            // {BP:STEP_CALLS_1}
+  NoArgStepB;            // {BP:STEP_CALLS_2}  step-over from _1 must land here
+  NoArgStepC;            // {BP:STEP_CALLS_3}
+  GSink.Use(['calls']);  // {BP:STEP_CALLS_END}
+end;
+
+// Step-into prologue fixture (F19). Stopping at STEPIN_CALLSITE and stepping
+// into TWidget.StepIntoProbe must report Self and the three by-register
+// parameters with their PASSED values, not the caller's leftover frame bytes.
+// The owner's field values are deliberately unlike any other fixture's, so a
+// stale read cannot coincidentally look right.
+procedure RunStepIntoPrologue;
+var
+  W: TWidget;
+  R: Integer;
+begin
+  W := TWidget.Create('stepin-owner', 4242);
+  try
+    R := W.StepIntoProbe(1234, 'probe-str', 2.5);   // {BP:STEPIN_CALLSITE}
+    GSink.Use([R]);
+  finally
+    W.Free;
+  end;
+end;
+
+procedure RunIndexedPropTest;
+var
+  Bag: TIndexedBag;
+begin
+  Bag := TIndexedBag.Create;
+  try
+    GSink.Use([Bag.Item[1], Bag.Caption]);   // {BP:INDEXED_PROP_BODY}
+  finally
+    Bag.Free;
+  end;
+end;
+
+procedure RunDateTimeAliasTest;
+var
+  DOnly: TDate;
+  TOnly: TTime;
+  Sng:   Single;
+begin
+  DOnly := Now;
+  TOnly := Now;
+  Sng   := 1.5;
+  GSink.Use([DOnly, TOnly, Sng]);  // {BP:DATE_ALIAS_BODY}
+end;
+
+procedure DupNameBlocks;
+begin
+  begin
+    var dup := 111;
+    GSink.Use([dup]);                 // {BP:DUP_BLOCK_INT}
+  end;
+  begin
+    var dup := 'shadow-str';
+    GSink.Use([Length(dup)]);         // {BP:DUP_BLOCK_STR}
+  end;
+end;
+
+function MakeNullVariant: Variant;
+begin
+  Result := Null;   // a Variant returned via the hidden var-out slot
+end;
+
+procedure InlineVariantScenario;
+  procedure InnerNested;
+  begin
+    var vnest := MakeNullVariant;
+    GSink.Use([vnest]);               // {BP:NESTED_VARIANT}
+  end;
+begin
+  var vn: Variant := Null;
+  var ve: Variant := Unassigned;
+  var vi: Variant := 1234;
+  var vr := MakeNullVariant;
+  InnerNested;
+  GSink.Use([vn, ve, vi, vr]);        // {BP:INLINE_VARIANT}
+end;
+
+procedure RunRealScenario;
+var
+  W: TWidget;
+  S: TStuff;
+  SL: TStringList;
+begin
+  DupNameBlocks;
+  InlineVariantScenario;
+  RunConflict1;
+  RunConflict2;
+  W := TWidget.Create('real', 99);
+  S := TStuff.Create(5, 'rtag');
+  SL := TStringList.Create;
+  try
+    SL.Add('HELLO_VAROUT');
+    var InlineLocal := 31337;
+    GSink.Use([W.Value, S.PubCount, SL.Count, InlineLocal]);  // {BP:REAL_SCENARIO}
+  finally
+    SL.Free;
+    S.Free;
+    W.Free;
+  end;
+end;
+
+procedure RunVariantTests;
+var
+  V:     Variant;
+  Arr1D: Variant;
+  Mat:   Variant;
+begin
+  V     := 99;
+  Arr1D := VarArrayCreate([0, 4], varInteger);
+  Arr1D[0] := 10;  Arr1D[1] := 20;  Arr1D[2] := 30;  Arr1D[3] := 40;  Arr1D[4] := 50;
+  Mat   := VarArrayCreate([1, 3, 1, 4], varDouble);
+  Mat[1, 1] := 1.5;
+  Mat[2, 3] := 7.25;
+  GSink.Use(V);  // {BP:VARIANT_BODY}
+end;
+
+procedure RunNestedVariantTest;
+
+  procedure DoNested;
+  var
+    NestedDate:    Variant;
+    NestedStr:     Variant;
+    NestedNull:    Variant;
+    NestedEmpty:   Variant;
+    NestedInt:     Variant;
+    NestedBool:    Variant;
+    NestedDouble:  Variant;
+    NestedI64:     Variant;
+    NestedArr1D:   Variant;
+    NestedMat2D:   Variant;
+  begin
+    NestedDate   := EncodeDate(2025, 12, 31);
+    NestedStr    := 'hello-variant';
+    NestedNull   := Null;     // explicit varNull
+    NestedEmpty  := Unassigned; // explicit varEmpty (Variant default)
+    NestedInt    := Int32(123456);
+    NestedBool   := True;
+    NestedDouble := Double(3.14);
+    NestedI64    := Int64(1) shl 40;
+    NestedArr1D  := VarArrayCreate([0, 4], varInteger);
+    NestedArr1D[0] := 100; NestedArr1D[1] := 200; NestedArr1D[2] := 300;
+    NestedArr1D[3] := 400; NestedArr1D[4] := 500;
+    NestedMat2D  := VarArrayCreate([1, 2, 1, 3], varDouble);
+    NestedMat2D[1, 1] := 1.5; NestedMat2D[1, 2] := 2.5; NestedMat2D[1, 3] := 3.5;
+    NestedMat2D[2, 1] := 4.5; NestedMat2D[2, 2] := 5.5; NestedMat2D[2, 3] := 6.5;
+    GSink.Use(NestedDate);  // {BP:NESTED_VARIANT_BODY}
+  end;
+
+begin
+  DoNested;
+end;
+
+procedure InspectConstVariant(const v: Variant);
+begin
+  GSink.Use(v);  // {BP:CONST_VARIANT_BODY}
+end;
+
+procedure RunConstVariantTest;
+var
+  Outer: Variant;
+begin
+  Outer := EncodeDate(2026, 5, 26);
+  InspectConstVariant(Outer);
+end;
+
+procedure RunMistaggedConstVariantTest;
+  procedure InspectInsideNested(const v: Variant);
+  begin
+    GSink.Use(v);  // {BP:MISTAGGED_CONST_VARIANT_BODY}
+  end;
+var
+  Outer: Variant;
+begin
+  Outer := EncodeDate(2026, 12, 31);
+  InspectInsideNested(Outer);
+end;
+
+constructor TMenuCacheBase.Create;
+begin
+  inherited Create;
+  BaseTag := 7;
+end;
+
+function TMenuCacheBase.GetBaseScore: Integer;
+begin
+  Result := BaseTag * 10;   // 70
+end;
+
+constructor TMenuCache.Create;
+begin
+  inherited Create;
+  Items   := ['one', 'two'];
+  FLevels := [10, 20, 30];
+end;
+
+function TMenuCache.GetLevel(Idx: Integer): Integer;
+begin
+  if (Idx >= 0) and (Idx <= High(FLevels)) then
+    Result := FLevels[Idx]
+  else
+    Result := -1;
+end;
+
+constructor TMenuRepro.Create(const AOwnerName: string);
+begin
+  inherited Create;
+  FOwnerName := AOwnerName;
+end;
+
+procedure TMenuRepro.LoadMenu;
+var
+  Cache: TMenuCache;
+
+  procedure CreateNodes(NodeId: Integer);
+  var
+    CurrentLevel:  Integer;
+    CurrentParent: TMenuCache; // class-typed pointer; must show as `nil` not `0`
+    LocalStr:      string;
+  begin
+    CurrentLevel  := 1;
+    CurrentParent := nil;
+    LocalStr      := 'hello';
+    GSink.Use([NodeId]);                                    // {BP:NESTED_CLASS_METHOD_BODY}
+    GSink.Use([CurrentLevel, LocalStr, Cache.Items[0], FOwnerName, Cache.Level[0]]);
+    if CurrentParent <> nil then
+      GSink.Use(['parent: ', CurrentParent.Items[0]]);
+  end;
+
+begin
+  Cache := TMenuCache.Create;
+  try
+    CreateNodes(42);
+  finally
+    Cache.Free;
+  end;
+end;
+
+procedure RunNestedClassMethodTest;
+var
+  R: TMenuRepro;
+begin
+  // Call the collider FIRST so its `createnodes` proc record is parsed and
+  // indexed before TMenuRepro's (RSM short-name last-write-wins).
+  RunCollider;
+  R := TMenuRepro.Create('repro-owner');
+  try
+    R.LoadMenu;
+  finally
+    R.Free;
+  end;
+end;
+
+procedure RunExceptionTest;
+begin
+  try
+    raise Exception.Create('exc-test'); // {BP:EXC_RAISE}
+  except
+    on E: Exception do
+      GSink.Use(['caught: ', E.Message]);
+  end;
+end;
+
+// Native (non-Delphi) Windows exception followed by a Delphi one. The native
+// raise carries no exception object at the point the debugger sees it, hence no
+// class and no message: only the `code` rule criterion can target it. The code
+// is a customer-defined one so it collides with nothing the debugger handles
+// itself (0x406D1388, the thread-name announcement, is consumed by the debugger
+// before rules run and can therefore not be used here).
+procedure RunNativeExceptionTest;
+const
+  CUSTOM_NATIVE_EXCEPTION_CODE = $E0424242;
+begin
+  try
+    RaiseException(CUSTOM_NATIVE_EXCEPTION_CODE, 0, 0, nil);   // {BP:NATIVE_RAISE}
+  except
+    on E: Exception do
+      GSink.Use(['native caught: ', E.Message]);
+  end;
+  try
+    raise Exception.Create('exc-after-native');   // {BP:AFTER_NATIVE_RAISE}
+  except
+    on E: Exception do
+      GSink.Use(['caught: ', E.Message]);
+  end;
+end;
+
+procedure RunReRaiseFlow;
+begin
+  try
+    try
+      raise Exception.Create('reraise-orig');   // first raise
+    except
+      raise;                                     // {BP:RERAISE} bare re-raise
+    end;
+  except
+    on E: Exception do
+      GSink.Use(['reraise caught: ', E.Message]);
+  end;
+end;
+
+procedure RunAccessViolation;
+var
+  P: PInteger;
+begin
+  try
+    P := nil;
+    P^ := 42;   // {BP:AV_WRITE} write to address 0 -> access violation
+  except
+    on E: Exception do
+      GSink.Use(['av-caught: ', E.Message]);
+  end;
+end;
+
+procedure RunAttachSurvive;
+var
+  I: Integer;
+begin
+  for I := 1 to 120 do begin
+    GSink.Use(['attach-survive', I]);   // {BP:ATTACH_SURVIVE_BODY}
+    Sleep(250);
+  end;
+end;
+
+procedure RunLoadNoDebugDll;
+type
+  TNoDebugAdd = function(A, B: Integer): Integer; stdcall;
+var
+  H:  HMODULE;
+  Fn: TNoDebugAdd;
+  R:  Integer;
+begin
+  R := 0;
+  H := LoadLibrary('NoDebugLib.dll');
+  if H <> 0 then begin
+    @Fn := GetProcAddress(H, 'NoDebugAdd');
+    if Assigned(Fn) then
+      R := Fn(40, 2);
+  end;
+  GSink.Use(['nodebug-add=', R]);   // {BP:NODEBUG_DONE} reached after the no-debug DLL is loaded + called
+end;
+
+procedure RunLoadUnloadBplObj;
+type
+  TMakeWidget = function: NativeUInt;
+var
+  H:  HMODULE;
+  Fn: TMakeWidget;
+begin
+  GPkgObj := nil;
+  H := LoadPackage('TestPackage.bpl');
+  if H <> 0 then begin
+    @Fn := GetProcAddress(H, 'PkgMakePersistentWidget');
+    if Assigned(Fn) then
+      GPkgObj := TObject(Pointer(Fn()));
+    UnloadPackage(H);   // BPL code + VMT unmapped; GPkgObj is now stale
+  end;
+  GSink.Use(['unloaded-bpl-obj']);   // {BP:UNLOADED_OBJ} inspect GPkgObj -- must not crash
+end;
+
+procedure RunExceptionHandlerProbe;
+begin
+  try
+    raise Exception.Create('exc-test-probe');
+  except
+    on E: Exception do begin
+      GSink.Use(['handler: ', E.Message]);
+      GSink.Use([0]); // {BP:EXC_HANDLER}
+    end;
+  end;
+end;
+
+function FreeAdd(A, B: Integer): Integer;
+begin
+  Result := A + B;
+end;
+
+function FreeWrap(const S: string): string;
+begin
+  Result := '<' + S + '>';
+end;
+
+type
+  // POD record of exactly 8 bytes: the Win64 ABI returns it PACKED IN RAX, not
+  // through a hidden var-out slot. Watching a call to MakeSmallPt used to show a
+  // bogus zero because the debugger read the untouched var-out slot.
+  TSmallPt = record
+    X, Y: Integer;
+  end;
+
+function MakeSmallPt(AX, AY: Integer): TSmallPt;
+begin
+  Result.X := AX;
+  Result.Y := AY;
+end;
+
+procedure NameCurrentThread(const Name: string);
+var
+  H:  HMODULE;
+  Fn: TSetThreadDescription;
+begin
+  H := GetModuleHandleW('kernel32.dll');
+  if H = 0 then Exit;
+  Fn := TSetThreadDescription(GetProcAddress(H, 'SetThreadDescription'));
+  if Assigned(Fn) then
+    Fn(GetCurrentThread, PWideChar(Name));
+end;
+
+function ThreadWorker(Param: Pointer): DWORD; stdcall;
+begin
+  NameCurrentThread('TestWorker' + IntToStr(NativeUInt(Param)));
+  Sleep(INFINITE);
+  Result := 0;
+end;
+
+function WorkerBpProc(Param: Pointer): DWORD; stdcall;
+var
+  WLocal: Integer;
+begin
+  NameCurrentThread('BpWorker');
+  WLocal := 4242;
+  GSink.Use(['worker-body ', WLocal]);   // {BP:WORKER_BODY}
+  Result := 0;
+end;
+
+procedure RunWorkerBpTest;
+var
+  H: THandle;
+  Id: DWORD;
+begin
+  H := CreateThread(nil, 0, @WorkerBpProc, nil, 0, Id);
+  WaitForSingleObject(H, 5000);
+  CloseHandle(H);
+end;
+
+function WorkerRaiseProc(Param: Pointer): DWORD; stdcall;
+begin
+  NameCurrentThread('RaiseWorker');
+  try
+    raise Exception.Create('worker-boom');   // {BP:WORKER_RAISE}
+  except
+    on E: Exception do
+      GSink.Use(['worker caught ', E.Message]);
+  end;
+  Result := 0;
+end;
+
+procedure RunWorkerRaiseTest;
+var
+  H: THandle;
+  Id: DWORD;
+begin
+  H := CreateThread(nil, 0, @WorkerRaiseProc, nil, 0, Id);
+  WaitForSingleObject(H, 10000);
+  CloseHandle(H);
+end;
+
+procedure RunThreadsTest;
+var
+  H1, H2: THandle;
+  Id1, Id2: DWORD;
+begin
+  NameCurrentThread('TestMain');
+  H1 := CreateThread(nil, 0, @ThreadWorker, Pointer(1), 0, Id1);
+  H2 := CreateThread(nil, 0, @ThreadWorker, Pointer(2), 0, Id2);
+  Sleep(150);
+  GSink.Use(['workers spawned ', Id1, ' ', Id2]); // {BP:THREADS_READY}
+  CloseHandle(H1);
+  CloseHandle(H2);
+end;
+
+// --- MS_VC_EXCEPTION self-naming fixture -----------------------------------
+// TThread.NameThreadForDebugging announces a thread's name to the debugger by
+// raising the $406D1388 protocol exception. The debugger must consume it: adopt
+// the name AND never surface it as a stop, whatever the exception filters say.
+//
+// The worker names itself only after the main thread gives it the go-ahead, so
+// the announcement lands long after the thread's CREATE_THREAD event. That is
+// deliberate: it forces the debugger's id -> name mapping to be updated live
+// rather than snapshotted when the thread appeared.
+
+type
+  TSelfNamingThread = class(TThread)
+  protected
+    procedure Execute; override;
+  end;
+
+var
+  GNamingGo:   THandle = 0;  // main -> worker: name yourself now
+  GNamingDone: Integer = 0;  // worker -> main: announcement sent
+
+procedure TSelfNamingThread.Execute;
+begin
+  WaitForSingleObject(GNamingGo, 10000);
+  TThread.NameThreadForDebugging('DelphiNamedWorker');
+  GNamingDone := 1;
+  while not Terminated do
+    Sleep(10);
+end;
+
+procedure RunThreadNamingTest;
+var
+  Worker: TSelfNamingThread;
+begin
+  NameCurrentThread('NamingMain');
+  GNamingDone := 0;
+  GNamingGo   := CreateEvent(nil, True, False, nil);
+  Worker      := TSelfNamingThread.Create(False);
+  try
+    Sleep(150);                                     // worker parked, still unnamed
+    SetEvent(GNamingGo);                            // {BP:THREADNAME_BEFORE}
+    Sleep(400);                                     // let the announcement land
+    GSink.Use(['named ', GNamingDone]);             // {BP:THREADNAME_READY}
+    Worker.Terminate;
+    Worker.WaitFor;
+  finally
+    Worker.Free;
+    CloseHandle(GNamingGo);
+    GNamingGo := 0;
+  end;
+end;
+
+// --- Per-thread stepping isolation fixture --------------------------------
+// Two worker threads spin incrementing their OWN counter until GStepIsoStop.
+// The main thread stops at STEPISO_MAIN with both spinners live (frozen by the
+// stop). A test then single-steps ONE spinner and asserts only its counter moved
+// while the other's stayed exactly put -- proof the step froze every other thread.
+
+function StepIsoSpinB(Param: Pointer): DWORD; stdcall;
+var
+  TagB: Integer;             // distinctive live local: proves a frame selected on
+begin                        // THIS thread reads THIS thread's stack
+  NameCurrentThread('StepIsoSpinB');
+  TagB := 12345;
+  while not GStepIsoStop do begin
+    Inc(GStepIsoB);          // {BP:STEPISO_SPIN_B}
+    if TagB = 0 then Break;  // never taken; keeps TagB live across the loop
+  end;
+  Result := 0;
+end;
+
+function StepIsoSpinC(Param: Pointer): DWORD; stdcall;
+begin
+  NameCurrentThread('StepIsoSpinC');
+  while not GStepIsoStop do
+    Inc(GStepIsoC);          // {BP:STEPISO_SPIN_C}
+  Result := 0;
+end;
+
+procedure StepIsoMainMark;
+begin
+  GSink.Use(['per-thread-step ready ', GStepIsoB, GStepIsoC]);   // {BP:STEPISO_MAIN}
+end;
+
+procedure RunPerThreadStepFixture;
+var
+  HB, HC: THandle;
+  IdB, IdC: DWORD;
+begin
+  NameCurrentThread('StepIsoMain');
+  GStepIsoStop := False;
+  GStepIsoB    := 0;
+  GStepIsoC    := 0;
+  HB := CreateThread(nil, 0, @StepIsoSpinB, nil, 0, IdB);
+  HC := CreateThread(nil, 0, @StepIsoSpinC, nil, 0, IdC);
+  Sleep(100);            // let both spinners get well inside their loops
+  StepIsoMainMark;       // debugger stops here; both spinners live but frozen
+  GStepIsoStop := True;  // reached only once the debugger resumes / detaches
+  WaitForSingleObject(HB, 5000);
+  WaitForSingleObject(HC, 5000);
+  CloseHandle(HB);
+  CloseHandle(HC);
+end;
+
+procedure RunBpTests;
+var
+  I, Acc: Integer;
+begin
+  Acc := 0;
+  I   := 1;
+  while I <= 5 do begin
+    Inc(Acc, I);              // {BP:BP_LOOP}
+    if Acc < 0 then GSink.Use(['?']);
+    Inc(I);
+  end;
+  GSink.Use(['Acc=', Acc]);   // {BP:BP_AFTER_LOOP}
+end;
+
+// Portable replica of the program-main-block object scenario using PROC-LOCAL
+// objects instead of main-block inline vars. The inline vars TheWidget/TheStuff
+// in TestTarget.dpr are exe-only (RSM main-block table, no BPL/TD32 equivalent),
+// but the METHOD markers they exercise -- CTOR_BODY, STUFF_CTOR_END,
+// COMPUTE_BODY, NESTED_INC/NESTED_CALL_INNER/INNER_BODY, STUFF_PUBBUMP -- and the
+// canonical field values ('hello',42 / 7,'tag' -> FValue=42 => Factor=84,
+// FCount=7) are PORTABLE. Calling this from RunAllScenarios makes every
+// "inside a method" test (implicit-Self, bare fields, var param, ctor params,
+// nested-proc locals) fire in BOTH the monolithic exe AND the BPL. In the exe,
+// RunAllScenarios runs BEFORE the .dpr main block, so these markers hit HERE
+// first with identical values -- monolithic assertions are unchanged.
+procedure RunMainObjectScenarioPortable;
+var
+  W:    TWidget;
+  S:    TStuff;
+  Res:  Integer;
+  X:    Integer;
+begin
+  // NB: the BP markers (CTOR_BODY/STUFF_CTOR_END/COMPUTE_BODY/NESTED_*/INNER_BODY/
+  // STUFF_PUBBUMP) live INSIDE the called methods -- do NOT repeat the {BP:...}
+  // token at these call sites or Bp() would find each marker twice.
+  W := TWidget.Create('hello', 42);   // -> CTOR_BODY (inside TWidget.Create)
+  S := TStuff.Create(7, 'tag');        // -> STUFF_CTOR_END (FCount=7)
+  try
+    Res := 0;
+    W.Compute(Res);                    // -> COMPUTE_BODY (Factor = FValue*2 = 84)
+    GSink.Use(['Compute: ', Res]);
+    if Res < 0 then
+      GSink.Use([W.Sum5(1, 2, 3, 4, 5)]);
+    X := 10;
+    ComputeNested(X);                  // -> NESTED_INC / NESTED_CALL_INNER / INNER_BODY
+    GSink.Use(['X after: ', X]);
+    GSink.Use([S.PubCount]);
+    GSink.Use([S.PubBump]);            // -> STUFF_PUBBUMP
+    if Res < 0 then begin
+      GSink.Use([S.BumpCount]);
+      GSink.Use([S.RaiseBoom]);
+    end;
+  finally
+    S.Free;
+    W.Free;
+  end;
+end;
+
+// True when THIS code is executing from inside the runtime package
+// (TestSubject.bpl) rather than the monolithic exe. Resolves the module that
+// physically contains this unit's code from a code address: VirtualQuery gives
+// the allocation base of that address (the module's load base), then
+// GetModuleFileName turns it into a path. Reliable PER-MODULE even when the host
+// exe and the package share a single RTL package -- in that case IsLibrary and
+// HInstance are the shared MAIN module's values (exe -> False), so they cannot
+// be used to tell exe-hosted code apart from package-hosted code.
+function RunningInsidePackageModule: Boolean;
+var
+  Info: TMemoryBasicInformation;
+  Path: array[0..MAX_PATH] of Char;
+begin
+  Result := False;
+  if VirtualQuery(@RunMainObjectScenarioPortable, Info, SizeOf(Info)) = 0 then
+    Exit;
+  if GetModuleFileName(HINST(Info.AllocationBase), Path, Length(Path)) = 0 then
+    Exit;
+  Result := SameText(ExtractFileExt(Path), '.bpl');
+end;
+
+procedure RunAllScenarios;
+begin
+  GSink := TSink.Create;
+  // Attach test entrypoint: when invoked with `--attach-pause`, sleep long
+  // enough for an external debugger to attach before the target races to exit.
+  if FindCmdLineSwitch('attach-pause') or FindCmdLineSwitch('-attach-pause') then
+    Sleep(5000);
+
+  if FindCmdLineSwitch('attach-survive') or FindCmdLineSwitch('-attach-survive') then
+    RunAttachSurvive;
+
+  if FindCmdLineSwitch('run-per-thread-step') or FindCmdLineSwitch('-run-per-thread-step') then
+    RunPerThreadStepFixture;
+
+  if FindCmdLineSwitch('run-av') or FindCmdLineSwitch('-run-av') then
+    RunAccessViolation;
+
+  if FindCmdLineSwitch('run-reraise') or FindCmdLineSwitch('-run-reraise') then
+    RunReRaiseFlow;
+
+  if FindCmdLineSwitch('run-worker-raise') or FindCmdLineSwitch('-run-worker-raise') then
+    RunWorkerRaiseTest;
+
+  if FindCmdLineSwitch('run-step-raise') or FindCmdLineSwitch('-run-step-raise') then
+    RunStepRaise;
+
+  if FindCmdLineSwitch('run-deep-nested-raise') or FindCmdLineSwitch('-run-deep-nested-raise') then
+    RunDeepNestedRaise;
+
+  if FindCmdLineSwitch('load-nodebug-dll') or FindCmdLineSwitch('-load-nodebug-dll') then
+    RunLoadNoDebugDll;
+
+  if FindCmdLineSwitch('load-unload-bpl-obj') or FindCmdLineSwitch('-load-unload-bpl-obj') then
+    RunLoadUnloadBplObj;
+
+  if FindCmdLineSwitch('run-real-scenario') or FindCmdLineSwitch('-run-real-scenario') then
+    RunRealScenario;
+
+  if FindCmdLineSwitch('run-uses-scope') or FindCmdLineSwitch('-run-uses-scope') then begin
+    GSink.Use([TestTargetUsesA.DupFunc,  TestTargetUsesB.DupFunc,  TestTargetUsesC.DupFunc,
+               TestTargetUsesA.DupConst, TestTargetUsesB.DupConst, TestTargetUsesC.DupConst,
+               TestTargetUsesA.TDup.Tag, TestTargetUsesB.TDup.Tag, TestTargetUsesC.TDup.Tag,
+               SizeOf(TestTargetUsesA.TDupRec), SizeOf(TestTargetUsesB.TDupRec),
+               SizeOf(TestTargetUsesC.TDupRec)]);
+    RunUsesScope;
+  end;
+
+  // Keep the free procs alive (DCE guard, never true at runtime).
+  if FreeAdd(1, 2) < 0 then ;
+  if Length(FreeWrap('x')) < 0 then ;
+  if MakeSmallPt(1, 2).X < 0 then ;
+
+  // Keep TBareClass alive in the binary: instantiate then free. All its members
+  // are private; its constructor is only reachable from inside this unit, so the
+  // keep-alive lives here (not in the thin .dpr). The type record is what the
+  // RSM all-private-class test cares about.
+  TBareClass.Create('bare', 99).Free;
+
+  // Host copy of the uses-graph collision global. Set before any package loads.
+  GUsesGraph := 444;
+
+  if FindCmdLineSwitch('load-package') or FindCmdLineSwitch('-load-package') then
+    LoadPackage('TestPackage.bpl');
+
+  if FindCmdLineSwitch('load-missing-bpl') or FindCmdLineSwitch('-load-missing-bpl') then
+    try
+      LoadPackage('NoSuchPackage_zzz.bpl');
+    except
+      on E: Exception do
+        GSink.Use(['missing-bpl caught: ', E.Message]);
+    end;
+
+  if FindCmdLineSwitch('reload-package') or FindCmdLineSwitch('-reload-package') then begin
+    var H := LoadPackage('TestPackage.bpl');   // load #1 -> BP fires
+    UnloadPackage(H);                           // form closed
+    LoadPackage('TestPackage.bpl');            // load #2 -> BP fires again
+  end;
+
+  if FindCmdLineSwitch('load-package2') or FindCmdLineSwitch('-load-package2') then begin
+    LoadPackage('TestPackage.bpl');    // PkgAdd  -> PKG_BP
+    LoadPackage('TestPackage2.bpl');   // PkgMul  -> PKG2_BP
+  end;
+
+  // Portable object-method scenario: makes the "inside a method" markers
+  // (CTOR_BODY/STUFF_CTOR_END/COMPUTE_BODY/NESTED_*/INNER_BODY/STUFF_PUBBUMP)
+  // fire with the canonical 'hello'/42, 7/'tag' values. ONLY in the BPL
+  // (IsLibrary = True when this code runs inside TestSubject.bpl): in the
+  // monolithic exe the .dpr main block already exercises these markers, and
+  // running this first there would flip the MAIN_GCOUNTER-before-STUFF_PUBBUMP
+  // order some monolithic tests (e.g. Test_Bug16) depend on.
+  if RunningInsidePackageModule then
+    RunMainObjectScenarioPortable;
+
+  RunAliasLocalTest;
+  RunClosureSampler;
+  RunClosureParamSampler;
+  RunDeepNestedTest;
+  RunEvalTests;
+  RunDateTimeAliasTest;
+  RunStepConsecutiveCalls;
+  RunStepIntoPrologue;
+  RunStepManagedClear;
+  RunIndexedPropTest;
+  RunVariantTests;
+  RunWideFieldsProbe;
+  RunDynArrayDisplayProbe;
+  if FindCmdLineSwitch('run-goto') or FindCmdLineSwitch('-run-goto') then
+    RunGotoProbe;
+  RunEnumPackProbe;
+  RunBigVarArrayProbe;
+  if FindCmdLineSwitch('run-ods') or FindCmdLineSwitch('-run-ods') then
+    RunOdsProbe;
+  RunNestedVariantTest;
+  RunConstVariantTest;
+  RunMistaggedConstVariantTest;
+  RunNestedClassMethodTest;
+  RunDeepNesting;
+  RunStaticClassMethod;
+  RunOperatorOverload;
+  RunPropertySetter;
+  RunCollections;
+  RunTypeSampler;
+  RunEdgeCases;
+  RunRecursion;
+  RunCtorProbe;
+  RunEdge2;
+  RunOpenArray;
+  RunReal;
+  RunRobust;
+  RunStepFlow;
+  RunStepBranchFlow;
+  RunStepEntryFlow;
+  RunNest3Flow;
+  RunRecByValFlow;
+  if FindCmdLineSwitch('run-exc-flow') or FindCmdLineSwitch('-run-exc-flow') then
+    RunExcHandlerFlow;
+  TestTargetTypes.DoWork;
+  RunBpTests;
+  if FindCmdLineSwitch('run-exception-handler') or
+     FindCmdLineSwitch('-run-exception-handler') then
+    RunExceptionHandlerProbe;
+  if FindCmdLineSwitch('run-exception-test') or
+     FindCmdLineSwitch('-run-exception-test') then
+    RunExceptionTest;
+  if FindCmdLineSwitch('run-native-exception-test') or
+     FindCmdLineSwitch('-run-native-exception-test') then
+    RunNativeExceptionTest;
+  if FindCmdLineSwitch('run-threads') or FindCmdLineSwitch('-run-threads') then
+    RunThreadsTest;
+  if FindCmdLineSwitch('run-thread-naming') or FindCmdLineSwitch('-run-thread-naming') then
+    RunThreadNamingTest;
+  if FindCmdLineSwitch('run-worker-bp') or FindCmdLineSwitch('-run-worker-bp') then
+    RunWorkerBpTest;
+end;
+
+exports RunAllScenarios;
+
+end.

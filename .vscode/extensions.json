@@ -1,0 +1,14 @@
+﻿{
+    "recommendations": [
+        "embarcaderotechnologies.delphilsp",
+        "schwartzkers.cvs-scm",
+        "editorconfig.editorconfig",
+        "oracle.sql-developer",
+        "jebbs.plantuml",
+        "mechatroner.rainbow-csv",
+        "tomoki1207.pdf",
+        "ms-vscode.vscode-websearchforcopilot",
+        "redhat.vscode-xml",
+        "redhat.vscode-yaml"
+    ]
+}

@@ -1,0 +1,19 @@
+package TestPackage2;
+
+// Second runtime-loadable BPL. Loaded alongside TestPackage.bpl by the
+// host when invoked with `--load-package2`, to exercise per-module
+// symbol routing: a breakpoint in each BPL must resolve against its own
+// debug info.
+
+{$RUNONLY}
+
+requires
+  rtl,
+  TestPackage;   // runtime dependency: exercises uses-graph global scoping
+                 // (a global in a required package must beat an unrelated
+                 // binary's same-named global when watched from this BPL).
+
+contains
+  TestPkgUnit2 in 'TestPkgUnit2.pas';
+
+end.

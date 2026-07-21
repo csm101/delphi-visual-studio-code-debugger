@@ -1,0 +1,398 @@
+# Test Catalog
+
+Living index of what the Debugger Tests cover and what is still uncovered.
+
+Status legend:
+- `[x]` covered by an automated test in `DebuggerTests.pas`
+- `[ ]` known gap -- add a TestTarget proc + DUnitX assertion before fixing
+       any bug in this area
+- `[~]` partially covered (some aspect works, an edge case is missing)
+
+Update this catalog in the same change set as the test or fix.
+
+**Backlog as registered tests:** every edge case brainstormed is now a
+named DUnitX test. Runnable ones are `[Test]` (green) or
+`[Test] [Ignore('TODO-RED: ...')]` (real bug, root cause in the message).
+Not-yet-feasible ones are `Test_BL_*` stubs: `[Ignore('TODO: ...')]` with
+an `Assert.Fail('not implemented')` body, so removing `[Ignore]` forces a
+real implementation. Run summary shows the live count
+(`Tests Ignored : N`). Nothing is tracked only in prose.
+
+---
+
+## A. Local variable type display
+
+### A.1 Primitives
+- [x] Integer / LongInt / Int32
+- [x] Cardinal / UInt32
+- [x] Byte / ShortInt
+- [x] Word / SmallInt
+- [x] Int64 / UInt64
+- [x] Single / Double / Currency
+- [x] Boolean (1-byte)
+- [x] ByteBool / WordBool / LongBool (TD32 $0031 named-subrange NameIdx
+      pickup -> declared alias preserved -> True/False display)
+- [x] AnsiChar / Char (WideChar)
+- [x] AnsiString / UnicodeString
+- [x] ShortString (TD32 $0033 named-array NameIdx pickup + inline
+      length-prefixed value decode)
+- [x] WideString (TD32 $0039 managed-type tag)
+- [ ] RawByteString / UTF8String (covered for property GET; local display missing)
+- [x] TDateTime (Double-backed)
+- [x] TGUID (16-byte record literal)
+- [ ] PChar / PAnsiChar / PWideChar with non-string content
+- [x] PChar with string content (`^Char` alias) -- decoded via
+      FormatStringByPointer extension
+- [x] **Critical regression guard**: Integer = 1 next to zeroed
+      neighbour locals must surface as Integer, not as varNull / TVarRec.
+      Now enforced by `Test_Types_TrickyOne_NotMisDecodedAsVariant`
+      (TVarRec augment denylist + Variant pattern slot-size guard).
+
+### A.2 Enums and sets
+- [x] Enum literal value display (`wmRunning`)
+- [x] Set value display (`[wmRunning, wmIdle]`)
+- [x] Enum whose ordinal exceeds byte (`Test_Types_BigEnum_DisplaysName`)
+- [ ] Set whose element enum lives in a different unit
+- [x] Non-trivial set decode (`Test_Types_NonEmptySet_Display`)
+- [x] Empty set displays as `[]` (`Test_Types_EmptySet_Display`)
+- [ ] Set with `..` ranges in source (compiler may expand differently)
+
+### A.3 Records
+- [x] Flat record fields
+- [x] Nested record field expansion
+- [x] Packed record locals-view expansion (`Test_Types_PackedRecord_FieldsVisible`)
+- [x] Managed-field record locals-view expansion
+      (`Test_Types_ManagedRecord_FieldsVisible`)
+- [ ] Record with methods (modern Delphi)
+- [ ] Record with class operators (body steppable -- partial)
+- [ ] Anonymous record `record A,B: Integer end`
+
+### A.4 Arrays
+- [x] Static array `array[0..N] of T`
+- [x] Dynamic array `TArray<T>` / `array of T` (Integer)
+- [x] Dynamic array of class/record as a FIELD (RTTI TypeInfo path, e.g.
+      MRec.Tags) -- expands via ExpandDynArray
+- [x] Dynamic array of records as a LOCAL
+      (`Test_Coll_DynArrayOfRecord_ElementFields`) -- ekDynArrayNamed:
+      validates Win64 dyn-array header (RefCnt@-12, Length@-8), element
+      stride from ITypeSizeProvider, per-element ekRsmMembers children.
+- [x] Dynamic array of class instances as a LOCAL
+      (`Test_Coll_DynArrayOfClass_ElementInstance`) -- same path,
+      class elements dereferenced + labelled.
+- [ ] Multi-dim static array -- display + `[i,j]` index. BLOCKED: TD32 types
+      a static array as its element ("Integer"), dims lost (needs LF_ARRAY).
+- [x] Multi-dim dynamic array expand (`Test_E2_MultiDimDynamic_Expand`)
+- [ ] Open array parameter (`array of const`)
+- [x] Open array parameter `array of T` -- `A[i]` indexing in a watch
+      (`Test_E2_OpenArrayParam_Element`; `^Element` base, DerefPtr)
+
+### A.5 Classes
+- [x] Class instance, declared and runtime type match
+- [x] Class instance, derived shown as declared not base
+- [x] Null class reference displays as `nil`
+- [x] Self visible in nested proc of class method
+- [ ] Static class method (no Self)
+- [ ] Class constructor (`class constructor` body)
+- [ ] Abstract class (no concrete VMT)
+- [ ] Anonymous (non-named) class created via `class procedure`
+- [x] Generic class instance `TList<Integer>` -- elements reachable by
+      drilling GenList -> FItems -> [0..2] (`Test_Types_GenericList_EnumeratesElements`)
+- [x] `TDictionary<K,V>` element enumeration (buckets) -- entries reachable
+      by walking Dict -> FItems -> TItem.Key/Value
+      (`Test_BL_Generic_DictElementEnumeration`)
+- [x] Interfaced class (refcounted) -- live non-nil + field reach
+      (`Test_Coll_InterfacedClass_FieldVisible`)
+- [x] Class reference value `class of TBar` (`Test_Types_ClassRef_*`)
+
+### A.6 Pointers
+- [x] `^Integer` displays through pointer-to-primitive recovery
+- [x] `^TClass` displays as class (nil for 0, $addr (RuntimeClassName) for non-zero)
+- [x] `^TRecord` (typed pointer-to-record) display (covered via PtrRecord test)
+- [x] Untyped `Pointer` display
+- [x] Pointer deref `P^` in watch (`Test_Types_PtrPrimitive_DerefMatches`)
+- [x] PChar string content covered above (A.1)
+
+### A.7 Variants
+- [x] varEmpty
+- [x] varNull
+- [x] varInteger
+- [x] varBoolean
+- [x] varDouble
+- [x] varInt64
+- [x] varString / varUString
+- [x] varDate
+- [x] VarArray 1D / 2D shape and expansion (hover/watch + locals view)
+- [x] Variant in nested proc auto-decoded
+- [x] Const Variant parameter deref through pointer
+- [x] Variant parameter mis-tagged as small int recovered
+- [x] **regression**: Integer = 1 next to zeroed neighbours must NOT trigger varNull recovery
+- [ ] varByRef (Variant containing a reference to another Variant)
+- [ ] OleVariant
+- [ ] varDispatch (IDispatch)
+
+### A.8 Other reference types
+- [x] Interface variable LIVE: `Test_Types_Interface_Live_HasClassName`
+- [x] Interface NIL: `Test_Types_Interface_Nil_DisplaysAsNil`
+- [x] Method pointer NIL: `Test_Types_MethodPointer_Nil` (TD32 $0034 ->
+      `procedure of object` label -> nil-shape display)
+- [x] Method pointer LIVE / anonymous proc (partial -- pending real call dispatch)
+- [ ] Anonymous method reference: `reference to procedure`
+- [ ] TextFile / typed File (legacy)
+
+---
+
+## B. Parameter passing
+
+- [x] Value param (Integer, String, Variant, Const Variant, Var Variant)
+- [x] Var param `var X: Integer` (modifies caller's slot)
+- [x] Out param: `Test_OutParam_AfterAssignment_ReadsBack` (TD32 `^T`
+      promoted to lkVarParam; deref + width-correct read)
+- [x] Const param: `Test_ConstParam_ReadsValue`
+- [x] Default parameter: `Test_DefaultParam_TakesDefaultValue`
+- [ ] Open array parameter (`array of const`)
+- [ ] Untyped var parameter (`var X` without type)
+
+---
+
+## C. Frame layout and call kinds
+
+- [x] Top-level free proc
+- [x] Class method (Self visible)
+- [x] Class function with Result
+- [x] Constructor (StepInto_Ctor)
+- [x] Destructor side-effect verified (BP in `Destroy` body)
+- [x] Nested proc 1 level
+- [x] Nested proc inside class method (`TMenuRepro.LoadMenu.CreateNodes`)
+- [x] Nested proc inside nested proc (2 levels): own local,
+      parent (`Mid.MidTag`), grandparent (`RunDeepNesting.OuterTag`).
+      Multi-Z Itanium parser + NameToRva qualified-fallback wired.
+- [ ] Anonymous method body invoked via `TThread.CreateAnonymousThread`
+- [ ] Generic method body
+- [x] Property setter body: `Test_PropertySetterBody_NewValueVisible`
+- [x] Operator overload body: `Test_OperatorBody_StoppableAndArgsVisible`
+- [ ] Class constructor body
+- [ ] Initialization / Finalization sections
+
+---
+
+## D. Expression evaluation (watch / hover)
+
+- [x] Identifier (local, global, Self.X implicit)
+- [x] Field access `a.b.c`
+- [x] Indexed property `a.Level[0]`
+- [x] Method call (no args, with args, chained)
+- [x] Boolean ops, comparisons, precedence, unary minus
+- [x] Arithmetic int and float mix, div/mod
+- [x] String concat
+- [x] nil compare
+- [x] Cast: `Integer(x)`, class cast, TObject upcast
+- [x] `is` and `as`
+- [x] Length, High, Low, SizeOf, Ord
+- [ ] @ address-of operator on locals
+- [x] Pointer dereference `P^`: `Test_Types_PtrPrimitive_DerefMatches`
+- [x] Set algebra `[a] + [b]` union, `-` difference, `*` intersection
+      (`Test_BL_Eval_SetLiteralArith`)
+- [x] In: `wmRunning in S`
+- [x] Method call with a side effect persists across evals
+      (`Test_BL_Eval_MethodSideEffect`)
+- [x] Deref of unmapped memory fails gracefully, session survives
+      (`Test_BL_Ptr_UnmappedRead`)
+- [ ] Inherited call (`inherited Foo`)
+- [x] Parameterless system funcs (Now)
+- [ ] Long dot chain `Self.A.B.C.D.E.F`
+- [ ] Anonymous record literal
+- [ ] Range expression `Low(T) .. High(T)`
+
+---
+
+## E. Stepping and breakpoints
+
+- [x] Set / clear BP at source line
+- [x] Conditional BP
+- [x] Hit-count BP
+- [x] Log point BP
+- [x] Step over
+- [x] Step over a call that hits a BP in the callee -- BP wins
+      (`Test_BL_Step_OverCallThatHitsBp`)
+- [x] Step into ctor
+- [x] Step into a no-debug-info (RTL) call degrades to step-over
+      (`Test_Step_IntoNoDebugInfo_StepsOver`)
+- [x] Step out from nested proc
+- [x] BP on the program's first executable line (`Test_BL_Bp_FirstLine`)
+- [x] BP on a no-code/comment line handled cleanly; a real BP in the same
+      request still fires (`Test_Bp_NoCodeLine_HandledCleanly`)
+- [ ] Run to cursor
+- [ ] Step into / over of a chained `try..finally`
+- [ ] Step on `for var x := ... do` inline-var loop
+- [ ] Restart session
+- [x] Disconnect leaves the target running (attach + killOnDetach=False)
+      (`Test_BL_Module_DetachLeavesRunning`)
+- [x] Set a BP AFTER attaching to a live process
+      (`Test_BL_Attach_SetBpAfterAttach`)
+- [x] Terminate / run-to-completion clean shutdown
+      (`Test_Lifecycle_RunToTermination`)
+
+---
+
+## F. Exception handling
+
+- [x] Pause on Delphi exception (filter on)
+- [x] Pause filtered by class match
+- [x] Hover E.ClassName / E.Message inside on-clause
+- [x] Expand E in variables view
+- [x] Exception class DEFINED in a BPL -- E.ClassName/E.Message in its
+      handler via runtime VMT (`Test_BL_Exc_BplDefinedClass`)
+- [x] Re-raise (bare `raise;`) -- second exception stop, propagation to the
+      outer handler (`Test_BL_Exc_ReRaise`)
+- [ ] Nested except / try-finally
+- [x] OS exception (access violation) surfaces via the `av` filter
+      (`Test_BL_Exc_OsAccessViolation`)
+- [x] Native (non-Delphi) exception targeted by the `code` rule criterion:
+      breaks on the raise the filters ignore and leaves the Delphi exception
+      raised next to it alone (`Test_ExceptionRule_Code_MatchesNativeOnly`,
+      `Test_ExceptionRule_Code_Decimal_BreaksOnNative`)
+- [ ] Unhandled exception terminates session cleanly
+- [x] Watch/hover that invokes a method which RAISES must not hang
+      (`Test_BL_Exc_DuringEvaluate`) -- RunMethodCall aborts the synthetic
+      call on raise/AV/second-chance and the session survives
+
+---
+
+## G. Threads
+
+- [x] Enumerate threads and read names
+- [x] Per-thread locals: BP on a worker fires on that worker, its frame
+      exposes the worker's own local (`Test_Threads_BpOnWorker_LocalVisible`)
+- [x] Exception raised on a worker thread surfaces on that thread; the
+      worker's stack is inspected (`Test_Threads_ExceptionInWorker`)
+- [ ] Step on a specific thread while others stop
+
+---
+
+## H. Modules and debug info sources
+
+- [x] EXE TD32 + RSM
+- [x] EXE MAP fallback
+- [x] BPL TD32 -- BP hits
+- [x] BPL TD32-only BP hits
+- [x] BPL loaded after launch (deferred `LoadPackage`; BP set before load
+      binds when the module arrives -- Test_Bpl_BreakpointHits)
+- [x] DCP for unit symbols not in EXE TD32 (BPL params A/B via .dcp)
+- [x] Missing/invalid BPL load fails gracefully, session completes
+      (`Test_BL_Module_BplLoadFails`)
+- [x] Step INTO a BPL-resident function (BPL debug info drives the step)
+      (`Test_BL_Step_IntoBplFunction`)
+- [x] Detach (killOnDetach=False) leaves the target running
+      (`Test_BL_Module_DetachLeavesRunning`)
+- [x] **BPL-defined class inspected from a BPL frame** (TPkgWidget):
+      field eval (`Test_Bpl_DefinedClass_FieldVisible`) + variables-tree
+      expand (`Test_Bpl_DefinedClass_ExpandInLocals`). Core SampleApp case.
+- [ ] DLL with no Delphi debug info (TD32 absent, MAP absent) -- graceful
+- [x] Module UNLOAD + RELOAD (form close / reopen): BP set once fires on
+      both loads -- proves provider teardown + re-bind
+      (`Test_Bpl_UnloadReload_BpRebinds`)
+- [x] Two BPLs loaded simultaneously, BP in each routes to its own unit
+      source (`Test_Bpl_TwoModules_EachBpRoutes`, TestPackage2 fixture).
+      Fixing this exposed + fixed a real race: BP planting on DLL load
+      was async, so a deferred module's init could run past the BP before
+      the int3 landed. Now planted synchronously in the LOAD_DLL handler.
+- [ ] EXE built with -V- (no debug info) refuses to start session gracefully
+
+---
+
+## I. Real-world / SampleApp quirks
+
+- [x] CurrentLevel := 1 in nested proc shows as Integer 1 (not Variant `<null>`)
+- [x] CurrentParent := nil in nested proc shows as `nil` (not `0 (0x0)`)
+- [x] Outer-method local with ancestor mis-tag (TNoRefCountObject -> TCachedMenu) augments to the leaf class
+- [x] Cache.Level[0] indexed-property watch resolves on a class whose
+      member list comes from RSM, not TD32 (TD32 may report True/0 members)
+- [x] **cross-unit collision**: TestTargetCollider.pas declares a second
+      `LoadMenu.CreateNodes` with opposite local types; wired before the
+      repro so RSM short-name index collides. Covered by
+      `Test_NestedClassMethod_AllThreeBugs` + `Test_CrossUnitDoWork_NoCollision`.
+- [x] **deep nesting** (2 levels: RunDeepNesting.Mid.Inner) -- own,
+      parent, grandparent locals all visible. Parent body RVA resolved
+      via FRvaToParentRva (same-unit), collision-proof across units
+      (`Test_Flow_Nest3_AllAncestorsVisible` adds a SECOND unit with the
+      same Mid/Inner names; both resolve correctly).
+- [ ] **3+ levels deep nesting** (`A.B.C.D`) -- not yet exercised
+- [ ] **same TypeId for different declared types**: TD32 emits the same
+      TypeId for pointer locals of different declared classes; verify
+      each displays its declared / runtime class correctly
+- [ ] **BPL-defined class referenced from main EXE**: instantiate from
+      EXE, stop in EXE, inspect a field of the BPL-class instance
+- [ ] **fully-qualified method name longer than 200 chars**
+- [ ] **Self.A.B.C dot chain of length > 4** in watch
+
+---
+
+## J. Edge cases
+
+- [ ] Uninitialised local (read after declare, before assign)
+- [ ] Variable optimised away (compiler dropped slot)
+- [ ] Local in register only (no memory home slot)
+- [ ] Local that moves register-to-memory mid-procedure
+- [ ] Inline function call (no own frame)
+- [ ] Tail-call optimised return (no return-to frame)
+- [x] $00000001 4-byte Integer next to zeroed neighbours -- not varNull
+      (`Test_Types_TrickyOne_NotMisDecodedAsVariant`)
+- [x] $00000000 4-byte Integer -- displays 0, not `<empty>`
+      (`Test_Types_ZeroInt_DisplaysZeroNotEmpty`)
+- [x] Watch on a name that does not exist -- clean error, no exception
+      leak (`Test_Watch_NonExistentName_ErrorShaped`)
+
+### J.1 Edge battery (TestTargetEdge.pas)
+- [x] Gap enum (`geA=5,geB=10,geC=20`) name display
+- [x] Empty string `''` renders empty, no error
+- [x] Negative Integer / Int64 signed display
+- [x] Float NaN / Infinity display
+- [x] Embedded-NUL string (`'a'#0'b'`) -- surfaces content
+- [x] Emoji / surrogate-pair string -- no read failure
+- [x] Variant record (`case ... of`) expandable
+- [x] Interface method call resolves (`Thing.Name`)
+- [x] Cyclic object graph (Root.Child.Parent=Root) -- expand without hang
+- [x] Object mid-construction (BP in ctor; FirstField set, SecondField 0)
+- [x] **Large set (>8 elements)** (`Test_Edge_LargeSet_BeyondOneByte`):
+      TD32 $0030 leaf decoded as a named set (tkSet) with base-enum names
+      populated; LookupEnumInfo prefers the richest set result; formatter
+      decodes membership across the full 64-bit slot. `set of TManyEnum`
+      = `[me0, me9, me19]`.
+- [x] **Negative SmallInt** (`Test_Edge_NegSmallInt_Signed`): merge now
+      rejects a `TArray\`1` augment over a small-int local (geometric
+      mismatch), so it stays SmallInt and reads 2 bytes signed.
+- [!] **Long string**: TODO-RED `Test_Edge_LongString_NoCrash` --
+      ReadDelphiUnicodeString returns `''` for a 5000-char string (length
+      cap returns nothing instead of truncated content).
+- [x] **Recursion / non-top-frame locals** (`Test_Edge_Recursion_PerFrameLocals`):
+      scopes/evaluate now honor frameId -- the adapter selects that
+      call-stack frame (its unwound Ctx.Rbp) and reads ITS locals/params.
+      Each recursion frame's N (1..5) reads distinctly. High value: any
+      deep-stack inspection / clicking a frame in the call stack.
+
+---
+
+## K. Set variable
+
+- [x] Class field string
+- [x] Nested record field double
+- [ ] Class field Integer / Cardinal / Int64
+- [x] Enum by name (`Gap := geC`) -- type-scoped, gapped enums OK
+      (`Test_SetVar_EnumByName`)
+- [ ] Class field Set
+- [ ] Class field Variant
+- [ ] Local variable (not a field)
+- [ ] Parameter
+- [x] Invalid write rejected cleanly (success:false, session survives)
+      (`Test_SetVar_TypeMismatch_Rejected`)
+
+---
+
+## L. Clipboard / format
+
+- [x] Class instance clean format
+- [x] String field no token error
+- [x] Integer no redundant unsigned suffix
+- [ ] Variant clipboard text
+- [ ] Set clipboard text
+- [ ] Class with > 30 fields -- truncated representation

@@ -1,0 +1,1954 @@
+# TASK_RESUME
+
+Exact current task state. High-level permanent state lives in `PROJECT_STATE.md`.
+
+## IN PROGRESS (2026-07-21): status-bar progress via a `delphiProgress` custom event.
+
+VS Code renders DAP progress events as notification toasts (status-bar rendering
+was reverted upstream in microsoft/vscode#204750) and the protocol has no field
+for the location. The adapter side is DONE: launch/attach config gains
+`progressLocation: "statusBar" | "notification"`, default `statusBar`.
+
+* `statusBar` -> emit ONLY `delphiProgress`
+  `{ "id", "state": "start"|"update"|"end", "text" }` (`text` omitted on `end`),
+  rendered by our own VS Code extension.
+* `notification` -> emit ONLY the standard DAP `progressStart/Update/End`
+  (today's behaviour, so a non-Delphi DAP client still works). Never both.
+
+Both channels ('startup' and 'op') fan out from the single
+`TDapServer.EmitProgress`; the busy/debounce logic is untouched.
+`supportsProgressReporting` stays True: it is a CLIENT capability in the spec,
+VS Code ignores it in the initialize response, so it does not gate toasts.
+
+`TModuleSymbolLoader.OnModuleLoadBegin` (new) fires before a module's symbols are
+actually parsed and retitles the busy text to `loading symbols: <Module>`.
+
+Adapter build clean; suite **865 found / 863 passed / 0 failed / 2 ignored**
+(baseline). NOT COMMITTED. REMAINING: the VS Code extension must consume
+`delphiProgress` and declare `progressLocation` in its launch-config schema.
+
+## DONE (2026-07-21): two defects found while REJECTING the TD32 sidecar idea.
+
+A TD32 sidecar (mirror of the `.rsm` `.idx` for the `.debug` section) was
+investigated and REJECTED on measurements: only 2.1-2.4x faster to load than a
+full TD32 parse, and the sidecar would be 2.6-3.8x LARGER than the section it
+replaces (105 MB for a 44 MB package). Do not revisit without a new argument.
+The investigation did surface two real defects in shipped code; both are fixed
+here. Suite: **864 found / 862 passed / 0 failed / 0 errored / 2 ignored**
+(baseline 861/859/0/2, +3 new tests). NOT COMMITTED.
+
+### Fix 1 -- quadratic locals append in `TD32FileReader.AppendLocalToScope`.
+
+It built the same locals into TWO `TDictionary<K, TArray<TLocalSymbol>>` with
+`Existing := Existing + [L]`, i.e. a full array realloc+copy per local, twice,
+inside `ParseAllAlignSymbols` (~51% of a TD32 parse).
+
+Now: one flat append-only store `FLocalsStore` plus two singly-linked index
+chains (`FLocalNextByName` / `FLocalNextByRva`, `-1`-terminated) whose heads and
+tails live in `FProcLocalChains` / `FRvaLocalChains`. Append is amortised O(1);
+each local is stored ONCE instead of once per index; `GetLocalsForFunction*`
+materialise the chain in link order, which is exactly the old parse order.
+
+`LoadFromFile`, medians of 5, the SAME probe built against both revisions
+(`C:\Athens\__ClaudeTools\Td32LocalsPerf`, `build.bat` / `build_before.bat`;
+`before_core\` holds the git-HEAD reader):
+
+| input | before | after |
+|---|---|---|
+| TestTarget.exe 5.6 MB | 39 ms | 34 ms |
+| dxRichEditCoreRS29.bpl 11.9 MB | 110 ms | 96 ms |
+| cxLibraryRS29.bpl 54 MB | 585 ms | 494 ms |
+
+Reader heap after loading cxLibraryRS29: 161.5 -> 152.6 MB.
+
+HONEST SIZING: this is -13..-16%, not the multiple the shape suggested. The
+tail is short -- 146,279 locals over 48,124 name keys, longest chain 398; the
+by-RVA index has 115,332 locals and a longest chain of 33. The remaining ~500 ms
+is byte-walking, not container churn. If more is needed, the phase itself has to
+change, not its storage.
+
+CORRECTNESS, proved not assumed: `Td32LocalsProbe dump` writes every locals
+answer -- all 48,124 by-name keys sorted, plus every line-table RVA and every
+`RvaToFunctionStart` of one, hit and miss alike, with all 9 `TLocalSymbol`
+fields. Before/after dumps are SHA-256 identical on all three inputs
+(569,355 lines for cxLibraryRS29).
+
+### Fix 2 -- RSM sidecar publication (one path could hang the debugger).
+
+`DebuggerCore\RsmFileReader.pas`, `DebuggerCore\RsmDecoders.pas`:
+
+1. **Atomic publish.** `PublishSidecar` writes `<idx>.<pid>-<tid>.tmp` and
+   `MoveFileEx(..., MOVEFILE_REPLACE_EXISTING)`s it into place. The old code
+   wrote straight over the final path, so a reader could load a partial file.
+2. **The loser no longer deletes the winner's file**, and no failure escapes:
+   both the rename failure and the temp-file cleanup are swallowed, and only
+   OUR temp file is ever deleted. Previously the `except` deleted
+   `SidecarPath` outright and, when that delete ALSO failed (the file being
+   open is precisely when the write failed), the exception escaped the index
+   thread -> `FIndexReady` never set -> every later `WaitForIndex` burned its
+   full 60 s budget. `DevTools\PrebuildIdx` next to a live session hits this.
+3. **Readiness before I/O.** `SaveProcIndexToSidecar` is split into
+   `SerializeIndexToStream` (under `FLock`) + `PublishSidecar`, and the index
+   thread now does serialise -> `MarkIndexReady` -> write. The earlier note
+   ("moving readiness before the save is unsafe") was right about the
+   SERIALISATION and wrong about the WRITE: serialising first keeps the byte
+   stream reproducible (lazy lookups mutate `FProcLocals` the moment the index
+   is ready), while the file write -- the part that can block on a slow or
+   network directory -- no longer gates symbol availability. `MarkIndexReady`
+   sits in a `finally` that also covers the phase waves, so no failure path can
+   leave `FIndexReady` False. The build body moved into
+   `TRsmFile.BuildIndexAndPublish`.
+4. **`SidecarWriteStr` truncation.** The UTF-8 length was a silently truncating
+   `UInt16` assignment; over 64 KB the writer emitted more bytes than the
+   length it wrote and the whole rest of the sidecar decoded as garbage,
+   undetectably. Now `$FFFF` is an escape introducing a `UInt32` length.
+   `RSM_SIDECAR_MAGIC` is **unchanged and deliberately so**: every string under
+   64 KB encodes byte for byte as before, and no old sidecar can contain the
+   sentinel except for a string of exactly 65535 bytes, which no `.rsm`/`.dcp`
+   name comes near. Byte identity re-verified with `PrebuildIdx -verify`
+   against sidecars built by the pre-change code (6/6 verified: Abbrevia290,
+   CPortLibAthens, CoolTrayIconAthens `.rsm`; libAboutBoxD29, libElaborazioniD29,
+   DGOdacD29 `.dcp`).
+
+Tests (3 new, all in `RsmReaderTests`): `Sidecar_LongString_RoundTripsWithoutDesync`,
+`Sidecar_PublishRace_LeavesTheOtherWritersFileIntact` (ages the sidecar, holds
+it open with `fmShareDenyWrite`, forces a rebuild: readiness must still be
+published within a bounded budget, the file must be intact and byte-identical,
+no `.tmp` left behind), `Sidecar_Corrupt_IsRejectedAndRebuilt` (truncated AND
+garbled-body variants: same symbol set as a clean build, and the sidecar is
+valid again afterwards). A/B verified: with the pre-change readers restored,
+the long-string and publish-race tests fail with exactly their intended
+messages.
+
+### OPEN, deliberately not touched (policy decisions, not defects)
+
+- **Sidecars are still written into the Embarcadero `Bpl\Win64` / `Dcp\Win64`
+  directories.** Moving them to a user-writable cache changes the freshness
+  contract, the `PrebuildIdx` workflow and the shipped-corpus story. Needs a
+  decision, not a patch.
+- **Two disagreeing freshness rules**: `RsmFileReader.pas:664-665` accepts a
+  sidecar whose mtime is `>=` the source's; `PeSymbolSupport.pas:69-81` uses a
+  different rule for the same class of question. They should be reconciled by
+  one owner.
+- **Pre-existing hazard, unchanged by this work**: `TRsmFile.LookupEnumInfo`
+  mutates `FEnumInfoByName` (the lazy set base-type resolution) WITHOUT
+  `FLock`, while the index thread writes the same dictionary under it. Same
+  class as the `LookupTypeName` bug fixed on 2026-07-20; a rehash under a
+  concurrent read is an AV. Four-line fix, left out to keep this change set to
+  its two subjects.
+- **Observation**: the `.idx` files shipped in the local Embarcadero
+  directories do NOT match what the current parser produces (`PrebuildIdx
+  -verify` reported 6/6 MISMATCH against them, while HEAD-built ones verify
+  6/6). They predate the 2026-07-20 two-wave fix, i.e. they are the degraded,
+  lossy indexes. Consider a one-off `PrebuildIdx -r -force` over those trees.
+
+## PARTIAL: background symbol PREFETCH -- built, documented, SHIPPED DISABLED.
+## The concurrency fixes around it ARE live (2026-07-20).
+
+READ THIS FIRST. The prefetcher is complete and wired into both frontends, but
+`SetSymbolPrefetchEnabled` defaults to FALSE (`SYMBOL_PREFETCH=1` turns it on),
+because with it enabled the full suite reproducibly loses 1-3 requests per run
+to a 30 s response timeout -- always in `TDebuggerTestsBpl`, always `seq=6`
+(the first request after the first stop), never in isolation, never in the mono
+fixture. That is the same signature that disabled the previous background
+loader. Isolated by running the IDENTICAL build with the prefetcher off: clean,
+0 errored. So the cause is the prefetcher, not the reader-level fixes.
+
+Everything ELSE below is live and green: the six concurrency fixes, the removal
+of the dead DAP loader, the single-load-path claim protocol, the publication
+plumbing in `TDebugSession.Pump`, and the DAP `invalidated` push.
+
+WHAT WAS ALREADY RULED OUT as the cause of the timeout (do not re-walk):
+- The dispatch thread WAITING for the worker. First implementation waited up to
+  750 ms (further capped by the interactive budget); removing the wait entirely
+  in favour of revoke-or-decline did NOT fix it.
+- Repost churn. Publication no longer fires `OnSymbolsLoaded` per module; the
+  session reposts once per drain. Did not fix it.
+- Locals re-parse storms. `GetLocalsForFunction` now serves a provisional cache
+  instead of re-waiting per lookup. Did not fix it (that run was WORSE: 3).
+- Publishing while the debuggee runs. Publication is confined to stops; that DID
+  fix a separate, real bug (missed breakpoints), but not the timeout.
+
+NEXT STEP when this is picked up: get the adapter's own log for a hung run.
+`DAP_LOG=1` plus `RUNTESTS_ONLY=TDebuggerTestsBpl` in a loop until it fails,
+then find the largest timestamp gap in `%TEMP%\dap_adapter.log` (the file is
+append-only across adapter instances, so the whole run's history is there). The
+one thing NOT yet done is looking at where the adapter actually sits during
+those 30 s; every hypothesis above was reasoned, not observed.
+
+## DONE (the part that IS enabled): the concurrency work under the prefetcher.
+
+The "frames come back WITHOUT NAMES" complaint. Root cause was WHEN, not how
+fast: `HandleDllLoaded` parses a module only when a breakpoint already owns its
+source, so with no breakpoints -- the state right after attach -- nothing is
+parsed for any module and the first stop pays a full synchronous parse per
+module on the stack (measured 98-652 ms per real BPL; TD32 is 68-71% of it and
+is the only provider that names frames).
+
+Shipped, in dependency order.
+
+**Pre-existing concurrency hazards, closed FIRST (they were live before this
+change and this change would have made them frequent):**
+
+1. `RsmFileReader.SaveProcIndexToSidecar` enumerated `FProcLocals` / `FGlobals`
+   / `FTypeIdToName` / ... with NO lock, on the index thread, while the
+   dispatch thread mutated `FProcLocals` under `FLock` -- reachable today the
+   moment the 3 s interactive budget expires. Now serialises into a
+   `TMemoryStream` under `FLock` and writes the file with the lock released.
+   Byte stream unchanged.
+2. `LookupTypeName` (+ the three `Diag*` siblings) read `FTypeIdToName` /
+   `FClassHashCandidates` unlocked while wave 1 wrote them under `FLock`. A
+   `TDictionary` rehash under a read is an AV, not a wrong answer. Locked.
+3. `GetLocalsForFunction` pinned locals in `FProcLocals` even when
+   `WaitForIndex` had TIMED OUT, i.e. parsed against a half-built index with
+   blank/wrong type hints -- and pinned it for the session.
+   `WaitForIndex` is now `function: Boolean` (True = index actually ready). A
+   result derived from a not-ready index goes to a separate
+   `FProvisionalLocals` cache instead of `FProcLocals`: it is still served (so a
+   `variables` request expanding many children does not pay the whole
+   wait-and-reparse per child -- that alone could burn the interactive budget
+   several times over in one request) but it is dropped wholesale the moment the
+   index completes, so nothing derived from a half-built index survives.
+4. `TRsmFile.InteractiveDeadlineTicks` and `TInteractiveWaitGuard`'s depth are
+   now THREADVARs. As process-wide class vars a worker inherited the dispatch
+   thread's 3 s budget (abandoning its own index build) and cleared it on scope
+   exit (disarming F14 protection mid-stop).
+5. `TTD32FileReader` mutated itself on the hot path: `ResolveNameByIndex`
+   lazily built `FNamesByIndex` and did `FNamesCache.Add` (not AddOrSetValue).
+   The names table is now built during `LocateNamesSection` and `FNamesCache`
+   is deleted, so a loaded TD32 reader is immutable -- which is what makes it
+   safe to build one on a worker and hand it over.
+6. `TWinDebugger.GetStackFrames` stamped the frame cache with the revision read
+   AFTER the walk and sampled `AnyBackgroundIndexingPending` only before it.
+   Now snapshots the revision before and re-samples indexing after.
+
+**The feature:** `TSymbolPrefetcher` in `DebuggerCore\ModuleSymbolLoader.pas`
+(not in a frontend, so MCP gets it too -- it had no loader at all). One worker
+thread; value-snapshot requests in, finished unregistered readers out;
+publication on the dispatch thread from `TDebugSession.Pump`. Design rules and
+the reasoning behind each are in `DAP_DEBUGGER_ARCHITECTURE.md` -> "Symbol
+prefetcher". The short version: claim the module before the worker starts;
+never mark a claimed module as tried; steal the request back rather than wait
+for it; publish only while stopped; one breakpoint repost per drain; enqueue
+last in `HandleDllLoaded`; never enqueue from the stop path.
+`NO_SYMBOL_PREFETCH=1` disables it.
+
+THE ONE THING THAT MUST NOT BE REVERTED: `PrefetchBlocks` never waits. An
+intermediate revision let the dispatch thread wait briefly (750 ms, further
+capped by the 3 s interactive budget) for a parse already under way. That alone
+reproduced the exact failure that got the previous background loader disabled --
+one request per full-suite run timing out in `TDebuggerTestsBpl`, always
+`seq=6`, always zero failures in isolation. Proven by running the full suite
+with `NO_SYMBOL_PREFETCH=1` (clean, 0 errored) against the same build with it
+enabled (1 errored per run). A bound is not enough: publication, breakpoint
+reposting and further module loads all run on the dispatch thread and compound.
+Revoke-or-decline only.
+
+**Removed:** the shelved `DAP_BG_LOADER` code in `DapServer.pas`
+(`StartSymbolLoader` / `StopSymbolLoader` / `ParseDllReaders` /
+`RegisterParsedModule` / `EnqueueBackgroundLoad` / `ResolveDcpPath` /
+`TModuleLoadReq` / `TParsedDllReaders`, ~280 lines). It registered the module
+MAP with `AddProvider` (UNSCOPED) where the synchronous path uses
+`AddProviderForModule` (RVA-range-scoped), so the provider topology depended on
+which path won a race; and `StopSymbolLoader` called
+`TThread.RemoveQueuedEvents(nil)`, which cancels queued main-thread events
+process-wide.
+
+**Added:** DAP sends `invalidated(stacks)` when the prefetcher registers
+providers while stopped, so a stack already drawn with nameless frames is
+re-fetched without the user doing anything. MCP needs nothing equivalent: it
+re-reads on every request and the frame cache is revision-keyed.
+
+Tests (4 new): `RsmReaderTests.WaitForIndex_ReportsWhetherIndexWasReady`,
+`RsmReaderTests.InteractiveDeadline_IsPerThread`,
+`DebugSessionTests.Prefetch_NoBreakpoints_LoadsRuntimePackageSymbols` (the
+"when" regression: two packages load, no breakpoint exists anywhere, both must
+end up with symbols -- before this change neither would),
+`DebugSessionTests.Prefetch_ModuleLoadedSynchronously_IsNotParsedAgain`
+(single-load-path: no claim on a module the dispatch thread already loaded, and
+no duplicated locals from a double registration).
+
+THE TRADE, stated plainly: a frame whose module happens to be MID-PARSE on the
+worker now comes back nameless for that one request, where before it came back
+named after a synchronous parse. It self-corrects -- the provider-set revision
+bump invalidates the frame cache and the DAP pushes `invalidated(stacks)` -- and
+it is the deliberate price for never blocking the loop. The common case moves
+the other way: a module parsed at its LOAD_DLL event is already registered when
+the stop happens, so its frames are named immediately AND cost nothing.
+
+MEASUREMENT, honestly: the fixtures CANNOT show a change in named-frame count
+at a first stop. Every fixture stop has a breakpoint in the module it stops in,
+so the synchronous eager gate loads that module before the stop in both the old
+and the new code; and the neutral core's `TModuleSymbols.ContainsSourceFile` is
+deliberately conservative (True whenever any sidecar path is set, which is
+always), so at DebugSession level ANY breakpoint makes the gate load EVERY
+module. What is measurable is the state the new test asserts: with no
+breakpoint, a runtime-loaded package went from "no symbols, ever, until a stop
+touched it" to "symbols already registered".
+
+KNOWN NARROW HOLE (accepted, documented): a breakpoint SET WHILE THE TARGET IS
+RUNNING, in a module whose prefetch the worker has already started, does not
+bind on that call -- the sweep declines rather than waits, and publication is
+held until the next stop. It binds at that stop (the drain reposts). Modules
+that own a breakpoint at their LOAD_DLL event are never affected: the eager gate
+loads them synchronously and `EnqueuePrefetch` then skips them entirely.
+
+NOT DONE, deliberately:
+- `WarmupSymbolProvidersForEvaluate` (`DapServer.pas`) is still O(N) over every
+  eligible module. It is not restructured; what defuses it in practice is that
+  the prefetcher has normally already loaded those modules, so the loop's
+  `EnsureModule*` calls find everything registered. A launch config naming a
+  module in a shared BPL output directory with prefetch disabled still has the
+  7-55 s worst case.
+- The prefetcher stays single-worker. Bounded on purpose: `TRsmFile` fans its
+  index build out with `TParallel` and `TMapFile` forks its own thread, so more
+  prefetch workers would oversubscribe the shared pool against the very stop
+  they are meant to help.
+- `TDebugSession`'s conservative `ContainsSourceFile` still makes the eager
+  gate load every module once any breakpoint exists (the DAP overrides it with
+  an authoritative PACKAGEINFO check; MCP does not). Worth fixing separately --
+  it is the reason MCP does more synchronous work at module-load than DAP.
+
+## DONE: cold symbol-index build -- 2.2-2.4x faster AND reproducible (2026-07-20).
+
+Complaint: at a breakpoint in a real app, symbol data is not ready yet, which
+"makes a bad impression". Three profiling passes were run first; this change set
+takes the measured wins and skips the rest with reasons.
+
+Shipped (`DebuggerCore\RsmFileReader.pas`, `DebuggerCore\MapFileReader.pas`):
+1. Sidecar writers go through `TBufferedFileStream` instead of a raw
+   `TFileStream`. The per-field `WriteBuffer` calls were one `WriteFile` syscall
+   each (~246,000 / 2.9 MB on cxLibraryRS29.dcp at ~2.4 us apiece): 585 -> ~10 ms.
+   Same one-line fix in `TMapFile.SaveUnitIndexToSidecar`.
+2. `ParseUserTypeTable`: the nested `MatchesAt` / `LooksLikeTypeRefAt` are now
+   prefiltered at the call site (64-bit compare / tag byte). Nested functions
+   carry a static link and can never be inlined, so every byte of the file paid
+   a real call. Same trick in `FindUserTypeTableAnchor` (18-byte anchor: reject
+   on the first 8 bytes with one compare).
+3. `ParseTypeInfoSection` + `ExtractTypeInfoNames`: the 8-byte `$08 00 ...`
+   TypeInfo prefix is one unaligned `PUInt64` compare instead of 8 byte compares.
+4. The index build now runs in TWO WAVES (producers, then consumers) instead of
+   one flat fan-out; `IndexClassMemberRecords` joined wave 1. This fixes a
+   LOSSY, NON-DETERMINISTIC build: consumers resolved type hints against
+   dictionaries the producers were still filling, so three cold builds of the
+   same TestTarget.rsm gave three different sidecars (699427/699421/699428 bytes),
+   all short of the sequential 699512, and the degraded index was cached in the
+   `.idx`. Also removes an unlocked concurrent `TDictionary` read (AV risk) in
+   `LookupTypeName`. See `DAP_DEBUGGER_ARCHITECTURE.md` -> Threading model ->
+   Symbol index build.
+
+New tool `DevTools\PrebuildIdx.dpr` (`-r -j N -verify -force`): builds `.idx`
+for a whole directory offline; `-verify` SHA-256-compares against the existing
+sidecar (that is the byte-identity harness for any future parser change).
+
+Cold build, median of 3, page cache warm, sidecar deleted per run
+(probe `C:\Athens\__ClaudeTools\IdxVerify`):
+| input | before | after |
+|---|---|---|
+| cxLibraryRS29.dcp 45.5 MB | 1200 ms | 523 ms |
+| Spring.Base.dcp 36.9 MB | 907 ms | 374 ms |
+| Tee929.dcp 4.2 MB | 106 ms | 57 ms |
+| SampleApp.rsm 2.2 MB | 58 ms | 31 ms |
+| DapAdapter.rsm 17 MB | 399 ms | 164 ms |
+| TestTarget.rsm | 299 ms | 107 ms |
+
+All six sidecars are now byte-identical to a fully sequential reference build
+and stable across runs (6 consecutive SampleApp builds: one hash).
+
+SKIPPED, with reasons (do not re-walk):
+- Container-aware `ParseUserTypeTable` (skip the System-anchor scan and the
+  TypeInfo fallback on `.dcp`): would have been ~17% before item 2, but items 2
+  and 3 already removed most of that cost, and it is the only proposal that is
+  NOT byte-identical by construction (it would need a diff across the 622-file
+  DCP corpus to justify). Not worth the risk now.
+- Chunked/parallel `IndexClassMemberRecords` (x11 on the phase, -20% end to end):
+  measured to change the output on 1 of 4 inputs (TestTarget.rsm) because a chunk
+  boundary lands inside a record the serial scan had skipped. Needs a boundary
+  arbitration rule first.
+- Pointer-cursor sidecar DECODER (warm load 17 -> 15 ms on the biggest file):
+  ~130 lines of second decoder to keep in lockstep with the format for ~3 ms.
+- Hand-written sidecar encoder (7 vs 10 ms after buffering) and pre-sizing the
+  buffer: measured, not worth the code.
+- Compiling `DebuggerCore` with `-$O+`: MEASURED, only ~5% (636 -> 601 ms on
+  cxLibraryRS29.dcp with the adapter's own `-$O- -$R+ -$Q+` flags). The scans are
+  memory-bound, not codegen-bound. Not worth losing a debuggable adapter build.
+- Moving `SaveProcIndexToSidecar` after `FIndexReady := True`: unsafe (the saver
+  enumerates containers that lazy lookups mutate), and pointless now that the
+  write is ~10 ms.
+
+NOT DONE -- the headline "frames come back WITHOUT NAMES" is a DIFFERENT bug:
+`TRsmFile` does not implement `IFunctionNameProvider` at all (only
+`TD32FileReader`, `MapFileReader`, `JclDebugReader` do). Frame names are gated on
+`EnsureModuleTD32/Map/Jcl` having run for that module, which happens lazily at
+the stop (`DebugSession.pas:1141-1145`, uncapped, ~157 ms of synchronous TD32 per
+module). The `.idx` governs the SECOND symptom: locals/types arriving late. NEXT
+STEP for the nameless frames is the WHEN work (module-load enqueue + single load
+path, TASK_RESUME "BACKGROUND SYMBOL LOADER" below), not more parser speed.
+
+## DONE: F23 -- a nameless frame was silent about WHY it had no name (2026-07-20).
+
+Live after attach: paused frames rendered with an EMPTY function name and nothing
+else. Three different situations produced that same rendering (address in no known
+module / module without debug info / module whose index is still building), and
+`TSessionFrame.ModuleName` was declared but NEVER assigned, so `McpJson`'s
+`if F.ModuleName <> ''` guard could not fire and the DAP degraded to a bare `0x…`.
+
+Shipped (additive; no change to WHEN symbols load, `HandleDllLoaded` untouched):
+- `DebugInfoTypes.pas`: `TSymbolAvailability` (`saUnknownModule` / `saNoSymbols` /
+  `saIndexing` / `saLoaded`) + `SymbolAvailabilityName` (shared wire spelling).
+- `ModuleSymbolLoader.pas`: `TModuleSymbols.SymbolAvailability` (a provider is
+  asked whether it is indexing ONLY if registered -- an unloaded `TMapFile` reports
+  "pending" because it never started) and `TModuleSymbolLoader.DescribeAddress`,
+  which also covers the MAIN exe via `ImageBase` + PE `SizeOfImage` (`FMainImageSize`),
+  since the exe is deliberately NOT in the runtime registry.
+- `TSessionFrame.Symbols` + `ModuleName`, filled in `TDebugSession.FrameToSession`.
+- MCP: always emits `symbols`, plus `module` when known. DAP: `moduleId`, and
+  `NamelessFrameLabel` renders `0x… (module: reason)`.
+- `TWinDebugger.GetStackFrames`: cache neither SERVED nor STORED while
+  `AnyBackgroundIndexingPending` -- an incomplete symbolication used to be pinned
+  for the whole stop. (The seed-captured cache key from earlier today is intact.)
+
+Test: `DebugSessionTests.Frames_NoDebugInfoModule_ReportModuleAndSymbolState`
+(launches `NoDebugExe.exe` with stopAtEntry; asserts blank name BUT
+`ModuleName = 'nodebugexe.exe'` and `Symbols = saNoSymbols`).
+Suite: 856 found / 854 passed / 0 failed / 2 ignored.
+
+Root fix NOT taken on purpose: symbolicating every module during the attach burst
+is O(N) synchronous parsing on the pump thread = the F14 freeze class
+(`DebugSession.pas:1020-1029`). See the F23 entry in `MCP_LIVE_FINDINGS_TODO.md`.
+
+Measured with a throwaway probe (`C:\Athens\__ClaudeTools\FrameCacheProbe`): the
+"indexing pending" window IS real in the fixtures at a stopAtEntry stop, but the
+frames blank there are `kernel32.dll` / `ntdll.dll` -- genuinely `saNoSymbols` --
+so no name was observed to appear on retry; the fixture MAP index finishes far
+faster than any frame it would resolve is needed.
+
+## DONE: F19 -- step_into stopped at the callee's ENTRY, before the prologue (2026-07-20).
+
+Reported live on a real application: `step_into` into a method reported at the
+function's ENTRY address, so the first thing shown was garbage --
+`Self = -1232 (0xFFFFFB30)`, correct type, expandable: false -- and one extra
+step_over turned it into the real instance. A normal breakpoint on the SAME first
+statement was verified correct (it binds to the line-table address, past the
+prologue), which is why this looked like a value-decoding bug.
+
+Root cause (`DebuggerCore\Win64Debugger.pas`, `EXCEPTION_SINGLE_STEP` / `smInto`):
+the entry address ALREADY maps to a source line, so the naive `AtNewLine` test
+("a source line different from where the step started") is satisfied by the
+callee's very FIRST instruction -- RBP still the caller's, no register argument
+spilled to its home slot. Every `[rbp+N]` read is the caller's frame.
+
+Fix: new `TWinDebugger.FunctionBodyStartVA(VA)`. When an `smInto` landing would be
+reported and the body start is still ahead, plant a one-shot BP there and resume
+full speed; the existing run-to-`FStepOverVA` path reports it as a step. A one-shot
+BP rather than more single-stepping because a preamble may CALL (managed-local
+init, stack probes) and single-stepping would dive into sourceless RTL and
+resurface mid-preamble.
+
+TRAP measured en route: **`UNWIND_INFO.SizeOfProlog` alone is NOT the boundary.**
+Disassembling `TWidget.StepIntoProbe` (`DumpFunc.exe ... 15D2B0`):
+`push rbp; push rbx; sub rsp,68h; mov rbp,rsp` = SizeOfProlog 9, and only THEN
+`mov [rbp+80h],rcx; mov [rbp+88h],edx; mov [rbp+90h],r8; movsd [rbp+98h],xmm3`.
+Stopping at entry+SizeOfProlog gave a correct-looking `Self` (its home slot lands
+in the caller's stack area and happened to hold the right object) but `AInt = 1`.
+So the boundary is the LINE TABLE: the first address inside the function whose
+line record differs from the ENTRY's record -- exactly where a BP on the first
+statement binds. `.pdata` still supplies the function extent (Begin/EndAddress)
+and the `SizeOfProlog` fallback for a routine written entirely on one line (and 0
+for leaf/frameless/chained, so such a routine still stops at its first
+instruction). Everything unknown -> 0 -> previous behaviour.
+
+Test: `DebugSessionTests.StepInto_Method_ReportsSpilledSelfAndParams` + fixture
+`RunStepIntoPrologue` / `TWidget.StepIntoProbe(AInt, const AStr, ADbl)` in
+`TestTargetCore.pas` (markers `STEPIN_CALLSITE` / `STEPIN_PROBE_BODY`). RED output
+was `Self is not a live instance after step-into (value: 4668256 (0x473B60))`.
+
+Collateral: `DebuggerTests.Test_Step_Over_FromFunctionEntry_LandsNextLine` reached
+the pre-prologue entry stop BY step-into and asserted it landed on the `begin`
+line -- it encoded the bug. Its real subject (step-over from an entry-RSP stop)
+is preserved by reaching the entry with a BREAKPOINT on the `begin` line instead.
+
+Full suite: **854 found / 852 passed / 0 failed / 0 errored / 2 ignored**
+(baseline 853/851/0/2; +1 is the new test). Not committed -- awaiting review.
+
+## DONE: dbghelp never learned about runtime-loaded modules (2026-07-20).
+
+Root cause of a whole class of "one frame only" / "step-out went nowhere" reports.
+`SymInitialize(FProcess, nil, True)` ran ONCE, lazily, at whichever came first --
+`GetStackFrames` or `CallerReturnAddress`. `fInvadeProcess=True` enumerates only the
+modules mapped AT THAT INSTANT, and `HandleLoadDll` told our own MAP/RSM/TD32 loader
+about later modules but never told dbghelp. Inside such a module
+`SymFunctionTableAccess64` returns nil, so `StackWalk64` silently falls back to the
+AMD64 LEAF convention (`return address := [RSP]`). Just past a Delphi prologue
+(`push rbp; sub rsp,N; mov rbp,rsp`) RSP == RBP, so `[RSP]` is an uninitialised local
+-> the walk ends after ONE frame; after the function has made a CALL, `[RSP]` is
+address-like -> a long bogus chain. Whether it bit depended purely on WHEN the first
+stack walk happened: a client that walks the stack at the entry stop (VS Code does)
+armed it for the rest of the session.
+
+Same nil function table broke `CallerReturnAddress`, so `step_out` degenerated: both
+its `StackWalk64` calls failed -> `RetAddr = 0` -> the fallback flipped to `smInto`
++ TF WITHOUT seeding `FStepFromLoc`/`FStepHasFromLoc` and without resetting
+`FStepSafetyCount`, so the FIRST trap satisfied `AtNewLine` and reported a successful
+step 3-7 bytes later, inside the same function.
+
+Fixed in `DebuggerCore\Win64Debugger.pas`:
+1. **ROOT CAUSE (explicit per-module registration, the preferred option).**
+   `EnsureSymInitialized` (still lazy -- the invade sweep is what covers the MAIN EXE,
+   which never gets a LOAD_DLL event) + `RegisterModuleWithDbgHelp` called from
+   `HandleLoadDll` (`SymLoadModuleExW`, wide variant for non-ASCII paths) +
+   `SymUnloadModule64` in `HandleUnloadDll`. Registration is a no-op while
+   `FSymInitialized` is False -- the pending invade will see that module anyway --
+   which is what keeps the ordering problem from becoming a regression.
+   `SymRefreshModuleList` was NOT used: it re-scans the whole module list on every
+   walk, and we already have the exact base/size/path in hand at load time.
+   TRAP measured en route: `SYMOPT_DEFERRED_LOADS` (tried as a perf guard, since we
+   now touch dbghelp once per DLL and never ask it for symbols) BREAKS the fix --
+   the function-table callback does not reliably materialise a deferred module, so
+   unwind info goes missing again. It cost the whole `Test_ClosureParam_*` BPL set
+   (853/850/1/2, and 3/16 failing in isolation with a different subset each run --
+   it looked flaky, it was not). Only `SYMOPT_FAIL_CRITICAL_ERRORS` is set now, and
+   the constant block carries the warning.
+2. **SILENT SUCCESS (bogus INT3).** `IsPlausibleReturnAddress` (executable + inside a
+   module `SymGetModuleBase64` knows) now gates the `PlantInt3` in `ckStepOut` and in
+   the smInto sourceless pivot. A leaf-convention guess used to be patched blindly.
+3. **SILENT SUCCESS (step-out that isn't).** The `ckStepOut` smInto fallback seeds
+   `FStepFromLoc`/`FStepHasFromLoc`, resets `FStepSafetyCount`, and sets the new
+   `FStepMinSP`; the smInto stop test requires `RSP > FStepMinSP`, i.e. the frame was
+   really left. Cleared in `ReportStopped` and at every other step start.
+4. **Frame cache.** The key was WRITTEN from the `Ctx` that `StackWalk64` mutates into
+   each unwound frame, but COMPARED against the live seed -- so a healthy walk never
+   hit the cache while the degenerate 1-frame case did. Now captured as
+   `SeedRip`/`SeedRsp`/`SeedRbp` before the loop (the synthesized-frame0 fallback and
+   its log line use the seed too, which is what they always meant).
+
+Test: `DebugSessionTests.Bpl_StackWalk_AfterEarlyWalk_ResolvesFramesAndStepsOut`
+(TestTarget.exe `--load-package`, StopAtEntry, ONE GetCallStack at entry to arm the
+bug, BP at `TestPkgUnit.pas` `{BP:PKG_INNER_BODY}`, assert >= 3 frames + frame 1 is
+`PkgAdd`, then step_out must leave `PkgInner` at a strictly higher RSP). RED before
+the fix with exactly "got 1"; A/B verified by temporarily removing the entry walk
+(passed), which pins the trigger. Helpers added: `PackageSrc`, `MarkerLineInFile`
+(`MarkerLine` now delegates to it).
+
+Full suite after the fix: **853 found / 851 passed / 0 failed / 0 errored / 2
+ignored** (baseline was 852/850/0/2; +1 is the new test). Not committed -- awaiting
+review.
+
+## DONE: fresh-clone portability pass (2026-07-20). Commits 714bcac..bb96cc6.
+
+Triggered by the observation that the docs cited diagnostic tools living OUTSIDE
+git. Audited every out-of-repo absolute path in the repo (289 hits) and the ~75
+probe folders in the scratch tree.
+
+- **Nine reusable probes are now DevTools tools**, argv-driven, no hardcoded
+  target: `JclProbe`, `ProcessEnumProbe`, `DumpTd32Globals`, `Td32LineLookup`,
+  `FindBytes`, `DumpRsmUses`, `ScanRsmConsts`, `RsmDiff` (four merged programs),
+  `StepPerf`. Everything else was a one-off whose finding already lives in the
+  specs.
+- **`build_all.bat` now DISCOVERS `*.dpr`.** A third of the tracked tools had no
+  build stanza and could not be built on a fresh clone. Guard on `%~xF` is
+  required: cmd's `*.dpr` also matches `*.dproj` (8.3 short names).
+- **`setpaths.bat`** resolves `JCL_ROOT` / `DUNITX_ROOT`; the hardcoded JCL and
+  DUnitX paths are out of the `.cfg` files (dcc64 reads those automatically and
+  they have no conditional syntax, so they were a hard build breaker off this
+  machine). JCL is NOT optional: `DebuggerCore\JclDebugReader.pas` needs it.
+- **42 dead doc references repaired** (54 edits, 7 files). Findings kept
+  verbatim; only pointers changed. Worst was a copy-pasteable command block in
+  PROJECT_STATE.md's "stable build/run commands".
+- `.gitattributes` added -- CRLF was convention-only and three files had drifted
+  to LF.
+- Deleted two stale out-of-tree forks of `Win64Debugger.pas` / `DebugInfoSet.pas`
+  (6 weeks old, 1501 / 628 lines diverged) that a future session could have read
+  instead of the repo.
+
+Suite after every step: 851 / 849 / 0 / 2. TRAP found and fixed en route:
+`build_and_run.bat` had its own copy of the RunTests compile line instead of
+calling `build_runner.bat`, so it went stale the moment the search paths moved.
+
+NEXT: field test on SampleApp (see below) -- blocked on the user rebuilding the
+target (9 sources newer than the 17/07 exe) and reconnecting the MCP server.
+Re-check F9 (step_into into a not-yet-loaded BPL mis-resolves the line), F15
+(worker-thread stacks), F16 (on-clause `E:` deref), plus live validation of the
+round-3 fixes.
+
+## DONE: wrong-PLACE audit ROUND 3 + 7 fixes (2026-07-19).
+
+Audited LOCATION / ATTRIBUTION (right value, wrong place). 8 suspects, analyse +
+adversarially refute: **8 confirmed, 0 refuted** -- this axis had never been
+examined. 7 fixed (each full-suite green, 851/849/0/0/2), 1 documented as a hard
+limit. Full record in `KNOWN_UNKNOWNS.md` ("Wrong-PLACE audit -- round 3").
+1. **(HIGH) Cross-thread frame selection** -- clicking a frame of a non-stopped
+   thread read the STOPPED thread's stack (frame cache was not thread-qualified;
+   DAP frame ids are bare indices). Fixed + tested (`65ec2e5`).
+2. **MAP 1 GB window** -> foreign addresses attributed to a loaded module.
+3. **MAP unbounded nearest-preceding public** -> address named after a DATA symbol
+   or a far-away routine (`PublicCanContain`). (2+3 = `23bc0c9`)
+4. **TD32 line borrowed across a function end** -> frame reported in another unit's
+   file; now bounded by the owning proc's EndRva. (`23bc0c9`)
+5. **Watch resolved a same-named function in the WRONG MODULE** (unit linked into
+   exe + package); both tiers now prefer the frame's module window.
+6. **Step-over ended in a deeper RECURSIVE frame** (nested returns share the return
+   address); expected post-return RSP now gates the resume BP. (5+6 = `2d31498`)
+7. **Breakpoint bound to the wrong module's same-basename file** while reporting
+   verified; `SourceLineToRvaCandidates` + plant every candidate.
+STILL OPEN (low, HARD limit): same-basename SOURCE FILE cannot be disambiguated --
+TD32 NAMES has no directory, so a frame in DOA's `Oracle.pas` can open DGOdac's.
+Mitigations (keep a rooted path when a provider supplies one; warn on an ambiguous
+basename) are described in KNOWN_UNKNOWNS.
+
+## DONE: wrong-data audit ROUND 2 + 4 fixes (2026-07-19).
+
+Round 2 audited the "compute a VALUE" paths (8 suspects, analyse + adversarially
+refute): 6 confirmed, 2 refuted. Four fixed, all with tests; full record in
+`KNOWN_UNKNOWNS.md` ("audit round 2"). Ranked by impact:
+1. **setVariable corrupted a NEIGHBOUR variable** -- a 3-byte set slot got a 4-byte
+   write (exact provider size discarded, packing table rounded 3->4). This wrote
+   wrong bytes INTO the debuggee. Sets are byte-granular now; store is a
+   little-endian loop (`case 1,2,4` could not emit 3/5/6/7 and wrote zeros).
+2. **UTF8String / non-default-code-page AnsiString** decoded with the system ANSI
+   page -> mojibake. Now uses `TStrRec.codePage` (Word at `Ptr-12`).
+3. **Enum ordinal display** masked 4 bytes over an 8-byte read -> an uninitialised
+   enum showed the neighbouring local's bytes. Masked to real storage width.
+4. **Enum member name** masked `and $FF` -> ordinal 260 displayed as member `e4`.
+   Masked to real storage width.
+5. **Small POD record return** (<=8 bytes) is packed in RAX, but every record went
+   through the hidden var-out slot -> watch showed a bogus zero (and the slot arg
+   shifted the user args). Size-routed now; shows the packed value.
+STILL OPEN (low): typeless MAP-only global reads 8 bytes and folds the next
+global's bytes (fix: clamp to the gap to the next DATA public RVA).
+New test infra: `TFakeMemTarget` (fixed-memory `IDebugTarget`) + `TFakeEnumSizeProvider`
+in `ValueReaderTests.pas` -- deterministic unit tests for the memory/type heuristics.
+
+## DONE: wrong-data heuristic audit (2026-07-19).
+
+Adversarial multi-agent audit of the object/value-guessing heuristics (8 suspects,
+analyse + adversarially-refute). Result: 1 MEDIUM fixed, 2 LOW deferred, 5 refuted.
+Full record in `KNOWN_UNKNOWNS.md` ("Wrong-data heuristics — audit 2026-07-19").
+- **FIXED (medium):** `LooksLikeVariantAt` auto-accepted varInt64/varUInt64
+  unconditionally -> any untyped local == 20/21 shown as a Variant reading the
+  NEIGHBOUR slot as the payload. Now falls through to False like varSmallint/
+  varInteger. Added reusable `TFakeMemTarget` (a fixed-memory `IDebugTarget` fake)
+  in `ValueReaderTests.pas` + `VariantAutoDetect_*` tests.
+- **DEFERRED (low x2):** closure-object recovery has no reverse link (raw
+  Pointer/Int64 local can latch an unrelated nearby `$ActRec`); dyn-array `^T`
+  header can alias a real header (cross-type). Both need careful fixes (regression
+  risk to shipped closure/array display); scenarios + fix hints in KNOWN_UNKNOWNS.
+- **REFUTED (5):** closure-self fallback, interface->object, IsClassInstance,
+  PickPauseReportTid, by-name-locals-lastwins -- all correctly report current target
+  memory / hold under the non-optimised-target + Delphi ARC invariants.
+
+## DONE: closures endgame — anon-method params (2026-07-19).
+
+Investigating the "closures endgame (TD32 FIELDLIST)" roadmap item found the CORE
+already shipped: captured vars expand from the TD32 `$ActRec` FIELDLIST in every
+scenario (mono/BPL/NO_RSM), tests un-gated and green (commits `ca9cee9`/`1dbcb0e`/
+`d7c2324`). The docs' "RSM-format-only / FIELDLIST deferred" notes were stale; fixed.
+
+The only genuine remnant — the anon body's OWN declared param (`procedure(X: Integer)`,
+`Clo(7)`) — is now DONE via a general param decoder (option "build the real param
+decoder"). Proven by a one-off closure-param probe (finding recorded here) that no provider
+carries the anon-body frame's slots, but the `$ActRec` FIELDLIST DOES carry the
+`$0$Body` method reachable to its ARGLIST.
+
+What shipped:
+- **TD32 method-signature decode.** New `IMethodSignatureProvider.TryGetMethodParams`
+  (`DebugInfoTypes` + `TD32FileReader`, aggregated in `DebugInfoSet`): on-demand walk
+  of the class FIELDLIST for LF_METHOD/LF_ONEMETHOD by name -> LF_METHODLIST (entry =
+  attr(2)+mfunction(4)) -> LF_MFUNCTION (parmCount@14, argList@16, thisType@8) ->
+  LF_ARGLIST (Borland: count(u16) + count*type(u32)). `$`->`_` class-name retry like
+  GetClassMembers. Does NOT touch the bulk type parse.
+- **Win64 ABI mapping.** New `IDebugTarget.CurrentFrameParamHomeAddr(paramIndex)`
+  (`DebugTarget` + `Win64Debugger`): RBP + subRspN + extraPush + 16 + 8*index (same
+  anchor `ReadParentFramePointer` uses; mirrors `GetLocalValues` active/top frame pick).
+- **Surface.** `TDebugSession.AppendAnonMethodParams` maps each declared param (Self
+  is ABI slot 0, declared params start at slot 1) to its home slot, reads + formats
+  via `LocalToSession`. Params have no names in a CV ARGLIST -> labelled `arg1..argN`.
+- **Tests.** `arg1`=7 in `Test_Closure_CapturedVarsVisibleInBody`, plus a rich
+  `RunClosureParamSampler` fixture (markers `CLOP_*`) + `Test_ClosureParam_*`
+  covering 8 signatures: 2 ints, string, Double (XMM), Int64, Boolean, object
+  (`$addr (TParamObj)` + expandable), mixed int/string/float/bool, 6 ints (stack
+  spill past the register home area). All green mono/BPL/NO_RSM.
+- **Bug fixed en route (`TryFindClosureSelf` stale object).** The closure Self was
+  found by a blind register/stack scan for any VMT-valid `$ActRec`; with >1 closure
+  fixture live it could latch a STALE `$ActRec` from an earlier closure -> wrong
+  class/methods. Now Self is read directly from its ABI home slot
+  (`CurrentFrameParamHomeAddr(0)`); scan kept as fallback. + per-param try/except so
+  one bad param can't drop the other locals. + the object-param fixture uses a
+  dedicated marker-free `TParamObj` (TWidget's ctor owns the CTOR_BODY marker).
+  Limits: values masked by type width; a `var`/`const` scalar param shows the passed
+  pointer; params surface only for a CAPTURING closure.
+
+## DONE: per-thread stepping (2026-07-19). Suite green 822/820/0/0/2.
+
+Step over/into/out now act on the DAP/MCP-selected thread and freeze every other
+thread for the duration of the step, so only the stepped thread advances. Read-only
+per-thread inspection was already done; this closes the run-control gap.
+
+What shipped (all 4 parts of the plan):
+- **Plumb threadId.** `TCommand.ThreadId: DWORD` (0 = stopped thread) in
+  `DebugTarget.pas`. `TDebugSession.StepOver/Into/Out(ThreadId: DWORD = 0)` set it.
+  `DapServer.HandleNext/StepIn/StepOut` read `Args.threadId` via new
+  `StepThreadFromArgs` (validated against `GetThreads`, else 0). MCP `step_*` tools
+  read a `threadId` arg (`McpServer` + schema `threadId` prop).
+- **Retarget the step handler** (`Win64Debugger.ProcessCommandQueue` ckStep* cases):
+  `var StepTid := Cmd.ThreadId; if StepTid = 0 then StepTid := FStoppedTid;` then
+  `CurrentRIP/CurrentRSP/CallerReturnAddress/SetTrapFlag` all use `StepTid`.
+  `UnpatchBpAtRip(Tid=0)` gained a thread param (defaults to `FStoppedTid`).
+  `ResumeTid` intentionally still returns the EVENT thread (`FStoppedTid`), not
+  `StepTid`, so `ContinueDebugEvent` releases the correct pending event.
+- **Freeze others** (the delicate part). New `FStepTid`/`FStepFreezeActive`/
+  `FStepFrozenTids: TList<DWORD>`. `FreezeThreadsForStep(StepTid)` `SuspendThread`s
+  every other thread before `ReleasePendingEvent`; `ThawStepFrozenThreads` resumes
+  them at the single choke point `ReportStopped` (covers breakpoint/step/exception/
+  pause/entry). `HandleCreateThread` freezes a mid-step newborn; `HandleExitThread`
+  drops an exiting thread from the set and, if the STEPPED thread exits mid-step,
+  thaws all + clears step mode (no all-frozen deadlock); `HandleExitProcess` clears
+  the bookkeeping. Persistent-BP re-arm gated on the owning thread via new
+  `FReactivateTid` (set with `FPendingReactivateVA`; both re-arm checks gated) so
+  stepping a different thread doesn't steal/lose a pending re-arm, and a 2nd thread
+  hitting the same BP VA is a real hit, not a swallowed re-arm.
+- **Test.** `DebugSessionTests.PerThreadStep_StepsOnlySelectedThread` +
+  fixture `RunPerThreadStepFixture` in `TestTargetCore` (switch
+  `--run-per-thread-step`; markers `STEPISO_MAIN`/`STEPISO_SPIN_B/C`; globals
+  `GStepIsoB/C/Stop`). Two spinner threads increment their own counter; stopping the
+  main thread and single-stepping ONE spinner advances only its counter (the other
+  stays exactly put) and retargets run control to it.
+
+Inherent limit (accepted, as in VS Code): if the stepped thread blocks on a lock
+held by a frozen thread the step cannot complete. The suite's step targets don't hit
+this. Docs updated: `PROJECT_STATE.md` (roadmap DONE + feature),
+`DAP_DEBUGGER_ARCHITECTURE.md` (Stepping per-thread targeting + limits).
+
+## Latest: debug-info roadmap quick wins (2026-07-18) -- pending final full-suite green
+
+Two roadmap items closed after the JCL work + live test on SampleAppSingleExe (a large
+proprietary Delphi Win64 application on the maintainer's machine, not present in a fresh
+clone; referred to as SampleApp throughout this file):
+- **"No debug info in any format" diagnostic -- DONE.** `TModuleSymbolLoader` now reports
+  once per module (runtime: `LoadModuleSymbols` via `HasAnySymbols`/`NoSymbolsReported`;
+  main exe: `LoadMainModule` via `FMainProviderCount`) when NO TD32/.map/.rsm/.dcp/.jdbg
+  is found. Delivered via loader `OnConsole` (DAP routes to a console output event; MCP
+  frontend does NOT wire OnConsole, so DAP-only for now). New no-debug target
+  `DebuggerTests\TestTarget\NoDebugExe.dpr` (built with no debug switches in
+  build_target.bat + build_and_run.bat). Test
+  `DebugSessionTests.MainModule_NoDebugInfo_ReportsDiagnostic` (green in isolation).
+- **DCP linked debug info -- CONFIRMED no gap.** A BPL is covered by embedded TD32
+  (.bpl .debug section) + `.dcp` (RSM-format); both load (`DLL TD32 loaded` + `DLL DCP
+  loaded` in the two-BPL test) and the dual-scenario suite proves package code resolves.
+  No work needed. Both documented in `DEBUG_INFO_FORMATS_TODO.md`.
+
+### Follow-ups closed same session (2026-07-18), suite green 813/811/0/0/2:
+- **`.tds` investigation RESOLVED.** dcc64 DOES emit external `.tds` on Win64
+  (`-VT` = "Debug information in TDS"); header `FB09` = the SAME TD32/CodeView the
+  reader already parses. So `.tds` is a thin `TD32FileReader` variant (file-as-CV-blob
+  + companion PE section table for segment->RVA). NO current consumer (all builds use
+  `-V` embedded) -> documented recipe in `DEBUG_INFO_FORMATS_TODO.md`, implementation
+  deferred. Tool: `DevTools\TdsProbe.exe <tds-or-exe>`.
+- **"No debug info" diagnostic now visible in BOTH frontends.** `TDebugSession` wires
+  `FLoader.OnConsole := HandleLoaderConsole` (constructor + `ReleaseSymbolProviders`)
+  -> appends to `FDebuggerOutput` + `OnSessionOutput`. DAP overrides with its console
+  sink; MCP inherits -> loader notices (no-debug diagnostic, RSM/TD32/JCL load, stale
+  warnings) now appear in `get_debugger_output`. Test updated to assert via
+  `DrainDebuggerOutput` (the MCP path). Noted a latent pre-existing bug:
+  `ReleaseSymbolProviders` drops other frontend loader hooks on recreate (out of scope).
+
+### External `.tds` — IMPLEMENTED (2026-07-18), suite green 817/815/0/0/2:
+`TTD32FileReader.LoadFromTdsFile(TdsPath, ExePath, Shift)` reads the standalone `.tds`
+(dcc64 -VT) as the CodeView blob + the companion exe's PE sections/imports (second file
+mapping; `FBase`=exe, `FDebugBase`->tds). Wired: `ModuleSymbolLoader.LoadMainTds`
+(fallback when `LoadMainTD32` finds no embedded `.debug`) + `EnsureModuleTds`; `MainTD32`
+falls back to the tds reader. STALE-GATED (`.tds` older than the binary skipped, main +
+module). FORMAT QUIRK handled: external `.tds` offsets are `(segRel - ImageBase)` (vs
+embedded pure segRel) -> capture PE ImageBase in `FindDebugSection`, fold into
+`FSegmentVAs`, compute every CV address via `SegOffsetToRva` (32-bit truncation cancels
+the bias). Tests `TD32ReaderTests.Tds_*` + `DebugSessionTests.Tds_*`. Target
+`TdsSample.dpr` (`-VT`). Tool: `DevTools\TdsProbe.exe <tds-or-exe>`.
+
+Remaining roadmap: DCU (hard), JCL nested-proc linkage follow-up; per-thread stepping;
+generics/closures in variables; import-table reader; child-process tracking;
+disassembly; Win32; marketplace publish; progress-cue UI.
+
+---
+
+## Latest: JCL debug-info provider (P1) -- DONE pending final full-suite green (2026-07-18)
+
+Added `DebuggerCore\JclDebugReader.pas` implementing ISourceLineProvider +
+IFunctionNameProvider from JCL's `TJclBinDebugScanner` (linked `JCLDEBUG` section
+or sidecar `.jdbg`). Registered below TD32 / above MAP via `ModuleSymbolLoader`
+(`EnsureMainJcl` / `EnsureModuleJcl`). Opt-in define `JCL_DEBUG`, DEFAULT ON;
+`-D JCL_DEBUG_OFF` compiles out all JclDebug dependency (verified: 425-line
+compile, no JCL needed). JCL search paths added to adapter `.cfg`,
+`DebuggerTests\RunTests.cfg`, `build_mcp.bat` (harmless when define off).
+
+Verified on SampleAppSingleExe: JCL is address->location + proc-name only; NO
+line->address (SourceLineToRva=False, TD32 owns BP binding); NO `_ZZ` nested-proc
+linkage (JCL drops the mangled `$pdata$` publics -- 0 of 454k), so the SampleApp
+outer-scope gap is unchanged. Full findings in `DEBUG_INFO_FORMATS_TODO.md` (P1 DONE).
+
+Two bugs found + fixed during integration (both were regressions in the mono
+`Test_Bpl_TwoModules_EachBpRoutes`, adapter crash "Timeout waiting for stopped"):
+  1. TJclBinDebugScanner CacheData=True lazily MUTATES caches on first query;
+     adapter queries providers from 2 threads -> serialized with `FLock` + eager
+     cache prime at load.
+  2. ROOT CAUSE: JCL queried via the FLAT provider path with out-of-range
+     addresses (kernel VAs, $0) -> JCL clamps to wrong symbol AND range-errors
+     under the adapter's `{$R+}`. Fix: `InModuleCodeRange` guard (provider now
+     takes ImageSize -> answers only within [shift, shift+ImageSize) at/above the
+     $1000 code base). TD32/MAP don't hit this because they bounds-check internally.
+
+Smoke test `DebuggerTests\JclDebugReaderTests.pas` (8 tests, TD32 as oracle) +
+`build_jdbg.bat` generates `TestTarget.jdbg` (JCL `ConvertMapFileToJdbgFile`),
+wired into `build_and_run.bat`. Both JCL fixture (8/8) and the formerly-failing
+BPL test (2/2 both scenarios) now green. Full suite re-run in progress.
+
+Tool: `DevTools\JclProbe.exe <pe-or-jdbg>` (JCL Win64 compile + jdbg survey).
+
+---
+
+
+## Latest: MCP lifecycle bug fixes (2026-07-17) -- DONE, suite green 795/793/0/2
+
+Three bugs reported from a real DGOdacTests.exe MCP session. Details + probe in
+`PROJECT_STATE.md` ("MCP session/process lifecycle bugs"). Status:
+- BUG 2 session-stuck-after-terminate: FIXED. `TMcpServer.EnsureFreshSessionForStart`
+  recreates `FSession` from a terminal state (called in every launch/attach handler +
+  `PerformAttach`). Test `McpE2ETests.Relaunch_AfterTerminate_Succeeds`.
+- BUG 3 zombie-locks-exe: FIXED. `TWinDebugger.Terminate` kill path now `DrainUntilExit`
+  (pump `WaitForDebugEvent`/`ContinueDebugEvent` to the real `EXIT_PROCESS`, 3 s cap, then
+  `DebugActiveProcessStop` fallback) + `CloseTargetHandles`; `Destroy` delegates to it.
+  New `TDebugSession.DebuggeeProcessId`. Test `DebugSessionTests.Terminate_ReapsDebuggeeProcess`.
+- BUG 1 verified-BP-never-fires: NOT reproducible; the BP WORKS. `oracle.pas:2018` binds
+  uniquely+correctly to `TOracleQuery.FieldOptional @ $988A00` (TD32 NAMES basename-only;
+  DOA's line 2018 has no code record). A one-off repro harness (not retained) drove
+  `TDebugSession` directly against the real DGOdacTests.exe (a proprietary test binary on
+  the maintainer's machine, not present in a fresh clone) with the exact launch args:
+  `verified=True`, stops at `Oracle.pas:2018` in FieldOptional (reason=breakpoint) on the
+  FIRST continue, before any exception. So bind/plant/fire is correct; the user's original
+  non-firing was environmental / data-dependent / compromised-session, not a debugger bug.
+  No code change shipped for Bug 1.
+
+## Current task
+
+MCP FRONTEND over the shared debugger core (started 2026-07-13). Approved plan
+(volatile scratchpad, gone). Goal: a semantic MCP tool
+API (no raw DAP ids) letting Claude Code autonomously drive the debugger, reusing
+the engine. Architecture: extract a JSON-free `TDebugSession` core facade; DAP +
+MCP are two thin frontends. Attach-to-process is first-class. Extensible for a
+future Win32 target. Decisions (user-confirmed): full extract; vertical slice
+first; SEPARATE MCP exe (`DelphiDebuggerMcp.dpr`) — DAP adapter untouched.
+
+Phases: 0 = extract `TDebugSession` (no DAP behavior change; gate = DAP suite
+stays green). 1 = vertical slice (ProcessEnum + `list_debuggable_processes`,
+MessageChannel+TMcpIO+McpServer with launch/set_breakpoint/continue_and_wait/
+snapshot). 2 = attach + inspection. 3 = deferred (logpoints, changed-vars,
+exception config, run_until).
+
+### ENDGAME COMPLETE (2026-07-15): TDapServer is a thin frontend over one TDebugSession.
+
+DONE + shipped. Steps: 0 session superset (51c0e81), 1-2 engine-ownership pivot
+(9305b0b), 3 read queries (8cd16d4), 4 evaluate/EvaluateForFrame (b68300c), 5
+setVariable + ValueEncoders (2f85822), 6 breakpoints + single recolor (d30268f), 7-8
+goto + dead-code sweep (8b0f246). One engine + FDebugInfo/FLoader/FExpander/FBpEval,
+owned by the session; both DAP and MCP frontends sit on it. DapServer.pas ~5714 ->
+2877 lines over the whole dedup+endgame. Suite 792/790/0/2, 0 leaked, both fixtures.
+DAP retains only: transport+JSON, int-ref<->handle bimap+EmitVar, spinner/progress,
+eval warm-up+FEvalMissCache, exception-filter/rule config, launch.json parse, the
+(off) DAP_BG_LOADER wrapper, TDllModule/PACKAGEINFO, and FSession accessors.
+OPEN FOLLOW-UP (task #10, perf-only, non-blocking): the session's HandleDllLoaded
+eager-loads on any module load when HaveBreakpoints (ungated) -- port the PACKAGEINFO/
+ContainsSourceFile gate into it so a many-BPL host (SampleApp) does not repost-storm.
+
+### (SUPERSEDED) ENDGAME cursor — migrate TDapServer onto one TDebugSession.
+
+Dedup ladder DONE + shipped this session: TVariableExpander (83b92cc/cd34ca3),
+TBpEvaluator (dfb42c0), TrimRaisePlumbing+GetDisplayMembers (c552a39), PeSymbolSupport
+(77db745), TModuleSymbolLoader (ee00973). ~2000+ dup lines gone from DapServer.
+Now the endgame: TDapServer becomes a thin frontend over ONE TDebugSession (which
+owns FDebugger/FDebugInfo/FExpander/FBpEval/FLoader); DAP keeps only JSON transport,
+progress/spinner, the int-ref<->TVarHandle bimap + EmitVar, uses-scope warm-up +
+FEvalMissCache, exception-filter/rule config, launch.json parse, bg-loader wrapper.
+
+Map: workflow wf_5f83e196-c52. Decision digest (volatile scratchpad, gone).
+STAGED PLAN (each step green on BOTH mono TestTarget + BPL TestSubject fixtures):
+  STEP 0 (session superset, DAP UNTOUCHED -> can't break shipped adapter): add to
+    TDebugSession/DebugSessionTypes -- accessors (Expander/Loader/DebugInfo); injection
+    hooks (ModuleClass/RequiresFor/ShouldRetry + OnDllLoadedHook/OnModuleSymbolsLoaded
+    Hook); OnBreakpointChanged(file,line,verified); enrich TSessionFrame with FrameRBP/
+    FuncEntryVA/IP + SelectFrame(index)/ClearActiveFrame; GetThreads/GetStoppedThreadId/
+    GetThreadName; GetRegisters/SetRegister; ResolveSourcePath; EnsureMainRsm passthrough;
+    TStopInfo exception-description enrichment; TLaunchOptions/AttachOptions +modules-
+    config +exceptionRules +exceptionFilters wired in Launch/Attach; also fix the broken
+    RemoveAllBreakpoints (posts nothing today). Cover each with DebugSessionTests.
+  STEP 1: DAP constructs FSession; FDebugInfo/FLoader/FExpander/FBpEval/FReaders become
+    private accessors -> FSession.* (delete DAP's instances); DAP still builds FDebugger
+    but sets it on the session's single loader/debuginfo. First real dedup.
+  STEP 2 (the pivot, engine-ownership cut): HandleLaunch/Attach -> FSession.Launch/Attach
+    (session BuildAndWireDebugger owns the one TWinDebugger); delete DAP engine wiring;
+    subscribe OnSessionStopped/Exited/Output -> DAP emit; Run loop ProcessOneEvent->
+    Pump, HasExited->FSession.HasExited; Continue/Step*/Pause/Disconnect -> session.
+  STEP 3: read queries -> session (Threads, StackTrace via rich GetFrames, Scopes via
+    SelectFrame, Variables locals/registers/nested). STEP 4: evaluate -> session
+    EvaluateForFrame (DAP keeps warm-up+miss-cache). STEP 5: setVariable -> session
+    SetRegister/SetLocal/SetField (move encoders to core). STEP 6: breakpoints -> session
+    SetBreakpoints + DAP id-map + OnBreakpointChanged recolor. STEP 7: goto. STEP 8:
+    delete DAP's dead engine fields/handlers.
+  TOP RISKS (map): repost-storm/freeze in BPL (port PACKAGEINFO gate to session STEP 0);
+    verified-flip recolor lost (OnBreakpointChanged); double-free during ownership window
+    (session owns+frees, DAP holds accessors only); TSessionFrame too thin for frame-
+    select; evaluate warm-up/miss-cache regression (keep DAP-side); Pump stays launch-
+    thread. GATE: a step green on mono but not BPL is NOT committable.
+
+### (SUPERSEDED) Phase B — full-extract DAP variable expansion into the core.
+
+User approved Option A (kill the two-engine duplication; "we have tests"). The core
+had only 3 expansion kinds; DAP had 9 (getters, Variant arrays, props/events groups).
+Mapped both engines via workflow wf_9131ff4e-dd3 (digest: volatile scratchpad, gone).
+
+STAGE 1 (core parity + MCP feature) — CODE DONE, validating:
+- DebugSessionTypes: +vkGroup. DebugSession TSessionExpKind: +exPropGroup/exEventGroup/
+  exPropertyGetter/exVariantArray; TSessionExpansion: +NoGroup +VarArrPtr/VarBaseType/
+  VarDimCount/VarBounds. uses +System.Variants,System.Math.
+- Ported DAP-private classifiers into TDebugSession: IsEventHandlerProp,
+  ClassHasProperties, ClassHasPropertyKind, PropertyBackingFieldOffset. Added
+  FormatMemberValue (= DAP FormatRttiField: class '{T @ 0xADDR}'/'nil', record '{T}',
+  dynarray 'T[len]'/'(empty)', else FormatLocalValue) so core field VALUES now match
+  DAP byte-for-byte. MemberFieldToSession + BuildGroupNodes.
+- ExpandViaMembers: property-bearing class -> BuildGroupNodes (properties/event
+  handlers/fields). ExpandProperties (field-backed inline / getter deferred
+  '(expand to evaluate)' / indexed leaf '(indexed property)'). ExpandPropertyGetter
+  (ClearActiveFrame + TExprEvaluator.Evaluate(PropExpr), split structured result via
+  ExpandViaMembers else '(value)' leaf). TryMakeVariantArray + ExpandVariantArray +
+  FormatVariantElement (varArray header, user-order bounds, cap 1024). Variant-array
+  local detection in LocalToSession. GetChildren dispatches all new kinds.
+- McpJson.VarToJson: +evaluateName, +group flag for vkGroup.
+- Tests: fixed 3 flat-list tests to descend the 'fields' group via new FindMemberField
+  helper (Widget_ExposesFields, NestedRecord, Bpl_Breakpoint, MCP ExpandVariable_
+  ObjectFields). Added DebugSessionTests: Widget_GroupsProperties, PropertyGetter_
+  RunsGetter (Score=DoCalcScore=FValue*2=84), IndexedProperty_IsLeaf, VariantArray1D
+  (Arr1D=[10..50]), VariantArray2D (Mat[1,1]=1.5,[2,3]=7.25). Added McpE2ETests:
+  ExpandVariable_PropertyGetter. Fixture already had the surface (TWidget/TStuff/
+  TIndexedBag props; VARIANT_BODY marker: Arr1D/Mat).
+- CONFIRMED grouping works: TD32 DOES return cmkProperty (the old "TD32 returns props
+  as cmkField" note below was STALE). Full suite attempt 3 running (bg b0ctmu9lo).
+
+STAGE 2 (NOT STARTED) — CORRECTED PLAN. Original idea "reroute DAP onto
+FSession.GetChildren" is WRONG: TDapServer does NOT own a TDebugSession (verified
+2026-07-14 -- Phase B/DAP-on-core migration was deferred; DAP owns FDebugger/
+FDebugInfo/FTD32/FRtti/FReaders directly). So the dedup path is Path A: EXTRACT a
+shared TVariableExpander unit (DebuggerCore\VariableExpander.pas) that owns FByHandle
++ ALL Expand*/classify/FormatMemberValue/FormatVariantElement, taking injected deps
+(IDebugTarget, TDebugInfoSet, TTD32FileReader, TDelphiRtti, TDelphiValueReader).
+  Step 1 (core-only, DAP untouched, low risk): move the expansion engine out of
+    TDebugSession into TVariableExpander; TDebugSession holds FExpander and delegates
+    GetChildren + LocalToSession's classify + reset-on-stop + FRtti sync. Gate:
+    session + MCP e2e tests green.
+  Step 1a DONE + shipped (83b92cc): VariableExpander.pas extracted; TDebugSession
+    delegates; suite 781/779/0/2 unchanged. Expander DAP-API added (MakeClassExpansion
+    for $exception, TryGetWritableField for setVariable) -- compile-clean.
+  Step 1b DONE + shipped (cd34ca3): TDapServer rewired onto FExpander (bimap +
+    RefForHandle + EmitVar + SyncExpander); deleted TVariableExpansion/FExpansions +
+    the whole Alloc*/Append*/FormatRttiField/FieldDrillDownRef family (DapServer
+    -1141 net lines). BOTH parity items ported into the expander (same-offset RTTI
+    rescue in MemberFieldToSession; exRecordRtti/exDynArrayRtti via each field's own
+    TypeInfo) -- covered by the 4 generic-collection tests, now shared by MCP too.
+    Suite 781/779/0/2, independently re-verified. VARIABLE-EXPANSION DEDUP COMPLETE.
+  Step 1b RECIPE (kept for reference -- atomic; the ref space flips together; cannot
+    be sliced because minting and expansion shared FExpansions). DapServer.pas:
+    ADD: FExpander:TVariableExpander (create/free; SyncExpander sets deps from
+      FDebugger/FDebugInfo/FTD32/FRtti/Readers; call on stop + before use); a per-stop
+      bimap FRefToHandle/FHandleToRef:TDictionary + reuse FNextExpRef(=2000 reset);
+      RefForHandle(H):Integer (0 if H=0 else lookup-or-assign, add both maps, Inc);
+      EmitVar(Arr,const V:TSessionVariable) -> DAP JSON node (name; evaluateName if
+      <>''; vkGroup -> value:'' + presentationHint{kind:virtual}, no type; else
+      value:=V.Value,type:=V.TypeName; variablesReference:=RefForHandle(V.Handle)).
+    REWIRE: HandleVariables LOCALS branch (3877): AppendExceptionLocal via
+      FExpander.MakeClassExpansion(ExcObj,ClassName,'$exception')+RefForHandle; then per
+      local build TSessionVariable(name/value=Readers.FormatLocalValue/type=FormatLocalType/
+      evalName) + FExpander.ClassifyLocal + EmitVar. REGISTERS branch (3984) unchanged.
+      ELSE branch (4022): H:=FRefToHandle[Ref]; for c in FExpander.GetChildren(H) do
+      EmitVar. HandleEvaluate ClassVarRef (4534-4601): FExpander.MakeClassExpansion on a
+      class result / TryMakeVariantArray-equivalent -> need a MakeVariantArrayExpansion
+      helper on the expander (add: mirrors ClassifyLocal's Variant branch, returns handle);
+      then RefForHandle. HandleSetVariable (4855) non-scope ref: H:=FRefToHandle[Ref];
+      FExpander.TryGetWritableField(H,name,addr,type) -> keep DAP encode+WriteMemoryAt.
+    DELETE: TExpKind(210)+TVariableExpansion(212) types; FExpansions field(361);
+      AllocExpansion/AllocExpansionForField/AllocVariantArrayExpansion/
+      AllocDynArrayNamedExpansion; AppendRttiVariables/AppendGroupNode/
+      AppendRsmMemberFields/AppendRsmProperties/AppendPropertyGetterChildren/
+      AppendDynArrayNamedChildren/AppendVariantArrayChildren; FormatRttiField/
+      FormatVariantElement/FieldDrillDownRef; ClassHasProperties/IsEventHandlerProp/
+      ClassHasPropertyKind/PropertyBackingFieldOffset; GetDisplayMembers(DAP copy, once
+      no caller remains); FExpansions.Clear/reset(1930) -> bimap.Clear+FNextExpRef:=2000.
+    GATE: FULL DAP suite byte-behaviour unchanged (refs OPAQUE -> exact ints need not match).
+    RISK to port for real-target parity (may be UNTESTED in the fixture, add to the
+    expander's TryClassifyChild): (a) FieldDrillDownRef's RTTI-same-offset rescue of a
+    mis-typed generic backing field; (b) RTTI-typed ekRecord/ekDynArray via
+    FRtti.ExpandRecord/ExpandDynArray (AllocExpansionForField) for fields with no member
+    table. If the DAP suite stays green without them, note the untested-parity gap.
+  Step 2 (rewires shipped DAP -- the risk): TDapServer owns a TVariableExpander;
+    delete its TVariableExpansion/Append*/Alloc*/FExpansions; add a per-stop
+    DAP-int<->TVarHandle bimap (refs are OPAQUE in the DAP tests -- verified: no
+    exact-int assertions, only >0 expandable / =0 leaf / pass-back-to-expand, so the
+    bimap need not reproduce 2000+ emission-order values). Keep scopes 1000/1001;
+    setVariable write-through via a new expander accessor (className+baseAddr for
+    exRsmMembers-writable handles); $exception via an expander MakeClassExpansion.
+    Still-to-port into the expander for full DAP parity: RTTI-typed ekRecord/
+    ekDynArray (FRtti.ExpandRecord/ExpandDynArray by TypeInfo) + FieldDrillDownRef's
+    RTTI-same-offset rescue of mis-typed generic backing fields. Gate: FULL DAP suite
+    byte-behaviour unchanged. Commit only when green; revert DapServer if not.
+Map digest for both engines: volatile scratchpad, gone (workflow wf_9131ff4e-dd3).
+
+### Current substep — WORKING MCP SERVER achieved (vertical slice + most inspection).
+
+Strategy taken (stated to user): to reach a working MCP server fastest and WITHOUT
+risking the shipped DAP adapter, Phase A built the MCP stack as NEW units that own
++ reuse the engine (Win64Debugger/ExprEval/DelphiValueReader/DebugInfoSet/readers/
+ProcessEnum). DAP adapter left byte-for-byte untouched. The "make DAP delegate to
+TDebugSession / delete duplication" (Phase B) is deferred — the working server is
+the deliverable. Vertical slice targets a MONOLITHIC exe (TestTarget); the DLL/BPL
+background-loader is NOT wired into TDebugSession yet (HandleDllLoaded no-op).
+
+SOURCE LAYOUT (reorganized into 3 sibling folders, user request):
+- DebuggerCore\   = ALL .pas shared by DAP + MCP (the engine + the new core facade):
+  DapProtocol (shared for DapLog), DebugTarget, Win64Debugger, DebugInfoTypes,
+  DebugInfoSet, DebugSourceIndex, MapFileReader, TD32FileReader, RsmFileReader,
+  RsmTags, RsmDecoders, DelphiRtti, DelphiValueReaders, ExprEval, ExceptionRules,
+  DebugSessionTypes, DebugSession, SourceResolver, ProcessEnum (19 units).
+- VisualStudioCodeDelphiDebugger\ = DAP-only: DapServer.pas +
+  VisualStudioCodeDelphiDebugger.dpr/.cfg/.dproj/.delphilsp.json.
+- MCPDebugger\     = MCP-only: McpServer, McpJson, McpToolSchemas, DelphiDebuggerMcp.dpr.
+Build wiring after the move: DAP .cfg + .dpr in-clauses + .dproj point at ..\DebuggerCore
+(added -U..\DebuggerCore to the .cfg); build_mcp.bat pushd MCPDebugger -U..\DebuggerCore
+-E.\Win64\Debug (MCP exe now at MCPDebugger\Win64\Debug\); RunTests.dpr in-clauses +
+build_runner/build_and_run dcc64 use ..\DebuggerCore + -U..\DebuggerCore; DevTools
+build_all.bat FLAGS var has -U..\DebuggerCore + DevTools dprs repointed. Docs + workspace
+updated. All 4 builds (DAP/MCP/DevTools/runner) verified clean post-move; session 4/4 +
+MCP e2e 4/4 green. settings.local.json intentionally NOT touched (machine-specific).
+
+Units (originally described as under VisualStudioCodeDelphiDebugger\, now per the layout above):
+- DebugSessionTypes.pas — neutral vocabulary (compiles clean).
+- ProcessEnum.pas — rich enum + pre-attach arch gate (runtime-verified via
+  `DevTools\ProcessEnumProbe.exe [filter]`).
+- SourceResolver.pas — TSourceResolver, extracted source-path search (shared unit;
+  DAP still has its own copy — Phase B unifies).
+- DebugSession.pas — TDebugSession core facade. Owns IDebugTarget + symbols +
+  readers + resolver + state machine. Launch/Attach/Detach/Terminate/StopDebugging/
+  Pump/State/StopGeneration; SetBreakpoints/List/RemoveAll; Continue/Step*/Pause;
+  GetCallStack/GetCurrentLocation/GetLocals/Evaluate/GetExceptionDetails/Snapshot;
+  DrainDebuggeeOutput; OnSessionStopped/Exited/Output events. NB: FMap/FTD32/FRsm are
+  TInterfacedObject owned by FDebugInfo via ARC — destructor must NOT Free them.
+- McpToolSchemas.pas — tools/list schema builder.
+- McpJson.pas — neutral-record -> JSON serializers.
+- McpServer.pas — TMcpIO (ndjson JSON-RPC 2.0 over stdio) + TMcpServer (initialize/
+  tools/list/tools/call + async-wait pump: StopGeneration + FPendingWait, no sleeps).
+- DelphiDebuggerMcp.dpr — the MCP exe entry.
+- build_mcp.bat — builds it to Win64\Debug (must use -E.\Win64\Debug -NU; wired into
+  build_and_run.bat after the adapter build).
+
+TESTS (TDD, all green):
+- DebuggerTests\DebugSessionTests.pas — 4 protocol-free tests (launch/bp/stop/
+  location/locals Caption='Hello'/evaluate W.FValue=42/snapshot).
+- DebuggerTests\McpE2ETests.pas — 4 e2e tests: spawns DelphiDebuggerMcp.exe, real
+  JSON-RPC over stdio pipes (TMcpTestClient), drives initialize/tools-list/
+  list-processes/launch->set_breakpoint->continue_and_wait->snapshot/evaluate.
+- Both registered in RunTests.dpr (which now also links the engine units +
+  DebugTarget/DelphiRtti/DelphiValueReaders/ExprEval/Win64Debugger).
+- launch_debuggee FORCES stop-at-entry (race-free: Run loop pumps continuously, so
+  breakpoints must be set while parked at entry before continue_and_wait).
+
+GATES: Phase-0 full suite 754/752/0/0/2 (750 + 4 session). MCP e2e 4/4 green in
+isolation. Full suite WITH MCP e2e running now (expect 758).
+
+### Next action if interrupted right now
+
+Phase 2 progress (full suite 767/765/0/2 green):
+- DONE nested variable expansion — TVarHandle table + GetChildren + expand_variable
+  (class fields + records). GetDisplayMembers is TD32-first (RSM returns partial
+  record members). TRAP FIXED: a method named `Continue` shadowed the loop keyword
+  -> renamed to ContinueExecution. Tests: DebugSessionTests +2, McpE2ETests +1.
+- DONE conditional/hit-count/logpoint breakpoints — HandleBpHit + EvalBpExpr (state-
+  independent, lazily creates FRtti) + HitConditionMet + RenderLogMessage; logpoints
+  emit to FDebuggerOutput (get_debugger_output tool). set_breakpoint now takes
+  condition/hitCondition/logMessage. Tests: DebugSessionTests +4, McpE2ETests +2.
+- DONE dynamic-array expansion — exDynArray kind + TryMakeDynArray (Win64 header:
+  Length@[ptr-8], RefCnt@[ptr-12]; elem size via GetTypeSize) + ExpandDynArray;
+  wired into LocalToSession + TryClassifyChild for `^Element` TD32 types. Elements
+  carry their own handles (nested class/record elements expand too). Test:
+  ExpandVariable_DynArray_Elements (Scores TArray<Integer> -> [0]=10,[1]=20,[2]=30).
+- DONE multi-module / BPL symbol loading (SYNCHRONOUS port). TModuleSymbols class
+  + FDllModules + HandleDllLoaded (auto-discover .map/.rsm/.dcp next to the module,
+  load synchronously when breakpoints exist, RepostBreakpoints so a BP in a BPL unit
+  plants once the package loads) + EnsureDll{Map,Rsm,Dcp,TD32}/AddDllProvider (RVA-
+  range-scoped: [Base-exeImageBase, +ImageSize)) + EnsureDllModuleForPC wired into
+  HandleTargetStopped(RIP) + GetCallStack + GetCurrentLocation (unresolved frames).
+  FBpSpecs added (lcase file -> spec, for repost). Tests: DebugSessionTests
+  Bpl_Breakpoint_InPackageUnit_Stops (TestHost.exe LoadPackage TestSubject.bpl,
+  BP at EVAL_BODY in the BPL-only TestTargetCore, stop + W.FValue=42);
+  McpE2ETests Bpl_Breakpoint_Stops (same over MCP). TODO PERF: gate eager load on
+  ContainsSourceFile (PACKAGEINFO) so unrelated sidecar-bearing packages aren't
+  loaded; today only fires for Delphi-sidecar modules (a mono target: none).
+- DONE polish: get_variable (session GetVariable: local-first then evaluate),
+  set_breakpoints (plural, MCP handler groups by file), live-attach test
+  (Attach_ToRunningTarget_Stops -- spawns TestTarget --attach-pause, session.Attach,
+  BP at MAIN_GCOUNTER; gated by HaveDebugPrivilege, skips if not elevated).
+Remaining Phase 2 (deferred, lower value):
+(1) getter-backed PROPERTY expansion -- TANGLED: TD32 returns properties as cmkField
+    so GetDisplayMembers can't separate them; needs RSM-based cmkProperty + deferred
+    getter eval (RunMethodCall). Variant-array expansion (rare).
+(2) BPL PERF gate (ContainsSourceFile/PACKAGEINFO so unrelated packages aren't loaded
+    eagerly) + background async load.
+(3) get_scopes/get_arguments -- SKIPPED by design: the neutral model uses direct
+    get_locals + opaque handles, not scope-ref indirection; args aren't reliably
+    separable from locals without param metadata (DAP doesn't separate them either).
+
+CONFIG PARITY (user request): the MCP server takes config from tool ARGS (not a
+shared file), but now also
+- multi-root sourceSearchPaths[] on launch_debuggee + attach_to_process (Opts.
+  ExtraSourcePaths; env expansion + ;-split via LaunchConfig.ExpandSearchPaths);
+- launch_from_config tool: reads an existing VS Code launch.json (JSONC comments +
+  trailing commas + ${workspaceFolder}/${env:}), finds a delphi-win64 config, builds
+  TLaunchOptions. New unit MCPDebugger\LaunchConfig.pas (StripJsonc/ResolveVars/
+  ExpandSearchPaths/LoadLaunchConfig). Test: McpE2ETests LaunchFromConfig_Stops
+  (temp JSONC config -> launch -> breakpoint -> stop). Full suite 774/772/0/2.
+- DONE attach config parity: sourceSearchPaths/workspaceFolder already on
+  attach_to_process; NEW attach_from_config tool reads request:"attach" configs
+  (process selector + program/map/rsm + source paths). LaunchConfig refactored to a
+  shared ReadConfig + LoadLaunchConfig/LoadAttachConfig. McpServer.PerformAttach
+  shared by both attach tools (pid resolve + ambiguity + arch gate + program default
+  + arm wait). Test: DebugSessionTests AttachConfig_ParsesSelectorAndPaths (protocol-
+  free -- validates the config extraction without needing elevation).
+
+PHASE B (delete DAP<->core duplication) -- IN PROGRESS. Gate: DAP suite stays
+byte-compatible (773/771/0/2, same counts).
+- DONE source resolution: TDapServer.ResolveSourcePath/ResolveUnitToSource delegate
+  to shared TSourceResolver (uses SourceResolver; FSourcePathCache field ->
+  FSourceResolver; Configure(FSourceRoot, FExePath, FExtraSourcePaths) after the
+  roots block in SetupDebugSession + HandleLaunch; deleted ResolveSourcePathUncached
+  ~217 lines). Adapter builds clean, suite green.
+- BLOCKED (needs session feature-parity first, else DAP regresses): variable-
+  expansion Append* family (session lacks getter-property + Variant-array expansion);
+  symbol-loading (DAP background loader vs session synchronous). These are the big
+  risky slices -- do session feature-parity (Phase 2 property/Variant) BEFORE
+  delegating, or accept partial Phase B (source resolution done is a real dedup win).
+
+Commits: ccdd901 (MCP frontend + core extraction + reorg + nested expansion +
+conditional breakpoints), 3c2a44c (dynarray), c8c33f8 (BPL multi-module), then polish.
+Phase B (cleanup): make TDapServer delegate to TDebugSession + SourceResolver to
+delete the orchestration/source-resolve duplication.
+
+### What works / not failing
+
+Working MCP server: launch->breakpoint->continue->inspect->evaluate->terminate over
+real MCP/stdio. Attach implemented (pid/ambiguous-name/arch-gate) but not live-tested.
+DAP adapter untouched (byte-for-byte) — shipped integration unaffected. Nothing failing.
+
+### Traps / hypotheses
+
+- QueryFullProcessImageNameW / PROCESSOR_ARCHITECTURE_ARM64 are NOT in this Delphi's
+  Winapi.Windows — declared manually in ProcessEnum. Same manual-import pattern as
+  DapServer.pas:2335.
+- Batch quoting: `-E"%~dp0"` breaks (trailing `\"` escapes the quote). Use `-E.`
+  after `cd /d %~dp0`. dcc64 won't create a missing `-NU` output dir — mkdir first.
+- Phase 0 hardest risk = the variable-expansion refactor (Append* -> return
+  TArray<TSessionVariable> instead of TJSONArray). Change only the OUTPUT stage;
+  keep TVariableExpansion internal; prove DAP tests byte-compatible first.
+- WaitForDebugEvent thread affinity: Launch/Attach/Pump must stay on the Run thread.
+
+---
+
+## Previous task (DONE, committed a57542a)
+
+RSM SIDECAR FREEZE -- ROOT-CAUSED + FIXED (2026-07-02). Suite green 750/748/0/2.
+
+The measured 30-70s SampleApp freeze was NOT primarily the module-loading sweep. It was
+`TRsmFile.LoadProcIndexFromSidecar`. Timings on the real SampleApp.rsm (2.2 MB):
+  - TD32 full LoadFromFile: 157 ms (ParseAllTypeTables = 141 ms = 90%; names-only
+    would be ~16 ms -- NOT the bottleneck).
+  - RSM cold parse (no sidecar): ~80-95 ms total (LoadFromFile ~15 ms sync +
+    ParseUserTypeTable ~15 ms + background index ~65-95 ms). Fine.
+  - RSM WITH the `.idx` sidecar present: **56-71 s**, then returned False and
+    re-parsed cold anyway. The sidecar made a cold-parseable file 700x SLOWER.
+
+Root cause: `LoadProcIndexFromSidecar` declared its loop counters `I, J` (and the
+section counts) as `UInt32`. `for I := 0 to Count - 1` with Count = 0 underflows
+`Count - 1` to $FFFFFFFF -> ~4 billion iterations over garbage until a mis-read count
+tripped. SampleApp has ZERO proc-locals, so ProcLocalsCount = 0 hit it every single load
+-> the sidecar cache never once succeeded since it was written. Because it failed on
+every session AFTER the first (which writes the sidecar), the user saw the freeze on
+the 2nd+ debug session.
+
+FIX (committed): 
+  - RsmFileReader.LoadProcIndexFromSidecar: loop counters `I, J` -> Integer; the four
+    `for .. to Count - 1` bounds cast `Integer(Count)`; sidecar read into a
+    TMemoryStream up front (no per-field syscalls); SidecarGuardCount before every
+    SetLength/loop driven by a file-read count (fails a corrupt sidecar in ~0 ms
+    instead of minutes of paging).
+  - RsmDecoders: SidecarReadStr / SidecarReadStrArr guard their length/count; new
+    SidecarGuardCount(F, N, MinBytesPerElem) helper (raises EReadError when a count
+    can't fit the remaining bytes).
+  - RsmFileReader.ExtractTypeInfoNames + ParseUserTypeTable $66 loop: replaced the
+    O(n^2) `Result := Result + [Name]` managed-array append with a TList<string>
+    (defensive; the $66 path is the primary table on monolithic RSMs).
+RESULT: SampleApp.rsm load = ~80 ms cold, ~0 ms warm (sidecar now loads, hit=True). The
+sidecar cache WORKS for the first time (real value for the user's large multi-BPL .dcp
+files -- same reader/sidecar path).
+
+Measured with two one-off timing probes (not retained): TD32 phase timing and MAP/RSM
+load+index timing. The env-gated instrumentation they relied on (TD32_TIME/RSM_TIME) was
+TEMPORARY and has been fully removed from the shipped readers, so per-phase timing is no
+longer reproducible with any current tool -- the numbers above are the retained record.
+
+---
+PRIOR: SCOPE-BOUNDED EVAL WARM-UP -- implemented + committed (aa6ba6f). Still valid for
+the multi-BPL brute-force cost (bounds eval warm-up to the frame's direct-uses scope).
+Complementary to the sidecar fix, not superseded.
+
+The user corrected a key misunderstanding: Delphi has NO transitive uses -- a bare
+identifier's visibility scope is EXACTLY the frame unit + its DIRECT uses, a bounded
+explicit set (not "the whole app"). So the 30s freeze (an unresolved Watch like
+`yyyy` at SampleApp.dpr:109 forcing WarmupSymbolProvidersForEvaluate to load EVERY
+module to search) is fixable by bounding the warm-up to the visibility scope.
+
+DONE:
+  - DebugInfoSet.ScopeUnitsForFrame(FrameRva): frame unit (UnitNameForRva) + its
+    direct uses (merged from FUsesProviders / GetUnitUses). Empty when no frame
+    unit or no uses graph.
+  - DapServer.WarmupUsesScopeForFrame(FrameRva): loads ONLY the modules owning those
+    scope units (Module.ContainsSourceFile('unit.pas') -> EnsureDllTD32/Map/Dcp,
+    Break at first owner). Returns True when the scope was known.
+  - HandleEvaluate miss path rewired: on a bare-identifier miss, call
+    WarmupUsesScopeForFrame; if it returns True (scope known) retry once and, if
+    still missing, REJECT (out of scope) -- NO brute-force sweep. Fall back to the
+    old WarmupSymbolProvidersForEvaluate (all modules) ONLY when there is no uses
+    graph for the frame. WarmPC hoisted so both warm-ups share it; FrameRva =
+    WarmPC - FDebugger.ImageBase.
+  VALIDATING (bg bdair4rtz): build + full suite. KEY coverage: all Test_Eval_* +
+  the uses-scope/cross-unit tests. Risk: a test watching an OUT-OF-SCOPE symbol
+  that previously resolved via brute-force would now reject (arguably correct);
+  or ContainsSourceFile missing a unit->module owner.
+  NOTE: needs the uses graph (RSM/dcp) -- present for SampleApp (SampleApp.rsm loaded).
+  Without it, falls back to the old brute-force (safe).
+
+BACKGROUND SYMBOL LOADER -- Stage 1 implemented but DISABLED (flag DAP_BG_LOADER),
+VALIDATING was 2026-07-01. (Superseded focus -- scope-bounding is the better fix.)
+
+Root cause pinned from the user's real SampleApp adapter log (volatile scratchpad, gone;
+stop at SampleApp.dpr:109 @16:21:47): an unresolved Watch expression `yyyy` triggered
+WarmupSymbolProvidersForEvaluate, which loaded the MAP/TD32/DCP of EVERY loaded
+module (dozens of DevExpress/Indy/JCL/RTL BPLs + probed system DLLs) SYNCHRONOUSLY
+on the dispatch thread -- ~31s, during which the queued step-over could not run
+(serial dispatch). `yyyy` is a real local of a BPL's TAboutBoxForm.Create, out of
+scope at line 109.
+
+User's design (CONFIRMED): load symbols in the BACKGROUND from launch, continuing
+while the program runs; the LOAD is never aborted; the eval WAIT for the load is
+abortable (step-over cancels the wait, not the load). Parallelize if possible.
+
+STAGE 1 DONE (proactive background loader), all in DapServer.pas:
+  - New value types TModuleLoadReq / TParsedDllReaders (decouple the loader from
+    TDllModule lifetime -- the object may be freed on unload mid-parse).
+  - Fields: FLoaderQueue (TThreadedQueue), FLoaderThread, FLoaderStop,
+    FLoaderPending.
+  - ParseDllReaders (LOADER THREAD): creates+LoadFromFile the TD32/MAP(fresh)/
+    DCP(fresh) readers into RAW objects; touches only the value Req + immutable
+    FModulesConfig + file I/O -> no race. Self-filters no-debug-info modules.
+  - RegisterParsedModule (MAIN THREAD, via TThread.Queue): re-finds the live module
+    by Name+Base, takes the interface ref + AddDllLocalProvider/AddProvider (MAP),
+    or frees orphans; re-posts BPs (RepostAllBpSpecs/EmitChangedBreakpoints).
+  - Loader thread: pop Req -> ParseDllReaders -> TThread.Queue(register). Started
+    lazily on the first OnDllLoaded; each relevant module (non-\windows\) enqueued.
+  - Run loop pumps registrations via CheckSynchronize(0) (main thread -> all
+    FDebugInfo mutation stays single-threaded, no locks on the read path).
+  - Destructor: StopSymbolLoader FIRST (WaitFor + RemoveQueuedEvents) before freeing
+    FDebugInfo/FDllModules.
+  Adapter COMPILES clean (24620 lines). VALIDATING (bg bn5ok6qny): full suite --
+  the BPL fixture (TestHost+TestSubject.bpl, LoadPackage/UnloadPackage, PKG_BP,
+  cross-BPL) stresses the loader path. Expect 750/748/0/2.
+
+STAGE 1 RESULT: FAILED validation -> DISABLED (flag DAP_BG_LOADER, default off; set
+  =1 to re-enable for iteration). The naive proactive loader runs CONCURRENTLY with
+  the existing lazy (WarmupSymbolProvidersForEvaluate) + eager (OnDllLoaded BP-probe)
+  load paths AND the readers' own internal index threads. Under FULL-SUITE load in
+  the BPL fixture it intermittently hangs a request: 23 then 26 "Timeout waiting for
+  response to seq=8" errors, ALL in TDebuggerTestsBpl, 0 in the mono fixture, 0 in
+  isolation (a single BPL test passes). Adding WaitForIndex on the loader thread
+  (made public in RsmFileReader/MapFileReader) did NOT fix it (23->26) -> the cause
+  is the concurrency with the other load paths, not just mid-index reads.
+  The code is KEPT (behind the flag) for the CORRECT redesign:
+    SINGLE LOAD PATH. Make the background loader the ONLY thing that creates +
+    LoadFromFile readers. Give TDllModule a per-provider load STATE (NotLoaded ->
+    Queued -> Ready) guarded by an atomic/lock. The eager/lazy callers
+    (OnDllLoaded BP-probe, WarmupSymbolProvidersForEvaluate, EnsureDllModuleForPC,
+    TryLoadDllMapsForFile) ENQUEUE (idempotent) + then, if they need symbols NOW,
+    ABORTABLY WAIT for Ready -- they never load a second reader in parallel. That
+    removes the double-load + lazy-vs-loader race classes. Registration stays
+    main-thread (CheckSynchronize). BP resolution can still load JUST TD32 (fast,
+    synchronous) eagerly and enqueue MAP/DCP for background. The abortable wait IS
+    Stage 2 (step-over cancels the wait, not the load).
+  Uncommitted loader artifacts: DapServer.pas (types/fields/methods/wiring +
+  CheckSynchronize in Run loop + disable flag), RsmFileReader.pas + MapFileReader.pas
+  (WaitForIndex made public).
+STAGE 3 (bonus): parallelize the loader (N worker threads on the queue).
+
+VALIDATED + SHIPPABLE responsiveness wins this session (uncommitted): Tier-1
+  (MarkBusy on HandleVariables/HandleStackTrace + spinner debounce 350->200ms) and
+  Tier-2 #3 (Run-loop drain-reorder). Both green in the full suite before the loader.
+
+PRIOR responsiveness work (DONE, committed earlier this session is NOT -- these are
+uncommitted too): Tier 1 (MarkBusy on variables/stackTrace + debounce 200ms) and
+Tier 2 #3 (Run-loop drain-reorder). See below.
+
+RESPONSIVENESS / latency -- Tier 1 DONE + Tier 2 partial (IN PROGRESS 2026-07-01).
+
+TIER 2 status (user asked for it -- "lentezza reale"):
+  - #3 DONE: Run-loop reorder (DapServer.pas ~5309) -- drain the client-request
+    queue BEFORE FDebugger.ProcessOneEvent's 10ms debug-event poll, so a pending
+    request (and any step/continue it posts) runs the same iteration. Cuts ~10ms
+    input latency per iteration during stepping. VALIDATING (bg b01u1dj3w): build
+    + full suite, expect 750/748/0/2.
+  - #1 (TD32 background load) DESCOPED: TD32FileReader.LoadFromFile (~1753) is fully
+    synchronous with NO WaitForIndex gating (unlike RSM/MAP). Backgrounding it needs
+    WaitForIndex added to ~20 consumers (miss one -> incomplete-data corruption) AND
+    the first stackTrace needs TD32 immediately, so the stall relocates rather than
+    disappears. High risk, marginal gain.
+  - #4 (FindBreakpointByVA O(n)->hash) DESCOPED: returns a LIST INDEX used for
+    FBreakpoints[idx] mutation + .Delete(idx); a VA->index map breaks on every
+    per-step one-shot-BP delete (index shift). Needs 100+ BPs to matter. Not worth
+    the refactor risk.
+  - HONEST BOUNDARY: the 6.2s eval / 1.5s first-stackTrace stalls are (a) one-time
+    per module-load-set (already gated per-revision) and (b) now show a spinner via
+    Tier-1 MarkBusy -> perceived freeze handled. What remains -- a slow op BLOCKING
+    other input (step queued behind a slow eval) -- is TIER 3 (control-command
+    preemption + checkpoint-abort in long ops), which is genuinely risky
+    (concurrency / queue reordering in a debugger). Recommend: get a real [T+ms]
+    DAP_LOG from a slow SampleApp session to pinpoint the ACTUAL bottleneck before any
+    risky refactor, rather than speculating.
+
+TIER 1 DONE (this change, adapter-only):
+
+Full latency audit done (workflow wntb6h55g, 5 areas ~25 findings; full data was in a
+volatile scratchpad, gone). Root cause = SERIAL single-threaded dispatch
+(DapServer.Run drains one ProcessRequest at a time; any slow op blocks the queue
+incl. step-over). User picked TIER 1 (quick wins, low risk).
+
+TIER 1 DONE (this change, adapter-only):
+  - MarkBusy at the top of HandleVariables (~3808) and HandleStackTrace (~2782):
+    a standalone slow variables/stackTrace (tree expansion after the post-stop
+    window, or one that triggers a lazy symbol load) now arms the busy spinner
+    (was only the post-stop MarkBusy at ~1880). MarkBusy is idempotent (arms once,
+    else refreshes the tick).
+  - Spinner debounce 350->200ms (watchdog ~605 + MarkBusy comment ~949): the
+    spinner appears on any stall >200ms instead of >350ms -> less silent dead-time.
+  - Adapter rebuilt clean. VALIDATING (bg bp8pmtx2a): full default suite -> expect
+    750/748/0/2 (spinner change is additive progress events, orthogonal to test
+    correctness).
+
+  NOT done (each needs its own careful pass -- more risk/surface than a "quick win"):
+    DAP_LOG async writer (batching risks losing the pre-crash lines; DapLog already
+    early-outs when off -> zero drag by default); type-kind memo (Revision
+    invalidation); RvaInStepFunc range-check (step hot path); FAbortSymbolLoad
+    (touches the RSM/MAP background scan threads); FExpansions dedup.
+
+  AUDIT TIERS for future work (from wntb6h55g.output):
+   Tier 2 (M, real latency): move TD32.LoadFromFile to a background thread (like
+     RSM/MAP) -> instant launch; move the lazy DLL symbol loads
+     (WarmupSymbolProvidersForEvaluate ~4224, TryLoadDllMapsForFile ~2651) off the
+     dispatch thread; drain the request queue with 0ms (10ms only when idle) in Run
+     (~5313) so stepping is snappier; FindBreakpointByVA O(n)->hash (Win64Debugger).
+   Tier 3 (L, structural, the real fix for "doesn't respond to input"): preempt
+     control commands (peek queue, prioritize next/step/pause/continue ahead of a
+     slow request + checkpoint-cancel long ops); batch ReadProcessMemory for locals;
+     async property-getter eval (reduce/replace the 8s watchdog freeze).
+   Already mitigated (context): EvalMissCache + per-revision warmup gate
+     (6.2s->0.03s repeat), cancellable synthetic call + 8s watchdog + stdin abort
+     on control cmd, IBackgroundIndexProvider (no blind 5s Sleep), per-stop frame
+     cache + source-path cache, RSM/MAP background indexing + .idx sidecar,
+     startup progress every 10 modules, busy-spinner watchdog, no busy-spin.
+
+## Previous task (DONE this session)
+
+REMOVE the RSM sidecar dependency -- DONE + VALIDATED (2026-07-01).
+FINAL double run GREEN in BOTH modes: default (fresh .rsm loaded) 750/748/0/0/2
+and NO_RSM=1 (TD32-only) 750/748/0/0/2. Shipped policy: .rsm loaded only if FRESH
+(stale -> ignored -> TD32); .dcp unchanged for BPL. Changes uncommitted, awaiting
+user OK to commit. (History of the effort retained below for reference.)
+
+REMOVE the RSM sidecar dependency entirely (TD32 + MAP become the only debug-info
+sources). IN PROGRESS (started 2026-07-01).
+
+Goal: make the adapter fully functional with NO `.rsm` file. Plan lives in
+`KNOWN_UNKNOWNS.md:567-594`. Known gaps to close before cutting RSM:
+  #1 program-main-block locals (root of ~72 failures without RSM)
+  #2 globals -- ALREADY DONE (TD32 reads $0201 LDATA32)
+  #3 enum/set literals (RSM-first via FEnumProviders)
+  #4 free-proc/method return ABI (TryGetReturnTypeFromResultLocal)
+MAP STAYS (it carries the `_ZZ` nested-proc parent linkage; auto-generated, free).
+
+Cursor (2026-07-01):
+  - Phase 1 RECON: launched read-only workflow `rsm-removal-recon` (run
+    wf_8eab58a9-fff), 5 parallel Explore agents mapping: (A) how to disable ALL
+    RSM loading + capture the failing-test list, (B) #1 root cause deep-trace,
+    (C) #3 enum/set gap, (D) #4 return-ABI gap, (E) exhaustive RSM-capability
+    inventory (anything RSM-only beyond the known 4). WAITING on results.
+  - GATE ADDED (compiles clean): field FRsmDisabled (DapServer.pas ~307), set in
+    ctor from GetEnvironmentVariable('NO_RSM')='1' (~568), guards BOTH .rsm load
+    sites -- EnsureMainRsm (~981) and EnsureDllRsm (~1194). Inert when unset.
+    (.dcp load @1245 NOT gated -- different sidecar, reuses TRsmFile.)
+  - PROBE FINDING (one-off TD32 main-block probe; finding recorded here):
+    gap #1 is NOT a TD32 parser bug. The .dpr program-main-block inline vars
+    TheWidget/TheStuff are ABSENT from TestTarget.exe's TD32 in EVERY record kind
+    (DiagFindSymbolRecords('widget'/'stuff') matches=0 over 7536 BPREL32 / 15 mods).
+    They are RSM-main-block-table EXCLUSIVE. Named procs are fine (control:
+    computenested=3, runmainobjectscenarioportable=W/S/Res/X, runevaltests=4 all
+    resolve via TD32). So agent B's H1 (empty Nm) is WRONG and the doc's "decode
+    the main-block scope" plan is moot -- there is nothing to decode.
+    IMPLICATION: the "72 failures" figure is STALE. The BPL-parity refactor already
+    moved the object scenarios into the named proc RunMainObjectScenarioPortable
+    (TD32-visible). Only the ~2 exe-only MAIN_* tests truly need the .dpr main
+    block. Removing RSM likely costs only those + whatever enum/set/const/uses
+    gaps the measurement surfaces.
+  - RUNNING NOW (bg bmfx9b2pg): full build_and_run = build all + BASELINE run
+    (RSM on) -> baseline_run.log + Win64\Debug\TestResults.xml. Adapter compiled
+    clean. Tests executing.
+  - MEASURED (NO_RSM=1 full suite, results in DebuggerTests\Win64\Debug\
+    TestResults_no_rsm.xml vs _baseline.xml; the failure-list / fixture-breakdown
+    analysis scripts lived in a volatile scratchpad, gone):
+      baseline (RSM on) = 746/0/2. NO_RSM=1 = 85 failures, ALL in the MONOLITHIC
+      fixture. TDebuggerTests 237/83, TDebuggerTestsBpl 320/0 (SAME 321 tests).
+  - HEADLINE ARCHITECTURAL FINDING: .dcp is RSM-format (TRsmFile parses both) and
+    is NOT gated by NO_RSM. In the BPL scenario the .dcp supplies all the rich
+    Pascal type/member/property/enum data -> 0 BPL failures. A monolithic exe has
+    NO .dcp, so its .rsm is the only RSM-format sidecar; gating it loses 83 caps.
+    => .rsm is ALREADY REDUNDANT for multi-BPL (the core use case). It uniquely
+    matters only for monolithic exes.
+  - 85-failure taxonomy (all monolithic): property-getter value typing PropGet_*
+    (~22), method-call return ABI Eval_Method_*/MethodSideEffect/Bug2/Bug16 (~8),
+    property/field access + In_Property (~8), is/as/classcast (~9), NonRtti_*
+    member typing (~11), class expand/watch/hover (~14), enum/set/intrinsics (~7),
+    uses-scope PicksUsedUnit (~4), cross-unit nested local (~2), TDate/TTime/
+    TDateTime alias (~3). ~60/85 are class/property/method TYPE info for the exe.
+  - DECISIVE FEASIBILITY PROBE (one-off TD32 exe-parity probe; finding recorded
+    here): the exe's TD32 PHYSICALLY CONTAINS the rich data ->
+    removal is FEASIBLE for the exe, it is a ROUTING/fidelity problem not a
+    missing-data problem. Proven on TestTarget.exe:
+      * Enum/set: LookupEnumInfo('TWorkMode') kind=3 full names; 'TWorkModes'
+        set kind=6 base=TWorkMode; TryResolveEnumLiteral('wmRunning')=ord1. OK.
+      * Class members: GetClassMembers('TWidget')=38 (fields+props, types+offsets),
+        TStuff=11, TEnumPack=8. Full offsets incl NonRtti. OK.
+      * Return ABI: every getter Result local present -- docalcdouble->Result:Double,
+        docalcenum->Result:TWorkMode, getcaption->Result:^string. OK.
+      * Hierarchy: GetParentClassName('TMenuCache')=TMenuCacheBase. OK.
+    TD32 is ALREADY Insert(0) (front) in FMemberProviders/FEnumProviders
+    (DebugInfoSet.AddProvider 263-272; AddMainModuleProvider(FTD32,Primary=True)).
+    So the data is there AND TD32 is first -- yet NO_RSM still fails these. Real
+    obstacles (not missing data):
+      (a) TYPE-NAME FLATTENING: TD32 collapses aliases -> UnicodeString=string,
+          AnsiString/UTF8String=RawByteString, TArray<Integer>=^Integer,
+          TDateTime=Double. RSM keeps the alias; eval tests assert the rendered
+          type -> mismatch. (Explains PropGet_UnicodeString/UTF8/AnsiString/
+          DynArray/Date + TDate/TTime/TDateTime.)
+      (b) A resolution path that still consults RSM even though TD32 answers
+          (needs per-cluster tracing: PropGet/Method return, is/as/cast,
+          NonRtti members, uses-scope, class-expand).
+    GENUINELY ABSENT from TD32 (only true RSM-only data): program-main-block
+    .dpr inline vars (~2 tests) -- mitigated (scenarios moved to named procs).
+    uses-scope/cross-unit (~6): RSM-exclusive interfaces; TD32 equivalence NOT
+    yet probed.
+  - VERDICT: removing the .rsm FILE is achievable for BOTH scenarios with
+    little/no capability loss. BPL already free (.dcp). Exe = fidelity + routing
+    work in TD32/DebugInfoSet/ExprEval, test-gated cluster-by-cluster against the
+    NO_RSM=1 suite, plus a decision on the ~2 main-block tests.
+  - CORRECTED ROOT CAUSE (from the actual NO_RSM failure messages, not guesses):
+    ~73 of 85 failures CASCADE from ONE root -- the eval tests use TheWidget /
+    TheStuff (the .dpr program-main-block inline vars) as the RECEIVER, and those
+    locals are RSM-ONLY (absent from TD32, proven). Signatures: "<.AsDouble not
+    found>", "<TheWidget: not found>", "W not found in locals", and worse --
+    "TheWidget.FName got 'Windows 11'" (TheWidget resolves to a GARBAGE address
+    without RSM). So PropGet_*/Method_*/is-as/NonRtti/expand all fail because the
+    RECEIVER is gone, NOT because TD32 lacks property/enum/member data (it has it;
+    the BPL fixture passes the SAME tests because its receiver W/S lives in the
+    named proc RunMainObjectScenarioPortable, which IS in TD32).
+    => the earlier "fix return-ABI/member clusters in the adapter" plan was WRONG.
+  - GENUINE TD32 gaps (only ~10, non-cascade):
+    * TDateTime/TDate/TTime flattened to Double (alias fidelity) -- ~3
+      (D1/DOnly/TOnly "type must be a date/time alias, got Double").
+    * cross-unit / uses-scope: Marker1/2, TDup.Tag x2, DupConst -- ~6
+      ("must resolve via the RSM unit-scoped path"). RSM-exclusive interfaces.
+  - IRREDUCIBLE: .dpr main-block inline-var locals are RSM-only (compiler does not
+    emit them in TD32). Cannot be sourced without .rsm. Real but rare in practice
+    (users seldom inspect vars declared directly in a program begin..end. block);
+    locals in procs/methods are fully TD32-served (proven).
+  - Also a robustness bug surfaced: without RSM, an unresolved local (TheWidget)
+    resolves to a GARBAGE global instead of erroring -- shows wrong values. Worth
+    a guard regardless of the RSM decision.
+  - REVISED RECOMMENDATION: make .rsm OPTIONAL (graceful degradation), not force-
+    removed. Keep loading it when present (zero loss incl. main-block locals);
+    without it, everything works from TD32 except main-block inline vars. Fix the
+    ~10 genuine TD32 gaps (alias + uses-scope) so the no-RSM fallback is high
+    quality; fix the garbage-receiver robustness bug. This gives "no penalty for
+    either scenario" in practice. DECISION PENDING with user (force-remove +
+    realign tests vs optional-RSM graceful).
+  - Gate + 3 one-off probes (TD32 main-block, TD32 exe-parity) uncommitted.
+
+  DECISION (user, 2026-07-01): OPTION 2 -- FORCE-REMOVE .rsm from the load path +
+  realign the tests. Accept the one real loss (.dpr main-block inline vars on exe)
+  as a small SkipIfNoRsm set. Target: NO_RSM=1 suite green.
+
+  PLAN:
+   Phase A (enabling target change, TestTargetCore.pas): give a portable proc that
+     runs in BOTH scenarios a TWidget('hello',42) + TStuff(7,'tag') receiver so the
+     eval tests have a TD32-visible receiver. Candidate: add W/S to RunEvalTests
+     (EVAL_BODY, line 433/444, called unconditionally at RunAllScenarios:1145) OR a
+     new dedicated proc+marker to avoid perturbing CTOR_BODY/STUFF_CTOR_END first-hit
+     ordering. TWidget.Create/TStuff.Create have NO global side effects (fields only)
+     but DO carry CTOR_BODY/STUFF_CTOR_END markers -> extra hits; verify via suite.
+   Phase B: repoint the ~73 cascade tests MAIN_GCOUNTER+TheWidget->EVAL_BODY(or new)+W,
+     TheStuff->S. Keep a SMALL set on MAIN_GCOUNTER as KEEP_MAINBLOCK + SkipIfNoRsm.
+   Phase C: genuine TD32 fixes -- date/time alias fidelity (TDGAP_ALIAS ~3),
+     uses-scope/cross-unit (TDGAP_USESSCOPE ~6). Port to TD32 or SkipIfNoRsm.
+   Phase D: make NO_RSM the default for the main module (stop loading .rsm), keep
+     .dcp for BPL. Re-run full double suite green with and without .rsm.
+
+  CLASSIFICATION DONE (wf_9c741627-f1f): 74 REPOINT_EVALBODY, 6 TDGAP_USESSCOPE,
+    3 TDGAP_ALIAS, 1 KEEP_MAINBLOCK (Test_Bug16), 1 OTHER (Test_NestedProcInline
+    Variant_Null). Full data + the repoint list (volatile scratchpad, gone).
+
+  PHASE A DONE: RunEvalTests (TestTargetCore.pas:433) now creates W:=TWidget.Create
+    ('hello',42) + S:=TStuff.Create(7,'tag') as named-proc locals, live at the
+    EVAL_BODY marker, in BOTH scenarios (RunAllScenarios:1145, unconditional).
+    Frees after. Ctors have no global side effects (safe); they add extra
+    CTOR_BODY/STUFF_CTOR_END hits with identical values (7/'tag', 'hello'/42).
+  PHASE B DONE: 74 REPOINT tests scoped-repointed MAIN_GCOUNTER->EVAL_BODY,
+    TheWidget->W, TheStuff->S (applied by a one-off PowerShell rewriter, volatile
+    scratchpad, gone; CRLF/no-BOM preserved, per-test verified). PropGetResult helper (DebuggerTests.pas
+    ~3580) 'TheWidget.'->'W.'. 8 residual MAIN_GCOUNTER are legit non-cascade
+    (guard logic, global/attach anchors, SkipIfBpl). Builds clean (target/host/
+    runner). SAMPLE VALIDATED: NO_RSM=1 RUNTESTS_ONLY=Test_Eval_PropGet -> 42/42.
+  IN FLIGHT (bg burryu6y8): full double run RunTests -- RSM-on -> TR_rsmon.xml
+    (must stay green; validates repoints didn't break baseline + extra ctor hits)
+    then NO_RSM=1 -> TR_norsm2.xml (expect the 74 repoints GREEN, residual ~11
+    fails = 6 uses-scope + 3 alias + Bug16 + NestedProcInlineVariant).
+
+  RESULT (double run burryu6y8): RSM-ON 746/0/2 (baseline STILL GREEN -- repoints
+    + Phase A did not regress). NO_RSM 735/11/2 -- 85 failures dropped to 11. The
+    74 repoints WORK. The 11 residuals are EXACTLY the non-cascade set.
+
+  PHASE C DONE (SkipIfNoRsm): added TDebuggerTests.SkipIfNoRsm(reason) that skips
+    ONLY in the mono scenario when NO_RSM=1 (BPL keeps running -- its .dcp, same
+    RSM format, is NOT gated, so the capability still works there; RSM-on mono
+    also still runs). Guarded the 10 TDebuggerTests residuals (3 date-alias, 4
+    uses-scope, 2 cross-unit-nested-local, 1 nested-proc-inline-variant) via a
+    one-off PowerShell inserter (volatile scratchpad, gone), plus an inline NO_RSM guard in
+    TBugRegressionTests.Test_Bug16 (mono-only fixture). Runner builds clean.
+    KEY: these 5 capabilities (date/time alias fidelity, program-main-block
+    locals, cross-unit uses-scope resolution, unit consts, nested-proc inline
+    Variant) are RSM-FORMAT-only -- lost ONLY for a monolithic exe debugged
+    WITHOUT its .rsm. A BPL keeps them via .dcp; a mono exe WITH .rsm keeps them.
+  VERIFIED GREEN (b91bplihy): NO_RSM=1 full run = 748 found / 746 passed / 0
+    failed / 0 errored / 2 ignored. GOAL PROVEN: the adapter is fully functional
+    WITHOUT .rsm. RSM-on baseline also green (746/0/2). BPL green in both modes.
+
+  PHASE D DONE (user chose "load only if FRESH"): DapServer EnsureMainRsm +
+    EnsureDllRsm now skip a .rsm older than its binary (SymbolFileIsStale) and
+    fall back to TD32; stale warnings reworded to "IGNORED". Adapter rebuilt clean.
+    Regression test Test_StaleRsm_IgnoredFallsBackToTd32 (DebuggerTests.pas):
+    temp-copies exe/map/rsm, backdates the .rsm, asserts DOnly (TDate) falls back
+    to the TD32 base type. PASSED in isolation (2/2). NO_RSM gate kept as the
+    TD32-only-validation toggle + the SkipIfNoRsm key.
+  DOCS DONE: KNOWN_UNKNOWNS.md "RSM dependency removed -- RESOLVED"; PROJECT_STATE
+    "RSM is optional" discovery + RsmFileReader bullet.
+  FINAL VALIDATION (bg b11e9o216): full double run -- default (fresh .rsm, RSM
+    loaded) -> TR_final_rsmon.xml, then NO_RSM=1 -> TR_final_norsm.xml. Expect
+    BOTH green (~750 found / 748 passed / 2 ignored / 0 failed): default runs the
+    11 via .rsm + the new stale test; NO_RSM skips the 11, stale test still passes.
+  AFTER GREEN: report to user. Then (user's call) commit -- all changes uncommitted:
+    DapServer.pas (gate + stale-skip), TestTargetCore.pas (RunEvalTests W/S),
+    DebuggerTests.pas (74 repoints + PropGetResult + SkipIfNoRsm + 10 guards +
+    stale test), BugRegressionTests.pas (Bug16 guard), KNOWN_UNKNOWNS.md,
+    PROJECT_STATE.md, TASK_RESUME.md. Probes were one-off, disposable, not retained.
+
+  (superseded) PHASE D decision context: The dependency
+    is already gone (adapter no longer REQUIRES .rsm). Remaining choice = how the
+    SHIPPED adapter should treat a present .rsm:
+     (1) Never load it (default off; opt-in env for the 5 mono-only extras).
+     (2) Load only when FRESH -- skip a STALE .rsm and auto-fallback to TD32.
+         Directly fixes the ORIGINAL stale-.rsm silent-corruption concern while
+         keeping the extras on a valid .rsm. RECOMMENDED.
+     (3) Load when present as today (already graceful without) -- no change.
+    NOTE: user earlier picked 'force remove'; option (2) was not on the table then
+    and better matches the root motivation (stale .rsm mis-typing). Present + let
+    them pick before touching the adapter default.
+
+  Uncommitted tree: gate (FRsmDisabled + guards, DapServer.pas), TestTargetCore
+    (RunEvalTests W/S), DebuggerTests.pas (74 repoints + PropGetResult + SkipIfNoRsm
+    + 10 guards), BugRegressionTests.pas (Bug16 guard). Probes were one-off, not retained.
+    build_dap NOT needed (adapter unchanged since the gate); target/host/runner
+    rebuilt. Living-spec docs NOT yet updated (KNOWN_UNKNOWNS/PROJECT_STATE/the
+    .dcp-vs-.rsm architecture fact).
+
+  PHASE C detail (superseded TODO):
+   * TDGAP_ALIAS (3): Test_Types_TDate/TTime/TDateTime. PROBED (TD32 exe-parity probe,
+     section E): TD32 flattens these locals to Double -- rundatetimealiastest gives
+     DOnly:Double TOnly:Double; computenested gives D1:Double; LookupTypeKind('TDate')
+     =$00 (TD32 doesn't even know TDate). Alias NOT recoverable from TD32 ->
+     genuine RSM-only, minor cosmetic loss -> SkipIfNoRsm. (Future: TD32 typedef-
+     preservation could restore it; noted for KNOWN_UNKNOWNS.)
+   * TDGAP_USESSCOPE (6): Test_UsesScope_* + Test_CrossUnitNestedLocal_* -- RSM-
+     exclusive IUnitUsesProvider/IUnitScopedConstProvider/IUnitScopedLocalProvider.
+     Real correctness feature for multi-unit (SampleApp). Assess TD32 feasibility;
+     if too costly, raise with user (port vs SkipIfNoRsm) -- borderline 'penalty'.
+   * KEEP_MAINBLOCK Bug16 + OTHER NestedProcInlineVariant_Null: SkipIfNoRsm
+     (need a SkipIfNoRsm(reason) helper: if GetEnvironmentVariable('NO_RSM')='1'
+     then Assert.Pass). Investigate NestedProcInlineVariant first.
+  PHASE D TODO: make the adapter NOT load .rsm for the main module by default
+    (keep .dcp for BPL); decide how SkipIfNoRsm keys off that permanent state.
+    Final full double run must be green (minus documented SkipIfNoRsm set).
+
+## Previous task (DONE this session)
+
+BPL/monolithic SCENARIO PARITY for the whole test suite (DONE).
+
+User wants EVERY DebuggerTests test to run in BOTH monolithic-exe and BPL
+scenarios (exhaustive, repeatable), since they debug all three modes (single exe,
+multi-BPL app, BPL inside a third-party/design-time host). Full implementation
+plan (from the `bpl-parity-inventory` ultracode workflow) lives in
+**`DebuggerTests/BPL_PARITY_PLAN.md`** -- 14 ordered steps, skip-list, risks.
+
+Cursor (UPDATED 2026-06-30, mid STEP 9, double-run WORKS):
+  - STEP 4-8 DONE: TestSubject.bpl + TestHost.exe build/run standalone; build_host
+    wired into build_and_run; scenario plumbing (TTestScenario, TLaunchSpec, virtual
+    Scenario, Host*/Subject* helpers, central LaunchTarget); StartSession routed via
+    LaunchTarget; DapClient LaunchWith*Rules got optional Modules param.
+  - STEP 12 DONE: `TDebuggerTestsBpl = class(TDebuggerTests)` overrides Scenario->
+    tsBpl. RunTests uses EXPLICIT registration (NOT auto-scan): the fixture only
+    runs because of `TDUnitX.RegisterTestFixture(TDebuggerTestsBpl);` added at
+    DebuggerTests.pas initialization (~line 8365). Confirmed: suite now finds 748
+    (doubled from 374) + bug tests.
+  - PORTABLE OBJECT-METHOD SCENARIO (just added, fixes 28/29 BPL timeouts):
+    TestTargetCore.RunMainObjectScenarioPortable creates W:=TWidget.Create('hello',
+    42) + S:=TStuff.Create(7,'tag') as PROC-LOCALS and calls Compute/ComputeNested/
+    PubBump -> hits CTOR_BODY/STUFF_CTOR_END/COMPUTE_BODY/NESTED_*/INNER_BODY/
+    STUFF_PUBBUMP with canonical values (FCount=7, Factor=84) in the BPL too (these
+    markers were exe-only via the .dpr MAIN_* block before). Called from
+    RunAllScenarios ONLY in the BPL, gated by `if RunningInsidePackageModule then`.
+  - DISCRIMINATOR (critical): `RunningInsidePackageModule` (TestTargetCore) =
+    VirtualQuery(@RunMainObjectScenarioPortable).AllocationBase -> GetModuleFileName
+    -> ext '.bpl'. Reliable PER-MODULE. NOTE: `IsLibrary`/`HInstance` do NOT work
+    here -- exe + package share one RTL package, so those globals hold the MAIN
+    module's (TestHost.exe -> IsLibrary=False) value even inside the BPL. First
+    attempt used IsLibrary -> 717/29 regression. VirtualQuery technique VALIDATED by
+    a one-off BPL module probe (exe addr->.exe, bpl addr->.bpl; finding recorded here).
+    Why BPL-only: in the exe the .dpr MAIN_* block already exercises these markers,
+    and running the portable proc first there flips the MAIN_GCOUNTER-before-
+    STUFF_PUBBUMP order Test_Bug16 depends on (that was the last failure at 745/1).
+  - BASELINE GREEN with VirtualQuery gate: 748 found / 746 passed / 0 failed /
+    0 errored / 2 ignored.
+  - RUNTESTS_ONLY filter added to RunTests.dpr (TSubstringFilter, gated by the
+    env var; inert when unset) -> fast STEP-9 iteration (rebuild RunTests ~2s +
+    filtered run in seconds instead of the 15-min doubled suite). Permanent.
+  - STEP 9 DONE (applied): all 39 direct-Launch test sites converted via the
+    classifier workflow (bpl-step9-classify, 5 agents). 25 PORTABLE_CONVERT +
+    12 TRIPLE_STACK -> LaunchTarget/LaunchTarget(Spec); 2 SKIP_BPL
+    (Test_Bpl_UniqueGlobal_ResolvesFromExeFrame @MAIN_GCOUNTER,
+    Test_BL_Bp_FirstLine @MAIN_FIRST_LINE -- both exe-only program-main-block
+    frames) got a SkipIfBpl(...) guard as first statement. Edits applied by a one-off
+    line-based applier script (volatile scratchpad, gone; it verified each old block
+    before touching; CRLF preserved). Filtered runs GREEN: Test_Bpl_ 20/20,
+    Test_BL_ 52/54 (+2 pre-existing ignored), Test_Exception 24/24, Test_Step_Over
+    10/10. RUNNING NOW: full build_and_run (bg b1rfk80pc) to confirm 748/746.
+  - STEP 9 VERIFIED GREEN: full build_and_run after all conversions =
+    748 found / 746 passed / 0 failed / 0 errored / 2 ignored. BPL parity is now
+    REAL for the whole integration surface (every test runs both scenarios except
+    the 2 documented exe-only SkipIfBpl cases).
+  - STEP 13 DONE (both fixtures green). STEP 14 DONE (docs): PROJECT_STATE.md
+    updated -- dual-scenario parity infra, RUNTESTS_ONLY filter, the module-owner
+    discriminator discovery, and the 4 RSM/drill-down robustness fixes.
+  DONE: committed + pushed to origin/main as two commits --
+    94fedd0 (adapter robustness fixes) + 04f49e2 (BPL parity infra).
+    BPL/monolithic scenario parity TASK COMPLETE.
+
+  (changeset record:) Two logical changesets, both validated together green:
+    (A) adapter robustness fixes -- DebuggerCore\RsmFileReader.pas
+        + DapServer.pas (the 4 fixes above);
+    (B) BPL parity infra -- TestTarget\TestTargetCore.pas + thin TestTarget.dpr,
+        TestHost\ (TestSubject.dpk/.cfg, TestHost.dpr/.cfg), build_host.bat +
+        build_and_run.bat wiring, DebuggerTests.pas (scenario plumbing + 39 site
+        conversions + TDebuggerTestsBpl + RegisterTestFixture), DapClient.pas
+        (Modules param), RunTests.dpr (RUNTESTS_ONLY filter), BPL_PARITY_PLAN.md,
+        and the doc updates. WAITING on user confirmation to commit/push.
+
+  (historical inventory of the 41/39 sites, for reference:)
+    * portable convert (~22): Test_BP_Conditional/HitCount/LogPoint,
+      Test_Step_Over_* (4), Test_ExceptionFilter_* (5), Test_ExceptionStop/Info/
+      Local, Test_Lifecycle_RunToTermination, Test_Threads_ExceptionInWorker.
+      Mechanic: replace `FClient.Launch(TargetExe,TargetMap,TargetRsm,TargetDir,
+      SAE,Args[,Modules]).Free` with `LaunchTarget(...).Free`; Bp() already finds
+      markers in TestTargetCore.pas; switch-gated scenarios work (FindCmdLineSwitch
+      in RunAllScenarios reads TestHost.exe's cmdline).
+    * Test_Bpl_* (5347-5865, 10 tests): already mono-loads-TestPackage*; decide
+      triple-stack vs SkipIfBpl per test.
+    * Test_BL_* (7569-7940, Tier-3 host+bpl) + Attach + Test_BL_Bp_FirstLine:
+      SkipIfBpl (already the host scenario; redundant in tsBpl).
+  Then re-run; STEP 13 both fixtures green; STEP 14 docs (KNOWN_UNKNOWNS, DAP_*,
+  PROJECT_STATE for the 4 adapter robustness fixes + parity infra); commit+push.
+
+(superseded) STEP 1-3 DONE, mono gate GREEN 426/426. The relocation
+(TestTargetCore.pas + thin TestTarget.dpr) compiles and the whole existing suite
+passes after FOUR real adapter robustness fixes the relocation surfaced (all
+landed in VisualStudioCodeDelphiDebugger):
+  - RsmFileReader.DecodeClassMemberHash: decode the 1-byte `$08 lo $FF` member
+    hash as $00lo (not $FFlo) -- unit-section Variant-D classes.
+  - RsmFileReader ParseTypeDeclarationSection Variant-D branch: also register the
+    even 1-byte low-byte class-hash candidate so members bind.
+  - RsmFileReader.GetClassMembers: reject built-in scalar/string type names
+    (IsBuiltinScalarTypeName) -- a primitive is never a class; prevents the
+    1-byte-hash collision from making GetClassMembers('Integer') spuriously true
+    (which had broken `Integer(3.9)` -> class-cast -> raw bits).
+  - DapServer.FieldDrillDownRef: for a non-expandable RSM leaf, consult the live
+    object's RTTI at the same offset before Exit(0) -- rescues a generic backing
+    field (TList<T>.FItems) whose per-unit type-id mis-resolved to PShortInt.
+A one-off RSM cast probe confirmed primitives now resolve to 0
+members, real classes unchanged. Adapter changes are UNCOMMITTED (commit when BPL
+parity is also green).
+NEXT: STEP 4-5 build TestHost\TestSubject.bpl + TestHost.exe (files drafted),
+verify standalone; STEP 6 wire build_host.bat into build_and_run; STEP 7-12
+fixture scenario plumbing + LaunchTarget + SkipIfBpl + Tier-2 re-vehicle +
+TDebuggerTestsBpl subclass; STEP 13 full BPL run; STEP 14 docs.
+
+(historical) STEP 1-3 delegated to a fork subagent (extract TestTarget.dpr body ->
+TestTargetCore.pas exporting RunAllScenarios; shrink the .dpr to uses
+TestTargetCore + the exe-only MAIN_* inline-var block; mono regression gate must
+stay 426 green). STEP 4-6 files already DRAFTED (not built yet) under
+`DebuggerTests\TestHost\`: TestSubject.dpk (+.cfg) = the BPL containing
+TestTargetCore + the 13 subject units; TestHost.dpr (+.cfg) = thin host that
+LoadPackage('TestSubject.bpl') + GetProcAddress('RunAllScenarios') + calls it;
+build_host.bat builds both and copies TestSubject/TestPackage*/NoDebugLib next to
+TestHost.exe. Remaining: STEP 3 gate result, then wire build_host into
+build_and_run, then STEPS 7-14 (fixture scenario plumbing, LaunchTarget,
+SkipIfBpl, Tier-2 re-vehicle, TDebuggerTestsBpl subclass, full BPL run, docs).
+
+## Previous task (DONE this session)
+
+BPL-frame locals fix + regression test (DONE this session).
+
+Symptom (user): no locals (and `Self: not found`) inside `TAboutBoxForm.Create`,
+a constructor in `libAboutBoxD29.bpl` (a BPL of the maintainer's proprietary Delphi Win64
+application, not present in a fresh clone). Root cause (probed with a one-off
+locals probe; finding recorded here): the BPL's RSM has ZERO locals for that
+function, but its TD32 has all 5 (Self/aowner/yyyy/mm/dd, correct types). The
+adapter enabled `ExposeLocals` only on the MAIN exe's TD32 (DapServer 2146/2370),
+NOT on DLL/BPL readers (`EnsureDllTD32`), so the package's TD32 locals were gated
+off -> RSM empty + TD32 gated = empty locals. NOT a regression of the prior
+commit (the locals path was untouched). The KNOWN_UNKNOWNS "TD32 lacks rich type
+metadata, ExposeLocals default off" note is outdated for this case.
+
+Fix: one line in `EnsureDllTD32` -- `Obj.ExposeLocals := True`.
+
+Regression test: `Test_Bpl_Td32Only_LocalsVisible` (DebuggerTests.pas) launches
+TestPackage with NO map/rsm/dcp (TD32-only) and asserts locals A/B/W at PKG_BP.
+PROVEN RED without the fix ("param A missing in TD32-only BPL frame") and GREEN
+with it. This fills the gap the old `Test_Bpl_Td32Only_BpHits` explicitly skipped
+("locals not asserted here"). Suite: 426 passed / 0 / 0.
+
+The multi-BPL test infra was already substantial (TestPackage/TestPackage2 .dpk,
+BP-in-BPL, BPL classes/fields, step-into-BPL, unload/reload, cross-binary
+globals); what was missing was the "BPL whose RSM lacks a function's locals while
+its TD32 has them" case -- because TestPackage's RSM is complete.
+
+## Earlier this session
+
+Adapter-freeze fix + cancellable synthetic call (DONE this session).
+
+Symptom (user): after the Globals fix, `Globals` correctly showed `nil (TGlobals)`,
+but Step Over did nothing. Root cause (from log): a HOVER over a unit name
+(`frmSelezioneCompanyU`, in the uses clause) triggered a SPECULATIVE synthetic
+free-function call (`ResolveIdent` step 3) to the unit's init code; `RunMethodCall`
+waited `WaitForDebugEvent(INFINITE)` for a trap that never fired -> the single main
+thread froze inside `ProcessRequest` -> all queued `next` requests piled up
+unprocessed (dispatch is serial; the stdin thread keeps reading but nothing drains).
+
+Two-layer fix:
+1. PREVENTION (`ExprEval.ApplyMethodCall`): new `Speculative` flag (true only on the
+   bare-identifier `ResolveIdent` path) refuses the call unless a return type can be
+   BOUND -- a unit/type/procedure (no `Result`) is never invoked. Explicit
+   `Name(...)` and calls-with-args are unaffected.
+2. SAFETY NET (`RunMethodCall`): the pump is cancellable + watchdogged. Waits in
+   100 ms slices; on a control command (stdin thread sets `FAbortRemoteCall`) or an
+   8 s deadline, it `SuspendThread` + `RIP:=FRemoteCallTrap` + `ResumeThread` so the
+   forced trap completes the call as a FAILURE. New `IDebugTarget`
+   `RemoteCallInFlight`/`RequestAbortRemoteCall`; atomics `FInRemoteCall`/
+   `FAbortRemoteCall`; wired in `TDapServer.Run`'s stdin loop.
+
+Files: `ExprEval.pas`, `Win64Debugger.pas`, `DebugTarget.pas`, `DapServer.pas`,
+`DAP_DEBUGGER_ARCHITECTURE.md`. Suite green 425/0/0. Removed the temporary
+`ResolveIdent` branch-`Tag` logging used to diagnose this.
+
+NEXT: user verifies Step Over advances (no freeze) AND `Globals` still nil->object.
+Watchdog/abort not yet unit-tested (needs a hanging getter + timing); a TestTarget
+slow-getter case is the follow-up if we want regression coverage.
+
+## Earlier this session
+
+Step/watch latency fix (DONE this session, after the data-global fix below).
+
+Symptom (user): after the first breakpoint, the "Updating..." phase is very slow.
+Cause (from `dap_adapter.log` gap analysis): each UNRESOLVED watch/hover cost
+~5-6 s. `TWinDebugger.EvaluateGlobalName`'s first-miss retry blind-`Sleep`ed the
+full 5 s window (waiting for MAP publics background indexing) even when nothing
+was indexing.
+
+Fix: new optional `IBackgroundIndexProvider` (only `TMapFile` implements it ->
+`not FPubsReady`); `TDebugInfoSet.AnyBackgroundIndexingPending` aggregates it;
+the retry loop now exits the instant nothing is indexing -> a genuine miss at a
+warm stop returns in one `NameToRva` pass instead of ~5 s. Files:
+`DebugInfoTypes.pas`, `MapFileReader.pas`, `DebugInfoSet.pas`, `Win64Debugger.pas`.
+
+TRAP HIT + FIXED: first GUID for `IBackgroundIndexProvider` was `...0009`, a
+DUPLICATE of `IUnitScopedConstProvider`. `Supports` then matched the wrong
+vtable, so `AnyBackgroundIndexingPending` invoked `FindConstInUnit` with garbage
+out-params -> AV (`Write of address 0x5`) -> 11 evaluate tests errored. Unique
+GUID `...000A` fixed it. Lesson: every provider interface needs a distinct GUID.
+Suite green: 425 passed / 0 failed / 0 errored.
+
+Secondary perf lever (config, not code): `DAP_LOG=1` is set at USER env level ->
+adapter logging always on (synchronous WriteFile per line). Recommend `setx
+DAP_LOG 0` for normal use; keep on only while diagnosing.
+
+## Previous task (DONE earlier this session)
+
+Data-global-watch garbage fix (DONE this session).
+
+Symptom (user, SampleApp `SampleApp.dpr`): watching `Globals` while stepping the
+program main block shows a different value AND a different TYPE on every
+step-over (`Integer 4725648`, then `TThreadBugReport`, …), only correct
+(`$354D0DA0 TGlobals`) after `Globals := TGlobals.Create` at line 117.
+
+Root cause (proven by `DevTools\DumpTd32Globals.exe <module> [filter]` -- then named
+Td32GlobalsProbe -- plus the adapter log, volatile scratchpad, gone):
+`Globals` (`GlobalsU.pas`) is contained in `libSharedFormsD29.bpl`, NOT the exe —
+`SampleApp.exe`'s TD32 covers only ~33 statically-linked units. The adapter loads
+the BPL's TD32 and `NameToRva("Globals")` resolves to the variable's DATA
+address (`BPL base $BA70000 + RVA $6F198 = $BADF198` — the exact `0xBADF198`
+garbage value seen in the log). `ExprEval.ResolveIdent` tries the parameterless
+free-function call (step 4) BEFORE the data-global read (step 5), so
+`ApplyMethodCall` invoked the data address as code via `RunMethodCall` —
+executing the variable's bytes as x64 instructions → garbage RAX (different each
+step) or `ABORT 0xC0000005`. `DapServer` then guessed the type from the garbage
+pointer's VMT (`GetInstanceClassName`), hence the changing class names.
+
+Fix: `IDebugTarget.AddressIsExecutable(VA)` (one `VirtualQueryEx`, true only on
+committed `PAGE_EXECUTE*`). `ApplyMethodCall` refuses the free-proc call when
+the resolved `FuncVA` is not executable → falls through to `EvaluateGlobalName`,
+which READS the global. Files: `DebugTarget.pas` (interface),
+`Win64Debugger.pas` (impl + decl), `ExprEval.pas` (guard ~line 1004).
+Also added `TTD32FileReader.DiagFindSymbolRecords` (raw symbol-record scan).
+
+Built clean (`build_dap.bat`). Full suite green: 425 passed / 1 ignored / 0
+failed (`DebuggerTests\build_and_run.bat`).
+
+Next: user re-runs the SampleApp session and confirms `Globals` shows `nil`
+(or the object) from line 110 instead of garbage. A deterministic end-to-end
+DUnitX repro is impractical (data-as-code usually faults-and-recovers on the
+trivial TestTarget, so old/new agree there); `DevTools\DumpTd32Globals.exe` reproduces the
+mechanism and the suite guards regression.
+
+## Previous task (done earlier)
+
+WOW64/32-bit target guard (DONE earlier session).
+
+A user debug session (DGOdac BPL, MigrazioneDoaODAC workspace) showed every
+exception-stop call-stack frame unresolved. Root cause: the launch config
+targeted Win32 (`bin\bds.exe` 32-bit host + `Bpl\DGOdacD29.*` Win32 map), and
+the adapter is Win64-only — `StackWalk64` on a WOW64 process only walks the x64
+emulation frames (wow64.dll / wow64cpu.dll / ntdll). Added
+`TWinDebugger.WarnIfUnsupportedTargetArchitecture` (called from
+`HandleCreateProcess`): detects a 32-bit target via `IsWow64Process2` and emits
+a `[FATAL]` advisory through `FOnOutput`. Adapter rebuilt clean.
+Discriminator verified by a one-off WOW64 probe (I386 -> fires,
+UNKNOWN -> silent; `bin\bds.exe` confirmed 32-bit). User-side fix is to target
+Win64 (host `bin64\bds.exe`, `Bpl\Win64\` map/rsm).
+
+## Previous task (paused)
+
+Distribution / packaging polish and English-only cleanup.
+
+Two goals, both substantially done:
+
+1. Make the project installable with a clear, interactive flow.
+2. Remove all Italian from the project (messages, comments, identifiers, docs).
+
+## Current substep
+
+Finalizing and verifying. Code, docs, installer, and README are updated; final
+verification grep pending.
+
+## Last completed action
+
+- Renamed the only Italian identifiers/strings in the code (`Debugme.dpr`) to
+  English: the `var`-parameter procedure is now `Increment`, the nested
+  constant is now `FOO = 'foo'`, the sample literal is now `'foo!'`, and the
+  sample raise message is now `'Test error'`.
+- Updated the references to those names in `DevTools\TestNested.dpr` and in the
+  living-spec docs (`RSM_FORMAT_NOTES.md`, `RSM_RECORD_TYPES.md`,
+  `PROJECT_STATE.md`) plus a comment in `Win64Debugger.pas`. The RSM byte-table
+  in `RSM_FORMAT_NOTES.md` is now marked as a historical/illustrative example.
+- Rebuilt `Debugme.exe` / `.rsm` / `.map` and the adapter via `build_debug.bat`
+  (clean; only known hints/warnings). DevTools rebuilt; `ScanRsmMethods` OK,
+  `TestRsmParser` still fails to build (pre-existing `RsmTags` unit-path issue,
+  unrelated).
+- Added an interactive installer: `install\Install.dpr` + `build_installer.bat`
+  (output `install\Install.exe`). It builds the adapter if missing, stages it
+  into `install\local.delphi-win64-debug\`, detects VS Code / VS Code Insiders,
+  and copies the extension with overwrite confirmation. Compiles clean.
+- Rewrote `README.md`: added a Quick start section, an installer-first
+  extension-setup section, refreshed the architecture file table, the
+  What-works list, the roadmap, the diagnostic-logging note (now opt-in), and
+  the known-limitations section (removed the false "no type information" claim).
+- Fixed stale content in `install\INSTALL_INSTRUCTIONS.md`.
+- Rewrote this file in English.
+
+## Next action if interrupted right now
+
+Run the final Italian-detection grep across the repo (distinctly-Italian words
+and accented characters in `*.pas *.dpr *.dpk *.inc *.md *.js`) and fix any
+remaining hit. Then optionally run the full test suite.
+
+## Files involved
+
+- `Debugme.dpr`, `DevTools\TestNested.dpr`
+- `install\Install.dpr`, `build_installer.bat`, `install\INSTALL_INSTRUCTIONS.md`
+- `README.md`, `RSM_FORMAT_NOTES.md`, `RSM_RECORD_TYPES.md`, `PROJECT_STATE.md`
+- `DebuggerCore\Win64Debugger.pas` (comment only)
+
+## What works
+
+- `build_debug.bat`, `build_dap.bat`, `build_installer.bat` all build clean.
+- `install\Install.exe` compiles; not auto-run (it modifies the user's VS Code
+  and blocks on interactive input).
+
+## What is failing
+
+- Nothing functional. `DevTools\TestRsmParser` build failure is pre-existing and
+  out of scope (unit search path for `RsmTags`).
+
+## Last test result
+
+Full DUnitX suite not re-run this session. Rationale: no adapter or RSM-parser
+logic changed (only a comment, the test target, docs, and new install files).
+The DUnitX suite targets `TestTarget.exe`, not `Debugme.exe`.
+
+## Exact next step
+
+Final verification grep; fix stragglers if any.
+
+## Traps / hypotheses
+
+- `for var x in ['a','b']` over string literals is fine in a for-in, but
+  `Exit(['a'])` / building a `TArray<string>` result from a `[...]` literal is
+  parsed as a set ("Ordinal type required"); use `TArray<string>.Create(...)`.
+- The staged `install\local.delphi-win64-debug\package.json` has no `main`
+  field, so it needs no `extension.js` (a pure debug-type contribution that
+  launches the external adapter exe). Do not "fix" the manual instructions to
+  copy `extension.js`.
+- Renaming test-target symbols shifts RSM/MAP byte offsets; the doc example
+  tables are illustrative, not tracked against the current binary.

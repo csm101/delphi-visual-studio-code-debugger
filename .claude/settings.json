@@ -1,0 +1,20 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(cmd /c \"C:\\Athens\\GitHub\\Win64Debugger\\build_dap.bat\" *)",
+      "PowerShell(cmd /c \"C:\\Athens\\GitHub\\Win64Debugger\\update-install.bat\" *)",
+      "PowerShell(cmd /c \"C:\\Athens\\GitHub\\Win64Debugger\\build_installer.bat\" *)",
+      "PowerShell(cmd /c \"C:\\Athens\\GitHub\\Win64Debugger\\build_setup_zip.bat\" *)",
+      "PowerShell(cmd /c \"C:\\Athens\\GitHub\\Win64Debugger\\build_mcp.bat\" *)",
+      "PowerShell(cmd /c \"C:\\Athens\\GitHub\\Win64Debugger\\DevTools\\*.bat\" *)",
+      "PowerShell(cmd /c \"C:\\Athens\\GitHub\\Win64Debugger\\DevTools\\build_all.bat\" *)",
+      "PowerShell(cmd /c \"C:\\Athens\\GitHub\\Win64Debugger\\DevTools\\devtool.bat\" *)",
+      "PowerShell(cmd /c \"C:\\Athens\\GitHub\\Win64Debugger\\DebuggerTests\\*.bat\" *)",
+      "PowerShell(cmd /c \"C:\\Athens\\GitHub\\Win64Debugger\\DebuggerTests\\build_and_run.bat\" *)",
+      "PowerShell(cmd /c \"C:\\Athens\\GitHub\\Win64Debugger\\DebuggerTests\\build_runner.bat\" *)",
+      "PowerShell(cmd /c \"C:\\Athens\\GitHub\\Win64Debugger\\DebuggerTests\\build_target.bat\" *)",
+      "PowerShell(cmd /c \"C:\\Athens\\GitHub\\Win64Debugger\\DebuggerTests\\run_tests.bat\" *)",
+      "PowerShell(cmd /c \"C:\\Athens\\GitHub\\Win64Debugger\\install\\extension-tests\\run.bat\" *)"
+    ]
+  }
+}

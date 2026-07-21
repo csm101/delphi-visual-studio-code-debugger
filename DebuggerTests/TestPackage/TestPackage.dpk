@@ -1,0 +1,17 @@
+package TestPackage;
+
+// Runtime-loadable BPL used by the BPL integration tests in
+// DebuggerTests/. The host EXE (TestTarget.exe) calls LoadPackage on
+// this BPL when invoked with `--load-package`; LoadPackage runs the
+// contained units' initialization sections, which in turn call
+// PkgAdd — that's where the BP_PKG marker fires.
+
+{$RUNONLY}
+
+requires
+  rtl;
+
+contains
+  TestPkgUnit in 'TestPkgUnit.pas';
+
+end.
