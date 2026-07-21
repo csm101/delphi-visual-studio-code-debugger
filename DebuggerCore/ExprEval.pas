@@ -98,6 +98,11 @@ type
     function  ParseStringLiteral(out S: string): Boolean;
     function  ApplySuffixes(const Base: TExprValue): TExprValue;
     function  ApplyIndex(const Base: TExprValue; Idx: Int64): TExprValue;
+    // `Obj[X]` on a class instance: finds the class's `default` array property,
+    // walking the ancestor chain (TStringList's default is TStrings.Strings).
+    // False when the receiver is not an instance or no ancestor declares one.
+    function  TryFindDefaultProperty(const Base: TExprValue;
+                out PropName, DeclClass: string): Boolean;
     function  ApplyVarArrayIndex(const Base: TExprValue; const Indices: TArray<Int64>): TExprValue;
     // Static Pascal array `array[lo..hi, ...] of T` (possibly multi-dim).
     function  IsStaticArrayHint(const H: string): Boolean;
@@ -517,6 +522,37 @@ end;
 
 { Indexing }
 
+function TExprEvaluator.TryFindDefaultProperty(const Base: TExprValue;
+  out PropName, DeclClass: string): Boolean;
+begin
+  Result    := False;
+  PropName  := '';
+  DeclClass := '';
+  if (FRtti = nil) or (FDebugInfo = nil) or (not Base.IsValid) then
+    Exit;
+  if not FRtti.IsClassInstance(Base.RawValue) then
+    Exit;
+
+  for var ClassName in FRtti.GetClassChainNames(Base.RawValue) do begin
+    var Members: TArray<TClassMember>;
+    if not FDebugInfo.GetClassMembers(ClassName, Members) then
+      Continue;
+    for var M in Members do
+      if (M.Kind = cmkProperty) and M.IsDefaultProperty and (M.Name <> '') then begin
+        PropName := M.Name;
+        // The member list of a class already includes its inherited members, so
+        // the flag may be found while scanning a descendant. Dispatch against
+        // the class that DECLARES it when that is known, since the getter's
+        // symbol lives there.
+        if M.DeclClass <> '' then
+          DeclClass := M.DeclClass
+        else
+          DeclClass := ClassName;
+        Exit(True);
+      end;
+  end;
+end;
+
 function TExprEvaluator.ApplyIndex(const Base: TExprValue; Idx: Int64): TExprValue;
 var
   DataPtr:  UInt64;
@@ -604,6 +640,14 @@ begin
   // Variant array element access (single-dimension call)
   if SameText(Base.TypeHint, 'Variant') or SameText(Base.TypeHint, 'TVarData') then
     Exit(ApplyVarArrayIndex(Base, [Idx]));
+
+  // A class instance that reaches here declares no `default` array property
+  // anywhere in its chain (or its debug information does not carry one). Say so,
+  // and say what to write instead: a named property still works.
+  if (FRtti <> nil) and Base.IsValid and FRtti.IsClassInstance(Base.RawValue) then
+    Exit(InvalidValue(Format(
+      '<"%s" has no default array property; name the property, e.g. Obj.Items[%d]>',
+      [Base.TypeHint, Idx])));
 
   Result := InvalidValue(Format('<cannot index type "%s">', [Base.TypeHint]));
 end;
@@ -1726,17 +1770,31 @@ begin
         Inc(FPos);
         // Collect comma-separated indices: arr[i] or arr[i,j,...] (Variant arrays)
         var Indices: TArray<Int64>;
+        // The same indices UNCOERCED. A default array property may take a
+        // string (`dataset['CODE']` -> FieldValues['CODE']), and
+        // Int64(RawValue) throws that away.
+        var IndexValues: TArray<TExprValue>;
         SetLength(Indices, 0);
+        SetLength(IndexValues, 0);
         repeat
           IdxVal := ParseExpr;
           if not IdxVal.IsValid then
             Exit(IdxVal);
-          Indices := Indices + [Int64(IdxVal.RawValue)];
+          Indices     := Indices + [Int64(IdxVal.RawValue)];
+          IndexValues := IndexValues + [IdxVal];
           SkipWS;
         until not MatchChar(',');
         if not MatchChar(']') then
           Exit(InvalidValue('<missing ] after index>'));
-        if IsStaticArrayHint(Result.TypeHint) then
+        // A class instance indexes through its `default` array property, which
+        // is what `Obj[X]` means in Pascal. Checked before the array forms: an
+        // object is not an array, and without this it fell through to
+        // "<cannot index type>".
+        var DefaultProp, DefaultPropClass: string;
+        if (not Result.IsTypeRef) and
+           TryFindDefaultProperty(Result, DefaultProp, DefaultPropClass) then
+          Result := ApplyMethodCall(Result, DefaultProp, IndexValues, DefaultPropClass)
+        else if IsStaticArrayHint(Result.TypeHint) then
           Result := ApplyStaticArrayIndex(Result, Indices)
         else if Length(Indices) = 1 then
           Result := ApplyIndex(Result, Indices[0])

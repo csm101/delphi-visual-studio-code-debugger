@@ -135,6 +135,8 @@ type
     IsIndexed:  Boolean;// True for an indexed (array) property -- the getter
                         // takes an index argument. The property descriptor
                         // carries a non-zero index-args type at offset +6.
+    IsDefaultProperty: Boolean; // the Pascal `default` array property, i.e.
+                        // the one `Obj[X]` resolves to. Bit 0 of the u16 at +4.
   end;
   TTD32TypeRecord = record
     Index:        Integer;            // record index in the section
@@ -2595,12 +2597,15 @@ begin
             // indexed Item[Index] has +6 = B4B4. An indexed property cannot be
             // read without an index, so the variables view must not auto-call
             // its getter.
-            if (FTypes[TgtIdx].PayloadPtr <> nil) and (FTypes[TgtIdx].PayloadLen >= 8) then
-              M.IsIndexed := PWord(FTypes[TgtIdx].PayloadPtr + 6)^ <> 0;
+            // The index-args type is a u32, not a u16: a typeId whose low word
+            // happened to be zero would otherwise read as "not indexed".
+            if (FTypes[TgtIdx].PayloadPtr <> nil) and (FTypes[TgtIdx].PayloadLen >= 10) then
+              M.IsIndexed := PCardinal(FTypes[TgtIdx].PayloadPtr + 6)^ <> 0;
             // $0035 property descriptor payload (22 bytes):
             //   +0  underlyingType : u32
-            //   +4  accessKind     : u32  (4 = read backing field,
-            //                              6 = read via getter method)
+            //   +4  accessKind     : u16  (4 = read backing field,
+            //                              6 = read via getter method;
+            //                              bit 0 set = Pascal `default`)
             //   +8  reserved       : u32  (zero)
             //   +12 reserved byte  : u8   (zero)
             //   +13 marker         : u8   ($80 -- variable-numeric tag)
@@ -2611,7 +2616,15 @@ begin
             //   +18 reserved       : u32  (zero)
             if (FTypes[TgtIdx].PayloadPtr <> nil) and
                (FTypes[TgtIdx].PayloadLen >= 18) then begin
-              var Kind     := PCardinal(FTypes[TgtIdx].PayloadPtr + 4)^;
+              // accessKind is 16 bits. Reading 32 folded in the index-args
+              // typeId that follows at +6, so for an INDEXED property the case
+              // below never matched and the getter name was silently dropped -
+              // every indexed property lost its TD32 getter binding. Bit 0
+              // carries `default` and is masked out here; it is read on its own
+              // right below.
+              var Raw      := PWord(FTypes[TgtIdx].PayloadPtr + 4)^;
+              var Kind     := Raw and $FFFE;
+              M.IsDefaultProperty := (Raw and $0001) <> 0;
               var Payload14 := PCardinal(FTypes[TgtIdx].PayloadPtr + 14)^;
               case Kind of
                 4: // field-backed: payload is the struct offset
@@ -3255,6 +3268,7 @@ begin
     M.TypeId     := Integer(FTypes[Idx].Members[I].TypeId);
     M.GetterName := FTypes[Idx].Members[I].GetterName;
     M.IsIndexed  := FTypes[Idx].Members[I].IsIndexed;
+    M.IsDefaultProperty := FTypes[Idx].Members[I].IsDefaultProperty;
     M.DeclClass  := FTypes[Idx].Name;  // the class at this hierarchy level
     Members := Members + [M];
   end;

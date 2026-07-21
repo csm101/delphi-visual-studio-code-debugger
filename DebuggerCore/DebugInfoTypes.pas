@@ -254,6 +254,14 @@ type
     Hash:        Word;        // field's `9C 09 XX YY` hash, or method's `E2 XX YY` body-hash
     // cmkProperty:
     GetterHash:  Word;        // 16-bit hash referenced by `80 XX YY` -- points at a field or method
+    // True for the class's `default` array property, i.e. the one `Obj[X]`
+    // means. Both formats record it: TD32 in bit 0 of the u16 at +4 of the
+    // $0035 property descriptor, RSM in bit $40 of the byte before Visibility.
+    // Verified across four binaries, with controls that separate it from the
+    // index type: TStrings.Values (string index, not default) and
+    // TStrings.Strings (Integer index, default) sit on opposite sides of the
+    // flag in both formats.
+    IsDefaultProperty: Boolean;
     GetterName:  string;      // TD32-derived getter method name (demangled)
                               // for method-backed properties. Empty for
                               // RSM-sourced properties (which bind via

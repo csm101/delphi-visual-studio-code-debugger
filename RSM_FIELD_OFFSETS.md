@@ -325,7 +325,7 @@ Identical to `0x2E` apart from the leading tag.
 | 0          | u1   | Tag            | `0x31`                                      |
 | 1          | u1   | NameLen        | `LEN`                                       |
 | 2          | LEN  | Name           | ANSI(LEN), property identifier              |
-| 2+LEN      | u1   | Flags          | `$00` ordinary, `$40` default indexed       |
+| 2+LEN      | u1   | Flags          | bit `$40` = the class's `default` array property; `$00` otherwise, INCLUDING a non-default indexed one |
 | 2+LEN+1    | u1   | Visibility     | Same encoding as fields/methods             |
 | 2+LEN+2    | u1   | Reserved       | `$00`                                       |
 | 2+LEN+3    | 1–2  | TypeId         | VLE-encoded same as `$2C.TypeId` (LSB rule). |

@@ -227,6 +227,22 @@ type
     property Level[Idx: Integer]: Integer read GetLevel;
   end;
 
+  // Format probe: two array properties that differ ONLY in the `default`
+  // marker. `Probe['x']` in Pascal means `Probe.ByName['x']`, so the evaluator
+  // has to know which property is the default one - and whether TD32/RSM record
+  // that at all is exactly what these two let us answer, by comparing the two
+  // property records byte for byte.
+  TIndexProbe = class
+  private
+    FBias: Integer;
+    function GetByName(const AName: string): Integer;
+    function GetPlain(AIdx: Integer): Integer;
+  public
+    constructor Create;
+    property ByName[const AName: string]: Integer read GetByName; default;
+    property Plain[AIdx: Integer]: Integer read GetPlain;
+  end;
+
   TMenuRepro = class
   public
     FOwnerName: string;
@@ -966,6 +982,22 @@ begin
   Result := BaseTag * 10;   // 70
 end;
 
+constructor TIndexProbe.Create;
+begin
+  inherited Create;
+  FBias := 100;
+end;
+
+function TIndexProbe.GetByName(const AName: string): Integer;
+begin
+  Result := Length(AName) + FBias;   // ByName['abcd'] = 104
+end;
+
+function TIndexProbe.GetPlain(AIdx: Integer): Integer;
+begin
+  Result := AIdx * 3 + FBias;        // Plain[4] = 112
+end;
+
 function TMenuCacheBase.BaseEcho(AValue: Integer): Integer;
 begin
   Result := AValue * 2 + BaseTag;   // BaseEcho(21) = 49 with BaseTag = 7
@@ -1000,6 +1032,7 @@ end;
 procedure TMenuRepro.LoadMenu;
 var
   Cache: TMenuCache;
+  Probe: TIndexProbe;   // in scope at NESTED_CLASS_METHOD_BODY for the evaluator tests
 
   procedure CreateNodes(NodeId: Integer);
   var
@@ -1016,15 +1049,20 @@ var
     // through the debugger, and a method nothing calls is smart-linked away -
     // its symbol would be missing and the test would fail for the wrong reason.
     GSink.Use([Cache.BaseEcho(0), Cache.BaseLen('')]);
+    // Same reason: both getters must survive the linker for the default-property
+    // work, and `Probe['x']` must have something to resolve to.
+    GSink.Use([Probe['seed'], Probe.Plain[1]]);
     if CurrentParent <> nil then
       GSink.Use(['parent: ', CurrentParent.Items[0]]);
   end;
 
 begin
   Cache := TMenuCache.Create;
+  Probe := TIndexProbe.Create;
   try
     CreateNodes(42);
   finally
+    Probe.Free;
     Cache.Free;
   end;
 end;

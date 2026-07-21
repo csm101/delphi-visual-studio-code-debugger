@@ -350,8 +350,18 @@ invoked from the evaluator.
    80 [getterHash16 LE] <opaque tail> 08 [classHash] FF
 ```
 
-- `flags`: `$00 = ordinary property`, `$40 = indexed property declared
-  with `default;` (also marks indexer-style accessors).
+- `flags`: bit `$40` marks the class's **`default`** array property -- the
+  one `Obj[X]` resolves to -- and nothing else. The parenthetical "also
+  marks indexer-style accessors" that stood here was **wrong**: a plain
+  indexed property that is not declared `default` reads `$00`
+  (`TMenuCache.Level`, `TStrings.Objects`, `TStrings.Names`,
+  `TStrings.ValueFromIndex`), while `default` ones read `$40` regardless of
+  whether their index is an Integer or a string, and regardless of having a
+  setter. Measured 2026-07-21 across `TestTarget.rsm` and `Debugme.rsm`
+  (60 of 1228 property records, never more than one per class), with a
+  fixture carrying two otherwise-identical array properties
+  (`TestTargetCore.TIndexProbe`). Bit-test it rather than comparing the
+  whole byte: the remaining bits are not understood.
 - `vis`: same encoding as field records.
 - `typeIdByte`: low byte of the property's declared type.
 - `getterHash16`: 16-bit hash (LE) immediately after the first `80`

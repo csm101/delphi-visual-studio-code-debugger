@@ -240,6 +240,17 @@ type
     [Test]
     procedure Test_InheritedMethod_WithStringArgument;
 
+    // --- `Obj[X]` is the class's `default` array property. TIndexProbe has two
+    //     array properties that differ only in that marker, so a debugger that
+    //     picked the wrong one would be caught here. Live repro:
+    //     dataset['CODE'] -> "<cannot index type "TAppDataSet">". ---
+    [Test]
+    procedure Test_DefaultArrayProperty_IndexingAnObject;
+    [Test]
+    procedure Test_DefaultArrayProperty_NotConfusedWithTheOtherIndexedOne;
+    [Test]
+    procedure Test_Indexing_ObjectWithoutDefaultProperty_SaysWhatToWrite;
+
     // --- Getter-backed STRING property on an RTL class (TStringList.Text):
     //     getter has no locals, var-out return ABI must come from the property
     //     type. Regression for SampleApp TApplication.ExeName / CurrentHelpFile. ---
@@ -2008,6 +2019,83 @@ begin
       'an inherited method taking a string must be callable, got: ' + Res);
     Assert.AreEqual('11', ExtractDisplayValue(Res),
       'Cache.BaseLen(''abcd'') = 4 + BaseTag(7) = 11, got: ' + Res);
+  finally
+    Resp.Free;
+  end;
+end;
+
+procedure TDebuggerTests.Test_DefaultArrayProperty_IndexingAnObject;
+// `Probe['abcd']` must mean `Probe.ByName['abcd']` - the property declared
+// `default` - and return Length('abcd') + FBias = 4 + 100 = 104.
+//
+// The index is a STRING, which is also why the parser cannot simply coerce
+// every index to Int64 the way array indexing does.
+var
+  FrameId, LocalsRef: Integer;
+  Resp: TJSONObject;
+  Res: string;
+begin
+  StartSession('NESTED_CLASS_METHOD_BODY', FrameId, LocalsRef);
+  Resp := FClient.Evaluate('Probe[''abcd'']', FrameId);
+  try
+    Res := Resp.GetValue<string>('result', '');
+    Assert.IsFalse(Res.Contains('cannot index'),
+      'indexing an object must go through its default array property, got: ' + Res);
+    Assert.AreEqual('104', ExtractDisplayValue(Res),
+      'Probe[''abcd''] = Length + FBias = 104, got: ' + Res);
+  finally
+    Resp.Free;
+  end;
+end;
+
+procedure TDebuggerTests.Test_DefaultArrayProperty_NotConfusedWithTheOtherIndexedOne;
+// TIndexProbe has TWO array properties. Only ByName is `default`; Plain is not.
+// A reader that merely spotted "an indexed property" - rather than the marked
+// one - would answer with Plain here and be wrong by a plausible-looking number,
+// which is the failure mode worth guarding against.
+var
+  FrameId, LocalsRef: Integer;
+  Resp: TJSONObject;
+  Res: string;
+begin
+  StartSession('NESTED_CLASS_METHOD_BODY', FrameId, LocalsRef);
+  Resp := FClient.Evaluate('Probe.Plain[4]', FrameId);
+  try
+    Res := Resp.GetValue<string>('result', '');
+    Assert.AreEqual('112', ExtractDisplayValue(Res),
+      'Probe.Plain[4] = 4*3 + FBias = 112, got: ' + Res);
+  finally
+    Resp.Free;
+  end;
+
+  Resp := FClient.Evaluate('Probe[4]', FrameId);
+  try
+    Res := Resp.GetValue<string>('result', '');
+    Assert.AreNotEqual('112', ExtractDisplayValue(Res),
+      'Probe[4] must NOT resolve to the non-default Plain property, got: ' + Res);
+  finally
+    Resp.Free;
+  end;
+end;
+
+procedure TDebuggerTests.Test_Indexing_ObjectWithoutDefaultProperty_SaysWhatToWrite;
+// TMenuCache has an indexed property (Level) but none marked `default`, so
+// `Cache[0]` cannot be resolved. The point of the test is the MESSAGE: it has to
+// name the way out rather than say "cannot index type", because the user's next
+// move is to write the property name explicitly.
+var
+  FrameId, LocalsRef: Integer;
+  Resp: TJSONObject;
+  Res: string;
+begin
+  StartSession('NESTED_CLASS_METHOD_BODY', FrameId, LocalsRef);
+  Resp := FClient.Evaluate('Cache[0]', FrameId);
+  try
+    Res := Resp.GetValue<string>('result', '');
+    Assert.IsTrue(Res.Contains('no default array property'),
+      'the error must explain there is no default property, got: ' + Res);
+    Assert.IsTrue(Res.Contains('name the property'),
+      'the error must tell the user what to write instead, got: ' + Res);
   finally
     Resp.Free;
   end;

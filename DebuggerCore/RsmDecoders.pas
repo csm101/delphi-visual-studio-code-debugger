@@ -199,6 +199,11 @@ begin
     end;
     $31: begin
       M.Kind := cmkProperty;
+      // Byte before Visibility carries $40 for the class's `default` array
+      // property -- the one `Obj[X]` means. Bit-tested rather than compared,
+      // because the other bits of this byte are not understood and a future
+      // one must not turn a `default` into a false negative.
+      M.IsDefaultProperty := (Data[After] and $40) <> 0;
       if After + 7 > Off + RecLen then Exit;
       var TypeIdBytes: Integer;
       if not ClassMember_ReadTypeIdVLE(Data, DataSize, After + 3,

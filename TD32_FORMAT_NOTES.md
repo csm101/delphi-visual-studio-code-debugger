@@ -200,13 +200,46 @@ formatter sees the real primitive / class / record. Empirically:
 | `$0032` | set type (base + element)                                 |
 | `$0033` | non-integer ordinal range (`'A'..'Z'`, ...)               |
 | `$0034` | generic parameter slot                                    |
-| `$0035` | set over enum / subrange                                  |
+| `$0035` | property descriptor on Athens (36) -- see below            |
 | `$0036` | 1-typeId alias                                            |
 | `$0038` | class-reference / metaclass                               |
 | `$0039` | rare                                                      |
 | `$003A` | rare                                                      |
 
-The exact payload layout for each is not extracted yet -- only the
+**Measured 2026-07-21, Athens (compiler 36):** the property descriptor
+paired with an offset-0 `LF_MEMBER` is leaf **`$0035`**, not `$0030`, in
+every binary checked (`TestTarget.exe`, `TestHost.exe`). The earlier
+"`$0035` = set over enum / subrange" reading is not confirmed and may
+have come from an older compiler. The reader does not depend on which one
+it is -- it accepts the whole `$0030..$003A` range as a descriptor -- so
+this is a documentation correction, not a behavioural one.
+
+#### `$0035` property descriptor payload (22 bytes)
+
+| Offset | Size | Meaning                                                     |
+|-------:|-----:|-------------------------------------------------------------|
+| `+0`   | u32  | underlying property type                                    |
+| `+4`   | u16  | access kind: `4` = read backing field, `6` = read via getter. **Bit 0 = Pascal `default`** (so `7` = getter-backed default property) |
+| `+6`   | u32  | index-args ARGLIST TypeId; `0` for a non-indexed property   |
+| `+10`  | u16  | zero                                                        |
+| `+12`  | u8   | zero                                                        |
+| `+13`  | u8   | `$80` variable-numeric tag                                  |
+| `+14`  | u32  | field offset when kind = 4, else NAMES index of the getter's mangled name |
+| `+18`  | u32  | zero                                                        |
+
+The `default` bit was established with a fixture carrying two array
+properties that differ only in that marker (`TestTargetCore.TIndexProbe`),
+and cross-checked against the RTL: `TStrings.Values` (string index, NOT
+default) reads `0006` while `TStrings.Strings` (Integer index, default)
+reads `0007` -- index type and the flag vary independently, so the bit is
+not an artefact of the index type. Census: 45 of 1027 descriptors in
+`TestTarget.exe` carry it, never more than one per class.
+
+Note the width: access kind is **16** bits. Reading 32 folds in the
+ARGLIST TypeId at `+6`, which for an indexed property makes the value
+match neither 4 nor 6.
+
+The exact payload layout for the others is not extracted yet -- only the
 first 4 bytes (underlying TypeId) are read.
 
 ### Directory chain (lfoNextDir)
