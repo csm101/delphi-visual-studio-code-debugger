@@ -267,6 +267,14 @@ type
     procedure Test_DefaultProperty_ReturningVariantString;
     [Test]
     procedure Test_IndexedProperty_ReturningVariantInteger;
+    // Return type resolved by KIND, not name: a distinct Variant alias
+    // (NullableInteger = type Variant), a class, and a record.
+    [Test]
+    procedure Test_IndexedProperty_ReturningVariantAlias;
+    [Test]
+    procedure Test_IndexedProperty_ReturningClass;
+    [Test]
+    procedure Test_IndexedProperty_ReturningRecord;
 
     // --- Two same-named nested classes in one unit, told apart only by VMT.
     //     Repro of the live dataset.Fields bug. ---
@@ -2219,6 +2227,67 @@ begin
       'VProbe.Num[7] must decode the integer variant to 1007, got: ' + Res);
     Assert.IsFalse(ExtractDisplayValue(Res) = '3',
       'the result must be the value, not the varInteger VType word, got: ' + Res);
+  finally
+    Resp.Free;
+  end;
+end;
+
+procedure TDebuggerTests.Test_IndexedProperty_ReturningVariantAlias;
+// RKProbe.NVar[5] returns a NullableInteger (= type Variant) holding 55. The
+// declared type name is "NullableInteger", not "Variant", so the return ABI
+// must be decided by the RESOLVED KIND (alias -> TK_VARIANT), not a name match.
+// Must decode to 55, not surface a VType word.
+var
+  FrameId, LocalsRef: Integer;
+  Resp: TJSONObject;
+  Res: string;
+begin
+  StartSession('NESTED_CLASS_METHOD_BODY', FrameId, LocalsRef);
+  Resp := FClient.Evaluate('RKProbe.NVar[5]', FrameId);
+  try
+    Res := Resp.GetValue<string>('result', '');
+    Assert.IsTrue(Res.Contains('55'),
+      'a distinct Variant alias must be decoded to its value (55), got: ' + Res);
+    Assert.IsFalse(ExtractDisplayValue(Res) = '3',
+      'must not surface the varInteger VType word, got: ' + Res);
+  finally
+    Resp.Free;
+  end;
+end;
+
+procedure TDebuggerTests.Test_IndexedProperty_ReturningClass;
+// RKProbe.Obj[5] returns a TMenuCacheBase (a class = pointer in RAX). Chaining
+// .BaseTag must read the returned object's field = 7.
+var
+  FrameId, LocalsRef: Integer;
+  Resp: TJSONObject;
+  Res: string;
+begin
+  StartSession('NESTED_CLASS_METHOD_BODY', FrameId, LocalsRef);
+  Resp := FClient.Evaluate('RKProbe.Obj[5].BaseTag', FrameId);
+  try
+    Res := Resp.GetValue<string>('result', '');
+    Assert.AreEqual('7', ExtractDisplayValue(Res),
+      'an indexed property returning a class must hand back the object pointer, got: ' + Res);
+  finally
+    Resp.Free;
+  end;
+end;
+
+procedure TDebuggerTests.Test_IndexedProperty_ReturningRecord;
+// RKProbe.Rec[3] returns a TPointRec (X=30, Y=31). A record larger than 8 bytes
+// comes back through the var-out slot. Field access on the result must read X.
+var
+  FrameId, LocalsRef: Integer;
+  Resp: TJSONObject;
+  Res: string;
+begin
+  StartSession('NESTED_CLASS_METHOD_BODY', FrameId, LocalsRef);
+  Resp := FClient.Evaluate('RKProbe.Rec[3].X', FrameId);
+  try
+    Res := Resp.GetValue<string>('result', '');
+    Assert.AreEqual('30', ExtractDisplayValue(Res),
+      'an indexed property returning a record must let its field be read, got: ' + Res);
   finally
     Resp.Free;
   end;

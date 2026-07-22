@@ -991,6 +991,12 @@ var
   // result is decoded as a Variant rather than read as an 8-byte pointer - the
   // old lumping showed 258 (the varUString VType word) for `dataset['X']`.
   WantsVariantReturn: Boolean;
+  // A record larger than 8 bytes is written into the var-out slot BY VALUE too.
+  // Its Address must point at the slot so field access reads the fields; reading
+  // 8 bytes as a pointer (the string path) would use the first two fields as an
+  // address. RetRecSize is its declared size, used to size the slot.
+  WantsRecordReturn: Boolean;
+  RetRecSize:        Integer;
   // Win64 ABI: a POD record of size <= 8 bytes is returned PACKED IN RAX, not
   // through a hidden var-out slot. Tracked separately so the slot argument is
   // NOT inserted for such a call (inserting it also shifted the user args into
@@ -1144,36 +1150,29 @@ begin
   // its Result to RDX=0 -> access violation -> the call aborts. When the caller
   // already knows the declared property type, use it: classify by name, then
   // fall back to the authoritative TD32 type kind for non-primitive names.
-  if (not HaveBoundReturn) and (ReturnTypeHint <> '') then begin
-    RetTypeName := ReturnTypeHint;
-    RetKind     := TypeNameToKind(RetTypeName);
-    if (RetKind = TK_UNKNOWN) and (FDebugInfo <> nil) then
-      RetKind := FDebugInfo.LookupTypeKind(RetTypeName);
-    HaveBoundReturn := RetKind <> TK_UNKNOWN;
-  end;
-  // Authoritative override: when the property's DECLARED type is a string family,
-  // the getter ALWAYS returns the managed string via the hidden var-out slot,
-  // regardless of what the Result-local probe inferred. A getter compiled WITH
-  // debug info (e.g. TOracleSession.GetLogonUsername) can have its var-out Result
-  // local typed as a kind TypeNameToKind does not map to TK_*STRING; that
-  // (wrongly) wins over ReturnTypeHint above and leaves WantsStringReturn False
-  // -> the callee writes its Result to RDX=0 -> access violation -> the call
-  // aborts. The declared property type is ground truth, so trust it here.
-  if (ReturnTypeHint <> '') and IsStringTypeHint(ReturnTypeHint) then begin
-    RetTypeName     := ReturnTypeHint;
-    RetKind         := TypeNameToKind(RetTypeName);
-    HaveBoundReturn := True;
-  end;
-  // Same authority for a Variant: the declared property type is ground truth.
-  // The getter's Result local is a TVarData whose kind the local probe may
-  // classify as anything but TK_VARIANT (seen in the BPL scenario), which would
-  // route the 16-byte-by-value result through the string path and surface the
-  // VType word (258) instead of the decoded value.
-  if (ReturnTypeHint <> '') and
-     (SameText(ReturnTypeHint, 'Variant') or SameText(ReturnTypeHint, 'OleVariant')) then begin
-    RetTypeName     := ReturnTypeHint;
-    RetKind         := TK_VARIANT;
-    HaveBoundReturn := True;
+  // The DECLARED return type, when the caller provides it, is authoritative over
+  // the Result-local probe. The property/method's declared type is ground truth
+  // for the return ABI (RAX vs a hidden var-out slot vs XMM0), and the local
+  // probe misses entirely for RTL/VCL getters with no debug info and can, in the
+  // BPL scenario, classify a var-out Result local as the wrong kind.
+  //
+  // The kind is RESOLVED, never matched by name: TypeNameToKind consults the
+  // debug-info type system for any name it does not know built-in, so it follows
+  // `type NullableInteger = type variant` to TK_VARIANT, `TCaption = type string`
+  // to a string kind, and a class or record name to TK_CLASS / TK_RECORD. Keying
+  // on the literal name "Variant" would have missed every distinct alias.
+  if ReturnTypeHint <> '' then begin
+    var HintKind := TypeNameToKind(ReturnTypeHint);
+    if HintKind <> TK_UNKNOWN then begin
+      RetTypeName     := ReturnTypeHint;
+      RetKind         := HintKind;
+      HaveBoundReturn := True;
+    end else if not HaveBoundReturn then begin
+      // No resolvable kind and nothing from the probe: keep the name so the
+      // formatter at least has a type hint, and let the ABI default to RAX.
+      RetTypeName     := ReturnTypeHint;
+      RetKind         := TK_UNKNOWN;
+    end;
   end;
   // Speculative bare-identifier free "call" (ResolveIdent's `Foo` = `Foo()`
   // convenience): only invoke when a return type could be BOUND, i.e. the symbol
@@ -1190,6 +1189,8 @@ begin
   WantsFloatReturn   := False;
   WantsStringReturn  := False;
   WantsVariantReturn := False;
+  WantsRecordReturn  := False;
+  RetRecSize         := 0;
   SmallRecInRax      := False;
   if HaveBoundReturn then begin
     case RetKind of
@@ -1199,21 +1200,22 @@ begin
         // Returned through the var-out slot like a string, but the slot holds a
         // 16/24-byte TVarData by value, decoded below - not a data pointer.
         WantsVariantReturn := True;
-      TK_LSTRING, TK_USTRING, TK_WSTRING, TK_DYNARRAY,
-      TK_MRECORD, TK_INTERFACE:
-        // Interfaces and MANAGED records are managed: a function returning one
-        // uses the hidden var-out slot (RDX for methods), like a string return.
+      TK_LSTRING, TK_USTRING, TK_WSTRING, TK_DYNARRAY, TK_INTERFACE:
+        // Interfaces and dynamic arrays are managed: a function returning one
+        // uses the hidden var-out slot (RDX for methods), and the slot holds a
+        // data/reference POINTER, read as 8 bytes like a string return.
         WantsStringReturn := True;
-      TK_RECORD: begin
+      TK_RECORD, TK_MRECORD: begin
         // A POD record <= 8 bytes comes back in RAX (the same ABI rule
-        // InvokeGetter documents). Routing it through the var-out slot read the
-        // untouched, zeroed slot -- a `MakePoint(3,4)` watch showed (0,0) -- and
-        // shifted the user args by one register. Only larger records use the
-        // slot; when the size is unknown, keep the previous slot behaviour.
-        var RecSz: Integer;
-        SmallRecInRax := FDebugInfo.GetTypeSize(RetTypeName, RecSz) and
-                         (RecSz > 0) and (RecSz <= 8);
-        WantsStringReturn := not SmallRecInRax;
+        // InvokeGetter documents). A larger record - and any managed record - is
+        // written into the var-out slot BY VALUE: point Address at the slot so
+        // its fields can be read. Managed records are never returned in RAX.
+        if (RetKind = TK_MRECORD) or
+           (not (FDebugInfo.GetTypeSize(RetTypeName, RetRecSize) and
+                 (RetRecSize > 0) and (RetRecSize <= 8))) then
+          WantsRecordReturn := True
+        else
+          SmallRecInRax := True;
       end;
     end;
     // TD32 types a managed dynamic-array Result as `^Element` (it has no
@@ -1254,9 +1256,11 @@ begin
   // Variant needs the whole 24-byte TVarData zeroed, not just 8 bytes, so a
   // field the getter leaves untouched cannot read as stale VType/data.
   Slot := 0;
-  if WantsStringReturn or WantsVariantReturn then begin
+  if WantsStringReturn or WantsVariantReturn or WantsRecordReturn then begin
     if WantsVariantReturn then
       Slot := FDebugger.GetRemoteScratchSlot(24)
+    else if WantsRecordReturn then
+      Slot := FDebugger.GetRemoteScratchSlot(NativeUInt(Max(RetRecSize, 16)))
     else
       Slot := FDebugger.GetRemoteScratchSlot(8);
     if Slot = 0 then
@@ -1295,6 +1299,14 @@ begin
     Result.Address  := Slot;
     Result.RawValue := 0;
     Result.Size     := 24;
+  end else if WantsRecordReturn then begin
+    // The slot IS the record (by value). Address at the slot lets the record
+    // field resolver read fields at slot + offset; RawValue stays 0 so nothing
+    // reinterprets the first bytes as a pointer.
+    Result.TypeHint := RetTypeName;
+    Result.Address  := Slot;
+    Result.RawValue := 0;
+    Result.Size     := RetRecSize;
   end else if WantsStringReturn then begin
     if HaveBoundReturn then
       Result.TypeHint := RetTypeName

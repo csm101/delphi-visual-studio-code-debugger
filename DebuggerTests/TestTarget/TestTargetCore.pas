@@ -261,6 +261,37 @@ type
     property Num[AIdx: Integer]: Variant read GetNum;
   end;
 
+  // A DISTINCT type that is a Variant underneath (`type ... = type Variant`).
+  // Its name is NOT "Variant", so decoding must follow the alias to its kind,
+  // not match the literal name.
+  NullableInteger = type Variant;
+
+  // 12 bytes (> 8) so it is returned through the hidden var-out slot, not packed
+  // in RAX. The <= 8-byte case comes back in RAX and its field-by-field access
+  // is a separate, still-open follow-up.
+  TPointRec = record
+    X: Integer;
+    Y: Integer;
+    Z: Integer;
+  end;
+
+  // Indexed properties whose return type is, in turn: a Variant ALIAS, a CLASS,
+  // and a RECORD. Exercises return-ABI decode driven by the declared type's
+  // KIND rather than its name.
+  TReturnKindProbe = class
+  private
+    FChild: TMenuCacheBase;
+    function GetNVar(AIdx: Integer): NullableInteger;
+    function GetObj(AIdx: Integer): TMenuCacheBase;
+    function GetRec(AIdx: Integer): TPointRec;
+  public
+    constructor Create;
+    destructor Destroy; override;
+    property NVar[AIdx: Integer]: NullableInteger read GetNVar;
+    property Obj[AIdx: Integer]:  TMenuCacheBase  read GetObj;
+    property Rec[AIdx: Integer]:  TPointRec       read GetRec;
+  end;
+
   // A class whose DEFAULT property takes TWO indices, so `M[r, c]` (not through
   // an explicit name) has to marshal both. Delphi allows a multi-index default.
   TMatrixProbe = class
@@ -1084,6 +1115,35 @@ begin
   Result := AIdx + 1000;          // integer variant, Num[7] -> 1007
 end;
 
+constructor TReturnKindProbe.Create;
+begin
+  inherited Create;
+  FChild := TMenuCacheBase.Create;   // BaseTag = 7
+end;
+
+destructor TReturnKindProbe.Destroy;
+begin
+  FChild.Free;
+  inherited;
+end;
+
+function TReturnKindProbe.GetNVar(AIdx: Integer): NullableInteger;
+begin
+  Result := AIdx + 50;   // NVar[5] -> a Variant(alias) holding 55
+end;
+
+function TReturnKindProbe.GetObj(AIdx: Integer): TMenuCacheBase;
+begin
+  Result := FChild;      // Obj[0].BaseTag -> 7
+end;
+
+function TReturnKindProbe.GetRec(AIdx: Integer): TPointRec;
+begin
+  Result.X := AIdx * 10; // Rec[3] -> (30, 31, 32)
+  Result.Y := AIdx * 10 + 1;
+  Result.Z := AIdx * 10 + 2;
+end;
+
 constructor TMatrixProbe.Create;
 begin
   inherited Create;
@@ -1151,6 +1211,7 @@ var
   Probe: TIndexProbe;    // in scope at NESTED_CLASS_METHOD_BODY for the evaluator tests
   Matrix: TMatrixProbe;  // multi-index default property
   VProbe: TVariantProbe; // default property returning a Variant (FieldValues shape)
+  RKProbe: TReturnKindProbe; // indexed properties returning variant-alias/class/record
   DupA: TCollideOuterA.TDup;   // two same-named nested classes, distinct layouts
   DupB: TCollideOuterB.TDup;
   // Same two objects, but typed as TObject: the static type carries no member
@@ -1182,6 +1243,7 @@ var
     // work, and `Probe['x']` / `Matrix[r,c]` must have something to resolve to.
     GSink.Use([Probe['seed'], Probe.Plain[1], Probe.Cell[0, ''], Matrix[0, 0]]);
     GSink.Use([VProbe['a'], VProbe.Num[0]]);
+    GSink.Use([RKProbe.NVar[0], RKProbe.Obj[0].BaseTag, RKProbe.Rec[0].X]);
     // Keep every same-named instance referenced and reachable.
     GSink.Use([DupA.AlphaA, DupB.GammaB]);
     if (DupObjA = nil) or (DupObjB = nil) or (CrossReal = nil) then GSink.Use(['x']);
@@ -1194,6 +1256,7 @@ begin
   Probe  := TIndexProbe.Create;
   Matrix := TMatrixProbe.Create;
   VProbe := TVariantProbe.Create;
+  RKProbe := TReturnKindProbe.Create;
   DupA   := TCollideOuterA.TDup.Create;
   DupB   := TCollideOuterB.TDup.Create;
   DupObjA := DupA;
@@ -1205,6 +1268,7 @@ begin
     CrossReal.Free;
     DupB.Free;
     DupA.Free;
+    RKProbe.Free;
     VProbe.Free;
     Matrix.Free;
     Probe.Free;
