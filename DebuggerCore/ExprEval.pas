@@ -602,11 +602,26 @@ begin
     var Members: TArray<TClassMember>;
     if not FDebugInfo.GetClassMembers(ClassName, Members) then
       Continue;
-    for var M in Members do
-      if (M.Kind = cmkProperty) and M.IsIndexed and SameText(M.Name, PropName) then begin
+    for var M in Members do begin
+      if (M.Kind <> cmkProperty) or not SameText(M.Name, PropName) then
+        Continue;
+      if M.IsIndexed then begin
         PropType := M.TypeName;
         Exit(True);
       end;
+      // IsIndexed can be lost when the class FIELDLIST is empty (RSM fallback /
+      // a BPL type). A getter that TAKES parameters is an indexed property just
+      // the same: `[...]` are its arguments, not a post-index of its result.
+      if M.GetterName <> '' then begin
+        var GParams: TArray<TMethodParam>;
+        var GHasSelf: Boolean;
+        if FDebugInfo.TryGetMethodParams(ClassName, M.GetterName, GParams, GHasSelf) and
+           (Length(GParams) > 0) then begin
+          PropType := M.TypeName;
+          Exit(True);
+        end;
+      end;
+    end;
   end;
 end;
 
@@ -1217,6 +1232,19 @@ begin
   // handled above.
   if IsFreeProc and Speculative and (not HaveBoundReturn) then
     Exit(InvalidValue(Format('<%s is not a value-returning function>', [FullName])));
+  // A value-returning function that TAKES parameters must not be invoked bare:
+  // a speculative zero-argument synthetic call reads whatever garbage is in the
+  // argument registers and returns a plausible-but-wrong value. Only a genuinely
+  // parameterless function may be auto-called; an explicit `Name(args)` call
+  // (Speculative=False) is never gated.
+  // TODO (audit F1): a bare value-returning FREE FUNCTION that takes parameters
+  // is still auto-called with garbage argument registers, returning a
+  // plausible-but-wrong value. A clean guard needs a free-function arity source:
+  // TryGetMethodParams resolves only methods (it keys on a class), and the
+  // frame-locals RbpOffset is RSM-encoded, so "above RBP" cannot be read off it
+  // reliably. The fix is a TD32 LF_PROCEDURE param-count accessor. The
+  // METHOD-getter case (indexed properties) is already guarded via
+  // IsKnownIndexedProperty using TryGetMethodParams.
   WantsFloatReturn   := False;
   WantsStringReturn  := False;
   WantsVariantReturn := False;

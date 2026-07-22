@@ -810,6 +810,18 @@ begin
   end;
 end;
 
+// Free functions for the speculative-invoke guard (F1): a parameterless one may
+// be auto-called by a bare identifier; one taking a parameter must not.
+function GetFortyTwo: Integer;
+begin
+  Result := 42;
+end;
+
+function TripleValue(X: Integer): Integer;
+begin
+  Result := X * 3;
+end;
+
 procedure RunEvalTests;
 var
   Caption: string;
@@ -837,6 +849,7 @@ begin
   TVarData(ByRefVar).VType     := varInteger or varByRef;
   TVarData(ByRefVar).VPointer  := @IntStore;
   GSink.Use([Caption, W.Name, S.PubCount, EvalDate, CapAlias, NVarLocal, IntStore, ByRefVar]);  // {BP:EVAL_BODY}
+  GSink.Use([GetFortyTwo, TripleValue(2)]);   // keep the free functions linked
   S.Free;
   W.Free;
 end;

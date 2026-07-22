@@ -596,6 +596,7 @@ type
     [Test] procedure Test_Eval_StringAliasIndexing_ReadsWideChar;
     [Test] procedure Test_Eval_VariantAliasLocal_Decoded;
     [Test] procedure Test_Eval_ByRefVariant_Dereferenced;
+    [Test] procedure Test_Eval_BareParameterlessFunction_Invoked;
 
     // --- generic method call: Obj.Method(arg1, arg2, ...) ---
     [Test] procedure Test_Eval_Method_Integer;
@@ -4473,6 +4474,25 @@ begin
       'a Variant-alias local must decode to its value 1234, got: ' + Res);
     Assert.IsFalse(ExtractDisplayValue(Res) = '3',
       'must not surface the varInteger VType word, got: ' + Res);
+  finally
+    Resp.Free;
+  end;
+end;
+
+procedure TDebuggerTests.Test_Eval_BareParameterlessFunction_Invoked;
+// Bare `GetFortyTwo` (no parameters) must still be auto-called, returning 42 -
+// the arity guard must not block the legitimate speculative call.
+var
+  FrameId, LocalsRef: Integer;
+  Resp: TJSONObject;
+  Res: string;
+begin
+  StartSession('EVAL_BODY', FrameId, LocalsRef);
+  Resp := FClient.Evaluate('GetFortyTwo', FrameId);
+  try
+    Res := Resp.GetValue<string>('result', '');
+    Assert.AreEqual('42', ExtractDisplayValue(Res),
+      'a bare parameterless function must still auto-call, got: ' + Res);
   finally
     Resp.Free;
   end;
