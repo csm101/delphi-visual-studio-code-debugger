@@ -251,6 +251,14 @@ type
     [Test]
     procedure Test_Indexing_ObjectWithoutDefaultProperty_SaysWhatToWrite;
 
+    // --- Multi-index properties (matrix / IMldoSqlResult-style). Two indices,
+    //     and mixed types (Integer + string). Both the explicit-name form and
+    //     the default-property form must marshal every index. ---
+    [Test]
+    procedure Test_IndexedProperty_TwoMixedIndices_ExplicitName;
+    [Test]
+    procedure Test_DefaultProperty_TwoIndices;
+
     // --- Getter-backed STRING property on an RTL class (TStringList.Text):
     //     getter has no locals, var-out return ABI must come from the property
     //     type. Regression for SampleApp TApplication.ExeName / CurrentHelpFile. ---
@@ -2096,6 +2104,47 @@ begin
       'the error must explain there is no default property, got: ' + Res);
     Assert.IsTrue(Res.Contains('name the property'),
       'the error must tell the user what to write instead, got: ' + Res);
+  finally
+    Resp.Free;
+  end;
+end;
+
+procedure TDebuggerTests.Test_IndexedProperty_TwoMixedIndices_ExplicitName;
+// probe.Cell[3, 'xy'] -> GetCell(3, 'xy') = 3*1000 + Length('xy') + FBias(100)
+//                     = 3000 + 2 + 100 = 3102.
+// Two arguments, one Integer and one string, marshalled positionally.
+var
+  FrameId, LocalsRef: Integer;
+  Resp: TJSONObject;
+  Res: string;
+begin
+  StartSession('NESTED_CLASS_METHOD_BODY', FrameId, LocalsRef);
+  Resp := FClient.Evaluate('Probe.Cell[3, ''xy'']', FrameId);
+  try
+    Res := Resp.GetValue<string>('result', '');
+    Assert.AreEqual('3102', ExtractDisplayValue(Res),
+      'Probe.Cell[3, ''xy''] must marshal both indices, got: ' + Res);
+  finally
+    Resp.Free;
+  end;
+end;
+
+procedure TDebuggerTests.Test_DefaultProperty_TwoIndices;
+// Matrix[2, 3] -> the default property Item[2,3] = 2*100 + 3*10 + FSeed(7) = 237.
+// A default array property is allowed more than one index; both must be passed.
+var
+  FrameId, LocalsRef: Integer;
+  Resp: TJSONObject;
+  Res: string;
+begin
+  StartSession('NESTED_CLASS_METHOD_BODY', FrameId, LocalsRef);
+  Resp := FClient.Evaluate('Matrix[2, 3]', FrameId);
+  try
+    Res := Resp.GetValue<string>('result', '');
+    Assert.IsFalse(Res.Contains('cannot index') or Res.Contains('not found'),
+      'a two-index default property must resolve, got: ' + Res);
+    Assert.AreEqual('237', ExtractDisplayValue(Res),
+      'Matrix[2, 3] = 2*100 + 3*10 + FSeed = 237, got: ' + Res);
   finally
     Resp.Free;
   end;

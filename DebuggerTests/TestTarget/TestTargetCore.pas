@@ -237,10 +237,25 @@ type
     FBias: Integer;
     function GetByName(const AName: string): Integer;
     function GetPlain(AIdx: Integer): Integer;
+    function GetCell(ARow: Integer; const ACol: string): Integer;
   public
     constructor Create;
     property ByName[const AName: string]: Integer read GetByName; default;
     property Plain[AIdx: Integer]: Integer read GetPlain;
+    // Two indices, mixed types: exercises `probe.Cell[3, 'x']` -- multi-arg,
+    // int + string. A matrix property (IMldoSqlResult-style) is this shape.
+    property Cell[ARow: Integer; const ACol: string]: Integer read GetCell;
+  end;
+
+  // A class whose DEFAULT property takes TWO indices, so `M[r, c]` (not through
+  // an explicit name) has to marshal both. Delphi allows a multi-index default.
+  TMatrixProbe = class
+  private
+    FSeed: Integer;
+    function GetItem(ARow, ACol: Integer): Integer;
+  public
+    constructor Create;
+    property Item[ARow, ACol: Integer]: Integer read GetItem; default;
   end;
 
   TMenuRepro = class
@@ -998,6 +1013,22 @@ begin
   Result := AIdx * 3 + FBias;        // Plain[4] = 112
 end;
 
+function TIndexProbe.GetCell(ARow: Integer; const ACol: string): Integer;
+begin
+  Result := ARow * 1000 + Length(ACol) + FBias;   // Cell[3, 'xy'] = 3102
+end;
+
+constructor TMatrixProbe.Create;
+begin
+  inherited Create;
+  FSeed := 7;
+end;
+
+function TMatrixProbe.GetItem(ARow, ACol: Integer): Integer;
+begin
+  Result := ARow * 100 + ACol * 10 + FSeed;        // Item[2,3] = 237
+end;
+
 function TMenuCacheBase.BaseEcho(AValue: Integer): Integer;
 begin
   Result := AValue * 2 + BaseTag;   // BaseEcho(21) = 49 with BaseTag = 7
@@ -1032,7 +1063,8 @@ end;
 procedure TMenuRepro.LoadMenu;
 var
   Cache: TMenuCache;
-  Probe: TIndexProbe;   // in scope at NESTED_CLASS_METHOD_BODY for the evaluator tests
+  Probe: TIndexProbe;    // in scope at NESTED_CLASS_METHOD_BODY for the evaluator tests
+  Matrix: TMatrixProbe;  // multi-index default property
 
   procedure CreateNodes(NodeId: Integer);
   var
@@ -1049,19 +1081,21 @@ var
     // through the debugger, and a method nothing calls is smart-linked away -
     // its symbol would be missing and the test would fail for the wrong reason.
     GSink.Use([Cache.BaseEcho(0), Cache.BaseLen('')]);
-    // Same reason: both getters must survive the linker for the default-property
-    // work, and `Probe['x']` must have something to resolve to.
-    GSink.Use([Probe['seed'], Probe.Plain[1]]);
+    // Same reason: every getter must survive the linker for the default-property
+    // work, and `Probe['x']` / `Matrix[r,c]` must have something to resolve to.
+    GSink.Use([Probe['seed'], Probe.Plain[1], Probe.Cell[0, ''], Matrix[0, 0]]);
     if CurrentParent <> nil then
       GSink.Use(['parent: ', CurrentParent.Items[0]]);
   end;
 
 begin
-  Cache := TMenuCache.Create;
-  Probe := TIndexProbe.Create;
+  Cache  := TMenuCache.Create;
+  Probe  := TIndexProbe.Create;
+  Matrix := TMatrixProbe.Create;
   try
     CreateNodes(42);
   finally
+    Matrix.Free;
     Probe.Free;
     Cache.Free;
   end;
