@@ -137,6 +137,12 @@ type
                         // carries a non-zero index-args type at offset +6.
     IsDefaultProperty: Boolean; // the Pascal `default` array property, i.e.
                         // the one `Obj[X]` resolves to. Bit 0 of the u16 at +4.
+    ReturnTypeId: Cardinal; // For a property: the CV type id of the RETURN
+                        // (value) type, decoded from the $0035 descriptor's
+                        // payload+0. 0 for fields (TypeId already IS their type)
+                        // and for properties whose descriptor lacked it. Lets the
+                        // owning reader resolve the property's kind/size by the
+                        // EXACT id instead of round-tripping through its name.
   end;
   TTD32TypeRecord = record
     Index:        Integer;            // record index in the section
@@ -352,6 +358,13 @@ type
     // Members. Used by GetClassMembers to surface inherited fields.
     procedure AppendClassMembersByIdx(Idx: Integer;
                               var Members: TArray<TClassMember>; Depth: Integer);
+    // Deterministic kind/size of a type given its EXACT CV type id (not its
+    // name). Resolve non-primitive types (>= $1000) through FTypeIdToRecord --
+    // the exact record, immune to the first-wins ambiguity of same-named types.
+    // Return 0 for primitives (id < $1000): their names never collide, so the
+    // name path handles them without loss (and drives float-in-XMM correctly).
+    function  TypeKindById(TypeId: Cardinal; Depth: Integer = 0): Byte;
+    function  TypeSizeById(TypeId: Cardinal): Integer;
     procedure HandleBpRel32(Payload: PByte; PayloadEnd: PByte;
                             const ScopeName: string; ScopeRva: UInt64;
                             BlockStartRva, BlockEndRva: UInt64);
@@ -2641,6 +2654,10 @@ begin
             if (FTypes[TgtIdx].PayloadPtr <> nil) and
                (FTypes[TgtIdx].PayloadLen >= 4) then begin
               var BaseTid := PCardinal(FTypes[TgtIdx].PayloadPtr + 0)^;
+              // Keep the exact return-type id so the property's kind/size can be
+              // resolved deterministically later (M.TypeId still points at the
+              // descriptor record, which is useless downstream).
+              M.ReturnTypeId := BaseTid;
               var BaseName := GetTypeName(BaseTid);
               if BaseName <> '' then
                 M.TypeName := BaseName;
@@ -3298,8 +3315,61 @@ begin
     M.IsIndexed  := FTypes[Idx].Members[I].IsIndexed;
     M.IsDefaultProperty := FTypes[Idx].Members[I].IsDefaultProperty;
     M.DeclClass  := FTypes[Idx].Name;  // the class at this hierarchy level
+    // The effective type id is the property's RETURN-type id when present
+    // (M.TypeId for a property still points at the descriptor record), else the
+    // field's own type id. Resolve kind/size from that exact id -- deterministic
+    // where same-named types would otherwise collide.
+    var EffId := FTypes[Idx].Members[I].ReturnTypeId;
+    if EffId = 0 then
+      EffId := FTypes[Idx].Members[I].TypeId;
+    M.TypeKind := TypeKindById(EffId);
+    M.TypeSize := TypeSizeById(EffId);
     Members := Members + [M];
   end;
+end;
+
+function TTD32FileReader.TypeKindById(TypeId: Cardinal; Depth: Integer): Byte;
+var
+  Idx: Integer;
+begin
+  Result := 0;
+  // Primitives (id < $1000) have canonical, collision-free names; leave them to
+  // the name path (which also routes float -> XMM). Only the named-type space is
+  // ambiguous, and that is exactly what FTypeIdToRecord disambiguates.
+  if (TypeId < $1000) or (Depth > 8) then Exit;
+  if not FTypeIdToRecord.TryGetValue(TypeId, Idx) then Exit;
+  if (Idx < 0) or (Idx >= Length(FTypes)) then Exit;
+  // Follow one alias/modifier level to the underlying type (e.g.
+  // `type NullableInteger = type Variant`), mirroring GetTypeName.
+  if (FTypes[Idx].Kind = tkModifier) and (FTypes[Idx].BaseTypeId <> 0) then
+    Exit(TypeKindById(FTypes[Idx].BaseTypeId, Depth + 1));
+  case FTypes[Idx].Kind of
+    tkClass:     Result := 7;   // tkClass
+    tkStructure: Result := 14;  // tkRecord
+    tkEnum:      Result := 3;   // tkEnumeration
+    tkSet:       Result := 6;   // tkSet
+    tkPointer: begin
+      // A Delphi class-typed value is internally a POINTER to the class layout,
+      // yet its TTypeKind is tkClass (matching GetTypeName, which strips the
+      // caret, and LookupTypeKind by name). Deref one level: a pointee that is a
+      // class -> tkClass; anything else (^TRecord, PInteger) stays tkPointer.
+      var PtIdx: Integer;
+      if (FTypes[Idx].BaseTypeId >= $1000) and
+         FTypeIdToRecord.TryGetValue(FTypes[Idx].BaseTypeId, PtIdx) and
+         (PtIdx >= 0) and (PtIdx < Length(FTypes)) and
+         (FTypes[PtIdx].Kind = tkClass) then
+        Result := 7    // tkClass
+      else
+        Result := 20;  // tkPointer
+    end;
+  end;
+end;
+
+function TTD32FileReader.TypeSizeById(TypeId: Cardinal): Integer;
+begin
+  // ArrayElemByteSize already resolves primitives by CV id and named types
+  // exactly via FTypeIdToRecord -- reuse it as the byte-size-by-id oracle.
+  Result := ArrayElemByteSize(TypeId);
 end;
 
 function TTD32FileReader.TryGetMethodParams(const ClassName, MethodName: string;

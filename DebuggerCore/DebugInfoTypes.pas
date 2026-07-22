@@ -276,6 +276,14 @@ type
                               // (`property P[I]: T`). Its getter needs an index
                               // argument, so the variables view must not
                               // auto-evaluate it (no standard index type / count).
+    // Deterministic, id-resolved counterparts of TypeName. The provider that
+    // produced this member fills them from the member's EXACT type id (for a
+    // property, its return-type id), within its own id namespace -- so no
+    // cross-provider id confusion and no lossy re-lookup by name. 0 means "not
+    // resolved"; the consumer then falls back to the (first-wins) TypeName path.
+    // Prefer these over re-deriving from TypeName when they are non-zero.
+    TypeKind:    Byte;        // Delphi System.TypInfo.TTypeKind ordinal (0 = unknown)
+    TypeSize:    Integer;     // declared type's byte size (0 = unknown)
   end;
 
   IClassMemberProvider = interface

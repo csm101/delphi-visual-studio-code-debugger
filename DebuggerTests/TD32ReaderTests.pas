@@ -65,6 +65,10 @@ type
     // whose declared size matches the requested instance size. This is the
     // mechanism behind the live Data.DB.TFields vs TFieldsCache.TFields fix.
     [Test] procedure GetClassMembers_SizeHint_PicksTheMatchingRecord;
+    // A property member must carry its RETURN type's kind/size, resolved by the
+    // exact CV type id (not the descriptor id, not a re-lookup by name). This is
+    // what lets the evaluator pick a getter's return ABI deterministically.
+    [Test] procedure GetClassMembers_PropertyReturn_KindAndSizeResolvedById;
     [Test] procedure Types_LookupTypeKind_Class;
     [Test] procedure Types_PointerToClass_StripsCaret;
 
@@ -547,6 +551,52 @@ begin
       'size B must select TCollideOuterB.TDup (GammaB)');
     Assert.IsFalse(HasField(MembersB, 'AlphaA'),
       'size B must NOT select the other TDup (AlphaA)');
+  finally R.Free; end;
+end;
+
+procedure TTD32ReaderTests.GetClassMembers_PropertyReturn_KindAndSizeResolvedById;
+
+  function FindMember(const Members: TArray<TClassMember>;
+    const Name: string; out M: TClassMember): Boolean;
+  begin
+    Result := False;
+    for var Cand in Members do
+      if SameText(Cand.Name, Name) then begin
+        M := Cand;
+        Exit(True);
+      end;
+  end;
+
+begin
+  var R := TTD32FileReader.Create;
+  try
+    R.LoadFromFile(ExePath);
+    var Members: TArray<TClassMember>;
+    Assert.IsTrue(R.GetClassMembers('TWidget', Members),
+      'TWidget must resolve');
+
+    var M: TClassMember;
+
+    // AsBig: TPoint3D -> tkRecord (14), 24 bytes (3 x Double). Both come from the
+    // property's return-type id; a fix that dropped it would leave them 0 / wrong.
+    Assert.IsTrue(FindMember(Members, 'AsBig', M), 'AsBig property must be present');
+    Assert.AreEqual(14, Integer(M.TypeKind), 'AsBig return kind must be tkRecord');
+    Assert.AreEqual(24, M.TypeSize, 'AsBig return size must be SizeOf(TPoint3D)');
+
+    // AsSet: TWorkModes -> tkSet (6), 1 byte.
+    Assert.IsTrue(FindMember(Members, 'AsSet', M), 'AsSet property must be present');
+    Assert.AreEqual(6, Integer(M.TypeKind), 'AsSet return kind must be tkSet');
+    Assert.AreEqual(1, M.TypeSize, 'AsSet return size must be 1 (set of 4 values)');
+
+    // AsClass: TObject -> tkClass (7).
+    Assert.IsTrue(FindMember(Members, 'AsClass', M), 'AsClass property must be present');
+    Assert.AreEqual(7, Integer(M.TypeKind), 'AsClass return kind must be tkClass');
+
+    // A primitive-typed FIELD keeps TypeKind = 0 (by design: primitive names never
+    // collide, so the name path owns them) but still resolves a byte size by id.
+    Assert.IsTrue(FindMember(Members, 'FValue', M), 'FValue field must be present');
+    Assert.AreEqual(0, Integer(M.TypeKind), 'a primitive field must leave TypeKind 0');
+    Assert.AreEqual(4, M.TypeSize, 'FValue is an Integer -> 4 bytes');
   finally R.Free; end;
 end;
 

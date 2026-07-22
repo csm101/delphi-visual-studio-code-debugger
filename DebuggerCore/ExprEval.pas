@@ -102,14 +102,16 @@ type
     // walking the ancestor chain (TStringList's default is TStrings.Strings).
     // False when the receiver is not an instance or no ancestor declares one.
     function  TryFindDefaultProperty(const Base: TExprValue;
-                out PropName, DeclClass, PropType: string): Boolean;
+                out PropName, DeclClass, PropType: string;
+                out PropKind: Byte; out PropSize: Integer): Boolean;
     // True when `PropName` is a known INDEXED property of Base's class (or an
     // ancestor). Lets `obj.Prop[i]` skip the speculative zero-argument getter
     // call: if the member is indexed, `[i]` is its argument, full stop. On a hit
     // `PropType` is its declared return type, passed on so the call decodes the
     // result by the DECLARED type rather than guessing from the getter's locals.
     function  IsKnownIndexedProperty(const Base: TExprValue;
-                const PropName: string; out PropType: string): Boolean;
+                const PropName: string; out PropType: string;
+                out PropKind: Byte; out PropSize: Integer): Boolean;
     function  ApplyVarArrayIndex(const Base: TExprValue; const Indices: TArray<Int64>): TExprValue;
     // Static Pascal array `array[lo..hi, ...] of T` (possibly multi-dim).
     function  IsStaticArrayHint(const H: string): Boolean;
@@ -124,7 +126,14 @@ type
                 const ReturnTypeHint: string = '';
                 ClassRefSelf: UInt64 = 0;
                 ForceClassMethod: Boolean = False;
-                Speculative: Boolean = False): TExprValue;
+                Speculative: Boolean = False;
+                // Deterministic return-type kind/size, resolved by the debug-info
+                // provider from the member's EXACT type id. When non-zero they are
+                // authoritative over ReturnTypeHint (a name, first-wins-ambiguous):
+                // ReturnKindHint drives the RAX/XMM0/var-out ABI choice and
+                // ReturnSizeHint sizes the var-out slot for a record/set return.
+                ReturnKindHint: Byte = 0;
+                ReturnSizeHint: Integer = 0): TExprValue;
     // `TClassName.Member[(args)]` on a bare class reference (Base.IsTypeRef).
     // Invokes a class method / class function with Self = the class VMT.
     function  ApplyClassRefMember(const ClassName, Member: string;
@@ -557,12 +566,15 @@ end;
 { Indexing }
 
 function TExprEvaluator.TryFindDefaultProperty(const Base: TExprValue;
-  out PropName, DeclClass, PropType: string): Boolean;
+  out PropName, DeclClass, PropType: string;
+  out PropKind: Byte; out PropSize: Integer): Boolean;
 begin
   Result    := False;
   PropName  := '';
   DeclClass := '';
   PropType  := '';
+  PropKind  := 0;
+  PropSize  := 0;
   if (FRtti = nil) or (FDebugInfo = nil) or (not Base.IsValid) then
     Exit;
   if not FRtti.IsClassInstance(Base.RawValue) then
@@ -576,6 +588,8 @@ begin
       if (M.Kind = cmkProperty) and M.IsDefaultProperty and (M.Name <> '') then begin
         PropName := M.Name;
         PropType := M.TypeName;
+        PropKind := M.TypeKind;
+        PropSize := M.TypeSize;
         // The member list of a class already includes its inherited members, so
         // the flag may be found while scanning a descendant. Dispatch against
         // the class that DECLARES it when that is known, since the getter's
@@ -590,10 +604,13 @@ begin
 end;
 
 function TExprEvaluator.IsKnownIndexedProperty(const Base: TExprValue;
-  const PropName: string; out PropType: string): Boolean;
+  const PropName: string; out PropType: string;
+  out PropKind: Byte; out PropSize: Integer): Boolean;
 begin
   Result   := False;
   PropType := '';
+  PropKind := 0;
+  PropSize := 0;
   if (FRtti = nil) or (FDebugInfo = nil) or (not Base.IsValid) then
     Exit;
   if not FRtti.IsClassInstance(Base.RawValue) then
@@ -607,6 +624,8 @@ begin
         Continue;
       if M.IsIndexed then begin
         PropType := M.TypeName;
+        PropKind := M.TypeKind;
+        PropSize := M.TypeSize;
         Exit(True);
       end;
       // IsIndexed can be lost when the class FIELDLIST is empty (RSM fallback /
@@ -618,6 +637,8 @@ begin
         if FDebugInfo.TryGetMethodParams(ClassName, M.GetterName, GParams, GHasSelf) and
            (Length(GParams) > 0) then begin
           PropType := M.TypeName;
+          PropKind := M.TypeKind;
+          PropSize := M.TypeSize;
           Exit(True);
         end;
       end;
@@ -999,7 +1020,7 @@ function TExprEvaluator.ApplyMethodCall(const Base: TExprValue;
   const MethodName: string; const Args: TArray<TExprValue>;
   const ExplicitClass: string; const ReturnTypeHint: string;
   ClassRefSelf: UInt64; ForceClassMethod: Boolean;
-  Speculative: Boolean): TExprValue;
+  Speculative: Boolean; ReturnKindHint: Byte; ReturnSizeHint: Integer): TExprValue;
 
   // Authoritative return-type lookup: every Delphi function records its
   // `Result` slot as a local in the procedure's $28 RSM record. Var-out
@@ -1020,6 +1041,16 @@ function TExprEvaluator.ApplyMethodCall(const Base: TExprValue;
         RetKind     := TypeNameToKind(RetTypeName);
         Exit(True);
       end;
+  end;
+
+  // The managed/variant return families (string, dyn-array, interface, Variant)
+  // travel through the hidden var-out slot and are decoded specially. A CV type-id
+  // kind cannot separate them from a by-value record, so when the declared NAME
+  // already resolves to one of these it must win over the id-resolved kind hint.
+  function IsManagedReturnKind(K: Byte): Boolean;
+  begin
+    Result := K in [TK_LSTRING, TK_USTRING, TK_WSTRING,
+                    TK_DYNARRAY, TK_INTERFACE, TK_VARIANT];
   end;
 
 var
@@ -1207,8 +1238,20 @@ begin
   // `type NullableInteger = type variant` to TK_VARIANT, `TCaption = type string`
   // to a string kind, and a class or record name to TK_CLASS / TK_RECORD. Keying
   // on the literal name "Variant" would have missed every distinct alias.
+  //
+  // ReturnKindHint is the same member's kind resolved from its EXACT type id, so
+  // it is immune to the first-wins ambiguity of two same-named types. It arbitrates
+  // the class-vs-record-vs-set-vs-enum-vs-pointer question the name can get wrong.
+  // But the id path CANNOT represent the managed families -- a Variant (TVarData),
+  // a string, a dyn-array and an interface all look like a struct/pointer record by
+  // CV kind -- so a managed name must WIN over the id hint, or a `: Variant` getter
+  // would be dispatched as a by-value record (the old 258/TVarData-as-record bug).
+  // Hence: name first for managed/variant kinds; the id hint arbitrates the rest
+  // and fills in when the name cannot be classified.
   if ReturnTypeHint <> '' then begin
     var HintKind := TypeNameToKind(ReturnTypeHint);
+    if not IsManagedReturnKind(HintKind) and (ReturnKindHint <> TK_UNKNOWN) then
+      HintKind := ReturnKindHint;
     if HintKind <> TK_UNKNOWN then begin
       RetTypeName     := ReturnTypeHint;
       RetKind         := HintKind;
@@ -1219,6 +1262,10 @@ begin
       RetTypeName     := ReturnTypeHint;
       RetKind         := TK_UNKNOWN;
     end;
+  end else if ReturnKindHint <> TK_UNKNOWN then begin
+    // No declared name, but the member carried an id-resolved kind.
+    RetKind         := ReturnKindHint;
+    HaveBoundReturn := True;
   end;
   // Speculative bare-identifier free "call" (ResolveIdent's `Foo` = `Foo()`
   // convenience): only invoke when a return type could be BOUND, i.e. the symbol
@@ -1259,8 +1306,14 @@ begin
         WantsFloatReturn := not SameText(RetTypeName, 'Currency');
       TK_SET:
         // > 8 bytes -> var-out slot (by value). <= 8 -> RAX (the else branch);
-        // the set formatter reads the real width from RawValue there.
-        if FDebugInfo.GetTypeSize(RetTypeName, RetSetSize) and (RetSetSize > 8) then
+        // the set formatter reads the real width from RawValue there. Size from
+        // the exact id when available (ReturnSizeHint), else the name table.
+        if ReturnSizeHint > 0 then begin
+          RetSetSize := ReturnSizeHint;
+          if RetSetSize > 8 then
+            WantsSetReturn := True;
+        end
+        else if FDebugInfo.GetTypeSize(RetTypeName, RetSetSize) and (RetSetSize > 8) then
           WantsSetReturn := True;
       TK_VARIANT:
         // Returned through the var-out slot like a string, but the slot holds a
@@ -1276,9 +1329,17 @@ begin
         // InvokeGetter documents). A larger record - and any managed record - is
         // written into the var-out slot BY VALUE: point Address at the slot so
         // its fields can be read. Managed records are never returned in RAX.
+        // Size from the exact id (ReturnSizeHint) when available; the name table
+        // otherwise. RetRecSize is kept for the slot allocation below.
+        var HaveRecSize: Boolean;
+        if ReturnSizeHint > 0 then begin
+          RetRecSize  := ReturnSizeHint;
+          HaveRecSize := True;
+        end
+        else
+          HaveRecSize := FDebugInfo.GetTypeSize(RetTypeName, RetRecSize);
         if (RetKind = TK_MRECORD) or
-           (not (FDebugInfo.GetTypeSize(RetTypeName, RetRecSize) and
-                 (RetRecSize > 0) and (RetRecSize <= 8))) then
+           (not (HaveRecSize and (RetRecSize > 0) and (RetRecSize <= 8))) then
           WantsRecordReturn := True
         else
           SmallRecInRax := True;
@@ -1793,8 +1854,12 @@ function TExprEvaluator.ApplyDot(const Base: TExprValue; const Field: string): T
             // Resolve the getter against its DECLARING class (DeclClass), so an
             // INHERITED getter (e.g. TComponent.GetComponentCount on a
             // TApplication instance) is found under the right class symbol.
+            // Pass the id-resolved return kind/size (from GetClassMembers) so the
+            // getter's ABI is chosen deterministically, not by re-looking-up the
+            // return type NAME (which two same-named types would share).
             V := ApplyMethodCall(Base, Members[I].GetterName, [], Members[I].DeclClass,
-                   Members[I].TypeName);
+                   Members[I].TypeName, 0, False, False,
+                   Members[I].TypeKind, Members[I].TypeSize);
             if V.IsValid and (Members[I].TypeName <> '') then
               V.TypeHint := Members[I].TypeName;
             // Propagate the getter's own outcome (value OR its specific error,
@@ -1975,9 +2040,13 @@ begin
         // object is not an array, and without this it fell through to
         // "<cannot index type>".
         var DefaultProp, DefaultPropClass, DefaultPropType: string;
+        var DefaultPropKind: Byte;
+        var DefaultPropSize: Integer;
         if (not Result.IsTypeRef) and
-           TryFindDefaultProperty(Result, DefaultProp, DefaultPropClass, DefaultPropType) then
-          Result := ApplyMethodCall(Result, DefaultProp, IndexValues, DefaultPropClass, DefaultPropType)
+           TryFindDefaultProperty(Result, DefaultProp, DefaultPropClass, DefaultPropType,
+             DefaultPropKind, DefaultPropSize) then
+          Result := ApplyMethodCall(Result, DefaultProp, IndexValues, DefaultPropClass,
+                      DefaultPropType, 0, False, False, DefaultPropKind, DefaultPropSize)
         else if IsStaticArrayHint(Result.TypeHint) then
           Result := ApplyStaticArrayIndex(Result, Indices)
         else if Length(Indices) = 1 then
@@ -2062,7 +2131,10 @@ begin
           // index registers holding garbage.
           var HandledAsIndexedCall := False;
           var IndexedPropType: string;
-          if IsKnownIndexedProperty(Result, Field, IndexedPropType) then begin
+          var IndexedPropKind: Byte;
+          var IndexedPropSize: Integer;
+          if IsKnownIndexedProperty(Result, Field, IndexedPropType,
+               IndexedPropKind, IndexedPropSize) then begin
             Inc(FPos);
             var IdxArgs: TArray<TExprValue>;
             SetLength(IdxArgs, 0);
@@ -2077,7 +2149,8 @@ begin
             end;
             if not MatchChar(']') then
               Exit(InvalidValue('<missing ] after indexed-property args>'));
-            Result := ApplyMethodCall(Result, Field, IdxArgs, '', IndexedPropType);
+            Result := ApplyMethodCall(Result, Field, IdxArgs, '', IndexedPropType,
+                        0, False, False, IndexedPropKind, IndexedPropSize);
             HandledAsIndexedCall := True;
           end;
 
