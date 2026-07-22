@@ -263,6 +263,11 @@ type
     //     Repro of the live dataset.Fields bug. ---
     [Test]
     procedure Test_CollidingNestedClass_ResolvesMembersByVmt;
+    // Cross-unit: top-level TestTargetTypes.TDupCross vs nested
+    // TestTargetCore.TDupCrossCache.TDupCross. This is the live Data.DB.TFields
+    // vs System.Classes.TFieldsCache.TFields shape.
+    [Test]
+    procedure Test_CollidingCrossUnitClass_ResolvesRealMembers;
 
     // --- Getter-backed STRING property on an RTL class (TStringList.Text):
     //     getter has no locals, var-out return ABI must come from the property
@@ -2162,6 +2167,40 @@ begin
   var ObjB := Eval('DupObjB.GammaB', FrameId);
   Assert.AreEqual('999', ExtractDisplayValue(ObjB),
     'DupObjB (a TObject over TCollideOuterB.TDup) must resolve GammaB via its VMT, got: ' + ObjB);
+end;
+
+procedure TDebuggerTests.Test_CollidingCrossUnitClass_ResolvesRealMembers;
+// CrossReal is a TestTargetTypes.TDupCross (top-level: RealFirst=4242,
+// RealSecond=8484), held as TObject so the class is known only from the runtime
+// VMT. Its bare name "TDupCross" collides with the nested
+// TestTargetCore.TDupCrossCache.TDupCross (FakeHits). The debugger must resolve
+// CrossReal's members from ITS vmt, not from whichever record won the bare-name
+// index. This is the exact live failure: dataset.Fields (Data.DB.TFields) showed
+// the members of System.Classes.TFieldsCache.TFields.
+  function Eval(const Expr: string; FrameId: Integer): string;
+  begin
+    var Resp := FClient.Evaluate(Expr, FrameId);
+    try
+      Result := Resp.GetValue<string>('result', '');
+    finally
+      Resp.Free;
+    end;
+  end;
+var
+  FrameId, LocalsRef: Integer;
+begin
+  StartSession('NESTED_CLASS_METHOD_BODY', FrameId, LocalsRef);
+
+  Assert.AreEqual('4242', ExtractDisplayValue(Eval('CrossReal.RealFirst', FrameId)),
+    'CrossReal must resolve the top-level TDupCross field, not the nested one''s');
+  Assert.AreEqual('8484', ExtractDisplayValue(Eval('CrossReal.RealSecond', FrameId)),
+    'CrossReal.RealSecond must read the real class field');
+
+  // The tell: FakeHits belongs only to the nested collider. Resolving it means
+  // CrossReal was matched to the wrong class record.
+  var Fake := Eval('CrossReal.FakeHits', FrameId);
+  Assert.IsTrue(Fake.Contains('not found') or Fake.Contains('<'),
+    'CrossReal must NOT expose the nested TDupCross''s FakeHits, got: ' + Fake);
 end;
 
 procedure TDebuggerTests.Test_IndexedProperty_TwoMixedIndices_ExplicitName;

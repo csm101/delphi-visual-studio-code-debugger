@@ -33,6 +33,18 @@ uses
   System.Generics.Collections, System.SysUtils;
 
 type
+  // Top-level class named TDupCross. A DIFFERENT unit (TestTargetCore) declares
+  // a nested class of the same bare name. This is the exact shape of the live
+  // Data.DB.TFields vs System.Classes.TFieldsCache.TFields collision: same bare
+  // name, two units, one top-level and one nested. Same-unit nesting did not
+  // reproduce it (the compiler qualifies those), cross-unit does.
+  TDupCross = class
+  public
+    RealFirst:  Integer;   // = 4242
+    RealSecond: Integer;   // = 8484
+    constructor Create;
+  end;
+
   TStaticOps = class
   public
     class procedure Run(Tag: Integer); static;
@@ -120,6 +132,13 @@ implementation
 
 uses
   System.Variants;
+
+constructor TDupCross.Create;
+begin
+  inherited Create;
+  RealFirst  := 4242;
+  RealSecond := 8484;
+end;
 
 // Local sink. Same-shape virtual call as TestTarget.dpr's GSink so the
 // optimiser cannot drop the local values just to keep the frame small.

@@ -283,6 +283,19 @@ type
     end;
   end;
 
+  // Nested class whose bare name TDupCross collides with the top-level
+  // TestTargetTypes.TDupCross. Different fields, so a wrong pick shows plainly.
+  // Mirrors System.Classes.TFieldsCache.TFields (nested) shadowing
+  // Data.DB.TFields (top-level) in the live bug.
+  TDupCrossCache = class
+  public type
+    TDupCross = class
+    public
+      FakeHits: Int64;   // = 777 -- name/width/offset all differ from the real one
+      constructor Create;
+    end;
+  end;
+
   TMenuRepro = class
   public
     FOwnerName: string;
@@ -1062,6 +1075,12 @@ begin
   GammaB := 999;
 end;
 
+constructor TDupCrossCache.TDupCross.Create;
+begin
+  inherited Create;
+  FakeHits := 777;
+end;
+
 function TMatrixProbe.GetItem(ARow, ACol: Integer): Integer;
 begin
   Result := ARow * 100 + ACol * 10 + FSeed;        // Item[2,3] = 237
@@ -1110,6 +1129,10 @@ var
   // the by-name path that the live `dataset.Fields` bug travels.
   DupObjA: TObject;
   DupObjB: TObject;
+  // Instance of the TOP-LEVEL TestTargetTypes.TDupCross, held as TObject so the
+  // debugger must resolve members from the runtime VMT by the bare name that
+  // collides with the nested TDupCrossCache.TDupCross.
+  CrossReal: TObject;
 
   procedure CreateNodes(NodeId: Integer);
   var
@@ -1129,9 +1152,9 @@ var
     // Same reason: every getter must survive the linker for the default-property
     // work, and `Probe['x']` / `Matrix[r,c]` must have something to resolve to.
     GSink.Use([Probe['seed'], Probe.Plain[1], Probe.Cell[0, ''], Matrix[0, 0]]);
-    // Keep both same-named nested instances referenced and reachable.
+    // Keep every same-named instance referenced and reachable.
     GSink.Use([DupA.AlphaA, DupB.GammaB]);
-    if (DupObjA = nil) or (DupObjB = nil) then GSink.Use(['x']);
+    if (DupObjA = nil) or (DupObjB = nil) or (CrossReal = nil) then GSink.Use(['x']);
     if CurrentParent <> nil then
       GSink.Use(['parent: ', CurrentParent.Items[0]]);
   end;
@@ -1144,9 +1167,11 @@ begin
   DupB   := TCollideOuterB.TDup.Create;
   DupObjA := DupA;
   DupObjB := DupB;
+  CrossReal := TestTargetTypes.TDupCross.Create;
   try
     CreateNodes(42);
   finally
+    CrossReal.Free;
     DupB.Free;
     DupA.Free;
     Matrix.Free;
