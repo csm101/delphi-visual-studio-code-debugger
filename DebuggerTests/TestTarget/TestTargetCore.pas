@@ -258,6 +258,31 @@ type
     property Item[ARow, ACol: Integer]: Integer read GetItem; default;
   end;
 
+  // Two classes with the SAME bare name, nested in different outer classes in
+  // the SAME unit. Neither the bare name nor the unit name tells them apart:
+  // only the VMT address does. Distinct layouts so a wrong pick shows plainly.
+  // This is the shape behind the live `dataset.Fields` bug, where the debugger
+  // returned the members of System.Classes.TFieldsCache.TFields for a
+  // Data.DB.TFields instance.
+  TCollideOuterA = class
+  public type
+    TDup = class
+    public
+      AlphaA: Integer;   // = 111
+      BetaA:  Integer;   // = 222
+      constructor Create;
+    end;
+  end;
+
+  TCollideOuterB = class
+  public type
+    TDup = class
+    public
+      GammaB: Int64;     // = 999 -- different name, different width, different offset
+      constructor Create;
+    end;
+  end;
+
   TMenuRepro = class
   public
     FOwnerName: string;
@@ -1024,6 +1049,19 @@ begin
   FSeed := 7;
 end;
 
+constructor TCollideOuterA.TDup.Create;
+begin
+  inherited Create;
+  AlphaA := 111;
+  BetaA  := 222;
+end;
+
+constructor TCollideOuterB.TDup.Create;
+begin
+  inherited Create;
+  GammaB := 999;
+end;
+
 function TMatrixProbe.GetItem(ARow, ACol: Integer): Integer;
 begin
   Result := ARow * 100 + ACol * 10 + FSeed;        // Item[2,3] = 237
@@ -1065,6 +1103,13 @@ var
   Cache: TMenuCache;
   Probe: TIndexProbe;    // in scope at NESTED_CLASS_METHOD_BODY for the evaluator tests
   Matrix: TMatrixProbe;  // multi-index default property
+  DupA: TCollideOuterA.TDup;   // two same-named nested classes, distinct layouts
+  DupB: TCollideOuterB.TDup;
+  // Same two objects, but typed as TObject: the static type carries no member
+  // list, so the debugger must read the runtime VMT to find the real class -
+  // the by-name path that the live `dataset.Fields` bug travels.
+  DupObjA: TObject;
+  DupObjB: TObject;
 
   procedure CreateNodes(NodeId: Integer);
   var
@@ -1084,6 +1129,9 @@ var
     // Same reason: every getter must survive the linker for the default-property
     // work, and `Probe['x']` / `Matrix[r,c]` must have something to resolve to.
     GSink.Use([Probe['seed'], Probe.Plain[1], Probe.Cell[0, ''], Matrix[0, 0]]);
+    // Keep both same-named nested instances referenced and reachable.
+    GSink.Use([DupA.AlphaA, DupB.GammaB]);
+    if (DupObjA = nil) or (DupObjB = nil) then GSink.Use(['x']);
     if CurrentParent <> nil then
       GSink.Use(['parent: ', CurrentParent.Items[0]]);
   end;
@@ -1092,9 +1140,15 @@ begin
   Cache  := TMenuCache.Create;
   Probe  := TIndexProbe.Create;
   Matrix := TMatrixProbe.Create;
+  DupA   := TCollideOuterA.TDup.Create;
+  DupB   := TCollideOuterB.TDup.Create;
+  DupObjA := DupA;
+  DupObjB := DupB;
   try
     CreateNodes(42);
   finally
+    DupB.Free;
+    DupA.Free;
     Matrix.Free;
     Probe.Free;
     Cache.Free;

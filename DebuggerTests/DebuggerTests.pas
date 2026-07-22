@@ -259,6 +259,11 @@ type
     [Test]
     procedure Test_DefaultProperty_TwoIndices;
 
+    // --- Two same-named nested classes in one unit, told apart only by VMT.
+    //     Repro of the live dataset.Fields bug. ---
+    [Test]
+    procedure Test_CollidingNestedClass_ResolvesMembersByVmt;
+
     // --- Getter-backed STRING property on an RTL class (TStringList.Text):
     //     getter has no locals, var-out return ABI must come from the property
     //     type. Regression for SampleApp TApplication.ExeName / CurrentHelpFile. ---
@@ -2107,6 +2112,56 @@ begin
   finally
     Resp.Free;
   end;
+end;
+
+procedure TDebuggerTests.Test_CollidingNestedClass_ResolvesMembersByVmt;
+// DupA is a TCollideOuterA.TDup (AlphaA=111, BetaA=222); DupB is a
+// TCollideOuterB.TDup (GammaB=999). Same bare name "TDup", same unit. Expanding
+// each must show ITS OWN fields. The live failure was the mirror of this:
+// dataset.Fields (a Data.DB.TFields) expanded to FHits/FOffsets, the members of
+// the unrelated System.Classes.TFieldsCache.TFields, because member lookup keyed
+// on the bare name and the first-indexed record won.
+  function Eval(const Expr: string; FrameId: Integer): string;
+  begin
+    var Resp := FClient.Evaluate(Expr, FrameId);
+    try
+      Result := Resp.GetValue<string>('result', '');
+    finally
+      Resp.Free;
+    end;
+  end;
+
+var
+  FrameId, LocalsRef: Integer;
+begin
+  StartSession('NESTED_CLASS_METHOD_BODY', FrameId, LocalsRef);
+
+  Assert.AreEqual('111', ExtractDisplayValue(Eval('DupA.AlphaA', FrameId)),
+    'DupA.AlphaA must read the TCollideOuterA.TDup field');
+  Assert.AreEqual('222', ExtractDisplayValue(Eval('DupA.BetaA', FrameId)),
+    'DupA.BetaA must read the TCollideOuterA.TDup field');
+  Assert.AreEqual('999', ExtractDisplayValue(Eval('DupB.GammaB', FrameId)),
+    'DupB.GammaB must read the TCollideOuterB.TDup field');
+
+  // The cross-check that actually proves disambiguation: GammaB does not exist
+  // on TCollideOuterA.TDup, so if DupA were resolved against the wrong class
+  // record this would spuriously succeed.
+  var Cross := Eval('DupA.GammaB', FrameId);
+  Assert.IsTrue(Cross.Contains('not found') or Cross.Contains('<'),
+    'DupA has no GammaB; resolving it means DupA was matched to the wrong class, got: ' + Cross);
+
+  // The by-VMT-name path (the live bug's path): DupObjA is statically a TObject,
+  // so the real class is known only from the runtime VMT. Its own field must
+  // resolve and the other class's must not - keyed on the VMT, not the bare name.
+  var ObjA := Eval('DupObjA.AlphaA', FrameId);
+  Assert.AreEqual('111', ExtractDisplayValue(ObjA),
+    'DupObjA (a TObject over TCollideOuterA.TDup) must resolve AlphaA via its VMT, got: ' + ObjA);
+  var ObjACross := Eval('DupObjA.GammaB', FrameId);
+  Assert.IsTrue(ObjACross.Contains('not found') or ObjACross.Contains('<'),
+    'DupObjA must NOT see TCollideOuterB.TDup''s GammaB, got: ' + ObjACross);
+  var ObjB := Eval('DupObjB.GammaB', FrameId);
+  Assert.AreEqual('999', ExtractDisplayValue(ObjB),
+    'DupObjB (a TObject over TCollideOuterB.TDup) must resolve GammaB via its VMT, got: ' + ObjB);
 end;
 
 procedure TDebuggerTests.Test_IndexedProperty_TwoMixedIndices_ExplicitName;
