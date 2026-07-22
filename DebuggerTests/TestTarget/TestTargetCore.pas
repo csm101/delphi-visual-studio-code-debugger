@@ -821,6 +821,8 @@ var
   EvalDate: TDateTime;   // float-argument marshalling fixture (D1)
   CapAlias: TStrAlias;   // string-alias indexing fixture (B1)
   NVarLocal: NullableInteger;  // Variant-alias local formatting fixture (B2)
+  IntStore:  Integer;    // byRef-Variant target (A3)
+  ByRefVar:  Variant;
 begin
   Caption := 'Hello';
   Scores  := TArray<Integer>.Create(10, 20, 30);
@@ -831,7 +833,10 @@ begin
   EvalDate := 45.678;                  // DayOfDate -> Round(0.678*1000)+45 = 723
   CapAlias  := 'World';                // CapAlias[2] -> 'o' (wide)
   NVarLocal := 1234;                   // must decode to 1234, not the VType word 3
-  GSink.Use([Caption, W.Name, S.PubCount, EvalDate, CapAlias, NVarLocal]);  // {BP:EVAL_BODY}
+  IntStore  := 12345;                  // byRef Variant: must deref to 12345
+  TVarData(ByRefVar).VType     := varInteger or varByRef;
+  TVarData(ByRefVar).VPointer  := @IntStore;
+  GSink.Use([Caption, W.Name, S.PubCount, EvalDate, CapAlias, NVarLocal, IntStore, ByRefVar]);  // {BP:EVAL_BODY}
   S.Free;
   W.Free;
 end;

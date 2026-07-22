@@ -595,6 +595,7 @@ type
     [Test] procedure Test_Eval_MethodCall_TDateTimeArgument;
     [Test] procedure Test_Eval_StringAliasIndexing_ReadsWideChar;
     [Test] procedure Test_Eval_VariantAliasLocal_Decoded;
+    [Test] procedure Test_Eval_ByRefVariant_Dereferenced;
 
     // --- generic method call: Obj.Method(arg1, arg2, ...) ---
     [Test] procedure Test_Eval_Method_Integer;
@@ -4472,6 +4473,25 @@ begin
       'a Variant-alias local must decode to its value 1234, got: ' + Res);
     Assert.IsFalse(ExtractDisplayValue(Res) = '3',
       'must not surface the varInteger VType word, got: ' + Res);
+  finally
+    Resp.Free;
+  end;
+end;
+
+procedure TDebuggerTests.Test_Eval_ByRefVariant_Dereferenced;
+// ByRefVar is a varInteger|varByRef pointing at IntStore=12345. The formatter
+// must deref the pointer and show 12345, not the low bits of the address.
+var
+  FrameId, LocalsRef: Integer;
+  Resp: TJSONObject;
+  Res: string;
+begin
+  StartSession('EVAL_BODY', FrameId, LocalsRef);
+  Resp := FClient.Evaluate('ByRefVar', FrameId);
+  try
+    Res := Resp.GetValue<string>('result', '');
+    Assert.IsTrue(Res.Contains('12345'),
+      'a byRef Variant must be dereferenced to its value 12345, got: ' + Res);
   finally
     Resp.Free;
   end;

@@ -539,6 +539,17 @@ begin
   if ByRef then
     Label_ := Label_ + ' (byRef)';
 
+  // A byRef Variant's Data field is a POINTER to the value, not the value
+  // itself. Dereference one level so the scalar decoders below read the real
+  // payload (an integer, a double, ...) instead of the low bits of the address,
+  // and so a byRef string subtype gets the string pointer it expects. VarArrays
+  // took the `not ByRef` path above and never reach here.
+  if ByRef and (Data <> 0) then begin
+    var Deref: UInt64 := 0;
+    if Debugger.ReadProcessMemoryAt(Data, @Deref, 8) then
+      Data := Deref;
+  end;
+
   // Decode the value
   var ValStr: string;
   case BaseType of
