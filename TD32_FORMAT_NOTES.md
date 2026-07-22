@@ -277,6 +277,27 @@ And recognises (advances past, no semantic):
 | `$0201` | S_LDATA32         | local data symbol                           |
 | `$0206` | S_THUNK32         | thunk                                       |
 
+#### S_GPROC32 / S_LPROC32 record layout (Borland)
+
+The fields the walker reads (offsets are from the record payload start, i.e.
+after the `len`+`kind` u16 pair):
+
+| Offset | Size | Meaning                                                    |
+|-------:|-----:|------------------------------------------------------------|
+| `+12`  | u32  | proc length (code size)                                    |
+| `+24`  | u32  | offset (segment-relative code offset)                      |
+| `+28`  | u16  | segment                                                    |
+| `+32`  | u32  | **proctype** — the `LF_PROCEDURE` ($0008) type id          |
+| `+36`  | u32  | name index (into `SST_NAMES`)                              |
+
+The layout is Borland's, NOT Microsoft's S_GPROC32 (which puts `typind` at
+`+24`). The `proctype` offset was pinned empirically: a u32 read at `+30`
+comes out two bytes low (two pad bytes follow the u16 segment), while `+32`
+resolves to a valid `LF_PROCEDURE` record. `LF_PROCEDURE` carries `parmCount`
+as the u16 at payload `+6`, so a free function's declared arity is
+`proctype -> LF_PROCEDURE.parmCount`. `TryGetFreeFunctionParamCount` uses this
+to refuse auto-calling a bare `Foo` that actually takes arguments.
+
 ### Primitive TypeIds (TypeId < $1000)
 
 The compiler-predefined primitives don't live in the TYPES table.
@@ -330,6 +351,35 @@ the pointer target is a class, so the user-facing TypeHint matches
 Delphi source (`TFoo`, not `^TFoo`). Pointers to records / primitives
 keep the `^` per Pascal pointer-type syntax (`^Integer`, `^TPoint3D`).
 
+## Runtime identity ⇄ TD32 type-id: name (+ size) only
+
+There is **no** deterministic bridge from a runtime class identity (the VMT /
+its `TypeInfo`) to a TD32 type-id. Established by inspection + enumeration of
+`TestTarget.exe`:
+
+- A TD32 type record (`LF_CLASS`) stores fieldlist + name + size + vshape — all
+  type indices, **no runtime address**. A type table carries no VMT/`TypeInfo`
+  RVA by design.
+- Of the 477 globals, the 35 class-typed ones are all *variables that hold an
+  instance* (`TEncoding.FUnicodeEncoding`, `TFieldsCache.FGlobal`, …); their RVA
+  is the data slot, not a VMT. **No per-class VMT/`TypeInfo` symbol carries a
+  type-id.**
+- At runtime the VMT/`TypeInfo` yields the class **name** (a string) and the
+  **instance size** (`vmtInstanceSize`), never a TD32 type-id — those indices
+  are internal to the debug blob.
+
+Consequence: the only linkage is **name, disambiguated by instance size** (what
+`GetClassMembers(..., PreferInstanceSize)` does). Two classes sharing **both**
+name and size are indistinguishable — a hard TD32-format limit, not an
+implementation gap.
+
+`inherited` (resolving the ancestor of the *declaring* class) cannot use this
+size disambiguation at all: the object's size is the **leaf** class's, not the
+declaring ancestor's. Cross-module `inherited` with duplicate class names is
+therefore resolved by bare name (first-wins) and shares this limit. Pinning it
+would require decoding the per-procedure type reference of the `Self` local into
+a global class id — not currently done.
+
 ## Verification
 
 The reader is exercised by `DebuggerTests\TD32ReaderTests.pas`. The
@@ -341,6 +391,12 @@ type-table tests assert:
 - `LookupTypeKind` returns the System.TypInfo.TTypeKind ordinal for
   classes (`7`) and `0` for unknown names.
 - A pointer-to-record global keeps its `^` prefix.
+- A property member carries its RETURN type's kind/size, resolved by the
+  exact type id (record → 14 + size, set → 6, class → 7); a primitive field
+  keeps kind `0` but still resolves a byte size.
+- `TryGetFreeFunctionParamCount` returns the declared arity from the
+  `LF_PROCEDURE` signature (`FreeAdd` → 2, `FreeWrap` → 1) and misses cleanly
+  on an unknown name.
 
 Against `SampleAppSingleExe.exe`, manual probing confirmed:
 
