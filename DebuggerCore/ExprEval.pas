@@ -103,6 +103,10 @@ type
     // False when the receiver is not an instance or no ancestor declares one.
     function  TryFindDefaultProperty(const Base: TExprValue;
                 out PropName, DeclClass: string): Boolean;
+    // True when `PropName` is a known INDEXED property of Base's class (or an
+    // ancestor). Lets `obj.Prop[i]` skip the speculative zero-argument getter
+    // call: if the member is indexed, `[i]` is its argument, full stop.
+    function  IsKnownIndexedProperty(const Base: TExprValue; const PropName: string): Boolean;
     function  ApplyVarArrayIndex(const Base: TExprValue; const Indices: TArray<Int64>): TExprValue;
     // Static Pascal array `array[lo..hi, ...] of T` (possibly multi-dim).
     function  IsStaticArrayHint(const H: string): Boolean;
@@ -550,6 +554,24 @@ begin
           DeclClass := ClassName;
         Exit(True);
       end;
+  end;
+end;
+
+function TExprEvaluator.IsKnownIndexedProperty(const Base: TExprValue;
+  const PropName: string): Boolean;
+begin
+  Result := False;
+  if (FRtti = nil) or (FDebugInfo = nil) or (not Base.IsValid) then
+    Exit;
+  if not FRtti.IsClassInstance(Base.RawValue) then
+    Exit;
+  for var ClassName in FRtti.GetClassChainNames(Base.RawValue) do begin
+    var Members: TArray<TClassMember>;
+    if not FDebugInfo.GetClassMembers(ClassName, Members) then
+      Continue;
+    for var M in Members do
+      if (M.Kind = cmkProperty) and M.IsIndexed and SameText(M.Name, PropName) then
+        Exit(True);
   end;
 end;
 
@@ -1866,35 +1888,68 @@ begin
             Exit(InvalidValue('<missing ) after method args>'));
           Result := ApplyMethodCall(Result, Field, Args);
         end else if (FPos <= Length(FExpr)) and (FExpr[FPos] = '[') then begin
-          // Try `.Ident` as property/field first; if it produces an
-          // indexable value, the `[...]` will be consumed by the
-          // top-level `[` branch on the next iteration.
-          var DotResult := ApplyDot(Result, Field);
-          if DotResult.IsValid and
-             (IsStringTypeHint(DotResult.TypeHint) or
-              SameText(DotResult.TypeHint, 'Variant') or
-              DotResult.TypeHint.StartsWith('TArray<', True) or
-              DotResult.TypeHint.StartsWith('array of ', True) or
-              // TD32 types a dyn-array property as `^Element`; index the result.
-              DotResult.TypeHint.StartsWith('^', True)) then
-            Result := DotResult
-          else begin
-            // Fall back: treat `.Ident[args]` as indexed-accessor method call.
+          // `.Ident[...]` is ambiguous: either `.Ident` is a non-indexed
+          // property whose (string / array / variant) result is then indexed
+          // (`obj.Caption[2]`), or `.Ident` is an indexed property whose getter
+          // TAKES the index (`obj.Items[2]`).
+          //
+          // When the debug info already says `.Ident` is an INDEXED property,
+          // there is nothing to probe: `[...]` are its arguments. Go straight to
+          // the call. This is the only correct branch for an indexed property --
+          // evaluating `.Ident` with no arguments would fire the getter with the
+          // index registers holding garbage.
+          var HandledAsIndexedCall := False;
+          if IsKnownIndexedProperty(Result, Field) then begin
             Inc(FPos);
-            var Args: TArray<TExprValue>;
-            SetLength(Args, 0);
+            var IdxArgs: TArray<TExprValue>;
+            SetLength(IdxArgs, 0);
             SkipWS;
             if (FPos <= Length(FExpr)) and (FExpr[FPos] <> ']') then begin
               repeat
                 var A := ParseExpr;
                 if not A.IsValid then Exit(A);
-                Args := Args + [A];
+                IdxArgs := IdxArgs + [A];
                 SkipWS;
               until not MatchChar(',');
             end;
             if not MatchChar(']') then
-              Exit(InvalidValue('<missing ] after method args>'));
-            Result := ApplyMethodCall(Result, Field, Args);
+              Exit(InvalidValue('<missing ] after indexed-property args>'));
+            Result := ApplyMethodCall(Result, Field, IdxArgs);
+            HandledAsIndexedCall := True;
+          end;
+
+          if not HandledAsIndexedCall then begin
+            // Not known to be indexed. Evaluate `.Ident`; if it yields an
+            // indexable value, the top-level `[` branch consumes `[...]` on the
+            // next iteration. Otherwise treat `[...]` as accessor arguments -
+            // this is the metadata-less fallback (RTTI-only or MAP-only targets)
+            // and the only place the zero-argument probe still runs.
+            var DotResult := ApplyDot(Result, Field);
+            if DotResult.IsValid and
+               (IsStringTypeHint(DotResult.TypeHint) or
+                SameText(DotResult.TypeHint, 'Variant') or
+                DotResult.TypeHint.StartsWith('TArray<', True) or
+                DotResult.TypeHint.StartsWith('array of ', True) or
+                // TD32 types a dyn-array property as `^Element`; index the result.
+                DotResult.TypeHint.StartsWith('^', True)) then
+              Result := DotResult
+            else begin
+              Inc(FPos);
+              var Args: TArray<TExprValue>;
+              SetLength(Args, 0);
+              SkipWS;
+              if (FPos <= Length(FExpr)) and (FExpr[FPos] <> ']') then begin
+                repeat
+                  var A := ParseExpr;
+                  if not A.IsValid then Exit(A);
+                  Args := Args + [A];
+                  SkipWS;
+                until not MatchChar(',');
+              end;
+              if not MatchChar(']') then
+                Exit(InvalidValue('<missing ] after method args>'));
+              Result := ApplyMethodCall(Result, Field, Args);
+            end;
           end;
         end else
           Result := ApplyDot(Result, Field);
