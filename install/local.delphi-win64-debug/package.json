@@ -2,7 +2,7 @@
   "name": "delphi-win64-debug",
   "displayName": "Delphi Win64 Debugger",
   "description": "Debug Delphi Win64 applications in VS Code - breakpoints, stepping, call stacks, watches and exception rules, without the Embarcadero IDE.",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "publisher": "local",
   "license": "MIT",
   "author": "Carlo Sirna",
