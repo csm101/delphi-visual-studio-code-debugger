@@ -60,6 +60,11 @@ type
     [Test] procedure Types_TBareClass_Resolves;
     [Test] procedure Types_TObject_Resolves;
     [Test] procedure Types_ExceptionClass_Resolves;
+    // Two classes named "TDup" (TCollideOuterA.TDup / TCollideOuterB.TDup) share
+    // a bare name but have different sizes; GetClassMembers must pick the record
+    // whose declared size matches the requested instance size. This is the
+    // mechanism behind the live Data.DB.TFields vs TFieldsCache.TFields fix.
+    [Test] procedure GetClassMembers_SizeHint_PicksTheMatchingRecord;
     [Test] procedure Types_LookupTypeKind_Class;
     [Test] procedure Types_PointerToClass_StripsCaret;
 
@@ -494,6 +499,54 @@ begin
     Assert.IsTrue(R.FindTypeByName('TBareClass', Rec),
       'TBareClass must resolve from the TD32 type table');
     Assert.AreEqual(Ord(tkClass), Ord(Rec.Kind), 'TBareClass must be tkClass');
+  finally R.Free; end;
+end;
+
+procedure TTD32ReaderTests.GetClassMembers_SizeHint_PicksTheMatchingRecord;
+
+  function HasField(const Members: TArray<TClassMember>; const Name: string): Boolean;
+  begin
+    Result := False;
+    for var M in Members do
+      if SameText(M.Name, Name) then Exit(True);
+  end;
+
+begin
+  var R := TTD32FileReader.Create;
+  try
+    R.LoadFromFile(ExePath);
+
+    // Find the two "TDup" records and their sizes.
+    var SizeA := 0;
+    var SizeB := 0;
+    var Rec: TTD32TypeRecord;
+    for var Tid := Cardinal($1000) to Cardinal($40000) do begin
+      if not R.GetTypeRecord(Tid, Rec) then Continue;
+      if not SameText(Rec.Name, 'TDup') then Continue;
+      // A carries AlphaA/BetaA (small); B carries GammaB/DeltaB/EpsilonB (large).
+      var HasAlpha := False;
+      for var M in Rec.Members do
+        if SameText(M.Name, 'AlphaA') then HasAlpha := True;
+      if HasAlpha then SizeA := Integer(Rec.Size) else SizeB := Integer(Rec.Size);
+    end;
+    Assert.IsTrue((SizeA > 0) and (SizeB > 0), 'both TDup records must be present');
+    Assert.AreNotEqual(SizeA, SizeB, 'the two TDup records must have different sizes');
+
+    var MembersA: TArray<TClassMember>;
+    Assert.IsTrue(R.GetClassMembers('TDup', MembersA, SizeA),
+      'GetClassMembers(TDup, sizeA) must resolve');
+    Assert.IsTrue(HasField(MembersA, 'AlphaA'),
+      'size A must select TCollideOuterA.TDup (AlphaA)');
+    Assert.IsFalse(HasField(MembersA, 'GammaB'),
+      'size A must NOT select the other TDup (GammaB)');
+
+    var MembersB: TArray<TClassMember>;
+    Assert.IsTrue(R.GetClassMembers('TDup', MembersB, SizeB),
+      'GetClassMembers(TDup, sizeB) must resolve');
+    Assert.IsTrue(HasField(MembersB, 'GammaB'),
+      'size B must select TCollideOuterB.TDup (GammaB)');
+    Assert.IsFalse(HasField(MembersB, 'AlphaA'),
+      'size B must NOT select the other TDup (AlphaA)');
   finally R.Free; end;
 end;
 

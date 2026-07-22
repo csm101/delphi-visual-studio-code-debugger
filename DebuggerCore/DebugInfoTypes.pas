@@ -280,8 +280,11 @@ type
 
   IClassMemberProvider = interface
     ['{B4C7A531-0F92-4E31-9D86-7A2C1F3E8B41}']
+    // PreferInstanceSize > 0 disambiguates two classes that share a bare name:
+    // the record whose declared instance size matches is chosen. 0 keeps the
+    // first-indexed record (the historical behaviour).
     function GetClassMembers(const ClassName: string;
-      out Members: TArray<TClassMember>): Boolean;
+      out Members: TArray<TClassMember>; PreferInstanceSize: Integer = 0): Boolean;
   end;
 
   // Class hierarchy: the immediate parent (base) class of a named class.

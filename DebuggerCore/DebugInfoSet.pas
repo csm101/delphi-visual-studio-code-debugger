@@ -168,7 +168,7 @@ type
     function  TryResolveEnumLiteral(const Name: string;
                 out Ordinal: Integer; out EnumTypeName: string): Boolean;
     function  GetClassMembers(const ClassName: string;
-                out Members: TArray<TClassMember>): Boolean;
+                out Members: TArray<TClassMember>; PreferInstanceSize: Integer = 0): Boolean;
     // Declared parameters of a class method (first provider that resolves the
     // signature; TD32). Self is excluded from Params; HasSelf reports whether the
     // method takes one (so ABI slot 0 is Self, declared params start at slot 1).
@@ -1220,7 +1220,7 @@ begin
 end;
 
 function TDebugInfoSet.GetClassMembers(const ClassName: string;
-  out Members: TArray<TClassMember>): Boolean;
+  out Members: TArray<TClassMember>; PreferInstanceSize: Integer): Boolean;
 var
   ProviderMembers: TArray<TClassMember>;
 begin
@@ -1231,10 +1231,15 @@ begin
   // which holds the real member list. SampleApp: TCachedMenu's `Level`
   // indexed property could not be found because TD32's 0-member True
   // shadowed RSM's 11-member view.
+  //
+  // PreferInstanceSize disambiguates a bare name shared by two classes (the
+  // live Data.DB.TFields vs System.Classes.TFieldsCache.TFields): it is passed
+  // to each provider so the record whose declared size matches the object's
+  // runtime VMT wins over the first-indexed one.
   Result := False;
   SetLength(Members, 0);
   for var P in FMemberProviders do
-    if P.GetClassMembers(ClassName, ProviderMembers) and
+    if P.GetClassMembers(ClassName, ProviderMembers, PreferInstanceSize) and
        (Length(ProviderMembers) > 0) then begin
       Members := ProviderMembers;
       Exit(True);

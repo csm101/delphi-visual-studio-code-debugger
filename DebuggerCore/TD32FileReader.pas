@@ -418,7 +418,7 @@ type
 
     // IClassMemberProvider -- backed by FTypes / FNameToTypeIdx.
     function    GetClassMembers(const TypeName: string;
-                  out Members: TArray<TClassMember>): Boolean;
+                  out Members: TArray<TClassMember>; PreferInstanceSize: Integer = 0): Boolean;
     // IMethodSignatureProvider -- decodes a class method's declared params from
     // the FIELDLIST -> LF_METHOD -> LF_METHODLIST -> LF_MFUNCTION -> LF_ARGLIST
     // chain (on-demand; does not touch the bulk type parse).
@@ -3217,7 +3217,7 @@ begin
 end;
 
 function TTD32FileReader.GetClassMembers(const TypeName: string;
-  out Members: TArray<TClassMember>): Boolean;
+  out Members: TArray<TClassMember>; PreferInstanceSize: Integer): Boolean;
 var
   Idx: Integer;
 begin
@@ -3233,6 +3233,34 @@ begin
     if not (TypeName.Contains('$') and
             FNameToTypeIdx.TryGetValue(AnsiLowerCase(TypeName.Replace('$', '_')), Idx)) then
       Exit;
+  end;
+  // Two classes can share a bare name (Data.DB.TFields vs the nested
+  // System.Classes.TFieldsCache.TFields). FNameToTypeIdx kept only the first,
+  // so a caller holding the OBJECT's real instance size (read from its VMT) can
+  // pin the right record: scan every same-named class type for the one whose
+  // declared Size matches. This is the object's actual size, not a guess; the
+  // only case it cannot separate is two records with identical name AND size,
+  // which TD32 leaves indistinguishable (it records neither VMT nor unit).
+  if PreferInstanceSize > 0 then begin
+    var Key := AnsiLowerCase(TypeName);
+    // The object's runtime vmtInstanceSize counts the 8-byte VMT self-pointer;
+    // the TD32 LF_CLASS Size does not always (observed: Data.DB.TFields is 72 at
+    // runtime, 64 in TD32). Accept either, preferring an exact match, so the
+    // record is still pinned deterministically to the object's real class.
+    var Chosen := -1;
+    for var I := 0 to High(FTypes) do begin
+      if (FTypes[I].Kind = tkEnum) or (AnsiLowerCase(FTypes[I].Name) <> Key) then
+        Continue;
+      var Sz := Integer(FTypes[I].Size);
+      if Sz = PreferInstanceSize then begin
+        Chosen := I;
+        Break;   // exact match wins outright
+      end;
+      if (Sz = PreferInstanceSize - 8) and (Chosen < 0) then
+        Chosen := I;
+    end;
+    if Chosen >= 0 then
+      Idx := Chosen;
   end;
   if (Idx < 0) or (Idx >= Length(FTypes)) then Exit;
   // For enums we don't surface members through IClassMemberProvider;

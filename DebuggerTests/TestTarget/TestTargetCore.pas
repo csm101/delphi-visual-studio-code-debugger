@@ -373,7 +373,12 @@ type
   public type
     TDup = class
     public
-      GammaB: Int64;     // = 999 -- different name, different width, different offset
+      // Deliberately MORE fields than TCollideOuterA.TDup so the two same-named
+      // records have DIFFERENT instance sizes: the size-disambiguation in
+      // GetClassMembers must pick the right one from the bare name + size.
+      GammaB: Int64;     // = 999
+      DeltaB: Int64;
+      EpsilonB: Int64;
       constructor Create;
     end;
   end;
@@ -1273,6 +1278,8 @@ constructor TCollideOuterB.TDup.Create;
 begin
   inherited Create;
   GammaB := 999;
+  DeltaB := 1000;
+  EpsilonB := 1001;
 end;
 
 constructor TDupCrossCache.TDupCross.Create;

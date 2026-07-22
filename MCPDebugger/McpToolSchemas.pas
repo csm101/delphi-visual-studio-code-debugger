@@ -258,6 +258,19 @@ begin
   Result.Add(MakeTool('get_debugger_output',
     'Return debugger-generated output since the previous call — notably logpoint messages ' +
     '(incremental).', []));
+
+  Result.Add(MakeTool('read_memory',
+    'Read a block of the debuggee''s memory. Returns the bytes as hex plus little-endian ' +
+    'integer interpretations, for inspecting raw structures (VMT slots, record fields) the ' +
+    'evaluator does not surface. The session must be stopped.',
+    [Prop('address', 'string', 'Start address, decimal or 0x-hex (e.g. "0x239B7765CC0").', True),
+     Prop('count', 'integer', 'Number of bytes to read (1..4096).', True)]));
+
+  Result.Add(MakeTool('write_memory',
+    'Write bytes into the debuggee''s memory at an address. Use with care — it mutates the ' +
+    'live process. The session must be stopped.',
+    [Prop('address', 'string', 'Start address, decimal or 0x-hex.', True),
+     Prop('hexBytes', 'string', 'Bytes to write as contiguous hex (e.g. "48008B00"); whitespace ignored.', True)]));
 end;
 
 end.

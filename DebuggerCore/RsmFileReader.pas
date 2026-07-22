@@ -302,7 +302,7 @@ type
     function    TryResolveEnumLiteral(const Name: string;
                   out Ordinal: Integer; out EnumTypeName: string): Boolean;
     function    GetClassMembers(const ClassName: string;
-                  out Members: TArray<TClassMember>): Boolean;
+                  out Members: TArray<TClassMember>; PreferInstanceSize: Integer = 0): Boolean;
     function    AllProcedureNames: TArray<string>;
     function    DiagModuleTypeIds: TArray<TPair<Integer, string>>;
     property    Loaded: Boolean read FLoaded;
@@ -3356,8 +3356,10 @@ begin
 end;
 
 function TRsmFile.GetClassMembers(const ClassName: string;
-  out Members: TArray<TClassMember>): Boolean;
+  out Members: TArray<TClassMember>; PreferInstanceSize: Integer): Boolean;
 begin
+  // RSM keeps a flat, non-size-indexed member table; the size hint (used by TD32
+  // to disambiguate same-named classes) does not apply here.
   SetLength(Members, 0);
   if IsBuiltinScalarTypeName(ClassName) then
     Exit(False);

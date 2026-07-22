@@ -154,6 +154,10 @@ type
     // Reads the (un-decorated) class name from the VMT of the instance at
     // ObjAddr. Returns '' on read failure.
     function GetInstanceClassName(ObjAddr: UInt64): string;
+    // The declared instance size from the object's runtime VMT (vmtInstanceSize),
+    // used to disambiguate two classes that share a bare name in the debug info:
+    // their type records have different Size fields. 0 when the VMT is unreadable.
+    function GetInstanceSize(ObjAddr: UInt64): Integer;
     // Pascal `instance is TFoo` semantics: True if the object's runtime class
     // is `TargetClassName` OR any descendant. Walks the VMT/TypeInfo parent
     // chain comparing each class name case-insensitively. Returns False if
@@ -300,6 +304,24 @@ end;
 function TDelphiRtti.ReadVmtSlot(VmtAddr: UInt64; Offset: Integer; out V: UInt64): Boolean;
 begin
   Result := ReadU64(UInt64(Int64(VmtAddr) + Offset), V);
+end;
+
+function TDelphiRtti.GetInstanceSize(ObjAddr: UInt64): Integer;
+var
+  VmtAddr, SizeVal: UInt64;
+begin
+  Result := 0;
+  if ObjAddr < 65536 then Exit;
+  if not ReadU64(ObjAddr, VmtAddr) then Exit;
+  if not IsValidVmt(VmtAddr) then Exit;
+  // vmtInstanceSize sits a FIXED +40 above vmtTypeInfo in every Delphi VMT
+  // layout (standard: -144/-104; Athens's empirical -168 for TypeInfo puts it at
+  // -128). Deriving it from VMT64_TYPEINFO keeps it correct on the same layout
+  // GetInstanceClassName already reads TypeInfo from, rather than the standalone
+  // VMT64_INSTANCESIZE constant which carries the pre-Athens offset.
+  if ReadVmtSlot(VmtAddr, VMT64_TYPEINFO + 40, SizeVal) and
+     (SizeVal > 0) and (SizeVal < $10000000) then
+    Result := Integer(SizeVal);
 end;
 
 function TDelphiRtti.VmtLayoutShift(VmtAddr: UInt64): Integer;

@@ -1755,7 +1755,14 @@ function TExprEvaluator.ApplyDot(const Base: TExprValue; const Field: string): T
       [Field, Base.RawValue, Base.Address, ClassName, Base.TypeHint,
        BoolToStr(IsClass, True)]));
     if ClassName = '' then Exit;
-    if not FDebugInfo.GetClassMembers(ClassName, Members) then begin
+    // Disambiguate a bare class name shared by two units (Data.DB.TFields vs the
+    // nested System.Classes.TFieldsCache.TFields) by the OBJECT's real instance
+    // size, read from its VMT. Without it, member resolution and expansion used
+    // whichever record was indexed first and showed the wrong class's fields.
+    var InstSize := 0;
+    if IsClass then
+      InstSize := FRtti.GetInstanceSize(Base.RawValue);
+    if not FDebugInfo.GetClassMembers(ClassName, Members, InstSize) then begin
       DapLog(Format('  RsmDot: no class members for "%s"', [ClassName]));
       Exit;
     end;

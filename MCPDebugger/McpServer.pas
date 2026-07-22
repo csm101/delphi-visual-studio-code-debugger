@@ -65,6 +65,8 @@ type
     procedure ArmWait(const IdJson: string; TimeoutMs: Integer);
     procedure FulfilPendingWait;
     procedure CheckWaitTimeout;
+    procedure HandleReadMemory(const IdJson, AddrStr: string; Count: Integer);
+    procedure HandleWriteMemory(const IdJson, AddrStr, HexBytes: string);
 
     // Tool-result envelopes.
     procedure SendToolJson(const IdJson: string; Payload: TJSONValue);
@@ -710,12 +712,97 @@ begin
       SendToolJson(IdJson, McpJson.StringListToJson(FSession.DrainDebuggerOutput));
       Exit;
     end;
+    if Name = 'read_memory' then begin
+      HandleReadMemory(IdJson, ArgStr('address'), ArgInt('count'));
+      Exit;
+    end;
+    if Name = 'write_memory' then begin
+      HandleWriteMemory(IdJson, ArgStr('address'), ArgStr('hexBytes'));
+      Exit;
+    end;
 
     SendToolError(IdJson, 'Unknown tool: ' + Name);
   except
     on E: Exception do
       SendToolError(IdJson, E.ClassName + ': ' + E.Message);
   end;
+end;
+
+function ParseAddress(const S: string; out Addr: UInt64): Boolean;
+begin
+  var T := Trim(S);
+  if T.StartsWith('0x', True) then
+    T := '$' + T.Substring(2)
+  else if not T.StartsWith('$') then
+    T := T;   // decimal
+  Result := TryStrToUInt64(T, Addr);
+end;
+
+procedure TMcpServer.HandleReadMemory(const IdJson, AddrStr: string; Count: Integer);
+var
+  Addr: UInt64;
+begin
+  if (Count < 1) or (Count > 4096) then begin
+    SendToolError(IdJson, 'count must be 1..4096');
+    Exit;
+  end;
+  if not ParseAddress(AddrStr, Addr) then begin
+    SendToolError(IdJson, 'invalid address: ' + AddrStr);
+    Exit;
+  end;
+  var Buf: TBytes;
+  SetLength(Buf, Count);
+  if not FSession.Debugger.ReadProcessMemoryAt(Addr, @Buf[0], Count) then begin
+    SendToolError(IdJson, Format('read failed at 0x%x (%d bytes)', [Addr, Count]));
+    Exit;
+  end;
+  var Hex := '';
+  for var B in Buf do
+    Hex := Hex + IntToHex(B, 2);
+  var Obj := TJSONObject.Create;
+  Obj.AddPair('address', Format('0x%x', [Addr]));
+  Obj.AddPair('count', TJSONNumber.Create(Count));
+  Obj.AddPair('hex', Hex);
+  // Little-endian integer views for the common widths, for reading VMT slots
+  // and record fields without hand-assembling the bytes.
+  if Count >= 8 then Obj.AddPair('u64le', TJSONNumber.Create(PUInt64(@Buf[0])^));
+  if Count >= 4 then Obj.AddPair('u32le', TJSONNumber.Create(Int64(PCardinal(@Buf[0])^)));
+  if Count >= 2 then Obj.AddPair('u16le', TJSONNumber.Create(PWord(@Buf[0])^));
+  SendToolJson(IdJson, Obj);
+end;
+
+procedure TMcpServer.HandleWriteMemory(const IdJson, AddrStr, HexBytes: string);
+var
+  Addr: UInt64;
+begin
+  if not ParseAddress(AddrStr, Addr) then begin
+    SendToolError(IdJson, 'invalid address: ' + AddrStr);
+    Exit;
+  end;
+  var Clean := StringReplace(HexBytes, ' ', '', [rfReplaceAll]);
+  Clean := StringReplace(Clean, #9, '', [rfReplaceAll]);
+  if (Clean = '') or (Length(Clean) mod 2 <> 0) then begin
+    SendToolError(IdJson, 'hexBytes must be an even number of hex digits');
+    Exit;
+  end;
+  var Buf: TBytes;
+  SetLength(Buf, Length(Clean) div 2);
+  for var I := 0 to High(Buf) do begin
+    var ByteVal: Integer;
+    if not TryStrToInt('$' + Clean.Substring(I * 2, 2), ByteVal) then begin
+      SendToolError(IdJson, 'invalid hex at byte ' + IntToStr(I));
+      Exit;
+    end;
+    Buf[I] := Byte(ByteVal);
+  end;
+  if not FSession.Debugger.WriteMemoryAt(Addr, @Buf[0], Length(Buf)) then begin
+    SendToolError(IdJson, Format('write failed at 0x%x', [Addr]));
+    Exit;
+  end;
+  var Obj := TJSONObject.Create;
+  Obj.AddPair('address', Format('0x%x', [Addr]));
+  Obj.AddPair('written', TJSONNumber.Create(Length(Buf)));
+  SendToolJson(IdJson, Obj);
 end;
 
 procedure TMcpServer.ProcessRpc(Msg: TJSONObject);

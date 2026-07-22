@@ -150,7 +150,7 @@ type
     // aggregate provider set. Shared with a frontend that needs member info
     // outside an expansion (e.g. the DAP evaluate handler).
     function  GetDisplayMembers(const TypeName: string;
-                out Members: TArray<TClassMember>): Boolean;
+                out Members: TArray<TClassMember>; PreferInstanceSize: Integer = 0): Boolean;
   end;
 
 implementation
@@ -186,15 +186,18 @@ end;
 // for some record types, so TD32 (which carries the full field list) is tried
 // first, then the aggregate as fallback.
 function TVariableExpander.GetDisplayMembers(const TypeName: string;
-  out Members: TArray<TClassMember>): Boolean;
+  out Members: TArray<TClassMember>; PreferInstanceSize: Integer): Boolean;
 begin
   Result := False;
   Members := nil;
   if TypeName = '' then
     Exit;
-  if (TD32 <> nil) and TD32.GetClassMembers(TypeName, Members) and (Length(Members) > 0) then
+  // PreferInstanceSize disambiguates two classes sharing a bare name by the
+  // object's real VMT size (Data.DB.TFields vs System.Classes.TFieldsCache.
+  // TFields), so expansion lists the right class's fields.
+  if (TD32 <> nil) and TD32.GetClassMembers(TypeName, Members, PreferInstanceSize) and (Length(Members) > 0) then
     Exit(True);
-  if (DebugInfo <> nil) and DebugInfo.GetClassMembers(TypeName, Members) and (Length(Members) > 0) then
+  if (DebugInfo <> nil) and DebugInfo.GetClassMembers(TypeName, Members, PreferInstanceSize) and (Length(Members) > 0) then
     Exit(True);
 end;
 
@@ -614,7 +617,12 @@ var
   List: TList<TSessionVariable>;
 begin
   Result := nil;
-  if not GetDisplayMembers(Exp.TypeName, Members) then
+  // The object's real VMT size disambiguates a bare class name shared across
+  // units, so the right class's members are listed.
+  var PreferSize := 0;
+  if (Rtti <> nil) and (Exp.BaseAddr <> 0) and Rtti.IsClassInstance(Exp.BaseAddr) then
+    PreferSize := Rtti.GetInstanceSize(Exp.BaseAddr);
+  if not GetDisplayMembers(Exp.TypeName, Members, PreferSize) then
     Exit;
   // Top of a property-bearing type: split into properties / events / fields.
   if (not Exp.NoGroup) and ClassHasProperties(Members) then
