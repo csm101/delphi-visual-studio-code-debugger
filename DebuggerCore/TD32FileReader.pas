@@ -96,6 +96,9 @@ type
     StartRva: UInt64;
     EndRva:   UInt64;
     Name:     string;   // demangled name; empty if name lookup failed
+    TypeId:   Cardinal; // GPROC32/LPROC32 proctype field (+30): the LF_PROCEDURE
+                        // type id. Resolves to parmCount for free-function arity.
+                        // 0 when the record was too short to carry it.
   end;
 
   // Head/tail of one singly-linked chain of locals inside the reader's flat
@@ -437,6 +440,8 @@ type
     // chain (on-demand; does not touch the bulk type parse).
     function    TryGetMethodParams(const ClassName, MethodName: string;
                   out Params: TArray<TMethodParam>; out HasSelf: Boolean): Boolean;
+    function    TryGetFreeFunctionParamCount(const FuncName: string;
+                  out Count: Integer): Boolean;
     // ITypeSizeProvider
     function    GetTypeSize(const TypeName: string; out Size: Integer): Boolean;
     // IClassHierarchyProvider
@@ -1496,6 +1501,13 @@ begin
   R.StartRva := Rva;
   R.EndRva   := Rva + ProcLen;
   R.Name     := Friendly;
+  // GPROC32/LPROC32 proctype (LF_PROCEDURE type id) sits at +32: Seg(+28,u16),
+  // then 2 pad bytes, then the u32 typind, then NameIdx(+36). Kept for
+  // free-function arity. (Verified empirically: the u32 at +30 reads 2 bytes low.)
+  if PayloadEnd - Payload >= 36 then
+    R.TypeId := PCardinal(Payload + 32)^
+  else
+    R.TypeId := 0;
   FProcs := FProcs + [R];
   if not FNameToRva.ContainsKey(AnsiLowerCase(Friendly)) then
     FNameToRva.Add(AnsiLowerCase(Friendly), Rva);
@@ -3370,6 +3382,30 @@ begin
   // ArrayElemByteSize already resolves primitives by CV id and named types
   // exactly via FTypeIdToRecord -- reuse it as the byte-size-by-id oracle.
   Result := ArrayElemByteSize(TypeId);
+end;
+
+function TTD32FileReader.TryGetFreeFunctionParamCount(const FuncName: string;
+  out Count: Integer): Boolean;
+begin
+  Result := False;
+  Count  := 0;
+  if FuncName = '' then Exit;
+  // Name -> RVA -> the GPROC32/LPROC32 range -> its LF_PROCEDURE type id.
+  var Rva: UInt64;
+  if not FNameToRva.TryGetValue(AnsiLowerCase(FuncName), Rva) then Exit;
+  var ProcIdx := FindProcIndex(Rva);
+  if (ProcIdx < 0) or (ProcIdx >= Length(FProcs)) then Exit;
+  var Tid := FProcs[ProcIdx].TypeId;
+  if Tid < $1000 then Exit;
+  var Idx: Integer;
+  if not FTypeIdToRecord.TryGetValue(Tid, Idx) then Exit;
+  if (Idx < 0) or (Idx >= Length(FTypes)) then Exit;
+  // Only a genuine LF_PROCEDURE signature answers here. parmCount is the u16 at
+  // payload+6 (retType u32, callConv u8, funcAttr u8, then parmCount).
+  if FTypes[Idx].Kind <> tkProcedure then Exit;
+  if (FTypes[Idx].PayloadPtr = nil) or (FTypes[Idx].PayloadLen < 8) then Exit;
+  Count  := PWord(FTypes[Idx].PayloadPtr + 6)^;
+  Result := True;
 end;
 
 function TTD32FileReader.TryGetMethodParams(const ClassName, MethodName: string;

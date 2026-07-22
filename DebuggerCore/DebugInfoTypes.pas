@@ -331,6 +331,13 @@ type
     ['{9D4B1C6E-2A73-4F58-B1E0-5C8A9F2D6041}']
     function TryGetMethodParams(const ClassName, MethodName: string;
       out Params: TArray<TMethodParam>; out HasSelf: Boolean): Boolean;
+    // Declared parameter count of a FREE function/procedure (no class), from its
+    // LF_PROCEDURE signature. Lets the evaluator refuse to auto-call a bare
+    // `Foo` when Foo actually takes arguments -- a zero-arg synthetic call would
+    // read garbage argument registers and return a plausible-but-wrong value.
+    // False when the name is not a known free proc or its signature is absent.
+    function TryGetFreeFunctionParamCount(const FuncName: string;
+      out Count: Integer): Boolean;
   end;
 
 implementation

@@ -69,6 +69,10 @@ type
     // exact CV type id (not the descriptor id, not a re-lookup by name). This is
     // what lets the evaluator pick a getter's return ABI deterministically.
     [Test] procedure GetClassMembers_PropertyReturn_KindAndSizeResolvedById;
+    // A free function's declared parameter count, from its LF_PROCEDURE
+    // signature. Lets the evaluator refuse to auto-call a bare `Foo` that
+    // actually takes arguments (F1). Also validates the GPROC32 proctype offset.
+    [Test] procedure FreeFunctionParamCount_ResolvesFromLfProcedure;
     [Test] procedure Types_LookupTypeKind_Class;
     [Test] procedure Types_PointerToClass_StripsCaret;
 
@@ -597,6 +601,26 @@ begin
     Assert.IsTrue(FindMember(Members, 'FValue', M), 'FValue field must be present');
     Assert.AreEqual(0, Integer(M.TypeKind), 'a primitive field must leave TypeKind 0');
     Assert.AreEqual(4, M.TypeSize, 'FValue is an Integer -> 4 bytes');
+  finally R.Free; end;
+end;
+
+procedure TTD32ReaderTests.FreeFunctionParamCount_ResolvesFromLfProcedure;
+begin
+  var R := TTD32FileReader.Create;
+  try
+    R.LoadFromFile(ExePath);
+    var C: Integer;
+    // FreeAdd(A, B: Integer): Integer -> 2 params.
+    Assert.IsTrue(R.TryGetFreeFunctionParamCount('FreeAdd', C),
+      'FreeAdd must resolve as a free function');
+    Assert.AreEqual(2, C, 'FreeAdd(A, B) declares 2 parameters');
+    // FreeWrap(const S: string): string -> 1 param.
+    Assert.IsTrue(R.TryGetFreeFunctionParamCount('FreeWrap', C),
+      'FreeWrap must resolve as a free function');
+    Assert.AreEqual(1, C, 'FreeWrap(S) declares 1 parameter');
+    // Unknown name must fail cleanly (so the F1 gate stays inert for it).
+    Assert.IsFalse(R.TryGetFreeFunctionParamCount('NoSuchFreeFunc____', C),
+      'an unknown name must not resolve');
   finally R.Free; end;
 end;
 

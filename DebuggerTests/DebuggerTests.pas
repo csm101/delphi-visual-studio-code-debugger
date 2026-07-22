@@ -709,6 +709,7 @@ type
     // --- free-procedure / function calls (no Self) ---
     [Test] procedure Test_Eval_FreeProc_IntegerReturn;
     [Test] procedure Test_Eval_FreeProc_StringReturn;
+    [Test] procedure Test_Eval_FreeProc_BareWithParams_Refused;
 
     // --- Pascal set literals `[a, b]` ---
     [Test] procedure Test_Eval_SetLiteral_Compare;
@@ -6083,6 +6084,22 @@ begin
   Display := NonRttiResult(FClient, FrameId, 'FreeWrap(''foo'')');
   Assert.IsTrue(Display.Contains('<foo>'),
     'FreeWrap(''foo'') expected ''<foo>'', got: ' + Display);
+end;
+
+// Bare `FreeAdd` (no args) where FreeAdd(A, B: Integer) takes 2 parameters.
+// The speculative zero-argument synthetic call would read garbage argument
+// registers and return a plausible-but-wrong Integer (F1). The evaluator must
+// REFUSE it up front -- recognising the declared arity from the LF_PROCEDURE
+// signature -- rather than call it. An explicit `FreeAdd(3, 4)` is unaffected
+// (covered by Test_Eval_FreeProc_IntegerReturn).
+procedure TDebuggerTests.Test_Eval_FreeProc_BareWithParams_Refused;
+var FrameId, LocalsRef: Integer; Display: string;
+begin
+  StartSession('EVAL_BODY', FrameId, LocalsRef);
+  Display := NonRttiResult(FClient, FrameId, 'FreeAdd');
+  Assert.IsTrue(Display.ToLower.Contains('requires'),
+    'bare FreeAdd (2 params) must be refused with a "requires N argument(s)" ' +
+    'message, not auto-called; got: ' + Display);
 end;
 
 // `TheWidget.AsSet = [wmRunning, wmPaused]` — TWidget.AsSet is a published

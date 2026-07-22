@@ -174,6 +174,8 @@ type
     // method takes one (so ABI slot 0 is Self, declared params start at slot 1).
     function  TryGetMethodParams(const ClassName, MethodName: string;
                 out Params: TArray<TMethodParam>; out HasSelf: Boolean): Boolean;
+    function  TryGetFreeFunctionParamCount(const FuncName: string;
+                out Count: Integer): Boolean;
     function  GetTypeSize(const TypeName: string; out Size: Integer): Boolean;
     // Immediate parent (base) class name of ClassName, via the first hierarchy
     // provider that knows it (TD32). False when unknown / no base.
@@ -1255,6 +1257,17 @@ begin
   // First provider that resolves the signature wins. Only TD32 implements it.
   for var P in FSigProviders do
     if P.TryGetMethodParams(ClassName, MethodName, Params, HasSelf) then
+      Exit(True);
+end;
+
+function TDebugInfoSet.TryGetFreeFunctionParamCount(const FuncName: string;
+  out Count: Integer): Boolean;
+begin
+  Result := False;
+  Count  := 0;
+  // First provider that recognises the free proc wins. Only TD32 implements it.
+  for var P in FSigProviders do
+    if P.TryGetFreeFunctionParamCount(FuncName, Count) then
       Exit(True);
 end;
 

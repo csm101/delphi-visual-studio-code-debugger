@@ -375,6 +375,21 @@ begin
       Exit;
   end;
 
+  // A bare free FUNCTION that declares parameters cannot be auto-called: Delphi
+  // would require the arguments. Refuse it here, up front -- before the
+  // speculative zero-arg call (which would read garbage argument registers) AND
+  // before the global fallback (which would return the function's code address
+  // read as raw prologue bytes). The declared arity comes from the LF_PROCEDURE
+  // signature; a parameterless function (count 0) is unaffected, so `Now` still
+  // calls. Unknown arity falls through unchanged.
+  if FDebugInfo <> nil then begin
+    var DeclaredParamCount: Integer;
+    if FDebugInfo.TryGetFreeFunctionParamCount(Name, DeclaredParamCount) and
+       (DeclaredParamCount > 0) then
+      Exit(InvalidValue(Format('<%s requires %d argument(s)>',
+        [Name, DeclaredParamCount])));
+  end;
+
   // 3) Parameterless free-function call BEFORE the global lookup. In Delphi a
   // bare function name IS a call (`Now` = `Now()`), so it must be invoked, not
   // resolved to the function's code address (which EvaluateGlobalName's
@@ -1279,19 +1294,21 @@ begin
   // handled above.
   if IsFreeProc and Speculative and (not HaveBoundReturn) then
     Exit(InvalidValue(Format('<%s is not a value-returning function>', [FullName])));
-  // A value-returning function that TAKES parameters must not be invoked bare:
-  // a speculative zero-argument synthetic call reads whatever garbage is in the
-  // argument registers and returns a plausible-but-wrong value. Only a genuinely
-  // parameterless function may be auto-called; an explicit `Name(args)` call
-  // (Speculative=False) is never gated.
-  // TODO (audit F1): a bare value-returning FREE FUNCTION that takes parameters
-  // is still auto-called with garbage argument registers, returning a
-  // plausible-but-wrong value. A clean guard needs a free-function arity source:
-  // TryGetMethodParams resolves only methods (it keys on a class), and the
-  // frame-locals RbpOffset is RSM-encoded, so "above RBP" cannot be read off it
-  // reliably. The fix is a TD32 LF_PROCEDURE param-count accessor. The
-  // METHOD-getter case (indexed properties) is already guarded via
-  // IsKnownIndexedProperty using TryGetMethodParams.
+  // A free function that TAKES parameters must not be invoked with fewer
+  // arguments than it declares: the synthetic call would read whatever garbage
+  // is in the unset argument registers and return a plausible-but-wrong value.
+  // The declared count comes from the function's LF_PROCEDURE signature, so we
+  // refuse WITHOUT ever attempting the call (the bare `Foo` speculative form and
+  // an explicit `Foo()` with too few args are both caught). A genuinely
+  // parameterless function (count 0) is unaffected, so `Now` etc. still auto-call.
+  // When the arity is unknown the call proceeds as before -- a strict improvement.
+  if IsFreeProc and (FDebugInfo <> nil) then begin
+    var DeclaredParamCount: Integer;
+    if FDebugInfo.TryGetFreeFunctionParamCount(FullName, DeclaredParamCount) and
+       (DeclaredParamCount > Length(Args)) then
+      Exit(InvalidValue(Format('<%s requires %d argument(s)>',
+        [FullName, DeclaredParamCount])));
+  end;
   WantsFloatReturn   := False;
   WantsStringReturn  := False;
   WantsVariantReturn := False;
