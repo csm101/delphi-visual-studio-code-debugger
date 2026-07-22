@@ -314,12 +314,24 @@ type
     function GetNVar(AIdx: Integer): NullableInteger;
     function GetObj(AIdx: Integer): TMenuCacheBase;
     function GetRec(AIdx: Integer): TPointRec;
+    function GetModes(AIdx: Integer): TWorkModes;
+    function GetWide(AIdx: Integer): TWideSet;
+    function GetRec0: TPointRec;
+    function GetModes0: TWorkModes;
+    function GetWide0: TWideSet;
   public
     constructor Create;
     destructor Destroy; override;
     property NVar[AIdx: Integer]: NullableInteger read GetNVar;
     property Obj[AIdx: Integer]:  TMenuCacheBase  read GetObj;
     property Rec[AIdx: Integer]:  TPointRec       read GetRec;
+    property Modes[AIdx: Integer]: TWorkModes     read GetModes;  // <= 8-byte set (RAX)
+    property Wide[AIdx: Integer]:  TWideSet        read GetWide;  // > 8-byte set (var-out)
+    // NON-indexed getter-backed properties: these take the property-getter
+    // resolution path (InvokeGetter / ResolveRsmMethodProp), the C1/C2 sites.
+    property PointP:  TPointRec  read GetRec0;
+    property SmallSetP: TWorkModes read GetModes0;
+    property WideSetP:  TWideSet   read GetWide0;
   end;
 
   // A class whose DEFAULT property takes TWO indices, so `M[r, c]` (not through
@@ -1180,6 +1192,31 @@ begin
   Result.Z := AIdx * 10 + 2;
 end;
 
+function TReturnKindProbe.GetModes(AIdx: Integer): TWorkModes;
+begin
+  Result := [wmRunning, wmError];   // <= 8-byte set returned in RAX
+end;
+
+function TReturnKindProbe.GetWide(AIdx: Integer): TWideSet;
+begin
+  Result := [we05, we70];           // > 8-byte set returned via var-out slot
+end;
+
+function TReturnKindProbe.GetRec0: TPointRec;
+begin
+  Result.X := 30; Result.Y := 31; Result.Z := 32;
+end;
+
+function TReturnKindProbe.GetModes0: TWorkModes;
+begin
+  Result := [wmRunning, wmError];
+end;
+
+function TReturnKindProbe.GetWide0: TWideSet;
+begin
+  Result := [we05, we70];
+end;
+
 constructor TMatrixProbe.Create;
 begin
   inherited Create;
@@ -1283,6 +1320,8 @@ var
     GSink.Use([VProbe['a'], VProbe.Num[0]]);
     GSink.Use([RKProbe.NVar[0], RKProbe.Obj[0].BaseTag, RKProbe.Rec[0].X]);
     if (WideSet <> []) and (OptField <> nil) then GSink.Use(['s']);
+    if (RKProbe.Modes[0] <> []) and (RKProbe.Wide[0] <> []) then GSink.Use(['g']);
+    if (RKProbe.SmallSetP <> []) and (RKProbe.WideSetP <> []) then GSink.Use([RKProbe.PointP.X]);
     // Keep every same-named instance referenced and reachable.
     GSink.Use([DupA.AlphaA, DupB.GammaB]);
     if (DupObjA = nil) or (DupObjB = nil) or (CrossReal = nil) then GSink.Use(['x']);

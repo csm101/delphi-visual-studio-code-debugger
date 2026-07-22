@@ -281,6 +281,14 @@ type
     procedure Test_WideSet_MembersBeyond64BitsShown;
     [Test]
     procedure Test_FieldBackedSet_HighMemberShown;
+    // Getter-returned sets: a <= 8-byte set (RAX) and a > 8-byte set (var-out).
+    [Test]
+    procedure Test_GetterReturningSmallSet;
+    [Test]
+    procedure Test_GetterReturningWideSet;
+    // Getter returning a record: decoded by declared type, fields readable.
+    [Test]
+    procedure Test_GetterReturningRecord_FieldsReadable;
 
     // --- Two same-named nested classes in one unit, told apart only by VMT.
     //     Repro of the live dataset.Fields bug. ---
@@ -2233,6 +2241,64 @@ begin
       'VProbe.Num[7] must decode the integer variant to 1007, got: ' + Res);
     Assert.IsFalse(ExtractDisplayValue(Res) = '3',
       'the result must be the value, not the varInteger VType word, got: ' + Res);
+  finally
+    Resp.Free;
+  end;
+end;
+
+procedure TDebuggerTests.Test_GetterReturningSmallSet;
+// RKProbe.SmallSetP -> GetModes0 = [wmRunning, wmError]; a <= 8-byte set from a
+// getter, returned in RAX, must decode both members.
+var
+  FrameId, LocalsRef: Integer;
+  Resp: TJSONObject;
+  Res: string;
+begin
+  StartSession('NESTED_CLASS_METHOD_BODY', FrameId, LocalsRef);
+  Resp := FClient.Evaluate('RKProbe.SmallSetP', FrameId);
+  try
+    Res := Resp.GetValue<string>('result', '');
+    Assert.IsTrue(Res.Contains('wmRunning') and Res.Contains('wmError'),
+      'a getter-returned set must decode its members, got: ' + Res);
+  finally
+    Resp.Free;
+  end;
+end;
+
+procedure TDebuggerTests.Test_GetterReturningWideSet;
+// RKProbe.WideSetP -> GetWide0 = [we05, we70]; a > 8-byte set from a getter is
+// returned through the var-out slot, must not AV and must show both members.
+var
+  FrameId, LocalsRef: Integer;
+  Resp: TJSONObject;
+  Res: string;
+begin
+  StartSession('NESTED_CLASS_METHOD_BODY', FrameId, LocalsRef);
+  Resp := FClient.Evaluate('RKProbe.WideSetP', FrameId);
+  try
+    Res := Resp.GetValue<string>('result', '');
+    Assert.IsTrue(Res.Contains('we05'), 'low member missing from wide getter set: ' + Res);
+    Assert.IsTrue(Res.Contains('we70'), 'high member dropped from wide getter set: ' + Res);
+  finally
+    Resp.Free;
+  end;
+end;
+
+procedure TDebuggerTests.Test_GetterReturningRecord_FieldsReadable;
+// RKProbe.PointP -> GetRec0 = (30,31,32). A record from a non-indexed getter
+// must keep its declared type so `.X` reads the field, not render a garbage
+// Double or a truncated Cardinal.
+var
+  FrameId, LocalsRef: Integer;
+  Resp: TJSONObject;
+  Res: string;
+begin
+  StartSession('NESTED_CLASS_METHOD_BODY', FrameId, LocalsRef);
+  Resp := FClient.Evaluate('RKProbe.PointP.Z', FrameId);
+  try
+    Res := Resp.GetValue<string>('result', '');
+    Assert.AreEqual('32', ExtractDisplayValue(Res),
+      'a getter-returned record must let its field be read, got: ' + Res);
   finally
     Resp.Free;
   end;
@@ -4329,31 +4395,42 @@ begin
 end;
 
 procedure TDebuggerTests.Test_Eval_PropGet_SmallRecord;
+// A getter returning a <= 8-byte record (TSmallRec A=7,B=11 in RAX). The fix
+// writes the RAX bytes to a slot and keeps the record type, so the FIELDS read.
+// The old test accepted the packed integer 720903 - the pre-fix behaviour that
+// could not expand fields.
 var
   FrameId, LocalsRef: Integer;
-  Display: string;
 begin
   StartSession('EVAL_BODY', FrameId, LocalsRef);
-  Display := PropGetResult(FClient, FrameId, 'AsSmall');
-  // TSmallRec(A=7, B=11) packed in low 32 bits of RAX:
-  //   A=7 at bits 0..15, B=11 at bits 16..31 → 0x000B0007 = 720903.
-  Assert.IsTrue(Display.Contains('720903') or
-                (Display.Contains('7') and Display.Contains('11')),
-    'AsSmall expected SmallRec(A=7,B=11), got: ' + Display);
+  var A := FClient.Evaluate('W.AsSmall.A', FrameId);
+  try
+    Assert.AreEqual('7', ExtractDisplayValue(A.GetValue<string>('result', '')),
+      'W.AsSmall.A must read the record field');
+  finally A.Free; end;
+  var B := FClient.Evaluate('W.AsSmall.B', FrameId);
+  try
+    Assert.AreEqual('11', ExtractDisplayValue(B.GetValue<string>('result', '')),
+      'W.AsSmall.B must read the record field');
+  finally B.Free; end;
 end;
 
 procedure TDebuggerTests.Test_Eval_PropGet_BigRecord;
+// A getter returning a > 8-byte record (TPoint3D X=1.5,Y=2.5,Z=3.5 via slot).
+// The old test asserted "1.5/2.5/3.5" against the buggy Double reinterpret of
+// the first 8 bytes; the fix keeps the record type with Address at the slot so
+// each field reads correctly.
 var
   FrameId, LocalsRef: Integer;
-  Display: string;
 begin
   StartSession('EVAL_BODY', FrameId, LocalsRef);
-  Display := PropGetResult(FClient, FrameId, 'AsBig');
-  Assert.IsFalse(Display.Contains('not yet supported'),
-    'AsBig (TPoint3D) must not error out; got: ' + Display);
-  // Display should mention at least one of the field values.
-  Assert.IsTrue(Display.Contains('1.5') or Display.Contains('2.5') or Display.Contains('3.5'),
-    'AsBig expected one of 1.5/2.5/3.5, got: ' + Display);
+  var Z := FClient.Evaluate('W.AsBig.Z', FrameId);
+  try
+    var Res := Z.GetValue<string>('result', '');
+    Assert.IsFalse(Res.Contains('not yet supported'), 'AsBig must not error out: ' + Res);
+    Assert.IsTrue(Res.Contains('3.5'),
+      'W.AsBig.Z must read the third field = 3.5, got: ' + Res);
+  finally Z.Free; end;
 end;
 
 procedure TDebuggerTests.Test_Eval_Method_Integer;

@@ -997,6 +997,10 @@ var
   // address. RetRecSize is its declared size, used to size the slot.
   WantsRecordReturn: Boolean;
   RetRecSize:        Integer;
+  // A set wider than 8 bytes is returned through the var-out slot by value, like
+  // a record. A <= 8-byte set comes back in RAX and is decoded from RawValue.
+  WantsSetReturn:    Boolean;
+  RetSetSize:        Integer;
   // Win64 ABI: a POD record of size <= 8 bytes is returned PACKED IN RAX, not
   // through a hidden var-out slot. Tracked separately so the slot argument is
   // NOT inserted for such a call (inserting it also shifted the user args into
@@ -1191,11 +1195,18 @@ begin
   WantsVariantReturn := False;
   WantsRecordReturn  := False;
   RetRecSize         := 0;
+  WantsSetReturn     := False;
+  RetSetSize         := 0;
   SmallRecInRax      := False;
   if HaveBoundReturn then begin
     case RetKind of
       TK_FLOAT:
         WantsFloatReturn := not SameText(RetTypeName, 'Currency');
+      TK_SET:
+        // > 8 bytes -> var-out slot (by value). <= 8 -> RAX (the else branch);
+        // the set formatter reads the real width from RawValue there.
+        if FDebugInfo.GetTypeSize(RetTypeName, RetSetSize) and (RetSetSize > 8) then
+          WantsSetReturn := True;
       TK_VARIANT:
         // Returned through the var-out slot like a string, but the slot holds a
         // 16/24-byte TVarData by value, decoded below - not a data pointer.
@@ -1256,11 +1267,13 @@ begin
   // Variant needs the whole 24-byte TVarData zeroed, not just 8 bytes, so a
   // field the getter leaves untouched cannot read as stale VType/data.
   Slot := 0;
-  if WantsStringReturn or WantsVariantReturn or WantsRecordReturn then begin
+  if WantsStringReturn or WantsVariantReturn or WantsRecordReturn or WantsSetReturn then begin
     if WantsVariantReturn then
       Slot := FDebugger.GetRemoteScratchSlot(24)
     else if WantsRecordReturn then
       Slot := FDebugger.GetRemoteScratchSlot(NativeUInt(Max(RetRecSize, 16)))
+    else if WantsSetReturn then
+      Slot := FDebugger.GetRemoteScratchSlot(NativeUInt(Max(RetSetSize, 16)))
     else
       Slot := FDebugger.GetRemoteScratchSlot(8);
     if Slot = 0 then
@@ -1307,6 +1320,13 @@ begin
     Result.Address  := Slot;
     Result.RawValue := 0;
     Result.Size     := RetRecSize;
+  end else if WantsSetReturn then begin
+    // The slot holds the set by value; Address lets DecodeSetMembers read the
+    // full declared width.
+    Result.TypeHint := RetTypeName;
+    Result.Address  := Slot;
+    Result.RawValue := 0;
+    Result.Size     := RetSetSize;
   end else if WantsStringReturn then begin
     if HaveBoundReturn then
       Result.TypeHint := RetTypeName
@@ -1459,6 +1479,14 @@ function TExprEvaluator.ApplyDot(const Base: TExprValue; const Field: string): T
     case P.PropTypeKind of
       TK_LSTRING, TK_USTRING, TK_WSTRING, TK_DYNARRAY,
       TK_VARIANT, TK_RECORD, TK_MRECORD: Exit(True);
+      TK_SET: begin
+        // A set of 1/2/4/8 bytes comes back in RAX like an ordinal; a set wider
+        // than 8 bytes is returned through the hidden result pointer. Dispatching
+        // a >8-byte set through RAX would leave the callee writing to a garbage
+        // RDX -> access violation.
+        var SetSz: Integer := 0;
+        Exit(FDebugInfo.GetTypeSize(P.PropTypeName, SetSz) and (SetSz > 8));
+      end;
     else
       Exit(False);
     end;
@@ -1482,6 +1510,11 @@ function TExprEvaluator.ApplyDot(const Base: TExprValue; const Field: string): T
       case P.PropTypeKind of
         TK_VARIANT:               SlotSize := 16;
         TK_RECORD, TK_MRECORD:    SlotSize := 256;
+        TK_SET: begin
+          SlotSize := 0;
+          FDebugInfo.GetTypeSize(P.PropTypeName, SlotSize);
+          if SlotSize < 1 then SlotSize := 32;
+        end;
       else
         SlotSize := 8;
       end;
@@ -1507,24 +1540,30 @@ function TExprEvaluator.ApplyDot(const Base: TExprValue; const Field: string): T
             Exit(InvalidValue('<getter result deref failed>'));
         end;
         TK_RECORD, TK_MRECORD: begin
-          // Win64 ABI: records of size <= 8 bytes are returned in RAX, not
-          // via the var-out slot. Larger records are written to the slot.
-          // We can't easily tell from PropTypeKind alone, so probe: read
-          // the first 8 bytes; if the slot is still zero, the callee
-          // didn't write here and the value must have come back in RAX
-          // (display as the packed integer). Otherwise expose the slot's
-          // first 8 bytes -- for now reinterpreted as Double so the common
-          // float-field record (TPoint3D etc.) renders something useful.
-          // Full record expansion via TypeInfo field table is a follow-up.
-          var SlotFirst8: UInt64 := 0;
-          FDebugger.ReadProcessMemoryAt(Slot, @SlotFirst8, 8);
-          if SlotFirst8 = 0 then begin
-            Result.TypeHint := 'Cardinal';
-            Result.RawValue := Rax;
-          end else begin
-            Result.TypeHint := 'Double';
-            Result.RawValue := SlotFirst8;
-          end;
+          // Decide by the DECLARED size, not by probing the slot. A record <= 8
+          // bytes (and not managed) is returned PACKED IN RAX; the callee never
+          // touches the slot. Write those RAX bytes into the slot so the value
+          // has a memory home and its fields can be read at slot + offset -
+          // exactly like the larger records that arrive in the slot directly.
+          // Keeping TypeHint = the record type is what lets `.X` resolve; the
+          // old 'Cardinal'/'Double' reinterpret dropped fields / showed garbage.
+          var RecSz: Integer := 0;
+          FDebugInfo.GetTypeSize(P.PropTypeName, RecSz);
+          if (P.PropTypeKind = TK_RECORD) and (RecSz > 0) and (RecSz <= 8) then
+            FDebugger.WriteMemoryAt(Slot, @Rax, 8);
+          Result.TypeHint := P.PropTypeName;
+          Result.Address  := Slot;
+          Result.RawValue := 0;
+          if RecSz > 0 then
+            Result.Size := RecSz;
+        end;
+        TK_SET: begin
+          // A >8-byte set lives in the slot by value; Address at the slot lets
+          // DecodeSetMembers read the full width. (<= 8-byte sets take the RAX
+          // path below, not this branch.)
+          Result.TypeHint := P.PropTypeName;
+          Result.Address  := Slot;
+          Result.RawValue := 0;
         end;
         // TK_VARIANT -- leave RawValue=0; FormatVariantAt reads via Address.
       end;
