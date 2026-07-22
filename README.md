@@ -9,7 +9,7 @@ The repository contains **three programs** that share one debugger engine:
 |---|---|---|
 | **Debug adapter** | A **Debug Adapter Protocol (DAP)** server. This is the debugger itself: breakpoints, stepping, call stacks, variables, expression evaluation. Any DAP client can drive it. | `VisualStudioCodeDelphiDebugger\` |
 | **VS Code extension** | The client that makes it usable in the editor: the `delphi-win64` debug type, the process picker for attaching, status-bar progress, and an editor for the exception rules. | `install\local.delphi-win64-debug\` |
-| **MCP server** | The same engine exposed to an **AI agent** over the Model Context Protocol — 31 tools (`set_breakpoint`, `step_into`, `get_locals`, `evaluate_expression`, `get_call_stack`, …). It lets an agent run a program, stop it, and read its actual state instead of guessing from the source. | `MCPDebugger\` |
+| **MCP server** | The same engine exposed to an **AI agent** over the Model Context Protocol — 33 tools (`set_breakpoint`, `step_into`, `get_locals`, `evaluate_expression`, `get_call_stack`, `read_memory`, …). It lets an agent run a program, stop it, and read its actual state instead of guessing from the source. | `MCPDebugger\` |
 
 The engine is shared: `DebuggerCore\` holds the Windows Debug API loop, the
 symbol readers (`.rsm`, TD32, `.map`, `.dcp`, JCL) and the expression evaluator.
@@ -673,7 +673,7 @@ the `claude` CLI, user scope) and with VS Code by merging the user `mcp.json`.
 It is idempotent, and `-Unregister` removes it. `install\Install.exe` offers the
 same registration at the end of an install.
 
-The 31 tools cover the debugging cycle:
+The 33 tools cover the debugging cycle:
 
 | Group | Tools |
 |---|---|
@@ -681,6 +681,7 @@ The 31 tools cover the debugging cycle:
 | Breakpoints | `set_breakpoint`, `set_breakpoints`, `list_breakpoints`, `remove_all_breakpoints`, `set_exception_filters` |
 | Execution | `continue_and_wait`, `step_over`, `step_into`, `step_out`, `pause_execution`, `wait_until_stopped` |
 | State | `get_call_stack`, `get_threads`, `get_locals`, `get_variable`, `expand_variable`, `evaluate_expression`, `get_current_source_location`, `get_exception_details`, `get_compact_debug_snapshot` |
+| Memory | `read_memory`, `write_memory` |
 | Output | `get_debuggee_output`, `get_debugger_output` |
 
 `launch_from_config` and `attach_from_config` read the `launch.json` the IDE
@@ -716,7 +717,7 @@ symbol resolution reaches both.
 |---|---|
 | `DebuggerCore\` | The debugger proper: Windows debug loop, symbol readers (`.rsm`, TD32, `.map`, `.dcp`, JCL), expression evaluator, exception rules |
 | `VisualStudioCodeDelphiDebugger\` | DAP server: reads DAP from stdin, drives the engine |
-| `MCPDebugger\` | MCP server: the same engine as 32 tools an agent can call |
+| `MCPDebugger\` | MCP server: the same engine as 33 tools an agent can call |
 | `install\local.delphi-win64-debug\` | VS Code extension: registers the `delphi-win64` debug type, the attach picker and the exception-rules editor, and bundles the adapter |
 | `Debugme.dpr` | A small program used as a debug target while developing the debugger |
 
@@ -769,17 +770,20 @@ At runtime the adapter compares the debuggee's actual `ImageBase` (from `CREATE_
 - [x] Call stack with function names (frame unwinding beyond the current frame)
 - [x] Local variable inspection from reverse-engineered Delphi `.rsm` files
 - [x] Parent-procedure locals visible from inside nested procedures
+- [x] Anonymous-method parameters and closure-captured variables inspectable (the captured `$ActRec` fields expand like a normal object)
 - [x] Locals declared in the program's main `begin..end` block
 - [x] Global variable inspection (with decoded `typeId`)
 - [x] Registers scope in the Variables panel
 - [x] Type-aware value formatting (integers, floats, `TDateTime`, chars, strings, Variants, C-string pointers, dynamic arrays in `[...]` notation)
 - [x] Object / record / dynamic-array expansion in the Variables tree (all fields, all ancestor classes, nested)
+- [x] Generic collection inspection: `TList<T>` and `TDictionary<...>` expand and enumerate their elements
 - [x] Hover data tips in the editor (`evaluateForHovers`)
 - [x] Full Pascal expression evaluator: qualified identifiers, arithmetic / comparison / boolean / set ops, string concat, indexing, type casts, `is` / `as`, `Length` / `SizeOf` / `Ord` / `Low` / `High`, enum / set literals, method and property calls (executed in the debuggee, raises aborted cleanly)
 - [x] `setVariable` for primitives, floats, dates, chars, sized integer writes
 - [x] `setVariable` for enums (by name / ordinal) and sets (by bitmask) at the correct storage width
 - [x] `setVariable` for strings via in-process `@UStrAsg` / `@LStrAsg` (no refcount leak)
 - [x] `setVariable` writes through the pointer for `var` parameters
+- [x] Read and write raw debuggee process memory (MCP `read_memory` / `write_memory`)
 - [x] First-chance exception break (continue past handled exceptions)
 - [x] Exception class name and message shown on stop (`exceptionInfo` details panel)
 - [x] `$exception` pseudo-variable: live exception object inspectable in Locals and Watch
@@ -799,21 +803,12 @@ Debugger features:
 
 Variable / type system:
 
-- [ ] Generics, anonymous methods, closure capture frames
+- [ ] Broader generic *type* coverage beyond the common collection classes
 - [ ] Pretty-printing for more RTL types beyond what's already handled
-
-Tooling / UI:
-
-- [ ] Visual editor for `exceptionRules` — a dedicated TypeScript VS Code
-  extension with a Webview UI (add/reorder rules, action dropdowns, live
-  match preview), persisting back to `launch.json`. The current thin
-  debug-type registration has no extension code; the JSON schema already
-  provides launch.json autocompletion/validation, so this is only needed for
-  a form-style editor.
 
 Project / packaging:
 
-- [ ] PE import-table reader so the `.map` file can be dropped entirely
+- [ ] Make a `.map`-free build the documented default (the `.map` is already optional at load time and a PE import-table reader exists; this is about dropping the dependency end to end)
 - [ ] Publish the VS Code extension to the marketplace instead of the local install
 
 ---
