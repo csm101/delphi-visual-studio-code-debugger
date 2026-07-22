@@ -276,6 +276,12 @@ type
     [Test]
     procedure Test_IndexedProperty_ReturningRecord;
 
+    // --- Sets wider than 8 bytes, and a field-backed set, must not truncate. ---
+    [Test]
+    procedure Test_WideSet_MembersBeyond64BitsShown;
+    [Test]
+    procedure Test_FieldBackedSet_HighMemberShown;
+
     // --- Two same-named nested classes in one unit, told apart only by VMT.
     //     Repro of the live dataset.Fields bug. ---
     [Test]
@@ -2227,6 +2233,45 @@ begin
       'VProbe.Num[7] must decode the integer variant to 1007, got: ' + Res);
     Assert.IsFalse(ExtractDisplayValue(Res) = '3',
       'the result must be the value, not the varInteger VType word, got: ' + Res);
+  finally
+    Resp.Free;
+  end;
+end;
+
+procedure TDebuggerTests.Test_WideSet_MembersBeyond64BitsShown;
+// WideSet = [we05, we70, we79]. Decoding only the low 8 bytes would drop we70
+// and we79 (bits beyond 63). All three must appear.
+var
+  FrameId, LocalsRef: Integer;
+  Resp: TJSONObject;
+  Res: string;
+begin
+  StartSession('NESTED_CLASS_METHOD_BODY', FrameId, LocalsRef);
+  Resp := FClient.Evaluate('WideSet', FrameId);
+  try
+    Res := Resp.GetValue<string>('result', '');
+    Assert.IsTrue(Res.Contains('we05'), 'low member missing: ' + Res);
+    Assert.IsTrue(Res.Contains('we70'), 'member past bit 63 dropped (we70): ' + Res);
+    Assert.IsTrue(Res.Contains('we79'), 'member past bit 63 dropped (we79): ' + Res);
+  finally
+    Resp.Free;
+  end;
+end;
+
+procedure TDebuggerTests.Test_FieldBackedSet_HighMemberShown;
+// OptField.Options = [o10]; o10 is bit 10 -> byte 1. Reading only byte 0 shows
+// []. The field-backed set must read its full declared width.
+var
+  FrameId, LocalsRef: Integer;
+  Resp: TJSONObject;
+  Res: string;
+begin
+  StartSession('NESTED_CLASS_METHOD_BODY', FrameId, LocalsRef);
+  Resp := FClient.Evaluate('OptField.Options', FrameId);
+  try
+    Res := Resp.GetValue<string>('result', '');
+    Assert.IsTrue(Res.Contains('o10'),
+      'a field-backed set must not be truncated to byte 0 (expected o10): ' + Res);
   finally
     Resp.Free;
   end;

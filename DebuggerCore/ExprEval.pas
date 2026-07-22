@@ -1380,8 +1380,17 @@ function TExprEvaluator.ApplyDot(const Base: TExprValue; const Field: string): T
   function SizeForKind(K: Byte; const Name: string): Integer;
   begin
     case K of
-      TK_CHAR, TK_ENUM, TK_SET, TK_WCHAR:
-        // Enum/set size depends on declaration; default to 1 byte (most common).
+      TK_SET: begin
+        // A set is 1..32 bytes. Resolve the declared width so a >8-byte set
+        // (e.g. `set of AnsiChar`) is not read as a single byte, dropping every
+        // member past bit 7. GetTypeSize is authoritative; fall back to 1.
+        var SetSz: Integer;
+        if (FDebugInfo <> nil) and FDebugInfo.GetTypeSize(Name, SetSz) and (SetSz > 0) then
+          Exit(SetSz);
+        Exit(1);
+      end;
+      TK_CHAR, TK_ENUM, TK_WCHAR:
+        // Enum size depends on declaration; default to 1 byte (most common).
         if SameText(Name, 'WideChar') then Exit(2) else Exit(1);
       TK_INTEGER, TK_FLOAT:
         if SameText(Name, 'Single') then Exit(4)

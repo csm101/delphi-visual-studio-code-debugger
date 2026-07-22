@@ -90,6 +90,13 @@ type
 
     // Decode a Delphi TVarData at Address into a display string.
     function FormatVariantAt(Address: UInt64): string;
+    // Decode a set value into `[a, b, ...]`, reading the WHOLE storage width
+    // (a Delphi set is 1..32 bytes, one bit per member) instead of only the
+    // low 8 bytes. Bytes come from Address when the set is wider than the
+    // RawValue register can hold, else from RawValue. Single home for set
+    // decoding so the formatter, field reads and returns cannot disagree.
+    function DecodeSetMembers(RawValue, Address: UInt64; ByteWidth: Integer;
+      const Names: TArray<string>; MinValue: Integer): string;
     // Heuristic: does memory at Address look like a meaningful TVarData?
     function LooksLikeVariantAt(Address: UInt64): Boolean;
 
@@ -399,6 +406,35 @@ begin
   // class instance (valid VMT). Otherwise report unknown rather than guess.
   if Rtti.IsClassInstance(Obj) then
     Result := Obj;
+end;
+
+function TDelphiValueReader.DecodeSetMembers(RawValue, Address: UInt64;
+  ByteWidth: Integer; const Names: TArray<string>; MinValue: Integer): string;
+var
+  Buf: array[0..31] of Byte;   // a Delphi set is at most 32 bytes (256 members)
+begin
+  if ByteWidth < 1 then
+    ByteWidth := 1;
+  if ByteWidth > 32 then
+    ByteWidth := 32;
+  FillChar(Buf, SizeOf(Buf), 0);
+  // Up to 8 bytes fit in the value register; a wider set lives in memory.
+  if ByteWidth <= 8 then
+    Move(RawValue, Buf[0], ByteWidth)
+  else if not ((Address <> 0) and Debugger.ReadProcessMemoryAt(Address, @Buf[0], ByteWidth)) then
+    Move(RawValue, Buf[0], 8);   // best effort when there is no readable address
+
+  Result := '';
+  for var I := 0 to High(Names) do begin
+    var BitIdx := MinValue + I;
+    if (BitIdx >= 0) and (BitIdx < ByteWidth * 8) and
+       ((Buf[BitIdx shr 3] and (Byte(1) shl (BitIdx and 7))) <> 0) then begin
+      if Result <> '' then
+        Result := Result + ', ';
+      Result := Result + Names[I];
+    end;
+  end;
+  Result := '[' + Result + ']';
 end;
 
 function TDelphiValueReader.FormatVariantAt(Address: UInt64): string;
@@ -1313,21 +1349,17 @@ begin
           end;
         end;
         if Length(Names) > 0 then begin
-          // Decode membership across the FULL slot (up to 64 bits): a set
-          // over a 20-member enum spans 3-4 bytes, so bit 9 / bit 19 live
-          // beyond byte 0. Bit (MinV+I) set means member I is present.
-          var Bits := V.RawValue;
-          var Members := '';
-          for var I := 0 to High(Names) do begin
-            var BitIdx := MinV + I;
-            if (BitIdx >= 0) and (BitIdx < 64) and
-               ((Bits and (UInt64(1) shl BitIdx)) <> 0) then begin
-              if Members <> '' then
-                Members := Members + ', ';
-              Members := Members + Names[I];
-            end;
-          end;
-          Exit('[' + Members + ']');
+          // The set's real storage width: 1..32 bytes. Declared type size is
+          // authoritative; else derive it from the highest member ordinal. A
+          // fixed 8 lost every member past bit 63 (e.g. `set of AnsiChar`, 32
+          // bytes). For a wider-than-8 set the bytes are read from V.Address.
+          var ByteWidth: Integer := 0;
+          var DeclSz: Integer;
+          if (DebugInfo <> nil) and DebugInfo.GetTypeSize(V.TypeHint, DeclSz) and (DeclSz > 0) then
+            ByteWidth := DeclSz
+          else
+            ByteWidth := (EnumInfo.MaxValue div 8) + 1;
+          Exit(DecodeSetMembers(V.RawValue, V.Address, ByteWidth, Names, MinV));
         end;
       end;
     end;

@@ -51,6 +51,24 @@ type
   TWorkMode  = (wmIdle, wmRunning, wmPaused, wmError);
   TWorkModes = set of TWorkMode;
 
+  // A wide enum + its set, so the set spans more than 8 bytes (member ordinals
+  // reach 79 -> 10 bytes). Decoding only the low 8 bytes drops every member
+  // above bit 63. `set of AnsiChar` (32 bytes) is the same shape in real code.
+  TWideEnum = (we00, we01, we02, we03, we04, we05, we06, we07, we08, we09,
+               we10, we11, we12, we13, we14, we15, we16, we17, we18, we19,
+               we20, we21, we22, we23, we24, we25, we26, we27, we28, we29,
+               we30, we31, we32, we33, we34, we35, we36, we37, we38, we39,
+               we40, we41, we42, we43, we44, we45, we46, we47, we48, we49,
+               we50, we51, we52, we53, we54, we55, we56, we57, we58, we59,
+               we60, we61, we62, we63, we64, we65, we66, we67, we68, we69,
+               we70, we71, we72, we73, we74, we75, we76, we77, we78, we79);
+  TWideSet = set of TWideEnum;
+
+  // 12-member enum -> a 2-byte set, for a field-backed set property (member 10
+  // lives in byte 1, dropped when only byte 0 is read).
+  TOpt  = (o0, o1, o2, o3, o4, o5, o6, o7, o8, o9, o10, o11);
+  TOpts = set of TOpt;
+
   // $M- class wide enough that its trailing fields live BEYOND byte offset
   // 127, exercising the RSM $2C field-offset decode for offsets that do not
   // fit the single-byte `value*2` form.
@@ -259,6 +277,18 @@ type
   public
     property Tag[const AKey: string]: Variant read GetTag; default;
     property Num[AIdx: Integer]: Variant read GetNum;
+  end;
+
+  // Field-backed set property: `Options` reads the FOptions field directly (no
+  // getter), so the debugger reads the field bytes. A 2-byte set with member 10
+  // set must not be truncated to byte 0.
+  TThingWithOptSet = class(TPersistent)
+  private
+    FOptions: TOpts;
+  published
+    property Options: TOpts read FOptions;
+  public
+    constructor Create;
   end;
 
   // A DISTINCT type that is a Variant underneath (`type ... = type Variant`).
@@ -1127,6 +1157,12 @@ begin
   inherited;
 end;
 
+constructor TThingWithOptSet.Create;
+begin
+  inherited Create;
+  FOptions := [o10];   // bit 10 -> byte 1; reading only byte 0 shows []
+end;
+
 function TReturnKindProbe.GetNVar(AIdx: Integer): NullableInteger;
 begin
   Result := AIdx + 50;   // NVar[5] -> a Variant(alias) holding 55
@@ -1212,6 +1248,8 @@ var
   Matrix: TMatrixProbe;  // multi-index default property
   VProbe: TVariantProbe; // default property returning a Variant (FieldValues shape)
   RKProbe: TReturnKindProbe; // indexed properties returning variant-alias/class/record
+  WideSet:  TWideSet;        // > 8-byte set (A1)
+  OptField: TThingWithOptSet;// field-backed 2-byte set (A2)
   DupA: TCollideOuterA.TDup;   // two same-named nested classes, distinct layouts
   DupB: TCollideOuterB.TDup;
   // Same two objects, but typed as TObject: the static type carries no member
@@ -1244,6 +1282,7 @@ var
     GSink.Use([Probe['seed'], Probe.Plain[1], Probe.Cell[0, ''], Matrix[0, 0]]);
     GSink.Use([VProbe['a'], VProbe.Num[0]]);
     GSink.Use([RKProbe.NVar[0], RKProbe.Obj[0].BaseTag, RKProbe.Rec[0].X]);
+    if (WideSet <> []) and (OptField <> nil) then GSink.Use(['s']);
     // Keep every same-named instance referenced and reachable.
     GSink.Use([DupA.AlphaA, DupB.GammaB]);
     if (DupObjA = nil) or (DupObjB = nil) or (CrossReal = nil) then GSink.Use(['x']);
@@ -1257,6 +1296,8 @@ begin
   Matrix := TMatrixProbe.Create;
   VProbe := TVariantProbe.Create;
   RKProbe := TReturnKindProbe.Create;
+  WideSet  := [we05, we70, we79];   // members beyond bit 63
+  OptField := TThingWithOptSet.Create;
   DupA   := TCollideOuterA.TDup.Create;
   DupB   := TCollideOuterB.TDup.Create;
   DupObjA := DupA;
@@ -1268,6 +1309,7 @@ begin
     CrossReal.Free;
     DupB.Free;
     DupA.Free;
+    OptField.Free;
     RKProbe.Free;
     VProbe.Free;
     Matrix.Free;
