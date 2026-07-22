@@ -157,6 +157,11 @@ type
     // against the System unit's primitive set; anything else returns
     // TK_UNKNOWN and the caller picks a safe default.
     function  TypeNameToKind(const TypeName: string): Byte;
+    // True when a value of this type is passed/returned in an XMM register
+    // (Single/Double/Extended/TDateTime/float aliases; NOT Currency). Resolves
+    // the kind so aliases are not missed. Used for both argument marshalling and
+    // the return-class heuristic so the two cannot drift.
+    function  IsFloatValueHint(const TypeHint: string): Boolean;
 
   public
     constructor Create(const Debugger: IDebugTarget; Rtti: TDelphiRtti = nil;
@@ -475,6 +480,19 @@ begin
 end;
 
 { TypeName -> TypeKind (System primitives only) }
+
+function TExprEvaluator.IsFloatValueHint(const TypeHint: string): Boolean;
+begin
+  // A floating-point value goes into an XMM register on the Win64 ABI. Decided
+  // by the resolved KIND, not a fixed name list: TypeNameToKind knows TDateTime,
+  // TDate, TTime and follows a `type TRate = type Double` alias, all of which
+  // the old SameText('Single'/'Double'/'Extended') missed - sending the bits to
+  // an integer register and leaving XMM 0. Currency is TK_FLOAT but ABI-wise a
+  // scaled Int64 in an integer register, so it is excluded.
+  if SameText(TypeHint, 'Currency') then
+    Exit(False);
+  Result := TypeNameToKind(TypeHint) = TK_FLOAT;
+end;
 
 function TExprEvaluator.TypeNameToKind(const TypeName: string): Byte;
 begin
@@ -1236,9 +1254,7 @@ begin
       WantsStringReturn := True;
   end else if Length(Args) > 0 then begin
     // Fallback heuristic: dispatch on first arg's declared TypeHint.
-    if SameText(Args[0].TypeHint, 'Single') or
-       SameText(Args[0].TypeHint, 'Double') or
-       SameText(Args[0].TypeHint, 'Extended') then
+    if IsFloatValueHint(Args[0].TypeHint) then
       WantsFloatReturn := True
     else if SameText(Args[0].TypeHint, 'UnicodeString') or
             SameText(Args[0].TypeHint, 'string')         or
@@ -1282,11 +1298,10 @@ begin
     Flt  := Flt  + [False];
   end;
 
-  // Marshall user args.
+  // Marshall user args. A float goes into an XMM register by position; the kind
+  // fallback catches TDateTime and float aliases the old name list missed.
   for var I := 0 to High(Args) do begin
-    var IsFloat := SameText(Args[I].TypeHint, 'Single') or
-                   SameText(Args[I].TypeHint, 'Double') or
-                   SameText(Args[I].TypeHint, 'Extended');
+    var IsFloat := IsFloatValueHint(Args[I].TypeHint);
     Vals := Vals + [Args[I].RawValue];
     Flt  := Flt  + [IsFloat];
   end;

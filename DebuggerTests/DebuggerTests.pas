@@ -592,6 +592,7 @@ type
     // Records.
     [Test] procedure Test_Eval_PropGet_SmallRecord;
     [Test] procedure Test_Eval_PropGet_BigRecord;
+    [Test] procedure Test_Eval_MethodCall_TDateTimeArgument;
 
     // --- generic method call: Obj.Method(arg1, arg2, ...) ---
     [Test] procedure Test_Eval_Method_Integer;
@@ -4431,6 +4432,26 @@ begin
     Assert.IsTrue(Res.Contains('3.5'),
       'W.AsBig.Z must read the third field = 3.5, got: ' + Res);
   finally Z.Free; end;
+end;
+
+procedure TDebuggerTests.Test_Eval_MethodCall_TDateTimeArgument;
+// W.DayOfDate(EvalDate), EvalDate=45.678 -> Round(0.678*1000)+45 = 723. TDateTime
+// is a Double alias: name-only float detection sent the bits to an integer
+// register, XMM stayed 0, and the callee saw 0.0 -> 0. It must marshal to XMM.
+var
+  FrameId, LocalsRef: Integer;
+  Resp: TJSONObject;
+  Res: string;
+begin
+  StartSession('EVAL_BODY', FrameId, LocalsRef);
+  Resp := FClient.Evaluate('W.DayOfDate(EvalDate)', FrameId);
+  try
+    Res := Resp.GetValue<string>('result', '');
+    Assert.AreEqual('723', ExtractDisplayValue(Res),
+      'a TDateTime argument must be marshalled to XMM (expected 723, 0 means it went to an int reg): ' + Res);
+  finally
+    Resp.Free;
+  end;
 end;
 
 procedure TDebuggerTests.Test_Eval_Method_Integer;

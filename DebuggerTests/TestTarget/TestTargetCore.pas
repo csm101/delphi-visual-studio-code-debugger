@@ -163,6 +163,10 @@ type
     function Mult(A, B: Integer): Integer;
     function Sum5(A, B, C, D, E: Integer): Integer;
     function Scale(X: Double): Double;
+    // A TDateTime parameter (a Double alias): the debugger must marshal it to
+    // an XMM register, which name-only float detection failed to do. Returns the
+    // day-of-month so a wrong (0.0) argument gives a distinguishable answer.
+    function DayOfDate(const D: TDateTime): Integer;
     function Greet(const Who: string): string;
     // Step-into prologue fixture (F19): a METHOD whose Self and three
     // by-register parameters (RCX/RDX/R8/XMM3) only become readable once the
@@ -515,6 +519,13 @@ begin
   Result := X * 2 + 0.5;        // 1.5*2 + 0.5 = 3.5
 end;
 
+function TWidget.DayOfDate(const D: TDateTime): Integer;
+begin
+  // Trunc(D) is the date part; the fractional part is the time. A wrongly
+  // marshalled argument (0.0) yields Trunc(0) = 0, distinct from any real day.
+  Result := Round(Frac(D) * 1000) + Trunc(D);
+end;
+
 function TWidget.Greet(const Who: string): string;
 begin
   Result := 'hi_' + Who + '!_' + FName;  // 'hi_world!_hello'
@@ -803,6 +814,7 @@ var
   Modes:   TWorkModes;
   W:       TWidget;   // portable object receivers for the eval/property/method tests:
   S:       TStuff;    // present as NAMED-proc locals so TD32 resolves them WITHOUT .rsm
+  EvalDate: TDateTime;   // float-argument marshalling fixture (D1)
 begin
   Caption := 'Hello';
   Scores  := TArray<Integer>.Create(10, 20, 30);
@@ -810,7 +822,8 @@ begin
   Modes   := [wmRunning, wmPaused];
   W := TWidget.Create('hello', 42);   // same canonical values the .dpr main block used
   S := TStuff.Create(7, 'tag');
-  GSink.Use([Caption, W.Name, S.PubCount]);  // {BP:EVAL_BODY} -- W and S are live here
+  EvalDate := 45.678;                  // DayOfDate -> Round(0.678*1000)+45 = 723
+  GSink.Use([Caption, W.Name, S.PubCount, EvalDate]);  // {BP:EVAL_BODY} -- W and S are live here
   S.Free;
   W.Free;
 end;
