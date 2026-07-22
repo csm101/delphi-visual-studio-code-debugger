@@ -593,6 +593,8 @@ type
     [Test] procedure Test_Eval_PropGet_SmallRecord;
     [Test] procedure Test_Eval_PropGet_BigRecord;
     [Test] procedure Test_Eval_MethodCall_TDateTimeArgument;
+    [Test] procedure Test_Eval_StringAliasIndexing_ReadsWideChar;
+    [Test] procedure Test_Eval_VariantAliasLocal_Decoded;
 
     // --- generic method call: Obj.Method(arg1, arg2, ...) ---
     [Test] procedure Test_Eval_Method_Integer;
@@ -4432,6 +4434,47 @@ begin
     Assert.IsTrue(Res.Contains('3.5'),
       'W.AsBig.Z must read the third field = 3.5, got: ' + Res);
   finally Z.Free; end;
+end;
+
+procedure TDebuggerTests.Test_Eval_StringAliasIndexing_ReadsWideChar;
+// CapAlias: TStrAlias = 'World'. CapAlias[2] must read the WideChar 'o' (byte
+// offset 2), not a narrow AnsiChar at offset 1. Name-only width detection read
+// offset 1 as AnsiChar (#0 mid-char) for the alias.
+var
+  FrameId, LocalsRef: Integer;
+  Resp: TJSONObject;
+  Res: string;
+begin
+  StartSession('EVAL_BODY', FrameId, LocalsRef);
+  Resp := FClient.Evaluate('CapAlias[2]', FrameId);
+  try
+    Res := Resp.GetValue<string>('result', '');
+    Assert.IsTrue(Res.Contains('o'),
+      'indexing a UnicodeString alias must read a WideChar (expected ''o''): ' + Res);
+  finally
+    Resp.Free;
+  end;
+end;
+
+procedure TDebuggerTests.Test_Eval_VariantAliasLocal_Decoded;
+// NVarLocal: NullableInteger (= type Variant) = 1234. Formatting the local must
+// decode the Variant to 1234, not surface the varInteger VType word (3).
+var
+  FrameId, LocalsRef: Integer;
+  Resp: TJSONObject;
+  Res: string;
+begin
+  StartSession('EVAL_BODY', FrameId, LocalsRef);
+  Resp := FClient.Evaluate('NVarLocal', FrameId);
+  try
+    Res := Resp.GetValue<string>('result', '');
+    Assert.IsTrue(Res.Contains('1234'),
+      'a Variant-alias local must decode to its value 1234, got: ' + Res);
+    Assert.IsFalse(ExtractDisplayValue(Res) = '3',
+      'must not surface the varInteger VType word, got: ' + Res);
+  finally
+    Resp.Free;
+  end;
 end;
 
 procedure TDebuggerTests.Test_Eval_MethodCall_TDateTimeArgument;

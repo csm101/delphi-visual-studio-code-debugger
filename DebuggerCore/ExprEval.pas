@@ -418,8 +418,17 @@ end;
 
 function TExprEvaluator.IsWideStringHint(const H: string): Boolean;
 begin
-  Result := SameText(H, 'string') or SameText(H, 'UnicodeString') or
-            SameText(H, 'WideString');
+  if SameText(H, 'string') or SameText(H, 'UnicodeString') or SameText(H, 'WideString') then
+    Exit(True);
+  // A string alias (TCaption, TFileName, TComponentName, ...) is 2-byte
+  // UnicodeString, not narrow AnsiChar. Resolve the KIND so indexing reads a
+  // WideChar: only TK_LSTRING (AnsiString family) is 1 byte. IsStringTypeHint,
+  // which gates the caller, already follows these aliases.
+  case TypeNameToKind(H) of
+    TK_USTRING, TK_WSTRING: Result := True;
+  else
+    Result := False;
+  end;
 end;
 
 function TExprEvaluator.PrimTypeSize(const TypeName: string): Integer;

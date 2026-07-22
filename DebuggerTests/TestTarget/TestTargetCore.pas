@@ -299,6 +299,10 @@ type
   // Its name is NOT "Variant", so decoding must follow the alias to its kind,
   // not match the literal name.
   NullableInteger = type Variant;
+  // A distinct UnicodeString alias: indexing it must read WideChars, not narrow
+  // AnsiChars (B1). A plain `string` name is collapsed by TD32, so a `type ...`
+  // alias is needed to keep the name in the debug info.
+  TStrAlias = type UnicodeString;
 
   // 12 bytes (> 8) so it is returned through the hidden var-out slot, not packed
   // in RAX. The <= 8-byte case comes back in RAX and its field-by-field access
@@ -815,6 +819,8 @@ var
   W:       TWidget;   // portable object receivers for the eval/property/method tests:
   S:       TStuff;    // present as NAMED-proc locals so TD32 resolves them WITHOUT .rsm
   EvalDate: TDateTime;   // float-argument marshalling fixture (D1)
+  CapAlias: TStrAlias;   // string-alias indexing fixture (B1)
+  NVarLocal: NullableInteger;  // Variant-alias local formatting fixture (B2)
 begin
   Caption := 'Hello';
   Scores  := TArray<Integer>.Create(10, 20, 30);
@@ -823,7 +829,9 @@ begin
   W := TWidget.Create('hello', 42);   // same canonical values the .dpr main block used
   S := TStuff.Create(7, 'tag');
   EvalDate := 45.678;                  // DayOfDate -> Round(0.678*1000)+45 = 723
-  GSink.Use([Caption, W.Name, S.PubCount, EvalDate]);  // {BP:EVAL_BODY} -- W and S are live here
+  CapAlias  := 'World';                // CapAlias[2] -> 'o' (wide)
+  NVarLocal := 1234;                   // must decode to 1234, not the VType word 3
+  GSink.Use([Caption, W.Name, S.PubCount, EvalDate, CapAlias, NVarLocal]);  // {BP:EVAL_BODY}
   S.Free;
   W.Free;
 end;

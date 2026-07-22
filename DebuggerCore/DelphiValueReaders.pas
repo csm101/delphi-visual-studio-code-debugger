@@ -1197,8 +1197,13 @@ begin
   // parameters to lkVarParam so the dispatch here stays simple:
   //   lkVarParam  -> indirect (slot is a pointer to TVarData).
   //   lkLocal     -> direct (slot IS the 24-byte TVarData).
-  if (V.TypeHint = 'Variant') or (V.TypeHint = 'TVarData') or
-     (V.TypeHint = 'OleVariant') then begin
+  // Variant, OleVariant, TVarData, AND any distinct alias (`type NX = type
+  // Variant`). Resolve the KIND so an alias is decoded, not rendered as the raw
+  // TVarData VType word (258 for a varUString). TVarData is matched by name
+  // because it is a record, not a variant kind.
+  if (V.TypeHint = 'TVarData') or
+     ((DebugInfo <> nil) and (DebugInfo.LookupTypeKind(V.TypeHint) = TK_VARIANT)) or
+     SameText(V.TypeHint, 'Variant') or SameText(V.TypeHint, 'OleVariant') then begin
     if V.Kind = lkVarParam then
       Exit(FormatVariantAt(V.RawValue))
     else
