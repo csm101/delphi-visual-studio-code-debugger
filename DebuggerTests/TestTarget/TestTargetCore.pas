@@ -247,6 +247,20 @@ type
     property Cell[ARow: Integer; const ACol: string]: Integer read GetCell;
   end;
 
+  // Default property returning a VARIANT, exactly like TDataSet.FieldValues,
+  // which is what `dataset['CODE']` resolves to. The var-out slot holds a
+  // TVarData by value; the debugger must DECODE it, not read its first 8 bytes
+  // (which showed 258 = the varUString VType word live). GetTag returns a
+  // one-char string variant, mirroring the char(1) CODE field.
+  TVariantProbe = class
+  private
+    function GetTag(const AKey: string): Variant;
+    function GetNum(AIdx: Integer): Variant;
+  public
+    property Tag[const AKey: string]: Variant read GetTag; default;
+    property Num[AIdx: Integer]: Variant read GetNum;
+  end;
+
   // A class whose DEFAULT property takes TWO indices, so `M[r, c]` (not through
   // an explicit name) has to marshal both. Delphi allows a multi-index default.
   TMatrixProbe = class
@@ -1056,6 +1070,20 @@ begin
   Result := ARow * 1000 + Length(ACol) + FBias;   // Cell[3, 'xy'] = 3102
 end;
 
+function TVariantProbe.GetTag(const AKey: string): Variant;
+begin
+  // One-char string variant, like the char(1) CODE field ('A'/'B'/'C'/'D').
+  if AKey = '' then
+    Result := 'A'
+  else
+    Result := Copy(AKey, 1, 1);   // Tag['Gxx'] -> 'G'
+end;
+
+function TVariantProbe.GetNum(AIdx: Integer): Variant;
+begin
+  Result := AIdx + 1000;          // integer variant, Num[7] -> 1007
+end;
+
 constructor TMatrixProbe.Create;
 begin
   inherited Create;
@@ -1122,6 +1150,7 @@ var
   Cache: TMenuCache;
   Probe: TIndexProbe;    // in scope at NESTED_CLASS_METHOD_BODY for the evaluator tests
   Matrix: TMatrixProbe;  // multi-index default property
+  VProbe: TVariantProbe; // default property returning a Variant (FieldValues shape)
   DupA: TCollideOuterA.TDup;   // two same-named nested classes, distinct layouts
   DupB: TCollideOuterB.TDup;
   // Same two objects, but typed as TObject: the static type carries no member
@@ -1152,6 +1181,7 @@ var
     // Same reason: every getter must survive the linker for the default-property
     // work, and `Probe['x']` / `Matrix[r,c]` must have something to resolve to.
     GSink.Use([Probe['seed'], Probe.Plain[1], Probe.Cell[0, ''], Matrix[0, 0]]);
+    GSink.Use([VProbe['a'], VProbe.Num[0]]);
     // Keep every same-named instance referenced and reachable.
     GSink.Use([DupA.AlphaA, DupB.GammaB]);
     if (DupObjA = nil) or (DupObjB = nil) or (CrossReal = nil) then GSink.Use(['x']);
@@ -1163,6 +1193,7 @@ begin
   Cache  := TMenuCache.Create;
   Probe  := TIndexProbe.Create;
   Matrix := TMatrixProbe.Create;
+  VProbe := TVariantProbe.Create;
   DupA   := TCollideOuterA.TDup.Create;
   DupB   := TCollideOuterB.TDup.Create;
   DupObjA := DupA;
@@ -1174,6 +1205,7 @@ begin
     CrossReal.Free;
     DupB.Free;
     DupA.Free;
+    VProbe.Free;
     Matrix.Free;
     Probe.Free;
     Cache.Free;

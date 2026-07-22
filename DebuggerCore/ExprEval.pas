@@ -102,11 +102,14 @@ type
     // walking the ancestor chain (TStringList's default is TStrings.Strings).
     // False when the receiver is not an instance or no ancestor declares one.
     function  TryFindDefaultProperty(const Base: TExprValue;
-                out PropName, DeclClass: string): Boolean;
+                out PropName, DeclClass, PropType: string): Boolean;
     // True when `PropName` is a known INDEXED property of Base's class (or an
     // ancestor). Lets `obj.Prop[i]` skip the speculative zero-argument getter
-    // call: if the member is indexed, `[i]` is its argument, full stop.
-    function  IsKnownIndexedProperty(const Base: TExprValue; const PropName: string): Boolean;
+    // call: if the member is indexed, `[i]` is its argument, full stop. On a hit
+    // `PropType` is its declared return type, passed on so the call decodes the
+    // result by the DECLARED type rather than guessing from the getter's locals.
+    function  IsKnownIndexedProperty(const Base: TExprValue;
+                const PropName: string; out PropType: string): Boolean;
     function  ApplyVarArrayIndex(const Base: TExprValue; const Indices: TArray<Int64>): TExprValue;
     // Static Pascal array `array[lo..hi, ...] of T` (possibly multi-dim).
     function  IsStaticArrayHint(const H: string): Boolean;
@@ -527,11 +530,12 @@ end;
 { Indexing }
 
 function TExprEvaluator.TryFindDefaultProperty(const Base: TExprValue;
-  out PropName, DeclClass: string): Boolean;
+  out PropName, DeclClass, PropType: string): Boolean;
 begin
   Result    := False;
   PropName  := '';
   DeclClass := '';
+  PropType  := '';
   if (FRtti = nil) or (FDebugInfo = nil) or (not Base.IsValid) then
     Exit;
   if not FRtti.IsClassInstance(Base.RawValue) then
@@ -544,6 +548,7 @@ begin
     for var M in Members do
       if (M.Kind = cmkProperty) and M.IsDefaultProperty and (M.Name <> '') then begin
         PropName := M.Name;
+        PropType := M.TypeName;
         // The member list of a class already includes its inherited members, so
         // the flag may be found while scanning a descendant. Dispatch against
         // the class that DECLARES it when that is known, since the getter's
@@ -558,9 +563,10 @@ begin
 end;
 
 function TExprEvaluator.IsKnownIndexedProperty(const Base: TExprValue;
-  const PropName: string): Boolean;
+  const PropName: string; out PropType: string): Boolean;
 begin
-  Result := False;
+  Result   := False;
+  PropType := '';
   if (FRtti = nil) or (FDebugInfo = nil) or (not Base.IsValid) then
     Exit;
   if not FRtti.IsClassInstance(Base.RawValue) then
@@ -570,8 +576,10 @@ begin
     if not FDebugInfo.GetClassMembers(ClassName, Members) then
       Continue;
     for var M in Members do
-      if (M.Kind = cmkProperty) and M.IsIndexed and SameText(M.Name, PropName) then
+      if (M.Kind = cmkProperty) and M.IsIndexed and SameText(M.Name, PropName) then begin
+        PropType := M.TypeName;
         Exit(True);
+      end;
   end;
 end;
 
@@ -978,6 +986,11 @@ var
   Rax, Xmm0: UInt64;
   Slot: UInt64;
   WantsFloatReturn, WantsStringReturn: Boolean;
+  // A Variant return also uses the var-out slot, but the slot holds a TVarData
+  // BY VALUE, not a data pointer. Tracked apart from WantsStringReturn so the
+  // result is decoded as a Variant rather than read as an 8-byte pointer - the
+  // old lumping showed 258 (the varUString VType word) for `dataset['X']`.
+  WantsVariantReturn: Boolean;
   // Win64 ABI: a POD record of size <= 8 bytes is returned PACKED IN RAX, not
   // through a hidden var-out slot. Tracked separately so the slot argument is
   // NOT inserted for such a call (inserting it also shifted the user args into
@@ -1151,6 +1164,17 @@ begin
     RetKind         := TypeNameToKind(RetTypeName);
     HaveBoundReturn := True;
   end;
+  // Same authority for a Variant: the declared property type is ground truth.
+  // The getter's Result local is a TVarData whose kind the local probe may
+  // classify as anything but TK_VARIANT (seen in the BPL scenario), which would
+  // route the 16-byte-by-value result through the string path and surface the
+  // VType word (258) instead of the decoded value.
+  if (ReturnTypeHint <> '') and
+     (SameText(ReturnTypeHint, 'Variant') or SameText(ReturnTypeHint, 'OleVariant')) then begin
+    RetTypeName     := ReturnTypeHint;
+    RetKind         := TK_VARIANT;
+    HaveBoundReturn := True;
+  end;
   // Speculative bare-identifier free "call" (ResolveIdent's `Foo` = `Foo()`
   // convenience): only invoke when a return type could be BOUND, i.e. the symbol
   // is a genuine value-returning function. A bare unit name
@@ -1163,15 +1187,20 @@ begin
   // handled above.
   if IsFreeProc and Speculative and (not HaveBoundReturn) then
     Exit(InvalidValue(Format('<%s is not a value-returning function>', [FullName])));
-  WantsFloatReturn  := False;
-  WantsStringReturn := False;
-  SmallRecInRax     := False;
+  WantsFloatReturn   := False;
+  WantsStringReturn  := False;
+  WantsVariantReturn := False;
+  SmallRecInRax      := False;
   if HaveBoundReturn then begin
     case RetKind of
       TK_FLOAT:
         WantsFloatReturn := not SameText(RetTypeName, 'Currency');
+      TK_VARIANT:
+        // Returned through the var-out slot like a string, but the slot holds a
+        // 16/24-byte TVarData by value, decoded below - not a data pointer.
+        WantsVariantReturn := True;
       TK_LSTRING, TK_USTRING, TK_WSTRING, TK_DYNARRAY,
-      TK_VARIANT, TK_MRECORD, TK_INTERFACE:
+      TK_MRECORD, TK_INTERFACE:
         // Interfaces and MANAGED records are managed: a function returning one
         // uses the hidden var-out slot (RDX for methods), like a string return.
         WantsStringReturn := True;
@@ -1220,11 +1249,16 @@ begin
     Flt  := Flt  + [False];
   end;
 
-  // For var-out string return, slot comes next (RDX for methods, RCX for
-  // free procs since there's no Self), then user args.
+  // For a var-out return, the hidden result-slot pointer comes next (RDX for
+  // methods, RCX for free procs since there's no Self), then user args. A
+  // Variant needs the whole 24-byte TVarData zeroed, not just 8 bytes, so a
+  // field the getter leaves untouched cannot read as stale VType/data.
   Slot := 0;
-  if WantsStringReturn then begin
-    Slot := FDebugger.GetRemoteScratchSlot(8);
+  if WantsStringReturn or WantsVariantReturn then begin
+    if WantsVariantReturn then
+      Slot := FDebugger.GetRemoteScratchSlot(24)
+    else
+      Slot := FDebugger.GetRemoteScratchSlot(8);
     if Slot = 0 then
       Exit(InvalidValue('<method scratch alloc failed>'));
     Vals := Vals + [Slot];
@@ -1252,6 +1286,15 @@ begin
       Result.TypeHint := 'Double';
     Result.RawValue := Xmm0;
     Result.Size     := 8;
+  end else if WantsVariantReturn then begin
+    // The slot IS the TVarData (by value). Point Address at it and leave
+    // RawValue 0; the value formatter's FormatVariantAt decodes VType + data.
+    // Reading 8 bytes as a pointer here is the bug that surfaced 258 (the
+    // varUString VType word) for a Variant-returning default property.
+    Result.TypeHint := 'Variant';
+    Result.Address  := Slot;
+    Result.RawValue := 0;
+    Result.Size     := 24;
   end else if WantsStringReturn then begin
     if HaveBoundReturn then
       Result.TypeHint := RetTypeName
@@ -1812,10 +1855,10 @@ begin
         // is what `Obj[X]` means in Pascal. Checked before the array forms: an
         // object is not an array, and without this it fell through to
         // "<cannot index type>".
-        var DefaultProp, DefaultPropClass: string;
+        var DefaultProp, DefaultPropClass, DefaultPropType: string;
         if (not Result.IsTypeRef) and
-           TryFindDefaultProperty(Result, DefaultProp, DefaultPropClass) then
-          Result := ApplyMethodCall(Result, DefaultProp, IndexValues, DefaultPropClass)
+           TryFindDefaultProperty(Result, DefaultProp, DefaultPropClass, DefaultPropType) then
+          Result := ApplyMethodCall(Result, DefaultProp, IndexValues, DefaultPropClass, DefaultPropType)
         else if IsStaticArrayHint(Result.TypeHint) then
           Result := ApplyStaticArrayIndex(Result, Indices)
         else if Length(Indices) = 1 then
@@ -1899,7 +1942,8 @@ begin
           // evaluating `.Ident` with no arguments would fire the getter with the
           // index registers holding garbage.
           var HandledAsIndexedCall := False;
-          if IsKnownIndexedProperty(Result, Field) then begin
+          var IndexedPropType: string;
+          if IsKnownIndexedProperty(Result, Field, IndexedPropType) then begin
             Inc(FPos);
             var IdxArgs: TArray<TExprValue>;
             SetLength(IdxArgs, 0);
@@ -1914,7 +1958,7 @@ begin
             end;
             if not MatchChar(']') then
               Exit(InvalidValue('<missing ] after indexed-property args>'));
-            Result := ApplyMethodCall(Result, Field, IdxArgs);
+            Result := ApplyMethodCall(Result, Field, IdxArgs, '', IndexedPropType);
             HandledAsIndexedCall := True;
           end;
 

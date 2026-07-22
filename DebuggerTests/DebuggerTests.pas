@@ -259,6 +259,15 @@ type
     [Test]
     procedure Test_DefaultProperty_TwoIndices;
 
+    // --- A default property returning a Variant (the FieldValues shape). The
+    //     var-out slot holds a TVarData by value and must be DECODED, not read
+    //     as a pointer. Live: dataset['CODE'] showed 258 (the varUString
+    //     VType word) instead of the char value. ---
+    [Test]
+    procedure Test_DefaultProperty_ReturningVariantString;
+    [Test]
+    procedure Test_IndexedProperty_ReturningVariantInteger;
+
     // --- Two same-named nested classes in one unit, told apart only by VMT.
     //     Repro of the live dataset.Fields bug. ---
     [Test]
@@ -2167,6 +2176,52 @@ begin
   var ObjB := Eval('DupObjB.GammaB', FrameId);
   Assert.AreEqual('999', ExtractDisplayValue(ObjB),
     'DupObjB (a TObject over TCollideOuterB.TDup) must resolve GammaB via its VMT, got: ' + ObjB);
+end;
+
+procedure TDebuggerTests.Test_DefaultProperty_ReturningVariantString;
+// VProbe['Gxx'] -> GetTag('Gxx') -> a string Variant 'G'. The result must be
+// decoded to the string 'G', not shown as 258 (the varUString VType word), which
+// is what the live dataset['CODE'] produced.
+var
+  FrameId, LocalsRef: Integer;
+  Resp: TJSONObject;
+  Res: string;
+begin
+  StartSession('NESTED_CLASS_METHOD_BODY', FrameId, LocalsRef);
+  Resp := FClient.Evaluate('VProbe[''Gxx'']', FrameId);
+  try
+    Res := Resp.GetValue<string>('result', '');
+    Assert.IsFalse(Res.Contains('258'),
+      'a Variant string result must not surface the varUString VType word (258), got: ' + Res);
+    Assert.IsTrue(Res.Contains('G'),
+      'VProbe[''Gxx''] must decode to the string variant ''G'', got: ' + Res);
+  finally
+    Resp.Free;
+  end;
+end;
+
+procedure TDebuggerTests.Test_IndexedProperty_ReturningVariantInteger;
+// VProbe.Num[7] -> GetNum(7) -> integer Variant 1007. Decodes to 1007, proving
+// the Variant path handles a non-string payload too (not just strings).
+var
+  FrameId, LocalsRef: Integer;
+  Resp: TJSONObject;
+  Res: string;
+begin
+  StartSession('NESTED_CLASS_METHOD_BODY', FrameId, LocalsRef);
+  Resp := FClient.Evaluate('VProbe.Num[7]', FrameId);
+  try
+    Res := Resp.GetValue<string>('result', '');
+    // The Variant formatter renders "<subtype>: <value>" consistently across the
+    // debugger; what matters is that the decoded VALUE is 1007, not the VType
+    // word 3 (varInteger) that the pre-fix pointer read surfaced.
+    Assert.IsTrue(Res.Contains('1007'),
+      'VProbe.Num[7] must decode the integer variant to 1007, got: ' + Res);
+    Assert.IsFalse(ExtractDisplayValue(Res) = '3',
+      'the result must be the value, not the varInteger VType word, got: ' + Res);
+  finally
+    Resp.Free;
+  end;
 end;
 
 procedure TDebuggerTests.Test_CollidingCrossUnitClass_ResolvesRealMembers;
