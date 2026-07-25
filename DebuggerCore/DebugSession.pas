@@ -27,7 +27,8 @@ uses
   System.Math, Winapi.Windows,
   DebugSessionTypes, DebugTarget, DebugInfoTypes, DebugInfoSet,
   MapFileReader, RsmFileReader, TD32FileReader, ModuleSymbolLoader,
-  DelphiRtti, DelphiValueReaders, ExprEval, Win64Debugger, SourceResolver,
+  DelphiRtti, DelphiValueReaders, ExprEval, Win64Debugger, WinDebuggerX86,
+  SourceResolver,
   VariableExpander, BreakpointEval, ExceptionRules, ValueEncoders, DapProtocol;
 
 type
@@ -557,7 +558,15 @@ end;
 
 function TDebugSession.BuildAndWireDebugger(PreferredBase: UInt64): Boolean;
 begin
-  FDebugger := TWinDebugger.Create(FDebugInfo, PreferredBase);
+  // The target's architecture decides the class, and it has to be known BEFORE
+  // the object exists. IsWow64Process2 cannot answer until
+  // CREATE_PROCESS_DEBUG_EVENT, which is long after construction; the on-disk
+  // PE header can answer now. TWinDebugger's own TargetIsWow64 check remains,
+  // demoted to an assertion that the live process agrees with what we built.
+  if ReadPEMachine(FExePath) = IMAGE_FILE_MACHINE_I386 then
+    FDebugger := TWin32Debugger.Create(FDebugInfo, PreferredBase)
+  else
+    FDebugger := TWinDebugger.Create(FDebugInfo, PreferredBase);
   FDebugger.OnStopped     := HandleTargetStopped;
   FDebugger.OnExited      := HandleTargetExited;
   FDebugger.OnOutput      := HandleTargetOutput;

@@ -145,9 +145,14 @@ type
     function  VAToRva(VA: UInt64): UInt64;
     function  ReadByte(VA: UInt64; out B: Byte): Boolean;
     function  WriteByte(VA: UInt64; B: Byte): Boolean;
+  protected
+    // Visible to a per-architecture descendant: the virtual seam below plus the
+    // handful of helpers it needs. Everything else stays private.
     function  ThreadHandle(TID: DWORD): THandle;
+  private
     function  FindBreakpointByVA(VA: UInt64): Integer;
     function  ReadFrameSize(EntryVA: UInt64): UInt32;
+  protected
     // Recognised=False means "the prologue was not understood", which is NOT
     // the same as a zero-byte frame and must never be treated as one: every
     // address derived from the frame size would be silently wrong. Callers are
@@ -185,6 +190,7 @@ type
     // start of the same storage.
     function  FillStackWalkContext(TH: THandle; var Buf: TContext;
                 out SeedPc, SeedSp, SeedFp: UInt64): Boolean; virtual;
+  private
     procedure SetTrapFlag(TID: DWORD; Enable: Boolean);
     procedure SetRIP(TID: DWORD; NewRIP: UInt64);
     function  CurrentRIP(TID: DWORD): UInt64;
@@ -341,6 +347,7 @@ type
                 out IntResult, FloatResultLow: UInt64): Boolean;
   private
     function  RunRemoteCall(FuncVA: UInt64; Arg0, Arg1: UInt64): Boolean;
+  protected
     // The only calling-convention-aware halves of the synthetic-call
     // machinery. The event pump between them is architecture neutral and stays
     // shared; a 32-bit target replaces exactly these two.

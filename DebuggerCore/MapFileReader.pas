@@ -152,6 +152,7 @@ type
   end;
 
 function ReadPEPreferredBase(const ExePath: string): UInt64;
+function ReadPEMachine(const ExePath: string): Word;
 
 implementation
 
@@ -273,6 +274,36 @@ end;
 { --------------------------------------------------------------------------- }
 {  ReadPEPreferredBase                                                         }
 { --------------------------------------------------------------------------- }
+
+// IMAGE_FILE_HEADER.Machine of an on-disk image, or 0 when it cannot be read.
+// The debugger needs this BEFORE the process exists: the architecture decides
+// which TWinDebugger descendant to construct, and IsWow64Process2 cannot answer
+// until CREATE_PROCESS_DEBUG_EVENT, by which time the object has been built.
+function ReadPEMachine(const ExePath: string): Word;
+var
+  F: TFileStream;
+  DosHeader: array[0..63] of Byte;
+  PEOffset: DWORD;
+  Signature: DWORD;
+begin
+  Result := 0;
+  if not FileExists(ExePath) then Exit;
+  F := TFileStream.Create(ExePath, fmOpenRead or fmShareDenyNone);
+  try
+    if F.Size < 64 then Exit;
+    F.ReadBuffer(DosHeader, 64);
+    if (DosHeader[0] <> Ord('M')) or (DosHeader[1] <> Ord('Z')) then Exit;
+    PEOffset := PCardinal(@DosHeader[$3C])^;
+    F.Position := PEOffset;
+    F.ReadBuffer(Signature, 4);
+    if Signature <> $00004550 then Exit;
+    // Machine is the first field of IMAGE_FILE_HEADER, immediately after the
+    // 4-byte PE signature.
+    F.ReadBuffer(Result, 2);
+  finally
+    F.Free;
+  end;
+end;
 
 function ReadPEPreferredBase(const ExePath: string): UInt64;
 var
