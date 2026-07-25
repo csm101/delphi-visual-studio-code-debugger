@@ -218,10 +218,16 @@ type
     function  RunMethodCall(FuncVA: UInt64;
                 const ArgValues:  array of UInt64;
                 const ArgIsFloat: array of Boolean;
-                out RaxResult, Xmm0Low: UInt64): Boolean;
+                out IntResult, FloatResultLow: UInt64): Boolean;
+    // Arguments are POSITIONAL, not register-named: which physical register (or
+    // stack slot) each one lands in is the implementation's business, and the
+    // answer differs per architecture. Delphi's 32-bit `register` convention
+    // passes the first three in EAX/EDX/ECX with the rest pushed, and returns
+    // floats on the x87 stack rather than in an SSE register, so a signature
+    // spelled ArgRcx/RaxResult would be a lie there.
     function  RunRemoteCallEx(FuncVA: UInt64;
-                ArgRcx, ArgRdx, ArgR8, ArgR9: UInt64;
-                out RaxResult, Xmm0Low: UInt64): Boolean;
+                Arg0, Arg1, Arg2, Arg3: UInt64;
+                out IntResult, FloatResultLow: UInt64): Boolean;
 
     // Forwards to the target's debug-info set; here for evaluator
     // convenience so it doesn't need its own DebugInfoSet ref.

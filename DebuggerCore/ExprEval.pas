@@ -1667,6 +1667,9 @@ function TExprEvaluator.ApplyDot(const Base: TExprValue; const Field: string): T
       // Delphi Win64 ABI for functions returning a managed/record result:
       // RCX = Self, RDX = hidden result-slot pointer. (Counter-intuitive vs
       // pure MS x64 ABI; Delphi keeps Self in the first integer register.)
+      // Positional: Self first, hidden result-slot pointer second. On x64 those
+      // land in RCX and RDX; naming them that way here would bake in an ABI
+      // this call deliberately does not know about.
       if not FDebugger.RunRemoteCallEx(FuncVA, ObjAddr, Slot, 0, 0, Rax, Xmm0) then
         Exit(InvalidValue('<getter invocation failed>'));
       Result.TypeHint     := P.PropTypeName;

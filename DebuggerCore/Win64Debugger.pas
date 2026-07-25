@@ -170,6 +170,10 @@ type
     function  ReadThreadRegisters(TID: DWORD; out Regs: TRegisterSnapshot): Boolean;
     function  SetThreadPc(TID: DWORD; VA: UInt64): Boolean;
     function  SetThreadTrapFlag(TID: DWORD; Enable: Boolean): Boolean;
+    // Machine type handed to StackWalk64. dbghelp already unwinds i386 as well
+    // as amd64, so a 32-bit target changes this value rather than needing a
+    // hand-rolled walker.
+    function  StackWalkMachineType: DWORD;
     procedure SetTrapFlag(TID: DWORD; Enable: Boolean);
     procedure SetRIP(TID: DWORD; NewRIP: UInt64);
     function  CurrentRIP(TID: DWORD): UInt64;
@@ -302,21 +306,24 @@ type
     // marshalling string literals as arguments to a method call.
     function  AllocateRemoteString(const Text, TypeHint: string;
                 out Ptr: UInt64): Boolean;
-    // Generic method-call invoker: builds a call frame with the supplied
-    // args dispatched to RCX/RDX/R8/R9 (or XMM0..3 for floats, by position)
-    // and to the stack for args 5+. Captures RAX and XMM0 low qword.
+    // Generic method-call invoker. Callers supply POSITIONAL arguments; this
+    // x64 implementation dispatches them to RCX/RDX/R8/R9 (or XMM0..3 for
+    // floats, by position) and to the stack for args 5+, then captures RAX and
+    // the low qword of XMM0. Which registers those are is this implementation's
+    // business, which is why the parameters are not named after them.
     function  RunMethodCall(FuncVA: UInt64;
                 const ArgValues:  array of UInt64;
                 const ArgIsFloat: array of Boolean;
-                out RaxResult, Xmm0Low: UInt64): Boolean;
+                out IntResult, FloatResultLow: UInt64): Boolean;
     // Invokes a function in the debuggee, capturing the return value (RAX).
     // Public surface for the expression evaluator's method-backed property
-    // getters. ArgR8/ArgR9 may be 0 for unary callees (Self only).
+    // getters. Arguments are positional; trailing ones may be 0 for unary
+    // callees (Self only).
     function  RunRemoteCallEx(FuncVA: UInt64;
-                ArgRcx, ArgRdx, ArgR8, ArgR9: UInt64;
-                out RaxResult, Xmm0Low: UInt64): Boolean;
+                Arg0, Arg1, Arg2, Arg3: UInt64;
+                out IntResult, FloatResultLow: UInt64): Boolean;
   private
-    function  RunRemoteCall(FuncVA: UInt64; ArgRcx, ArgRdx: UInt64): Boolean;
+    function  RunRemoteCall(FuncVA: UInt64; Arg0, Arg1: UInt64): Boolean;
   public
     procedure Terminate;
     // IDebugTarget event accessors. Method-style getter/setter pairs are
@@ -908,6 +915,11 @@ begin
   Result := SetThreadContext(TH, Ctx);
 end;
 
+function TWinDebugger.StackWalkMachineType: DWORD;
+begin
+  Result := IMAGE_FILE_MACHINE_AMD64;
+end;
+
 function TWinDebugger.SetThreadTrapFlag(TID: DWORD; Enable: Boolean): Boolean;
 const
   TRAP_FLAG = DWORD($100);
@@ -1179,11 +1191,11 @@ begin
   SF.AddrStack.Mode   := AddrModeFlat;
 
   // Consume the current frame.
-  if not StackWalk64(IMAGE_FILE_MACHINE_AMD64, FProcess, TH, SF, @Ctx,
+  if not StackWalk64(StackWalkMachineType, FProcess, TH, SF, @Ctx,
       nil, @SymFunctionTableAccess64, @SymGetModuleBase64, nil) then
     Exit;
   // Caller frame: AddrPC.Offset is the RIP we'll return to.
-  if not StackWalk64(IMAGE_FILE_MACHINE_AMD64, FProcess, TH, SF, @Ctx,
+  if not StackWalk64(StackWalkMachineType, FProcess, TH, SF, @Ctx,
       nil, @SymFunctionTableAccess64, @SymGetModuleBase64, nil) then
     Exit;
   Result := SF.AddrPC.Offset;
@@ -2622,7 +2634,7 @@ begin
   SF.AddrStack.Offset := Ctx.Rsp;
   SF.AddrStack.Mode   := AddrModeFlat;
 
-  while StackWalk64(IMAGE_FILE_MACHINE_AMD64, FProcess, TH, SF, @Ctx,
+  while StackWalk64(StackWalkMachineType, FProcess, TH, SF, @Ctx,
       nil, @SymFunctionTableAccess64, @SymGetModuleBase64, nil) do begin
     if SF.AddrPC.Offset = 0 then
       Break;
@@ -3055,7 +3067,7 @@ end;
 // debuggee doesn't hang.
 function TWinDebugger.RunMethodCall(FuncVA: UInt64;
   const ArgValues: array of UInt64; const ArgIsFloat: array of Boolean;
-  out RaxResult, Xmm0Low: UInt64): Boolean;
+  out IntResult, FloatResultLow: UInt64): Boolean;
 var
   TH:       THandle;
   SavedCtx: TContext;
@@ -3067,8 +3079,8 @@ var
   Stack:    array of UInt64;        // args 5+ in order
 begin
   Result    := False;
-  RaxResult := 0;
-  Xmm0Low   := 0;
+  IntResult      := 0;
+  FloatResultLow := 0;
   if Length(ArgValues) <> Length(ArgIsFloat) then Exit;
   TH := ThreadHandle(FStoppedTid);
   if (TH = 0) or (FProcess = 0) or (FuncVA = 0) then Exit;
@@ -3199,8 +3211,8 @@ begin
         PostCtx := Default(TContext);
         PostCtx.ContextFlags := CONTEXT_FULL or CONTEXT_FLOATING_POINT;
         if GetThreadContext(TH, PostCtx) then begin
-          RaxResult := PostCtx.Rax;
-          Xmm0Low   := PUInt64(@PostCtx.Xmm0)^;
+          IntResult      := PostCtx.Rax;
+          FloatResultLow := PUInt64(@PostCtx.Xmm0)^;
         end;
         SetThreadContext(TH, SavedCtx);
         // When the trap is the one WE forced to abort a hung call, the RAX/XMM0
@@ -3332,23 +3344,23 @@ begin
 end;
 
 function TWinDebugger.RunRemoteCall(FuncVA: UInt64;
-  ArgRcx, ArgRdx: UInt64): Boolean;
+  Arg0, Arg1: UInt64): Boolean;
 var
-  RaxDummy, XmmDummy: UInt64;
+  IntDummy, FloatDummy: UInt64;
 begin
-  Result := RunRemoteCallEx(FuncVA, ArgRcx, ArgRdx, 0, 0, RaxDummy, XmmDummy);
+  Result := RunRemoteCallEx(FuncVA, Arg0, Arg1, 0, 0, IntDummy, FloatDummy);
 end;
 
 function TWinDebugger.RunRemoteCallEx(FuncVA: UInt64;
-  ArgRcx, ArgRdx, ArgR8, ArgR9: UInt64; out RaxResult, Xmm0Low: UInt64): Boolean;
+  Arg0, Arg1, Arg2, Arg3: UInt64; out IntResult, FloatResultLow: UInt64): Boolean;
 begin
   // Thin wrapper over RunMethodCall so there is exactly ONE synthetic-call
   // event pump. The historical separate implementation here lacked the
   // abort-on-raise / EXIT_PROCESS handling: a property getter that raised
   // (or exited the process) left WaitForDebugEvent(INFINITE) spinning and
   // hung the whole adapter.
-  Result := RunMethodCall(FuncVA, [ArgRcx, ArgRdx, ArgR8, ArgR9],
-    [False, False, False, False], RaxResult, Xmm0Low);
+  Result := RunMethodCall(FuncVA, [Arg0, Arg1, Arg2, Arg3],
+    [False, False, False, False], IntResult, FloatResultLow);
 end;
 
 function TWinDebugger.SetStringVariable(VarAddr: UInt64; const Text, TypeHint: string): Boolean;
