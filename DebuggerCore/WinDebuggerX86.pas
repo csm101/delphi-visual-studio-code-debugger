@@ -379,10 +379,62 @@ begin
   Result := Wow64SetThreadContext(TH, Ctx);
 end;
 
-// EAX carries the integer/pointer result. An Int64 comes back in EDX:EAX and a
-// floating-point result on the x87 stack; neither is reported yet, so a caller
-// asking for one gets the documented "unavailable" rather than the low half of
-// something larger presented as the whole answer.
+// Converts an x87 80-bit extended to the bit pattern of the nearest Double,
+// which is what the shared code expects to find in FloatResultLow (on x64 that
+// slot holds the low qword of XMM0, i.e. a Double).
+//
+// The 80-bit layout is sign(1) | exponent(15, bias 16383) | mantissa(64, with an
+// EXPLICIT leading integer bit). A Double is sign(1) | exponent(11, bias 1023) |
+// mantissa(52, leading bit implicit), so the conversion re-biases the exponent
+// and drops both the explicit integer bit and the 11 lowest mantissa bits.
+function ExtendedBytesToDoubleBits(const Bytes: array of Byte): UInt64;
+begin
+  Result := 0;
+  var Mantissa: UInt64 := PUInt64(@Bytes[0])^;
+  var SignExp:  Word   := PWord(@Bytes[8])^;
+  var Sign:     UInt64 := UInt64(SignExp shr 15) shl 63;
+  var Exp80:    Integer := SignExp and $7FFF;
+
+  if (Exp80 = 0) and (Mantissa = 0) then
+    Exit(Sign);                        // +/- zero
+  if Exp80 = $7FFF then                // infinity or NaN
+    Exit(Sign or (UInt64($7FF) shl 52) or (Mantissa shr 11) and ((UInt64(1) shl 52) - 1));
+
+  var Exp64 := Exp80 - 16383 + 1023;
+  if Exp64 <= 0 then
+    Exit(Sign);                        // underflows a Double: report zero
+  if Exp64 >= $7FF then
+    Exit(Sign or (UInt64($7FF) shl 52));  // overflows: report infinity
+
+  // Drop the explicit integer bit (bit 63) and keep the next 52.
+  var Frac := (Mantissa shr 11) and ((UInt64(1) shl 52) - 1);
+  Result := Sign or (UInt64(Exp64) shl 52) or Frac;
+end;
+
+// EAX carries the integer/pointer result.
+//
+// FLOATING-POINT RETURNS DO NOT WORK YET, and the reason is not what the code
+// below assumes. The x87 decode here is correct in isolation -- it was checked
+// by hand against 3.25, whose 80-bit form converts to the Double bit pattern
+// $400A000000000000 -- but a Double-returning getter still evaluates to 0 on a
+// 32-bit target while the same getter returns 3.25 on x64. What was actually
+// measured: requesting WOW64_CONTEXT_FLOATING_POINT returns a FloatSave area
+// that is entirely zero, status word included, which is why this reads the
+// FXSAVE area instead. That did not fix it either, so the remaining fault is
+// upstream -- a Double return appears not to reach this function at all -- and
+// finding it needs the ExprEval float path traced, not more work here.
+//
+// Left in place rather than reverted because the decode is verified and will be
+// wanted once the upstream path is understood. Do NOT read the 0 it currently
+// produces as a value.
+//
+// KNOWN GAP: an Int64 returns in EDX:EAX and only EAX is reported. Combining
+// them blindly would be worse, not better -- on x64 a 32-bit result leaves the
+// high half of RAX zeroed by the hardware, but x86 leaves EDX holding whatever
+// the callee last put there, so every ordinary Integer return would come back
+// with garbage in its high half. Reporting EAX alone reproduces the x64
+// behaviour for everything up to 32 bits and truncates only genuine Int64
+// returns, which is the narrower failure of the two.
 function TWin32Debugger.ReadSyntheticCallResult(TH: THandle;
   out IntResult, FloatResultLow: UInt64): Boolean;
 var
@@ -391,11 +443,33 @@ begin
   IntResult      := 0;
   FloatResultLow := 0;
   Ctx := Default(TWow64Context);
-  Ctx.ContextFlags := WOW64_CONTEXT_FULL;
+  Ctx.ContextFlags := WOW64_CONTEXT_FULL or WOW64_CONTEXT_FLOATING_POINT or
+                      WOW64_CONTEXT_EXTENDED_REGISTERS;
   Result := Wow64GetThreadContext(TH, Ctx);
   if not Result then
     Exit;
   IntResult := Ctx.Eax;
+
+  // The x87 state comes back in ExtendedRegisters, the FXSAVE area, NOT in the
+  // legacy FloatSave view -- measured: with FLOATING_POINT requested, FloatSave
+  // came back entirely zero, status word included, while the FXSAVE area
+  // carries the real thing. On hardware this old the legacy FNSAVE layout is a
+  // compatibility shim the WOW64 layer does not fill in.
+  //
+  // FXSAVE layout: FCW at +0, FSW at +2, then the eight registers from +32, one
+  // every 16 bytes with only the low 10 in use. RegisterArea holds the PHYSICAL
+  // registers R0..R7 while ST(0) is R[TOP], so the stack top has to come out of
+  // the status word (bits 11..13) rather than be assumed to be register zero.
+  const FX_STATUS_WORD = 2;
+  const FX_ST0         = 32;
+  const FX_REG_STRIDE  = 16;
+  if Length(Ctx.ExtendedRegisters) < FX_ST0 + 8 * FX_REG_STRIDE then
+    Exit;
+  var Fsw := PWord(@Ctx.ExtendedRegisters[FX_STATUS_WORD])^;
+  var Top := (Fsw shr 11) and 7;
+  var Reg: array[0..9] of Byte;
+  Move(Ctx.ExtendedRegisters[FX_ST0 + Integer(Top) * FX_REG_STRIDE], Reg[0], 10);
+  FloatResultLow := ExtendedBytesToDoubleBits(Reg);
 end;
 
 end.
