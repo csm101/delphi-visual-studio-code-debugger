@@ -380,6 +380,9 @@ type
     // unit-test suite can exercise it directly.
     class function DemangleItanium(const Mangled: string;
                     out InnerName, ParentName: string): Boolean; static;
+    // dcc32 mangles differently from dcc64. Public for the same reason.
+    class function DemangleBorland(const Mangled: string;
+                    out InnerName, ParentName: string): Boolean; static;
     constructor Create;
     destructor  Destroy; override;
     procedure   LoadFromFile(const ExePath: string; OutputRvaShift: UInt64 = 0);
@@ -1170,6 +1173,45 @@ begin
   Result := AnsiLowerCase(FileName) + ':' + IntToStr(Line);
 end;
 
+// Borland-style mangling, which is what dcc32 emits where dcc64 uses the
+// Itanium form:
+//
+//   @Testtargetedge@EdgeFactorial$qqri      unit + routine
+//   @Forms@TApplication@Run$qqrv            unit + class + method
+//
+// The `$` introduces the parameter encoding (`$qqr...`) and carries no name.
+// Deliberately mirrors the Itanium demangler's presentation so a stack from a
+// 32-bit target reads identically to one from a 64-bit target: the unit prefix
+// is dropped for a plain routine, and a method keeps its Class.Method form.
+class function TTD32FileReader.DemangleBorland(const Mangled: string;
+  out InnerName, ParentName: string): Boolean;
+begin
+  InnerName  := '';
+  ParentName := '';
+  Result := False;
+  if not Mangled.StartsWith('@') then
+    Exit;
+  var Body := Mangled.Substring(1);
+  var DollarPos := Body.IndexOf('$');
+  if DollarPos >= 0 then
+    Body := Body.Substring(0, DollarPos);
+  if Body = '' then
+    Exit;
+  var Parts := Body.Split(['@']);
+  for var P in Parts do
+    if P = '' then
+      Exit;   // a stray '@' means this is not the shape we think it is
+  case Length(Parts) of
+    0: Exit;
+    1: InnerName := Parts[0];
+    2: InnerName := Parts[1];                       // unit + routine
+  else
+    InnerName  := Parts[High(Parts)];               // unit + ... + class + method
+    ParentName := Parts[High(Parts) - 1];
+  end;
+  Result := InnerName <> '';
+end;
+
 class function TTD32FileReader.DemangleItanium(const Mangled: string;
   out InnerName, ParentName: string): Boolean;
 // Itanium ABI demangler with the Delphi-relevant subset:
@@ -1494,6 +1536,11 @@ begin
       Friendly := Inner;
     if Mangled.StartsWith('_ZZ') and (Parent <> '') then
       FInnerToParent.AddOrSetValue(AnsiLowerCase(Inner), Parent);
+  end else if DemangleBorland(Mangled, Inner, Parent) then begin
+    if Parent <> '' then
+      Friendly := Parent + '.' + Inner
+    else
+      Friendly := Inner;
   end else
     Friendly := Mangled;
   if Friendly = '' then Exit;
