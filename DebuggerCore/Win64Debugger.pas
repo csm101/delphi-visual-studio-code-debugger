@@ -152,8 +152,9 @@ type
     // the same as a zero-byte frame and must never be treated as one: every
     // address derived from the frame size would be silently wrong. Callers are
     // required to check it and refuse rather than guess.
+    // ARCH: x86 has no .pdata at all, so its decoder is byte patterns only.
     function  ReadPrologInfo(EntryVA: UInt64; out ExtraPushBytes: UInt32;
-                out Recognised: Boolean): UInt32;
+                out Recognised: Boolean): UInt32; virtual;
     function  FunctionBodyStartVA(VA: UInt64): UInt64;
     function  ReadParentFramePointer(ChildRBP: UInt64;
                 ChildFrameSize, ChildExtraPushBytes: UInt32): UInt64;
@@ -167,13 +168,13 @@ type
     // rather than eleven scattered TContext sites. Callers that need the raw
     // CONTEXT (StackWalk64 seeding, RunMethodCall's marshalling) are genuinely
     // architecture-specific and stay outside.
-    function  ReadThreadRegisters(TID: DWORD; out Regs: TRegisterSnapshot): Boolean;
-    function  SetThreadPc(TID: DWORD; VA: UInt64): Boolean;
-    function  SetThreadTrapFlag(TID: DWORD; Enable: Boolean): Boolean;
+    function  ReadThreadRegisters(TID: DWORD; out Regs: TRegisterSnapshot): Boolean; virtual;
+    function  SetThreadPc(TID: DWORD; VA: UInt64): Boolean; virtual;
+    function  SetThreadTrapFlag(TID: DWORD; Enable: Boolean): Boolean; virtual;
     // Machine type handed to StackWalk64. dbghelp already unwinds i386 as well
     // as amd64, so a 32-bit target changes this value rather than needing a
     // hand-rolled walker.
-    function  StackWalkMachineType: DWORD;
+    function  StackWalkMachineType: DWORD; virtual;
     procedure SetTrapFlag(TID: DWORD; Enable: Boolean);
     procedure SetRIP(TID: DWORD; NewRIP: UInt64);
     function  CurrentRIP(TID: DWORD): UInt64;
@@ -255,7 +256,13 @@ type
     procedure SetActiveFrame(FrameRBP, FuncEntryVA: UInt64; const FuncName: string;
                 FramePC: UInt64 = 0);
     procedure ClearActiveFrame;
-    function  CurrentFrameParamHomeAddr(ParamIndex: Integer): UInt64;
+    // ARCH: this is a Win64-ABI question. x86 has NO analogue -- Delphi's
+    // 32-bit register convention passes the first three parameters in
+    // EAX/EDX/ECX with no stack home at all, spills them to NEGATIVE EBP
+    // offsets, and orders stack parameters in reverse. Measured in Phase 0:
+    // Self is provably not at EBP+8. The x86 implementation must answer from
+    // debug-info symbol offsets or refuse, never from a positional formula.
+    function  CurrentFrameParamHomeAddr(ParamIndex: Integer): UInt64; virtual;
     function  GetRegisters: TRegisterSnapshot;
     // Look up a symbol name (local or global) and return a TLocalValue for it.
     // Returns False if no such symbol is in scope.
@@ -281,7 +288,7 @@ type
     // Memory layout of the debuggee's address space. Fixed at 64-bit here; the
     // x86 implementation reports its own, and callers decoding target
     // structures must consult this rather than SizeOf(Pointer).
-    function  TargetLayout: TTargetLayout;
+    function  TargetLayout: TTargetLayout; virtual;
     // Sets RIP of the currently stopped thread. Returns False if not stopped.
     function  SetInstructionPointer(VA: UInt64): Boolean;
     // Resolves a fully-qualified symbol name (e.g. `TWidget.GetScore`) to its
@@ -330,9 +337,9 @@ type
     function  PrepareSyntheticCall(TH: THandle; FuncVA: UInt64;
                 const ArgValues: array of UInt64;
                 const ArgIsFloat: array of Boolean;
-                const SavedCtx: TContext): Boolean;
+                const SavedCtx: TContext): Boolean; virtual;
     function  ReadSyntheticCallResult(TH: THandle;
-                out IntResult, FloatResultLow: UInt64): Boolean;
+                out IntResult, FloatResultLow: UInt64): Boolean; virtual;
   public
     procedure Terminate;
     // IDebugTarget event accessors. Method-style getter/setter pairs are
