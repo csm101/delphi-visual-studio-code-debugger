@@ -162,6 +162,14 @@ type
                 FramePcRva: UInt64): TArray<TLocalValue>;
     procedure PlantInt3(var BP: TBreakpointRec);
     procedure RemoveInt3(var BP: TBreakpointRec);
+    // Thread-context funnel: the single place that opens a thread context to
+    // read or mutate a ROLE. A WOW64 target swaps these three implementations
+    // rather than eleven scattered TContext sites. Callers that need the raw
+    // CONTEXT (StackWalk64 seeding, RunMethodCall's marshalling) are genuinely
+    // architecture-specific and stay outside.
+    function  ReadThreadRegisters(TID: DWORD; out Regs: TRegisterSnapshot): Boolean;
+    function  SetThreadPc(TID: DWORD; VA: UInt64): Boolean;
+    function  SetThreadTrapFlag(TID: DWORD; Enable: Boolean): Boolean;
     procedure SetTrapFlag(TID: DWORD; Enable: Boolean);
     procedure SetRIP(TID: DWORD; NewRIP: UInt64);
     function  CurrentRIP(TID: DWORD): UInt64;
@@ -830,11 +838,84 @@ begin
   BP.IsPlanted := False;
 end;
 
-procedure TWinDebugger.SetTrapFlag(TID: DWORD; Enable: Boolean);
+{ ---------------------------------------------------------------------------
+  Thread-context funnel.
+
+  Everything that reads or mutates a ROLE of the register file -- the program
+  counter, the stack pointer, the trap flag -- goes through these three, rather
+  than opening its own TContext. That is what makes a WOW64 variant one
+  implementation instead of eleven: a 32-bit target needs Wow64GetThreadContext
+  and a WOW64_CONTEXT whose fields have different names, and there is no reason
+  for a caller that just wants "the program counter" to know that.
+
+  Two categories deliberately stay outside the funnel because they are genuinely
+  architecture-specific rather than role-based: seeding StackWalk64 (which wants
+  the raw CONTEXT it will unwind) and RunMethodCall's argument marshalling
+  (which is the calling convention itself).
+  --------------------------------------------------------------------------- }
+
+function TWinDebugger.ReadThreadRegisters(TID: DWORD;
+  out Regs: TRegisterSnapshot): Boolean;
 var
   Ctx: TContext;
-  TH: THandle;
+  TH:  THandle;
 begin
+  Regs := Default(TRegisterSnapshot);
+  Result := False;
+  TH := ThreadHandle(TID);
+  if TH = 0 then
+    Exit;
+  Ctx := Default(TContext);
+  Ctx.ContextFlags := CONTEXT_FULL;
+  if not GetThreadContext(TH, Ctx) then
+    Exit;
+  Regs.Rip    := Ctx.Rip;
+  Regs.Rsp    := Ctx.Rsp;
+  Regs.Rbp    := Ctx.Rbp;
+  Regs.Rax    := Ctx.Rax;
+  Regs.Rbx    := Ctx.Rbx;
+  Regs.Rcx    := Ctx.Rcx;
+  Regs.Rdx    := Ctx.Rdx;
+  Regs.Rsi    := Ctx.Rsi;
+  Regs.Rdi    := Ctx.Rdi;
+  Regs.R8     := Ctx.R8;
+  Regs.R9     := Ctx.R9;
+  Regs.R10    := Ctx.R10;
+  Regs.R11    := Ctx.R11;
+  Regs.R12    := Ctx.R12;
+  Regs.R13    := Ctx.R13;
+  Regs.R14    := Ctx.R14;
+  Regs.R15    := Ctx.R15;
+  Regs.EFlags := Ctx.EFlags;
+  Regs.Valid  := True;
+  Result := True;
+end;
+
+function TWinDebugger.SetThreadPc(TID: DWORD; VA: UInt64): Boolean;
+var
+  Ctx: TContext;
+  TH:  THandle;
+begin
+  Result := False;
+  TH := ThreadHandle(TID);
+  if TH = 0 then
+    Exit;
+  Ctx := Default(TContext);
+  Ctx.ContextFlags := CONTEXT_CONTROL;
+  if not GetThreadContext(TH, Ctx) then
+    Exit;
+  Ctx.Rip := VA;
+  Result := SetThreadContext(TH, Ctx);
+end;
+
+function TWinDebugger.SetThreadTrapFlag(TID: DWORD; Enable: Boolean): Boolean;
+const
+  TRAP_FLAG = DWORD($100);
+var
+  Ctx: TContext;
+  TH:  THandle;
+begin
+  Result := False;
   TH := ThreadHandle(TID);
   if TH = 0 then
     Exit;
@@ -843,62 +924,45 @@ begin
   if not GetThreadContext(TH, Ctx) then
     Exit;
   if Enable then
-    Ctx.EFlags := Ctx.EFlags or $100
+    Ctx.EFlags := Ctx.EFlags or TRAP_FLAG
   else
-    Ctx.EFlags := Ctx.EFlags and (not DWORD($100));
-  SetThreadContext(TH, Ctx);
+    Ctx.EFlags := Ctx.EFlags and (not TRAP_FLAG);
+  Result := SetThreadContext(TH, Ctx);
+end;
+
+procedure TWinDebugger.SetTrapFlag(TID: DWORD; Enable: Boolean);
+begin
+  SetThreadTrapFlag(TID, Enable);
 end;
 
 procedure TWinDebugger.SetRIP(TID: DWORD; NewRIP: UInt64);
-var
-  Ctx: TContext;
-  TH: THandle;
 begin
-  TH := ThreadHandle(TID);
-  if TH = 0 then
-    Exit;
-  Ctx := Default(TContext);
-  Ctx.ContextFlags := CONTEXT_CONTROL;
-  GetThreadContext(TH, Ctx);
-  Ctx.Rip := NewRIP;
-  SetThreadContext(TH, Ctx);
+  SetThreadPc(TID, NewRIP);
 end;
 
 function TWinDebugger.SetInstructionPointer(VA: UInt64): Boolean;
 begin
-  Result := FStoppedTid <> 0;
-  if Result then
-    SetRIP(FStoppedTid, VA);
+  Result := (FStoppedTid <> 0) and SetThreadPc(FStoppedTid, VA);
 end;
 
 function TWinDebugger.CurrentRIP(TID: DWORD): UInt64;
 var
-  Ctx: TContext;
-  TH: THandle;
+  Regs: TRegisterSnapshot;
 begin
-  Result := 0;
-  TH := ThreadHandle(TID);
-  if TH = 0 then
-    Exit;
-  Ctx := Default(TContext);
-  Ctx.ContextFlags := CONTEXT_CONTROL;
-  if GetThreadContext(TH, Ctx) then
-    Result := Ctx.Rip;
+  if ReadThreadRegisters(TID, Regs) then
+    Result := Regs.Pc
+  else
+    Result := 0;
 end;
 
 function TWinDebugger.CurrentRSP(TID: DWORD): UInt64;
 var
-  Ctx: TContext;
-  TH: THandle;
+  Regs: TRegisterSnapshot;
 begin
-  Result := 0;
-  TH := ThreadHandle(TID);
-  if TH = 0 then
-    Exit;
-  Ctx := Default(TContext);
-  Ctx.ContextFlags := CONTEXT_CONTROL;
-  if GetThreadContext(TH, Ctx) then
-    Result := Ctx.Rsp;
+  if ReadThreadRegisters(TID, Regs) then
+    Result := Regs.StackPtr
+  else
+    Result := 0;
 end;
 
 // Plant a one-shot step BP at VA and track it in FStepBpVAs. Skips VAs already
@@ -2637,38 +2701,8 @@ begin
 end;
 
 function TWinDebugger.GetRegisters: TRegisterSnapshot;
-var
-  Ctx: TContext;
-  TH:  THandle;
 begin
-  Result       := Default(TRegisterSnapshot);
-  Result.Valid := False;
-  TH := ThreadHandle(FStoppedTid);
-  if TH = 0 then
-    Exit;
-  Ctx := Default(TContext);
-  Ctx.ContextFlags := CONTEXT_FULL;
-  if not GetThreadContext(TH, Ctx) then
-    Exit;
-  Result.Rip    := Ctx.Rip;
-  Result.Rsp    := Ctx.Rsp;
-  Result.Rbp    := Ctx.Rbp;
-  Result.Rax    := Ctx.Rax;
-  Result.Rbx    := Ctx.Rbx;
-  Result.Rcx    := Ctx.Rcx;
-  Result.Rdx    := Ctx.Rdx;
-  Result.Rsi    := Ctx.Rsi;
-  Result.Rdi    := Ctx.Rdi;
-  Result.R8     := Ctx.R8;
-  Result.R9     := Ctx.R9;
-  Result.R10    := Ctx.R10;
-  Result.R11    := Ctx.R11;
-  Result.R12    := Ctx.R12;
-  Result.R13    := Ctx.R13;
-  Result.R14    := Ctx.R14;
-  Result.R15    := Ctx.R15;
-  Result.EFlags := Ctx.EFlags;
-  Result.Valid  := True;
+  ReadThreadRegisters(FStoppedTid, Result);
 end;
 
 function TWinDebugger.EvaluateLocalName(const Name: string;

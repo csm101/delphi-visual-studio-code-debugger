@@ -121,9 +121,73 @@ Win32 now sits at the same residual level as the always-correct x64 control, so
 the leftovers are ordinary MAP-vs-TD32 granularity (one source line owning many
 RVAs in instantiated generics), not a bitness defect.
 
+### Increment 1: DONE, gated, committed (0a72d42, 7ef0c92)
+
+`DebuggerCore\TargetLayout.pas` -- a plain DATA record, deliberately not an
+interface (a virtual call per pointer would shatter bulk reads into syscalls).
+Seam is `IDebugTarget.TargetLayout`; `TDelphiRtti` is told its layout at
+construction instead, because it reads through a raw handle. Consumers: the six
+duplicated dynamic-array header reads, plus the two scans that strided target
+memory by the HOST's `SizeOf(Pointer)`.
+
+`TFakeMemTarget` in `ValueReaderTests.pas` gained a SETTABLE layout rather than
+an inert stub, so 32-bit decode paths are testable against a fixed byte window
+with no live debuggee and no 32-bit build. Three tests, including a negative one
+that reads a 32-bit image with the 64-bit shape and asserts the result is wrong
+-- it documents the real failure mode (a plausible wrong number, not an error)
+and stops the positive tests going vacuous.
+
+**Scope decision, deliberate:** the ~70 pointer-read sites in `DelphiRtti` /
+`ExprEval` were NOT swept. Not every `ReadU64` there is a pointer read -- many
+are genuine 8-byte values -- and a mechanical pass would introduce silent bugs.
+Those sites are revisited in Increment 4c anyway, where the VMT32 table lands
+and they become testable at 32 bits. Same reason no speculative `ReadPtr`
+helpers were added.
+
+### Increment 2: PART DONE, gated, committed (96fbe0e)
+
+Done so far:
+* Role accessors `Pc` / `StackPtr` / `FramePtr` on `TRegisterSnapshot`, which is
+  now documented as a 64-bit SUPERSET of both register files (x86 fills the same
+  fields from EIP/ESP/EBP, R8..R15 stay zero). Physical names are legitimate in
+  exactly two places: the x64 implementation itself and the DAP Registers view.
+* **D1 fixed** -- the x64 stack-probe loop (a fixed 22-byte block between the
+  pushes and the real `sub rsp`) is now decoded. Measured: a routine with a
+  16464-byte frame read as 0. Signature verified at expected offsets, not
+  skipped blindly.
+* **Fail-closed** -- `ReadPrologInfo` now reports whether the prologue was
+  UNDERSTOOD; all four callers refuse rather than guess. Needed because a
+  pure-`asm` routine can be frameless yet still have parameters in debug info.
+  `PrologProbe`'s verbatim copy updated in step, or it stops being evidence.
+
 ### CURRENT CURSOR
 
-**Next: Increment 1 -- `TTargetLayout` + shared read helpers.** Nothing started.
+**Next: the context funnel, the remaining core of Increment 2.**
+
+~11 sites call `GetThreadContext`/`SetThreadContext` independently and name x64
+`TContext` fields directly. They fall into three groups, and only the third is
+genuinely arch-specific:
+
+1. **Read a role** (PC / SP / FP / the whole snapshot): `CurrentRIP`,
+   `CurrentRSP`, `GetRegisters`, `GetLocalValues`, `CurrentFrameParamHomeAddr`.
+2. **Mutate a role**: `SetTrapFlag` (EFLAGS bit $100), `SetRIP`,
+   `SetRegisterByName` (already string-keyed, so polymorphic for free).
+3. **Need the raw CONTEXT**: `StackWalk64` seeding in `GetStackFrames` and
+   `CallerReturnAddress`, and `RunMethodCall`'s ABI block. These stay in the
+   arch implementation.
+
+Plan: give groups 1 and 2 named primitives on `TWinDebugger`
+(`ReadThreadRegisters`, `SetThreadPc`, `SetThreadTrapFlag`) and route the sites
+through them, so the WOW64 variant becomes one implementation instead of eleven.
+Leave group 3 alone until the unit split.
+
+Still open in Increment 2 after that: `IMAGE_FILE_MACHINE_AMD64` at three sites
+becoming runtime-selected, `RunRemoteCallEx`'s positional parameter names, and
+splitting `RunMethodCall` into an arch `PrepareCall`/`ReadCallResult` plus the
+already-neutral pump.
+
+**Suite baseline for every gate from here: 949 found / 947 passed / 0 failed /
+0 leaked / 2 ignored.**
 
 * Historical detail of Increment -1, six edits (four planned + two from the
   measured single-step finding above):
