@@ -324,6 +324,15 @@ type
                 out IntResult, FloatResultLow: UInt64): Boolean;
   private
     function  RunRemoteCall(FuncVA: UInt64; Arg0, Arg1: UInt64): Boolean;
+    // The only calling-convention-aware halves of the synthetic-call
+    // machinery. The event pump between them is architecture neutral and stays
+    // shared; a 32-bit target replaces exactly these two.
+    function  PrepareSyntheticCall(TH: THandle; FuncVA: UInt64;
+                const ArgValues: array of UInt64;
+                const ArgIsFloat: array of Boolean;
+                const SavedCtx: TContext): Boolean;
+    function  ReadSyntheticCallResult(TH: THandle;
+                out IntResult, FloatResultLow: UInt64): Boolean;
   public
     procedure Terminate;
     // IDebugTarget event accessors. Method-style getter/setter pairs are
@@ -3059,52 +3068,27 @@ begin
   Result := True;
 end;
 
-// Hijacks the stopped thread to invoke an RTL helper such as @UStrAsg.
-// Saves the thread's context, places a synthetic call (return address points
-// to a 0xCC trap page we own), pumps WaitForDebugEvent until that trap fires,
-// then restores the original context. While we wait, debug events for other
-// threads or unrelated exceptions are passed through unchanged so the
-// debuggee doesn't hang.
-function TWinDebugger.RunMethodCall(FuncVA: UInt64;
+{ ---------------------------------------------------------------------------
+  Synthetic-call ABI. These two are the ONLY calling-convention-aware parts of
+  the synthetic-call machinery; the event pump around them is architecture
+  neutral and stays shared. A 32-bit target replaces exactly these two: Delphi's
+  `register` convention puts the first three arguments in EAX/EDX/ECX with the
+  rest pushed right-to-left, has no shadow space, and returns floats on the x87
+  stack rather than in an SSE register.
+  --------------------------------------------------------------------------- }
+
+// Places a synthetic call frame for POSITIONAL arguments and points the thread
+// at FuncVA, with the return address aimed at our INT3 trap page.
+function TWinDebugger.PrepareSyntheticCall(TH: THandle; FuncVA: UInt64;
   const ArgValues: array of UInt64; const ArgIsFloat: array of Boolean;
-  out IntResult, FloatResultLow: UInt64): Boolean;
+  const SavedCtx: TContext): Boolean;
 var
-  TH:       THandle;
-  SavedCtx: TContext;
-  CallCtx:  TContext;
-  PostCtx:  TContext;
-  Ev:       TDebugEvent;
-  IntRegs:  array[0..3] of UInt64;  // RCX, RDX, R8, R9 (after arg dispatch)
-  XmmRegs:  array[0..3] of UInt64;
-  Stack:    array of UInt64;        // args 5+ in order
+  CallCtx: TContext;
+  IntRegs: array[0..3] of UInt64;  // RCX, RDX, R8, R9 (after arg dispatch)
+  XmmRegs: array[0..3] of UInt64;
+  Stack:   array of UInt64;        // args 5+ in order
 begin
-  Result    := False;
-  IntResult      := 0;
-  FloatResultLow := 0;
-  if Length(ArgValues) <> Length(ArgIsFloat) then Exit;
-  TH := ThreadHandle(FStoppedTid);
-  if (TH = 0) or (FProcess = 0) or (FuncVA = 0) then Exit;
-  // Stopped on a first-chance exception: the pending debug event must be
-  // continued with DBG_EXCEPTION_NOT_HANDLED so the program's own handler
-  // runs. A synthetic call would consume that event with DBG_CONTINUE,
-  // swallowing the exception and desynchronising FPendingContinueStatus
-  // from the trap event it later applies to. Refuse the call instead.
-  if FPendingContinueStatus <> DBG_CONTINUE then begin
-    DapLog('RunMethodCall: refused while stopped on an exception ' +
-      '(pending continue status would be lost)');
-    Exit;
-  end;
-
-  // Lazy-allocate the INT3 return-trap (same one used by RunRemoteCallEx).
-  if FRemoteCallTrap = 0 then begin
-    var Trap := VirtualAllocEx(FProcess, nil, 1, MEM_COMMIT or MEM_RESERVE,
-      PAGE_EXECUTE_READWRITE);
-    if Trap = nil then Exit;
-    var Cc: Byte := $CC;
-    if not WriteMemoryAt(UInt64(Trap), @Cc, 1) then Exit;
-    FRemoteCallTrap := UInt64(Trap);
-  end;
-
+  Result := False;
   // Win64 ABI: argument N (1-based) lands in either an integer register
   // (RCX/RDX/R8/R9) or a float register (XMM0/1/2/3) based on its kind,
   // BUT IN BOTH CASES by POSITION. Args 5+ go to the stack at
@@ -3121,10 +3105,6 @@ begin
     end else
       Stack := Stack + [ArgValues[I]];
   end;
-
-  SavedCtx := Default(TContext);
-  SavedCtx.ContextFlags := CONTEXT_FULL or CONTEXT_FLOATING_POINT;
-  if not GetThreadContext(TH, SavedCtx) then Exit;
 
   CallCtx := SavedCtx;
   // RSP: 16-align down, then reserve 32 (shadow) + 8 (ret) + 8*Length(Stack)
@@ -3155,7 +3135,72 @@ begin
   PUInt64(@CallCtx.Xmm2)^ := XmmRegs[2];
   PUInt64(@CallCtx.Xmm3)^ := XmmRegs[3];
   CallCtx.EFlags := CallCtx.EFlags and (not DWORD($100)); // clear TF
-  if not SetThreadContext(TH, CallCtx) then Exit;
+  Result := SetThreadContext(TH, CallCtx);
+end;
+
+// Reads the return value out of the thread that has just hit the return trap.
+function TWinDebugger.ReadSyntheticCallResult(TH: THandle;
+  out IntResult, FloatResultLow: UInt64): Boolean;
+var
+  PostCtx: TContext;
+begin
+  IntResult      := 0;
+  FloatResultLow := 0;
+  PostCtx := Default(TContext);
+  PostCtx.ContextFlags := CONTEXT_FULL or CONTEXT_FLOATING_POINT;
+  Result := GetThreadContext(TH, PostCtx);
+  if not Result then Exit;
+  IntResult      := PostCtx.Rax;
+  FloatResultLow := PUInt64(@PostCtx.Xmm0)^;
+end;
+
+// Hijacks the stopped thread to invoke an RTL helper such as @UStrAsg.
+// Saves the thread's context, places a synthetic call (return address points
+// to a 0xCC trap page we own), pumps WaitForDebugEvent until that trap fires,
+// then restores the original context. While we wait, debug events for other
+// threads or unrelated exceptions are passed through unchanged so the
+// debuggee doesn't hang.
+function TWinDebugger.RunMethodCall(FuncVA: UInt64;
+  const ArgValues: array of UInt64; const ArgIsFloat: array of Boolean;
+  out IntResult, FloatResultLow: UInt64): Boolean;
+var
+  TH:       THandle;
+  SavedCtx: TContext;
+  Ev:       TDebugEvent;
+begin
+  Result    := False;
+  IntResult      := 0;
+  FloatResultLow := 0;
+  if Length(ArgValues) <> Length(ArgIsFloat) then Exit;
+  TH := ThreadHandle(FStoppedTid);
+  if (TH = 0) or (FProcess = 0) or (FuncVA = 0) then Exit;
+  // Stopped on a first-chance exception: the pending debug event must be
+  // continued with DBG_EXCEPTION_NOT_HANDLED so the program's own handler
+  // runs. A synthetic call would consume that event with DBG_CONTINUE,
+  // swallowing the exception and desynchronising FPendingContinueStatus
+  // from the trap event it later applies to. Refuse the call instead.
+  if FPendingContinueStatus <> DBG_CONTINUE then begin
+    DapLog('RunMethodCall: refused while stopped on an exception ' +
+      '(pending continue status would be lost)');
+    Exit;
+  end;
+
+  // Lazy-allocate the INT3 return-trap (same one used by RunRemoteCallEx).
+  if FRemoteCallTrap = 0 then begin
+    var Trap := VirtualAllocEx(FProcess, nil, 1, MEM_COMMIT or MEM_RESERVE,
+      PAGE_EXECUTE_READWRITE);
+    if Trap = nil then Exit;
+    var Cc: Byte := $CC;
+    if not WriteMemoryAt(UInt64(Trap), @Cc, 1) then Exit;
+    FRemoteCallTrap := UInt64(Trap);
+  end;
+
+  SavedCtx := Default(TContext);
+  SavedCtx.ContextFlags := CONTEXT_FULL or CONTEXT_FLOATING_POINT;
+  if not GetThreadContext(TH, SavedCtx) then Exit;
+
+  if not PrepareSyntheticCall(TH, FuncVA, ArgValues, ArgIsFloat, SavedCtx) then
+    Exit;
 
   ContinueDebugEvent(FProcessId, FStoppedTid, DBG_CONTINUE);
   // Planted breakpoints being skipped inside the injected call:
@@ -3208,12 +3253,7 @@ begin
          IsBreakpointExceptionCode(Ev.Exception.ExceptionRecord.ExceptionCode) and
          (UInt64(Ev.Exception.ExceptionRecord.ExceptionAddress) = FRemoteCallTrap) and
          (Ev.dwThreadId = FStoppedTid) then begin
-        PostCtx := Default(TContext);
-        PostCtx.ContextFlags := CONTEXT_FULL or CONTEXT_FLOATING_POINT;
-        if GetThreadContext(TH, PostCtx) then begin
-          IntResult      := PostCtx.Rax;
-          FloatResultLow := PUInt64(@PostCtx.Xmm0)^;
-        end;
+        ReadSyntheticCallResult(TH, IntResult, FloatResultLow);
         SetThreadContext(TH, SavedCtx);
         // When the trap is the one WE forced to abort a hung call, the RAX/XMM0
         // just read are meaningless -- report failure so the caller surfaces
