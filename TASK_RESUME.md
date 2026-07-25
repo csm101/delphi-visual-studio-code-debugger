@@ -2,30 +2,139 @@
 
 Exact current task state. High-level permanent state lives in `PROJECT_STATE.md`.
 
-## IN PROGRESS (2026-07-21): status-bar progress via a `delphiProgress` custom event.
+## IN PROGRESS (2026-07-25): Win32 (32-bit) target support.
 
-VS Code renders DAP progress events as notification toasts (status-bar rendering
-was reverted upstream in microsoft/vscode#204750) and the protocol has no field
-for the location. The adapter side is DONE: launch/attach config gains
-`progressLocation: "statusBar" | "notification"`, default `statusBar`.
+Branch **`feature/win32-target-support`**, cut from `public-main` at `a079c9e`.
+Full plan (phases, constants, risks) is the approved plan file; this section is
+the cursor inside it.
 
-* `statusBar` -> emit ONLY `delphiProgress`
-  `{ "id", "state": "start"|"update"|"end", "text" }` (`text` omitted on `end`),
-  rendered by our own VS Code extension.
-* `notification` -> emit ONLY the standard DAP `progressStart/Update/End`
-  (today's behaviour, so a non-Delphi DAP client still works). Never both.
+### Architecture, settled -- do not re-open
 
-Both channels ('startup' and 'op') fan out from the single
-`TDapServer.EmitProgress`; the busy/debounce logic is untouched.
-`supportsProgressReporting` stays True: it is a CLIENT capability in the spec,
-VS Code ignores it in the initialize response, so it does not gate toasts.
+ONE 64-bit adapter binary debugs BOTH x64 and WOW64 x86 targets. Rejected the
+two-binary design because the MCP server is registered once at editor startup
+with a fixed command, long before any target exists, so it cannot pick a
+per-bitness binary; two binaries would force an IPC proxy for no gain.
+BEHAVIOUR differences (context/registers, stack walk, prologue, call ABI) go
+behind `IDebugTarget`. LAYOUT differences (pointer size, VMT offsets, dynarray
+header) go in a plain DATA record read while decoding an already-read buffer --
+never a virtual call per pointer, which would shatter bulk reads into syscalls.
+Unit rename `Win64Debugger.pas` -> `WinDebuggerBase.pas` + `WinDebuggerX64.pas`
++ `WinDebuggerX86.pas`; repo / extension / MCP names unchanged.
 
-`TModuleSymbolLoader.OnModuleLoadBegin` (new) fires before a module's symbols are
-actually parsed and retitles the busy text to `loading symbols: <Module>`.
+### Phase 0: DONE, verdict GO (12-agent workflow + adversarial verification)
 
-Adapter build clean; suite **865 found / 863 passed / 0 failed / 2 ignored**
-(baseline). NOT COMMITTED. REMAINING: the VS Code extension must consume
-`delphiProgress` and declare `progressLocation` in its launch-config schema.
+Facts established, each measured rather than assumed:
+
+* `dcc32` compiles the whole test-target tree clean and emits `.exe/.map/.rsm`;
+  `-V -VR -VT -VN` all exist. `.cfg` `-E`/`-NU` are overridable from the command
+  line (last wins), so **do not fork the `.cfg` files**.
+* `RsmFileReader` AND `TTD32FileReader` parse 32-bit output **unmodified**. The
+  feared JCL-Win32-padding mismatch does not apply to Athens 36 dcc32 output.
+* `StackWalk64(IMAGE_FILE_MACHINE_I386)` + `TWow64Context` unwinds correctly
+  (6 correct frames). **No hand-rolled EBP walker needed.** dbghelp contributes
+  nothing to the i386 walk of a Delphi target (invade-only, explicit modules and
+  both-callbacks-nil give byte-identical output).
+* VMT x86: SelfPtr **-88**, TypeInfo **-72**, FieldTable **-68**, ClassName
+  **-56**, InstanceSize **-52**, Parent **-48** (double indirection). CPP_ABI
+  shift is **0** on Win32, 24 on Win64 applied to EVERY class. Anchor on an
+  identity-tested SelfPtr + per-bitness deltas, never absolutes.
+* x86 frame model: `mov ebp,esp` PRECEDES allocation (opposite of x64), so the
+  return address is always `[EBP+4]` and **no frame size is needed at all**.
+  Delphi emits `add esp,-N` (`83 C4`/`81 C4`, negative imm), not `sub esp,N`.
+  Matcher must require `$55` at offset 0 AND `8B EC` right after.
+* **No x86 analogue of the parameter home-slot formula.** First three params are
+  in EAX/EDX/ECX with no stack home, spilled to NEGATIVE EBP offsets under
+  `-$O-`; stack params run in REVERSE declaration order; `Self` is provably not
+  at `EBP+8`. Parameter addresses must come from debug-info symbol offsets.
+* A matcher miss must mean **"refuse to report locals"**, never "has none": a
+  pure-`asm` body that never names a param is frameless yet debug info still
+  lists the param, and the RTL is full of these.
+* Scope limitation to accept: Win32 locals/params are supportable for `-$O-`
+  builds only (`-$O+` omits the frame pointer routinely).
+
+### Shipping defects found (see plan file for full list)
+
+* **D1, x64, real bug, file separately:** `ReadPrologInfo`'s byte matcher returns
+  `subRsp=0` for any function using the x64 stack-probe loop (`Bytes[1]=$B8`
+  breaks the push loop). Masked today only because `.pdata` normally succeeds.
+* **D3, blocker:** `TMapFile.ParseSegmentTableEager` hardcodes a 16-hex-digit
+  Start column; PE32 prints 8, so every segment line is rejected and
+  `FSegmentBaseRvas` ends up EMPTY -- the root cause of the MAP/TD32 `$1000`
+  disagreement. True rebase is `LinearStart - ImageBase` PER SEGMENT.
+* **D4, latent, hits the core use case:** `ReadPEPreferredBase` bails on non-PE32+
+  and falls back to a hardcoded `$400000`; a PE32 BPL with a non-default base
+  corrupts every segment base.
+
+### Phase 0 unknowns: BOTH CLOSED BY MEASUREMENT (2026-07-25)
+
+Probe: `DevTools\Win64\Debug\Wow64StackProbe.exe <32-bit exe> -rva DD83C [-step|-nopatch]`
+(`$DD83C` = `TestTargetEdge.RunRecursion`, i.e. seg-0001 base `$1000` + `$DC83C`).
+
+1. **A single step in a 32-bit target reports `$4000001E`
+   (STATUS_WX86_SINGLE_STEP), NOT `EXCEPTION_SINGLE_STEP`.** Set EFLAGS.TF via
+   `Wow64SetThreadContext` (EFLAGS became `$00200344`), continued, and the next
+   event was `$4000001E` at BP+1. So stepping needs the SAME treatment as
+   breakpoints; this was folded into Increment -1 as a fifth and sixth edit.
+2. **The i386 walk does NOT survive a still-planted INT3.** This one bites.
+   With the byte restored and EIP rewound the walk is correct:
+   `#0 +$DD83C  ->  #1 +$EE96F (real caller)  ->  #2 +$F3E52`.
+   With `-nopatch` (INT3 left in place, EIP one past it) it becomes:
+   `#0 +$DD83D  ->  #1 $00AFFC54 <unknown module>  ->  #2 +$F3E52`
+   -- the walker takes a STACK ADDRESS as a return address, fabricates a bogus
+   frame, and LOSES the real caller entirely. On x64 the adapter keeps
+   breakpoints planted across a stop and that is harmless because unwinding is
+   `.pdata`-driven. **On Win32 restoring the byte and rewinding EIP before any
+   stack walk is a hard requirement, not an optimisation.** Design the x86 stop
+   path around this.
+
+Also confirmed in the wild: the FIRST stop of a WOW64 target is `$80000003` at a
+64-bit ntdll address with EBP=0 and yields 1 frame (not unwindable); every later
+32-bit stop is `$4000001F`. `StackWalk64(IMAGE_FILE_MACHINE_I386)` returned 6
+correct frames, and the three dbghelp modes (invade-only / explicit modules /
+both callbacks nil) gave byte-identical output with `FTE=$00000000` throughout,
+confirming dbghelp contributes nothing to the i386 walk of a Delphi target.
+
+The 32-bit MAP segment table, read directly, confirms the D3 root cause:
+`0001:00401000 .text` -- an **8-hex-digit** Start column, ImageBase `$400000`,
+per-segment bases `.text $1000`, `.data $F5000`, `.bss $F9000` (so the shift is
+per segment, never a flat `$1000`). Segment `0005 .tls` has linearStart `$0`,
+below `FPreferredBase`, so it stays unregistered -- the known open TLS gap.
+
+### CURRENT CURSOR
+
+Task #1 DONE. Task #2 (Increment -1) edits ALL APPLIED and the adapter compiles
+clean (same warnings/hints as baseline, none new). **Gate run in flight.**
+
+* **Baseline before any change: 946 found / 944 passed / 0 failed / 0 errored /
+  2 ignored.** The gate requires exactly these numbers again.
+* **Next action if interrupted right now:** read the gate run's totals and
+  compare against 946/944/0/0/2. If identical, commit Increment -1 as a
+  milestone. If not, the delta names which of the six edits is wrong -- do not
+  assume the baseline drifted, all six are no-ops on PE32+ by construction.
+* Increment -1, six edits (four planned + two from finding 1 above):
+  1. `MapFileReader.pas:483-494` -- replace the fixed 16-char `AddrPart` slice
+     with a scan of consecutive hex digits from `ColonPos+1`, accept a run of 8
+     or 16 terminated by whitespace/EOL. Keep the `LinearAddr >= FPreferredBase`
+     guard and line 497 unchanged. Remove the now-unused `IsHex` local.
+  2. `MapFileReader.pas:299` -- accept magic `$010B` too; PE32 ImageBase is
+     4 bytes at optional-header `+$1C` (PE32+ is 8 bytes at `+$18`).
+  3. `MapFileReader.pas:508` -- bump `MAP_SIDECAR_MAGIC` `MIX2` -> `MIX3` AND
+     delete existing `*.map.idx`, or the fix will look like it failed.
+  4. `Win64Debugger.pas` -- add untyped consts `STATUS_WX86_BREAKPOINT =
+     $4000001F` / `STATUS_WX86_SINGLE_STEP = $4000001E` to the const block at
+     ~360, add the case label at 1859 (must be UNTYPED to be a legal case
+     label), and cover the two comparisons at 3122 and 3150.
+* **GATE for Increment -1:** the x64 suite must be byte-for-byte unchanged. Any
+  x64 delta means the change is wrong, not that the baseline drifted.
+
+### Environment traps hit this session
+
+* Two idle `DelphiDebuggerMcp.exe` instances (children of `claude.exe`) held a
+  lock on their own exe and made `build_and_run.bat` die with
+  `F2039 Could not create output file`. No live debuggees under them; killed
+  both to unblock. **Expect this again** -- any editor session with the MCP
+  server registered will re-take the lock.
+* `.claude/worktrees/` is now git-ignored (agent worktrees are full checkouts).
 
 ## DONE (2026-07-21): two defects found while REJECTING the TD32 sidecar idea.
 
