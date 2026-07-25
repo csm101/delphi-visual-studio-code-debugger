@@ -296,10 +296,20 @@ begin
     if Signature <> $00004550 then Exit;
     F.Position := PEOffset + 4 + 20;
     F.ReadBuffer(Magic, 2);
-    if Magic <> $020B then Exit;
-    F.Position := PEOffset + 4 + 20 + 24;
-    F.ReadBuffer(Base, 8);
-    Result := Base;
+    // PE32+ widened ImageBase to 8 bytes and dropped the BaseOfData field that
+    // precedes it in PE32, so the two layouts differ in BOTH offset and width.
+    // Falling back to the hardcoded $400000 for PE32 is not harmless: a module
+    // with a non-default preferred base then gets every segment base wrong.
+    if Magic = $020B then begin
+      F.Position := PEOffset + 4 + 20 + $18;
+      F.ReadBuffer(Base, 8);
+      Result := Base;
+    end else if Magic = $010B then begin
+      var Base32: Cardinal := 0;
+      F.Position := PEOffset + 4 + 20 + $1C;
+      F.ReadBuffer(Base32, 4);
+      Result := Base32;
+    end;
   finally
     F.Free;
   end;
@@ -455,7 +465,6 @@ var
   Line, SegStr, AddrPart: string;
   ColonPos, SegNum, NextIdx: Integer;
   LinearAddr: UInt64;
-  IsHex: Boolean;
 begin
   var Limit := FMapSize;
   if Int64(ScanLimit) < Limit then Limit := ScanLimit;
@@ -480,17 +489,20 @@ begin
       if (Cls = 'DATA') or (Cls = 'BSS') or (Cls = 'TLS') then
         FDataSegments.AddOrSetValue(SegNum, True);
     end;
-    if Trimmed.Length < ColonPos + 1 + 16 then Continue;
-    AddrPart := Trimmed.Substring(ColonPos + 1, 16);
-    IsHex := True;
-    for var C in AddrPart do
-      if not CharInSet(C, ['0'..'9', 'A'..'F', 'a'..'f']) then begin
-        IsHex := False;
-        Break;
-      end;
-    if not IsHex then Continue;
-    NextIdx := ColonPos + 1 + 16;
+    // Delphi prints the Start column at the TARGET's pointer width: 8 hex
+    // digits for PE32, 16 for PE32+. Scan the run rather than assuming one
+    // width. Assuming 16 rejects every PE32 segment line, which leaves
+    // FSegmentBaseRvas empty -- and because all three consumers read it with
+    // TryGetValue defaulting to 0, every emitted RVA silently degrades to a
+    // bare segment offset instead of failing visibly.
+    var HexLen := 0;
+    while (ColonPos + 1 + HexLen < Trimmed.Length) and
+          CharInSet(Trimmed.Chars[ColonPos + 1 + HexLen], ['0'..'9', 'A'..'F', 'a'..'f']) do
+      Inc(HexLen);
+    if (HexLen <> 8) and (HexLen <> 16) then Continue;
+    NextIdx := ColonPos + 1 + HexLen;
     if (NextIdx < Trimmed.Length) and (Trimmed.Chars[NextIdx] <> ' ') then Continue;
+    AddrPart   := Trimmed.Substring(ColonPos + 1, HexLen);
     LinearAddr := StrToInt64Def('$' + AddrPart, 0);
     if (LinearAddr > 0) and (LinearAddr >= FPreferredBase) then begin
       {$Q-}
@@ -505,7 +517,10 @@ end;
 { --------------------------------------------------------------------------- }
 
 const
-  MAP_SIDECAR_MAGIC: UInt32 = $4D495832; // 'MIX2' -- includes FullPath field
+  // 'MIX3' -- bumped when the segment-table parse learned the PE32 (8 hex digit)
+  // Start column. Sidecars written by the previous build baked MinRva values
+  // computed from an empty segment table, so they must not be reused.
+  MAP_SIDECAR_MAGIC: UInt32 = $4D495833;
 
 function MapSidecarIsFresh(const MapPath, SidecarPath: string): Boolean;
 begin
