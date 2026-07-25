@@ -319,6 +319,34 @@ DevTools\Win64\Debug\FindBytes.exe Win64\Debug\Debugme.rsm 6328 20
 Scans any binary for a hex byte pattern and lists every hit offset; the
 optional third argument caps the number of hits reported.
 
+#### PrologProbe
+
+Self-contained prologue-shape probe. It contains deliberately shaped routines
+(parameterless, eight integer parameters, large local array, high register
+pressure, method with hidden `Self`, nested procedure, `try/finally`,
+`try/except`, managed and record results) and dumps the first 32 bytes at each
+routine's own entry address together with a decode.
+
+It also *measures* four frames at run time: each measured routine records the
+address of one of its own locals, the value of `ReturnAddress` and the address
+of every parameter, then locates the return-address slot on the stack **by
+searching for it**. The prologue decoder's predictions are checked against
+those measurements rather than asserted, so a wrong decoder shows up as a
+mismatch instead of a plausible number.
+
+Unlike the other tools this one must be compiled **four ways** — `dcc32 -$O-`,
+`dcc32 -$O+`, `dcc64 -$O-`, `dcc64 -$O+` — and the columns compared. The dcc64
+columns replicate `TWinDebugger.ReadPrologInfo`'s byte-pattern matcher verbatim,
+so they act as the self-check: if they stop reproducing the Win64 parameter-home
+formula, the probe is wrong, not the shipping code.
+
+```bat
+DevTools\Win64\Debug\PrologProbe.exe        REM full dump
+DevTools\Win64\Debug\PrologProbe.exe -q     REM decodes only, no raw hex
+```
+
+Takes no target: the binary under inspection is itself.
+
 ### JCL and TDS debug info
 
 Both tools in this group need the upstream JCL sources (see
@@ -385,6 +413,46 @@ each watch expression) over N iterations, reporting min/avg/max. Arguments:
 **Caveat:** every phase bottoms out near 30 ms because of the response-polling
 granularity in `DebuggerTests\DapClient.pas`. The tool cannot resolve costs
 below that floor — treat sub-30 ms readings as noise.
+
+#### Wow64StackProbe
+
+```bat
+DevTools\Win64\Debug\Wow64StackProbe.exe C:\path\To\Win32App.exe -rva DD83C
+```
+
+Answers whether a **64-bit** debugger can unwind a **32-bit (WOW64)** target
+with dbghelp. Launches the executable under `DEBUG_ONLY_THIS_PROCESS`,
+classifies it with `IsWow64Process2`, then walks the stopped thread with
+`StackWalk64` using `IMAGE_FILE_MACHINE_I386` + `TWow64Context` for a WOW64
+target, or `IMAGE_FILE_MACHINE_AMD64` + `TContext` for a native one — the same
+code path, so a run against a known-good x64 executable validates the harness.
+
+Arguments: `<exe> [-rva <hex>] [-maxstops <n>]`. With `-rva` the probe plants an
+INT3 at `ImageBase + RVA` and walks there, giving an application-code stack
+instead of the loader's. Each stop is walked three ways — dbghelp invade-only,
+dbghelp with every module explicitly registered via `SymLoadModuleExW`, and with
+no dbghelp callbacks at all — which separates "`StackWalk64` cannot do this"
+from "dbghelp was not told about the modules".
+
+`run_wow64probe.bat <logfile> <exe> [args]` runs it with output tee'd to a file,
+so partial progress is visible while the probe is still running.
+
+**Findings so far (recorded here because they shape the Win32 port):**
+
+- A 64-bit debugger **does** unwind a WOW64 target correctly:
+  `IMAGE_FILE_MACHINE_I386` with a `TWow64Context` passed by pointer works
+  directly; no native `CONTEXT` translation is needed.
+- A 32-bit `INT3` is reported to a 64-bit debugger as
+  `STATUS_WX86_BREAKPOINT` (`$4000001F`), **not** `EXCEPTION_BREAKPOINT`
+  (`$80000003`). A debug loop that only tests `$80000003` never sees a user
+  breakpoint in 32-bit code and re-dispatches it forever.
+- The initial `$80000003` breakpoint of a WOW64 target arrives while the 32-bit
+  side has `EBP = 0` and is not yet unwindable; the usable 32-bit loader stop is
+  the later `$4000001F` one.
+- dbghelp contributes nothing to the i386 walk of a Delphi target
+  (`FuncTableEntry` is nil in every frame, and the no-callback walk is
+  byte-identical), so the result rests on `StackWalk64`'s built-in frame-pointer
+  chain plus its first-frame `[ESP]` heuristic.
 
 ## Source layout
 
