@@ -175,6 +175,16 @@ type
     // as amd64, so a 32-bit target changes this value rather than needing a
     // hand-rolled walker.
     function  StackWalkMachineType: DWORD; virtual;
+    // Fills Buf with the raw context StackWalk64 expects for this architecture
+    // and reports the seed registers. The walk itself never reads Buf's fields
+    // again -- StackWalk64 mutates it opaquely as it unwinds -- so this is the
+    // only place that needs to know the context's shape.
+    //
+    // Buf is typed TContext because it is the larger and correctly aligned of
+    // the two; a WOW64 context is smaller and the x86 override writes it at the
+    // start of the same storage.
+    function  FillStackWalkContext(TH: THandle; var Buf: TContext;
+                out SeedPc, SeedSp, SeedFp: UInt64): Boolean; virtual;
     procedure SetTrapFlag(TID: DWORD; Enable: Boolean);
     procedure SetRIP(TID: DWORD; NewRIP: UInt64);
     function  CurrentRIP(TID: DWORD): UInt64;
@@ -936,6 +946,22 @@ begin
   Result := IMAGE_FILE_MACHINE_AMD64;
 end;
 
+function TWinDebugger.FillStackWalkContext(TH: THandle; var Buf: TContext;
+  out SeedPc, SeedSp, SeedFp: UInt64): Boolean;
+begin
+  SeedPc := 0;
+  SeedSp := 0;
+  SeedFp := 0;
+  Buf := Default(TContext);
+  Buf.ContextFlags := CONTEXT_FULL;
+  Result := GetThreadContext(TH, Buf);
+  if not Result then
+    Exit;
+  SeedPc := Buf.Rip;
+  SeedSp := Buf.Rsp;
+  SeedFp := Buf.Rbp;
+end;
+
 function TWinDebugger.SetThreadTrapFlag(TID: DWORD; Enable: Boolean): Boolean;
 const
   TRAP_FLAG = DWORD($100);
@@ -1192,18 +1218,17 @@ begin
   TH := ThreadHandle(TID);
   if TH = 0 then
     Exit;
-  Ctx := Default(TContext);
-  Ctx.ContextFlags := CONTEXT_FULL;
-  if not GetThreadContext(TH, Ctx) then
+  var SeedPc, SeedSp, SeedFp: UInt64;
+  if not FillStackWalkContext(TH, Ctx, SeedPc, SeedSp, SeedFp) then
     Exit;
   EnsureSymInitialized;
 
   SF := Default(TDbgStackFrame64);
-  SF.AddrPC.Offset    := Ctx.Rip;
+  SF.AddrPC.Offset    := SeedPc;
   SF.AddrPC.Mode      := AddrModeFlat;
-  SF.AddrFrame.Offset := Ctx.Rbp;
+  SF.AddrFrame.Offset := SeedFp;
   SF.AddrFrame.Mode   := AddrModeFlat;
-  SF.AddrStack.Offset := Ctx.Rsp;
+  SF.AddrStack.Offset := SeedSp;
   SF.AddrStack.Mode   := AddrModeFlat;
 
   // Consume the current frame.
@@ -2595,10 +2620,13 @@ begin
   TH := ThreadHandle(TID);
   if TH = 0 then
     Exit;
-  Ctx := Default(TContext);
-  Ctx.ContextFlags := CONTEXT_FULL;
-  if not GetThreadContext(TH, Ctx) then begin
-    DapLog(Format('GetStackFrames(TID=%d): GetThreadContext FAILED LastErr=%d', [TID, GetLastError]));
+  // StackWalk64 MUTATES Ctx into the unwound state of each frame it yields, so
+  // the seed registers must be captured HERE -- reading them back off Ctx after
+  // the loop stored the LAST frame's registers under a key that is compared
+  // against the live seed, which no healthy walk could ever match.
+  var SeedRip, SeedRsp, SeedRbp: UInt64;
+  if not FillStackWalkContext(TH, Ctx, SeedRip, SeedRsp, SeedRbp) then begin
+    DapLog(Format('GetStackFrames(TID=%d): thread context read FAILED LastErr=%d', [TID, GetLastError]));
     Exit;
   end;
 
@@ -2623,8 +2651,8 @@ begin
   // permanently nameless frames for a module whose symbols did land.
   var RevBefore := FDebugInfo.Revision;
   if (not IndexingPending) and
-     (FCachedFramesTID = TID) and (FCachedFramesRIP = Ctx.Rip) and
-     (FCachedFramesRSP = Ctx.Rsp) and
+     (FCachedFramesTID = TID) and (FCachedFramesRIP = SeedRip) and
+     (FCachedFramesRSP = SeedRsp) and
      (FCachedFramesRev = FDebugInfo.Revision) and
      (Length(FCachedFrames) > 0) then
     Exit(FCachedFrames);
@@ -2634,20 +2662,12 @@ begin
   // HandleLoadDll -- this sweep sees only what exists right now.
   EnsureSymInitialized;
 
-  // StackWalk64 MUTATES Ctx into the unwound state of each frame it yields, so
-  // the cache key must be taken from the seed context here -- reading it back off
-  // Ctx after the loop stored the LAST frame's registers under a key that is
-  // compared against the live seed, which no healthy walk could ever match.
-  var SeedRip := Ctx.Rip;
-  var SeedRsp := Ctx.Rsp;
-  var SeedRbp := Ctx.Rbp;
-
   SF := Default(TDbgStackFrame64);
-  SF.AddrPC.Offset    := Ctx.Rip;
+  SF.AddrPC.Offset    := SeedRip;
   SF.AddrPC.Mode      := AddrModeFlat;
-  SF.AddrFrame.Offset := Ctx.Rbp;
+  SF.AddrFrame.Offset := SeedRbp;
   SF.AddrFrame.Mode   := AddrModeFlat;
-  SF.AddrStack.Offset := Ctx.Rsp;
+  SF.AddrStack.Offset := SeedRsp;
   SF.AddrStack.Mode   := AddrModeFlat;
 
   while StackWalk64(StackWalkMachineType, FProcess, TH, SF, @Ctx,
