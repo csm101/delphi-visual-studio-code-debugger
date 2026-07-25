@@ -62,6 +62,12 @@ type
     // way Delphi's 32-bit `register` convention expects, and reads the result
     // back out of EAX.
     [Test] procedure Win32_Evaluate_MatchesWin64;
+    // Stepping. Inherited from the architecture-neutral base, but it rides on
+    // SetThreadTrapFlag and the WOW64 single-step status code, both of which
+    // are 32-bit specific -- and STATUS_WX86_SINGLE_STEP was measured rather
+    // than assumed, so it deserves a test that actually steps.
+    [Test] procedure Win32_StepInto_LandsInTheCallee;
+    [Test] procedure Win32_StepOver_AdvancesWithinTheSameFrame;
   end;
 
   [TestFixture]
@@ -2461,6 +2467,75 @@ begin
   // same way: the getter must actually have produced a number.
   Assert.IsTrue(Eval64[High(Eval64)].Contains('84'),
     'the getter-backed property should evaluate to 84, got ' + Eval64[High(Eval64)]);
+end;
+
+procedure PumpUntilStop(Session: TDebugSession; TimeoutMs: Cardinal);
+begin
+  var Deadline := GetTickCount64 + TimeoutMs;
+  while (Session.State <> dsStopped) and (not Session.HasExited) and
+        (GetTickCount64 < Deadline) do
+    Session.Pump;
+end;
+
+procedure TWin32RunControlTests.Win32_StepInto_LandsInTheCallee;
+const
+  STEP_SOURCE = 'TestTargetCore.pas';
+begin
+  var CallSite := MarkerLineInFile(TargetDir + STEP_SOURCE, 'STEPIN_CALLSITE');
+  Assert.IsTrue(CallSite > 0, 'marker STEPIN_CALLSITE not found');
+
+  var Session := OpenSessionAtMarker(Win32Exe, Win32Map, Win32Rsm, TargetDir,
+    STEP_SOURCE, CallSite);
+  try
+    Assert.AreEqual(Ord(dsStopped), Ord(Session.State), 'did not stop at the call site');
+    Session.StepInto;
+    PumpUntilStop(Session, 30000);
+    Assert.AreEqual(Ord(dsStopped), Ord(Session.State),
+      'step-into produced no stop on a 32-bit target');
+
+    var FnName, SrcFile: string;
+    var StopLine: Integer;
+    Assert.IsTrue(Session.GetCurrentLocation(FnName, SrcFile, StopLine),
+      'no location after step-into');
+    Assert.IsTrue(FnName.Contains('StepIntoProbe'),
+      'step-into did not land in the callee, got: ' + FnName);
+  finally
+    Session.Free;
+  end;
+end;
+
+procedure TWin32RunControlTests.Win32_StepOver_AdvancesWithinTheSameFrame;
+const
+  STEP_SOURCE = 'TestTargetCore.pas';
+begin
+  var CallSite := MarkerLineInFile(TargetDir + STEP_SOURCE, 'STEPIN_CALLSITE');
+  Assert.IsTrue(CallSite > 0, 'marker STEPIN_CALLSITE not found');
+
+  var Session := OpenSessionAtMarker(Win32Exe, Win32Map, Win32Rsm, TargetDir,
+    STEP_SOURCE, CallSite);
+  try
+    var FnBefore, SrcBefore: string;
+    var LineBefore: Integer;
+    Assert.IsTrue(Session.GetCurrentLocation(FnBefore, SrcBefore, LineBefore),
+      'no location before the step');
+
+    Session.StepOver;
+    PumpUntilStop(Session, 30000);
+    Assert.AreEqual(Ord(dsStopped), Ord(Session.State),
+      'step-over produced no stop on a 32-bit target');
+
+    var FnAfter, SrcAfter: string;
+    var LineAfter: Integer;
+    Assert.IsTrue(Session.GetCurrentLocation(FnAfter, SrcAfter, LineAfter),
+      'no location after the step');
+    // Stepping OVER a call must stay in the caller and move on.
+    Assert.AreEqual(FnBefore, FnAfter,
+      'step-over left the frame it started in');
+    Assert.IsTrue(LineAfter <> LineBefore,
+      Format('step-over did not advance: still on line %d', [LineAfter]));
+  finally
+    Session.Free;
+  end;
 end;
 
 initialization
