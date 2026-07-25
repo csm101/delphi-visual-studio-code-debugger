@@ -37,6 +37,12 @@ rem External-TDS target: -VT emits debug info to a standalone .tds (no embedded
 rem .debug section) so TD32ReaderTests can exercise LoadFromTdsFile.
 dcc64 -$O- -VT -VN -E.\Win64\Debug -NU.\Win64\Debug TdsSample.dpr 2>&1
 if errorlevel 1 ( popd & echo FAILED: TdsSample & exit /b 1 )
+rem 32-bit build of the SAME sources for the Win32 target-support tests. The
+rem .cfg hardcodes -E/-NU to Win64\Debug and dcc lets the command line win, so
+rem these overrides redirect the output without forking the .cfg.
+if not exist Win32\Debug md Win32\Debug
+dcc32 -E.\Win32\Debug -NU.\Win32\Debug TestTarget.dpr 2>&1
+if errorlevel 1 ( popd & echo FAILED: TestTarget ^(Win32^) & exit /b 1 )
 popd
 
 echo.

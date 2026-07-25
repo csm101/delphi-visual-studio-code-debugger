@@ -11,6 +11,41 @@ uses
   DUnitX.TestFramework;
 
 type
+  // Win32 target support. Deliberately a SEPARATE fixture rather than a
+  // bitness subclass of TDebugSessionTests: most of those 49 tests inspect
+  // variables, which a 32-bit target cannot do yet, so subclassing would land a
+  // large block of red that says nothing. This fixture covers exactly what x86
+  // run control claims to do, and grows as capability lands.
+  //
+  // The 32-bit target is the SAME sources built with dcc32 (see
+  // build_target.bat), so any behavioural difference is the debugger's, not the
+  // fixture's.
+  [TestFixture]
+  TWin32RunControlTests = class
+  private
+    function RepoRoot: string;
+    function TargetDir: string;
+    function Win32Exe: string;
+    function Win32Map: string;
+    function Win32Rsm: string;
+    function Win64Exe: string;
+    function Win64Map: string;
+    function Win64Rsm: string;
+    function MarkerLine(const SourceBaseName, Marker: string): Integer;
+  public
+    // A breakpoint on a 32-bit target must bind and fire, and report the line
+    // the user asked for.
+    [Test] procedure Win32_Breakpoint_BindsAndFires;
+    // The call stack must unwind past the recursion into the caller chain --
+    // this is what StackWalk64 with IMAGE_FILE_MACHINE_I386 buys.
+    [Test] procedure Win32_CallStack_UnwindsPastRecursion;
+    // The strongest of the three: the SAME marker on both bitnesses must give
+    // the same function names in the same order. It catches a demangler
+    // regression, a stack-walk regression and a symbol-resolution regression
+    // without asserting any hardcoded name.
+    [Test] procedure Win32_StackFrameNames_MatchWin64;
+  end;
+
   [TestFixture]
   TDebugSessionTests = class
   private
@@ -2097,7 +2132,158 @@ begin
   end;
 end;
 
+{ ------------------------------------------------------ Win32 run control -- }
+
+function TWin32RunControlTests.RepoRoot: string;
+begin
+  Result := ExpandFileName(ExtractFilePath(ParamStr(0)) + '..\..\..\');
+end;
+
+function TWin32RunControlTests.TargetDir: string;
+begin
+  Result := RepoRoot + 'DebuggerTests\TestTarget\';
+end;
+
+function TWin32RunControlTests.Win32Exe: string;
+begin
+  Result := TargetDir + 'Win32\Debug\TestTarget.exe';
+end;
+
+function TWin32RunControlTests.Win32Map: string;
+begin
+  Result := TargetDir + 'Win32\Debug\TestTarget.map';
+end;
+
+function TWin32RunControlTests.Win32Rsm: string;
+begin
+  Result := TargetDir + 'Win32\Debug\TestTarget.rsm';
+end;
+
+function TWin32RunControlTests.Win64Exe: string;
+begin
+  Result := TargetDir + 'Win64\Debug\TestTarget.exe';
+end;
+
+function TWin32RunControlTests.Win64Map: string;
+begin
+  Result := TargetDir + 'Win64\Debug\TestTarget.map';
+end;
+
+function TWin32RunControlTests.Win64Rsm: string;
+begin
+  Result := TargetDir + 'Win64\Debug\TestTarget.rsm';
+end;
+
+function TWin32RunControlTests.MarkerLine(const SourceBaseName,
+  Marker: string): Integer;
+var
+  Lines: TStringList;
+begin
+  Result := 0;
+  Lines := TStringList.Create;
+  try
+    Lines.LoadFromFile(TargetDir + SourceBaseName);
+    var Tag := '{BP:' + Marker + '}';
+    for var I := 0 to Lines.Count - 1 do
+      if Lines[I].Contains(Tag) then
+        Exit(I + 1);
+  finally
+    Lines.Free;
+  end;
+end;
+
+const
+  W32_SOURCE = 'TestTargetEdge.pas';
+  W32_MARKER = 'RECURSION_BASE_BODY';
+
+procedure TWin32RunControlTests.Win32_Breakpoint_BindsAndFires;
+begin
+  Assert.IsTrue(FileExists(Win32Exe),
+    '32-bit target missing -- build_target.bat should have produced ' + Win32Exe);
+  var Line := MarkerLine(W32_SOURCE, W32_MARKER);
+  Assert.IsTrue(Line > 0, 'marker not found: ' + W32_MARKER);
+
+  var Session := OpenSessionAtMarker(Win32Exe, Win32Map, Win32Rsm, TargetDir,
+    W32_SOURCE, Line);
+  try
+    Assert.AreEqual(Ord(dsStopped), Ord(Session.State),
+      'a 32-bit target did not stop at its breakpoint');
+    var FnName, SrcFile: string;
+    var StopLine: Integer;
+    Assert.IsTrue(Session.GetCurrentLocation(FnName, SrcFile, StopLine),
+      'stopped but no location resolved');
+    Assert.AreEqual(W32_SOURCE, ExtractFileName(SrcFile), 'wrong source file');
+    Assert.AreEqual(Line, StopLine, 'stopped on the wrong line');
+  finally
+    Session.Free;
+  end;
+end;
+
+procedure TWin32RunControlTests.Win32_CallStack_UnwindsPastRecursion;
+begin
+  var Line := MarkerLine(W32_SOURCE, W32_MARKER);
+  Assert.IsTrue(Line > 0, 'marker not found: ' + W32_MARKER);
+  var Session := OpenSessionAtMarker(Win32Exe, Win32Map, Win32Rsm, TargetDir,
+    W32_SOURCE, Line);
+  try
+    Assert.AreEqual(Ord(dsStopped), Ord(Session.State), 'did not stop');
+    var Frames := Session.GetCallStack;
+    // The marker sits in the base case of a recursive function, so a walk that
+    // works reaches well past frame 0. A broken unwind yields one frame.
+    Assert.IsTrue(Length(Frames) >= 5,
+      Format('expected the recursion to unwind, got %d frame(s)', [Length(Frames)]));
+    // At least one frame above the top must be a NAMED frame from the target
+    // itself, not just ntdll padding.
+    var NamedInTarget := 0;
+    for var I := 1 to High(Frames) do
+      if (Frames[I].FunctionName <> '') and
+         SameText(ExtractFileExt(Frames[I].SourceFile), '.pas') then
+        Inc(NamedInTarget);
+    Assert.IsTrue(NamedInTarget >= 2,
+      Format('expected named caller frames with Pascal sources, got %d', [NamedInTarget]));
+  finally
+    Session.Free;
+  end;
+end;
+
+procedure TWin32RunControlTests.Win32_StackFrameNames_MatchWin64;
+
+  function NamesAt(const Exe, Map, Rsm: string; Line: Integer): TArray<string>;
+  begin
+    var Session := OpenSessionAtMarker(Exe, Map, Rsm, TargetDir, W32_SOURCE, Line);
+    try
+      Assert.AreEqual(Ord(dsStopped), Ord(Session.State),
+        'did not stop in ' + ExtractFileName(Exe));
+      Result := [];
+      for var F in Session.GetCallStack do
+        // Compare only the frames that belong to the target: the OS frames
+        // below differ legitimately between a native and a WOW64 process.
+        if SameText(ExtractFileExt(F.SourceFile), '.pas') or
+           SameText(ExtractFileExt(F.SourceFile), '.dpr') then
+          Result := Result + [F.FunctionName];
+    finally
+      Session.Free;
+    end;
+  end;
+
+begin
+  Assert.IsTrue(FileExists(Win64Exe), '64-bit control target missing');
+  var Line := MarkerLine(W32_SOURCE, W32_MARKER);
+  Assert.IsTrue(Line > 0, 'marker not found: ' + W32_MARKER);
+
+  var Names64 := NamesAt(Win64Exe, Win64Map, Win64Rsm, Line);
+  var Names32 := NamesAt(Win32Exe, Win32Map, Win32Rsm, Line);
+
+  Assert.IsTrue(Length(Names64) > 0, 'the 64-bit control produced no named frames');
+  Assert.AreEqual(Length(Names64), Length(Names32),
+    Format('frame counts differ: x64 %d vs x86 %d', [Length(Names64), Length(Names32)]));
+  for var I := 0 to High(Names64) do
+    Assert.AreEqual(Names64[I], Names32[I],
+      Format('frame %d name differs between bitnesses', [I]));
+end;
+
 initialization
   TDUnitX.RegisterTestFixture(TDebugSessionTests);
+  TDUnitX.RegisterTestFixture(TWin32RunControlTests);
 
 end.

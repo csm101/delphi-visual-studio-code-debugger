@@ -1204,7 +1204,18 @@ begin
   case Length(Parts) of
     0: Exit;
     1: InnerName := Parts[0];
-    2: InnerName := Parts[1];                       // unit + routine
+    2: begin
+         // A unit's initialization/finalization section is presented as the
+         // OWNING UNIT's name, not as the section keyword -- the same
+         // special case the Itanium demangler already makes, so a main block
+         // reads the same on both bitnesses. Without this, a 64-bit stack says
+         // `Testtarget` where a 32-bit one says `initialization`.
+         if SameText(Parts[1], 'initialization') or
+            SameText(Parts[1], 'finalization') then
+           InnerName := Parts[0]
+         else
+           InnerName := Parts[1];                   // unit + routine
+       end;
   else
     InnerName  := Parts[High(Parts)];               // unit + ... + class + method
     ParentName := Parts[High(Parts) - 1];
