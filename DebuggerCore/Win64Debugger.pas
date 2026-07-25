@@ -364,6 +364,31 @@ const
   IMAGE_FILE_MACHINE_I386    = USHORT($014C);
   EXCEPTION_ACCESS_VIOLATION: DWORD = $C0000005;
 
+  // A 32-bit (WOW64) target's traps surface under the WOW64 layer's OWN status
+  // codes, not the native ones: an INT3 arrives as $4000001F rather than
+  // EXCEPTION_BREAKPOINT ($80000003). A debug loop that tests only the native
+  // code misses every user breakpoint in a 32-bit target and leaves it spinning,
+  // re-dispatching its own trap forever.
+  //
+  // Deliberately UNTYPED constants: a typed constant is not a compile-time
+  // constant in Delphi and cannot appear as a `case` label.
+  STATUS_WX86_BREAKPOINT  = $4000001F;
+  STATUS_WX86_SINGLE_STEP = $4000001E;
+
+function IsBreakpointExceptionCode(Code: DWORD): Boolean; inline;
+begin
+  Result := (Code = DWORD(EXCEPTION_BREAKPOINT)) or (Code = DWORD(STATUS_WX86_BREAKPOINT));
+end;
+
+// Measured, not assumed: setting EFLAGS.TF on a WOW64 thread and continuing
+// yields $4000001E, not EXCEPTION_SINGLE_STEP. Stepping therefore needs the same
+// treatment as breakpoints -- without it every step in a 32-bit target falls
+// through to the generic exception path and the step never completes.
+function IsSingleStepExceptionCode(Code: DWORD): Boolean; inline;
+begin
+  Result := (Code = DWORD(EXCEPTION_SINGLE_STEP)) or (Code = DWORD(STATUS_WX86_SINGLE_STEP));
+end;
+
 // IsWow64Process2 (Windows 10+) reports the target's image machine directly:
 // a 32-bit (WOW64) process yields ProcessMachine = IMAGE_FILE_MACHINE_I386,
 // a native x64 process yields IMAGE_FILE_MACHINE_UNKNOWN. Resolved dynamically
@@ -1856,10 +1881,10 @@ begin
   ExcAddr := UInt64(Ev.Exception.ExceptionRecord.ExceptionAddress);
 
   case Code of
-    EXCEPTION_BREAKPOINT:
+    EXCEPTION_BREAKPOINT, STATUS_WX86_BREAKPOINT:
     begin
-      DapLog(Format('EXCEPTION_BREAKPOINT at $%x FirstBreak=%s',
-        [ExcAddr, BoolToStr(FFirstBreak, True)]));
+      DapLog(Format('EXCEPTION_BREAKPOINT ($%x) at $%x FirstBreak=%s',
+        [Code, ExcAddr, BoolToStr(FFirstBreak, True)]));
       if not FFirstBreak then begin
         FFirstBreak := True;
         ApplyAllBreakpoints;
@@ -2021,7 +2046,7 @@ begin
       ContinueDebugEvent(Ev.dwProcessId, Ev.dwThreadId, DBG_CONTINUE);
     end;
 
-    EXCEPTION_SINGLE_STEP:
+    EXCEPTION_SINGLE_STEP, STATUS_WX86_SINGLE_STEP:
     begin
       FStoppedTid := Ev.dwThreadId;
       SetTrapFlag(Ev.dwThreadId, False);
@@ -3119,7 +3144,7 @@ begin
         Continue;
       end;
       if (Ev.dwDebugEventCode = EXCEPTION_DEBUG_EVENT) and
-         (Ev.Exception.ExceptionRecord.ExceptionCode = EXCEPTION_BREAKPOINT) and
+         IsBreakpointExceptionCode(Ev.Exception.ExceptionRecord.ExceptionCode) and
          (UInt64(Ev.Exception.ExceptionRecord.ExceptionAddress) = FRemoteCallTrap) and
          (Ev.dwThreadId = FStoppedTid) then begin
         PostCtx := Default(TContext);
@@ -3147,7 +3172,7 @@ begin
       // surfaced (DAP has no nested-stop concept) and HitCount stays
       // untouched -- this is debugger-induced execution, not a program stop.
       if (Ev.dwDebugEventCode = EXCEPTION_DEBUG_EVENT) and
-         (Ev.Exception.ExceptionRecord.ExceptionCode = EXCEPTION_BREAKPOINT) then begin
+         IsBreakpointExceptionCode(Ev.Exception.ExceptionRecord.ExceptionCode) then begin
         var HitVA := UInt64(Ev.Exception.ExceptionRecord.ExceptionAddress);
         var BpIdx := FindBreakpointByVA(HitVA);
         if (BpIdx >= 0) and FBreakpoints[BpIdx].IsPlanted then begin
@@ -3167,7 +3192,7 @@ begin
       // Completion of a BP skip: the real instruction executed, re-plant the
       // INT3 so the breakpoint keeps working for normal execution.
       if (Ev.dwDebugEventCode = EXCEPTION_DEBUG_EVENT) and
-         (Ev.Exception.ExceptionRecord.ExceptionCode = EXCEPTION_SINGLE_STEP) then begin
+         IsSingleStepExceptionCode(Ev.Exception.ExceptionRecord.ExceptionCode) then begin
         var SkipVA: UInt64;
         if PendingSkips.TryGetValue(Ev.dwThreadId, SkipVA) then begin
           PendingSkips.Remove(Ev.dwThreadId);
