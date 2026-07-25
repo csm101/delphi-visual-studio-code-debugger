@@ -319,24 +319,83 @@ begin
   Result := 0;
 end;
 
-// Delphi's 32-bit `register` convention passes the first three arguments in
-// EAX/EDX/ECX with the rest pushed right to left, has no shadow space, and
-// returns floats on the x87 stack rather than in an SSE register. Refusing is
-// correct until that is implemented: the inherited x64 version would place
-// arguments in registers the callee never reads.
+{ ------------------------------------------------------- synthetic call ABI -- }
+
+// Delphi's 32-bit `register` convention: the first three arguments travel in
+// EAX, EDX and ECX in declaration order, and the rest go on the stack.
+//
+// The stack ORDER was taken from measurement, not documentation. PrologProbe
+// compiled an eight-parameter routine with dcc32 and found A/B/C spilled to
+// EBP-4/-8/-12 (the register three) and the remainder at D=+24, E=+20, F=+16,
+// G=+12, H=+8. H sitting closest to the return address means H was pushed
+// LAST, so the stack arguments are pushed left to right -- the opposite of
+// cdecl. Laying the frame out by hand, argument i of n therefore lands at
+// [ESP + 4 + 4*(n-1-i)].
+//
+// There is no shadow space and no 16-byte alignment requirement.
 function TWin32Debugger.PrepareSyntheticCall(TH: THandle; FuncVA: UInt64;
   const ArgValues: array of UInt64; const ArgIsFloat: array of Boolean;
   const SavedCtx: TContext): Boolean;
+var
+  Ctx: TWow64Context;
 begin
   Result := False;
+  // Floats do not travel in the integer registers on x86 and are returned on
+  // the x87 stack, neither of which this implements yet. Refuse rather than
+  // place a float where the callee will read an integer.
+  for var I := 0 to High(ArgIsFloat) do
+    if ArgIsFloat[I] then
+      Exit;
+
+  Ctx := Default(TWow64Context);
+  Ctx.ContextFlags := WOW64_CONTEXT_FULL;
+  if not Wow64GetThreadContext(TH, Ctx) then
+    Exit;
+
+  var StackArgs := Length(ArgValues) - 3;
+  if StackArgs < 0 then
+    StackArgs := 0;
+  // Return address plus the stack arguments, below the current stack pointer.
+  var Esp := (Ctx.Esp and not DWORD(3)) - DWORD(4 + 4 * StackArgs);
+  var Trap := RemoteCallTrap;
+  if Trap = 0 then
+    Exit;
+  var Trap32: Cardinal := Cardinal(Trap);
+  if not WriteMemoryAt(Esp, @Trap32, 4) then
+    Exit;
+  for var I := 3 to High(ArgValues) do begin
+    var Slot: Cardinal := Cardinal(ArgValues[I]);
+    var Addr := UInt64(Esp) + 4 + 4 * UInt64(High(ArgValues) - I);
+    if not WriteMemoryAt(Addr, @Slot, 4) then
+      Exit;
+  end;
+
+  Ctx.Esp := Esp;
+  Ctx.Eip := DWORD(FuncVA);
+  if Length(ArgValues) > 0 then Ctx.Eax := DWORD(ArgValues[0]);
+  if Length(ArgValues) > 1 then Ctx.Edx := DWORD(ArgValues[1]);
+  if Length(ArgValues) > 2 then Ctx.Ecx := DWORD(ArgValues[2]);
+  Ctx.EFlags := Ctx.EFlags and (not DWORD($100));   // clear TF
+  Result := Wow64SetThreadContext(TH, Ctx);
 end;
 
+// EAX carries the integer/pointer result. An Int64 comes back in EDX:EAX and a
+// floating-point result on the x87 stack; neither is reported yet, so a caller
+// asking for one gets the documented "unavailable" rather than the low half of
+// something larger presented as the whole answer.
 function TWin32Debugger.ReadSyntheticCallResult(TH: THandle;
   out IntResult, FloatResultLow: UInt64): Boolean;
+var
+  Ctx: TWow64Context;
 begin
   IntResult      := 0;
   FloatResultLow := 0;
-  Result := False;
+  Ctx := Default(TWow64Context);
+  Ctx.ContextFlags := WOW64_CONTEXT_FULL;
+  Result := Wow64GetThreadContext(TH, Ctx);
+  if not Result then
+    Exit;
+  IntResult := Ctx.Eax;
 end;
 
 end.

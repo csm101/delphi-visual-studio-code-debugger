@@ -2788,6 +2788,13 @@ begin
     Stripped := '_Z' + Copy(Stripped, 5, MaxInt);
   if DemangleItanium(Stripped, Inner, Parent) then
     Exit(Inner);
+  // dcc32 uses Borland mangling here too, so a member declared in a 32-bit
+  // target arrives as @Unit@TClass@Method. Only the member's OWN name is
+  // wanted -- the class it belongs to is already known from the record that
+  // contains it -- so the innermost component is the answer, exactly as the
+  // Itanium branch above returns Inner and discards Parent.
+  if DemangleBorland(Mangled, Inner, Parent) then
+    Exit(Inner);
   Result := Mangled;
 end;
 

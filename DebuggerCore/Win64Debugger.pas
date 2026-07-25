@@ -149,6 +149,10 @@ type
     // Visible to a per-architecture descendant: the virtual seam below plus the
     // handful of helpers it needs. Everything else stays private.
     function  ThreadHandle(TID: DWORD): THandle;
+    // Address of the one-byte INT3 page a synthetic call returns to. Allocated
+    // lazily by RunMethodCall before it hands over to PrepareSyntheticCall, so
+    // an override can rely on it being set.
+    function  RemoteCallTrap: UInt64;
   private
     function  FindBreakpointByVA(VA: UInt64): Integer;
     function  ReadFrameSize(EntryVA: UInt64): UInt32;
@@ -958,6 +962,11 @@ end;
 function TWinDebugger.StackWalkMachineType: DWORD;
 begin
   Result := IMAGE_FILE_MACHINE_AMD64;
+end;
+
+function TWinDebugger.RemoteCallTrap: UInt64;
+begin
+  Result := FRemoteCallTrap;
 end;
 
 // The "round N down to a multiple of 16" rule reflects the 8-byte alignment

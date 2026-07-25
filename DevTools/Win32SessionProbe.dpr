@@ -123,11 +123,31 @@ begin
           // level -- the one that actually walks the VMT field table -- is one
           // deeper than the object itself.
           if C.Expandable and (C.Handle <> 0) then
-            for var G in Session.GetChildren(C.Handle) do
+            for var G in Session.GetChildren(C.Handle) do begin
               Writeln(Format('        %-18s = %-34s [%s]', [G.Name, G.Value, G.TypeName]));
+              // A getter-backed property is deferred until expanded -- that is
+              // the step that actually runs a synthetic call in the debuggee,
+              // so it is the only way to exercise the calling convention.
+              if G.Expandable and (G.Handle <> 0) then
+                for var P in Session.GetChildren(G.Handle) do
+                  Writeln(Format('            %-14s = %-30s [%s]',
+                    [P.Name, P.Value, P.TypeName]));
+            end;
         end;
         Break;
       end;
+    // Expressions given on the command line after the marker. A getter-backed
+    // property is the sharpest test available of the calling convention: it
+    // hijacks the stopped thread, runs real code in the debuggee and reads back
+    // a result.
+    if ParamCount > 6 then begin
+      Writeln('evaluate:');
+      for var I := 7 to ParamCount do begin
+        var R := Session.Evaluate(ParamStr(I));
+        Writeln(Format('  %-24s => %-32s [%s]',
+          [ParamStr(I), R.Value, R.TypeName]));
+      end;
+    end;
   finally
     Session.Free;
   end;

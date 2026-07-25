@@ -482,8 +482,20 @@ begin
      SameText(TypeName, 'Cardinal') or SameText(TypeName, 'LongWord')  or
      SameText(TypeName, 'Single')   or SameText(TypeName, 'LongBool')  then
     Exit(4);
-  // Int64, UInt64, Double, string types, pointers -> 8 bytes
-  Result := 8;
+  // Genuinely 8 bytes on both architectures.
+  if SameText(TypeName, 'Int64')  or SameText(TypeName, 'UInt64')   or
+     SameText(TypeName, 'QWord')  or SameText(TypeName, 'Double')   or
+     SameText(TypeName, 'Currency') or SameText(TypeName, 'Comp')   or
+     SameText(TypeName, 'Extended') or SameText(TypeName, 'Real')   or
+     SameText(TypeName, 'TDateTime') or SameText(TypeName, 'TDate') or
+     SameText(TypeName, 'TTime') then
+    Exit(8);
+  // Everything else reaching here is a pointer-sized handle -- a string, class,
+  // interface, dynamic array or plain pointer -- or a type we could not
+  // identify. That is 4 bytes on a 32-bit target, where reading 8 folds the
+  // neighbouring slot into the high half and turns a valid string handle into
+  // an address outside the process.
+  Result := FDebugger.TargetLayout.PointerSize;
 end;
 
 // Recognises "array of X" and "TArray<X>" (with optional "System." prefix).
@@ -1537,9 +1549,9 @@ end;
 //      parent locals -- handled by `EvaluateName`.
 function TExprEvaluator.ApplyDot(const Base: TExprValue; const Field: string): TExprValue;
 
-  // Returns the Win64 ABI size (1, 2, 4, or 8) for a primitive Delphi type
-  // identified by its TypeKind plus optional TypeName. Strings, classes and
-  // dynamic arrays are 8-byte pointer-sized handles.
+  // Returns the storage size for a primitive Delphi type identified by its
+  // TypeKind plus optional TypeName. Strings, classes and dynamic arrays are
+  // pointer-sized handles, so their width follows the TARGET, not the host.
   function SizeForKind(K: Byte; const Name: string): Integer;
   begin
     case K of
@@ -1562,7 +1574,8 @@ function TExprEvaluator.ApplyDot(const Base: TExprValue; const Field: string): T
       TK_INT64: Exit(8);
       TK_STRING: Exit(1);   // ShortString first byte = length (caller-specific)
       TK_LSTRING, TK_USTRING, TK_WSTRING, TK_DYNARRAY, TK_CLASS,
-      TK_INTERFACE, TK_POINTER, TK_PROCEDURE, TK_VARIANT: Exit(8);
+      TK_INTERFACE, TK_POINTER, TK_PROCEDURE, TK_VARIANT:
+        Exit(FDebugger.TargetLayout.PointerSize);
     else
       Exit(PrimTypeSize(Name));
     end;

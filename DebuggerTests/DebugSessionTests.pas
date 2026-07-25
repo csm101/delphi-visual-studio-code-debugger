@@ -56,6 +56,12 @@ type
     // into the high half and yields an address outside its own range, so a
     // string field renders as a read failure rather than an error.
     [Test] procedure Win32_ObjectFields_MatchWin64;
+    // Expression evaluation, including a getter-backed property. That last one
+    // is the sharpest test of the calling convention available: it hijacks the
+    // stopped thread, runs real code in the debuggee with arguments placed the
+    // way Delphi's 32-bit `register` convention expects, and reads the result
+    // back out of EAX.
+    [Test] procedure Win32_Evaluate_MatchesWin64;
   end;
 
   [TestFixture]
@@ -2412,6 +2418,49 @@ begin
   Assert.IsTrue(SawNative,
     'expected a NativeUInt member in the expansion -- if TWidget changed, ' +
     'the bitness-dependent-type check above is no longer being exercised');
+end;
+
+procedure TWin32RunControlTests.Win32_Evaluate_MatchesWin64;
+const
+  OBJ_SOURCE = 'TestTargetCore.pas';
+  OBJ_MARKER = 'COMPUTE_BODY';
+  EXPRS: array[0..3] of string =
+    ('Self.Value',      // plain field
+     'Self.Name',       // string handle: a pointer-width read
+     'Self.Active',     // narrow ordinal
+     'Self.Score');     // getter-backed: runs a synthetic call in the debuggee
+
+  function EvalAll(const Exe, Map, Rsm: string; Line: Integer): TArray<string>;
+  begin
+    var Session := OpenSessionAtMarker(Exe, Map, Rsm, TargetDir, OBJ_SOURCE, Line);
+    try
+      Assert.AreEqual(Ord(dsStopped), Ord(Session.State),
+        'did not stop in ' + ExtractFileName(Exe));
+      Result := [];
+      for var E in EXPRS do begin
+        var R := Session.Evaluate(E);
+        Result := Result + [E + ' => ' + WithoutAddresses(R.Value) +
+                            ' [' + R.TypeName + ']'];
+      end;
+    finally
+      Session.Free;
+    end;
+  end;
+
+begin
+  var Line := MarkerLineInFile(TargetDir + OBJ_SOURCE, OBJ_MARKER);
+  Assert.IsTrue(Line > 0, 'marker not found: ' + OBJ_MARKER);
+
+  var Eval64 := EvalAll(Win64Exe, Win64Map, Win64Rsm, Line);
+  var Eval32 := EvalAll(Win32Exe, Win32Map, Win32Rsm, Line);
+
+  for var I := 0 to High(Eval64) do
+    Assert.AreEqual(Eval64[I], Eval32[I],
+      'expression result differs between bitnesses');
+  // Guard against the whole comparison passing because BOTH sides failed the
+  // same way: the getter must actually have produced a number.
+  Assert.IsTrue(Eval64[High(Eval64)].Contains('84'),
+    'the getter-backed property should evaluate to 84, got ' + Eval64[High(Eval64)]);
 end;
 
 initialization
