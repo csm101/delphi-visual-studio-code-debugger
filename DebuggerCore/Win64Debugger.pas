@@ -1677,14 +1677,28 @@ procedure TWinDebugger.WarnIfUnsupportedTargetArchitecture;
   end;
 
 begin
-  if not TargetIsWow64 then
+  // The debugger class was chosen from the on-disk PE header before the process
+  // existed, because IsWow64Process2 needs a live handle and cannot answer until
+  // now -- far too late to pick a class. This is the other half of that bargain:
+  // the first moment the live process CAN be asked, check that it agrees with
+  // what was built. Agreement is the normal case and says nothing.
+  var LiveIs32  := TargetIsWow64;
+  var BuiltIs32 := not TargetLayout.Is64Bit;
+  if LiveIs32 = BuiltIs32 then
     Exit;
-  DapLog('Unsupported target: 32-bit (WOW64) process. This debugger is Win64 only.');
+  var Live:  string := '64-bit';
+  if LiveIs32 then Live := '32-bit (WOW64)';
+  var Built: string := '64-bit';
+  if BuiltIs32 then Built := '32-bit';
+  DapLog(Format('Architecture mismatch: the running process is %s but the ' +
+    'debugger was built for a %s target.', [Live, Built]));
   if not Assigned(FOnOutput) then
     Exit;
-  FOnOutput('[FATAL] Target process is 32-bit (WOW64). This debugger supports Win64 targets only.');
-  FOnOutput('        Call stacks, breakpoints and variables will NOT resolve for a 32-bit target.');
-  FOnOutput('        Fix: debug the Win64 build -- host bin64\bds.exe and the module map/rsm from the Bpl\Win64 folder.');
+  FOnOutput(Format('[FATAL] Architecture mismatch: the running process is %s, ' +
+    'but this session was set up for a %s target.', [Live, Built]));
+  FOnOutput('        Breakpoints, call stacks and variables will not resolve. The ' +
+            'architecture is chosen from the executable''s PE header, so this ' +
+            'means the launched image is not the one that was inspected.');
 end;
 
 procedure TWinDebugger.HandleCreateProcess(const Ev: TDebugEvent);

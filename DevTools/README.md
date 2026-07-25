@@ -246,6 +246,25 @@ procedure index, in both directions, and also dumps sample locals and globals.
 Reach for this when locals resolve under one reader but not the other: any name
 TD32 emits that RSM does not recognize fails the locals lookup downstream.
 
+#### Td32ProcNesting
+
+```bat
+DevTools\Win64\Debug\Td32ProcNesting.exe Win64\Debug\Debugme.exe [name-substring]
+```
+
+Answers whether the TD32 symbol stream expresses nested (inner) procedures as a
+lexical scope — an `LPROC32` / `GPROC32` opened while another proc scope is
+still open — and/or through the CodeView `pParent` back-pointer. This is the
+architecture-neutral alternative to the MAP-based mechanism, which recovers
+nesting by correlating `_ZZ…$pdata$…` mangled exception publics and therefore
+only works where the compiler emits `.pdata` (x64).
+
+The probe asserts nothing: it walks every symbol stream keeping a scope stack
+and reports, per procedure record, the depth, the enclosing procedure implied by
+the stack, and the raw `pParent` field. With no filter it prints only the
+aggregate counts. Works on PE32 and PE32+ images regardless of its own bitness —
+nothing in the TD32 container is pointer-sized.
+
 ### MAP files
 
 #### CompareMapTD32
@@ -286,6 +305,24 @@ a `0x` / `$` prefix). Reach for this to interpret stack frames dumped by
 WinDbg/cdb, which show Delphi binaries as huge offsets from the single
 `_dbk_fcall_wrapper` export. The MAP is loaded at the preferred base
 `$400000`, so pass RVAs, not runtime VAs.
+
+#### MapSegBaseProbe
+
+```bat
+DevTools\Win64\Debug\MapSegBaseProbe.exe Win64\Debug\Debugme.exe Win64\Debug\Debugme.map [seg:offset ...]
+```
+
+Determines how a MAP's segment table must be converted into image RVAs, and
+**verifies** the result against the PE section table: it reads however many hex
+digits the `Start` column actually has (8 for PE32, 16 for PE32+), derives
+`LinearStart − ImageBase`, then looks for a PE section whose `VirtualAddress`
+equals that value and whose name equals the MAP's `Name` column. That identity
+check is what makes the answer trustworthy on a platform whose constants are not
+known in advance.
+
+It also replays the old fixed-16-hex-digit parse, so the two can be compared
+side by side. Reach for this when MAP-derived addresses are off by a constant,
+or when adding support for a new image format.
 
 ### PE / raw binary
 
@@ -346,6 +383,27 @@ DevTools\Win64\Debug\PrologProbe.exe -q     REM decodes only, no raw hex
 ```
 
 Takes no target: the binary under inspection is itself.
+
+#### VmtProbe
+
+```bat
+DevTools\Win64\Debug\VmtProbe.exe        REM full dump
+DevTools\Win64\Debug\VmtProbe.exe -q     REM omit the raw VMT window dumps
+```
+
+Locates the Delphi VMT metadata slot offsets empirically, by searching the
+−256..0 byte window in front of a live VMT for every offset that satisfies an
+identity predicate whose ground truth comes from the compiler rather than from
+any `vmt*` constant: the class reference **is** the VMT address (SelfPtr); a
+compile-time string literal (ClassName); the parent class reference (Parent);
+the `TypeInfo()` intrinsic (TypeInfo); the declared field layout (InstanceSize);
+and declared published fields (FieldTable). Every matching offset is reported,
+not just the first.
+
+Like `PrologProbe` it must be compiled with **both** `dcc32` and `dcc64`: the
+`dcc64` column has to reproduce the values already in `TargetLayout.pas` before
+the `dcc32` column can be trusted. Takes no target — the binary under inspection
+is itself.
 
 ### JCL and TDS debug info
 
@@ -427,47 +485,68 @@ classifies it with `IsWow64Process2`, then walks the stopped thread with
 target, or `IMAGE_FILE_MACHINE_AMD64` + `TContext` for a native one — the same
 code path, so a run against a known-good x64 executable validates the harness.
 
-Arguments: `<exe> [-rva <hex>] [-maxstops <n>]`. With `-rva` the probe plants an
-INT3 at `ImageBase + RVA` and walks there, giving an application-code stack
-instead of the loader's. Each stop is walked three ways — dbghelp invade-only,
-dbghelp with every module explicitly registered via `SymLoadModuleExW`, and with
-no dbghelp callbacks at all — which separates "`StackWalk64` cannot do this"
-from "dbghelp was not told about the modules".
+Arguments: `<exe> [-rva <hex>] [-maxstops <n>] [-step] [-nopatch]`. With `-rva`
+the probe plants an INT3 at `ImageBase + RVA` and walks there, giving an
+application-code stack instead of the loader's. `-step` sets EFLAGS.TF through
+`Wow64SetThreadContext` and reports which exception code the resulting single
+step raises. `-nopatch` walks with the INT3 still planted, which corrupts an
+i386 walk — an artificial state the adapter is never in, since it restores the
+byte and rewinds the program counter before any walk.
+
+Each stop is walked three ways — dbghelp invade-only, dbghelp with every module
+explicitly registered via `SymLoadModuleExW`, and with no dbghelp callbacks at
+all — which separates "`StackWalk64` cannot do this" from "dbghelp was not told
+about the modules".
 
 `run_wow64probe.bat <logfile> <exe> [args]` runs it with output tee'd to a file,
 so partial progress is visible while the probe is still running.
 
-**Findings so far (recorded here because they shape the Win32 port):**
+This probe established the WOW64 facts the adapter is built on — the exception
+codes, the unwindability of the first stop, and that dbghelp contributes nothing
+to an i386 walk. They are recorded in "Target architecture" in
+`DAP_DEBUGGER_ARCHITECTURE.md`; re-run the probe to re-measure them rather than
+trusting either document.
 
-- A 64-bit debugger **does** unwind a WOW64 target correctly:
-  `IMAGE_FILE_MACHINE_I386` with a `TWow64Context` passed by pointer works
-  directly; no native `CONTEXT` translation is needed.
-- A 32-bit `INT3` is reported to a 64-bit debugger as
-  `STATUS_WX86_BREAKPOINT` (`$4000001F`), **not** `EXCEPTION_BREAKPOINT`
-  (`$80000003`). A debug loop that only tests `$80000003` never sees a user
-  breakpoint in 32-bit code and re-dispatches it forever.
-- The initial `$80000003` breakpoint of a WOW64 target arrives while the 32-bit
-  side has `EBP = 0` and is not yet unwindable; the usable 32-bit loader stop is
-  the later `$4000001F` one.
-- dbghelp contributes nothing to the i386 walk of a Delphi target
-  (`FuncTableEntry` is nil in every frame, and the no-callback walk is
-  byte-identical), so the result rests on `StackWalk64`'s built-in frame-pointer
-  chain plus its first-frame `[ESP]` heuristic.
+#### Win32SessionProbe
+
+```bat
+DevTools\Win64\Debug\Win32SessionProbe.exe ^
+  DebuggerTests\TestTarget\Win32\Debug\TestTarget.exe ^
+  DebuggerTests\TestTarget\Win32\Debug\TestTarget.map ^
+  DebuggerTests\TestTarget\Win32\Debug\TestTarget.rsm ^
+  DebuggerTests\TestTarget TestTargetEdge.pas RECURSION_BASE_BODY
+```
+
+Drives a real `TDebugSession` end to end and reports what happened: whether the
+breakpoint bound, whether it fired, where the session stopped, what the call
+stack looks like, and the frame's locals, their expansion and an evaluation.
+Arguments: `<exe> <map> <rsm> <sourceRoot> <sourceBaseName> <marker>`, where
+`<marker>` is the text inside a `{BP:…}` tag in the source file.
+
+Nothing in it is 32-bit specific, and that is the point: pointed at a 64-bit
+target it exercises exactly the same path, so the two runs are directly
+comparable and a difference between them is a real difference rather than an
+artefact of testing them differently. The adapter picks `TWinDebugger` or
+`TWin32Debugger` from the target's PE header, so the probe needs no switch of
+its own.
 
 ## Source layout
 
 | File | Purpose |
 |------|---------|
-| `<Tool>.dpr` | One self-contained entry point per tool; there are 24 of them and no shared units other than `RsmReader.pas` |
+| `<Tool>.dpr` | One self-contained entry point per tool; there are 31 of them and no shared units other than `RsmReader.pas` |
 | `RsmReader.pas` | Standalone binary RSM analyzer, used only by `RsmAnalyzer` (separate from `DebuggerCore\RsmFileReader.pas`, which is the parser the adapter actually ships) |
 | `build_all.bat` | Builds every `*.dpr` in this folder |
 | `build_one.bat` | Builds a single tool, optionally into a private output directory |
+| `build_wow64stackprobe.bat` | Builds only `Wow64StackProbe` (64-bit by construction: the probe *is* the 64-bit debugger side) |
+| `run_wow64probe.bat` | Runs `Wow64StackProbe` with its output tee'd to a log file |
 | `devtool.bat` | Runs a built tool from `Win64\Debug` |
 | `..\setpaths.bat` | Resolves the JCL / DUnitX source roots |
 
 The tools that exercise the debugger's parsers reference the shared engine
 units in `..\DebuggerCore\` (`RsmFileReader.pas`, `TD32FileReader.pas`,
-`MapFileReader.pas`, `DebugInfoTypes.pas`) via relative paths in their `uses`
+`MapFileReader.pas`, `DebugInfoTypes.pas`, and for `Win32SessionProbe` the
+whole `DebugSession.pas` facade) via relative paths in their `uses`
 clauses, so they always test the current version of the code the adapter ships.
 `build_all.bat` and `build_one.bat` pass `-U..\DebuggerCore` to resolve the
 transitive dependencies.

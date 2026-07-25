@@ -179,6 +179,10 @@ Key flags that must be active when compiling the program you want to debug:
 
 For `Debugme` these are set in `Debugme.cfg` (one per line, without the leading `-`).
 
+The same flags apply to a 32-bit target built with `dcc32`, where `-$O-` is not
+merely advisable: without a frame pointer, locals and parameters cannot be
+resolved at all.
+
 ### Optional: JCL debug-info support
 
 The adapter can additionally read **JCL** (JEDI Code Library) debug data — the
@@ -728,7 +732,9 @@ symbol resolution reaches both.
 | `DebuggerCore\DapProtocol.pas` | DAP framing: `Content-Length` header, JSON send/receive, logging |
 | `VisualStudioCodeDelphiDebugger\DapServer.pas` | DAP request dispatcher: launch, setBreakpoints, stackTrace, next, continue… |
 | `DebuggerCore\DebugTarget.pas` | `IDebugTarget` abstraction shared by the DAP layer and the evaluator |
-| `DebuggerCore\Win64Debugger.pas` | Windows x64 debug loop: `WaitForDebugEvent`, INT3 plant/remove, single-step, synthetic calls |
+| `DebuggerCore\Win64Debugger.pas` | Windows debug loop: `WaitForDebugEvent`, INT3 plant/remove, single-step, synthetic calls (also the x64 implementation of the architecture seam) |
+| `DebuggerCore\WinDebuggerX86.pas` | The same debugger against a 32-bit (WOW64) target: WOW64 thread context, i386 stack walk, x86 prologue decode and call ABI |
+| `DebuggerCore\TargetLayout.pas` | The debuggee's own pointer size, dynamic-array header and VMT slot offsets — the adapter's `SizeOf(Pointer)` describes the adapter |
 | `DebuggerCore\TD32FileReader.pas` | Borland TD32 reader for the `.debug` PE section: source lines, symbols, types |
 | `DebuggerCore\RsmFileReader.pas` | Reverse-engineered Delphi `.rsm` reader for type / local / global metadata |
 | `DebuggerCore\MapFileReader.pas` | Parses Delphi `.map` files, translates RVA ↔ source line (nested-proc linkage, fallback) |
@@ -753,6 +759,7 @@ At runtime the adapter compares the debuggee's actual `ImageBase` (from `CREATE_
 
 ## What works
 
+- [x] 64-bit **and** 32-bit (WOW64) targets from the same adapter binary — the debugger class is chosen from the target's PE header (32-bit locals and parameters require a `-$O-` build; see [Known limitations](#known-limitations))
 - [x] Launch (Windows Debug API, `DEBUG_ONLY_THIS_PROCESS`)
 - [x] Attach to a running process (`request: attach`, requires SeDebugPrivilege; auto-elevates when possible)
 - [x] Stop at entry point (`stopAtEntry: true`)
@@ -799,7 +806,7 @@ Debugger features:
 
 - [ ] Child process tracking (currently `DEBUG_ONLY_THIS_PROCESS` only)
 - [ ] Disassembly view (DAP `disassemble` request)
-- [ ] 32-bit (Win32) targets
+- [ ] On a 32-bit target: locals in optimised (`-$O+`) builds, and float / `Int64` results from expressions that call into the debuggee
 
 Variable / type system:
 
@@ -823,7 +830,13 @@ Project / packaging:
   limited.
 - **Single process**: only `DEBUG_ONLY_THIS_PROCESS` is used. Child processes launched by the debuggee are not tracked.
 - **Whole-process stops**: the process stops as a unit — there is no "freeze one thread and let the others run". Stepping does target the thread you selected (the others are suspended for the duration of the step), and any thread's call stack and variables can be inspected.
-- **x64 only**: the Win64 calling convention and stack layout are assumed throughout.
+- **32-bit targets need an unoptimised build for variables**: a WOW64 target is
+  debugged by the same 64-bit adapter, and run control (breakpoints, stepping,
+  call stacks) works either way. Locals and parameters, however, are read from
+  frame-pointer-relative offsets, and `dcc32 -$O+` omits the frame pointer
+  routinely — so compile a 32-bit debug target with `-$O-`. Expressions that
+  call a method or property getter in a 32-bit debuggee also cannot yet pass
+  floating-point arguments or return floating-point / `Int64` results.
 
 ---
 

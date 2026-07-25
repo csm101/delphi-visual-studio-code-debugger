@@ -10,6 +10,11 @@ captures the parts of the format we have actually validated against
 useful precisely because its scale exposes encoding details TestTarget
 glosses over).
 
+The container is not pointer-sized: the reader parses `dcc32` (PE32) output
+**unmodified**, and `Td32ProcNesting` works on PE32 and PE32+ alike regardless
+of its own bitness. The one thing that does differ per compiler is name
+mangling — see "Borland demangler" below.
+
 ## Container layout
 
 1. PE section `.debug` (raw offset taken from the section header).
@@ -341,6 +346,90 @@ Beyond the basic `_ZN ... E` shape, the demangler now handles:
 - Borland's `_ZTR` / `_ZTI` / `_ZTS` / `_ZTV` / `_ZTT` prefixes are
   stripped before parsing the embedded name (typeref / typeinfo /
   type-name string / vtable / VTT respectively).
+
+### Borland demangler (what `dcc32` emits) — confirmed
+
+`dcc64` mangles Itanium-style; `dcc32` mangles **Borland-style**, and the two
+never mix inside one image. `TTD32FileReader.DemangleBorland` handles the two
+shapes observed in `dcc32` output:
+
+```
+@Testtargetedge@EdgeFactorial$qqri      unit + routine
+@Forms@TApplication@Run$qqrv            unit + class + method
+```
+
+The `$` introduces the parameter encoding (`$qqr…`) and carries no name, so the
+name ends there. It is tried **only after** the Itanium demangler declines, so
+nothing about the x64 path changes.
+
+Presentation deliberately mirrors the Itanium demangler rather than inventing
+its own, because a 32-bit call stack must read identically to a 64-bit one — a
+difference between them then means something:
+
+- the unit prefix is dropped for a plain routine (`EdgeFactorial`);
+- a method keeps its `Class.Method` form (`TApplication.Run`);
+- a unit's `initialization` / `finalization` section is presented as the
+  **owning unit's** name, the same special case the Itanium branch already
+  makes. Without it the program main block reads `initialization` on x86 where
+  x64 shows the unit name.
+
+Confirmed by comparing the same recursive stack on both bitnesses name for name
+(`Win32_StackFrameNames_MatchWin64`, which caught the missing
+`initialization` case on its first run).
+
+Three call sites, because Borland mangling is not confined to procedure names:
+
+| Site | What it demangles |
+|---|---|
+| the procedure-record decode | routine / method names in the symbol stream |
+| `GetTypeName` | **type** names — a 32-bit target otherwise shows `@Testtargetcore@TWidget` |
+| `DecodeFriendlyTypeName` | class **member** names (the innermost component is the answer; the owning class is already known from the record that contains it) |
+
+The type-name index registers **both** spellings, mangled and demangled.
+Callers hold the source name — from a runtime VMT, from the `.rsm`, or from a
+user's watch expression — while the stored one is mangled, so registering only
+the clean form would break every lookup.
+
+## Runtime VMT slot offsets per target bitness — confirmed
+
+The adapter reads a live VMT to recover a class identity, so it needs the slot
+offsets of the **target**, not of itself. They are measured, not taken from
+`System.pas`, whose formula does not describe what the Athens compiler emits
+(see also the Win64 note in `PROJECT_STATE.md`). `DevTools\VmtProbe.dpr`
+searches the −256..0 window in front of a live VMT for offsets satisfying an
+identity predicate the compiler can verify (the class reference **is** the VMT
+address; `ClassName` against a compile-time literal; `InstanceSize` against the
+declared field layout; `TypeInfo` against the `TypeInfo()` intrinsic), and is
+compiled with both `dcc32` and `dcc64` so the `dcc64` column has to reproduce
+the values already in the shipping code before the `dcc32` column is trusted.
+No 32-bit constant is a scaled 64-bit one.
+
+| Slot | Win32 | Win64 |
+|---|---:|---:|
+| SelfPtr | −88 | −176 |
+| TypeInfo | −72 | −168 |
+| FieldTable | −68 | −160 |
+| ClassName | −56 | −112 |
+| InstanceSize | TypeInfo + 20 | TypeInfo + 40 |
+| CPP_ABI shift | 0 | 24 |
+
+Two consequences that are easy to get wrong:
+
+- **A VMT slot is one TARGET pointer wide.** Reading a fixed 8 bytes on a
+  32-bit target splices the adjacent slot into the high half and yields a
+  plausible address pointing nowhere — a credible wrong value rather than an
+  error. The same applies to the VMT pointer read from the object itself, which
+  is its first field.
+- **The CPP_ABI shift is 0 on Win32.** On Win64 two layouts coexist in one
+  image (RTL units built with `CPP_ABI_SUPPORT` shift every negative slot by
+  24), so the reader probes two self-pointer positions to decide which layout a
+  VMT follows. `CPP_ABI_SUPPORT` is defined for WIN64/EXTERNALLINKER only, so on
+  Win32 that detection collapses to a no-op instead of a second read that could
+  never match.
+
+The numbers live in `DebuggerCore\TargetLayout.pas` (`TTargetLayout.For32Bit` /
+`For64Bit`), which is the source of truth; the table above records what was
+measured and how.
 
 ## Pointer-to-class display convention
 

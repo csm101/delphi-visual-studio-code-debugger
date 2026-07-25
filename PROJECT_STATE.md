@@ -32,10 +32,24 @@ VS Code  ── DAP (JSON over stdio) ──>  VisualStudioCodeDelphiDebugger.ex
   `TBpSpec`, `TCommand`, callback signatures). DapServer + ExprEval
   talk only to `IDebugTarget`; concrete back-ends register themselves
   by implementing it.
-- `DebuggerCore\Win64Debugger.pas`: Windows x64 debug loop, INT3 plant/remove,
+- `DebuggerCore\Win64Debugger.pas`: Windows debug loop, INT3 plant/remove,
   single-step, thread context hijack for synthetic remote calls,
   StackWalk64-based unwinding. `TWinDebugger = class(TInterfacedObject,
-  IDebugTarget)` — lifetime managed by the interface refcount.
+  IDebugTarget)` — lifetime managed by the interface refcount. Architecture
+  neutral except for a virtual seam, of which it is also the x64
+  implementation.
+- `DebuggerCore\WinDebuggerX86.pas`: `TWin32Debugger = class(TWinDebugger)` —
+  debugs a 32-bit (WOW64) target from the same 64-bit adapter. Overrides only
+  the seam (target layout, stack-walk machine type, WOW64 thread context,
+  prologue decode, offset bases, synthetic-call ABI) and inherits the event
+  loop, breakpoints, stepping, module handling and the synthetic-call pump.
+  The class is chosen in `TDebugSession.BuildAndWireDebugger` from the target
+  PE's `IMAGE_FILE_HEADER.Machine`. See "Target architecture" in
+  `DAP_DEBUGGER_ARCHITECTURE.md`.
+- `DebuggerCore\TargetLayout.pas`: `TTargetLayout` — the DEBUGGEE's pointer
+  size, dynamic-array header shape and VMT slot offsets, as a plain data
+  record (a virtual call per pointer would shatter bulk reads into syscalls).
+  `SizeOf(Pointer)` describes the adapter, not the process being decoded.
 - `DebuggerCore\MapFileReader.pas`: parses Delphi `.map`, RVA <-> source line.
   Still used for nested-procedure parent linkage (`_ZZ` mangled publics) and as
   a secondary line/function provider. BPL candidate detection no longer depends on MAP.
@@ -88,7 +102,7 @@ VS Code  ── DAP (JSON over stdio) ──>  VisualStudioCodeDelphiDebugger.ex
 - `DebuggerTests\`: DUnitX integration test suite. Launches the adapter,
   exercises BPs / locals / step / globals / evaluate.
   Run with `cmd /c "C:\Athens\GitHub\Win64Debugger\DebuggerTests\build_and_run.bat"`.
-  Current status: **822 found / 820 pass / 2 ignored / 0 fail.**
+  Current status: **958 found / 956 pass / 0 fail / 0 leaked / 2 ignored.**
   Attach/detach tests self-skip when SeDebugPrivilege
   isn't held; run elevated to exercise them. The count includes the TD32
   + RSM reader unit tests (`TD32ReaderTests`, `RsmReaderTests`), the
@@ -109,6 +123,21 @@ VS Code  ── DAP (JSON over stdio) ──>  VisualStudioCodeDelphiDebugger.ex
     (program-main-block RSM inline locals at `MAIN_*` markers, attach) self-skip
     under `tsBpl` via `SkipIfBpl` / a `StartSession` auto-skip. Build of the
     host+BPL is wired into `build_and_run.bat` via `build_host.bat`.
+  - **Win32 coverage (`TWin32RunControlTests`).** `build_target.bat`,
+    `build_host.bat` and `build_package.bat` also produce
+    `TestTarget\Win32\Debug\` and 32-bit `TestSubject.bpl` / `TestHost.exe`
+    from the SAME sources via `dcc32` — a behavioural difference is then the
+    debugger's, not the fixture's. The `.cfg` files are not forked: `dcc` reads
+    the config first and the command line second and the last `-E` / `-NU` /
+    `-LE` / `-LN` wins, so the output is redirected by override rather than by
+    a duplicate config that would go stale unnoticed. Deliberately a separate
+    fixture, not a bitness subclass of `TDebuggerTests`: most of those tests
+    assume features that arrived incrementally, so subclassing would have
+    landed a large block of red that communicates nothing. Where a value
+    legitimately differs per bitness (`NativeUInt`, addresses) the tests
+    compare the SHAPE against the 64-bit control, and assert the difference
+    where it is real — with a guard that fails if the member disappears from
+    the fixture, so the check cannot go vacuous.
   - **`RUNTESTS_ONLY` env var** filters `RunTests.exe` to tests whose full name
     contains the substring (case-insensitive), for fast iteration on a subset
     instead of the full doubled suite. Inert when unset; full-suite behavior is
@@ -143,6 +172,23 @@ IDE integration:
 
 ## Implemented features
 
+Target architecture:
+- **Win32 (32-bit / WOW64) targets — SHIPPED.** One 64-bit adapter binary
+  debugs both bitnesses; a 64-bit process can debug a 32-bit one, and the
+  reverse is impossible. Working on a 32-bit target and verified against the
+  64-bit control: launch, breakpoint binding and firing (including deferred
+  binding into a not-yet-loaded package), stepping (into / over), stack unwind
+  past recursion with demangled Pascal names and source lines, locals and
+  parameters, object expansion (fields, strings, nil references), expression
+  evaluation including getter-backed properties (which means the debugger
+  hijacks the stopped thread and runs code in the debuggee), and the multi-BPL
+  case — a breakpoint inside a runtime package, unwinding across the module
+  boundary into the host.
+- **Limitation:** Win32 locals and parameters are supported for `-$O-` builds
+  only; `-$O+` omits the frame pointer routinely. A Win32 synthetic call also
+  refuses float arguments outright, and reports neither float nor Int64 results
+  (see `KNOWN_UNKNOWNS.md`).
+
 Stepping / control:
 - Launch with `DEBUG_ONLY_THIS_PROCESS`, optional `stopAtEntry`.
 - Launch (CreateProcess + DEBUG_ONLY_THIS_PROCESS, hidden console) and
@@ -150,14 +196,17 @@ Stepping / control:
   via AdjustTokenPrivileges if available). Disconnect mode configurable
   via launch.json `killOnDetach` (default False for attach,
   always-true for launch).
-- Unsupported-architecture guard: at CREATE_PROCESS_DEBUG_EVENT the target's
-  image machine is read via `IsWow64Process2` (fallback `IsWow64Process`). A
-  32-bit (WOW64) target emits a clear `[FATAL]` console message
-  (`WarnIfUnsupportedTargetArchitecture` in `Win64Debugger.pas`) instead of
-  silently producing unresolvable call stacks — `StackWalk64` on a WOW64
-  process walks the x64 emulation side (wow64.dll / wow64cpu.dll / ntdll),
-  never the real 32-bit Delphi frames. The session is not killed (the host may
-  be the IDE); the message is advisory. Win32 targets remain unsupported.
+- Architecture check at CREATE_PROCESS_DEBUG_EVENT: the target's image machine
+  is read via `IsWow64Process2` (fallback `IsWow64Process`). It predates Win32
+  support and is now only meaningful as an assertion that the live process
+  agrees with the class chosen from the on-disk PE header — the debugger class
+  itself is selected earlier, in `TDebugSession.BuildAndWireDebugger`, because
+  `IsWow64Process2` cannot answer until the process exists. **Stale:** the
+  advisory `[FATAL]` text it prints
+  (`WarnIfUnsupportedTargetArchitecture` in `Win64Debugger.pas`) still says a
+  32-bit target is unsupported and its stacks will not resolve, which is no
+  longer true. Nothing depends on the message; it should be rewritten or
+  dropped.
 - Source-line breakpoints from VS Code gutter, accurate verification state.
 - Step over (F10), step into (F11, walks until next source line),
   step out (Shift+F11, uses `StackWalk64` for caller resume RIP).
@@ -428,7 +477,12 @@ Debugger features:
 - PE import-table reader so MAP can be dropped entirely.
 - Child process tracking.
 - Disassembly view (DAP `disassemble`).
-- Win32 (32-bit) targets.
+- Win32 (32-bit) targets — **DONE**. Run control, locals, object expansion,
+  evaluation and the multi-BPL case all work on a WOW64 target from the same
+  64-bit adapter binary. See "Target architecture" under Implemented features
+  and in `DAP_DEBUGGER_ARCHITECTURE.md`; what is still open (x86 float / Int64
+  synthetic-call results, `-$O+` locals, Win32 TLS segment bases) is in
+  `KNOWN_UNKNOWNS.md`.
 - Per-thread STEPPING / run-control — **DONE** (step over/into/out target the
   DAP/MCP-selected thread; read-only per-thread inspection was already done).
   Synthetic-call evaluation still targets `FStoppedTid` (frame-independent, so
@@ -594,6 +648,59 @@ Architecture / portability:
 
 ## Important technical discoveries
 
+- **Host and target pointer size are not the same thing (2026-07-25).** On x64
+  they coincide, so every site that conflates them is correct *by accident*.
+  Pointing the debugger at a different bitness found three such sites that
+  nothing else would have: the `$ActRec` closure scan and the `Self` stack scan
+  strode target memory by the host's `SizeOf(Pointer)`; `LocalReadSize` returned
+  8 for everything "pointer-sized or unknown"; and `ExprEval`'s own read path
+  (`PrimTypeSize` / `SizeForKind`) did the same, independently, so a string
+  handle read 8 bytes and rendered as a read failure. The failure mode is
+  consistent and nasty: the neighbouring slot is spliced into the high half and
+  the result is a *plausible* wrong value, not an error. The width rule now
+  lives in one place, `LocalReadSize` in `DelphiValueReaders`, and the strides
+  come from `TTargetLayout`.
+- **Three latent x64 defects found while building Win32 support (2026-07-25),
+  all independent of it:**
+  1. The byte-pattern prologue matcher was blind to the x64 stack-probe loop
+     emitted for frames larger than a page (`push rbp` then `B8 <size>`, not
+     `sub rsp`), so it reported frame size 0. Measured with
+     `DevTools\PrologProbe.exe`: a routine whose real frame is 16464 bytes read
+     as 0, and its locals then resolved 16408 bytes below the frame. Masked in
+     practice because the `.pdata` strategy normally answers first — but it
+     breaks for any module without unwind data.
+  2. An unrecognised prologue was indistinguishable from a zero-byte frame.
+     `ReadPrologInfo` now reports whether the prologue was understood and all
+     four callers refuse rather than guess (a pure-`asm` routine can be
+     frameless while debug info still lists its parameters, and the RTL is full
+     of them). See "Local variable readout" in `DAP_DEBUGGER_ARCHITECTURE.md`.
+  3. `ReadPEPreferredBase` rejected any image that was not PE32+ and fell back
+     to a hardcoded `$400000`. PE32 keeps `ImageBase` at a different offset
+     (optional header `+$1C`) and a different width (4 bytes), so a PE32 module
+     with a non-default preferred base had every segment base corrupted — and a
+     runtime BPL is exactly where that arises.
+- **Win32 tooling, kept as stable probes** (`DevTools\`, argv-driven, documented
+  in `DevTools\README.md`). Each derives its constants by searching with an
+  identity predicate the compiler can verify, and the ones that measure layout
+  are compiled with both `dcc32` and `dcc64` so the `dcc64` column must
+  reproduce the values already in the shipping code before the `dcc32` column is
+  trusted — no 32-bit constant is a scaled 64-bit one.
+  - `VmtProbe` — VMT metadata slot offsets by identity predicate.
+  - `PrologProbe` — prologue shapes across 17 deliberately shaped routines, with
+    the return-address slot located at run time so a wrong decoder shows up as a
+    mismatch instead of a plausible number. Carries a verbatim copy of the
+    shipping x64 matcher, updated in step, or it stops being evidence.
+  - `Wow64StackProbe` — launches a 32-bit target under the debug API and walks
+    it with `StackWalk64` / `IMAGE_FILE_MACHINE_I386`; `-step` reports which
+    exception code a single step raises.
+  - `MapSegBaseProbe` — cross-checks derived MAP segment bases against the PE
+    section table.
+  - `Td32ProcNesting` — walks TD32 proc records and their `pParent` links.
+  - `Win32SessionProbe` — drives a real `TDebugSession` end to end (bind, fire,
+    stop location, stack, locals, expansion, evaluation). Nothing in it is
+    32-bit specific, which is the point: the same probe against either bitness
+    makes a difference between two runs a real difference.
+
 - **MCP session/process lifecycle bugs from a real DGOdacTests session (2026-07-17).**
   Three defects reported driving `DelphiDebuggerMcp.exe`; two fixed, one disproved:
   - **Session stuck after terminate (FIXED).** `TDebugSession.Launch/Attach` reject any
@@ -734,6 +841,10 @@ Architecture / portability:
   - VMT[-128] = raw `InstanceSize` integer (not a method table pointer)
   - VMT[-112..-96] = ClassName / InstanceSize / Parent (match source)
   `DelphiRtti.pas` uses `VMT64_TYPEINFO = -168` and `VMT64_FIELDTABLE = -160`.
+  These offsets now live per target bitness in `TTargetLayout`; the Win32 values
+  and the measurement method are in `TD32_FORMAT_NOTES.md` ("Runtime VMT slot
+  offsets per target bitness"). A slot is one TARGET pointer wide, never a fixed
+  8 bytes.
   The `TVmtFieldTable` at VMT[-160]^: `Count(2) + ClassTab(8) + ExCount(2) +
   TFieldExEntry[]`. For classes without `{$M+}`, Count=0; ExCount = number of
   extended fields. Each `TFieldExEntry` = Flags(1) + TypeRef:PPTypeInfo(8) +

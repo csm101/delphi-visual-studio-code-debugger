@@ -467,10 +467,34 @@ channel; `TDebugSession.OnConsole` would be the sink).
   a disassembler we can ship (zydis? capstone?) or a hand-rolled
   Delphi-prologue-aware one.
 - **Child process tracking** — debug API can follow children; we don't.
-- **Win32 (32-bit) targets** — not modelled. Stack walk, ABI, register
-  set all change.
 - **`%TEMP%\dap_adapter.log` opt-in** — currently always-on. No
   configuration knob in the launch schema yet.
+
+## Win32 targets — what is still open
+
+32-bit targets are implemented (launch, breakpoints, stepping, stack, locals,
+object expansion, evaluation, multi-BPL). See "Target architecture" in
+`DAP_DEBUGGER_ARCHITECTURE.md`. These remain unanswered:
+
+- **Float arguments and float returns in an x86 synthetic call.** Currently
+  refused rather than approximated: floats do not travel in the integer
+  registers on x86, and a result comes back on the x87 stack. Reading an x87
+  register out of a WOW64 context, and deciding where a float argument goes,
+  are both unexplored.
+- **Int64 returns from an x86 synthetic call.** The value comes back in EDX:EAX
+  and `ReadSyntheticCallResult` reads EAX only, so a 64-bit result would be
+  truncated. The open part is whether the evaluator can know the callee's
+  declared return width at that point, and therefore whether to widen the read
+  or refuse the call outright.
+- **Does `dcc32 -$O+` emit usable local symbols?** Win32 locals/params are
+  declared supported for `-$O-` builds only, because `-$O+` omits the frame
+  pointer routinely. Whether the debug info of an optimised 32-bit build still
+  carries offsets that can be anchored to something else has not been measured.
+- **Win32 TLS segment bases.** The MAP's TLS segment `Start` is not the PE
+  `.tls` `VirtualAddress` — on either platform. On a 32-bit build the TLS
+  segment's `Start` is 0, i.e. below the preferred base, so it stays
+  unregistered and any TLS-relative address is unresolved. The correct
+  derivation for a TLS segment base is unknown.
 
 ## Class-member field typeId encoding on large type spaces (BLOCKS #2)
 

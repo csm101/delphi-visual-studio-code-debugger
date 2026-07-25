@@ -18,8 +18,9 @@ VS Code ── DAP (JSON over stdio) ── VisualStudioCodeDelphiDebugger.exe �
                                           └── reads .map, .rsm, source files
 ```
 
-The adapter is a single Win64 process. VS Code spawns it via the local
-debug-type extension and exchanges DAP messages on stdin/stdout. The
+The adapter is a single Win64 process, and that one binary debugs both x64 and
+32-bit (WOW64) targets — see "Target architecture" below. VS Code spawns it via
+the local debug-type extension and exchanges DAP messages on stdin/stdout. The
 adapter spawns the debuggee with `DEBUG_ONLY_THIS_PROCESS`.
 
 ## Two frontends over one core (DAP + MCP)
@@ -86,10 +87,20 @@ The debugger engine is exposed through two frontends:
   (capabilities, pending breakpoints, source paths) and the DAP message
   loop. Translates each DAP request into either an immediate JSON
   response or a `TCommand` posted to the debug thread.
-- `Win64Debugger.pas` — Windows debug loop. Drives `WaitForDebugEvent`,
-  manages INT3 plant/remove, single-step, breakpoint reactivation,
-  StackWalk64-based unwinding, synthetic remote calls into the
-  debuggee, and the local/global variable readout.
+- `Win64Debugger.pas` — `TWinDebugger`: the Windows debug loop. Drives
+  `WaitForDebugEvent`, manages INT3 plant/remove, single-step, breakpoint
+  reactivation, StackWalk64-based unwinding, synthetic remote calls into the
+  debuggee, and the local/global variable readout. Everything here except the
+  architecture seam (see "Target architecture" below) is bitness-neutral; the
+  class doubles as the x64 implementation of that seam.
+- `WinDebuggerX86.pas` — `TWin32Debugger`, a descendant of `TWinDebugger` that
+  debugs a 32-bit (WOW64) target. It overrides only the architecture seam and
+  inherits the event loop, breakpoints, stepping, module handling and the
+  synthetic-call pump unchanged.
+- `TargetLayout.pas` — `TTargetLayout`, the memory layout of the DEBUGGEE
+  (pointer size, dynamic-array header shape, VMT slot offsets) as a plain data
+  record. `SizeOf(Pointer)` describes the adapter and says nothing about the
+  address space being decoded.
 - `MapFileReader.pas` — parses the Delphi `.map`. Supplies
   `ISourceLineProvider` (RVA ↔ source line), `IFunctionNameProvider`
   (RVA ↔ public symbol, lookup by name, enclosing-procedure mapping
@@ -119,11 +130,252 @@ The debugger engine is exposed through two frontends:
   background loader (still off by default), progress/spinner, and evaluate
   warm-up caches on top of the shared synchronous primitives.
 
+## Target architecture: one adapter, x64 and WOW64 x86
+
+**One 64-bit adapter binary debugs both bitnesses.** A 64-bit process can debug
+a 32-bit one; the reverse is impossible. A second, 32-bit build was rejected on
+a concrete constraint rather than on taste: the MCP server is registered once at
+editor startup with a fixed command, long before any target exists, so it could
+never pick a per-bitness binary — two binaries would force an IPC proxy for no
+gain.
+
+The split runs along one line:
+
+- **Behaviour** differences — thread context and registers, stack walking,
+  prologue decoding, the call ABI — go behind `IDebugTarget`, as virtual methods
+  overridden by `TWin32Debugger`.
+- **Layout** differences — pointer size, dynamic-array header, VMT slot offsets
+  — go in `TTargetLayout`, a plain data record consulted while decoding a buffer
+  that has already been read.
+
+### The architecture seam
+
+`TWin32Debugger` (`DebuggerCore\WinDebuggerX86.pas`) overrides exactly these and
+nothing else:
+
+| Method | What the x86 override does |
+|---|---|
+| `TargetLayout` | returns `TTargetLayout.For32Bit` |
+| `StackWalkMachineType` | `IMAGE_FILE_MACHINE_I386` |
+| `ReadThreadRegisters` | `Wow64GetThreadContext` |
+| `SetThreadPc` | `Wow64SetThreadContext` |
+| `SetThreadTrapFlag` | `Wow64SetThreadContext`, EFLAGS bit `$100` |
+| `FillStackWalkContext` | seeds `StackWalk64` from a WOW64 context |
+| `ReadPrologInfo` | x86 byte-pattern decoder (x86 has no `.pdata`) |
+| `LocalsOffsetBase` / `ParamsOffsetBase` | 0 — see "x86 frame model" |
+| `PrepareSyntheticCall` | EAX/EDX/ECX, no shadow space |
+| `ReadSyntheticCallResult` | EAX |
+| `CurrentFrameParamHomeAddr` | 0 — there is no x86 analogue |
+
+Everything else is inherited unchanged, which is the point: the debug event
+loop, breakpoint planting, stepping, module handling and the synthetic-call
+event pump (with its abort-on-raise path and watchdog) are architecture neutral.
+
+`FillStackWalkContext` takes a buffer typed `TContext` because that is the
+larger and correctly aligned of the two structures; the smaller WOW64 context is
+written at its start, and `StackWalk64` mutates it opaquely as it unwinds, so
+the walk never reads the buffer's declared fields again.
+
+### Choosing the class
+
+The factory is `TDebugSession.BuildAndWireDebugger`, the single construction
+site. It picks by reading `IMAGE_FILE_HEADER.Machine` from the **on-disk** PE
+(`MapFileReader.ReadPEMachine`).
+
+`IsWow64Process2` cannot be used here: it needs a live process handle and cannot
+answer until `CREATE_PROCESS_DEBUG_EVENT`, which is long after the object has
+been built. `TWinDebugger`'s own WOW64 probe at that event still runs, but it is
+now only a redundant confirmation that the live process agrees with what was
+constructed (its advisory console text predates Win32 support and is stale —
+noted in `PROJECT_STATE.md`).
+
+### `TTargetLayout` is data, not an interface
+
+Deliberately a plain record: a virtual call per pointer would shatter bulk reads
+into syscalls, and these values are consulted inside decode loops where a branch
+is free but a dispatch is not. **The rule it encodes: read a region once, then
+decode the local buffer with these numbers — never ask the target a question per
+field.**
+
+`IDebugTarget` exposes `TargetLayout`. `TDelphiRtti` reads through a raw process
+handle rather than through the interface, so it is told its layout at
+construction instead (at each of the three sites where `TDebugSession` creates
+it).
+
+Consumers so far: the dynamic-array header reads, the closure/`$ActRec` and
+`Self` stack scans, VMT slot reads, and every "pointer-shaped" value read
+(`LocalReadSize` in `DelphiValueReaders`, which separates genuinely 8-byte types
+— `Int64`, `Double`, `Currency`, `TDateTime` — from pointer-sized ones that take
+the target's pointer size).
+
+`TDynArrayRec` is the clearest case, since unlike the string header Delphi did
+not make it bitness-neutral:
+
+```
+Win64   _Padding(4) RefCnt(4) Length: NativeInt(8)   -> length at data-8, 8 wide
+Win32               RefCnt(4) Length: NativeInt(4)   -> length at data-4, 4 wide
+```
+
+Reading one with the other's shape does not fail; it splices the refcount into
+the length and returns a plausible wrong number.
+
+### `TRegisterSnapshot` is a superset, and roles beat physical names
+
+`TRegisterSnapshot` is a 64-bit **superset of both register files**. A 32-bit
+target fills the same fields from EIP/ESP/EBP and leaves R8..R15 zero. That is
+why the role accessors `Pc` / `StackPtr` / `FramePtr` exist: a consumer asking
+for a role gets a correct answer on both bitnesses, while one reading a physical
+64-bit name gets a meaningless one on x86. Physical register names are
+legitimate in exactly two places — the x64 implementation itself, and the DAP
+Registers view.
+
+### WOW64 debug events
+
+Measured against a live WOW64 target (`DevTools\Wow64StackProbe.dpr`), not taken
+from documentation:
+
+- An INT3 in 32-bit code arrives as `STATUS_WX86_BREAKPOINT` (`$4000001F`), not
+  `EXCEPTION_BREAKPOINT`. A loop testing only the native code never sees a user
+  breakpoint and re-dispatches the target's own trap forever.
+- A single step raises `STATUS_WX86_SINGLE_STEP` (`$4000001E`), **not**
+  `EXCEPTION_SINGLE_STEP`. This is the half that was at risk of being assumed:
+  it does not follow from the breakpoint half. The probe set EFLAGS.TF through
+  `Wow64SetThreadContext` and observed the code on the next event.
+- The **first** stop of a WOW64 target is a native `$80000003` at a 64-bit
+  `ntdll` address, with the 32-bit side still at `EBP = 0`; it yields one frame
+  and is not unwindable. Every later 32-bit stop is `$4000001F`.
+
+Both codes are accepted at all four sites (the two `HandleException` case labels
+and the two comparisons in the synthetic-call pump). The constants are untyped,
+because a typed constant is not a compile-time constant in Delphi and cannot
+appear as a case label. Win64 is unaffected: a native x64 target cannot raise
+them.
+
+### x86 stack walking
+
+`StackWalk64` with `IMAGE_FILE_MACHINE_I386` plus a WOW64 context unwinds a
+32-bit Delphi target correctly — no hand-rolled EBP walker is needed. dbghelp
+contributes **nothing** to that walk: invade-only, every module registered
+explicitly, and both callbacks nil all give byte-identical output with a nil
+`FuncTableEntry` throughout. The result rests on `StackWalk64`'s built-in
+frame-pointer chain plus its first-frame `[ESP]` heuristic.
+
+The i386 walk does not survive a still-planted INT3 (the walker takes a stack
+address as a return address and loses the real caller), but that is not a state
+the adapter is ever in: at a breakpoint hit it already restores the original
+byte and rewinds the program counter before anything walks. The corrupted walk
+is reproducible only with the probe's `-nopatch` mode.
+
+### x86 frame model
+
+The opposite of x64 in the one way that matters: **`mov ebp,esp` PRECEDES the
+allocation**. Consequences:
+
+- The return address is always at `[EBP+4]` and the caller's frame at `[EBP]`,
+  so **no frame size is needed to walk**.
+- A debug-info offset is already relative to the frame pointer — locals at
+  negative offsets, parameters at positive ones — so `LocalsOffsetBase` and
+  `ParamsOffsetBase` are 0. The x64 bases exist only because its frame pointer
+  is established *after* the allocation, so an offset needs re-anchoring.
+
+The prologue decoder (ported verbatim from the candidate `PrologProbe` validated
+across 17 deliberately shaped routines, not adapted from the x64 matcher):
+
+- Delphi allocates with `add esp,-N` (`83 C4` / `81 C4`, **negative
+  immediate**), not `sub esp,N`. A decoder looking only for `sub` reports frame
+  size zero on nearly every routine.
+- The matcher must require `$55` (`push ebp`) followed **immediately** by
+  `8B EC` (`mov ebp,esp`; `89 E5` is the alternate encoding). That adjacency is
+  what rejects an optimised frame in which EBP was pushed as an ordinary
+  callee-saved register.
+- Pushes and allocations appear in either order and may repeat, so the decode
+  accumulates rather than expecting a fixed sequence. `push ecx` reserving a
+  slot and `push ebx` saving a register are the same instruction.
+- A frame larger than a page uses a 16-byte stack-probe loop carrying its page
+  count as an immediate (plus 4 bytes for the EAX it saves).
+
+### x86 calling convention (synthetic calls)
+
+Delphi's 32-bit `register` convention: the first three arguments travel in
+**EAX, EDX, ECX** in declaration order; the rest go on the stack. No shadow
+space, no 16-byte alignment requirement. The result comes back in EAX.
+
+The stack **order** was measured, not read: documentation disagrees with itself
+here. `PrologProbe` compiled an eight-parameter routine with `dcc32` and found
+A/B/C spilled to EBP−4/−8/−12 (the register three) and the rest at D=+24,
+E=+20, F=+16, G=+12, H=+8. H sitting closest to the return address means H was
+pushed **last**, so stack arguments are pushed **left to right** — the opposite
+of cdecl. Laying the frame out by hand, argument *i* of *n* lands at
+`[ESP + 4 + 4*(n-1-i)]`.
+
+Three cases are deliberately **not** implemented, because a wrong answer here is
+silent:
+
+- **float arguments** — `PrepareSyntheticCall` refuses the whole call if any
+  argument is a float. They do not travel in the integer registers, so placing
+  one where the callee reads an integer would be quietly wrong.
+- **float returns** — they come back on the x87 stack, which is not read;
+  `FloatResultLow` stays 0.
+- **Int64 returns** — they come back in EDX:EAX and only EAX is read, so a
+  64-bit result would be truncated (see `KNOWN_UNKNOWNS.md`).
+
+### No x86 parameter home slot
+
+`CurrentFrameParamHomeAddr` returns 0 (its documented "unavailable") on x86, and
+that is not a gap to be filled with a positional formula. The first three
+parameters have no stack home at all, they are spilled to **negative** EBP
+offsets, and stack parameters run in **reverse** declaration order — `Self` is
+provably not at `EBP+8`. The answer has to come from debug-info symbol offsets.
+
+### Declared scope limitation
+
+Win32 locals and parameters are supported for **`-$O-` builds only**. `-$O+`
+omits the frame pointer routinely, and without it the EBP-relative offsets in
+debug info have nothing to anchor to.
+
+### MAP segment tables and the target's pointer width
+
+Delphi prints the MAP segment-table `Start` column at the **target's** pointer
+width: 8 hex digits for PE32, 16 for PE32+.
+
+```
+0001:00401000          .text   CODE     (PE32)
+0001:0000000000401000  .text   CODE     (PE32+)
+```
+
+Body addresses in a MAP are segment-relative and must be rebased **per
+segment** (`LinearStart − ImageBase` for that segment), never by a flat
+constant. A derived base is trustworthy because it can be checked: it must equal
+the `VirtualAddress` of the PE section with the same name — with `.tls` the
+known exception on both platforms (its MAP `Start` is not that section's
+`VirtualAddress`; on a 32-bit build it is 0, i.e. below the preferred base, so
+the segment stays unregistered). `DevTools\MapSegBaseProbe.dpr` performs exactly
+that identity check.
+
+Assuming one width is not a loud failure. `ParseSegmentTableEager` sliced a
+fixed 16 characters, so on a PE32 MAP the slice ran past the address into the
+next column, failed the hex test, and **every** segment line was skipped —
+leaving `FSegmentBaseRvas` empty. All three consumers read that dictionary with
+`TryGetValue` defaulting to 0, so nothing raised: every emitted RVA silently
+degraded into a bare segment offset, which landed inside a neighbouring function
+and made the MAP report a different source file than TD32 for the same address.
+The parse now scans the hex run and accepts 8 or 16 digits terminated by
+whitespace or end of line. `MAP_SIDECAR_MAGIC` was bumped `MIX2` → `MIX3` at the
+same time: sidecars written by an earlier build baked `MinRva` values computed
+from an empty segment table and must not be reused.
+
+`ReadPEPreferredBase` must read the right field for the right magic: PE32+ keeps
+`ImageBase` at optional header `+$18` as 8 bytes, PE32 at `+$1C` as 4 bytes
+(PE32+ widened the field and dropped the preceding `BaseOfData`). Falling back
+to a hardcoded `$400000` for PE32 is not harmless — a module with a non-default
+preferred base then gets every segment base wrong, and a runtime BPL is exactly
+where that arises.
+
 ## Threading model
 
 Two threads run inside the adapter:
 
-1. **Main / debug thread** — owns the `TWin64Debugger` instance, calls
+1. **Main / debug thread** — owns the `TWinDebugger` instance, calls
    `WaitForDebugEvent`, mutates breakpoint state, invokes
    `ContinueDebugEvent`. Also drains the request queue and writes DAP
    responses on stdout.
@@ -345,7 +597,7 @@ stdin thread `DoShutDown` → `PopItem` returns `wrAbandoned`, which sends a
 `DapLog` cap (`DapProtocol.pas`) remains as a last-resort disk guard.
 Covered by `Test_EmptyCommandMessage_Ignored_AdapterStaysResponsive`.
 
-`TWin64Debugger.ProcessOneEvent`:
+`TWinDebugger.ProcessOneEvent`:
 
 ```
 ProcessCommandQueue                                       // DAP → debugger
@@ -534,8 +786,13 @@ Three modes plus a none state:
 
 ## Stack walking
 
-Uses `StackWalk64` with `IMAGE_FILE_MACHINE_AMD64` and `dbghelp.dll`'s
-`SymFunctionTableAccess64` / `SymGetModuleBase64`. `SymInitialize` is
+Uses `StackWalk64` with `dbghelp.dll`'s `SymFunctionTableAccess64` /
+`SymGetModuleBase64`. The machine type comes from the virtual
+`StackWalkMachineType` (`IMAGE_FILE_MACHINE_AMD64`, or
+`IMAGE_FILE_MACHINE_I386` for a WOW64 target — see "Target architecture"); the
+seed context comes from `FillStackWalkContext`. Everything below describes the
+x64 path, where dbghelp does the unwinding; on i386 it contributes nothing and
+`StackWalk64`'s own frame-pointer chain carries the walk. `SymInitialize` is
 invoked lazily (`EnsureSymInitialized`) with `fInvadeProcess = True`,
 which enumerates only the modules mapped **at that instant** — including
 the main exe, which never produces a `LOAD_DLL` event.
@@ -610,9 +867,32 @@ emits `module` plus a `symbols` field on every frame.
    Locals from each parent are surfaced with a `parent.` prefix; cap
    at depth 32.
 
-`FrameSize` is read by disassembling the prologue:
+The read width per local comes from `LocalReadSize` (`DelphiValueReaders`),
+which distinguishes genuinely 8-byte types from pointer-sized ones; the latter
+take the TARGET's pointer size, so a pointer local on a 32-bit target reads its
+own 4-byte slot instead of that slot plus its neighbour.
+
+`FrameSize` is read by disassembling the prologue (`ReadPrologInfo`, virtual —
+the x86 decoder is described under "Target architecture"). On x64:
 - `55 48 83 EC NN`               → `NN` (frame < 128)
 - `55 48 81 EC NN NN NN NN`      → `imm32`
+- a frame larger than a page inserts a fixed 22-byte stack-probe loop between
+  the pushes and the real `sub rsp`, which the matcher steps over after
+  verifying its signature at the expected offsets.
+
+`ReadPrologInfo` also reports whether the prologue was **understood**, and all
+four callers are obliged to check it. A failed match used to return zero, which
+is indistinguishable from a function with no locals, so every address derived
+from the frame size was silently wrong rather than absent. "No frame
+recognised" now means refuse: the parameter home slot returns its documented
+"unavailable" 0, the parent-frame walk stops, and `CollectLocalsForFrame`
+reports no locals. This matters beyond large frames — a pure-`asm` routine that
+never names a parameter compiles without a frame at all while debug info still
+lists the parameter, and the RTL is full of them.
+
+The offset bases (`LocalsOffsetBase` / `ParamsOffsetBase`) are virtual too: the
+x64 anchors below exist because its frame pointer is established after the
+allocation, and they are 0 on x86.
 
 ### Cross-unit local disambiguation
 
@@ -880,7 +1160,7 @@ the locals readout, not lookup).
 
 Backed by `EncodeValueForType` for primitives, dates, floats, chars,
 booleans, sized integers. Strings hand off to
-`TWin64Debugger.SetStringVariable`, which:
+`TWinDebugger.SetStringVariable`, which:
 
 1. Allocates an immortal Delphi string buffer (RefCnt = -1) in the
    debuggee via `VirtualAllocEx` and `WriteProcessMemory`.
@@ -895,17 +1175,34 @@ parameter slot.
 
 ## Synthetic remote call
 
-`RunRemoteCall(FuncVA, ArgRcx, ArgRdx)`:
+The calling convention and the event pump are separate concerns, and only the
+first is architecture-specific:
+
+- `PrepareSyntheticCall` marshals the arguments, lays out the stack and points
+  the thread at the callee; `ReadSyntheticCallResult` reads the result from the
+  thread that has just hit the return trap. Both are virtual — the x86 versions
+  are described under "Target architecture".
+- Everything between them is shared, because it is architecture neutral: the
+  abort-on-raise path, the watchdog, the skip-and-single-step handling for
+  planted breakpoints hit inside the injected call, and `EXIT_PROCESS`.
+
+Arguments across the boundary are **positional** (`Arg0..Arg3`, `IntResult`,
+`FloatResultLow`). The earlier signature announced the physical register each
+argument lands in, which is the implementation's business and is simply false on
+Win32.
+
+`RunRemoteCall(FuncVA, Arg0, Arg1)`:
 
 1. Lazy-allocate a single-byte `0xCC` trap page (`FRemoteCallTrap`).
 2. Save full thread context.
-3. Build a Win64 ABI call frame:
+3. Build a Win64 ABI call frame (`PrepareSyntheticCall`, x64):
    - `RSP := (saved.RSP and not 15) - 40` — 16-byte aligned + 32 bytes
      shadow space + 8 bytes return address. RSP at callee entry must
      be `8 mod 16`.
    - Write the trap address at `[RSP]` so the callee's `RET` jumps to
      our trap.
-   - `RIP := FuncVA`, `RCX := ArgRcx`, `RDX := ArgRdx`.
+   - `RIP := FuncVA`, `RCX := Arg0`, `RDX := Arg1` (floats to XMM0..3;
+     arguments five onward at `[RSP+40]`).
    - Clear TF in `EFlags` — inheriting it from a breakpoint handler
      causes a single-step exception per instruction inside the helper
      and hangs the pump loop.
@@ -1196,7 +1493,11 @@ disassembly, set-next-statement).
   over/into/out act on the selected thread while the others are frozen (see
   "Stepping" and `PROJECT_STATE.md`). Synthetic-call evaluation still runs on the
   stopped thread (frame-independent, so it needs no per-thread targeting).
-- Win64 ABI only; 32-bit targets are out of scope today.
+- Both x64 and 32-bit (WOW64) targets are supported from the same 64-bit
+  adapter binary; the class is chosen from the target's PE header (see "Target
+  architecture"). On a 32-bit target, locals and parameters require a `-$O-`
+  build, and a synthetic call refuses float arguments, float returns and Int64
+  returns rather than approximating them.
 - `.rsm` is the only source of local/global variable metadata; if it
   isn't present, locals/globals scopes are empty but stepping and
   source mapping still work via `.map`.

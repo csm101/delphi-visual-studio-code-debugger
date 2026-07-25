@@ -144,67 +144,74 @@ Those sites are revisited in Increment 4c anyway, where the VMT32 table lands
 and they become testable at 32 bits. Same reason no speculative `ReadPtr`
 helpers were added.
 
-### Increment 2: PART DONE, gated, committed (96fbe0e)
+### Increments 2 through 4d: ALL DONE, gated and committed
 
-Done so far:
-* Role accessors `Pc` / `StackPtr` / `FramePtr` on `TRegisterSnapshot`, which is
-  now documented as a 64-bit SUPERSET of both register files (x86 fills the same
-  fields from EIP/ESP/EBP, R8..R15 stay zero). Physical names are legitimate in
-  exactly two places: the x64 implementation itself and the DAP Registers view.
-* **D1 fixed** -- the x64 stack-probe loop (a fixed 22-byte block between the
-  pushes and the real `sub rsp`) is now decoded. Measured: a routine with a
-  16464-byte frame read as 0. Signature verified at expected offsets, not
-  skipped blindly.
-* **Fail-closed** -- `ReadPrologInfo` now reports whether the prologue was
-  UNDERSTOOD; all four callers refuse rather than guess. Needed because a
-  pure-`asm` routine can be frameless yet still have parameters in debug info.
-  `PrologProbe`'s verbatim copy updated in step, or it stops being evidence.
+Every step below was gated on a green suite before the next began.
+
+| commit | what landed |
+|---|---|
+| `96fbe0e` | D1 stack-probe-loop decode + prologue fail-closed |
+| `d4a971c` | thread-context funnel (3 primitives replace 11 scattered sites) |
+| `b941c48` | stack-walk machine type + positional call parameters |
+| `c3db006` | synthetic-call ABI isolated from its arch-neutral event pump |
+| `10b2747` | the nine arch methods made virtual |
+| `6a674d9` | stack-walk context seeding routed through the seam |
+| `8648b57` | `TWin32Debugger` + factory by PE Machine |
+| `a36648e` | `Win32SessionProbe` + first end-to-end x86 evidence |
+| `c616d51` | Borland demangler for dcc32 names |
+| `93ee6ef` | 32-bit target built by the suite + 3 Win32 tests |
+| `385a0bb` | x86 prologue decoder + stack locals |
+| `73d0aea` | type-name demangling + 32-bit VMTs |
+| `0e54151` | pointer-shaped field reads at target width |
+| `cf02b3b` | x86 register calling convention -- evaluation works |
+| `bf02956` | Win32 stepping covered |
+| `869c6df` | Win32 multi-BPL covered |
+
+### WHAT WORKS ON WIN32 NOW
+
+Launch, breakpoints (including deferred binding to a module that loads later),
+stepping, call stacks across module boundaries, source lines, stack locals,
+object recognition and field expansion, strings, and expression evaluation
+including getter-backed properties that run real code in the debuggee.
+Multi-BPL -- the project's core use case -- verified end to end.
+
+Suite: **958 found / 956 passed / 0 failed / 0 leaked / 2 ignored.**
+
+### WHAT IS DELIBERATELY REFUSED (not broken -- unimplemented, and it says so)
+
+* Float arguments to a synthetic call, and float returns (x87 stack).
+* `Int64` returns (EDX:EAX not combined; only EAX is reported).
+* `CurrentFrameParamHomeAddr` -- no x86 analogue exists; the answer must come
+  from debug-info symbol offsets, never a positional formula.
+* Optimised (`-$O+`) builds: frame-pointer omission is routine there, so Win32
+  locals are supported for `-$O-` only. This is a DECLARED limitation.
+
+Each refuses rather than inheriting the x64 answer, which would be confidently
+wrong. In a debugger a plausible wrong number is worse than "unavailable".
+
+### THE LESSON THIS WORK KEEPS TEACHING
+
+On x64 the host and target pointer sizes coincide, so **every site that
+conflates them is correct by accident**. Three separate such sites were found,
+each in a different layer, and each only became visible when the debugger was
+pointed at a different bitness: `LocalReadSize` for stack locals,
+`SyntheticLocal` for expanded fields, and `PrimTypeSize`/`SizeForKind` in
+ExprEval. Expect more if a fourth path appears.
 
 ### CURRENT CURSOR
 
-**Next: the context funnel, the remaining core of Increment 2.**
+Win32 support is functionally complete for `-$O-` targets. Remaining work, in
+order of value:
 
-~11 sites call `GetThreadContext`/`SetThreadContext` independently and name x64
-`TContext` fields directly. They fall into three groups, and only the third is
-genuinely arch-specific:
-
-1. **Read a role** (PC / SP / FP / the whole snapshot): `CurrentRIP`,
-   `CurrentRSP`, `GetRegisters`, `GetLocalValues`, `CurrentFrameParamHomeAddr`.
-2. **Mutate a role**: `SetTrapFlag` (EFLAGS bit $100), `SetRIP`,
-   `SetRegisterByName` (already string-keyed, so polymorphic for free).
-3. **Need the raw CONTEXT**: `StackWalk64` seeding in `GetStackFrames` and
-   `CallerReturnAddress`, and `RunMethodCall`'s ABI block. These stay in the
-   arch implementation.
-
-Plan: give groups 1 and 2 named primitives on `TWinDebugger`
-(`ReadThreadRegisters`, `SetThreadPc`, `SetThreadTrapFlag`) and route the sites
-through them, so the WOW64 variant becomes one implementation instead of eleven.
-Leave group 3 alone until the unit split.
-
-Still open in Increment 2 after that: `IMAGE_FILE_MACHINE_AMD64` at three sites
-becoming runtime-selected, `RunRemoteCallEx`'s positional parameter names, and
-splitting `RunMethodCall` into an arch `PrepareCall`/`ReadCallResult` plus the
-already-neutral pump.
-
-**Suite baseline for every gate from here: 949 found / 947 passed / 0 failed /
-0 leaked / 2 ignored.**
-
-* Historical detail of Increment -1, six edits (four planned + two from the
-  measured single-step finding above):
-  1. `MapFileReader.pas:483-494` -- replace the fixed 16-char `AddrPart` slice
-     with a scan of consecutive hex digits from `ColonPos+1`, accept a run of 8
-     or 16 terminated by whitespace/EOL. Keep the `LinearAddr >= FPreferredBase`
-     guard and line 497 unchanged. Remove the now-unused `IsHex` local.
-  2. `MapFileReader.pas:299` -- accept magic `$010B` too; PE32 ImageBase is
-     4 bytes at optional-header `+$1C` (PE32+ is 8 bytes at `+$18`).
-  3. `MapFileReader.pas:508` -- bump `MAP_SIDECAR_MAGIC` `MIX2` -> `MIX3` AND
-     delete existing `*.map.idx`, or the fix will look like it failed.
-  4. `Win64Debugger.pas` -- add untyped consts `STATUS_WX86_BREAKPOINT =
-     $4000001F` / `STATUS_WX86_SINGLE_STEP = $4000001E` to the const block at
-     ~360, add the case label at 1859 (must be UNTYPED to be a legal case
-     label), and cover the two comparisons at 3122 and 3150.
-* **GATE for Increment -1:** the x64 suite must be byte-for-byte unchanged. Any
-  x64 delta means the change is wrong, not that the baseline drifted.
+1. **Living specs** -- in flight. DAP_DEBUGGER_ARCHITECTURE.md, TD32_FORMAT_NOTES.md,
+   KNOWN_UNKNOWNS.md (two entries to CLOSE), PROJECT_STATE.md, README.md.
+2. **Float and Int64 synthetic calls on x86** -- the remaining ABI gap. Needs the
+   x87 register area out of the WOW64 context.
+3. **The unit rename** the user chose: `Win64Debugger.pas` ->
+   `WinDebuggerBase.pas` + `WinDebuggerX64.pas`, alongside the existing
+   `WinDebuggerX86.pas`. Deferred deliberately until the x86 implementation's
+   size was known; it is now ~230 lines, so the split is safe to do.
+4. **`-$O+` support**, if wanted at all -- decide policy before building.
 
 ### Environment traps hit this session
 
