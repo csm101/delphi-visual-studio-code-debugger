@@ -1767,10 +1767,16 @@ function TExprEvaluator.ApplyDot(const Base: TExprValue; const Field: string): T
       akStatic:
         Exit(InvokeGetter(P.GetValue, ObjAddr, P));
       akVirtual: begin
-        // VMT slot offset; resolve through the instance's actual VMT.
-        if not FDebugger.ReadProcessMemoryAt(ObjAddr, @VmtAddr, 8) then
+        // VMT slot offset; resolve through the instance's actual VMT. Both the
+        // object's VMT pointer and the slot inside it are one TARGET pointer
+        // wide -- reading 8 on a 32-bit target splices the adjacent slot in and
+        // the call would be dispatched to a nonsense address.
+        var PtrSize := FDebugger.TargetLayout.PointerSize;
+        VmtAddr := 0;
+        FuncVA  := 0;
+        if not FDebugger.ReadProcessMemoryAt(ObjAddr, @VmtAddr, PtrSize) then
           Exit(InvalidValue('<vmt read failed>'));
-        if not FDebugger.ReadProcessMemoryAt(VmtAddr + P.GetValue, @FuncVA, 8) then
+        if not FDebugger.ReadProcessMemoryAt(VmtAddr + P.GetValue, @FuncVA, PtrSize) then
           Exit(InvalidValue('<vmt slot read failed>'));
         Exit(InvokeGetter(FuncVA, ObjAddr, P));
       end;

@@ -413,28 +413,38 @@ end;
 
 // EAX carries the integer/pointer result.
 //
-// FLOATING-POINT RETURNS DO NOT WORK YET, and the reason is not what the code
-// below assumes. The x87 decode here is correct in isolation -- it was checked
-// by hand against 3.25, whose 80-bit form converts to the Double bit pattern
-// $400A000000000000 -- but a Double-returning getter still evaluates to 0 on a
-// 32-bit target while the same getter returns 3.25 on x64. What was actually
-// measured: requesting WOW64_CONTEXT_FLOATING_POINT returns a FloatSave area
-// that is entirely zero, status word included, which is why this reads the
-// FXSAVE area instead. That did not fix it either, so the remaining fault is
-// upstream -- a Double return appears not to reach this function at all -- and
-// finding it needs the ExprEval float path traced, not more work here.
+// KNOWN GAP 1 -- Int64 returns. An Int64 comes back in EDX:EAX and only EAX is
+// reported. Combining them blindly would be worse, not better: on x64 a 32-bit
+// result leaves the high half of RAX zeroed by the hardware, but x86 leaves EDX
+// holding whatever the callee last put there, so every ordinary Integer return
+// would come back with garbage in its high half. Reporting EAX alone reproduces
+// the x64 behaviour up to 32 bits and truncates only genuine Int64 returns,
+// which is the narrower failure of the two.
 //
-// Left in place rather than reverted because the decode is verified and will be
-// wanted once the upstream path is understood. Do NOT read the 0 it currently
-// produces as a value.
+// KNOWN GAP 2 -- floating-point returns. What is and is not known, measured
+// rather than guessed, so the next attempt does not repeat the dead ends:
 //
-// KNOWN GAP: an Int64 returns in EDX:EAX and only EAX is reported. Combining
-// them blindly would be worse, not better -- on x64 a 32-bit result leaves the
-// high half of RAX zeroed by the hardware, but x86 leaves EDX holding whatever
-// the callee last put there, so every ordinary Integer return would come back
-// with garbage in its high half. Reporting EAX alone reproduces the x64
-// behaviour for everything up to 32 bits and truncates only genuine Int64
-// returns, which is the narrower failure of the two.
+//   * The 80-bit to Double decode above is CORRECT. Verified by hand against
+//     3.25, whose extended form converts to $400A000000000000, exactly the
+//     Double bit pattern for 3.25.
+//   * This function IS reached for a Double-returning getter -- instrumented
+//     and confirmed. An earlier note claiming the fault lay upstream in
+//     ExprEval was WRONG; it rested on a diagnostic that never compiled in.
+//   * WOW64_CONTEXT_FLOATING_POINT returns a FloatSave area that is entirely
+//     zero, status word included. That legacy FNSAVE view is not what the WOW64
+//     layer fills, which is why the FXSAVE area is read instead.
+//   * The FXSAVE area IS populated -- its status word reads $0020, not zero --
+//     but ST(0) is EMPTY at this point: TOP is 0 and the register bytes are all
+//     zero, on every call observed.
+//
+// So the open question is why the x87 stack is empty when the callee has just
+// returned a value in it. The likeliest explanation is that the WOW64 context
+// carries FP state as of the last WOW64 transition rather than live, in which
+// case the value must be recovered another way -- for instance by returning
+// into a stub that stores ST(0) to memory first. Try that next; do not re-test
+// either of the two register areas above.
+//
+// Do NOT read the 0 this currently produces as a value.
 function TWin32Debugger.ReadSyntheticCallResult(TH: THandle;
   out IntResult, FloatResultLow: UInt64): Boolean;
 var
@@ -450,12 +460,6 @@ begin
     Exit;
   IntResult := Ctx.Eax;
 
-  // The x87 state comes back in ExtendedRegisters, the FXSAVE area, NOT in the
-  // legacy FloatSave view -- measured: with FLOATING_POINT requested, FloatSave
-  // came back entirely zero, status word included, while the FXSAVE area
-  // carries the real thing. On hardware this old the legacy FNSAVE layout is a
-  // compatibility shim the WOW64 layer does not fill in.
-  //
   // FXSAVE layout: FCW at +0, FSW at +2, then the eight registers from +32, one
   // every 16 bytes with only the low 10 in use. RegisterArea holds the PHYSICAL
   // registers R0..R7 while ST(0) is R[TOP], so the stack top has to come out of
