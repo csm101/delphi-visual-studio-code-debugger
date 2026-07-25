@@ -68,6 +68,12 @@ type
     // than assumed, so it deserves a test that actually steps.
     [Test] procedure Win32_StepInto_LandsInTheCallee;
     [Test] procedure Win32_StepOver_AdvancesWithinTheSameFrame;
+    // An application split across runtime packages is this project's core use
+    // case and the shape where debugger bugs have historically surfaced, so it
+    // has to hold on both bitnesses rather than only x64. The breakpoint is
+    // deferred here -- the package is not loaded when it is set -- so this also
+    // covers binding a breakpoint to a module that arrives later.
+    [Test] procedure Win32_Bpl_BreakpointInPackage_FiresWithLocals;
   end;
 
   [TestFixture]
@@ -2536,6 +2542,54 @@ begin
   finally
     Session.Free;
   end;
+end;
+
+procedure TWin32RunControlTests.Win32_Bpl_BreakpointInPackage_FiresWithLocals;
+
+  function HostDir(const Bitness: string): string;
+  begin
+    Result := RepoRoot + 'DebuggerTests\TestHost\' + Bitness + '\Debug\';
+  end;
+
+  // Returns 'module|function|line|locals' so one comparison covers module
+  // attribution, symbol resolution and the frame read together.
+  function StopShape(const Bitness: string; Line: Integer): string;
+  begin
+    var Dir := HostDir(Bitness);
+    var Session := OpenSessionAtMarker(Dir + 'TestHost.exe', Dir + 'TestHost.map',
+      Dir + 'TestHost.rsm', TargetDir, W32_SOURCE, Line);
+    try
+      Assert.AreEqual(Ord(dsStopped), Ord(Session.State),
+        'the ' + Bitness + ' BPL host did not stop');
+      var Frames := Session.GetCallStack;
+      Assert.IsTrue(Length(Frames) > 0, 'no frames');
+      var FnName, SrcFile: string;
+      var StopLine: Integer;
+      Session.GetCurrentLocation(FnName, SrcFile, StopLine);
+      Result := LowerCase(Frames[0].ModuleName) + '|' + FnName + '|' +
+                IntToStr(StopLine);
+      for var L in Session.GetLocals do
+        Result := Result + '|' + L.Name + '=' + L.Value;
+    finally
+      Session.Free;
+    end;
+  end;
+
+begin
+  Assert.IsTrue(FileExists(HostDir('Win32') + 'TestHost.exe'),
+    '32-bit BPL host missing -- build_host.bat should have produced it');
+  var Line := MarkerLine(W32_SOURCE, W32_MARKER);
+  Assert.IsTrue(Line > 0, 'marker not found: ' + W32_MARKER);
+
+  var Shape64 := StopShape('Win64', Line);
+  var Shape32 := StopShape('Win32', Line);
+
+  // The frame must belong to the PACKAGE, not the host -- otherwise the test
+  // would pass on a debugger that never resolved the module at all.
+  Assert.IsTrue(Shape64.StartsWith('testsubject.bpl|'),
+    'the x64 control did not stop inside the package: ' + Shape64);
+  Assert.AreEqual(Shape64, Shape32,
+    'the 32-bit BPL stop differs from the 64-bit one');
 end;
 
 initialization

@@ -20,4 +20,18 @@ copy /Y TestHost\Win64\Debug\TestSubject.bpl  TestHost\Win64\Debug\ >nul 2>&1
 copy /Y TestPackage\Win64\Debug\TestPackage.bpl   TestHost\Win64\Debug\ >nul
 copy /Y TestPackage2\Win64\Debug\TestPackage2.bpl TestHost\Win64\Debug\ >nul
 copy /Y TestTarget\Win64\Debug\NoDebugLib.dll     TestHost\Win64\Debug\ >nul
+
+rem --- Win32 host + package, for the 32-bit multi-BPL tests. -----------------
+rem This is the project's core use case -- an application split across runtime
+rem packages -- and it is the shape where debugger bugs have historically
+rem surfaced, so it needs to exist on both bitnesses rather than only x64.
+if not exist TestHost\Win32\Debug md TestHost\Win32\Debug
+pushd TestHost
+dcc32 -E.\Win32\Debug -NU.\Win32\Debug -LE.\Win32\Debug -LN.\Win32\Debug TestSubject.dpk 2>&1
+if errorlevel 1 ( popd & echo FAILED: TestSubject.bpl ^(Win32^) & exit /b 1 )
+dcc32 -E.\Win32\Debug -NU.\Win32\Debug -LE.\Win32\Debug -LN.\Win32\Debug TestHost.dpr 2>&1
+if errorlevel 1 ( popd & echo FAILED: TestHost.exe ^(Win32^) & exit /b 1 )
+popd
+copy /Y TestPackage\Win32\Debug\TestPackage.bpl   TestHost\Win32\Debug\ >nul
+copy /Y TestPackage2\Win32\Debug\TestPackage2.bpl TestHost\Win32\Debug\ >nul
 exit /b 0
