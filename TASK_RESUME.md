@@ -205,8 +205,23 @@ order of value:
 
 1. **Living specs** -- in flight. DAP_DEBUGGER_ARCHITECTURE.md, TD32_FORMAT_NOTES.md,
    KNOWN_UNKNOWNS.md (two entries to CLOSE), PROJECT_STATE.md, README.md.
-2. **Float and Int64 synthetic calls on x86** -- the remaining ABI gap. Needs the
-   x87 register area out of the WOW64 context.
+2. **Float returns from x86 synthetic calls** -- the remaining ABI gap, and now
+   a DESIGN question rather than a coding one. Measured (see the long comment on
+   `TWin32Debugger.ReadSyntheticCallResult`): the function IS reached, the
+   FXSAVE area IS populated (`fsw=$0020`), but ST(0) is empty with TOP=0 and all
+   register bytes zero -- a RESET image, not a used one. A callee that had just
+   pushed a result would leave TOP=7, so the WOW64 context almost certainly
+   reports FP state as of the last WOW64 transition, and no context-flag
+   combination will reach the live stack.
+   The workaround is to return into a stub that does `fstp qword ptr [scratch]`
+   before the INT3. The catch: `fstp` on an empty stack raises
+   invalid-operation, which Delphi unmasks by default, so the stub is only safe
+   when a float result is expected -- and nothing in the seam knows that.
+   `PrepareSyntheticCall` is told which ARGUMENTS are floats, never what the
+   callee RETURNS. Doing it properly means adding the expected result class to
+   the seam, touching the shared pump and the x64 side as well. Contained, but
+   not local. Bolting the stub on without that signal breaks every integer call.
+   Int64 returns (EDX:EAX) are a separate, smaller gap in the same function.
 3. **The unit rename** the user chose: `Win64Debugger.pas` ->
    `WinDebuggerBase.pas` + `WinDebuggerX64.pas`, alongside the existing
    `WinDebuggerX86.pas`. Deferred deliberately until the x86 implementation's

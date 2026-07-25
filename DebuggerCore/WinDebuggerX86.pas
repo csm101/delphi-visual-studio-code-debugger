@@ -437,12 +437,25 @@ end;
 //     but ST(0) is EMPTY at this point: TOP is 0 and the register bytes are all
 //     zero, on every call observed.
 //
-// So the open question is why the x87 stack is empty when the callee has just
-// returned a value in it. The likeliest explanation is that the WOW64 context
-// carries FP state as of the last WOW64 transition rather than live, in which
-// case the value must be recovered another way -- for instance by returning
-// into a stub that stores ST(0) to memory first. Try that next; do not re-test
-// either of the two register areas above.
+// TOP=0 with every register byte zero is a RESET FPU image, not a used one --
+// a callee that had just pushed a result would leave TOP=7. So the WOW64
+// context most likely reports FP state as of the last WOW64 transition rather
+// than the thread's live x87 stack, and no combination of context flags will
+// reach it.
+//
+// The obvious workaround is to return the synthetic call into a stub that
+// stores ST(0) to memory first -- `DD 1D <disp32>` (fstp qword ptr [addr])
+// followed by the INT3, written into the same page as the return trap, with
+// eight bytes of scratch alongside. That much is easy.
+//
+// What makes it a DESIGN change rather than a quick fix: `fstp` on an empty
+// stack raises invalid-operation, and Delphi unmasks that by default, so the
+// stub may only be used when a float result is actually expected. Nothing in
+// this seam knows that -- PrepareSyntheticCall is told which ARGUMENTS are
+// floats, never what the callee returns. Doing this properly means adding the
+// expected result class to the seam, which touches the shared pump and the x64
+// implementation too. It is a contained change, but it is not a local one, and
+// bolting it on without that signal would break every integer call.
 //
 // Do NOT read the 0 this currently produces as a value.
 function TWin32Debugger.ReadSyntheticCallResult(TH: THandle;
