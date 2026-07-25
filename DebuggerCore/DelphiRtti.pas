@@ -330,9 +330,18 @@ end;
 // -24 for RTL classes built with CPP_ABI_SUPPORT (Exception, TObject, ...).
 // Returns -1 when neither layout's vmtSelfPtr matches -- the caller
 // should treat the address as not-a-VMT.
+// A VMT slot holds one TARGET pointer, so it is 4 bytes wide on a 32-bit
+// target. Reading 8 there splices the adjacent slot into the high half and
+// yields a plausible-looking address that points nowhere.
 function TDelphiRtti.ReadVmtSlot(VmtAddr: UInt64; Offset: Integer; out V: UInt64): Boolean;
+var
+  R: SIZE_T;
 begin
-  Result := ReadU64(UInt64(Int64(VmtAddr) + Offset), V);
+  V := 0;
+  var Addr := UInt64(Int64(VmtAddr) + Offset);
+  Result := (FProcess <> 0) and (Addr > 4096) and
+    ReadProcessMemory(FProcess, Pointer(Addr), @V, FLayout.PointerSize, R) and
+    (R = FLayout.PointerSize);
 end;
 
 function TDelphiRtti.GetInstanceSize(ObjAddr: UInt64): Integer;
@@ -341,14 +350,14 @@ var
 begin
   Result := 0;
   if ObjAddr < 65536 then Exit;
-  if not ReadU64(ObjAddr, VmtAddr) then Exit;
+  if not ReadVmtSlot(ObjAddr, 0, VmtAddr) then Exit;
   if not IsValidVmt(VmtAddr) then Exit;
   // vmtInstanceSize sits a FIXED +40 above vmtTypeInfo in every Delphi VMT
   // layout (standard: -144/-104; Athens's empirical -168 for TypeInfo puts it at
   // -128). Deriving it from VMT64_TYPEINFO keeps it correct on the same layout
   // GetInstanceClassName already reads TypeInfo from, rather than the standalone
   // VMT64_INSTANCESIZE constant which carries the pre-Athens offset.
-  if ReadVmtSlot(VmtAddr, VMT64_TYPEINFO + 40, SizeVal) and
+  if ReadVmtSlot(VmtAddr, FLayout.VmtTypeInfo + FLayout.VmtInstanceSizeFromTypeInfo, SizeVal) and
      (SizeVal > 0) and (SizeVal < $10000000) then
     Result := Integer(SizeVal);
 end;
@@ -358,12 +367,12 @@ var
   SelfPtr: UInt64;
 begin
   if VmtAddr < 65536 then Exit(MaxInt);
-  if ReadU64(UInt64(Int64(VmtAddr) + VMT64_SELF_PTR), SelfPtr) and
+  if ReadVmtSlot(VmtAddr, FLayout.VmtSelfPtr, SelfPtr) and
      (SelfPtr = VmtAddr) then
     Exit(0);
-  if ReadU64(UInt64(Int64(VmtAddr) + VMT64_SELF_PTR_CPPABI), SelfPtr) and
+  if ReadVmtSlot(VmtAddr, FLayout.VmtSelfPtr - FLayout.VmtCppAbiShift, SelfPtr) and
      (SelfPtr = VmtAddr) then
-    Exit(-VMT64_CPPABI_SHIFT);
+    Exit(-FLayout.VmtCppAbiShift);
   Result := MaxInt;
 end;
 
@@ -380,10 +389,10 @@ begin
   // accept either layout to recognise both.
   Result := False;
   if VmtAddr < 65536 then Exit;
-  if ReadU64(UInt64(Int64(VmtAddr) + VMT64_SELF_PTR), SelfPtr) and
+  if ReadVmtSlot(VmtAddr, FLayout.VmtSelfPtr, SelfPtr) and
      (SelfPtr = VmtAddr) then
     Exit(True);
-  if ReadU64(UInt64(Int64(VmtAddr) + VMT64_SELF_PTR_CPPABI), SelfPtr) and
+  if ReadVmtSlot(VmtAddr, FLayout.VmtSelfPtr - FLayout.VmtCppAbiShift, SelfPtr) and
      (SelfPtr = VmtAddr) then
     Exit(True);
 end;
@@ -416,7 +425,7 @@ begin
   // classes (-160 corresponds to vmtAutoTable in user code and to
   // vmtFieldTable after the -24 CPP_ABI shift -- and what we read at -160
   // for user code is actually field-table-compatible data in practice).
-  if not ReadU64(UInt64(Int64(VmtAddr) + VMT64_FIELDTABLE), FieldTablePtr) then Exit;
+  if not ReadVmtSlot(VmtAddr, FLayout.VmtFieldTable, FieldTablePtr) then Exit;
   if FieldTablePtr = 0 then Exit;
 
   // TVmtFieldTable (packed): Count(u16=2) + ClassTab(ptr8=8) = 10 bytes header,
@@ -483,7 +492,7 @@ var
 begin
   Result := False;
   if ObjAddr < 65536 then Exit;
-  if not ReadU64(ObjAddr, VmtAddr) then Exit;
+  if not ReadVmtSlot(ObjAddr, 0, VmtAddr) then Exit;
   Result := IsValidVmt(VmtAddr);
 end;
 
@@ -589,8 +598,8 @@ var
 begin
   SetLength(Result, 0);
   if not IsClassInstance(ObjAddr) then Exit;
-  if not ReadU64(ObjAddr, VmtAddr) then Exit;
-  if not ReadU64(UInt64(Int64(VmtAddr) + VMT64_TYPEINFO), TypeInfoAddr) then Exit;
+  if not ReadVmtSlot(ObjAddr, 0, VmtAddr) then Exit;
+  if not ReadVmtSlot(VmtAddr, FLayout.VmtTypeInfo, TypeInfoAddr) then Exit;
 
   // Walk: this class' TypeInfo, then ParentInfo, etc.
   var CurTI := TypeInfoAddr;
@@ -621,19 +630,19 @@ var
 begin
   Result := '';
   if ObjAddr < 65536 then Exit;
-  if not ReadU64(ObjAddr, VmtAddr) then Exit;
+  if not ReadVmtSlot(ObjAddr, 0, VmtAddr) then Exit;
   Shift := VmtLayoutShift(VmtAddr);
   if Shift = MaxInt then Exit;
   // Primary: TTypeInfo Name ShortString.
   // (No CPP_ABI shift here -- the empirical -168 offset hits Exception's
   // vmtTypeInfo too, see comment on VMT64_TYPEINFO above.)
-  if ReadU64(UInt64(Int64(VmtAddr) + VMT64_TYPEINFO), TypeInfoAddr) and
+  if ReadVmtSlot(VmtAddr, FLayout.VmtTypeInfo, TypeInfoAddr) and
      (TypeInfoAddr <> 0) and
      ReadTypeInfoKindName(TypeInfoAddr, Kind, Result, TypeDataAddr) and
      (Result <> '') then
     Exit;
   // Fallback: vmtClassName slot (PShortString).
-  if not ReadU64(UInt64(Int64(VmtAddr) + VMT64_CLASSNAME + Shift), NamePtr) then Exit;
+  if not ReadVmtSlot(VmtAddr, FLayout.VmtClassName + Shift, NamePtr) then Exit;
   if NamePtr < 65536 then Exit;
   var Consumed: Integer;
   ReadShortStr(NamePtr, Result, Consumed);
@@ -650,8 +659,8 @@ var
 begin
   Result := False;
   if not IsClassInstance(ObjAddr) then Exit;
-  if not ReadU64(ObjAddr, VmtAddr) then Exit;
-  if not ReadU64(UInt64(Int64(VmtAddr) + VMT64_TYPEINFO), TypeInfoAddr) then Exit;
+  if not ReadVmtSlot(ObjAddr, 0, VmtAddr) then Exit;
+  if not ReadVmtSlot(VmtAddr, FLayout.VmtTypeInfo, TypeInfoAddr) then Exit;
   // `TObject` matches anything that's a valid class instance -- there's no
   // explicit TypeInfo entry to compare against in some cases.
   if SameText(TargetClassName, 'TObject') then Exit(True);
@@ -678,8 +687,8 @@ var
 begin
   SetLength(Result, 0);
   if not IsClassInstance(ObjAddr) then Exit;
-  if not ReadU64(ObjAddr, VmtAddr) then Exit;
-  if not ReadU64(UInt64(Int64(VmtAddr) + VMT64_TYPEINFO), TypeInfoAddr) then Exit;
+  if not ReadVmtSlot(ObjAddr, 0, VmtAddr) then Exit;
+  if not ReadVmtSlot(VmtAddr, FLayout.VmtTypeInfo, TypeInfoAddr) then Exit;
 
   var Depth := 0;
   while (TypeInfoAddr <> 0) and (Depth < MAX_DEPTH) do begin
@@ -704,11 +713,11 @@ var
 begin
   SetLength(Result, 0);
   if ObjAddr = 0 then Exit;
-  if not ReadU64(ObjAddr, VmtAddr) then Exit;
+  if not ReadVmtSlot(ObjAddr, 0, VmtAddr) then Exit;
   if not IsValidVmt(VmtAddr) then Exit;
 
   // Read TypeInfo from VMT slot VMT64_TYPEINFO.  If absent, show only current-class fields.
-  if not ReadU64(UInt64(Int64(VmtAddr) + VMT64_TYPEINFO), TypeInfoAddr) then begin
+  if not ReadVmtSlot(VmtAddr, FLayout.VmtTypeInfo, TypeInfoAddr) then begin
     AppendClassLevelFields(VmtAddr, ObjAddr, Result);
     Exit;
   end;

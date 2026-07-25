@@ -58,6 +58,24 @@ type
     // accounting for a function prologue's saved registers.
     PushSlotSize: Byte;
 
+    // Negative byte offsets of the VMT metadata slots, MEASURED on live VMTs
+    // (DevTools\VmtProbe.dpr, by identity predicate) rather than taken from
+    // System.pas, whose formula does not describe what the Athens compiler
+    // actually emits. Each slot is one pointer wide, so a slot read uses
+    // PointerSize, not a fixed 8.
+    VmtSelfPtr:    Integer;
+    VmtTypeInfo:   Integer;
+    VmtFieldTable: Integer;
+    VmtClassName:  Integer;
+    // vmtInstanceSize sits a fixed distance ABOVE vmtTypeInfo in every layout,
+    // which is a more reliable derivation than its own standalone constant.
+    VmtInstanceSizeFromTypeInfo: Integer;
+    // Units built with CPP_ABI_SUPPORT shift every negative slot by this much,
+    // so two layouts coexist in one image and the reader has to detect which
+    // one a given VMT follows. Zero when the target has no such variation --
+    // measured as 0 on Win32 and 24 on Win64.
+    VmtCppAbiShift: Integer;
+
     class function For32Bit: TTargetLayout; static;
     class function For64Bit: TTargetLayout; static;
     class function ForBitness(Bitness: TTargetBitness): TTargetLayout; static;
@@ -84,6 +102,12 @@ begin
   Result.DynArrayLengthSize     := 8;
   Result.DynArrayRefCountOffset := -12;
   Result.PushSlotSize           := 8;
+  Result.VmtSelfPtr             := -176;
+  Result.VmtTypeInfo            := -168;
+  Result.VmtFieldTable          := -160;
+  Result.VmtClassName           := -112;
+  Result.VmtInstanceSizeFromTypeInfo := 40;
+  Result.VmtCppAbiShift         := 24;
 end;
 
 class function TTargetLayout.For32Bit: TTargetLayout;
@@ -95,6 +119,15 @@ begin
   Result.DynArrayLengthSize     := 4;
   Result.DynArrayRefCountOffset := -8;
   Result.PushSlotSize           := 4;
+  Result.VmtSelfPtr             := -88;
+  Result.VmtTypeInfo            := -72;
+  Result.VmtFieldTable          := -68;
+  Result.VmtClassName           := -56;
+  // -52 measured, i.e. TypeInfo + 20.
+  Result.VmtInstanceSizeFromTypeInfo := 20;
+  // CPP_ABI_SUPPORT is defined for WIN64/EXTERNALLINKER only, so on Win32
+  // every class uses one layout and there is nothing to detect.
+  Result.VmtCppAbiShift         := 0;
 end;
 
 class function TTargetLayout.ForBitness(Bitness: TTargetBitness): TTargetLayout;

@@ -3038,6 +3038,20 @@ begin
       var Key := AnsiLowerCase(R.Name);
       if not FNameToTypeIdx.ContainsKey(Key) then
         FNameToTypeIdx.Add(Key, IndexOffset + I);
+      // dcc32 stores a type's name Borland-mangled (@Unit@TWidget). Callers
+      // hold the SOURCE name -- from a runtime VMT, from the RSM, or from a
+      // user's watch expression -- so index the demangled form as well.
+      // Registering both is what lets GetTypeName present the clean name
+      // without breaking every lookup keyed on the stored one.
+      var Inner, Parent: string;
+      if DemangleBorland(R.Name, Inner, Parent) then begin
+        var Plain := Inner;
+        if Parent <> '' then
+          Plain := Parent + '.' + Inner;
+        var PlainKey := AnsiLowerCase(Plain);
+        if (PlainKey <> Key) and not FNameToTypeIdx.ContainsKey(PlainKey) then
+          FNameToTypeIdx.Add(PlainKey, IndexOffset + I);
+      end;
     end;
   end;
 end;
@@ -3148,6 +3162,19 @@ begin
   if not FTypeIdToRecord.TryGetValue(TypeId, Idx) then Exit;
   if (Idx < 0) or (Idx >= Length(FTypes)) then Exit;
   Result := FTypes[Idx].Name;
+  // dcc32 mangles type names too, so a 32-bit target would otherwise show
+  // `@Testtargetcore@TWidget` where a 64-bit one shows `TWidget`. Both forms
+  // are registered in the name index above, so presenting the clean one here
+  // costs no lookup.
+  if Result.StartsWith('@') then begin
+    var Inner, Parent: string;
+    if DemangleBorland(Result, Inner, Parent) then begin
+      if Parent <> '' then
+        Result := Parent + '.' + Inner
+      else
+        Result := Inner;
+    end;
+  end;
   // LF_MODIFIER is a transparent qualifier wrapper -- transparently
   // unwrap to the underlying type so callers see `Integer`, not the
   // empty modifier record name.

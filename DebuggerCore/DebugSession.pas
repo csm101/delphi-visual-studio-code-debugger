@@ -519,7 +519,7 @@ end;
 function TDebugSession.EnsureRtti: TDelphiRtti;
 begin
   if (FRtti = nil) and (FDebugger <> nil) and (FDebugger.ProcessHandle <> 0) then
-    FRtti := TDelphiRtti.Create(FDebugger.ProcessHandle);
+    FRtti := TDelphiRtti.Create(FDebugger.ProcessHandle, FDebugger.TargetLayout);
   Result := FRtti;
 end;
 
@@ -913,7 +913,7 @@ begin
   FStoppedOnException := Reason = srException;
   FStopReason := Reason;
   if (FRtti = nil) and (FDebugger <> nil) and (FDebugger.ProcessHandle <> 0) then
-    FRtti := TDelphiRtti.Create(FDebugger.ProcessHandle);
+    FRtti := TDelphiRtti.Create(FDebugger.ProcessHandle, FDebugger.TargetLayout);
   if FDebugger <> nil then begin
     FLoader.EnsureModuleForPC(FDebugger.GetRegisters.Pc);  // load DLL/BPL symbols at the stop
     FStopTid := FDebugger.GetStoppedThreadId;
@@ -971,7 +971,7 @@ begin
   // the main .rsm to load; the condition/log expression evaluator needs it.
   EnsureMainRsm;
   if (FRtti = nil) and (FDebugger <> nil) and (FDebugger.ProcessHandle <> 0) then
-    FRtti := TDelphiRtti.Create(FDebugger.ProcessHandle);
+    FRtti := TDelphiRtti.Create(FDebugger.ProcessHandle, FDebugger.TargetLayout);
   FBpEval.Debugger  := FDebugger;
   FBpEval.Rtti      := FRtti;
   FBpEval.DebugInfo := FDebugInfo;
