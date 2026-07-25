@@ -36,12 +36,25 @@ const
 
 type
 
+  // A 64-bit SUPERSET of both register files. A 32-bit target fills the same
+  // fields from its own registers -- Eip into Rip, Esp into Rsp, and so on --
+  // leaving R8..R15 zero, so a consumer that reads a physical name gets a
+  // correct value on x64 and a meaningless one on x86.
+  //
+  // Consumers that want a ROLE ("the program counter", "the frame pointer")
+  // rather than a specific physical register must use the accessors below.
+  // Physical names are for the x64 implementation itself and for the DAP
+  // Registers view, which is deliberately showing the machine's real registers.
   TRegisterSnapshot = record
     Rip, Rsp, Rbp:                           UInt64;
     Rax, Rbx, Rcx, Rdx, Rsi, Rdi:            UInt64;
     R8,  R9,  R10, R11, R12, R13, R14, R15:  UInt64;
     EFlags:                                  UInt32;
     Valid:                                   Boolean;
+
+    function Pc: UInt64;        // RIP / EIP
+    function StackPtr: UInt64;  // RSP / ESP
+    function FramePtr: UInt64;  // RBP / EBP
   end;
 
   TLocalValue = record
@@ -267,5 +280,20 @@ type
   end;
 
 implementation
+
+function TRegisterSnapshot.Pc: UInt64;
+begin
+  Result := Rip;
+end;
+
+function TRegisterSnapshot.StackPtr: UInt64;
+begin
+  Result := Rsp;
+end;
+
+function TRegisterSnapshot.FramePtr: UInt64;
+begin
+  Result := Rbp;
+end;
 
 end.

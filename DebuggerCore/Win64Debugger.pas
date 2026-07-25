@@ -148,7 +148,12 @@ type
     function  ThreadHandle(TID: DWORD): THandle;
     function  FindBreakpointByVA(VA: UInt64): Integer;
     function  ReadFrameSize(EntryVA: UInt64): UInt32;
-    function  ReadPrologInfo(EntryVA: UInt64; out ExtraPushBytes: UInt32): UInt32;
+    // Recognised=False means "the prologue was not understood", which is NOT
+    // the same as a zero-byte frame and must never be treated as one: every
+    // address derived from the frame size would be silently wrong. Callers are
+    // required to check it and refuse rather than guess.
+    function  ReadPrologInfo(EntryVA: UInt64; out ExtraPushBytes: UInt32;
+                out Recognised: Boolean): UInt32;
     function  FunctionBodyStartVA(VA: UInt64): UInt64;
     function  ReadParentFramePointer(ChildRBP: UInt64;
                 ChildFrameSize, ChildExtraPushBytes: UInt32): UInt64;
@@ -3654,8 +3659,11 @@ end;
 function TWinDebugger.ReadFrameSize(EntryVA: UInt64): UInt32;
 var
   ExtraBytes: UInt32;
+  Recognised: Boolean;
 begin
-  Result := ReadPrologInfo(EntryVA, ExtraBytes);
+  Result := ReadPrologInfo(EntryVA, ExtraBytes, Recognised);
+  if not Recognised then
+    Exit(0);
   if Result >= ExtraBytes then
     Dec(Result, ExtraBytes);
 end;
@@ -3692,7 +3700,7 @@ const
 //      shape (push rbp; [push rXX...]; sub rsp, NN; mov rbp, rsp).
 //      Used as a fallback if no unwind data is available.
 function TWinDebugger.ReadPrologInfo(EntryVA: UInt64;
-  out ExtraPushBytes: UInt32): UInt32;
+  out ExtraPushBytes: UInt32; out Recognised: Boolean): UInt32;
 
   // Walk UNWIND_INFO + UNWIND_CODE array from debuggee memory at UnwindVA.
   function FromUnwindData(UnwindVA: UInt64; out FrameSize, ExtraPushes: UInt32): Boolean;
@@ -3761,6 +3769,7 @@ var
 begin
   Result := 0;
   ExtraPushBytes := 0;
+  Recognised := False;
 
   // Strategy 1: DbgHelp .pdata lookup. Returns nil if SymInitialize never
   // ran or the address is outside any loaded module's function table.
@@ -3772,6 +3781,7 @@ begin
       if FromUnwindData(ImageBase + RF.UnwindInfoAddress, FS, EP) then begin
         Result := FS;
         ExtraPushBytes := EP;
+        Recognised := True;
         Exit;
       end;
     end;
@@ -3796,10 +3806,39 @@ begin
     end else
       Break;
   end;
-  if (Off + 3 < Integer(R)) and (Bytes[Off] = $48) and (Bytes[Off + 1] = $83) and (Bytes[Off + 2] = $EC) then
-    Result := Bytes[Off + 3]
-  else if (Off + 6 < Integer(R)) and (Bytes[Off] = $48) and (Bytes[Off + 1] = $81) and (Bytes[Off + 2] = $EC) then
+
+  // A frame larger than a page gets a stack-probe loop between the pushes and
+  // the real allocation, so `sub rsp` is NOT the next instruction:
+  //
+  //   B8 <size:u32>        mov eax, <bytes to probe>
+  //   48 2D 00 10 00 00    sub rax, 1000h
+  //   88 04 04             mov [rsp+rax], al
+  //   48 3D <limit:u32>    cmp rax, <limit>
+  //   77 EF                ja   (back to the sub)
+  //   48 81 EC <size:u32>  sub rsp, N        <- the allocation we actually want
+  //
+  // The loop is a fixed 22 bytes. Verify its signature at the expected offsets
+  // rather than skipping blindly, then continue matching from the far side.
+  // Without this the matcher stopped at the `B8` and reported frame size 0 --
+  // measured against a routine whose real frame is 16464 bytes.
+  if (Off + 22 < Integer(R)) and (Bytes[Off] = $B8) and
+     (Bytes[Off + 5] = $48) and (Bytes[Off + 6] = $2D) and
+     (Bytes[Off + 11] = $88) and (Bytes[Off + 12] = $04) and (Bytes[Off + 13] = $04) and
+     (Bytes[Off + 14] = $48) and (Bytes[Off + 15] = $3D) and
+     (Bytes[Off + 20] = $77) and (Bytes[Off + 21] = $EF) then
+    Inc(Off, 22);
+
+  if (Off + 3 < Integer(R)) and (Bytes[Off] = $48) and (Bytes[Off + 1] = $83) and (Bytes[Off + 2] = $EC) then begin
+    Result := Bytes[Off + 3];
+    Recognised := True;
+  end else if (Off + 6 < Integer(R)) and (Bytes[Off] = $48) and (Bytes[Off + 1] = $81) and (Bytes[Off + 2] = $EC) then begin
     Result := PUInt32(@Bytes[Off + 3])^;
+    Recognised := True;
+  end else if (Off + 2 < Integer(R)) and (Bytes[Off] = $48) and (Bytes[Off + 1] = $8B) and (Bytes[Off + 2] = $EC) then begin
+    // push rbp; [pushes]; mov rbp,rsp -- a genuine zero-byte local area.
+    Result := 0;
+    Recognised := True;
+  end;
 end;
 
 // Returns the VA of the first instruction of the BODY of the function that
@@ -3982,7 +4021,13 @@ begin
   // a third saved register) read locals 16 bytes too low and surfaced
   // Variants as `<nil VarArray>`.
   var ExtraPushBytes: UInt32;
-  var SubRspN := ReadPrologInfo(FuncEntryVA, ExtraPushBytes);
+  var PrologRecognised: Boolean;
+  var SubRspN := ReadPrologInfo(FuncEntryVA, ExtraPushBytes, PrologRecognised);
+  // Every local address below is anchored on the frame size. If the prologue
+  // was not understood, reporting locals would mean reporting whatever happens
+  // to sit at the guessed offsets -- report none instead.
+  if not PrologRecognised then
+    Exit(nil);
   var LocalsBase := Integer(SubRspN) - Integer(SubRspN mod 16);
   var ParamsBase := Integer(SubRspN) + Integer(ExtraPushBytes);
   for var Sym in Locals do begin
@@ -4177,7 +4222,12 @@ begin
       if not FDebugInfo.GetEnclosingProcedure(CurName, ParentName) then
         Break;
     var ChildExtraPushes: UInt32;
-    var ChildFrameSize   := ReadPrologInfo(CurEntry, ChildExtraPushes);
+    var ChildRecognised:  Boolean;
+    var ChildFrameSize   := ReadPrologInfo(CurEntry, ChildExtraPushes, ChildRecognised);
+    // Walking to the parent frame from an unrecognised prologue would follow a
+    // pointer read from an arbitrary stack slot. Stop the walk instead.
+    if not ChildRecognised then
+      Break;
     var ParentRBP        := ReadParentFramePointer(CurRBP, ChildFrameSize, ChildExtraPushes);
     if ParentRBP = 0 then
       Break;
@@ -4257,7 +4307,12 @@ function TWinDebugger.CurrentFrameParamHomeAddr(ParamIndex: Integer): UInt64;
   begin
     if (FrameRBP = 0) or (FuncEntryVA = 0) then Exit(0);
     var ExtraPushBytes: UInt32;
-    var SubRspN := ReadPrologInfo(FuncEntryVA, ExtraPushBytes);
+    var Recognised: Boolean;
+    var SubRspN := ReadPrologInfo(FuncEntryVA, ExtraPushBytes, Recognised);
+    // An unrecognised prologue makes every offset below a guess. 0 is this
+    // function's documented "unavailable", so refuse instead of returning an
+    // address that looks valid and points at an unrelated stack slot.
+    if not Recognised then Exit(0);
     Result := FrameRBP + UInt64(SubRspN) + UInt64(ExtraPushBytes) + 16 +
               UInt64(ParamIndex) * 8;
   end;

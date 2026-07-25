@@ -906,7 +906,7 @@ begin
   if (FRtti = nil) and (FDebugger <> nil) and (FDebugger.ProcessHandle <> 0) then
     FRtti := TDelphiRtti.Create(FDebugger.ProcessHandle);
   if FDebugger <> nil then begin
-    FLoader.EnsureModuleForPC(FDebugger.GetRegisters.Rip);  // load DLL/BPL symbols at the stop
+    FLoader.EnsureModuleForPC(FDebugger.GetRegisters.Pc);  // load DLL/BPL symbols at the stop
     FStopTid := FDebugger.GetStoppedThreadId;
   end;
 
@@ -1656,7 +1656,7 @@ begin
   // Stack slots are the TARGET's pointer size, not the debugger's: an 8-byte
   // stride over a 32-bit stack visits every other slot and covers twice the
   // intended window.
-  for var Anchor in [Regs.Rbp, Regs.Rsp] do begin
+  for var Anchor in [Regs.FramePtr, Regs.StackPtr] do begin
     if Anchor = 0 then Continue;
     for var K := -16 to 32 do begin
       var Slot: UInt64 := 0;

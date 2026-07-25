@@ -301,10 +301,11 @@ end;
 // (Win64Debugger.pas, byte-pattern matcher). Kept byte-for-byte identical in
 // logic so the dcc64 columns of this probe validate the shipping code.
 function DecodeX64ShippingMatcher(const Bytes: array of Byte; R: Integer;
-  out ExtraPushBytes: UInt32): UInt32;
+  out ExtraPushBytes: UInt32; out Recognised: Boolean): UInt32;
 begin
   Result := 0;
   ExtraPushBytes := 0;
+  Recognised := False;
   if R < 5 then Exit;
   if Bytes[0] <> $55 then Exit;                       // push rbp
   var Off: Integer := 1;
@@ -318,10 +319,25 @@ begin
     end else
       Break;
   end;
-  if (Off + 3 < R) and (Bytes[Off] = $48) and (Bytes[Off + 1] = $83) and (Bytes[Off + 2] = $EC) then
-    Result := Bytes[Off + 3]
-  else if (Off + 6 < R) and (Bytes[Off] = $48) and (Bytes[Off + 1] = $81) and (Bytes[Off + 2] = $EC) then
+  // Stack-probe loop for frames larger than a page: a fixed 22 bytes between
+  // the pushes and the real `sub rsp`.
+  if (Off + 22 < R) and (Bytes[Off] = $B8) and
+     (Bytes[Off + 5] = $48) and (Bytes[Off + 6] = $2D) and
+     (Bytes[Off + 11] = $88) and (Bytes[Off + 12] = $04) and (Bytes[Off + 13] = $04) and
+     (Bytes[Off + 14] = $48) and (Bytes[Off + 15] = $3D) and
+     (Bytes[Off + 20] = $77) and (Bytes[Off + 21] = $EF) then
+    Inc(Off, 22);
+
+  if (Off + 3 < R) and (Bytes[Off] = $48) and (Bytes[Off + 1] = $83) and (Bytes[Off + 2] = $EC) then begin
+    Result := Bytes[Off + 3];
+    Recognised := True;
+  end else if (Off + 6 < R) and (Bytes[Off] = $48) and (Bytes[Off + 1] = $81) and (Bytes[Off + 2] = $EC) then begin
     Result := PUInt32(@Bytes[Off + 3])^;
+    Recognised := True;
+  end else if (Off + 2 < R) and (Bytes[Off] = $48) and (Bytes[Off + 1] = $8B) and (Bytes[Off + 2] = $EC) then begin
+    Result := 0;
+    Recognised := True;
+  end;
 end;
 
 // Candidate x86 decoder. Recognises the shapes a 32-bit Delphi prologue can
@@ -484,8 +500,12 @@ begin
 
 {$IFDEF CPUX64}
   var Extra: UInt32;
-  var FS := DecodeX64ShippingMatcher(Bytes, DumpLen, Extra);
-  if (Bytes[0] = $55) then
+  var Recognised: Boolean;
+  var FS := DecodeX64ShippingMatcher(Bytes, DumpLen, Extra, Recognised);
+  // "matched" now reports whether the prologue was UNDERSTOOD, not merely
+  // whether it started with push rbp: a frame size of 0 from an unrecognised
+  // shape is a wrong answer, not a small one.
+  if Recognised then
     Writeln(Format('    x64ship: matched=yes subRsp=%d extraPush=%d', [FS, Extra]))
   else
     Writeln(Format('    x64ship: matched=NO  (first byte %s) subRsp=%d extraPush=%d',
@@ -533,7 +553,10 @@ begin
 
 {$IFDEF CPUX64}
   var Extra: UInt32;
-  var FS := DecodeX64ShippingMatcher(Bytes, DumpLen, Extra);
+  var Recognised: Boolean;
+  var FS := DecodeX64ShippingMatcher(Bytes, DumpLen, Extra, Recognised);
+  if not Recognised then
+    Writeln('    decoded   : prologue NOT recognised -- the shipping code now refuses');
   // Shipping model: RBP = RSPatEntry - 8 - extraPush - subRsp, so the return
   // address slot sits at RBP + subRsp + extraPush + 8, and the ABI home slot of
   // parameter i is at RBP + subRsp + extraPush + 16 + 8*i = retSlot + 8 + 8*i.
