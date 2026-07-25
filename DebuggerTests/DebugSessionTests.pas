@@ -87,6 +87,13 @@ type
     // Extended's 10 bytes keeps the mantissa and drops the exponent, which
     // reported 2.75 as -1.7E-77.
     [Test] procedure Win32_WideFloatLocals_ReadTheirFullWidth;
+    // Records and dynamic arrays are expanded by walking the DEBUGGEE's own
+    // RTTI tables, whose every entry is pointer-width: TRecordTypeField is
+    // 2*ptr+1 bytes, not a constant 17, and tkDynArray's elType2 sits at
+    // 8+ptr, not a constant 16. Object-field expansion did not catch this
+    // because it takes a different table, so these two shapes need their own
+    // cross-bitness check.
+    [Test] procedure Win32_RecordAndDynArrayExpansion_MatchWin64;
     // Stepping. Inherited from the architecture-neutral base, but it rides on
     // SetThreadTrapFlag and the WOW64 single-step status code, both of which
     // are 32-bit specific -- and STATUS_WX86_SINGLE_STEP was measured rather
@@ -2635,6 +2642,61 @@ begin
   Assert.IsTrue(Line > 0, 'marker not found: ' + MARKER);
   CheckAll(Win64Exe, Win64Map, Win64Rsm, Line);
   CheckAll(Win32Exe, Win32Map, Win32Rsm, Line);
+end;
+
+procedure TWin32RunControlTests.Win32_RecordAndDynArrayExpansion_MatchWin64;
+const
+  SRC    = 'TestTargetTypes.pas';
+  MARKER = 'TYPES_BODY';
+  // MRec is a managed record (a string plus a dynamic array of Integer), so one
+  // expansion covers the record field table AND, one level down, the dyn-array
+  // header and element stride.
+  SUBJECT = 'MRec';
+
+  function ChildrenOf(const Exe, Map, Rsm: string; Line: Integer): TArray<string>;
+  begin
+    Result := [];
+    var Session := OpenSessionAtMarker(Exe, Map, Rsm, TargetDir, SRC, Line);
+    try
+      Assert.AreEqual(Ord(dsStopped), Ord(Session.State),
+        'did not stop in ' + ExtractFileName(Exe));
+      for var L in Session.GetLocals do begin
+        if not SameText(L.Name, SUBJECT) then Continue;
+        Assert.IsTrue(L.Expandable and (L.Handle <> 0),
+          SUBJECT + ' should be expandable in ' + ExtractFileName(Exe));
+        for var F in Session.GetChildren(L.Handle) do begin
+          Result := Result + [F.Name + '=' + WithoutAddresses(F.Value) +
+                              ' [' + F.TypeName + ']'];
+          // One level deeper, which is where the dynamic array lives.
+          if F.Expandable and (F.Handle <> 0) then
+            for var G in Session.GetChildren(F.Handle) do
+              Result := Result + ['  ' + G.Name + '=' + WithoutAddresses(G.Value) +
+                                  ' [' + G.TypeName + ']'];
+        end;
+      end;
+    finally
+      Session.Free;
+    end;
+  end;
+
+begin
+  var Line := MarkerLineInFile(TargetDir + SRC, MARKER);
+  Assert.IsTrue(Line > 0, 'marker not found: ' + MARKER);
+
+  var Rows64 := ChildrenOf(Win64Exe, Win64Map, Win64Rsm, Line);
+  var Rows32 := ChildrenOf(Win32Exe, Win32Map, Win32Rsm, Line);
+
+  Assert.IsTrue(Length(Rows64) > 0, 'the 64-bit control expanded nothing');
+  Assert.AreEqual(Length(Rows64), Length(Rows32),
+    Format('child counts differ: x64 %d vs x86 %d', [Length(Rows64), Length(Rows32)]));
+  for var I := 0 to High(Rows64) do
+    Assert.AreEqual(Rows64[I], Rows32[I],
+      Format('%s child %d differs between bitnesses', [SUBJECT, I]));
+  // Guard against both sides agreeing on an empty-looking expansion: the record
+  // really does hold 'managed' and a three-element array.
+  var Joined := string.Join('|', Rows64);
+  Assert.IsTrue(Joined.Contains('managed'),
+    'expected the record''s string field to read "managed", got: ' + Joined);
 end;
 
 procedure PumpUntilStop(Session: TDebugSession; TimeoutMs: Cardinal);

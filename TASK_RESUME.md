@@ -175,7 +175,7 @@ object recognition and field expansion, strings, and expression evaluation
 including getter-backed properties that run real code in the debuggee.
 Multi-BPL -- the project's core use case -- verified end to end.
 
-Suite: **961 found / 959 passed / 0 failed / 0 leaked / 2 ignored.**
+Suite: **962 found / 960 passed / 0 failed / 0 leaked / 2 ignored.**
 
 NOTE ON A DIRTY RUN: one full-suite run produced a block of
 `DAP request failed: unknown error` failures across `TDebuggerTests.Test_Types_*`
@@ -273,6 +273,32 @@ name was the visible tip; the desynchronised walk was the cause.
 `Extended` is a true alias of `Double` on Win64 (same TypeInfo, so the reported
 name really is `Double`) and a distinct 10-byte x87 type on Win32; `NativeUInt`
 is `UInt64` vs `Cardinal`. Reporting one type on both would be the bug.
+
+### The rest of the RTTI walks were 64-bit-only too: FIXED
+
+Finding `GetClassProperties` broken made the obvious next question "what else",
+and the answer was every remaining RTTI table walk in `DelphiRtti`:
+
+* `TFieldExEntry` -- fixed part is `5 + ptr`, was a constant 13.
+* `TRecordTypeField` -- fixed part is `2*ptr + 1`, was a constant 17. Both
+  members of `TManagedField` are pointer-width, including the `NativeInt`
+  offset, whose old read even carried the comment "= 8 bytes on Win64".
+* `tkDynArray` `TTypeData` -- `elType2` is at `8 + ptr`, was a constant 16.
+* The dynamic-array variable slot itself, read 8 wide.
+* Three separate copies of the ParentInfo walk, all `TypeDataAddr + 8`; they
+  are now one `TryReadParentTypeInfo`.
+
+`TDelphiRtti.ReadU64` is DELETED rather than left unused: everything 8 bytes
+wide in these records is a pointer or a NativeInt, so the function only existed
+to reintroduce this bug. A comment in its place says so.
+
+Pinned by `Win32_RecordAndDynArrayExpansion_MatchWin64`, which compares a
+managed record's expansion (a string plus a dynamic array, so one subject covers
+the record field table and the dyn-array header) across both bitnesses.
+Honest limitation: that test asserts cross-bitness PARITY of the result, not
+that the live-RTTI path specifically served it -- the record could be expanded
+via TD32 members instead. The walk fixes themselves are correct by construction
+against the RTL's own declarations in System.TypInfo.
 
 ### Float types wider than the 8-byte value slot: FIXED
 

@@ -224,6 +224,23 @@ getter pointer**, so its shift follows the pointer width too: `System.TypInfo`
 defines `PROPSLOT_MASK` as `$FF000000` at 32-bit and `$FF00000000000000` at
 64-bit.
 
+The same rule governs every other RTTI table `TDelphiRtti` walks, and each one
+has a fixed part whose size is a function of the pointer width rather than a
+constant:
+
+| Record | Fixed part |
+|---|---|
+| `TPropInfo` | `4*ptr + 10` |
+| `TFieldExEntry` | `ptr + 5` |
+| `TRecordTypeField` | `2*ptr + 1` (both `TManagedField` members are pointer-width, the offset included) |
+| `tkDynArray` `TTypeData` | `elType` at `+4`, `elType2` at `+8+ptr` |
+
+There is deliberately **no `ReadU64`** on `TDelphiRtti`. Everything eight bytes
+wide in these records is a pointer or a `NativeInt`, so a fixed-width read is
+wrong on a 32-bit target — and wrong quietly, by splicing the neighbouring field
+into the high half and desynchronising the remainder of the walk. `ReadVmtSlot`
+and `ReadTargetPointer` are the only ways in.
+
 That fallback is why the symptom presented as a *type-name* difference rather
 than as missing properties: TD32 still produced correct values, but its
 primitive `$0041` collapses `Double`, `TDateTime` and `Real` onto one id, so a

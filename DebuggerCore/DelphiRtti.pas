@@ -122,7 +122,11 @@ type
     function ReadU8(Addr: UInt64; out V: Byte): Boolean; inline;
     function ReadU16(Addr: UInt64; out V: Word): Boolean; inline;
     function ReadU32(Addr: UInt64; out V: Cardinal): Boolean; inline;
-    function ReadU64(Addr: UInt64; out V: UInt64): Boolean; inline;
+    // There is deliberately no ReadU64 here. Everything 8 bytes wide in these
+    // RTTI records is a POINTER or a NativeInt, both of which are 4 bytes on a
+    // 32-bit target -- so a fixed 8-byte read is wrong there, and wrong in the
+    // quiet way: it splices the neighbouring field into the high half and
+    // desynchronises the rest of the walk. Use ReadTargetPointer.
 
     // Read a ShortString (1-byte length prefix + ANSI chars).
     // BytesConsumed = 1 + length.
@@ -141,6 +145,9 @@ type
     // One TARGET pointer at Addr. Same read as a VMT slot, named for the many
     // places that are walking an RTTI record rather than a VMT.
     function ReadTargetPointer(Addr: UInt64; out V: UInt64): Boolean;
+    // Follows TTypeData.ParentInfo to the ancestor class's TypeInfo.
+    function TryReadParentTypeInfo(TypeDataAddr: UInt64;
+      out ParentTypeInfo: UInt64): Boolean;
   private
 
     // Read TTypeInfo.Kind and .Name; return address of the following TTypeData.
@@ -277,14 +284,6 @@ begin
     ReadProcessMemory(FProcess, Pointer(Addr), @V, 4, R) and (R = 4);
 end;
 
-function TDelphiRtti.ReadU64(Addr: UInt64; out V: UInt64): Boolean;
-var
-  R: SIZE_T;
-begin
-  Result := (FProcess <> 0) and (Addr > 4096) and
-    ReadProcessMemory(FProcess, Pointer(Addr), @V, 8, R) and (R = 8);
-end;
-
 function TDelphiRtti.ReadShortStr(Addr: UInt64; out S: string;
   out BytesConsumed: Integer): Boolean;
 var
@@ -350,6 +349,21 @@ end;
 function TDelphiRtti.ReadTargetPointer(Addr: UInt64; out V: UInt64): Boolean;
 begin
   Result := ReadVmtSlot(Addr, 0, V);
+end;
+
+// TTypeData.tkClass is ClassType(ptr) followed by ParentInfo(ptr), so the parent
+// link sits one TARGET pointer in and needs two dereferences: the field is a
+// PPTypeInfo. TObject's is nil, which ends the walk.
+function TDelphiRtti.TryReadParentTypeInfo(TypeDataAddr: UInt64;
+  out ParentTypeInfo: UInt64): Boolean;
+begin
+  ParentTypeInfo := 0;
+  var PPParent: UInt64;
+  if not ReadTargetPointer(TypeDataAddr + FLayout.PointerSize, PPParent) then
+    Exit(False);
+  if PPParent = 0 then
+    Exit(False);
+  Result := ReadTargetPointer(PPParent, ParentTypeInfo);
 end;
 
 function TDelphiRtti.GetInstanceSize(ObjAddr: UInt64): Integer;
@@ -452,8 +466,10 @@ begin
   if not ReadU16(Pos, ExCount) then Exit;
   Pos := Pos + 2;
 
-  // Read ExCount TFieldExEntry records.
-  // Each (packed): Flags(1) + TypeRef:PPTypeInfo(8) + Offset(4) + Name(ShortString) + AttrData.
+  // Read ExCount TFieldExEntry records. Each (packed), in TARGET pointers:
+  //   Flags(1) + TypeRef:PPTypeInfo(ptr) + Offset(4) + Name(ShortString) + AttrData
+  // so the fixed part is 5 + ptr bytes, not a constant 13.
+  var PtrSize := UInt64(FLayout.PointerSize);
   for var I := 0 to Integer(ExCount) - 1 do begin
     var Flags:       Byte;
     var TypeRefPPtr: UInt64;
@@ -462,9 +478,9 @@ begin
     var Consumed:    Integer;
 
     if not ReadU8(Pos, Flags) then Exit;
-    if not ReadU64(Pos + 1, TypeRefPPtr) then Exit;
-    if not ReadU32(Pos + 9, OffsetVal) then Exit;
-    Pos := Pos + 13;
+    if not ReadTargetPointer(Pos + 1, TypeRefPPtr) then Exit;
+    if not ReadU32(Pos + 1 + PtrSize, OffsetVal) then Exit;
+    Pos := Pos + 5 + PtrSize;
 
     if not ReadShortStr(Pos, FieldName, Consumed) then Exit;
     Pos := Pos + UInt64(Consumed);
@@ -473,7 +489,7 @@ begin
     // TypeRefPPtr is PPTypeInfo; dereference once to get PTypeInfo.
     var TypeInfoAddr: UInt64 := 0;
     if TypeRefPPtr <> 0 then
-      ReadU64(TypeRefPPtr, TypeInfoAddr);
+      ReadTargetPointer(TypeRefPPtr, TypeInfoAddr);
 
     var FieldKind:     Byte   := TK_UNKNOWN;
     var FieldTypeName: string := '';
@@ -695,9 +711,7 @@ begin
     if not ReadTypeInfoKindName(TypeInfoAddr, Kind, TypeName, TypeDataAddr) then Exit;
     if Kind <> TK_CLASS then Exit;
     if SameText(TypeName, TargetClassName) then Exit(True);
-    if not ReadU64(TypeDataAddr + 8, PPParent) then Exit;
-    if PPParent = 0 then Exit;
-    if not ReadU64(PPParent, PParent) then Exit;
+    if not TryReadParentTypeInfo(TypeDataAddr, PParent) then Exit;
     TypeInfoAddr := PParent;
   end;
 end;
@@ -724,10 +738,7 @@ begin
       SetLength(Result, Length(Result) + 1);
       Result[High(Result)] := TypeName;
     end;
-    // ParentInfo: PPTypeInfo at TypeDataAddr+8; TObject's is nil.
-    if not ReadU64(TypeDataAddr + 8, PPParent) then Exit;
-    if PPParent = 0 then Exit;
-    if not ReadU64(PPParent, PParent) then Exit;
+    if not TryReadParentTypeInfo(TypeDataAddr, PParent) then Exit;
     TypeInfoAddr := PParent;
   end;
 end;
@@ -752,9 +763,9 @@ begin
   end;
 
   // Walk the TypeInfo parent chain to collect ancestor VMTs.
-  // TTypeData.tkClass layout (packed, Win64):
-  //   +0: ClassType (TClass = VMT address, 8 bytes)
-  //   +8: ParentInfo (PPTypeInfo, 8 bytes)  -- dereference to get parent PTypeInfo
+  // TTypeData.tkClass layout (packed), in TARGET pointers:
+  //   +0:   ClassType (TClass = VMT address)
+  //   +ptr: ParentInfo (PPTypeInfo) -- dereference to get parent PTypeInfo
   var AncestorVMTs: TArray<UInt64>;
   var CurTypeInfo := TypeInfoAddr;
   var Depth := 0;
@@ -767,16 +778,12 @@ begin
     if Kind <> TK_CLASS then Break;
 
     var AncVmt: UInt64;
-    if not ReadU64(TypeDataAddr, AncVmt) then Break;
+    if not ReadTargetPointer(TypeDataAddr, AncVmt) then Break;
     SetLength(AncestorVMTs, Length(AncestorVMTs) + 1);
     AncestorVMTs[High(AncestorVMTs)] := AncVmt;
 
-    // ParentInfo: PPTypeInfo at TypeDataAddr+8.
-    var PPParent: UInt64;
-    if not ReadU64(TypeDataAddr + 8, PPParent) then Break;
-    if PPParent = 0 then Break;
     var PParent: UInt64;
-    if not ReadU64(PPParent, PParent) then Break;
+    if not TryReadParentTypeInfo(TypeDataAddr, PParent) then Break;
     CurTypeInfo := PParent;
   end;
 
@@ -820,11 +827,13 @@ begin
   if not ReadU32(Pos, RecFldCnt) then Exit;
   Pos := Pos + 4;
 
-  // TRecordTypeField (packed):
-  //   TManagedField: TypeInfo:PPTypeInfo(8) + FldOffset:NativeInt(8) = 16 bytes
+  // TRecordTypeField (packed), in TARGET pointers -- both members of
+  // TManagedField are pointer-width, so the fixed part is 2*ptr + 1:
+  //   TManagedField: TypeInfo:PPTypeInfo(ptr) + FldOffset:NativeInt(ptr)
   //   Flags: Byte(1)
   //   Name: ShortString (variable)
   //   {AttrData: TAttrData} (variable)
+  var PtrSize := UInt64(FLayout.PointerSize);
   for var I := 0 to Integer(RecFldCnt) - 1 do begin
     var TypeRefPPtr:  UInt64;
     var FldOffset:    Cardinal;
@@ -832,12 +841,12 @@ begin
     var FieldName:    string;
     var Consumed:     Integer;
 
-    if not ReadU64(Pos, TypeRefPPtr) then Exit;
+    if not ReadTargetPointer(Pos, TypeRefPPtr) then Exit;
     var FldOffsetNI: UInt64;
-    if not ReadU64(Pos + 8, FldOffsetNI) then Exit;  // NativeInt = 8 bytes on Win64
+    if not ReadTargetPointer(Pos + PtrSize, FldOffsetNI) then Exit;  // NativeInt
     FldOffset := Cardinal(FldOffsetNI);
-    if not ReadU8(Pos + 16, FieldFlags) then Exit;
-    Pos := Pos + 17;  // TypeRef(8) + NativeInt(8) + Flags(1)
+    if not ReadU8(Pos + 2 * PtrSize, FieldFlags) then Exit;
+    Pos := Pos + 2 * PtrSize + 1;
 
     if not ReadShortStr(Pos, FieldName, Consumed) then Exit;
     Pos := Pos + UInt64(Consumed);
@@ -846,7 +855,7 @@ begin
     // TManagedField.TypeInfo is PPTypeInfo; dereference once.
     var FieldTypeInfoAddr: UInt64 := 0;
     if TypeRefPPtr <> 0 then
-      ReadU64(TypeRefPPtr, FieldTypeInfoAddr);
+      ReadTargetPointer(TypeRefPPtr, FieldTypeInfoAddr);
 
     var FieldKind:     Byte   := TK_UNKNOWN;
     var FieldTypeName: string := '';
@@ -881,23 +890,24 @@ begin
   if not ReadTypeInfoKindName(TypeInfoAddr, Kind, TypeName, TypeDataAddr) then Exit;
   if Kind <> TK_DYNARRAY then Exit;
 
-  // TTypeData.tkDynArray (packed, Win64):
-  //   +0:  elSize (Integer, 4 bytes)
-  //   +4:  elType (PPTypeInfo, 8 bytes) -- nil if element needs no managed cleanup
-  //   +12: varType (Integer, 4 bytes)
-  //   +16: elType2 (PPTypeInfo, 8 bytes) -- always present; the actual element type
+  // TTypeData.tkDynArray (packed), in TARGET pointers:
+  //   +0:       elSize (Integer, 4 bytes)
+  //   +4:       elType (PPTypeInfo) -- nil if the element needs no managed cleanup
+  //   +4+ptr:   varType (Integer, 4 bytes)
+  //   +8+ptr:   elType2 (PPTypeInfo) -- always present; the actual element type
+  var PtrSize := UInt64(FLayout.PointerSize);
   var ElSz: Cardinal;
   if not ReadU32(TypeDataAddr, ElSz) then Exit;
   ElemSize := ElSz;
 
   // Prefer elType2 (always valid); fall back to elType.
   var ElTypePPtr: UInt64;
-  if not ReadU64(TypeDataAddr + 16, ElTypePPtr) or (ElTypePPtr = 0) then
-    if not ReadU64(TypeDataAddr + 4, ElTypePPtr) then Exit;
+  if not ReadTargetPointer(TypeDataAddr + 8 + PtrSize, ElTypePPtr) or (ElTypePPtr = 0) then
+    if not ReadTargetPointer(TypeDataAddr + 4, ElTypePPtr) then Exit;
   if ElTypePPtr = 0 then Exit;
 
   var ElTypePtr: UInt64;
-  if not ReadU64(ElTypePPtr, ElTypePtr) then Exit;
+  if not ReadTargetPointer(ElTypePPtr, ElTypePtr) then Exit;
   ElemTypeInfoAddr := ElTypePtr;
 
   var ElemTypeData: UInt64;
@@ -914,8 +924,9 @@ var
 begin
   SetLength(Result, 0);
   if (ArrVarAddr = 0) or (ElemSize = 0) then Exit;
-  // ArrVarAddr holds the dynamic-array pointer (the variable slot).
-  if not ReadU64(ArrVarAddr, ArrPtr) then Exit;
+  // ArrVarAddr holds the dynamic-array pointer (the variable slot), one TARGET
+  // pointer wide -- reading 8 on a 32-bit target splices in the next slot.
+  if not ReadTargetPointer(ArrVarAddr, ArrPtr) then Exit;
   if ArrPtr = 0 then Exit;
 
   // Delphi dynarray layout in process: ArrPtr[-8] = element count (NativeInt).
