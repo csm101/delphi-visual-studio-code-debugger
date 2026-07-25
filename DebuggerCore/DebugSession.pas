@@ -1639,10 +1639,12 @@ begin
   // home slot. Read it DIRECTLY -- exact, and (unlike a blind register/stack scan)
   // it cannot pick up a STALE `$ActRec` pointer left on the stack by an unrelated
   // closure that ran earlier, which would resolve the wrong class + methods.
+  var Layout := FDebugger.TargetLayout;
   var SelfHome := FDebugger.CurrentFrameParamHomeAddr(0);
   if SelfHome <> 0 then begin
     var SelfPtr: UInt64 := 0;
-    if FDebugger.ReadProcessMemoryAt(SelfHome, @SelfPtr, 8) and Consider(SelfPtr) then
+    if FDebugger.ReadProcessMemoryAt(SelfHome, @SelfPtr, Layout.PointerSize) and
+       Consider(SelfPtr) then
       Exit(True);
   end;
   // Fallback (home slot unreadable / prologue not recognised): scan the param
@@ -1651,14 +1653,18 @@ begin
   for var R in [Regs.Rcx, Regs.Rdx, Regs.R8, Regs.R9, Regs.Rbx,
                 Regs.Rsi, Regs.Rdi, Regs.R12, Regs.R13, Regs.R14, Regs.R15] do
     if Consider(R) then Exit(True);
+  // Stack slots are the TARGET's pointer size, not the debugger's: an 8-byte
+  // stride over a 32-bit stack visits every other slot and covers twice the
+  // intended window.
   for var Anchor in [Regs.Rbp, Regs.Rsp] do begin
     if Anchor = 0 then Continue;
     for var K := -16 to 32 do begin
       var Slot: UInt64 := 0;
       {$Q-}{$R-}
-      var SlotAddr := Anchor + UInt64(Int64(K) * 8);
+      var SlotAddr := Anchor + UInt64(Int64(K) * Layout.PointerSize);
       {$Q+}{$R+}
-      if FDebugger.ReadProcessMemoryAt(SlotAddr, @Slot, 8) and Consider(Slot) then
+      if FDebugger.ReadProcessMemoryAt(SlotAddr, @Slot, Layout.PointerSize) and
+         Consider(Slot) then
         Exit(True);
     end;
   end;

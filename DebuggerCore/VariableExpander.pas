@@ -211,15 +211,19 @@ end;
 function TVariableExpander.TryRecoverClosureObject(InterfaceRef: UInt64;
   out ObjBase: UInt64; out ClassName: string): Boolean;
 const
-  SCAN_SLOTS = 8;   // search up to 8 pointer slots (64 bytes) below the interface ref
+  SCAN_SLOTS = 8;   // search up to 8 pointer slots below the interface reference
 begin
   Result := False;
   ObjBase := 0;
   ClassName := '';
-  if (Rtti = nil) or (InterfaceRef < 65536) then Exit;
+  if (Rtti = nil) or (Debugger = nil) or (InterfaceRef < 65536) then Exit;
+  // Stride by the TARGET's pointer size, not the debugger's. SizeOf(Pointer) is
+  // always 8 in this binary, so on a 32-bit target it stepped over every other
+  // candidate slot and the closure object was simply never found.
+  var SlotSize := Debugger.TargetLayout.PointerSize;
   for var K := 0 to SCAN_SLOTS do begin
     {$Q-}
-    var Cand := InterfaceRef - UInt64(K) * SizeOf(Pointer);
+    var Cand := InterfaceRef - UInt64(K) * SlotSize;
     {$Q+}
     if not Rtti.IsClassInstance(Cand) then Continue;
     var Cn := Rtti.GetInstanceClassName(Cand);
