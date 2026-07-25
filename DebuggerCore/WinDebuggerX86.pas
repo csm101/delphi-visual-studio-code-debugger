@@ -35,6 +35,14 @@ uses
 
 type
   TWin32Debugger = class(TWinDebugger)
+  private
+    // One page in the debuggee holding an FPU-capture stub and its scratch. The
+    // synthetic call returns HERE rather than straight at the INT3 trap; the
+    // stub writes the x87 state to memory and jumps on to the trap, so the
+    // shared pump still sees the breakpoint at the address it recognises.
+    FStubScratch: UInt64;   // 108-byte FNSAVE image
+    FStubCode:    UInt64;   // fnsave / frstor / jmp trap
+    function EnsureFpuCaptureStub: Boolean;
   protected
     function  StackWalkMachineType: DWORD; override;
 
@@ -321,6 +329,59 @@ end;
 
 { ------------------------------------------------------- synthetic call ABI -- }
 
+// Builds the FPU-capture stub in the debuggee, once per session.
+//
+// Reading the x87 result out of the thread context does not work: the WOW64
+// context reports FP state as of the last WOW64 transition, so ST(0) comes back
+// empty (TOP=0, all register bytes zero) even when the callee has just returned
+// a value in it. Measured, not assumed -- and true of both the legacy FloatSave
+// view and the FXSAVE area.
+//
+// So the value is captured in the debuggee instead. FNSAVE is the right
+// instruction for it because it is a NO-WAIT form: it cannot raise, even when
+// the x87 stack is empty, which is what makes this safe to run after EVERY
+// synthetic call rather than only the ones expected to return a float. (A bare
+// `fstp` would fault on an empty stack, and nothing in this seam knows what the
+// callee returns.) FNSAVE also reinitialises the FPU, so FRSTOR immediately
+// puts the debuggee's own state back.
+//
+//   DD 35 <abs32>   fnsave  [scratch]     -- 108-byte image, cannot fault
+//   DD 25 <abs32>   frstor  [scratch]     -- restore what the debuggee had
+//   E9 <rel32>      jmp     RemoteCallTrap
+function TWin32Debugger.EnsureFpuCaptureStub: Boolean;
+const
+  FNSAVE_IMAGE_BYTES = 108;
+  CODE_OFFSET        = 112;          // past the image, 4-byte aligned
+var
+  Code: array[0..16] of Byte;
+begin
+  Result := (FStubCode <> 0);
+  if Result then
+    Exit;
+  var Trap := RemoteCallTrap;
+  if (Trap = 0) or (ProcessHandle = 0) then
+    Exit;
+  var Page := VirtualAllocEx(ProcessHandle, nil, CODE_OFFSET + SizeOf(Code),
+    MEM_COMMIT or MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+  if Page = nil then
+    Exit;
+  var Base    := UInt64(Page);
+  var Scratch := Cardinal(Base);
+  var CodeVA  := Base + CODE_OFFSET;
+
+  Code[0] := $DD; Code[1] := $35;  PCardinal(@Code[2])^  := Scratch;   // fnsave
+  Code[6] := $DD; Code[7] := $25;  PCardinal(@Code[8])^  := Scratch;   // frstor
+  Code[12] := $E9;                                                     // jmp rel32
+  PInteger(@Code[13])^ := Integer(Int64(Trap) - Int64(CodeVA + 17));
+
+  if not WriteMemoryAt(CodeVA, @Code[0], SizeOf(Code)) then
+    Exit;
+  FlushInstructionCache(ProcessHandle, Pointer(CodeVA), SizeOf(Code));
+  FStubScratch := Base;
+  FStubCode    := CodeVA;
+  Result := True;
+end;
+
 // Delphi's 32-bit `register` convention: the first three arguments travel in
 // EAX, EDX and ECX in declaration order, and the rest go on the stack.
 //
@@ -340,6 +401,8 @@ var
   Ctx: TWow64Context;
 begin
   Result := False;
+  if not EnsureFpuCaptureStub then
+    Exit;
   // Floats do not travel in the integer registers on x86 and are returned on
   // the x87 stack, neither of which this implements yet. Refuse rather than
   // place a float where the callee will read an integer.
@@ -357,11 +420,13 @@ begin
     StackArgs := 0;
   // Return address plus the stack arguments, below the current stack pointer.
   var Esp := (Ctx.Esp and not DWORD(3)) - DWORD(4 + 4 * StackArgs);
-  var Trap := RemoteCallTrap;
-  if Trap = 0 then
+  // Return into the FPU-capture stub rather than straight at the trap: it saves
+  // the x87 state to memory and jumps on to the trap, so the pump still sees the
+  // INT3 at the address it recognises.
+  if RemoteCallTrap = 0 then
     Exit;
-  var Trap32: Cardinal := Cardinal(Trap);
-  if not WriteMemoryAt(Esp, @Trap32, 4) then
+  var Ret32: Cardinal := Cardinal(FStubCode);
+  if not WriteMemoryAt(Esp, @Ret32, 4) then
     Exit;
   for var I := 3 to High(ArgValues) do begin
     var Slot: Cardinal := Cardinal(ArgValues[I]);
@@ -411,82 +476,79 @@ begin
   Result := Sign or (UInt64(Exp64) shl 52) or Frac;
 end;
 
-// EAX carries the integer/pointer result.
+// EAX carries the integer result, EDX:EAX a 64-bit one, and a floating-point
+// result arrives via the capture stub rather than the thread context.
 //
-// KNOWN GAP 1 -- Int64 returns. An Int64 comes back in EDX:EAX and only EAX is
-// reported. Combining them blindly would be worse, not better: on x64 a 32-bit
-// result leaves the high half of RAX zeroed by the hardware, but x86 leaves EDX
-// holding whatever the callee last put there, so every ordinary Integer return
-// would come back with garbage in its high half. Reporting EAX alone reproduces
-// the x64 behaviour up to 32 bits and truncates only genuine Int64 returns,
-// which is the narrower failure of the two.
+// Combining EDX:EAX is safe for the same reason it is on x64, where IntResult
+// is the whole of RAX: the consumer masks the raw value down to the declared
+// type's width before using it, so a 32-bit return discards EDX exactly as it
+// discards RAX's high half. An earlier note here claimed the opposite and was
+// wrong.
 //
-// KNOWN GAP 2 -- floating-point returns. What is and is not known, measured
-// rather than guessed, so the next attempt does not repeat the dead ends:
+// FLOAT RETURNS STILL DO NOT PRODUCE A VALUE, but the question has moved and
+// the evidence is now conclusive rather than circumstantial.
 //
-//   * The 80-bit to Double decode above is CORRECT. Verified by hand against
-//     3.25, whose extended form converts to $400A000000000000, exactly the
-//     Double bit pattern for 3.25.
-//   * This function IS reached for a Double-returning getter -- instrumented
-//     and confirmed. An earlier note claiming the fault lay upstream in
-//     ExprEval was WRONG; it rested on a diagnostic that never compiled in.
-//   * WOW64_CONTEXT_FLOATING_POINT returns a FloatSave area that is entirely
-//     zero, status word included. That legacy FNSAVE view is not what the WOW64
-//     layer fills, which is why the FXSAVE area is read instead.
-//   * The FXSAVE area IS populated -- its status word reads $0020, not zero --
-//     but ST(0) is EMPTY at this point: TOP is 0 and the register bytes are all
-//     zero, on every call observed.
+// The x87 state cannot be read from the WOW64 context: both the legacy
+// FloatSave view and the FXSAVE area report ST(0) empty. That could have been
+// the context lying, so the stub was built to ask the debuggee itself -- FNSAVE
+// executes in the target, writes its own 108-byte image, and cannot be a stale
+// snapshot. The image says the same thing, and more precisely: `ftw=$FFFF`,
+// meaning ALL EIGHT registers are tagged empty, on every synthetic call
+// observed.
 //
-// TOP=0 with every register byte zero is a RESET FPU image, not a used one --
-// a callee that had just pushed a result would leave TOP=7. So the WOW64
-// context most likely reports FP state as of the last WOW64 transition rather
-// than the thread's live x87 stack, and no combination of context flags will
-// reach it.
+// So the x87 stack is genuinely empty when the callee returns, and the
+// remaining question is no longer "how do I read ST(0)" but "why is the Double
+// not there". That contradicts the classic Delphi Win32 ABI, so the next step
+// is to disassemble DoCalcDouble's return sequence in a 32-bit build and see
+// what the compiler actually emits -- not to try another way of reading the FPU.
+// Both register areas and the in-process FNSAVE image are now excluded.
 //
-// The obvious workaround is to return the synthetic call into a stub that
-// stores ST(0) to memory first -- `DD 1D <disp32>` (fstp qword ptr [addr])
-// followed by the INT3, written into the same page as the return trap, with
-// eight bytes of scratch alongside. That much is easy.
+// The stub is kept rather than reverted. It is the platform-correct way to read
+// x87 from a WOW64 target, it costs one page and three instructions, and it is
+// what lets the tag word distinguish "this call returned no float" from "this
+// call returned a float" -- so an integer-returning call now leaves the float
+// slot at zero deliberately instead of decoding whatever bytes were lying in a
+// register.
 //
-// What makes it a DESIGN change rather than a quick fix: `fstp` on an empty
-// stack raises invalid-operation, and Delphi unmasks that by default, so the
-// stub may only be used when a float result is actually expected. Nothing in
-// this seam knows that -- PrepareSyntheticCall is told which ARGUMENTS are
-// floats, never what the callee returns. Doing this properly means adding the
-// expected result class to the seam, which touches the shared pump and the x64
-// implementation too. It is a contained change, but it is not a local one, and
-// bolting it on without that signal would break every integer call.
-//
-// Do NOT read the 0 this currently produces as a value.
+// FNSAVE image layout (32-bit): control word at +0, status at +4, tag at +8,
+// then the eight PHYSICAL registers from +28, ten bytes each. ST(0) is R[TOP],
+// with TOP in status bits 11..13; the tag word holds two bits per physical
+// register, and 11b means empty -- which is how an integer-returning call is
+// told apart from one that really left a float behind.
 function TWin32Debugger.ReadSyntheticCallResult(TH: THandle;
   out IntResult, FloatResultLow: UInt64): Boolean;
+const
+  FN_STATUS = 4;
+  FN_TAG    = 8;
+  FN_ST0    = 28;
+  FN_STRIDE = 10;
+  TAG_EMPTY = 3;
 var
-  Ctx: TWow64Context;
+  Ctx:   TWow64Context;
+  Image: array[0..107] of Byte;
 begin
   IntResult      := 0;
   FloatResultLow := 0;
   Ctx := Default(TWow64Context);
-  Ctx.ContextFlags := WOW64_CONTEXT_FULL or WOW64_CONTEXT_FLOATING_POINT or
-                      WOW64_CONTEXT_EXTENDED_REGISTERS;
+  Ctx.ContextFlags := WOW64_CONTEXT_FULL;
   Result := Wow64GetThreadContext(TH, Ctx);
   if not Result then
     Exit;
-  IntResult := Ctx.Eax;
+  IntResult := (UInt64(Ctx.Edx) shl 32) or UInt64(Ctx.Eax);
 
-  // FXSAVE layout: FCW at +0, FSW at +2, then the eight registers from +32, one
-  // every 16 bytes with only the low 10 in use. RegisterArea holds the PHYSICAL
-  // registers R0..R7 while ST(0) is R[TOP], so the stack top has to come out of
-  // the status word (bits 11..13) rather than be assumed to be register zero.
-  const FX_STATUS_WORD = 2;
-  const FX_ST0         = 32;
-  const FX_REG_STRIDE  = 16;
-  if Length(Ctx.ExtendedRegisters) < FX_ST0 + 8 * FX_REG_STRIDE then
+  if FStubScratch = 0 then
     Exit;
-  var Fsw := PWord(@Ctx.ExtendedRegisters[FX_STATUS_WORD])^;
+  if not ReadProcessMemoryAt(FStubScratch, @Image[0], SizeOf(Image)) then
+    Exit;
+  var Fsw := PWord(@Image[FN_STATUS])^;
+  var Ftw := PWord(@Image[FN_TAG])^;
   var Top := (Fsw shr 11) and 7;
+  // Nothing on the x87 stack: an integer-returning call. Leave the float slot
+  // at zero rather than decoding whatever bytes happen to be in the register.
+  if ((Ftw shr (Top * 2)) and 3) = TAG_EMPTY then
+    Exit;
   var Reg: array[0..9] of Byte;
-  Move(Ctx.ExtendedRegisters[FX_ST0 + Integer(Top) * FX_REG_STRIDE], Reg[0], 10);
+  Move(Image[FN_ST0], Reg[0], 10);
   FloatResultLow := ExtendedBytesToDoubleBits(Reg);
 end;
-
 end.
