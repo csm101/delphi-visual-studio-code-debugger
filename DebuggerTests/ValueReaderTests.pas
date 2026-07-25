@@ -40,6 +40,15 @@ type
     // and a fixed $FF member mask aliased ordinals 256..511 to a wrong member.
     [Test] procedure Enum_UninitialisedOrdinal_MasksToStorageWidth;
     [Test] procedure Enum_OrdinalAbove255_ResolvesCorrectMember;
+    // Win32 target support: unlike the string header, Delphi's dynamic-array
+    // header is NOT bitness-neutral. Win64 is _Padding(4) RefCnt(4)
+    // Length:NativeInt(8), so the length sits at data-8 and is 8 bytes wide;
+    // Win32 is RefCnt(4) Length(4), so it sits at data-4 and is 4 wide.
+    // Decoding one with the other's shape does not fail, it returns a plausible
+    // wrong number -- which is why the negative case below is part of the suite.
+    [Test] procedure DynArrayHeader_Win32Layout_DecodesLength;
+    [Test] procedure DynArrayHeader_Win64Layout_DecodesLength;
+    [Test] procedure DynArrayHeader_Win32ImageReadAsWin64_IsWrong;
   end;
 
   // Pure unit tests for the setVariable byte encoders.
@@ -60,7 +69,7 @@ implementation
 uses
   System.SysUtils, Winapi.Windows,
   DebugInfoTypes, DebugTarget, DebugInfoSet, DelphiValueReaders, ExceptionRules,
-  ValueEncoders;
+  ValueEncoders, TargetLayout;
 
 type
   // Minimal IDebugTarget fake: only ReadProcessMemoryAt is live, serving a fixed
@@ -71,6 +80,7 @@ type
   private
     FBase: UInt64;
     FMem:  TBytes;
+    FLayout: TTargetLayout;
     FEnumName: string;
     FEnumInfo: TRsmEnumInfo;
     FOnStopped: TOnStopped; FOnExited: TOnExited; FOnOutput: TOnOutput;
@@ -80,6 +90,12 @@ type
     // Serve one enum type through IDebugTarget.LookupEnumInfo (the enum-name
     // display path queries the DEBUGGER, not the debug-info set).
     procedure SetEnum(const AName: string; const AInfo: TRsmEnumInfo);
+    // Defaults to the 64-bit layout. Settable so a decode path that depends on
+    // the TARGET's pointer size (dynamic-array headers, pointer strides) can be
+    // exercised for both bitnesses against a fixed byte window, with no live
+    // debuggee and no 32-bit build required.
+    procedure SetLayout(const ALayout: TTargetLayout);
+    function  TargetLayout: TTargetLayout;
     function  ReadProcessMemoryAt(VA: UInt64; Buf: Pointer; Size: NativeUInt): Boolean;
     // --- everything below is an inert stub ---
     function  ProcessHandle: THandle;
@@ -145,8 +161,19 @@ type
 constructor TFakeMemTarget.Create(BaseVA: UInt64; const Bytes: TBytes);
 begin
   inherited Create;
-  FBase := BaseVA;
-  FMem  := Bytes;
+  FBase   := BaseVA;
+  FMem    := Bytes;
+  FLayout := TTargetLayout.For64Bit;
+end;
+
+procedure TFakeMemTarget.SetLayout(const ALayout: TTargetLayout);
+begin
+  FLayout := ALayout;
+end;
+
+function TFakeMemTarget.TargetLayout: TTargetLayout;
+begin
+  Result := FLayout;
 end;
 
 function TFakeMemTarget.ReadProcessMemoryAt(VA: UInt64; Buf: Pointer; Size: NativeUInt): Boolean;
@@ -296,6 +323,74 @@ begin
   // it would be shown as a Variant reading the neighbour's bytes as the value.
   Assert.IsFalse(LooksLikeVariant($0014, UInt64($1122334455667788)),
     'a plain integer equal to 20 must not be auto-detected as a varInt64 Variant');
+end;
+
+// A Win32 dynamic-array image: RefCnt(4), Length(4), then the elements. The
+// array VARIABLE holds a pointer to the ELEMENTS, i.e. base + 8.
+function MakeDynArray32(RefCnt, Len, ElemBytes: Integer): TBytes;
+begin
+  SetLength(Result, 8 + ElemBytes);
+  FillChar(Result[0], Length(Result), 0);
+  PInteger(@Result[0])^ := RefCnt;
+  PInteger(@Result[4])^ := Len;
+end;
+
+// The Win64 image: _Padding(4), RefCnt(4), Length(8), then the elements, so the
+// data pointer is base + 16.
+function MakeDynArray64(RefCnt: Integer; Len: Int64; ElemBytes: Integer): TBytes;
+begin
+  SetLength(Result, 16 + ElemBytes);
+  FillChar(Result[0], Length(Result), 0);
+  PInteger(@Result[4])^ := RefCnt;
+  PInt64(@Result[8])^   := Len;
+end;
+
+// Reads the length the way the production decoders now do: address and width
+// both taken from the layout, into a variable zeroed first so a narrow read
+// cannot leave the high half as garbage.
+function ReadDynLenWith(const Image: TBytes; DataOffset: Integer;
+  const Layout: TTargetLayout): Int64;
+var
+  Raw: UInt64;
+begin
+  var Fake := TFakeMemTarget.Create(FAKE_BASE, Image);
+  Fake.SetLayout(Layout);
+  var Target: IDebugTarget := Fake;
+  Raw := 0;
+  Target.ReadProcessMemoryAt(
+    Layout.DynArrayLengthAddr(FAKE_BASE + UInt64(DataOffset)),
+    @Raw, Layout.DynArrayLengthSize);
+  Result := Int64(Raw);
+end;
+
+procedure TValueReaderTests.DynArrayHeader_Win32Layout_DecodesLength;
+begin
+  var Image := MakeDynArray32(1, 7, 28);
+  Assert.AreEqual(Int64(7),
+    ReadDynLenWith(Image, 8, TTargetLayout.For32Bit),
+    'a 32-bit dynamic array must report its real element count');
+end;
+
+procedure TValueReaderTests.DynArrayHeader_Win64Layout_DecodesLength;
+begin
+  var Image := MakeDynArray64(1, 7, 56);
+  Assert.AreEqual(Int64(7),
+    ReadDynLenWith(Image, 16, TTargetLayout.For64Bit),
+    'a 64-bit dynamic array must report its real element count');
+end;
+
+procedure TValueReaderTests.DynArrayHeader_Win32ImageReadAsWin64_IsWrong;
+begin
+  // Proves the layout is load-bearing rather than decorative: read the SAME
+  // 32-bit image with the 64-bit shape and the refcount is spliced into the
+  // length. If this ever starts returning 7, the decoders have stopped
+  // consulting the layout and the two tests above have gone vacuous.
+  var Image := MakeDynArray32(1, 7, 28);
+  var Wrong := ReadDynLenWith(Image, 8, TTargetLayout.For64Bit);
+  Assert.AreNotEqual(Int64(7), Wrong,
+    'reading a 32-bit array header with the 64-bit shape must NOT happen to be right');
+  Assert.AreEqual(Int64($0000000700000001), Wrong,
+    'the wrong read should splice Length into the high half and RefCnt into the low');
 end;
 
 procedure TValueReaderTests.VariantAutoDetect_UInt64Pattern_Rejected;

@@ -5,7 +5,8 @@ interface
 uses
   System.SysUtils, System.Classes, System.Generics.Collections,
   Winapi.Windows,
-  DapProtocol, DebugInfoTypes, DebugInfoSet, DebugTarget, ExceptionRules;
+  DapProtocol, DebugInfoTypes, DebugInfoSet, DebugTarget, ExceptionRules,
+  TargetLayout;
 
 type
   TWinDebugger = class(TInterfacedObject, IDebugTarget)
@@ -260,6 +261,10 @@ type
     function  LookupEnumInfo(const TypeName: string; out Info: TRsmEnumInfo): Boolean;
     // RVA (from MAP file) to actual virtual address in the running process.
     function  RvaToVA(Rva: UInt64): UInt64;
+    // Memory layout of the debuggee's address space. Fixed at 64-bit here; the
+    // x86 implementation reports its own, and callers decoding target
+    // structures must consult this rather than SizeOf(Pointer).
+    function  TargetLayout: TTargetLayout;
     // Sets RIP of the currently stopped thread. Returns False if not stopped.
     function  SetInstructionPointer(VA: UInt64): Boolean;
     // Resolves a fully-qualified symbol name (e.g. `TWidget.GetScore`) to its
@@ -583,6 +588,11 @@ end;
 function TWinDebugger.RvaToVA(Rva: UInt64): UInt64;
 begin
   Result := FImageBase + Rva;
+end;
+
+function TWinDebugger.TargetLayout: TTargetLayout;
+begin
+  Result := TTargetLayout.For64Bit;
 end;
 
 function TWinDebugger.VAToRva(VA: UInt64): UInt64;

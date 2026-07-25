@@ -10,7 +10,7 @@ unit DelphiRtti;
 interface
 
 uses
-  Winapi.Windows, System.SysUtils, System.TypInfo;
+  Winapi.Windows, System.SysUtils, System.TypInfo, TargetLayout;
 
 const
   // VMT metadata slot byte offsets for Delphi Athens 36 Win64.
@@ -114,6 +114,10 @@ type
   TDelphiRtti = class
   private
     FProcess: THandle;
+    // Layout of the DEBUGGEE's address space. This class reads through a raw
+    // process handle rather than IDebugTarget, so it cannot ask the target and
+    // must be told.
+    FLayout:  TTargetLayout;
 
     function ReadU8(Addr: UInt64; out V: Byte): Boolean; inline;
     function ReadU16(Addr: UInt64; out V: Word): Boolean; inline;
@@ -145,7 +149,15 @@ type
       var Fields: TArray<TRttiFieldInfo>);
 
   public
-    constructor Create(AProcess: THandle);
+    // ALayout defaults to the 64-bit shape so existing call sites keep their
+    // behaviour; a 32-bit target must pass its own.
+    constructor Create(AProcess: THandle); overload;
+    constructor Create(AProcess: THandle; const ALayout: TTargetLayout); overload;
+
+    // Element count of a dynamic array, from the header below its data
+    // pointer. Bitness-dependent in both offset and width, so it cannot go
+    // through ReadU64.
+    function ReadDynArrayLength(DataPtr: UInt64; out Len: UInt64): Boolean;
 
     // True if the value ObjAddr (stored in a class variable) points to what
     // looks like a valid Delphi object (VMT self-pointer check).
@@ -217,8 +229,25 @@ end;
 
 constructor TDelphiRtti.Create(AProcess: THandle);
 begin
+  Create(AProcess, TTargetLayout.For64Bit);
+end;
+
+constructor TDelphiRtti.Create(AProcess: THandle; const ALayout: TTargetLayout);
+begin
   inherited Create;
   FProcess := AProcess;
+  FLayout  := ALayout;
+end;
+
+function TDelphiRtti.ReadDynArrayLength(DataPtr: UInt64; out Len: UInt64): Boolean;
+var
+  R: SIZE_T;
+begin
+  Len := 0;
+  var Addr := FLayout.DynArrayLengthAddr(DataPtr);
+  Result := (FProcess <> 0) and (Addr > 4096) and
+    ReadProcessMemory(FProcess, Pointer(Addr), @Len, FLayout.DynArrayLengthSize, R) and
+    (R = FLayout.DynArrayLengthSize);
 end;
 
 function TDelphiRtti.ReadU8(Addr: UInt64; out V: Byte): Boolean;
@@ -856,7 +885,7 @@ begin
   if ArrPtr = 0 then Exit;
 
   // Delphi dynarray layout in process: ArrPtr[-8] = element count (NativeInt).
-  if not ReadU64(UInt64(Int64(ArrPtr) - 8), LenVal) then Exit;
+  if not ReadDynArrayLength(ArrPtr, LenVal) then Exit;
   ElemCount := Integer(LenVal);
   if ElemCount <= 0 then Exit;
   if ElemCount > MAX_DYNARRAY_ELEMS then ElemCount := MAX_DYNARRAY_ELEMS;

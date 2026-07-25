@@ -13,7 +13,7 @@ unit DebugTarget;
 interface
 
 uses
-  System.SysUtils, Winapi.Windows, DebugInfoTypes, ExceptionRules;
+  System.SysUtils, Winapi.Windows, DebugInfoTypes, ExceptionRules, TargetLayout;
 
 type
   TStopReason = (srEntry, srBreakpoint, srStep, srException, srPause);
@@ -129,6 +129,10 @@ type
     function  ReadProcessMemoryAt(VA: UInt64; Buf: Pointer; Size: NativeUInt): Boolean;
     function  WriteMemoryAt(VA: UInt64; Buf: Pointer; Size: NativeUInt): Boolean;
     function  RvaToVA(Rva: UInt64): UInt64;
+    // Memory layout of the TARGET's address space. Callers decoding target
+    // structures must take strides and header offsets from here rather than
+    // from SizeOf(Pointer), which describes the debugger and not the debuggee.
+    function  TargetLayout: TTargetLayout;
 
     // Thread enumeration. GetThreadIds lists every live thread (in
     // creation order). GetThreadName returns a human-readable label --

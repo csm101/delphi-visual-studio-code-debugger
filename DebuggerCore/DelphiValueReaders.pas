@@ -1153,8 +1153,11 @@ function TDelphiValueReader.FormatLocalValue(const V: TLocalValue): string;
     if DataPtr < 65536 then Exit;
     var Len: Int64 := 0;
     var RefCnt: Int32 := 0;
-    if not Debugger.ReadProcessMemoryAt(DataPtr - 8,  @Len, 8) then Exit;
-    if not Debugger.ReadProcessMemoryAt(DataPtr - 12, @RefCnt, 4) then Exit;
+    var Layout := Debugger.TargetLayout;
+    if not Debugger.ReadProcessMemoryAt(Layout.DynArrayLengthAddr(DataPtr),
+             @Len, Layout.DynArrayLengthSize) then Exit;
+    if not Debugger.ReadProcessMemoryAt(Layout.DynArrayRefCountAddr(DataPtr),
+             @RefCnt, 4) then Exit;
     // Header sanity: a genuine non-array pointer fails this (length reads huge
     // or the refcount is not a live dyn-array refcount).
     if (Len < 0) or (Len > (1 shl 24)) then Exit;

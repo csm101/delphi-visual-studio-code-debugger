@@ -144,6 +144,7 @@ type
     function  ReadU16(Addr: UInt64; out V: Word):    Boolean;
     function  ReadU32(Addr: UInt64; out V: Cardinal): Boolean;
     function  ReadU64(Addr: UInt64; out V: UInt64):  Boolean;
+    function  ReadDynArrayLength(DataPtr: UInt64; out Len: UInt64): Boolean;
 
     // Value construction
     function  InvalidValue(const Msg: string): TExprValue;
@@ -287,6 +288,18 @@ end;
 function TExprEvaluator.ReadU64(Addr: UInt64; out V: UInt64): Boolean;
 begin
   Result := FDebugger.ReadProcessMemoryAt(Addr, @V, 8);
+end;
+
+// Reads a dynamic array's element count from the header below its data
+// pointer. Both the offset and the width are bitness-dependent, so this cannot
+// go through ReadU64: on a 32-bit target the length is a 4-byte NativeInt at
+// data-4, and reading 8 bytes at data-8 would splice the refcount into it.
+function TExprEvaluator.ReadDynArrayLength(DataPtr: UInt64; out Len: UInt64): Boolean;
+begin
+  Len := 0;
+  var Layout := FDebugger.TargetLayout;
+  Result := FDebugger.ReadProcessMemoryAt(Layout.DynArrayLengthAddr(DataPtr),
+              @Len, Layout.DynArrayLengthSize);
 end;
 
 { Value construction }
@@ -724,7 +737,7 @@ begin
       if Base.DerefPtr then
         DataPtr := Base.Address;
     end else begin
-      if not ReadU64(UInt64(Int64(DataPtr) - 8), ArrLen) then
+      if not ReadDynArrayLength(DataPtr, ArrLen) then
         Exit(InvalidValue('<cannot read array length>'));
       var Count := Int64(ArrLen);
       if (Idx < 0) or (Idx >= Count) then
@@ -2570,7 +2583,7 @@ function TExprEvaluator.ApplyIntrinsic(const Name: string;
   var L: UInt64;
   begin
     if A.RawValue = 0 then Exit(MakeInt64(0));
-    if not ReadU64(A.RawValue - 8, L) then
+    if not ReadDynArrayLength(A.RawValue, L) then
       Exit(InvalidValue('<Length: array length read failed>'));
     Result := MakeInt64(Int64(L));
   end;

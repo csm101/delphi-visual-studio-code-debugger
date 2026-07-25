@@ -100,18 +100,33 @@ per-segment bases `.text $1000`, `.data $F5000`, `.bss $F9000` (so the shift is
 per segment, never a flat `$1000`). Segment `0005 .tls` has linearStart `$0`,
 below `FPreferredBase`, so it stays unregistered -- the known open TLS gap.
 
+### Increment -1: DONE, gated and committed (6f56a5d..6a6dafd)
+
+Gate: **946 found / 944 passed / 0 failed / 0 errored / 2 ignored** -- identical
+to the pre-change baseline, as required (all six edits are no-ops on PE32+ by
+construction, so any delta would have named a wrong edit rather than a drifting
+baseline).
+
+**Proof the MAP fix actually fixes Win32, not merely "does not break x64":**
+rebuilt DevTools against the fixed reader and re-ran
+`CompareMapTD32.exe <exe> <map>` on both bitnesses.
+
+| | TD32 entries | forward diverge | reverse diverge |
+|---|---|---|---|
+| Win32 before fix | 1568 | **all** (constant $1000) | **all** |
+| Win32 after fix  | 1568 | 9 | 10 |
+| Win64 (control)  | 1487 | 6 | 9 |
+
+Win32 now sits at the same residual level as the always-correct x64 control, so
+the leftovers are ordinary MAP-vs-TD32 granularity (one source line owning many
+RVAs in instantiated generics), not a bitness defect.
+
 ### CURRENT CURSOR
 
-Task #1 DONE. Task #2 (Increment -1) edits ALL APPLIED and the adapter compiles
-clean (same warnings/hints as baseline, none new). **Gate run in flight.**
+**Next: Increment 1 -- `TTargetLayout` + shared read helpers.** Nothing started.
 
-* **Baseline before any change: 946 found / 944 passed / 0 failed / 0 errored /
-  2 ignored.** The gate requires exactly these numbers again.
-* **Next action if interrupted right now:** read the gate run's totals and
-  compare against 946/944/0/0/2. If identical, commit Increment -1 as a
-  milestone. If not, the delta names which of the six edits is wrong -- do not
-  assume the baseline drifted, all six are no-ops on PE32+ by construction.
-* Increment -1, six edits (four planned + two from finding 1 above):
+* Historical detail of Increment -1, six edits (four planned + two from the
+  measured single-step finding above):
   1. `MapFileReader.pas:483-494` -- replace the fixed 16-char `AddrPart` slice
      with a scan of consecutive hex digits from `ColonPos+1`, accept a run of 8
      or 16 terminated by whitespace/EOL. Keep the `LinearAddr >= FPreferredBase`

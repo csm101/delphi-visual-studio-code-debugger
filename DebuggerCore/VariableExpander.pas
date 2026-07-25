@@ -414,7 +414,9 @@ begin
         Result := '(empty)'
       else begin
         var LenVal: UInt64 := 0;
-        Debugger.ReadProcessMemoryAt(UInt64(Int64(ArrPtr) - 8), @LenVal, 8);
+        var Layout := Debugger.TargetLayout;
+        Debugger.ReadProcessMemoryAt(Layout.DynArrayLengthAddr(ArrPtr),
+          @LenVal, Layout.DynArrayLengthSize);
         Result := Format('%s[%d]', [TypeName, Integer(LenVal)]);
       end;
     end;
@@ -852,14 +854,21 @@ begin
   Exp := Default(TSessionExpansion);
   if (SlotPtr < 65536) or (Debugger = nil) or (DebugInfo = nil) or (ElemTypeName = '') then
     Exit;
-  // SlotPtr = the array DATA pointer. Win64 TDynArrayRec sits just below it:
-  // -12 RefCnt(i32), -8 Length(NativeInt). A genuine typed pointer fails the
-  // header sanity (its preceding bytes are not a valid refcnt/length pair).
-  var Len: Int64 := -999;
+  // SlotPtr = the array DATA pointer. TDynArrayRec sits just below it, and its
+  // shape is bitness-dependent (unlike the string header): Win64 has
+  // -12 RefCnt(i32), -8 Length(NativeInt=8); Win32 has -8 RefCnt, -4 Length(4).
+  // A genuine typed pointer fails the header sanity (its preceding bytes are
+  // not a valid refcnt/length pair).
+  // Len starts at 0, not a sentinel: a 32-bit target writes only the low 4
+  // bytes, so anything else would leave the high half as garbage.
+  var Len: Int64 := 0;
   var RefCount: Int32 := -999;
   var ElemSize: Integer := 0;
-  var RdLen := Debugger.ReadProcessMemoryAt(UInt64(Int64(SlotPtr) - 8),  @Len, 8);
-  var RdRef := Debugger.ReadProcessMemoryAt(UInt64(Int64(SlotPtr) - 12), @RefCount, 4);
+  var Layout := Debugger.TargetLayout;
+  var RdLen := Debugger.ReadProcessMemoryAt(Layout.DynArrayLengthAddr(SlotPtr),
+                 @Len, Layout.DynArrayLengthSize);
+  var RdRef := Debugger.ReadProcessMemoryAt(Layout.DynArrayRefCountAddr(SlotPtr),
+                 @RefCount, 4);
   var GotSize := DebugInfo.GetTypeSize(ElemTypeName, ElemSize);
   if not RdLen or not RdRef then
     Exit;
