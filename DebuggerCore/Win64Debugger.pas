@@ -3274,6 +3274,13 @@ begin
   end;
 
   SavedCtx := Default(TContext);
+  // CONTEXT_FLOATING_POINT is load-bearing, not defensive. On a 32-bit target
+  // the callee returns floats on the x87 stack and the capture stub leaves the
+  // value there (popping it is the caller's job by the x87 ABI, and the stub is
+  // not the caller). Restoring the FP state below is what discards it. Without
+  // that flag every float-returning evaluation leaks one x87 slot and overflows
+  // the debuggee's FPU on the eighth -- silently, because ST(0) still reads
+  // correctly right up until it wraps.
   SavedCtx.ContextFlags := CONTEXT_FULL or CONTEXT_FLOATING_POINT;
   if not GetThreadContext(TH, SavedCtx) then Exit;
 

@@ -342,12 +342,23 @@ end;
 // the x87 stack is empty, which is what makes this safe to run after EVERY
 // synthetic call rather than only the ones expected to return a float. (A bare
 // `fstp` would fault on an empty stack, and nothing in this seam knows what the
-// callee returns.) FNSAVE also reinitialises the FPU, so FRSTOR immediately
-// puts the debuggee's own state back.
+// callee returns.) FNSAVE also reinitialises the FPU, so FRSTOR puts back what
+// the CALLEE left -- which still includes the returned value, since by the x87
+// ABI popping it is the caller's job and the stub is not that caller.
 //
 //   DD 35 <abs32>   fnsave  [scratch]     -- 108-byte image, cannot fault
-//   DD 25 <abs32>   frstor  [scratch]     -- restore what the debuggee had
+//   DD 25 <abs32>   frstor  [scratch]     -- put the callee's state back
 //   E9 <rel32>      jmp     RemoteCallTrap
+//
+// That leftover value does NOT accumulate across calls, and the reason is worth
+// knowing before anyone changes it: the shared pump in RunMethodCall saves the
+// thread context with CONTEXT_FULL **or CONTEXT_FLOATING_POINT** before the call
+// and restores it after reading the result, and on a WOW64 thread that is the
+// same physical x87 stack. Dropping CONTEXT_FLOATING_POINT from that save/restore
+// would make every float-returning evaluation leak one x87 slot and overflow the
+// debuggee's FPU on the eighth -- silently, since ST(0) reads correctly right up
+// until it wraps. Measured: twelve consecutive float evaluations in one session
+// all return the right value.
 function TWin32Debugger.EnsureFpuCaptureStub: Boolean;
 const
   FNSAVE_IMAGE_BYTES = 108;
@@ -485,36 +496,32 @@ end;
 // discards RAX's high half. An earlier note here claimed the opposite and was
 // wrong.
 //
-// FLOAT RETURNS STILL DO NOT PRODUCE A VALUE, but the question has moved and
-// the evidence is now conclusive rather than circumstantial.
+// The x87 state cannot be read from the WOW64 thread context at all: both the
+// legacy FloatSave view and the FXSAVE area report ST(0) empty, because the
+// context carries FP state as of the last WOW64 transition rather than the live
+// stack. Hence the capture stub, which asks the debuggee itself -- FNSAVE
+// executes in the target and writes its own image, so it cannot be stale.
 //
-// The x87 state cannot be read from the WOW64 context: both the legacy
-// FloatSave view and the FXSAVE area report ST(0) empty. That could have been
-// the context lying, so the stub was built to ask the debuggee itself -- FNSAVE
-// executes in the target, writes its own 108-byte image, and cannot be a stale
-// snapshot. The image says the same thing, and more precisely: `ftw=$FFFF`,
-// meaning ALL EIGHT registers are tagged empty, on every synthetic call
-// observed.
-//
-// So the x87 stack is genuinely empty when the callee returns, and the
-// remaining question is no longer "how do I read ST(0)" but "why is the Double
-// not there". That contradicts the classic Delphi Win32 ABI, so the next step
-// is to disassemble DoCalcDouble's return sequence in a 32-bit build and see
-// what the compiler actually emits -- not to try another way of reading the FPU.
-// Both register areas and the in-process FNSAVE image are now excluded.
-//
-// The stub is kept rather than reverted. It is the platform-correct way to read
-// x87 from a WOW64 target, it costs one page and three instructions, and it is
-// what lets the tag word distinguish "this call returned no float" from "this
-// call returned a float" -- so an integer-returning call now leaves the float
-// slot at zero deliberately instead of decoding whatever bytes were lying in a
-// register.
+// FNSAVE rather than FSTP is what makes the stub unconditional. FSTP on an empty
+// stack raises invalid-operation, which Delphi unmasks by default, so an FSTP
+// stub could only be planted when a float result is expected -- and the seam is
+// told which ARGUMENTS are floats, never what the callee RETURNS. FNSAVE cannot
+// fault, so one stub serves every call and the tag word then reports whether a
+// float was actually returned.
 //
 // FNSAVE image layout (32-bit): control word at +0, status at +4, tag at +8,
-// then the eight PHYSICAL registers from +28, ten bytes each. ST(0) is R[TOP],
-// with TOP in status bits 11..13; the tag word holds two bits per physical
-// register, and 11b means empty -- which is how an integer-returning call is
-// told apart from one that really left a float behind.
+// then the register area from +28, ten bytes each.
+//
+// THE TRAP, which cost three wrong conclusions before it was spotted: the tag
+// word is indexed by PHYSICAL register (two bits each, 11b = empty, so ST(0)'s
+// tag is at bit offset TOP*2), but the saved register AREA is in STACK order
+// with ST(0) ALWAYS in the first slot. Scaling the register offset by TOP reads
+// ST(7) and produces a plausible wrong number rather than an obvious failure.
+//
+// The value handed back is the nearest Double's bit pattern, matching what the
+// x64 side puts in this slot (the low qword of XMM0). Callers that need a
+// different encoding -- a Single's 4-byte pattern, a Currency's scaled Int64 --
+// convert from it; see TExprEvaluator.NormaliseFloatReturn.
 function TWin32Debugger.ReadSyntheticCallResult(TH: THandle;
   out IntResult, FloatResultLow: UInt64): Boolean;
 const

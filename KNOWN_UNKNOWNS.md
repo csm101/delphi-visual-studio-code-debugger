@@ -476,16 +476,18 @@ channel; `TDebugSession.OnConsole` would be the sink).
 object expansion, evaluation, multi-BPL). See "Target architecture" in
 `DAP_DEBUGGER_ARCHITECTURE.md`. These remain unanswered:
 
-- **Float arguments and float returns in an x86 synthetic call.** Currently
-  refused rather than approximated: floats do not travel in the integer
-  registers on x86, and a result comes back on the x87 stack. Reading an x87
-  register out of a WOW64 context, and deciding where a float argument goes,
-  are both unexplored.
-- **Int64 returns from an x86 synthetic call.** The value comes back in EDX:EAX
-  and `ReadSyntheticCallResult` reads EAX only, so a 64-bit result would be
-  truncated. The open part is whether the evaluator can know the callee's
-  declared return width at that point, and therefore whether to widen the read
-  or refuse the call outright.
+- **Float arguments in an x86 synthetic call.** Still refused rather than
+  approximated: floats do not travel in the integer registers on x86, and where
+  each one goes has not been measured. (Float *returns* and `Int64` returns are
+  now implemented — see "x86 return values" in `DAP_DEBUGGER_ARCHITECTURE.md`.)
+- **`Extended` is 10 bytes on Win32, and `TD32FileReader` reports it as 8.**
+  The type-size table maps CodeView primitives `$41` and `$42` to 8 bytes, which
+  is right for `Double` and right for `Extended` on Win64 (where it aliases
+  `Double`) but two bytes short on Win32, where `Extended` is a genuine 80-bit
+  x87 type. `TTD32FileReader` has no notion of target bitness at all, so fixing
+  this means threading one in. Not currently reachable through a synthetic call
+  return (those arrive already converted to `Double` bits) — the exposure is
+  reading an `Extended` variable out of target memory, which no test covers yet.
 - **Does `dcc32 -$O+` emit usable local symbols?** Win32 locals/params are
   declared supported for `-$O-` builds only, because `-$O+` omits the frame
   pointer routinely. Whether the debug info of an optimised 32-bit build still

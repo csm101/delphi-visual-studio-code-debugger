@@ -21,6 +21,10 @@ if "%HAVE_JCL%"=="1" set FLAGS=%FLAGS% %JCL_FLAGS%
 rem Tools that do not compile without the upstream JCL sources.
 set JCL_ONLY=TdsProbe JclProbe
 
+rem Probes that exist to measure what the 32-bit compiler emits. They contain
+rem x86 asm and cannot build under dcc64 at all - build them with build_one32.bat.
+set WIN32_ONLY=Win32FloatAbiProbe
+
 set FAILED=
 
 rem NOTE: the %%~xF guard is required - cmd's *.dpr wildcard also matches *.dproj
@@ -33,6 +37,10 @@ echo All DevTools built OK. Binaries in DevTools\Win64\Debug\
 exit /b 0
 
 :build
+for %%W in (%WIN32_ONLY%) do if /i "%%W"=="%~1" (
+  echo === %~1 ===  (skipped: 32-bit only, use build_one32.bat^)
+  exit /b 0
+)
 if "%HAVE_JCL%"=="0" (
   for %%J in (%JCL_ONLY%) do if /i "%%J"=="%~1" (
     echo === %~1 ===  (skipped: needs JCL^)

@@ -138,6 +138,9 @@ type
     function IsValidVmt(VmtAddr: UInt64): Boolean;
     function VmtLayoutShift(VmtAddr: UInt64): Integer;
     function ReadVmtSlot(VmtAddr: UInt64; Offset: Integer; out V: UInt64): Boolean;
+    // One TARGET pointer at Addr. Same read as a VMT slot, named for the many
+    // places that are walking an RTTI record rather than a VMT.
+    function ReadTargetPointer(Addr: UInt64; out V: UInt64): Boolean;
   private
 
     // Read TTypeInfo.Kind and .Name; return address of the following TTypeData.
@@ -344,6 +347,11 @@ begin
     (R = FLayout.PointerSize);
 end;
 
+function TDelphiRtti.ReadTargetPointer(Addr: UInt64; out V: UInt64): Boolean;
+begin
+  Result := ReadVmtSlot(Addr, 0, V);
+end;
+
 function TDelphiRtti.GetInstanceSize(ObjAddr: UInt64): Integer;
 var
   VmtAddr, SizeVal: UInt64;
@@ -530,13 +538,22 @@ const
     if TypeInfoAddr = 0 then Exit;
     if not ReadTypeInfoKindName(TypeInfoAddr, Kind, TypeName, TypeDataAddr) then Exit;
     if Kind <> TK_CLASS then Exit;
-    // TTypeData.tkClass layout: ClassType(8) ParentInfo(8) PropCount(2)
+
+    // EVERY pointer in these RTTI records is a TARGET pointer, so all the
+    // offsets below are expressed in PtrSize rather than a literal 8. The
+    // 64-bit-only version of this walk desynchronised on the very first record
+    // of a 32-bit target -- 18 bytes consumed where the record is 10 -- so no
+    // property ever matched by name and the whole live-RTTI property surface
+    // silently degraded to the debug-info fallback.
+    var PtrSize := UInt64(FLayout.PointerSize);
+
+    // TTypeData.tkClass layout: ClassType(ptr) ParentInfo(ptr) PropCount(2)
     //                           UnitName(ShortString) TPropData
     Cursor := TypeDataAddr;
-    if not ReadU64(Cursor, ClassType)  then Exit;
-    Inc(Cursor, 8);
-    if not ReadU64(Cursor, ParentInfo) then Exit;
-    Inc(Cursor, 8);
+    if not ReadTargetPointer(Cursor, ClassType)  then Exit;
+    Inc(Cursor, PtrSize);
+    if not ReadTargetPointer(Cursor, ParentInfo) then Exit;
+    Inc(Cursor, PtrSize);
     // Skip the SmallInt PropCount field on TTypeData (we'll use TPropData.PropCount).
     Inc(Cursor, 2);
     if not SkipShortStr(Cursor) then Exit;  // UnitName
@@ -545,23 +562,23 @@ const
     Inc(Cursor, 2);
     for var I := 0 to Integer(PropCount) - 1 do begin
       // TPropInfo (packed):
-      //   PropType:   PPTypeInfo   (8)   pointer-to-pointer-to-TypeInfo
-      //   GetProc:    Pointer      (8)
-      //   SetProc:    Pointer      (8)
-      //   StoredProc: Pointer      (8)
+      //   PropType:   PPTypeInfo   (ptr)  pointer-to-pointer-to-TypeInfo
+      //   GetProc:    Pointer      (ptr)
+      //   SetProc:    Pointer      (ptr)
+      //   StoredProc: Pointer      (ptr)
       //   Index:      Integer      (4)
       //   Default:    Integer      (4)
       //   NameIndex:  Word         (2)
       //   Name:       ShortString  (1 + len)
-      //   AttrData:   TAttrData    (Word len + bytes)
-      if not ReadU64(Cursor,      PropTIPP)   then Exit;
-      if not ReadU64(Cursor + 8,  GetProc)    then Exit;
-      if not ReadU64(Cursor + 16, SetProc)    then Exit;
-      if not ReadU64(Cursor + 24, StoredProc) then Exit;
-      if not ReadU32(Cursor + 32, IndexVal)   then Exit;
-      if not ReadU32(Cursor + 36, DefaultVal) then Exit;
-      if not ReadRaw(Cursor + 40, @NameIdx, 2) then Exit;
-      var NameAddr := Cursor + 42;
+      var FixedEnd := Cursor + 4 * PtrSize;
+      if not ReadTargetPointer(Cursor,               PropTIPP)   then Exit;
+      if not ReadTargetPointer(Cursor + PtrSize,     GetProc)    then Exit;
+      if not ReadTargetPointer(Cursor + 2 * PtrSize, SetProc)    then Exit;
+      if not ReadTargetPointer(Cursor + 3 * PtrSize, StoredProc) then Exit;
+      if not ReadU32(FixedEnd,     IndexVal)   then Exit;
+      if not ReadU32(FixedEnd + 4, DefaultVal) then Exit;
+      if not ReadRaw(FixedEnd + 8, @NameIdx, 2) then Exit;
+      var NameAddr := FixedEnd + 10;
       if not ReadShortStr(NameAddr, PropName, Bytes) then Exit;
       var AfterName: UInt64 := NameAddr + UInt64(Bytes);
       // No AttrData in the basic TPropInfo published layout -- the record
@@ -572,21 +589,27 @@ const
       Info.Name := PropName;
       PropTI := 0;
       if PropTIPP <> 0 then
-        ReadU64(PropTIPP, PropTI);
+        ReadTargetPointer(PropTIPP, PropTI);
       Info.PropTypeInfoAddr := PropTI;
       if PropTI <> 0 then begin
         var TDAignored: UInt64;
         ReadTypeInfoKindName(PropTI, Info.PropTypeKind, Info.PropTypeName, TDAignored);
       end;
       Info.HasGetter := GetProc <> 0;
-      if Info.HasGetter then
-        case (GetProc shr 56) and $FF of
-          $FF: begin Info.GetKind := akField;   Info.GetValue := GetProc and $00FFFFFFFFFFFFFF; end;
-          $FE: begin Info.GetKind := akVirtual; Info.GetValue := GetProc and $00FFFFFFFFFFFFFF; end;
+      if Info.HasGetter then begin
+        // The accessor kind is encoded in the TOP BYTE of the pointer, so the
+        // shift follows the target's pointer width: System.TypInfo's
+        // PROPSLOT_MASK is $FF000000 at 32-bit and $FF00000000000000 at 64-bit.
+        var TagShift  := 8 * PtrSize - 8;
+        var AddrMask  := (UInt64(1) shl TagShift) - 1;
+        case (GetProc shr TagShift) and $FF of
+          $FF: begin Info.GetKind := akField;   Info.GetValue := GetProc and AddrMask; end;
+          $FE: begin Info.GetKind := akVirtual; Info.GetValue := GetProc and AddrMask; end;
         else
           Info.GetKind  := akStatic;
           Info.GetValue := GetProc;
         end;
+      end;
       Result := Result + [Info];
       Cursor := AfterName;
     end;
@@ -607,17 +630,19 @@ begin
     if CurTI = 0 then Break;
     ReadOneClass(CurTI);
 
-    // Advance to parent: TTypeData.ParentInfo at TypeData + 8 is a PPTypeInfo.
+    // Advance to parent: TTypeData.ParentInfo is a PPTypeInfo sitting one
+    // TARGET pointer past ClassType, so both the offset and the read width
+    // follow the target's bitness.
     var Kind: Byte;
     var TN: string;
     var TDA: UInt64;
     if not ReadTypeInfoKindName(CurTI, Kind, TN, TDA) then Break;
     if Kind <> TK_CLASS then Break;
     var ParentPP: UInt64;
-    if not ReadU64(TDA + 8, ParentPP) then Break;
+    if not ReadTargetPointer(TDA + FLayout.PointerSize, ParentPP) then Break;
     if ParentPP = 0 then Break;
     var ParentTI: UInt64;
-    if not ReadU64(ParentPP, ParentTI) then Break;
+    if not ReadTargetPointer(ParentPP, ParentTI) then Break;
     CurTI := ParentTI;
   end;
 end;

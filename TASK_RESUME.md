@@ -175,12 +175,19 @@ object recognition and field expansion, strings, and expression evaluation
 including getter-backed properties that run real code in the debuggee.
 Multi-BPL -- the project's core use case -- verified end to end.
 
-Suite: **958 found / 956 passed / 0 failed / 0 leaked / 2 ignored.**
+Suite: **960 found / 958 passed / 0 failed / 0 leaked / 2 ignored.**
+
+NOTE ON A DIRTY RUN: one full-suite run produced a block of
+`DAP request failed: unknown error` failures across `TDebuggerTests.Test_Types_*`
+that did NOT reproduce on a re-run of identical code. If that shape appears
+again, re-run before investigating -- and capture the WHOLE log, since the
+default `Select-Object -Last 40` truncates the counts off the top when the
+failure list is long, which is how it looked like a regression in the first
+place.
 
 ### WHAT IS DELIBERATELY REFUSED (not broken -- unimplemented, and it says so)
 
-* Float arguments to a synthetic call, and float returns (x87 stack).
-* `Int64` returns (EDX:EAX not combined; only EAX is reported).
+* Float ARGUMENTS to a synthetic call (returns now work -- see below).
 * `CurrentFrameParamHomeAddr` -- no x86 analogue exists; the answer must come
   from debug-info symbol offsets, never a positional formula.
 * Optimised (`-$O+`) builds: frame-pointer omission is routine there, so Win32
@@ -192,11 +199,17 @@ wrong. In a debugger a plausible wrong number is worse than "unavailable".
 ### THE LESSON THIS WORK KEEPS TEACHING
 
 On x64 the host and target pointer sizes coincide, so **every site that
-conflates them is correct by accident**. Three separate such sites were found,
+conflates them is correct by accident**. Four separate such sites were found,
 each in a different layer, and each only became visible when the debugger was
 pointed at a different bitness: `LocalReadSize` for stack locals,
-`SyntheticLocal` for expanded fields, and `PrimTypeSize`/`SizeForKind` in
-ExprEval. Expect more if a fourth path appears.
+`SyntheticLocal` for expanded fields, `PrimTypeSize`/`SizeForKind` in ExprEval,
+and -- the worst of them -- `GetClassProperties`' walk of the published-RTTI
+records, which disabled live RTTI entirely on x86 while still returning
+plausible values through the debug-info fallback. Expect more.
+
+The corollary that matters more than the count: **a wrong pointer width rarely
+fails loudly.** Three of the four degraded into a fallback or a plausible
+number. Assume any remaining one is currently invisible.
 
 ### CURRENT CURSOR
 
@@ -205,28 +218,78 @@ order of value:
 
 1. **Living specs** -- in flight. DAP_DEBUGGER_ARCHITECTURE.md, TD32_FORMAT_NOTES.md,
    KNOWN_UNKNOWNS.md (two entries to CLOSE), PROJECT_STATE.md, README.md.
-2. **Float returns from x86 synthetic calls** -- the remaining ABI gap, and now
-   a DESIGN question rather than a coding one. Measured (see the long comment on
-   `TWin32Debugger.ReadSyntheticCallResult`): the function IS reached, the
-   FXSAVE area IS populated (`fsw=$0020`), but ST(0) is empty with TOP=0 and all
-   register bytes zero -- a RESET image, not a used one. A callee that had just
-   pushed a result would leave TOP=7, so the WOW64 context almost certainly
-   reports FP state as of the last WOW64 transition, and no context-flag
-   combination will reach the live stack.
-   The workaround is to return into a stub that does `fstp qword ptr [scratch]`
-   before the INT3. The catch: `fstp` on an empty stack raises
-   invalid-operation, which Delphi unmasks by default, so the stub is only safe
-   when a float result is expected -- and nothing in the seam knows that.
-   `PrepareSyntheticCall` is told which ARGUMENTS are floats, never what the
-   callee RETURNS. Doing it properly means adding the expected result class to
-   the seam, touching the shared pump and the x64 side as well. Contained, but
-   not local. Bolting the stub on without that signal breaks every integer call.
-   Int64 returns (EDX:EAX) are a separate, smaller gap in the same function.
-3. **The unit rename** the user chose: `Win64Debugger.pas` ->
+2. **Float and Int64 returns: DONE** (commit `fdeca39` plus the follow-up below).
+   Solved by an unconditional FPU-capture stub -- `fnsave`/`frstor` into scratch,
+   then `jmp RemoteCallTrap` -- which cannot fault on an empty stack, so it needs
+   no expected-result-class signal in the seam. The FNSAVE tag word says whether
+   ST(0) was actually occupied; if not, the float slot stays zero and the call is
+   read as an integer one. `IntResult` combines EDX:EAX.
+   **Trap that cost three wrong conclusions:** the tag word is indexed by
+   PHYSICAL register, but the saved register AREA is in STACK order with ST(0)
+   always FIRST. Multiplying the register offset by TOP reads ST(7).
+3. **Float-family return ENCODING: DONE.** Measured with
+   `DevTools\Win32FloatAbiProbe` (32-bit, build via `DevTools\build_one32.bat`):
+   on Win32 EVERY float-family type returns in ST(0), Currency included, and
+   Currency arrives already SCALED (19.95 -> 199500). The formatters in
+   `ExprEval.AsDouble` expect three different raw encodings, so
+   `TExprEvaluator.NormaliseFloatReturn` undoes the x87 Double conversion for
+   Single (narrow to a 4-byte pattern) and Currency (round to the scaled Int64).
+   It is called from BOTH return sites -- `ApplyMethodCall` and `InvokeGetter` --
+   because a property expression resolves through the FIRST of those on x86.
+   Verified `Single 1.5 / Double 3.25 / Real 6.75 / Extended 2.5 /
+   TDateTime 45000.5 / Currency 19.95 / Int64 0x1122334455667788` on both.
+4. **The unit rename** the user chose: `Win64Debugger.pas` ->
    `WinDebuggerBase.pas` + `WinDebuggerX64.pas`, alongside the existing
    `WinDebuggerX86.pas`. Deferred deliberately until the x86 implementation's
-   size was known; it is now ~230 lines, so the split is safe to do.
-4. **`-$O+` support**, if wanted at all -- decide policy before building.
+   size was known; it is now ~550 lines, so the split is safe to do.
+5. **`-$O+` support**, if wanted at all -- decide policy before building.
+
+### THE FOURTH host-vs-target SITE, and the biggest one: FIXED
+
+`TDelphiRtti.GetClassProperties` walked `TTypeData`/`TPropInfo` with `ReadU64`
+and literal 8-byte offsets. On a 32-bit target it desynchronised on the FIRST
+record (18 bytes consumed where the record is 10), so **no property ever matched
+by name** and the entire live-RTTI property surface silently fell back to debug
+info. It looked like a cosmetic type-name difference (`TDateTime` rendering as
+`Double`) because the fallback path still produced correct NUMBERS from TD32,
+whose primitive `$0041` collapses Double/TDateTime/Real onto one id.
+
+Fixed by expressing every offset in `FLayout.PointerSize` and reading pointers
+through the new `ReadTargetPointer`. The accessor-kind tag lives in the TOP BYTE
+of the getter pointer, so its shift follows the pointer width too --
+`System.TypInfo`'s `PROPSLOT_MASK` is `$FF000000` at 32-bit and
+`$FF00000000000000` at 64-bit (`System.TypInfo.pas:267-274`).
+
+Result: full parity. Both bitnesses now report
+`Single 1.5 [Single] / Double 3.25 / Real 6.75 [Real] / Extended 2.5 [Extended]
+/ TDateTime 2023-03-15 12:00:00.000 (45000.5) [TDateTime] / Currency 19.95 /
+Int64 0x1122334455667788`.
+
+**How it was found:** adding an `AsExt: Extended` getter to the test target made
+`Win32_ObjectFields_MatchWin64` fail with `[Double]` vs `[]`. The empty type
+name was the visible tip; the desynchronised walk was the cause.
+
+`AsExt` and `AsPtr` are now asserted as DELIBERATE divergences in that test:
+`Extended` is a true alias of `Double` on Win64 (same TypeInfo, so the reported
+name really is `Double`) and a distinct 10-byte x87 type on Win32; `NativeUInt`
+is `UInt64` vs `Cardinal`. Reporting one type on both would be the bug.
+
+### x87 stack leak: HYPOTHESISED, MEASURED, DISPROVED -- do not "fix" it
+
+The capture stub does `fnsave` + `frstor`, which puts the CALLEE's state back --
+including the returned value, since popping it is the caller's job under the x87
+ABI and the stub is not the caller. That looks like a one-slot-per-call leak that
+would overflow the eight-register stack on the eighth float evaluation.
+
+It does not happen. `RunMethodCall` saves the thread context with
+`CONTEXT_FULL or CONTEXT_FLOATING_POINT` before the call and restores it after
+reading the result (`Win64Debugger.pas:3277`, `:3335`); on a WOW64 thread that is
+the same physical x87 stack, so the restore discards the leftover.
+Measured: 12 consecutive `Self.AsDouble` evaluations in one session, all 3.25.
+
+Pinned by `Win32_RepeatedFloatEvaluations_DoNotExhaustTheX87Stack` (10 calls),
+because the dependency is invisible: removing `CONTEXT_FLOATING_POINT` from that
+save/restore breaks nothing until the eighth evaluation.
 
 ### Environment traps hit this session
 

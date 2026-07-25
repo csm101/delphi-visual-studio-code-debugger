@@ -184,10 +184,13 @@ Target architecture:
   hijacks the stopped thread and runs code in the debuggee), and the multi-BPL
   case — a breakpoint inside a runtime package, unwinding across the module
   boundary into the host.
+  Synthetic calls return the full float family (`Single`, `Double`, `Real`,
+  `Extended`, `TDateTime`, `Currency`) and `Int64` correctly: results come off
+  the x87 stack via an `fnsave` capture stub, and out of EDX:EAX for 64-bit
+  integers.
 - **Limitation:** Win32 locals and parameters are supported for `-$O-` builds
-  only; `-$O+` omits the frame pointer routinely. A Win32 synthetic call also
-  refuses float arguments outright, and reports neither float nor Int64 results
-  (see `KNOWN_UNKNOWNS.md`).
+  only; `-$O+` omits the frame pointer routinely. A Win32 synthetic call still
+  refuses float *arguments* outright. See `KNOWN_UNKNOWNS.md`.
 
 Stepping / control:
 - Launch with `DEBUG_ONLY_THIS_PROCESS`, optional `stopAtEntry`.

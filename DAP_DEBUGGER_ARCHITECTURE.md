@@ -203,10 +203,33 @@ construction instead (at each of the three sites where `TDebugSession` creates
 it).
 
 Consumers so far: the dynamic-array header reads, the closure/`$ActRec` and
-`Self` stack scans, VMT slot reads, and every "pointer-shaped" value read
-(`LocalReadSize` in `DelphiValueReaders`, which separates genuinely 8-byte types
-— `Int64`, `Double`, `Currency`, `TDateTime` — from pointer-sized ones that take
-the target's pointer size).
+`Self` stack scans, VMT slot reads, the published-RTTI walk (below), and every
+"pointer-shaped" value read (`LocalReadSize` in `DelphiValueReaders`, which
+separates genuinely 8-byte types — `Int64`, `Double`, `Currency`, `TDateTime` —
+from pointer-sized ones that take the target's pointer size).
+
+#### Walking `TTypeData` / `TPropInfo`
+
+`TDelphiRtti.GetClassProperties` enumerates a class's published properties by
+walking the RTTI records in target memory. Every pointer in them is a **target**
+pointer, so the record stride and each field offset are expressed in
+`FLayout.PointerSize`. Getting this wrong does not fail loudly: a 64-bit walk of
+a 32-bit target consumes 18 bytes where the record is 10, desynchronises on the
+first entry, and simply matches no property by name — which looks like "this
+class has no published properties" and quietly routes every property expression
+to the debug-info fallback instead.
+
+The accessor kind (field / virtual / static) is encoded in the **top byte of the
+getter pointer**, so its shift follows the pointer width too: `System.TypInfo`
+defines `PROPSLOT_MASK` as `$FF000000` at 32-bit and `$FF00000000000000` at
+64-bit.
+
+That fallback is why the symptom presented as a *type-name* difference rather
+than as missing properties: TD32 still produced correct values, but its
+primitive `$0041` collapses `Double`, `TDateTime` and `Real` onto one id, so a
+`TDateTime` property came back typed `Double` and lost its date rendering. The
+alias survives only in the debuggee's live RTTI (and in the `.rsm` type table);
+TD32 cannot express it.
 
 `TDynArrayRec` is the clearest case, since unlike the string header Delphi did
 not make it bitness-neutral:
@@ -308,16 +331,61 @@ pushed **last**, so stack arguments are pushed **left to right** — the opposit
 of cdecl. Laying the frame out by hand, argument *i* of *n* lands at
 `[ESP + 4 + 4*(n-1-i)]`.
 
-Three cases are deliberately **not** implemented, because a wrong answer here is
-silent:
+One case is deliberately **not** implemented, because a wrong answer here is
+silent: **float arguments**. `PrepareSyntheticCall` refuses the whole call if
+any argument is a float. They do not travel in the integer registers, so placing
+one where the callee reads an integer would be quietly wrong.
 
-- **float arguments** — `PrepareSyntheticCall` refuses the whole call if any
-  argument is a float. They do not travel in the integer registers, so placing
-  one where the callee reads an integer would be quietly wrong.
-- **float returns** — they come back on the x87 stack, which is not read;
-  `FloatResultLow` stays 0.
-- **Int64 returns** — they come back in EDX:EAX and only EAX is read, so a
-  64-bit result would be truncated (see `KNOWN_UNKNOWNS.md`).
+### x86 return values: EDX:EAX and the x87 stack
+
+A 64-bit integer result comes back in **EDX:EAX**, which
+`ReadSyntheticCallResult` combines into `IntResult`. Putting the EDX half into
+the high 32 bits of a 32-bit result is harmless — it is exactly what x64 does
+with the upper bytes of RAX, and every consumer masks by the declared type.
+
+Float results come back on the **x87 stack**, which no thread context exposes:
+the WOW64 context reports FP state as of the last WOW64 transition, not the
+live stack, so ST(0) reads back as a reset image no matter which context flags
+are requested. The engine therefore returns the synthetic call into a small
+**capture stub** planted in the debuggee:
+
+```
+DD 35 <abs32>   fnsave  [scratch]     ; 108-byte image; cannot fault
+DD 25 <abs32>   frstor  [scratch]     ; put the debuggee's FPU state straight back
+E9  <rel32>     jmp     RemoteCallTrap
+```
+
+`fnsave` was chosen over `fstp` precisely because it **cannot fault on an empty
+stack**. An `fstp` stub would raise invalid-operation on an integer-returning
+call, so it could only be planted when a float result is expected — and the seam
+never learns what the callee returns, only which *arguments* are floats. The
+unconditional stub removes that requirement entirely: the saved FNSAVE tag word
+says whether ST(0) was occupied, and when it was not, the float slot stays zero
+and the result is read as an integer one.
+
+**The trap in reading that image:** the tag word is indexed by **physical**
+register number (via TOP), but the saved register **area** is in **stack order**
+with ST(0) always in the first slot. Scaling the register offset by TOP reads
+ST(7) and yields a plausible wrong number.
+
+#### Return encodings differ per type, and the formatters expect the x64 ones
+
+Measured with `DevTools\Win32FloatAbiProbe` (32-bit; build it with
+`DevTools\build_one32.bat`, since `build_all.bat` is a dcc64 sweep): on Win32
+**every** float-family type returns in ST(0) — `Currency` included, where Win64
+instead returns a scaled `Int64` in RAX. `Currency` arrives already **scaled**
+(19.95 comes back as 199500.0).
+
+The value formatters in `ExprEval.AsDouble` read three different raw encodings —
+a `Single` as its 4-byte pattern, a `Currency` as the scaled `Int64` it divides
+by 10000, everything else as `Double` bits. Since the x86 engine converts the
+80-bit register to `Double` bits on the way out, two of those have to be undone.
+`TExprEvaluator.NormaliseFloatReturn` does it in one place, called from **both**
+return sites (`ApplyMethodCall` and `InvokeGetter`) because a property
+expression resolves through the first of those on x86 and the second on x64.
+Skipping it does not produce an error — a `Single` reads as 0 (the low half of a
+`Double` that narrows exactly is all zeroes) and a `Currency` as a trillions
+figure.
 
 ### No x86 parameter home slot
 
@@ -1496,8 +1564,8 @@ disassembly, set-next-statement).
 - Both x64 and 32-bit (WOW64) targets are supported from the same 64-bit
   adapter binary; the class is chosen from the target's PE header (see "Target
   architecture"). On a 32-bit target, locals and parameters require a `-$O-`
-  build, and a synthetic call refuses float arguments, float returns and Int64
-  returns rather than approximating them.
+  build, and a synthetic call refuses float arguments rather than approximating
+  them.
 - `.rsm` is the only source of local/global variable metadata; if it
   isn't present, locals/globals scopes are empty but stepping and
   source mapping still work via `.map`.

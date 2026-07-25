@@ -172,6 +172,13 @@ type
     // the kind so aliases are not missed. Used for both argument marshalling and
     // the return-class heuristic so the two cannot drift.
     function  IsFloatValueHint(const TypeHint: string): Boolean;
+    // Converts a float-class return from the TARGET's wire encoding into the
+    // raw encoding the value formatters expect (see AsDouble). Called from
+    // every site that lifts a float result so the two cannot drift.
+    function  NormaliseFloatReturn(FloatBits: UInt64; const TypeName: string): UInt64;
+    // True when this target returns Currency alongside the floats rather than
+    // as a scaled Int64 in an integer register.
+    function  CurrencyReturnsWithFloats: Boolean;
 
   public
     constructor Create(const Debugger: IDebugTarget; Rtti: TDelphiRtti = nil;
@@ -550,6 +557,46 @@ begin
   if SameText(TypeHint, 'Currency') then
     Exit(False);
   Result := TypeNameToKind(TypeHint) = TK_FLOAT;
+end;
+
+function TExprEvaluator.CurrencyReturnsWithFloats: Boolean;
+begin
+  // An x87 target returns every float-family type on the FPU stack, Currency
+  // included; an SSE target keeps Currency in an integer register.
+  Result := FDebugger.TargetLayout.FloatResultsUseX87;
+end;
+
+// The formatters in AsDouble read three different raw encodings depending on the
+// declared type:
+//
+//   Single   -> the 4-byte Single bit pattern
+//   Currency -> the scaled Int64 it then divides by 10000
+//   others   -> the 8-byte Double bit pattern
+//
+// On an SSE target XMM0 already holds exactly those, so this is the identity.
+// An x87 target returns EVERYTHING in ST(0) and the debugger converts the
+// 80-bit register to Double bits on the way out, so both special cases have to
+// be undone here -- otherwise a Single reads as 0 (the low half of a Double is
+// all zeroes for a value that narrows exactly) and a Currency reads as a
+// nonsense trillions figure.
+//
+// MEASURED, not assumed: DevTools\Win32FloatAbiProbe reports Currency arriving
+// in ST(0) already SCALED (19.95 -> 199500), which is why rounding that value
+// is the whole conversion and no further scaling is applied.
+function TExprEvaluator.NormaliseFloatReturn(FloatBits: UInt64;
+  const TypeName: string): UInt64;
+begin
+  Result := FloatBits;
+  if not FDebugger.TargetLayout.FloatResultsUseX87 then
+    Exit;
+  var Value: Double := 0;
+  PUInt64(@Value)^ := FloatBits;
+  if SameText(TypeName, 'Single') then begin
+    var Narrowed: Single := Value;
+    Result := PCardinal(@Narrowed)^;
+  end
+  else if SameText(TypeName, 'Currency') then
+    Result := UInt64(Round(Value));
 end;
 
 function TExprEvaluator.TypeNameToKind(const TypeName: string): Byte;
@@ -1345,7 +1392,8 @@ begin
   if HaveBoundReturn then begin
     case RetKind of
       TK_FLOAT:
-        WantsFloatReturn := not SameText(RetTypeName, 'Currency');
+        WantsFloatReturn := CurrencyReturnsWithFloats or
+                            not SameText(RetTypeName, 'Currency');
       TK_SET:
         // > 8 bytes -> var-out slot (by value). <= 8 -> RAX (the else branch);
         // the set formatter reads the real width from RawValue there. Size from
@@ -1456,7 +1504,7 @@ begin
       Result.TypeHint := RetTypeName
     else
       Result.TypeHint := 'Double';
-    Result.RawValue := Xmm0;
+    Result.RawValue := NormaliseFloatReturn(Xmm0, Result.TypeHint);
     Result.Size     := 8;
   end else if WantsVariantReturn then begin
     // The slot IS the TVarData (by value). Point Address at it and leave
@@ -1730,15 +1778,19 @@ function TExprEvaluator.ApplyDot(const Base: TExprValue; const Field: string): T
     end;
 
     UsesXmm0 := False;
-    // Win64 return-class dispatch for non var-out returns:
-    //   Integer/ordinal/pointer/class/interface (<=8 bytes) -> RAX.
-    //   Single/Double/Extended/TDateTime -> XMM0 (low 4 or 8 bytes).
-    //   Currency is TK_FLOAT but ABI-wise a scaled Int64 -> RAX.
+    // Return-class dispatch for non var-out returns:
+    //   Integer/ordinal/pointer/class/interface (<=8 bytes) -> integer register.
+    //   Single/Double/Extended/TDateTime -> the float slot.
+    //   Currency is TK_FLOAT but on Win64 it is ABI-wise a scaled Int64 in RAX.
+    // On a target whose floats come back on the x87 stack, Currency travels
+    // with them instead -- that rule is the target's, not a constant, which is
+    // why it is asked rather than assumed.
     case P.PropTypeKind of
       TK_INTEGER, TK_INT64, TK_ENUM, TK_CHAR, TK_WCHAR, TK_SET, TK_CLASS,
       TK_INTERFACE, TK_POINTER: ;
       TK_FLOAT:
-        UsesXmm0 := not SameText(P.PropTypeName, 'Currency');
+        UsesXmm0 := CurrencyReturnsWithFloats or
+                    not SameText(P.PropTypeName, 'Currency');
     else
       Exit(InvalidValue(Format('<getter for "%s" returns %s -- not yet supported>',
         [P.Name, P.PropTypeName])));
@@ -1748,7 +1800,7 @@ function TExprEvaluator.ApplyDot(const Base: TExprValue; const Field: string): T
     Result.TypeHint     := P.PropTypeName;
     Result.TypeInfoAddr := P.PropTypeInfoAddr;
     if UsesXmm0 then
-      Result.RawValue := Xmm0
+      Result.RawValue := NormaliseFloatReturn(Xmm0, P.PropTypeName)
     else
       Result.RawValue := Rax;
     Result.Size    := SizeForKind(P.PropTypeKind, P.PropTypeName);

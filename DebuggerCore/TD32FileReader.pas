@@ -3074,7 +3074,12 @@ begin
     $0030: Result := 'Boolean';
     $0040: Result := 'Single';
     $0041: Result := 'Double';      // also covers Extended (= Double on Win64)
-                                    // and TDateTime aliases
+                                    // and the TDateTime / Real aliases, which
+                                    // TD32 does not distinguish -- only the
+                                    // debuggee's live RTTI, or the .rsm type
+                                    // table, can recover those names
+    $0042: Result := 'Extended';    // 32-bit only: a genuine 10-byte x87 type,
+                                    // which on Win64 collapses into $0041
     $0061: Result := 'AnsiChar';
     $0071: Result := 'Char';        // = WideChar on Win64
     $0072: Result := 'SmallInt';

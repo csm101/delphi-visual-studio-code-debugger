@@ -62,6 +62,24 @@ type
     // way Delphi's 32-bit `register` convention expects, and reads the result
     // back out of EAX.
     [Test] procedure Win32_Evaluate_MatchesWin64;
+    // The whole float family, because Win32 returns ALL of it on the x87 stack
+    // -- Currency included, which Win64 instead returns as a scaled Int64 in an
+    // integer register (measured: DevTools\Win32FloatAbiProbe). The debugger
+    // converts the 80-bit register to Double bits on the way out, and two types
+    // need that undone again: a Single otherwise reads as the low half of a
+    // Double (i.e. 0), and a Currency as a nonsense trillions figure. Both
+    // failure modes produce a plausible wrong NUMBER rather than an error,
+    // which is why the values are asserted against the literals the getters
+    // return rather than merely compared across bitnesses.
+    [Test] procedure Win32_FloatFamilyReturns_MatchTheDeclaredValues;
+    // The x87 stack is only eight registers deep, and a float-returning callee
+    // leaves its result on it -- popping that is the CALLER's job, and the
+    // capture stub is not the caller. What discards it is the synthetic-call
+    // pump restoring a thread context saved with CONTEXT_FLOATING_POINT. Drop
+    // that one flag and every float evaluation leaks a slot, with nothing going
+    // wrong until the eighth. Ten evaluations in a single session is past the
+    // wrap point, so this fails if that restore is ever weakened.
+    [Test] procedure Win32_RepeatedFloatEvaluations_DoNotExhaustTheX87Stack;
     // Stepping. Inherited from the architecture-neutral base, but it rides on
     // SetThreadTrapFlag and the WOW64 single-step status code, both of which
     // are 32-bit specific -- and STATUS_WX86_SINGLE_STEP was measured rather
@@ -2375,6 +2393,24 @@ procedure TWin32RunControlTests.Win32_ObjectFields_MatchWin64;
 const
   OBJ_SOURCE = 'TestTargetCore.pas';
   OBJ_MARKER = 'COMPUTE_BODY';
+  // Columns of DIVERGENT below.
+  PREFIX     = 0;
+  TYPE_ON_64 = 1;
+  TYPE_ON_32 = 2;
+  // Properties of TWidget that CANNOT report the same type on both
+  // architectures -- reporting one type on both would itself be the bug:
+  //
+  //   AsPtr: NativeUInt -- a different concrete type per bitness.
+  //   AsExt: Extended   -- a TRUE ALIAS of Double on Win64 (same TypeInfo, so
+  //                        the name reported really is 'Double'), but a distinct
+  //                        10-byte x87 type on Win32.
+  //
+  // Each is asserted explicitly and excluded from the blanket comparison; the
+  // guard at the end fails if either stops appearing, so a rename in TWidget
+  // cannot silently retire the check.
+  DIVERGENT: array[0..1, PREFIX..TYPE_ON_32] of string =
+    (('AsPtr=', '[UInt64]', '[Cardinal]'),
+     ('AsExt=', '[Double]', '[Extended]'));
 
   function FieldsAt(const Exe, Map, Rsm: string; Line: Integer): TArray<string>;
   begin
@@ -2410,26 +2446,34 @@ begin
     Format('field counts differ: x64 %d vs x86 %d',
       [Length(Fields64), Length(Fields32)]));
 
-  // TWidget declares `property AsPtr: NativeUInt`, and NativeUInt IS a
-  // different concrete type per bitness -- UInt64 on Win64, Cardinal on Win32.
-  // Reporting the same type on both would be the bug, so this is asserted
-  // rather than ignored, and excluded from the blanket comparison below.
-  var SawNative := False;
+  var Seen: array[Low(DIVERGENT)..High(DIVERGENT)] of Boolean;
+  for var D := Low(DIVERGENT) to High(DIVERGENT) do
+    Seen[D] := False;
+
   for var I := 0 to High(Fields64) do begin
-    if Fields64[I].StartsWith('AsPtr=') then begin
-      SawNative := True;
-      Assert.IsTrue(Fields64[I].EndsWith('[UInt64]'),
-        'x64 should report NativeUInt as UInt64, got ' + Fields64[I]);
-      Assert.IsTrue(Fields32[I].EndsWith('[Cardinal]'),
-        'x86 should report NativeUInt as Cardinal, got ' + Fields32[I]);
+    var Matched := False;
+    for var D := Low(DIVERGENT) to High(DIVERGENT) do
+      if Fields64[I].StartsWith(DIVERGENT[D, PREFIX]) then begin
+        Seen[D] := True;
+        Matched := True;
+        Assert.IsTrue(Fields64[I].EndsWith(DIVERGENT[D, TYPE_ON_64]),
+          Format('x64 should report %s as %s, got %s',
+            [DIVERGENT[D, PREFIX], DIVERGENT[D, TYPE_ON_64], Fields64[I]]));
+        Assert.IsTrue(Fields32[I].EndsWith(DIVERGENT[D, TYPE_ON_32]),
+          Format('x86 should report %s as %s, got %s',
+            [DIVERGENT[D, PREFIX], DIVERGENT[D, TYPE_ON_32], Fields32[I]]));
+      end;
+    if Matched then
       Continue;
-    end;
     Assert.AreEqual(Fields64[I], Fields32[I],
       Format('object field %d differs between bitnesses', [I]));
   end;
-  Assert.IsTrue(SawNative,
-    'expected a NativeUInt member in the expansion -- if TWidget changed, ' +
-    'the bitness-dependent-type check above is no longer being exercised');
+
+  for var D := Low(DIVERGENT) to High(DIVERGENT) do
+    Assert.IsTrue(Seen[D],
+      Format('expected a %s member in the expansion -- if TWidget changed, the ' +
+             'bitness-dependent-type check above is no longer being exercised',
+             [DIVERGENT[D, PREFIX]]));
 end;
 
 procedure TWin32RunControlTests.Win32_Evaluate_MatchesWin64;
@@ -2473,6 +2517,79 @@ begin
   // same way: the getter must actually have produced a number.
   Assert.IsTrue(Eval64[High(Eval64)].Contains('84'),
     'the getter-backed property should evaluate to 84, got ' + Eval64[High(Eval64)]);
+end;
+
+procedure TWin32RunControlTests.Win32_FloatFamilyReturns_MatchTheDeclaredValues;
+const
+  OBJ_SOURCE = 'TestTargetCore.pas';
+  OBJ_MARKER = 'COMPUTE_BODY';
+  // Expression, and the literal its getter in TestTargetCore returns. Int64 is
+  // in the list because it shares the x86 return path's other half: EDX:EAX.
+  EXPRS: array[0..6] of string =
+    ('Self.AsSingle', 'Self.AsDouble', 'Self.AsReal',  'Self.AsExt',
+     'Self.AsDate',   'Self.AsCurr',   'Self.AsInt64');
+  EXPECTED: array[0..6] of string =
+    ('1.5',           '3.25',          '6.75',         '2.5',
+     '45000.5',       '19.95',         '1234605616436508552');
+
+  // A formatted value either IS the number or leads with it, except that a
+  // recognised TDateTime is rendered as a date with the raw number in trailing
+  // parentheses. Accepting both shapes keeps the assertion strict without
+  // making it depend on whether the alias name survived the debug info.
+  function ReportsValue(const Formatted, Expected: string): Boolean;
+  begin
+    Result := Formatted.StartsWith(Expected) or
+              Formatted.Contains('(' + Expected + ')');
+  end;
+
+  procedure CheckAll(const Exe, Map, Rsm: string; Line: Integer);
+  begin
+    var Session := OpenSessionAtMarker(Exe, Map, Rsm, TargetDir, OBJ_SOURCE, Line);
+    try
+      Assert.AreEqual(Ord(dsStopped), Ord(Session.State),
+        'did not stop in ' + ExtractFileName(Exe));
+      for var I := Low(EXPRS) to High(EXPRS) do begin
+        var R := Session.Evaluate(EXPRS[I]);
+        Assert.IsTrue(ReportsValue(R.Value, EXPECTED[I]),
+          Format('%s in %s: expected %s, got "%s" [%s]',
+            [EXPRS[I], ExtractFileName(Exe), EXPECTED[I], R.Value, R.TypeName]));
+      end;
+    finally
+      Session.Free;
+    end;
+  end;
+
+begin
+  var Line := MarkerLineInFile(TargetDir + OBJ_SOURCE, OBJ_MARKER);
+  Assert.IsTrue(Line > 0, 'marker not found: ' + OBJ_MARKER);
+  CheckAll(Win64Exe, Win64Map, Win64Rsm, Line);
+  CheckAll(Win32Exe, Win32Map, Win32Rsm, Line);
+end;
+
+procedure TWin32RunControlTests.Win32_RepeatedFloatEvaluations_DoNotExhaustTheX87Stack;
+const
+  OBJ_SOURCE = 'TestTargetCore.pas';
+  OBJ_MARKER = 'COMPUTE_BODY';
+  // Eight x87 registers, so ten calls is comfortably past a wrap.
+  EVALUATIONS = 10;
+begin
+  var Line := MarkerLineInFile(TargetDir + OBJ_SOURCE, OBJ_MARKER);
+  Assert.IsTrue(Line > 0, 'marker not found: ' + OBJ_MARKER);
+
+  var Session := OpenSessionAtMarker(Win32Exe, Win32Map, Win32Rsm, TargetDir,
+    OBJ_SOURCE, Line);
+  try
+    Assert.AreEqual(Ord(dsStopped), Ord(Session.State), 'did not stop');
+    for var I := 1 to EVALUATIONS do begin
+      var R := Session.Evaluate('Self.AsDouble');
+      Assert.IsTrue(R.Value.StartsWith('3.25'),
+        Format('float evaluation %d of %d returned "%s" -- an x87 stack that ' +
+               'is not being unwound between synthetic calls shows up here first',
+               [I, EVALUATIONS, R.Value]));
+    end;
+  finally
+    Session.Free;
+  end;
 end;
 
 procedure PumpUntilStop(Session: TDebugSession; TimeoutMs: Cardinal);

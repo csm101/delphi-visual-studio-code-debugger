@@ -146,6 +146,11 @@ type
     function DoCalcDouble:  Double;
     function DoCalcDate:    TDateTime;
     function DoCalcCurr:    Currency;
+    // Real is a Double alias on both architectures; Extended is a genuine
+    // 10-byte x87 type on Win32 but aliases Double on Win64, so the pair
+    // covers the two ends of the float family that are NOT just Double.
+    function DoCalcReal:    Real;
+    function DoCalcExt:     Extended;
     function DoCalcUStr:    UnicodeString;
     function DoCalcAStr:    AnsiString;
     function DoCalcWStr:    WideString;
@@ -195,6 +200,8 @@ type
     property AsDouble: Double        read DoCalcDouble;
     property AsDate:   TDateTime     read DoCalcDate;
     property AsCurr:   Currency      read DoCalcCurr;
+    property AsReal:   Real          read DoCalcReal;
+    property AsExt:    Extended      read DoCalcExt;
     property AsUStr:   UnicodeString read DoCalcUStr;
     property AsAStr:   AnsiString    read DoCalcAStr;
     property AsWStr:   WideString    read DoCalcWStr;
@@ -472,6 +479,8 @@ function TWidget.DoCalcSingle: Single;     begin Result := 1.5;              end
 function TWidget.DoCalcDouble: Double;     begin Result := 3.25;             end;
 function TWidget.DoCalcDate:   TDateTime;  begin Result := 45000.5;          end;
 function TWidget.DoCalcCurr:   Currency;   begin Result := 19.95;            end;
+function TWidget.DoCalcReal:   Real;       begin Result := 6.75;             end;
+function TWidget.DoCalcExt:    Extended;   begin Result := 2.5;              end;
 function TWidget.DoCalcUStr:   UnicodeString; begin Result := 'u_' + FName;  end;
 function TWidget.DoCalcAStr:   AnsiString;    begin Result := AnsiString('a_' + FName); end;
 function TWidget.DoCalcWStr:   WideString;    begin Result := WideString('w_' + FName); end;

@@ -70,6 +70,17 @@ type
     // vmtInstanceSize sits a fixed distance ABOVE vmtTypeInfo in every layout,
     // which is a more reliable derivation than its own standalone constant.
     VmtInstanceSizeFromTypeInfo: Integer;
+    // True when the target returns floating-point results on the x87 stack,
+    // which the debugger converts to a DOUBLE bit pattern before handing it
+    // back. Two consequences a caller must honour:
+    //
+    //   * A Single result arrives as Double bits, NOT as the raw 4-byte Single
+    //     pattern an SSE register would hold, so it has to be converted down.
+    //   * Currency travels with the floats here. On Win64 it is a scaled Int64
+    //     returned in RAX, and the return-class dispatch has to know which of
+    //     the two it is looking at.
+    FloatResultsUseX87: Boolean;
+
     // Units built with CPP_ABI_SUPPORT shift every negative slot by this much,
     // so two layouts coexist in one image and the reader has to detect which
     // one a given VMT follows. Zero when the target has no such variation --
@@ -108,6 +119,7 @@ begin
   Result.VmtClassName           := -112;
   Result.VmtInstanceSizeFromTypeInfo := 40;
   Result.VmtCppAbiShift         := 24;
+  Result.FloatResultsUseX87     := False;   // SSE: XMM0 carries the result
 end;
 
 class function TTargetLayout.For32Bit: TTargetLayout;
@@ -128,6 +140,7 @@ begin
   // CPP_ABI_SUPPORT is defined for WIN64/EXTERNALLINKER only, so on Win32
   // every class uses one layout and there is nothing to detect.
   Result.VmtCppAbiShift         := 0;
+  Result.FloatResultsUseX87     := True;
 end;
 
 class function TTargetLayout.ForBitness(Bitness: TTargetBitness): TTargetLayout;

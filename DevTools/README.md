@@ -29,6 +29,16 @@ The optional second argument is the output directory (default
 `.\Win64\Debug`); use a private directory when several builds may run
 concurrently, so they do not race on the shared DCU cache.
 
+A few probes exist to measure what the **32-bit** compiler emits and contain x86
+assembly, so they cannot build under `dcc64` at all. `build_all.bat` skips them
+(its `WIN32_ONLY` list); build those with:
+
+```bat
+DevTools\build_one32.bat Win32FloatAbiProbe.dpr
+```
+
+Binaries land in `DevTools\Win32\Debug\`.
+
 Run a built tool from `Win64\Debug` without typing the path:
 
 ```bat
@@ -431,6 +441,25 @@ Parses the embedded TD32 (`.debug` section, `FB09` magic) of a Delphi-built EXE
 using JCL's `TJclTD32InfoParser`, and reports module / source-module / symbol /
 proc-symbol / name counts with samples. Reach for this to compare JCL's TD32
 parser against our own `TD32FileReader` on the same binary.
+
+### Win32 ABI
+
+#### Win32FloatAbiProbe
+
+```bat
+DevTools\build_one32.bat Win32FloatAbiProbe.dpr
+DevTools\Win32\Debug\Win32FloatAbiProbe.exe
+```
+
+Takes no arguments. Calls a function returning each float-family type and
+immediately snapshots EAX, EDX and the whole x87 state, then reports which
+register actually carried the result. Answers the question the debugger's
+synthetic-call return path depends on, without having to trust documentation.
+
+Measured on Athens 36: **every** float-family type returns in `ST(0)` —
+`Currency` included, where Win64 returns a scaled `Int64` in RAX — and
+`Currency` arrives already **scaled** (`19.95` → `199500`). That last fact is
+why `TExprEvaluator.NormaliseFloatReturn` rounds rather than rescales.
 
 ### Live process and adapter
 
