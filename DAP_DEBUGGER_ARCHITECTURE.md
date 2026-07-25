@@ -231,6 +231,33 @@ primitive `$0041` collapses `Double`, `TDateTime` and `Real` onto one id, so a
 alias survives only in the debuggee's live RTTI (and in the `.rsm` type table);
 TD32 cannot express it.
 
+#### Float types wider than the value slot
+
+Every value is decoded from an 8-byte `RawValue`. Three float types do not fit
+it, and each fails silently rather than loudly if read at the wrong width:
+
+| Type | Win32 | Win64 |
+|---|---|---|
+| `Extended` | **10** (x87) | 8 (a true alias of `Double`) |
+| `Extended80` | 10 | **10** |
+| `Real48` | 6 | 6 |
+
+Sizes measured with `DevTools\Win32FloatAbiProbe`, which dual-compiles so both
+columns come from the compiler rather than from documentation.
+
+`ReadValueSlotRaw` (`DelphiValueReaders`) is the single entry point for reading a
+value slot. It consults `WideFloatByteSize` first and narrows those three to
+`Double` bits — the encoding every formatter downstream expects — before falling
+back to `LocalReadSize` for everything else. Precision beyond a `Double` is lost,
+which is the price of the slot and vastly better than the alternative: reading 8
+of an `Extended`'s 10 bytes keeps the **mantissa** and discards the **exponent**,
+reporting 2.75 as `-1.7E-77`.
+
+`Real48` is the pre-8087 Borland software float — 8-bit exponent biased by 129 in
+the **lowest** byte, 39-bit fraction, one sign bit. Nothing about it resembles an
+IEEE double, so it gets its own decoder, transcribed from the RTL's `_Real2Ext`
+rather than reconstructed.
+
 `TDynArrayRec` is the clearest case, since unlike the string header Delphi did
 not make it bitness-neutral:
 

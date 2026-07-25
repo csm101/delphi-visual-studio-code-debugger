@@ -31,7 +31,7 @@ interface
 
 uses
   Winapi.Windows,
-  DebugTarget, DebugInfoSet, TargetLayout, Win64Debugger;
+  DebugTarget, DebugInfoSet, TargetLayout, DelphiValueReaders, Win64Debugger;
 
 type
   TWin32Debugger = class(TWinDebugger)
@@ -453,38 +453,6 @@ begin
   if Length(ArgValues) > 2 then Ctx.Ecx := DWORD(ArgValues[2]);
   Ctx.EFlags := Ctx.EFlags and (not DWORD($100));   // clear TF
   Result := Wow64SetThreadContext(TH, Ctx);
-end;
-
-// Converts an x87 80-bit extended to the bit pattern of the nearest Double,
-// which is what the shared code expects to find in FloatResultLow (on x64 that
-// slot holds the low qword of XMM0, i.e. a Double).
-//
-// The 80-bit layout is sign(1) | exponent(15, bias 16383) | mantissa(64, with an
-// EXPLICIT leading integer bit). A Double is sign(1) | exponent(11, bias 1023) |
-// mantissa(52, leading bit implicit), so the conversion re-biases the exponent
-// and drops both the explicit integer bit and the 11 lowest mantissa bits.
-function ExtendedBytesToDoubleBits(const Bytes: array of Byte): UInt64;
-begin
-  Result := 0;
-  var Mantissa: UInt64 := PUInt64(@Bytes[0])^;
-  var SignExp:  Word   := PWord(@Bytes[8])^;
-  var Sign:     UInt64 := UInt64(SignExp shr 15) shl 63;
-  var Exp80:    Integer := SignExp and $7FFF;
-
-  if (Exp80 = 0) and (Mantissa = 0) then
-    Exit(Sign);                        // +/- zero
-  if Exp80 = $7FFF then                // infinity or NaN
-    Exit(Sign or (UInt64($7FF) shl 52) or (Mantissa shr 11) and ((UInt64(1) shl 52) - 1));
-
-  var Exp64 := Exp80 - 16383 + 1023;
-  if Exp64 <= 0 then
-    Exit(Sign);                        // underflows a Double: report zero
-  if Exp64 >= $7FF then
-    Exit(Sign or (UInt64($7FF) shl 52));  // overflows: report infinity
-
-  // Drop the explicit integer bit (bit 63) and keep the next 52.
-  var Frac := (Mantissa shr 11) and ((UInt64(1) shl 52) - 1);
-  Result := Sign or (UInt64(Exp64) shl 52) or Frac;
 end;
 
 // EAX carries the integer result, EDX:EAX a 64-bit one, and a floating-point

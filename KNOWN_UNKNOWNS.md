@@ -480,14 +480,12 @@ object expansion, evaluation, multi-BPL). See "Target architecture" in
   approximated: floats do not travel in the integer registers on x86, and where
   each one goes has not been measured. (Float *returns* and `Int64` returns are
   now implemented — see "x86 return values" in `DAP_DEBUGGER_ARCHITECTURE.md`.)
-- **`Extended` is 10 bytes on Win32, and `TD32FileReader` reports it as 8.**
-  The type-size table maps CodeView primitives `$41` and `$42` to 8 bytes, which
-  is right for `Double` and right for `Extended` on Win64 (where it aliases
-  `Double`) but two bytes short on Win32, where `Extended` is a genuine 80-bit
-  x87 type. `TTD32FileReader` has no notion of target bitness at all, so fixing
-  this means threading one in. Not currently reachable through a synthetic call
-  return (those arrive already converted to `Double` bits) — the exposure is
-  reading an `Extended` variable out of target memory, which no test covers yet.
+- **`TD32FileReader.GetTypeSize` still reports CodeView `$42` (`Extended`) as 8
+  bytes**, which is right on Win64 and two short on Win32. Reading a variable no
+  longer goes through it — `WideFloatByteSize` owns that decision now — but the
+  number is still consulted for dynamic-array element strides, so an array of
+  `Extended` on Win32 would stride wrongly. `TTD32FileReader` has no notion of
+  target bitness at all, so fixing it means threading one in.
 - **Does `dcc32 -$O+` emit usable local symbols?** Win32 locals/params are
   declared supported for `-$O-` builds only, because `-$O+` omits the frame
   pointer routinely. Whether the debug info of an optimised 32-bit build still

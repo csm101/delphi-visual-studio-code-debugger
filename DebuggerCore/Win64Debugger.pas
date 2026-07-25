@@ -3039,10 +3039,12 @@ begin
   // Width-aware read (same rule as locals): narrow primitives leave the
   // upper RawValue bytes zeroed instead of folding in the neighbouring
   // global's bytes.
-  var ReadSize := LocalReadSize(Value.TypeHint, TargetLayout.PointerSize);
-  if ReadProcessMemory(FProcess, Pointer(Value.Address), @Value.RawValue,
-       ReadSize, R) and (R = SIZE_T(ReadSize)) then
-    Value.ValueValid := True;
+  Value.ValueValid := ReadValueSlotRaw(
+    function(A: UInt64; Dest: Pointer; Size: Integer): Boolean
+    begin
+      Result := ReadProcessMemoryAt(A, Dest, Size);
+    end,
+    Value.Address, Value.TypeHint, TargetLayout.PointerSize, Value.RawValue);
 
   DapLog(Format('EvaluateGlobalName "%s": Rva=$%x VA=$%x Raw=$%x ' +
     'rsmGlobal=%s TypeHint="%s"',
@@ -4309,8 +4311,12 @@ begin
     // upper bytes of V.RawValue at zero so the formatter doesn't fold
     // stack garbage into Int64-cast displays of declared 4-byte values.
     V.RawValue := 0;
-    var ReadSize: Integer := LocalReadSize(Sym.TypeHint, TargetLayout.PointerSize);
-    if ReadProcessMemoryAt(V.Address, @V.RawValue, ReadSize) then begin
+    if ReadValueSlotRaw(
+         function(A: UInt64; Dest: Pointer; Size: Integer): Boolean
+         begin
+           Result := ReadProcessMemoryAt(A, Dest, Size);
+         end,
+         V.Address, Sym.TypeHint, TargetLayout.PointerSize, V.RawValue) then begin
       V.ValueValid := True;
       if (V.Kind = lkVarParam) and (V.RawValue <> 0) and
          ReadProcessMemoryAt(V.RawValue, @V.DerefValue, 8) then

@@ -80,6 +80,13 @@ type
     // wrong until the eighth. Ten evaluations in a single session is past the
     // wrap point, so this fails if that restore is ever weakened.
     [Test] procedure Win32_RepeatedFloatEvaluations_DoNotExhaustTheX87Stack;
+    // Two float types do not fit the 8-byte slot every value is decoded into:
+    // Extended is 10 bytes of x87 on Win32 (though a plain Double on Win64), and
+    // Real48 is the 6-byte pre-8087 software float on both. Reading either at
+    // the wrong width fails silently and spectacularly -- taking 8 of an
+    // Extended's 10 bytes keeps the mantissa and drops the exponent, which
+    // reported 2.75 as -1.7E-77.
+    [Test] procedure Win32_WideFloatLocals_ReadTheirFullWidth;
     // Stepping. Inherited from the architecture-neutral base, but it rides on
     // SetThreadTrapFlag and the WOW64 single-step status code, both of which
     // are 32-bit specific -- and STATUS_WX86_SINGLE_STEP was measured rather
@@ -2590,6 +2597,44 @@ begin
   finally
     Session.Free;
   end;
+end;
+
+procedure TWin32RunControlTests.Win32_WideFloatLocals_ReadTheirFullWidth;
+const
+  SRC    = 'TestTargetCore.pas';
+  MARKER = 'NESTED_INC';
+  NAMES:    array[0..1] of string = ('Ext1',  'R48');
+  EXPECTED: array[0..1] of string = ('2.75',  '3.5');
+
+  procedure CheckAll(const Exe, Map, Rsm: string; Line: Integer);
+  begin
+    var Session := OpenSessionAtMarker(Exe, Map, Rsm, TargetDir, SRC, Line);
+    try
+      Assert.AreEqual(Ord(dsStopped), Ord(Session.State),
+        'did not stop in ' + ExtractFileName(Exe));
+      for var I := Low(NAMES) to High(NAMES) do begin
+        var Found := False;
+        for var L in Session.GetLocals do
+          if SameText(L.Name, NAMES[I]) then begin
+            Found := True;
+            Assert.IsTrue(L.Value.StartsWith(EXPECTED[I]),
+              Format('%s in %s: expected %s, got "%s" [%s]',
+                [NAMES[I], ExtractFileName(Exe), EXPECTED[I], L.Value, L.TypeName]));
+          end;
+        Assert.IsTrue(Found,
+          Format('%s missing from the locals of ComputeNested in %s',
+            [NAMES[I], ExtractFileName(Exe)]));
+      end;
+    finally
+      Session.Free;
+    end;
+  end;
+
+begin
+  var Line := MarkerLineInFile(TargetDir + SRC, MARKER);
+  Assert.IsTrue(Line > 0, 'marker not found: ' + MARKER);
+  CheckAll(Win64Exe, Win64Map, Win64Rsm, Line);
+  CheckAll(Win32Exe, Win32Map, Win32Rsm, Line);
 end;
 
 procedure PumpUntilStop(Session: TDebugSession; TimeoutMs: Cardinal);

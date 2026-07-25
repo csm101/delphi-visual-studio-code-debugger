@@ -619,6 +619,15 @@ end;
 procedure ComputeNested(var X: Integer);
 var
   D1: TDateTime;
+  // Extended is 10 bytes of x87 on Win32 and an alias of Double on Win64, so
+  // this local reads back through two different decoders. Reading only 8 of the
+  // 10 bytes yields the mantissa reinterpreted as a Double -- a wildly wrong
+  // number rather than a rounded one, which is what makes it worth pinning.
+  Ext1: Extended;
+  // The pre-8087 Borland software float: 6 bytes, exponent in the LOWEST byte,
+  // biased by 129. Nothing about it resembles an IEEE double, so it needs its
+  // own decoder and is worth one local to keep that decoder honest.
+  R48: Real48;
 
   procedure Inner;
   var
@@ -631,7 +640,13 @@ var
 begin
   var D := Now;
   D1 := D;
+  Ext1 := 2.75;
+  R48  := 3.5;
   Inc(X);    // {BP:NESTED_INC}
+  // Keeps the Ext1/R48 stores live past the breakpoint above, so neither can be
+  // read back as zero merely because nothing ever consumed them.
+  if (Ext1 < 0) or (R48 < 0) then
+    GSink.Use(['unreachable']);
   Inner;     // {BP:NESTED_CALL_INNER}
 end;
 

@@ -175,7 +175,7 @@ object recognition and field expansion, strings, and expression evaluation
 including getter-backed properties that run real code in the debuggee.
 Multi-BPL -- the project's core use case -- verified end to end.
 
-Suite: **960 found / 958 passed / 0 failed / 0 leaked / 2 ignored.**
+Suite: **961 found / 959 passed / 0 failed / 0 leaked / 2 ignored.**
 
 NOTE ON A DIRTY RUN: one full-suite run produced a block of
 `DAP request failed: unknown error` failures across `TDebuggerTests.Test_Types_*`
@@ -273,6 +273,29 @@ name was the visible tip; the desynchronised walk was the cause.
 `Extended` is a true alias of `Double` on Win64 (same TypeInfo, so the reported
 name really is `Double`) and a distinct 10-byte x87 type on Win32; `NativeUInt`
 is `UInt64` vs `Cardinal`. Reporting one type on both would be the bug.
+
+### Float types wider than the 8-byte value slot: FIXED
+
+Measured with the now dual-compiling `DevTools\Win32FloatAbiProbe`:
+`Extended` is 10 bytes on Win32 and 8 on Win64 (a true alias of `Double`);
+`Extended80` is 10 on BOTH; `Real48` is 6 on both. `Real` is 8 everywhere --
+a `Double` alias -- so the pre-8087 software float lives on under the name
+`Real48`, not `Real`.
+
+An `Extended` local on Win32 previously read back as **-1.72723371101889E-77**
+for a stored 2.75: 8 of the 10 bytes keeps the mantissa and drops the exponent.
+`ReadValueSlotRaw` in `DelphiValueReaders` is now the single entry point for
+reading a value slot; it consults `WideFloatByteSize` and narrows all three to
+Double bits. The three former call sites (two in `Win64Debugger`, one in
+`VariableExpander.SyntheticLocal`) pass a read closure. `Real48` gets its own
+decoder transcribed from the RTL's `_Real2Ext`.
+
+TRAP while testing this: a local that nothing ever reads gets its store ELIDED
+even under `-$O-`, so `R48` measured as 0 until a later use was added. That was
+the compiler, not the decoder -- do not chase a zero without first making the
+variable live.
+
+Pinned by `Win32_WideFloatLocals_ReadTheirFullWidth`.
 
 ### x87 stack leak: HYPOTHESISED, MEASURED, DISPROVED -- do not "fix" it
 

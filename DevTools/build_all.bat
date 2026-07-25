@@ -21,9 +21,11 @@ if "%HAVE_JCL%"=="1" set FLAGS=%FLAGS% %JCL_FLAGS%
 rem Tools that do not compile without the upstream JCL sources.
 set JCL_ONLY=TdsProbe JclProbe
 
-rem Probes that exist to measure what the 32-bit compiler emits. They contain
-rem x86 asm and cannot build under dcc64 at all - build them with build_one32.bat.
-set WIN32_ONLY=Win32FloatAbiProbe
+rem Probes that contain x86 asm and cannot build under dcc64 at all - build those
+rem with build_one32.bat. (Win32FloatAbiProbe is NOT one of them: it guards its
+rem asm with {$IFDEF CPUX86} so it dual-compiles, and its size table is only
+rem meaningful when both columns are available.)
+set WIN32_ONLY=
 
 set FAILED=
 

@@ -243,13 +243,23 @@ begin
   Result.TypeHint   := TypeName;
   Result.Address    := Addr;
   Result.Kind       := lkLocal;
+  if Debugger = nil then
+    Exit;
   // Read the slot at its real width. Reading a fixed 8 here is what made a
   // 32-bit target render a string field as `@0x2A03172D4C (string read
   // failed)`: the 4-byte handle came back with the neighbouring field spliced
   // into its high half, giving an address far outside the target's range.
-  Result.ValueValid := (Debugger <> nil) and
-    Debugger.ReadProcessMemoryAt(Addr, @Result.RawValue,
-      LocalReadSize(TypeName, Debugger.TargetLayout.PointerSize));
+  // Read into a local first: inside the closure `Result` is the closure's own
+  // Boolean, so naming the record's field there would only invite confusion.
+  var Raw: UInt64 := 0;
+  var Reader := Debugger;
+  Result.ValueValid := ReadValueSlotRaw(
+    function(A: UInt64; Dest: Pointer; Size: Integer): Boolean
+    begin
+      Result := Reader.ReadProcessMemoryAt(A, Dest, Size);
+    end,
+    Addr, TypeName, Reader.TargetLayout.PointerSize, Raw);
+  Result.RawValue := Raw;
 end;
 
 function TVariableExpander.FormatExprValue(const E: TExprValue): string;

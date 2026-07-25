@@ -23,6 +23,42 @@ uses
 // reading 8 splices the neighbouring slot into the high half.
 function LocalReadSize(const TypeName: string; PointerSize: Integer): Integer;
 
+type
+  // How a caller reads Size bytes of target memory into Dest. Every read site
+  // already has a method of exactly this shape, so ReadValueSlotRaw below can be
+  // shared without any of them knowing about the others.
+  TSlotReader = reference to function(Addr: UInt64; Dest: Pointer;
+    Size: Integer): Boolean;
+
+// Byte width of the float types whose representation in the TARGET does not fit
+// the 8-byte RawValue slot every formatter decodes from -- or 0 for every other
+// type, which LocalReadSize handles. Measured with DevTools\Win32FloatAbiProbe,
+// both columns:
+//
+//   Extended     10 bytes on Win32; 8 on Win64, where it truly aliases Double
+//   Extended80   10 bytes on BOTH architectures
+//   Real48        6 bytes on both -- the pre-8087 Borland software float
+function WideFloatByteSize(const TypeName: string; PointerSize: Integer): Integer;
+
+// Converts an x87 80-bit extended to the bit pattern of the nearest Double,
+// which is the encoding the value formatters expect. Precision beyond a Double
+// is lost; that is the price of the 8-byte slot, and it beats the alternative by
+// a wide margin -- reading 8 of the 10 bytes keeps the MANTISSA and discards the
+// EXPONENT, which reported an Extended holding 2.75 as -1.7E-77.
+function ExtendedBytesToDoubleBits(const Bytes: array of Byte): UInt64;
+
+// Same, for the 6-byte Real48: 8-bit exponent (bias 129), 39-bit fraction,
+// 1 sign bit, with the exponent in the LOWEST byte. Layout follows the RTL's
+// own _Real2Ext (System.pas), not a reconstruction.
+function Real48BytesToDoubleBits(const Bytes: array of Byte): UInt64;
+
+// Reads one value slot into the 8-byte RawValue the formatters decode from,
+// narrowing the wide float types on the way. Use this rather than calling
+// LocalReadSize and reading into a UInt64 directly: that pattern silently
+// truncates any type WideFloatByteSize knows about.
+function ReadValueSlotRaw(const Read: TSlotReader; Addr: UInt64;
+  const TypeName: string; PointerSize: Integer; out Raw: UInt64): Boolean;
+
 // True when a type's Delphi TTypeKind makes it a candidate for the
 // structured-value formatting path (class / record / interface).
 function IsExpandableTKind(K: Byte): Boolean;
@@ -139,8 +175,10 @@ begin
      (TypeName = 'Single') or (TypeName = 'HRESULT') or
      (TypeName = 'LongBool') then
     Exit(4);
-  // tkInt64 and tkFloat (Double / Extended / TDateTime / Currency) are genuinely
-  // 8 bytes on both architectures.
+  // tkInt64 and tkFloat are genuinely 8 bytes on both architectures. `Extended`
+  // is the exception and is listed here only for the Win64 case where it truly
+  // aliases Double -- on Win32 it is 10 bytes and never reaches this function,
+  // because ReadValueSlotRaw diverts it via WideFloatByteSize first.
   if (TypeName = 'Int64') or (TypeName = 'UInt64') or (TypeName = 'QWord') or
      (TypeName = 'Double') or (TypeName = 'Currency') or (TypeName = 'Comp') or
      (TypeName = 'TDateTime') or (TypeName = 'TDate') or (TypeName = 'TTime') or
@@ -152,6 +190,84 @@ begin
   // on a 32-bit target. Reading 8 there splices the neighbouring slot into the
   // high half and produces a plausible wrong value rather than an error.
   Result := PointerSize;
+end;
+
+function WideFloatByteSize(const TypeName: string; PointerSize: Integer): Integer;
+begin
+  if SameText(TypeName, 'Real48') then
+    Exit(6);
+  if SameText(TypeName, 'Extended80') then
+    Exit(10);
+  // `Extended` is the only one whose width depends on the target: 10 bytes of
+  // x87 on Win32, a plain Double on Win64.
+  if SameText(TypeName, 'Extended') and (PointerSize = 4) then
+    Exit(10);
+  Result := 0;
+end;
+
+// The 80-bit layout is sign(1) | exponent(15, bias 16383) | mantissa(64, with an
+// EXPLICIT leading integer bit). A Double is sign(1) | exponent(11, bias 1023) |
+// mantissa(52, leading bit implicit), so the conversion re-biases the exponent
+// and drops both the explicit integer bit and the 11 lowest mantissa bits.
+function ExtendedBytesToDoubleBits(const Bytes: array of Byte): UInt64;
+begin
+  var Mantissa: UInt64 := PUInt64(@Bytes[0])^;
+  var SignExp:  Word   := PWord(@Bytes[8])^;
+  var Sign:     UInt64 := UInt64(SignExp shr 15) shl 63;
+  var Exp80:    Integer := SignExp and $7FFF;
+
+  if (Exp80 = 0) and (Mantissa = 0) then
+    Exit(Sign);                        // +/- zero
+  if Exp80 = $7FFF then                // infinity or NaN
+    Exit(Sign or (UInt64($7FF) shl 52) or (Mantissa shr 11) and ((UInt64(1) shl 52) - 1));
+
+  var Exp64 := Exp80 - 16383 + 1023;
+  if Exp64 <= 0 then
+    Exit(Sign);                        // underflows a Double: report zero
+  if Exp64 >= $7FF then
+    Exit(Sign or (UInt64($7FF) shl 52));  // overflows: report infinity
+
+  // Drop the explicit integer bit (bit 63) and keep the next 52.
+  var Frac := (Mantissa shr 11) and ((UInt64(1) shl 52) - 1);
+  Result := Sign or (UInt64(Exp64) shl 52) or Frac;
+end;
+
+function Real48BytesToDoubleBits(const Bytes: array of Byte): UInt64;
+const
+  REAL48_BIAS = 129;
+  DOUBLE_BIAS = 1023;
+begin
+  // A zero exponent means the whole number is zero, sign included.
+  if Bytes[0] = 0 then
+    Exit(0);
+  var Sign:     UInt64 := (UInt64(Bytes[5]) and $80) shl 56;
+  var Exponent: UInt64 := (UInt64(Bytes[0]) + DOUBLE_BIAS - REAL48_BIAS) shl 52;
+  var Fraction: UInt64 :=
+    ((UInt64(Bytes[5]) and $7F) shl 32) or
+    (UInt64(Bytes[4]) shl 24) or
+    (UInt64(Bytes[3]) shl 16) or
+    (UInt64(Bytes[2]) shl 8)  or
+     UInt64(Bytes[1]);
+  Result := Sign or Exponent or (Fraction shl 13);
+end;
+
+function ReadValueSlotRaw(const Read: TSlotReader; Addr: UInt64;
+  const TypeName: string; PointerSize: Integer; out Raw: UInt64): Boolean;
+begin
+  Raw := 0;
+  var Wide := WideFloatByteSize(TypeName, PointerSize);
+  if Wide = 0 then
+    Exit(Read(Addr, @Raw, LocalReadSize(TypeName, PointerSize)));
+
+  var Bytes: array[0..9] of Byte;
+  FillChar(Bytes, SizeOf(Bytes), 0);
+  if not Read(Addr, @Bytes[0], Wide) then
+    Exit(False);
+  if Wide = 6 then
+    Raw := Real48BytesToDoubleBits(Bytes)
+  else
+    Raw := ExtendedBytesToDoubleBits(Bytes);
+  Result := True;
 end;
 
 function FormatFloatNicely(V: Extended): string;
@@ -1021,7 +1137,10 @@ function TDelphiValueReader.FormatLocalValue(const V: TLocalValue): string;
       Exit(Format('%d  (0x%x)', [SmallInt(Raw and $FFFF), Raw and $FFFF]));
     if TypeName = 'Single' then
       Exit(FormatFloatNicely(PSingle(@Raw)^));
-    if (TypeName = 'Double') or (TypeName = 'Real') or (TypeName = 'Extended') then
+    // Real48 and Extended80 arrive here already narrowed to Double bits by
+    // ReadValueSlotRaw, so they format exactly like the rest of the family.
+    if (TypeName = 'Double') or (TypeName = 'Real') or (TypeName = 'Extended') or
+       (TypeName = 'Real48') or (TypeName = 'Extended80') then
       Exit(FormatFloatNicely(PDouble(@Raw)^));
     if (TypeName = 'TDateTime') or (TypeName = 'TDate') or (TypeName = 'TTime') then
       Exit(FormatDelphiDateTime(PDouble(@Raw)^));

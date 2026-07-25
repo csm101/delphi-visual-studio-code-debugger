@@ -447,18 +447,35 @@ parser against our own `TD32FileReader` on the same binary.
 #### Win32FloatAbiProbe
 
 ```bat
+DevTools\Win64\Debug\Win32FloatAbiProbe.exe          rem sizes only
 DevTools\build_one32.bat Win32FloatAbiProbe.dpr
-DevTools\Win32\Debug\Win32FloatAbiProbe.exe
+DevTools\Win32\Debug\Win32FloatAbiProbe.exe          rem sizes + return ABI
 ```
 
-Takes no arguments. Calls a function returning each float-family type and
-immediately snapshots EAX, EDX and the whole x87 state, then reports which
-register actually carried the result. Answers the question the debugger's
-synthetic-call return path depends on, without having to trust documentation.
+Takes no arguments. Dual-compiles on purpose: the size table is only meaningful
+with both columns, while the return-ABI half needs x86 asm and is skipped under
+dcc64.
 
-Measured on Athens 36: **every** float-family type returns in `ST(0)` —
-`Currency` included, where Win64 returns a scaled `Int64` in RAX — and
-`Currency` arrives already **scaled** (`19.95` → `199500`). That last fact is
+Reports the true byte width of every float-family type, then calls a function
+returning each one and immediately snapshots EAX, EDX and the whole x87 state to
+show which register actually carried the result. Answers the two questions the
+debugger's value-read and synthetic-call paths depend on, without trusting
+documentation for either.
+
+Measured on Athens 36:
+
+| Type | Win32 | Win64 |
+|---|---|---|
+| `Single` | 4 | 4 |
+| `Double` / `Real` / `Currency` / `TDateTime` / `Comp` | 8 | 8 |
+| `Real48` | 6 | 6 |
+| `Extended` | **10** | **8** |
+| `Extended80` | 10 | **10** |
+
+So `Real` is a `Double` alias on both, and the 6-byte pre-8087 software float is
+still there under the name `Real48`. On Win32 **every** float-family type returns
+in `ST(0)` — `Currency` included, where Win64 returns a scaled `Int64` in RAX —
+and `Currency` arrives already **scaled** (`19.95` → `199500`). That last fact is
 why `TExprEvaluator.NormaliseFloatReturn` rounds rather than rescales.
 
 ### Live process and adapter

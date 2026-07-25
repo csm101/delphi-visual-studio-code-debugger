@@ -187,7 +187,9 @@ Target architecture:
   Synthetic calls return the full float family (`Single`, `Double`, `Real`,
   `Extended`, `TDateTime`, `Currency`) and `Int64` correctly: results come off
   the x87 stack via an `fnsave` capture stub, and out of EDX:EAX for 64-bit
-  integers.
+  integers. Variables of the float types that do not fit the 8-byte value slot
+  read correctly too — `Extended` (10 bytes of x87 on Win32), `Extended80`
+  (10 on both) and the pre-8087 `Real48` (6 on both).
 - **Limitation:** Win32 locals and parameters are supported for `-$O-` builds
   only; `-$O+` omits the frame pointer routinely. A Win32 synthetic call still
   refuses float *arguments* outright. See `KNOWN_UNKNOWNS.md`.
