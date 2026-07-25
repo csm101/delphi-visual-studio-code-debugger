@@ -806,7 +806,7 @@ Debugger features:
 
 - [ ] Child process tracking (currently `DEBUG_ONLY_THIS_PROCESS` only)
 - [ ] Disassembly view (DAP `disassemble` request)
-- [ ] On a 32-bit target: locals in optimised (`-$O+`) builds, and float / `Int64` results from expressions that call into the debuggee
+- [ ] On a 32-bit target: locals in optimised (`-$O+`) builds, and floating-point **arguments** to expressions that call into the debuggee (results of every float type, and `Int64`, do work)
 
 Variable / type system:
 
@@ -835,8 +835,9 @@ Project / packaging:
   call stacks) works either way. Locals and parameters, however, are read from
   frame-pointer-relative offsets, and `dcc32 -$O+` omits the frame pointer
   routinely — so compile a 32-bit debug target with `-$O-`. Expressions that
-  call a method or property getter in a 32-bit debuggee also cannot yet pass
-  floating-point arguments or return floating-point / `Int64` results.
+  call a method or property getter in a 32-bit debuggee cannot yet pass
+  floating-point **arguments**; they do return every float type (`Single`,
+  `Double`, `Real`, `Extended`, `TDateTime`, `Currency`) and `Int64` correctly.
 
 ---
 
