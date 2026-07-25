@@ -33,7 +33,7 @@ uses
   DelphiRtti      in '..\DebuggerCore\DelphiRtti.pas',
   DelphiValueReaders in '..\DebuggerCore\DelphiValueReaders.pas',
   ExprEval        in '..\DebuggerCore\ExprEval.pas',
-  Win64Debugger   in '..\DebuggerCore\Win64Debugger.pas',
+  WinDebuggerBase in '..\DebuggerCore\WinDebuggerBase.pas',
   DebugSessionTypes in '..\DebuggerCore\DebugSessionTypes.pas',
   SourceResolver  in '..\DebuggerCore\SourceResolver.pas',
   DebugSession    in '..\DebuggerCore\DebugSession.pas',

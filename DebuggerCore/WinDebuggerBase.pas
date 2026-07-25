@@ -1,4 +1,13 @@
-unit Win64Debugger;
+unit WinDebuggerBase;
+
+// TWinDebugger: the architecture-neutral half of the engine -- the debug event
+// loop, breakpoints, stepping, module handling and the synthetic-call pump --
+// plus the x64 implementation of the architecture seam as its default.
+// TWin32Debugger (WinDebuggerX86.pas) overrides that seam and inherits
+// everything else unchanged.
+//
+// The unit was called Win64Debugger until 32-bit targets landed, at which point
+// the name described neither the class nor what it debugs.
 
 interface
 

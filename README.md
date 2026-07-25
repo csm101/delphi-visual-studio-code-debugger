@@ -732,7 +732,7 @@ symbol resolution reaches both.
 | `DebuggerCore\DapProtocol.pas` | DAP framing: `Content-Length` header, JSON send/receive, logging |
 | `VisualStudioCodeDelphiDebugger\DapServer.pas` | DAP request dispatcher: launch, setBreakpoints, stackTrace, next, continue… |
 | `DebuggerCore\DebugTarget.pas` | `IDebugTarget` abstraction shared by the DAP layer and the evaluator |
-| `DebuggerCore\Win64Debugger.pas` | Windows debug loop: `WaitForDebugEvent`, INT3 plant/remove, single-step, synthetic calls (also the x64 implementation of the architecture seam) |
+| `DebuggerCore\WinDebuggerBase.pas` | Windows debug loop: `WaitForDebugEvent`, INT3 plant/remove, single-step, synthetic calls (also the x64 implementation of the architecture seam) |
 | `DebuggerCore\WinDebuggerX86.pas` | The same debugger against a 32-bit (WOW64) target: WOW64 thread context, i386 stack walk, x86 prologue decode and call ABI |
 | `DebuggerCore\TargetLayout.pas` | The debuggee's own pointer size, dynamic-array header and VMT slot offsets — the adapter's `SizeOf(Pointer)` describes the adapter |
 | `DebuggerCore\TD32FileReader.pas` | Borland TD32 reader for the `.debug` PE section: source lines, symbols, types |

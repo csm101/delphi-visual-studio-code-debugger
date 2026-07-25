@@ -31,7 +31,7 @@ interface
 
 uses
   Winapi.Windows,
-  DebugTarget, DebugInfoSet, TargetLayout, DelphiValueReaders, Win64Debugger;
+  DebugTarget, DebugInfoSet, TargetLayout, DelphiValueReaders, WinDebuggerBase;
 
 type
   TWin32Debugger = class(TWinDebugger)
@@ -57,8 +57,9 @@ type
     function  LocalsOffsetBase(SubRspN, ExtraPushBytes: UInt32): Integer; override;
     function  ParamsOffsetBase(SubRspN, ExtraPushBytes: UInt32): Integer; override;
 
-    // Not yet implemented for x86; each refuses rather than inheriting the x64
-    // answer, which would be confidently wrong.
+    // Delphi's 32-bit `register` convention, and results out of EDX:EAX or the
+    // x87 stack. Float ARGUMENTS are still refused outright rather than placed
+    // where the callee would read an integer.
     function  PrepareSyntheticCall(TH: THandle; FuncVA: UInt64;
                 const ArgValues: array of UInt64;
                 const ArgIsFloat: array of Boolean;

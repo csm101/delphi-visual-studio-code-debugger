@@ -2,13 +2,13 @@ unit DebugTarget;
 
 // Target-agnostic debugger contract used by the DAP layer and the expression
 // evaluator. The Win64 process-API implementation is `TWinDebugger`
-// (Win64Debugger.pas); a future Win32 (or attach-mode, or remote) target
+// (WinDebuggerBase.pas); a future Win32 (or attach-mode, or remote) target
 // implements the same interface.
 //
-// Types previously declared inside Win64Debugger.pas (TStopReason,
+// Types previously declared inside WinDebuggerBase.pas (TStopReason,
 // TRegisterSnapshot, TLocalValue, TStackFrame, the event callback
 // signatures, TBreakpointRec, TBpSpec, TCommand) live here so that
-// alternative implementations don't have to depend on Win64Debugger.
+// alternative implementations don't have to depend on WinDebuggerBase.
 
 interface
 

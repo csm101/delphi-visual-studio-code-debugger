@@ -11,7 +11,7 @@ uses
   System.SyncObjs, System.StrUtils, System.IOUtils, System.Math, System.DateUtils,
   Winapi.Windows, Winapi.TlHelp32,
   DapProtocol, DebugInfoTypes, DebugInfoSet, DebugTarget, ExceptionRules,
-  MapFileReader, TD32FileReader, RsmFileReader, Win64Debugger, DelphiRtti, DebugSourceIndex,
+  MapFileReader, TD32FileReader, RsmFileReader, WinDebuggerBase, DelphiRtti, DebugSourceIndex,
   DelphiValueReaders, SourceResolver, DebugSessionTypes, DebugSession, VariableExpander,
   BreakpointEval, PeSymbolSupport, ModuleSymbolLoader,
   ExprEval, ValueEncoders;

@@ -87,7 +87,7 @@ The debugger engine is exposed through two frontends:
   (capabilities, pending breakpoints, source paths) and the DAP message
   loop. Translates each DAP request into either an immediate JSON
   response or a `TCommand` posted to the debug thread.
-- `Win64Debugger.pas` — `TWinDebugger`: the Windows debug loop. Drives
+- `WinDebuggerBase.pas` — `TWinDebugger`: the Windows debug loop. Drives
   `WaitForDebugEvent`, manages INT3 plant/remove, single-step, breakpoint
   reactivation, StackWalk64-based unwinding, synthetic remote calls into the
   debuggee, and the local/global variable readout. Everything here except the

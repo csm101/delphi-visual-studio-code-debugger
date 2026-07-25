@@ -27,7 +27,7 @@ uses
   System.Math, Winapi.Windows,
   DebugSessionTypes, DebugTarget, DebugInfoTypes, DebugInfoSet,
   MapFileReader, RsmFileReader, TD32FileReader, ModuleSymbolLoader,
-  DelphiRtti, DelphiValueReaders, ExprEval, Win64Debugger, WinDebuggerX86,
+  DelphiRtti, DelphiValueReaders, ExprEval, WinDebuggerBase, WinDebuggerX86,
   SourceResolver,
   VariableExpander, BreakpointEval, ExceptionRules, ValueEncoders, DapProtocol;
 

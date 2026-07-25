@@ -18,8 +18,9 @@ BEHAVIOUR differences (context/registers, stack walk, prologue, call ABI) go
 behind `IDebugTarget`. LAYOUT differences (pointer size, VMT offsets, dynarray
 header) go in a plain DATA record read while decoding an already-read buffer --
 never a virtual call per pointer, which would shatter bulk reads into syscalls.
-Unit rename `Win64Debugger.pas` -> `WinDebuggerBase.pas` + `WinDebuggerX64.pas`
-+ `WinDebuggerX86.pas`; repo / extension / MCP names unchanged.
+Unit rename `Win64Debugger.pas` -> `WinDebuggerBase.pas`, alongside
+`WinDebuggerX86.pas`; repo / extension / MCP names unchanged. DONE -- see
+"Unit rename" below for what was and was not split.
 
 ### Phase 0: DONE, verdict GO (12-agent workflow + adversarial verification)
 
@@ -238,10 +239,18 @@ order of value:
    because a property expression resolves through the FIRST of those on x86.
    Verified `Single 1.5 / Double 3.25 / Real 6.75 / Extended 2.5 /
    TDateTime 45000.5 / Currency 19.95 / Int64 0x1122334455667788` on both.
-4. **The unit rename** the user chose: `Win64Debugger.pas` ->
-   `WinDebuggerBase.pas` + `WinDebuggerX64.pas`, alongside the existing
-   `WinDebuggerX86.pas`. Deferred deliberately until the x86 implementation's
-   size was known; it is now ~550 lines, so the split is safe to do.
+4. **Unit rename: file rename DONE, class split NOT done.**
+   `Win64Debugger.pas` is now `WinDebuggerBase.pas`, which is what the name
+   needed to stop claiming: the unit holds the architecture-NEUTRAL engine and
+   debugs 32-bit targets too. Five code references, two comments and five
+   documents updated; repo, extension and MCP names unchanged.
+
+   What was NOT done is extracting a `TWin64Debugger` into `WinDebuggerX64.pas`.
+   Today the base class carries the x64 seam implementation as its DEFAULT and
+   `TWin32Debugger` overrides it. Splitting it would mean promoting whatever
+   private state those ~12 seam methods touch to `protected`, which is a real
+   design change to a 4000-line unit rather than the "pure move" the plan
+   assumed. Worth doing, but it needs a deliberate pass, not a drive-by.
 5. **`-$O+` support**, if wanted at all -- decide policy before building.
 
 ### THE FOURTH host-vs-target SITE, and the biggest one: FIXED
@@ -332,7 +341,7 @@ would overflow the eight-register stack on the eighth float evaluation.
 
 It does not happen. `RunMethodCall` saves the thread context with
 `CONTEXT_FULL or CONTEXT_FLOATING_POINT` before the call and restores it after
-reading the result (`Win64Debugger.pas:3277`, `:3335`); on a WOW64 thread that is
+reading the result (`WinDebuggerBase.pas:3277`, `:3335`); on a WOW64 thread that is
 the same physical x87 stack, so the restore discards the leftover.
 Measured: 12 consecutive `Self.AsDouble` evaluations in one session, all 3.25.
 
@@ -754,7 +763,7 @@ step_over turned it into the real instance. A normal breakpoint on the SAME firs
 statement was verified correct (it binds to the line-table address, past the
 prologue), which is why this looked like a value-decoding bug.
 
-Root cause (`DebuggerCore\Win64Debugger.pas`, `EXCEPTION_SINGLE_STEP` / `smInto`):
+Root cause (`DebuggerCore\WinDebuggerBase.pas`, `EXCEPTION_SINGLE_STEP` / `smInto`):
 the entry address ALREADY maps to a source line, so the naive `AtNewLine` test
 ("a source line different from where the step started") is satisfied by the
 callee's very FIRST instruction -- RBP still the caller's, no register argument
@@ -814,7 +823,7 @@ its `StackWalk64` calls failed -> `RetAddr = 0` -> the fallback flipped to `smIn
 `FStepSafetyCount`, so the FIRST trap satisfied `AtNewLine` and reported a successful
 step 3-7 bytes later, inside the same function.
 
-Fixed in `DebuggerCore\Win64Debugger.pas`:
+Fixed in `DebuggerCore\WinDebuggerBase.pas`:
 1. **ROOT CAUSE (explicit per-module registration, the preferred option).**
    `EnsureSymInitialized` (still lazy -- the invade sweep is what covers the MAIN EXE,
    which never gets a LOAD_DLL event) + `RegisterModuleWithDbgHelp` called from
@@ -879,7 +888,7 @@ probe folders in the scratch tree.
   PROJECT_STATE.md's "stable build/run commands".
 - `.gitattributes` added -- CRLF was convention-only and three files had drifted
   to LF.
-- Deleted two stale out-of-tree forks of `Win64Debugger.pas` / `DebugInfoSet.pas`
+- Deleted two stale out-of-tree forks of `WinDebuggerBase.pas` / `DebugInfoSet.pas`
   (6 weeks old, 1501 / 628 lines diverged) that a future session could have read
   instead of the repo.
 
@@ -2101,7 +2110,7 @@ Two-layer fix:
    `RemoteCallInFlight`/`RequestAbortRemoteCall`; atomics `FInRemoteCall`/
    `FAbortRemoteCall`; wired in `TDapServer.Run`'s stdin loop.
 
-Files: `ExprEval.pas`, `Win64Debugger.pas`, `DebugTarget.pas`, `DapServer.pas`,
+Files: `ExprEval.pas`, `WinDebuggerBase.pas`, `DebugTarget.pas`, `DapServer.pas`,
 `DAP_DEBUGGER_ARCHITECTURE.md`. Suite green 425/0/0. Removed the temporary
 `ResolveIdent` branch-`Tag` logging used to diagnose this.
 
@@ -2123,7 +2132,7 @@ Fix: new optional `IBackgroundIndexProvider` (only `TMapFile` implements it ->
 `not FPubsReady`); `TDebugInfoSet.AnyBackgroundIndexingPending` aggregates it;
 the retry loop now exits the instant nothing is indexing -> a genuine miss at a
 warm stop returns in one `NameToRva` pass instead of ~5 s. Files:
-`DebugInfoTypes.pas`, `MapFileReader.pas`, `DebugInfoSet.pas`, `Win64Debugger.pas`.
+`DebugInfoTypes.pas`, `MapFileReader.pas`, `DebugInfoSet.pas`, `WinDebuggerBase.pas`.
 
 TRAP HIT + FIXED: first GUID for `IBackgroundIndexProvider` was `...0009`, a
 DUPLICATE of `IUnitScopedConstProvider`. `Supports` then matched the wrong
@@ -2162,7 +2171,7 @@ Fix: `IDebugTarget.AddressIsExecutable(VA)` (one `VirtualQueryEx`, true only on
 committed `PAGE_EXECUTE*`). `ApplyMethodCall` refuses the free-proc call when
 the resolved `FuncVA` is not executable → falls through to `EvaluateGlobalName`,
 which READS the global. Files: `DebugTarget.pas` (interface),
-`Win64Debugger.pas` (impl + decl), `ExprEval.pas` (guard ~line 1004).
+`WinDebuggerBase.pas` (impl + decl), `ExprEval.pas` (guard ~line 1004).
 Also added `TTD32FileReader.DiagFindSymbolRecords` (raw symbol-record scan).
 
 Built clean (`build_dap.bat`). Full suite green: 425 passed / 1 ignored / 0
@@ -2212,7 +2221,7 @@ verification grep pending.
   sample raise message is now `'Test error'`.
 - Updated the references to those names in `DevTools\TestNested.dpr` and in the
   living-spec docs (`RSM_FORMAT_NOTES.md`, `RSM_RECORD_TYPES.md`,
-  `PROJECT_STATE.md`) plus a comment in `Win64Debugger.pas`. The RSM byte-table
+  `PROJECT_STATE.md`) plus a comment in `WinDebuggerBase.pas`. The RSM byte-table
   in `RSM_FORMAT_NOTES.md` is now marked as a historical/illustrative example.
 - Rebuilt `Debugme.exe` / `.rsm` / `.map` and the adapter via `build_debug.bat`
   (clean; only known hints/warnings). DevTools rebuilt; `ScanRsmMethods` OK,
@@ -2240,7 +2249,7 @@ remaining hit. Then optionally run the full test suite.
 - `Debugme.dpr`, `DevTools\TestNested.dpr`
 - `install\Install.dpr`, `build_installer.bat`, `install\INSTALL_INSTRUCTIONS.md`
 - `README.md`, `RSM_FORMAT_NOTES.md`, `RSM_RECORD_TYPES.md`, `PROJECT_STATE.md`
-- `DebuggerCore\Win64Debugger.pas` (comment only)
+- `DebuggerCore\WinDebuggerBase.pas` (comment only)
 
 ## What works
 

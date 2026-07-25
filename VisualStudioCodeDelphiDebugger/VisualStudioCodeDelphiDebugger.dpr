@@ -13,7 +13,7 @@ uses
   TD32FileReader in '..\DebuggerCore\TD32FileReader.pas',
   DebugSourceIndex in '..\DebuggerCore\DebugSourceIndex.pas',
   RsmFileReader in '..\DebuggerCore\RsmFileReader.pas',
-  Win64Debugger in '..\DebuggerCore\Win64Debugger.pas',
+  WinDebuggerBase in '..\DebuggerCore\WinDebuggerBase.pas',
   DelphiRtti in '..\DebuggerCore\DelphiRtti.pas',
   ProcessEnum in '..\DebuggerCore\ProcessEnum.pas',
   ProcessListJson in '..\DebuggerCore\ProcessListJson.pas',

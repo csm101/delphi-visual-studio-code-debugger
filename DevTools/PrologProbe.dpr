@@ -298,7 +298,7 @@ begin
 end;
 
 // Verbatim port of TWinDebugger.ReadPrologInfo strategy 2
-// (Win64Debugger.pas, byte-pattern matcher). Kept byte-for-byte identical in
+// (WinDebuggerBase.pas, byte-pattern matcher). Kept byte-for-byte identical in
 // logic so the dcc64 columns of this probe validate the shipping code.
 function DecodeX64ShippingMatcher(const Bytes: array of Byte; R: Integer;
   out ExtraPushBytes: UInt32; out Recognised: Boolean): UInt32;

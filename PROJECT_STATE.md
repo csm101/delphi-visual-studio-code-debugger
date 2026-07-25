@@ -32,7 +32,7 @@ VS Code  ── DAP (JSON over stdio) ──>  VisualStudioCodeDelphiDebugger.ex
   `TBpSpec`, `TCommand`, callback signatures). DapServer + ExprEval
   talk only to `IDebugTarget`; concrete back-ends register themselves
   by implementing it.
-- `DebuggerCore\Win64Debugger.pas`: Windows debug loop, INT3 plant/remove,
+- `DebuggerCore\WinDebuggerBase.pas`: Windows debug loop, INT3 plant/remove,
   single-step, thread context hijack for synthetic remote calls,
   StackWalk64-based unwinding. `TWinDebugger = class(TInterfacedObject,
   IDebugTarget)` — lifetime managed by the interface refcount. Architecture
@@ -208,7 +208,7 @@ Stepping / control:
   itself is selected earlier, in `TDebugSession.BuildAndWireDebugger`, because
   `IsWow64Process2` cannot answer until the process exists. **Stale:** the
   advisory `[FATAL]` text it prints
-  (`WarnIfUnsupportedTargetArchitecture` in `Win64Debugger.pas`) still says a
+  (`WarnIfUnsupportedTargetArchitecture` in `WinDebuggerBase.pas`) still says a
   32-bit target is unsupported and its stacks will not resolve, which is no
   longer true. Nothing depends on the message; it should be rewritten or
   dropped.
