@@ -44,6 +44,11 @@ type
     // regression, a stack-walk regression and a symbol-resolution regression
     // without asserting any hardcoded name.
     [Test] procedure Win32_StackFrameNames_MatchWin64;
+    // Stack locals. Covers the x86 prologue decoder (`add esp,-N` rather than
+    // `sub esp,N`, `mov ebp,esp` before the allocation) and the zero offset
+    // bases that follow from it. Compared against x64 rather than asserted
+    // literally, for the same reason as the frame names.
+    [Test] procedure Win32_Locals_MatchWin64;
   end;
 
   [TestFixture]
@@ -2280,6 +2285,38 @@ begin
   for var I := 0 to High(Names64) do
     Assert.AreEqual(Names64[I], Names32[I],
       Format('frame %d name differs between bitnesses', [I]));
+end;
+
+procedure TWin32RunControlTests.Win32_Locals_MatchWin64;
+
+  function LocalsAt(const Exe, Map, Rsm: string; Line: Integer): TArray<string>;
+  begin
+    var Session := OpenSessionAtMarker(Exe, Map, Rsm, TargetDir, W32_SOURCE, Line);
+    try
+      Assert.AreEqual(Ord(dsStopped), Ord(Session.State),
+        'did not stop in ' + ExtractFileName(Exe));
+      Result := [];
+      for var L in Session.GetLocals do
+        Result := Result + [L.Name + '=' + L.Value + ' [' + L.TypeName + ']'];
+    finally
+      Session.Free;
+    end;
+  end;
+
+begin
+  var Line := MarkerLine(W32_SOURCE, W32_MARKER);
+  Assert.IsTrue(Line > 0, 'marker not found: ' + W32_MARKER);
+
+  var Locals64 := LocalsAt(Win64Exe, Win64Map, Win64Rsm, Line);
+  var Locals32 := LocalsAt(Win32Exe, Win32Map, Win32Rsm, Line);
+
+  Assert.IsTrue(Length(Locals64) > 0, 'the 64-bit control reported no locals');
+  Assert.AreEqual(Length(Locals64), Length(Locals32),
+    Format('local counts differ: x64 %d vs x86 %d',
+      [Length(Locals64), Length(Locals32)]));
+  for var I := 0 to High(Locals64) do
+    Assert.AreEqual(Locals64[I], Locals32[I],
+      Format('local %d differs between bitnesses', [I]));
 end;
 
 initialization

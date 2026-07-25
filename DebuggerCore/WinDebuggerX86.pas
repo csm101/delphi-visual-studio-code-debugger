@@ -44,10 +44,13 @@ type
     function  FillStackWalkContext(TH: THandle; var Buf: TContext;
                 out SeedPc, SeedSp, SeedFp: UInt64): Boolean; override;
 
-    // Not yet implemented for x86; each refuses rather than inheriting the x64
-    // answer, which would be confidently wrong.
     function  ReadPrologInfo(EntryVA: UInt64; out ExtraPushBytes: UInt32;
                 out Recognised: Boolean): UInt32; override;
+    function  LocalsOffsetBase(SubRspN, ExtraPushBytes: UInt32): Integer; override;
+    function  ParamsOffsetBase(SubRspN, ExtraPushBytes: UInt32): Integer; override;
+
+    // Not yet implemented for x86; each refuses rather than inheriting the x64
+    // answer, which would be confidently wrong.
     function  PrepareSyntheticCall(TH: THandle; FuncVA: UInt64;
                 const ArgValues: array of UInt64;
                 const ArgIsFloat: array of Boolean;
@@ -172,23 +175,138 @@ begin
   SeedFp := Ctx^.Ebp;
 end;
 
-{ ------------------------------------------------------- not yet implemented -- }
+{ --------------------------------------------------------- prologue decode -- }
 
-// x86 has no .pdata, so the byte-pattern matcher is the only strategy available
-// and it must be written against the shapes dcc32 actually emits -- which are
-// NOT the x64 ones: Delphi emits `add esp,-N` rather than `sub esp,N`, and the
-// matcher must require `55` followed immediately by `8B EC`, because an
-// optimised build pushes EBP as an ordinary callee-saved register.
-// Until that decoder exists, refuse: an unrecognised prologue must never be
-// reported as a zero-byte frame, or every address derived from it is silently
-// wrong.
+// x86 has no .pdata, so byte-pattern matching is the ONLY strategy and it has
+// to be right. The shapes below were measured against dcc32 output rather than
+// inferred from the x64 decoder (DevTools\PrologProbe.dpr, 17 deliberately
+// shaped routines), and they differ from x64 in ways that matter:
+//
+//   * Delphi allocates with `add esp,-N` (83 C4 / 81 C4, NEGATIVE immediate),
+//     not `sub esp,N`. A decoder matching only `sub` reports frame size 0 on
+//     nearly every routine.
+//   * `mov ebp,esp` runs BEFORE the allocation, the opposite of x64. Requiring
+//     it immediately after `push ebp` is also what rejects an optimised frame
+//     where EBP is pushed as an ordinary callee-saved register.
+//   * Pushes and allocations appear in either order and may repeat, so the
+//     decode accumulates rather than expecting a fixed sequence.
+//   * A frame larger than a page uses a 16-byte probe loop whose page count is
+//     an immediate, plus 4 bytes for the eax it saves.
 function TWin32Debugger.ReadPrologInfo(EntryVA: UInt64;
   out ExtraPushBytes: UInt32; out Recognised: Boolean): UInt32;
+var
+  Bytes: array[0..31] of Byte;
+
+  function CanRead(Off, Need, Avail: Integer): Boolean;
+  begin
+    Result := Off + Need <= Avail;
+  end;
+
+  // 50                 push eax
+  // B8 nn nn nn nn     mov eax,<page count>
+  // 81 C4 04 F0 FF FF  add esp,-0FFCh
+  // 50 / 48 / 75 F6    push eax; dec eax; jnz
+  function IsStackProbeLoop(At, Avail: Integer; out PageCount: UInt32): Boolean;
+  begin
+    Result := False;
+    PageCount := 0;
+    if not CanRead(At, 16, Avail) then Exit;
+    if (Bytes[At] <> $50) or (Bytes[At + 1] <> $B8) then Exit;
+    if (Bytes[At + 6] <> $81) or (Bytes[At + 7] <> $C4) or
+       (Bytes[At + 8] <> $04) or (Bytes[At + 9] <> $F0) or
+       (Bytes[At + 10] <> $FF) or (Bytes[At + 11] <> $FF) then Exit;
+    if (Bytes[At + 12] <> $50) or (Bytes[At + 13] <> $48) or
+       (Bytes[At + 14] <> $75) then Exit;
+    PageCount := PCardinal(@Bytes[At + 2])^;
+    Result := True;
+  end;
+
 begin
   Result := 0;
   ExtraPushBytes := 0;
   Recognised := False;
+  FillChar(Bytes, SizeOf(Bytes), 0);
+  if not ReadProcessMemoryAt(EntryVA, @Bytes, SizeOf(Bytes)) then
+    Exit;
+  var Avail := SizeOf(Bytes);
+  if Bytes[0] <> $55 then           // push ebp
+    Exit;
+  var Off := 1;
+  // mov ebp,esp -- 8B EC, or the alternate 89 E5 encoding.
+  if CanRead(Off, 2, Avail) and (Bytes[Off] = $8B) and (Bytes[Off + 1] = $EC) then
+    Inc(Off, 2)
+  else if CanRead(Off, 2, Avail) and (Bytes[Off] = $89) and (Bytes[Off + 1] = $E5) then
+    Inc(Off, 2)
+  else
+    Exit;                           // EBP pushed but not established: not a frame
+
+  Recognised := True;
+
+  var Done := False;
+  while (not Done) and CanRead(Off, 1, Avail) do begin
+    var PageCount: UInt32;
+    if IsStackProbeLoop(Off, Avail, PageCount) then begin
+      Inc(ExtraPushBytes, 4);       // the eax the loop saves
+      Inc(Result, PageCount * 4096);
+      Inc(Off, 16);
+      // The saved eax is reloaded immediately: 8B 45 disp8 (mov eax,[ebp+d]).
+      if CanRead(Off, 3, Avail) and (Bytes[Off] = $8B) and (Bytes[Off + 1] = $45) then
+        Inc(Off, 3);
+      Continue;
+    end;
+    case Bytes[Off] of
+      // push r32. A `push ecx` used to reserve one slot and a `push ebx` saving
+      // a register are the same instruction; both just move esp down 4.
+      $50..$57:
+        begin
+          Inc(ExtraPushBytes, 4);
+          Inc(Off);
+        end;
+      $83:
+        begin
+          if not CanRead(Off, 3, Avail) then Break;
+          if Bytes[Off + 1] = $EC then begin
+            Inc(Result, Bytes[Off + 2]);            // sub esp,imm8
+            Inc(Off, 3);
+          end else if Bytes[Off + 1] = $C4 then begin
+            Inc(Result, UInt32(-ShortInt(Bytes[Off + 2])));  // add esp,-imm8
+            Inc(Off, 3);
+          end else
+            Done := True;
+        end;
+      $81:
+        begin
+          if not CanRead(Off, 6, Avail) then Break;
+          if Bytes[Off + 1] = $EC then begin
+            Inc(Result, PUInt32(@Bytes[Off + 2])^);          // sub esp,imm32
+            Inc(Off, 6);
+          end else if Bytes[Off + 1] = $C4 then begin
+            Inc(Result, UInt32(-PInteger(@Bytes[Off + 2])^)); // add esp,-imm32
+            Inc(Off, 6);
+          end else
+            Done := True;
+        end;
+    else
+      Done := True;
+    end;
+  end;
 end;
+
+// On x86 `mov ebp,esp` precedes the allocation, so a debug-info offset is
+// already relative to the frame pointer: locals are at negative offsets and
+// parameters at positive ones, with nothing to add back. The x64 bases exist
+// only because its frame pointer is established AFTER the allocation.
+function TWin32Debugger.LocalsOffsetBase(SubRspN, ExtraPushBytes: UInt32): Integer;
+begin
+  Result := 0;
+end;
+
+function TWin32Debugger.ParamsOffsetBase(SubRspN, ExtraPushBytes: UInt32): Integer;
+begin
+  Result := 0;
+end;
+
+{ ------------------------------------------------------- not yet implemented -- }
 
 // Measured in Phase 0: on x86 the first three parameters travel in EAX/EDX/ECX
 // with no stack home at all and are spilled to NEGATIVE EBP offsets, while

@@ -105,6 +105,12 @@ begin
          ExtractFileName(F.SourceFile), F.SourceLine,
          F.ModuleName, IntToHex(F.IP, 16)]));
     Writeln(Format('frame count: %d', [Length(Frames)]));
+
+    Writeln('locals:');
+    var Locals := Session.GetLocals;
+    for var L in Locals do
+      Writeln(Format('  %-24s = %-40s [%s]', [L.Name, L.Value, L.TypeName]));
+    Writeln(Format('local count: %d', [Length(Locals)]));
   finally
     Session.Free;
   end;

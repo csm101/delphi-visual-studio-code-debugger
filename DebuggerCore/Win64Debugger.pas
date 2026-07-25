@@ -190,6 +190,14 @@ type
     // start of the same storage.
     function  FillStackWalkContext(TH: THandle; var Buf: TContext;
                 out SeedPc, SeedSp, SeedFp: UInt64): Boolean; virtual;
+    // Bases that turn a debug-info frame-relative offset into a real one.
+    // ARCH: x64 Delphi encodes a local relative to the TOP of the locals area,
+    // so the (rounded) frame size has to be added back, and a parameter sits
+    // above the saved frame pointer past the extra pushes. On x86 `mov ebp,esp`
+    // runs BEFORE the allocation, so debug-info offsets are already relative to
+    // the frame pointer and both bases are zero.
+    function  LocalsOffsetBase(SubRspN, ExtraPushBytes: UInt32): Integer; virtual;
+    function  ParamsOffsetBase(SubRspN, ExtraPushBytes: UInt32): Integer; virtual;
   private
     procedure SetTrapFlag(TID: DWORD; Enable: Boolean);
     procedure SetRIP(TID: DWORD; NewRIP: UInt64);
@@ -489,7 +497,7 @@ const
   SYMOPT_FAIL_CRITICAL_ERRORS = DWORD($00000200);
 
 // Defined further down (locals section); used earlier by EvaluateGlobalName.
-function LocalReadSize(const TypeName: string): Integer; forward;
+function LocalReadSize(const TypeName: string; PointerSize: Integer): Integer; forward;
 
 { TWinDebugger }
 
@@ -951,6 +959,20 @@ end;
 function TWinDebugger.StackWalkMachineType: DWORD;
 begin
   Result := IMAGE_FILE_MACHINE_AMD64;
+end;
+
+// The "round N down to a multiple of 16" rule reflects the 8-byte alignment
+// padding Delphi inserts at the top of the locals area when (1 + ExtraPushCount)
+// is even. Empirically validated on procs with EP = 0 / 8 / 16; the earlier
+// "N - ExtraPushBytes" formula worked only by coincidence when EP = 8.
+function TWinDebugger.LocalsOffsetBase(SubRspN, ExtraPushBytes: UInt32): Integer;
+begin
+  Result := Integer(SubRspN) - Integer(SubRspN mod 16);
+end;
+
+function TWinDebugger.ParamsOffsetBase(SubRspN, ExtraPushBytes: UInt32): Integer;
+begin
+  Result := Integer(SubRspN) + Integer(ExtraPushBytes);
 end;
 
 function TWinDebugger.FillStackWalkContext(TH: THandle; var Buf: TContext;
@@ -2995,7 +3017,7 @@ begin
   // Width-aware read (same rule as locals): narrow primitives leave the
   // upper RawValue bytes zeroed instead of folding in the neighbouring
   // global's bytes.
-  var ReadSize := LocalReadSize(Value.TypeHint);
+  var ReadSize := LocalReadSize(Value.TypeHint, TargetLayout.PointerSize);
   if ReadProcessMemory(FProcess, Pointer(Value.Address), @Value.RawValue,
        ReadSize, R) and (R = SIZE_T(ReadSize)) then
     Value.ValueValid := True;
@@ -4074,7 +4096,7 @@ end;
 // the high half into Int64-cast displays. Falls back to 8 for any
 // pointer-sized / unknown type so existing class/string/Int64 paths work
 // unchanged.
-function LocalReadSize(const TypeName: string): Integer;
+function LocalReadSize(const TypeName: string; PointerSize: Integer): Integer;
 begin
   if (TypeName = 'Byte') or (TypeName = 'ShortInt') or
      (TypeName = 'AnsiChar') or (TypeName = 'UTF8Char') or
@@ -4091,12 +4113,19 @@ begin
      (TypeName = 'Single') or (TypeName = 'HRESULT') or
      (TypeName = 'LongBool') then
     Exit(4);
-  // tkInt64, tkFloat (Double / Extended / TDateTime / Currency), all
-  // pointer-sized types (class / interface / string / dyn-array / record
-  // address / Variant address / Variant data / etc.) all use the full
-  // 8-byte slot. Returning 8 as the default keeps existing call paths
-  // unchanged for everything we used to read this way.
-  Result := 8;
+  // tkInt64 and tkFloat (Double / Extended / TDateTime / Currency) are genuinely
+  // 8 bytes on both architectures.
+  if (TypeName = 'Int64') or (TypeName = 'UInt64') or (TypeName = 'QWord') or
+     (TypeName = 'Double') or (TypeName = 'Currency') or (TypeName = 'Comp') or
+     (TypeName = 'TDateTime') or (TypeName = 'TDate') or (TypeName = 'TTime') or
+     (TypeName = 'Extended') or (TypeName = 'Real') then
+    Exit(8);
+  // Everything else that reaches here -- class, interface, string, dynamic
+  // array, record address, Variant address, pointer, and any type we could not
+  // identify -- occupies one POINTER-SIZED slot in the target, which is 4 bytes
+  // on a 32-bit target. Reading 8 there splices the neighbouring slot into the
+  // high half and produces a plausible wrong value rather than an error.
+  Result := PointerSize;
 end;
 
 // Builds TLocalValue records for one procedure's locals given:
@@ -4148,8 +4177,8 @@ begin
   // to sit at the guessed offsets -- report none instead.
   if not PrologRecognised then
     Exit(nil);
-  var LocalsBase := Integer(SubRspN) - Integer(SubRspN mod 16);
-  var ParamsBase := Integer(SubRspN) + Integer(ExtraPushBytes);
+  var LocalsBase := LocalsOffsetBase(SubRspN, ExtraPushBytes);
+  var ParamsBase := ParamsOffsetBase(SubRspN, ExtraPushBytes);
   for var Sym in Locals do begin
     // Lexical-block scoping: a block-local (BlockEndRva<>0) is live only when
     // the frame PC is inside its [start,end) range. This hides not-yet-declared
@@ -4282,7 +4311,7 @@ begin
     // upper bytes of V.RawValue at zero so the formatter doesn't fold
     // stack garbage into Int64-cast displays of declared 4-byte values.
     V.RawValue := 0;
-    var ReadSize: Integer := LocalReadSize(Sym.TypeHint);
+    var ReadSize: Integer := LocalReadSize(Sym.TypeHint, TargetLayout.PointerSize);
     if ReadProcessMemoryAt(V.Address, @V.RawValue, ReadSize) then begin
       V.ValueValid := True;
       if (V.Kind = lkVarParam) and (V.RawValue <> 0) and
