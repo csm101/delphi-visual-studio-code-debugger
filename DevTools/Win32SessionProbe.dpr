@@ -111,6 +111,23 @@ begin
     for var L in Locals do
       Writeln(Format('  %-24s = %-40s [%s]', [L.Name, L.Value, L.TypeName]));
     Writeln(Format('local count: %d', [Length(Locals)]));
+
+    // Expand the first expandable local, which exercises the VMT field table
+    // rather than just the VMT header.
+    for var L in Locals do
+      if L.Expandable and (L.Handle <> 0) then begin
+        Writeln(Format('expanding %s [%s]:', [L.Name, L.TypeName]));
+        for var C in Session.GetChildren(L.Handle) do begin
+          Writeln(Format('    %-22s = %-34s [%s]', [C.Name, C.Value, C.TypeName]));
+          // The variables view groups an object's members, so the interesting
+          // level -- the one that actually walks the VMT field table -- is one
+          // deeper than the object itself.
+          if C.Expandable and (C.Handle <> 0) then
+            for var G in Session.GetChildren(C.Handle) do
+              Writeln(Format('        %-18s = %-34s [%s]', [G.Name, G.Value, G.TypeName]));
+        end;
+        Break;
+      end;
   finally
     Session.Free;
   end;

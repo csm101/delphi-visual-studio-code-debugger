@@ -243,8 +243,13 @@ begin
   Result.TypeHint   := TypeName;
   Result.Address    := Addr;
   Result.Kind       := lkLocal;
+  // Read the slot at its real width. Reading a fixed 8 here is what made a
+  // 32-bit target render a string field as `@0x2A03172D4C (string read
+  // failed)`: the 4-byte handle came back with the neighbouring field spliced
+  // into its high half, giving an address far outside the target's range.
   Result.ValueValid := (Debugger <> nil) and
-                       Debugger.ReadProcessMemoryAt(Addr, @Result.RawValue, 8);
+    Debugger.ReadProcessMemoryAt(Addr, @Result.RawValue,
+      LocalReadSize(TypeName, Debugger.TargetLayout.PointerSize));
 end;
 
 function TVariableExpander.FormatExprValue(const E: TExprValue): string;
@@ -403,7 +408,7 @@ begin
   case TypeKind of
     TK_CLASS: begin
       var ObjPtr: UInt64 := 0;
-      Debugger.ReadProcessMemoryAt(FieldAddr, @ObjPtr, 8);
+      Debugger.ReadProcessMemoryAt(FieldAddr, @ObjPtr, Debugger.TargetLayout.PointerSize);
       if ObjPtr = 0 then
         Result := 'nil'
       else
@@ -413,7 +418,7 @@ begin
       Result := '{' + TypeName + '}';
     TK_DYNARRAY: begin
       var ArrPtr: UInt64 := 0;
-      Debugger.ReadProcessMemoryAt(FieldAddr, @ArrPtr, 8);
+      Debugger.ReadProcessMemoryAt(FieldAddr, @ArrPtr, Debugger.TargetLayout.PointerSize);
       if ArrPtr = 0 then
         Result := '(empty)'
       else begin
@@ -446,7 +451,7 @@ begin
     Result.EvaluateName := Exp.EvaluateName + '.' + M.Name;
 
   var PtrVal: UInt64 := 0;
-  Debugger.ReadProcessMemoryAt(FieldAddr, @PtrVal, 8);
+  Debugger.ReadProcessMemoryAt(FieldAddr, @PtrVal, Debugger.TargetLayout.PointerSize);
   var ChildExp: TSessionExpansion;
   if TryClassifyChild(M.TypeName, Result.EvaluateName, FieldAddr, PtrVal, ChildExp) then begin
     Result.Expandable := True;
@@ -486,7 +491,7 @@ begin
   case RF.TypeKind of
     TK_CLASS: begin
       var ObjPtr: UInt64 := 0;
-      if (Debugger = nil) or not Debugger.ReadProcessMemoryAt(RF.FieldAddr, @ObjPtr, 8) then
+      if (Debugger = nil) or not Debugger.ReadProcessMemoryAt(RF.FieldAddr, @ObjPtr, Debugger.TargetLayout.PointerSize) then
         Exit;
       if ObjPtr = 0 then
         Exit;
@@ -757,7 +762,7 @@ begin
         Child.Value    := FormatMemberValue(P.TypeName, TypeKind, FieldAddr);
         Child.TypeName := P.TypeName;
         var PtrVal: UInt64 := 0;
-        Debugger.ReadProcessMemoryAt(FieldAddr, @PtrVal, 8);
+        Debugger.ReadProcessMemoryAt(FieldAddr, @PtrVal, Debugger.TargetLayout.PointerSize);
         var ChildExp: TSessionExpansion;
         if TryClassifyChild(P.TypeName, PropExpr, FieldAddr, PtrVal, ChildExp) then begin
           Child.Expandable := True;
@@ -923,7 +928,7 @@ begin
 
       if ElemKind = TK_CLASS then begin
         var ObjPtr: UInt64 := 0;
-        Debugger.ReadProcessMemoryAt(ElemAddr, @ObjPtr, 8);
+        Debugger.ReadProcessMemoryAt(ElemAddr, @ObjPtr, Debugger.TargetLayout.PointerSize);
         if ObjPtr = 0 then
           Child.Value := 'nil'
         else begin

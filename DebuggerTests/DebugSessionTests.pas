@@ -32,6 +32,7 @@ type
     function Win64Map: string;
     function Win64Rsm: string;
     function MarkerLine(const SourceBaseName, Marker: string): Integer;
+    function MarkerLineInFile(const SourcePath, Marker: string): Integer;
   public
     // A breakpoint on a 32-bit target must bind and fire, and report the line
     // the user asked for.
@@ -49,6 +50,12 @@ type
     // bases that follow from it. Compared against x64 rather than asserted
     // literally, for the same reason as the frame names.
     [Test] procedure Win32_Locals_MatchWin64;
+    // Object expansion: the VMT header (is this a class instance, what class),
+    // the field table, and the width of every pointer-shaped field read. A
+    // 32-bit target reading those 8 bytes wide splices the neighbouring field
+    // into the high half and yields an address outside its own range, so a
+    // string field renders as a read failure rather than an error.
+    [Test] procedure Win32_ObjectFields_MatchWin64;
   end;
 
   [TestFixture]
@@ -2181,13 +2188,19 @@ end;
 
 function TWin32RunControlTests.MarkerLine(const SourceBaseName,
   Marker: string): Integer;
+begin
+  Result := MarkerLineInFile(TargetDir + SourceBaseName, Marker);
+end;
+
+function TWin32RunControlTests.MarkerLineInFile(const SourcePath,
+  Marker: string): Integer;
 var
   Lines: TStringList;
 begin
   Result := 0;
   Lines := TStringList.Create;
   try
-    Lines.LoadFromFile(TargetDir + SourceBaseName);
+    Lines.LoadFromFile(SourcePath);
     var Tag := '{BP:' + Marker + '}';
     for var I := 0 to Lines.Count - 1 do
       if Lines[I].Contains(Tag) then
@@ -2317,6 +2330,88 @@ begin
   for var I := 0 to High(Locals64) do
     Assert.AreEqual(Locals64[I], Locals32[I],
       Format('local %d differs between bitnesses', [I]));
+end;
+
+// Addresses legitimately differ between two processes, so blank any hex run
+// before comparing. What must match is the SHAPE of the value.
+function WithoutAddresses(const S: string): string;
+begin
+  Result := '';
+  var I := 1;
+  while I <= Length(S) do begin
+    var IsHexIntro := ((S[I] = '$') and (I < Length(S))) or
+                      ((S[I] = '0') and (I < Length(S)) and (S[I + 1] = 'x'));
+    if not IsHexIntro then begin
+      Result := Result + S[I];
+      Inc(I);
+      Continue;
+    end;
+    Result := Result + '<addr>';
+    if S[I] = '0' then Inc(I, 2) else Inc(I);
+    while (I <= Length(S)) and CharInSet(S[I], ['0'..'9', 'A'..'F', 'a'..'f']) do
+      Inc(I);
+  end;
+end;
+
+procedure TWin32RunControlTests.Win32_ObjectFields_MatchWin64;
+const
+  OBJ_SOURCE = 'TestTargetCore.pas';
+  OBJ_MARKER = 'COMPUTE_BODY';
+
+  function FieldsAt(const Exe, Map, Rsm: string; Line: Integer): TArray<string>;
+  begin
+    var Session := OpenSessionAtMarker(Exe, Map, Rsm, TargetDir, OBJ_SOURCE, Line);
+    try
+      Assert.AreEqual(Ord(dsStopped), Ord(Session.State),
+        'did not stop in ' + ExtractFileName(Exe));
+      Result := [];
+      for var L in Session.GetLocals do begin
+        if not (L.Expandable and (L.Handle <> 0)) then Continue;
+        // The members are grouped, so the field rows are one level below.
+        for var G in Session.GetChildren(L.Handle) do
+          if G.Expandable and (G.Handle <> 0) then
+            for var F in Session.GetChildren(G.Handle) do
+              Result := Result + [F.Name + '=' + WithoutAddresses(F.Value) +
+                                  ' [' + F.TypeName + ']'];
+        Break;
+      end;
+    finally
+      Session.Free;
+    end;
+  end;
+
+begin
+  var Line := MarkerLineInFile(TargetDir + OBJ_SOURCE, OBJ_MARKER);
+  Assert.IsTrue(Line > 0, 'marker not found: ' + OBJ_MARKER);
+
+  var Fields64 := FieldsAt(Win64Exe, Win64Map, Win64Rsm, Line);
+  var Fields32 := FieldsAt(Win32Exe, Win32Map, Win32Rsm, Line);
+
+  Assert.IsTrue(Length(Fields64) > 0, 'the 64-bit control expanded no fields');
+  Assert.AreEqual(Length(Fields64), Length(Fields32),
+    Format('field counts differ: x64 %d vs x86 %d',
+      [Length(Fields64), Length(Fields32)]));
+
+  // TWidget declares `property AsPtr: NativeUInt`, and NativeUInt IS a
+  // different concrete type per bitness -- UInt64 on Win64, Cardinal on Win32.
+  // Reporting the same type on both would be the bug, so this is asserted
+  // rather than ignored, and excluded from the blanket comparison below.
+  var SawNative := False;
+  for var I := 0 to High(Fields64) do begin
+    if Fields64[I].StartsWith('AsPtr=') then begin
+      SawNative := True;
+      Assert.IsTrue(Fields64[I].EndsWith('[UInt64]'),
+        'x64 should report NativeUInt as UInt64, got ' + Fields64[I]);
+      Assert.IsTrue(Fields32[I].EndsWith('[Cardinal]'),
+        'x86 should report NativeUInt as Cardinal, got ' + Fields32[I]);
+      Continue;
+    end;
+    Assert.AreEqual(Fields64[I], Fields32[I],
+      Format('object field %d differs between bitnesses', [I]));
+  end;
+  Assert.IsTrue(SawNative,
+    'expected a NativeUInt member in the expansion -- if TWidget changed, ' +
+    'the bitness-dependent-type check above is no longer being exercised');
 end;
 
 initialization

@@ -6,7 +6,7 @@ uses
   System.SysUtils, System.Classes, System.Generics.Collections,
   Winapi.Windows,
   DapProtocol, DebugInfoTypes, DebugInfoSet, DebugTarget, ExceptionRules,
-  TargetLayout;
+  TargetLayout, DelphiValueReaders;
 
 type
   TWinDebugger = class(TInterfacedObject, IDebugTarget)
@@ -497,7 +497,6 @@ const
   SYMOPT_FAIL_CRITICAL_ERRORS = DWORD($00000200);
 
 // Defined further down (locals section); used earlier by EvaluateGlobalName.
-function LocalReadSize(const TypeName: string; PointerSize: Integer): Integer; forward;
 
 { TWinDebugger }
 
@@ -4096,37 +4095,6 @@ end;
 // the high half into Int64-cast displays. Falls back to 8 for any
 // pointer-sized / unknown type so existing class/string/Int64 paths work
 // unchanged.
-function LocalReadSize(const TypeName: string; PointerSize: Integer): Integer;
-begin
-  if (TypeName = 'Byte') or (TypeName = 'ShortInt') or
-     (TypeName = 'AnsiChar') or (TypeName = 'UTF8Char') or
-     (TypeName = 'Boolean') or (TypeName = 'ByteBool') then
-    Exit(1);
-  if (TypeName = 'Word') or (TypeName = 'SmallInt') or
-     (TypeName = 'WideChar') or (TypeName = 'Char') or
-     (TypeName = 'UCS2Char') or (TypeName = 'WordBool') then
-    Exit(2);
-  if (TypeName = 'Integer') or (TypeName = 'Cardinal') or
-     (TypeName = 'LongInt') or (TypeName = 'LongWord') or
-     (TypeName = 'FixedInt') or (TypeName = 'FixedUInt') or
-     (TypeName = 'Int32') or (TypeName = 'UInt32') or
-     (TypeName = 'Single') or (TypeName = 'HRESULT') or
-     (TypeName = 'LongBool') then
-    Exit(4);
-  // tkInt64 and tkFloat (Double / Extended / TDateTime / Currency) are genuinely
-  // 8 bytes on both architectures.
-  if (TypeName = 'Int64') or (TypeName = 'UInt64') or (TypeName = 'QWord') or
-     (TypeName = 'Double') or (TypeName = 'Currency') or (TypeName = 'Comp') or
-     (TypeName = 'TDateTime') or (TypeName = 'TDate') or (TypeName = 'TTime') or
-     (TypeName = 'Extended') or (TypeName = 'Real') then
-    Exit(8);
-  // Everything else that reaches here -- class, interface, string, dynamic
-  // array, record address, Variant address, pointer, and any type we could not
-  // identify -- occupies one POINTER-SIZED slot in the target, which is 4 bytes
-  // on a 32-bit target. Reading 8 there splices the neighbouring slot into the
-  // high half and produces a plausible wrong value rather than an error.
-  Result := PointerSize;
-end;
 
 // Builds TLocalValue records for one procedure's locals given:
 //   FrameRBP    - the value of RBP for that procedure's frame

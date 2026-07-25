@@ -16,6 +16,13 @@ uses
   Winapi.Windows,
   DebugTarget, DelphiRtti, DebugInfoTypes, DebugInfoSet;
 
+// Number of meaningful bytes to read from a value's slot in the TARGET.
+// Narrow primitives leave the upper bytes of a UInt64 destination untouched,
+// so without this a 4-byte Integer folds stack garbage into an Int64 display;
+// and everything pointer-shaped is 4 bytes wide on a 32-bit target, where
+// reading 8 splices the neighbouring slot into the high half.
+function LocalReadSize(const TypeName: string; PointerSize: Integer): Integer;
+
 // True when a type's Delphi TTypeKind makes it a candidate for the
 // structured-value formatting path (class / record / interface).
 function IsExpandableTKind(K: Byte): Boolean;
@@ -114,6 +121,38 @@ implementation
 
 uses
   System.DateUtils, DapProtocol;
+
+function LocalReadSize(const TypeName: string; PointerSize: Integer): Integer;
+begin
+  if (TypeName = 'Byte') or (TypeName = 'ShortInt') or
+     (TypeName = 'AnsiChar') or (TypeName = 'UTF8Char') or
+     (TypeName = 'Boolean') or (TypeName = 'ByteBool') then
+    Exit(1);
+  if (TypeName = 'Word') or (TypeName = 'SmallInt') or
+     (TypeName = 'WideChar') or (TypeName = 'Char') or
+     (TypeName = 'UCS2Char') or (TypeName = 'WordBool') then
+    Exit(2);
+  if (TypeName = 'Integer') or (TypeName = 'Cardinal') or
+     (TypeName = 'LongInt') or (TypeName = 'LongWord') or
+     (TypeName = 'FixedInt') or (TypeName = 'FixedUInt') or
+     (TypeName = 'Int32') or (TypeName = 'UInt32') or
+     (TypeName = 'Single') or (TypeName = 'HRESULT') or
+     (TypeName = 'LongBool') then
+    Exit(4);
+  // tkInt64 and tkFloat (Double / Extended / TDateTime / Currency) are genuinely
+  // 8 bytes on both architectures.
+  if (TypeName = 'Int64') or (TypeName = 'UInt64') or (TypeName = 'QWord') or
+     (TypeName = 'Double') or (TypeName = 'Currency') or (TypeName = 'Comp') or
+     (TypeName = 'TDateTime') or (TypeName = 'TDate') or (TypeName = 'TTime') or
+     (TypeName = 'Extended') or (TypeName = 'Real') then
+    Exit(8);
+  // Everything else that reaches here -- class, interface, string, dynamic
+  // array, record address, Variant address, pointer, and any type we could not
+  // identify -- occupies one POINTER-SIZED slot in the target, which is 4 bytes
+  // on a 32-bit target. Reading 8 there splices the neighbouring slot into the
+  // high half and produces a plausible wrong value rather than an error.
+  Result := PointerSize;
+end;
 
 function FormatFloatNicely(V: Extended): string;
 var
