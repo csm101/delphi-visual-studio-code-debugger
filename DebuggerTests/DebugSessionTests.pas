@@ -94,6 +94,14 @@ type
     // because it takes a different table, so these two shapes need their own
     // cross-bitness check.
     [Test] procedure Win32_RecordAndDynArrayExpansion_MatchWin64;
+    // The write direction of the same problem. Setting a variable encodes the
+    // new value into the TARGET's representation, and the generic encoder emits
+    // 8 bytes of IEEE double for anything it calls a float -- which for a
+    // 10-byte Win32 Extended leaves the sign and exponent bytes holding the
+    // variable's PREVIOUS contents, and for a 6-byte Real48 is not even the
+    // same format. The readback here goes through target memory, so it is a
+    // genuine round trip rather than an echo of what was requested.
+    [Test] procedure Win32_SetWideFloatLocals_RoundTrip;
     // Stepping. Inherited from the architecture-neutral base, but it rides on
     // SetThreadTrapFlag and the WOW64 single-step status code, both of which
     // are 32-bit specific -- and STATUS_WX86_SINGLE_STEP was measured rather
@@ -2697,6 +2705,50 @@ begin
   var Joined := string.Join('|', Rows64);
   Assert.IsTrue(Joined.Contains('managed'),
     'expected the record''s string field to read "managed", got: ' + Joined);
+end;
+
+procedure TWin32RunControlTests.Win32_SetWideFloatLocals_RoundTrip;
+const
+  SRC    = 'TestTargetCore.pas';
+  MARKER = 'NESTED_INC';
+  NAMES:     array[0..1] of string = ('Ext1', 'R48');
+  NEW_VALUE: array[0..1] of string = ('9.5',  '6.25');
+
+  // Failures are COLLECTED, not asserted per case. Both architectures and both
+  // types have to be reported: stopping at the first one hides whether the
+  // other three also broke, and the two executables share a file name so a
+  // message built from it cannot say which bitness failed.
+  procedure CollectFailures(const Bitness, Exe, Map, Rsm: string; Line: Integer;
+    var Failures: TArray<string>);
+  begin
+    var Session := OpenSessionAtMarker(Exe, Map, Rsm, TargetDir, SRC, Line);
+    try
+      if Ord(Session.State) <> Ord(dsStopped) then begin
+        Failures := Failures + [Bitness + ': did not stop'];
+        Exit;
+      end;
+      for var I := Low(NAMES) to High(NAMES) do begin
+        var NewValue, NewType: string;
+        if not Session.SetLocalVariable(NAMES[I], NEW_VALUE[I], NewValue, NewType) then
+          Failures := Failures + [Format('%s %s: set rejected (%s)',
+            [Bitness, NAMES[I], NewValue])]
+        else if not NewValue.StartsWith(NEW_VALUE[I]) then
+          Failures := Failures + [Format('%s %s: wrote %s, read back "%s"',
+            [Bitness, NAMES[I], NEW_VALUE[I], NewValue])];
+      end;
+    finally
+      Session.Free;
+    end;
+  end;
+
+begin
+  var Line := MarkerLineInFile(TargetDir + SRC, MARKER);
+  Assert.IsTrue(Line > 0, 'marker not found: ' + MARKER);
+
+  var Failures: TArray<string> := [];
+  CollectFailures('x64', Win64Exe, Win64Map, Win64Rsm, Line, Failures);
+  CollectFailures('x86', Win32Exe, Win32Map, Win32Rsm, Line, Failures);
+  Assert.IsTrue(Length(Failures) = 0, string.Join(' | ', Failures));
 end;
 
 procedure PumpUntilStop(Session: TDebugSession; TimeoutMs: Cardinal);

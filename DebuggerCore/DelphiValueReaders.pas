@@ -59,6 +59,13 @@ function Real48BytesToDoubleBits(const Bytes: array of Byte): UInt64;
 function ReadValueSlotRaw(const Read: TSlotReader; Addr: UInt64;
   const TypeName: string; PointerSize: Integer; out Raw: UInt64): Boolean;
 
+// The WRITE direction of the two conversions above: build the target's own
+// representation from a Double. Writing 8 bytes of IEEE double into a 10-byte
+// x87 slot is not a rounding error -- it leaves the top two bytes, the sign and
+// exponent, holding whatever the variable contained before.
+procedure DoubleToExtendedBytes(Value: Double; out Bytes: array of Byte);
+procedure DoubleToReal48Bytes(Value: Double; out Bytes: array of Byte);
+
 // True when a type's Delphi TTypeKind makes it a candidate for the
 // structured-value formatting path (class / record / interface).
 function IsExpandableTKind(K: Byte): Boolean;
@@ -249,6 +256,67 @@ begin
     (UInt64(Bytes[2]) shl 8)  or
      UInt64(Bytes[1]);
   Result := Sign or Exponent or (Fraction shl 13);
+end;
+
+// Inverse of ExtendedBytesToDoubleBits. The host is a 64-bit binary where
+// `Extended` IS `Double`, so the 80-bit pattern has to be built by hand rather
+// than by letting the FPU widen it.
+procedure DoubleToExtendedBytes(Value: Double; out Bytes: array of Byte);
+begin
+  FillChar(Bytes[0], 10, 0);
+  var Bits: UInt64 := PUInt64(@Value)^;
+  var Sign: Word   := Word(Bits shr 63) shl 15;
+  var Exp64        := Integer((Bits shr 52) and $7FF);
+  var Frac: UInt64 := Bits and ((UInt64(1) shl 52) - 1);
+
+  if (Exp64 = 0) and (Frac = 0) then begin
+    PWord(@Bytes[8])^ := Sign;               // +/- zero
+    Exit;
+  end;
+  if Exp64 = $7FF then begin                 // infinity or NaN
+    PUInt64(@Bytes[0])^ := (UInt64(1) shl 63) or (Frac shl 11);
+    PWord(@Bytes[8])^   := Sign or $7FFF;
+    Exit;
+  end;
+  // A Double denormal is below the smallest normal Extended this builds; report
+  // signed zero rather than a wrong magnitude.
+  if Exp64 = 0 then begin
+    PWord(@Bytes[8])^ := Sign;
+    Exit;
+  end;
+  // Restore the integer bit the Double leaves implicit, and re-bias.
+  PUInt64(@Bytes[0])^ := (UInt64(1) shl 63) or (Frac shl 11);
+  PWord(@Bytes[8])^   := Sign or Word(Exp64 - 1023 + 16383);
+end;
+
+// Inverse of Real48BytesToDoubleBits. Real48's exponent is 8 bits biased by 129,
+// so its range is far narrower than a Double's: anything outside it becomes zero
+// or the largest representable value rather than a wrapped-around bit pattern.
+procedure DoubleToReal48Bytes(Value: Double; out Bytes: array of Byte);
+const
+  REAL48_BIAS = 129;
+  DOUBLE_BIAS = 1023;
+begin
+  FillChar(Bytes[0], 6, 0);
+  var Bits: UInt64 := PUInt64(@Value)^;
+  var Exp64        := Integer((Bits shr 52) and $7FF);
+  var Frac: UInt64 := Bits and ((UInt64(1) shl 52) - 1);
+  if (Exp64 = 0) or (Exp64 = $7FF) then
+    Exit;                                    // zero, denormal, infinity or NaN
+
+  var Exp48 := Exp64 - DOUBLE_BIAS + REAL48_BIAS;
+  if Exp48 <= 0 then
+    Exit;                                    // underflows Real48: zero
+  if Exp48 > 255 then
+    Exp48 := 255;                            // saturate rather than wrap
+
+  var Fraction39: UInt64 := Frac shr 13;     // 52 significant bits -> 39
+  Bytes[0] := Byte(Exp48);
+  Bytes[1] := Byte(Fraction39);
+  Bytes[2] := Byte(Fraction39 shr 8);
+  Bytes[3] := Byte(Fraction39 shr 16);
+  Bytes[4] := Byte(Fraction39 shr 24);
+  Bytes[5] := Byte(((Fraction39 shr 32) and $7F) or (Byte(Bits shr 63) shl 7));
 end;
 
 function ReadValueSlotRaw(const Read: TSlotReader; Addr: UInt64;

@@ -1403,16 +1403,21 @@ end;
 function TDebugSession.EncodeAndWriteValue(TargetAddr: UInt64;
   const TypeHint, ValueStr: string; out ErrMsg: string): Boolean;
 var
-  Buf:  array[0..7] of Byte;
+  // 16, not 8: a Win32 `Extended` is 10 bytes wide.
+  Buf:  array[0..15] of Byte;
   Size: Integer;
 begin
   Result := False;
   ErrMsg := '';
   // Enum targets first (literal name, then numeric ordinal at the enum's TRUE
-  // width). EncodeValueForType's unknown-type fallback writes 8 bytes and would
-  // clobber the fields that follow a 1/2-byte enum/set slot.
+  // width), then the float types whose target width the generic encoder gets
+  // wrong. EncodeValueForType writes 8 bytes for anything it calls a float and
+  // for its unknown-type fallback, which would clobber what follows a 1/2-byte
+  // enum/set slot and would half-write a 10-byte Extended.
   if TryEncodeEnumByName(FDebugInfo, ValueStr, TypeHint, Buf, Size) or
      TryEncodeEnumOrdinal(FDebugInfo, ValueStr, TypeHint, Buf, Size) or
+     TryEncodeWideFloat(ValueStr, TypeHint,
+       FDebugger.TargetLayout.PointerSize, Buf, Size) or
      EncodeValueForType(ValueStr, TypeHint, Buf, Size, ErrMsg) then begin
     if not FDebugger.WriteMemoryAt(TargetAddr, @Buf[0], Size) then begin
       ErrMsg := Format('Memory write failed at 0x%x', [TargetAddr]);

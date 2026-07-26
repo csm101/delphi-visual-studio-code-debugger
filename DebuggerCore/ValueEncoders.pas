@@ -33,6 +33,18 @@ function StripStringQuotes(const S: string): string;
 function EncodeValueForType(const ValStr, TypeHint: string;
   out Buf: array of Byte; out Size: Integer; out ErrMsg: string): Boolean;
 
+// Floating-point types whose width in the TARGET is not what the generic
+// encoder assumes. Try this BEFORE EncodeValueForType, the same way the enum
+// encoders are tried first: EncodeValueForType writes 8 bytes of IEEE double
+// for anything it calls a float, which for a 10-byte Win32 `Extended` leaves
+// the top two bytes -- the sign and exponent -- holding the variable's PREVIOUS
+// contents, and for a 6-byte `Real48` is not even the same format.
+//
+// Buf must have room for 10 bytes. Returns False for every other type, so the
+// caller falls through to the generic encoder unchanged.
+function TryEncodeWideFloat(const ValStr, TypeHint: string; PointerSize: Integer;
+  out Buf: array of Byte; out Size: Integer): Boolean;
+
 // Resolves an enum value name (e.g. `geC`) against a target enum type and
 // encodes the ordinal at the enum's storage width. Returns False when the
 // literal is not a member of TypeHint's enum type.
@@ -49,6 +61,9 @@ function TryEncodeEnumOrdinal(DebugInfo: TDebugInfoSet;
   out Buf: array of Byte; out Size: Integer): Boolean;
 
 implementation
+
+uses
+  DelphiValueReaders;   // WideFloatByteSize + the Double <-> x87/Real48 encoders
 
 function TryStrToUInt64Lit(const S: string; out V: UInt64): Boolean;
 var
@@ -125,6 +140,27 @@ begin
     FS.DecimalSeparator := ',';
     Result := TryStrToFloat(Trim(S), V, FS);
   end;
+end;
+
+function TryEncodeWideFloat(const ValStr, TypeHint: string; PointerSize: Integer;
+  out Buf: array of Byte; out Size: Integer): Boolean;
+begin
+  Result := False;
+  Size   := 0;
+  var Width := WideFloatByteSize(TypeHint, PointerSize);
+  if Width = 0 then
+    Exit;
+  if Length(Buf) < Width then
+    Exit;
+  var D: Double;
+  if not TryParseFloat(Trim(ValStr), D) then
+    Exit;
+  if Width = 6 then
+    DoubleToReal48Bytes(D, Buf)
+  else
+    DoubleToExtendedBytes(D, Buf);
+  Size   := Width;
+  Result := True;
 end;
 
 function EncodeValueForType(const ValStr, TypeHint: string;

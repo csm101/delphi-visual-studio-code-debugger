@@ -176,7 +176,7 @@ object recognition and field expansion, strings, and expression evaluation
 including getter-backed properties that run real code in the debuggee.
 Multi-BPL -- the project's core use case -- verified end to end.
 
-Suite: **962 found / 960 passed / 0 failed / 0 leaked / 2 ignored.**
+Suite: **963 found / 961 passed / 0 failed / 0 leaked / 2 ignored.**
 
 NOTE ON A DIRTY RUN: one full-suite run produced a block of
 `DAP request failed: unknown error` failures across `TDebuggerTests.Test_Types_*`
@@ -331,6 +331,23 @@ the compiler, not the decoder -- do not chase a zero without first making the
 variable live.
 
 Pinned by `Win32_WideFloatLocals_ReadTheirFullWidth`.
+
+The WRITE direction had the identical defect and was found only because the user
+challenged the claim that floats worked. `EncodeValueForType` emits 8 bytes of
+IEEE double for any float, so a Win32 `Extended` kept its old sign and exponent
+bytes. `TryEncodeWideFloat` now runs BEFORE it, mirroring how the enum encoders
+are already tried first, and `EncodeAndWriteValue`'s buffer grew from 8 to 16
+bytes. `Real48` was rejected outright on both architectures.
+
+NEGATIVE CONTROL RUN, not assumed -- with the fix disabled the new test reports:
+`x64 R48: set rejected | x86 Ext1: wrote 9.5, read back "3.002136" |
+x86 R48: set rejected`. `x64 Ext1` correctly does NOT fail, since `Extended` is
+`Double` there and the generic encoder was already right.
+
+Pinned by `Win32_SetWideFloatLocals_RoundTrip`, which COLLECTS failures instead
+of asserting per case: both executables are named `TestTarget.exe`, so a message
+built from the file name cannot say which bitness failed, and stopping at the
+first failure hid the x86 case entirely on the first attempt.
 
 ### x87 stack leak: HYPOTHESISED, MEASURED, DISPROVED -- do not "fix" it
 

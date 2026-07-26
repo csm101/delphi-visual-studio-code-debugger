@@ -275,6 +275,17 @@ the **lowest** byte, 39-bit fraction, one sign bit. Nothing about it resembles a
 IEEE double, so it gets its own decoder, transcribed from the RTL's `_Real2Ext`
 rather than reconstructed.
 
+**Writing has the same problem and needs the same table.** `setVariable` encodes
+the new value into the target's own representation, and the generic
+`EncodeValueForType` emits 8 bytes of IEEE double for anything it classifies as a
+float. Into a 10-byte Win32 `Extended` that leaves the top two bytes — the sign
+and exponent — holding the variable's *previous* contents. Measured, by disabling
+the fix and re-running the round-trip test: setting a Win32 `Extended` to `9.5`
+read back as `3.002136`. `TryEncodeWideFloat` is therefore tried **before**
+`EncodeValueForType`, exactly as the enum encoders already are, and builds the
+80-bit or Real48 pattern by hand — the adapter is a 64-bit binary where
+`Extended` *is* `Double`, so the FPU cannot widen it for us.
+
 `TDynArrayRec` is the clearest case, since unlike the string header Delphi did
 not make it bitness-neutral:
 
