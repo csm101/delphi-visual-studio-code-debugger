@@ -415,9 +415,26 @@ begin
   Result := False;
   if not EnsureFpuCaptureStub then
     Exit;
-  // Floats do not travel in the integer registers on x86 and are returned on
-  // the x87 stack, neither of which this implements yet. Refuse rather than
-  // place a float where the callee will read an integer.
+  // Float ARGUMENTS are refused. (Float RESULTS work -- see the capture stub.)
+  //
+  // The blocker is the seam, not the ABI, and the ABI is now measured
+  // (DevTools\Win32FloatArgProbe):
+  //
+  //   * A float parameter consumes NO register slot. In
+  //     `Foo(A: Integer; B: Double; C: Integer)` the compiler puts A in EAX,
+  //     B on the stack, and C in EDX -- so the positional ArgValues[0..2] ->
+  //     EAX/EDX/ECX mapping below is wrong as soon as a float appears.
+  //   * Stack widths are NOT uniform: Single 4, Double 8, Currency 8,
+  //     Extended 12 (10 bytes padded to a 4-byte boundary), against the fixed
+  //     4-byte slot and 4-byte stride this routine writes.
+  //
+  // The seam passes `ArgIsFloat: array of Boolean`, which is enough on x64
+  // where every float goes into an XMM register as 8 bytes, and not enough
+  // here where the width decides the layout. A 10-byte Extended does not even
+  // fit the UInt64 that carries the value. Supporting these means widening the
+  // seam to carry each argument's TYPE and rewriting the placement below as
+  // two passes. Until then, refuse: putting a Double where the callee reads an
+  // integer yields a plausible wrong number, the worst failure available.
   for var I := 0 to High(ArgIsFloat) do
     if ArgIsFloat[I] then
       Exit;

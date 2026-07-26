@@ -476,10 +476,18 @@ channel; `TDebugSession.OnConsole` would be the sink).
 object expansion, evaluation, multi-BPL). See "Target architecture" in
 `DAP_DEBUGGER_ARCHITECTURE.md`. These remain unanswered:
 
-- **Float arguments in an x86 synthetic call.** Still refused rather than
-  approximated: floats do not travel in the integer registers on x86, and where
-  each one goes has not been measured. (Float *returns* and `Int64` returns are
-  now implemented — see "x86 return values" in `DAP_DEBUGGER_ARCHITECTURE.md`.)
+- **Float arguments in an x86 synthetic call** — still refused, but no longer
+  an unknown. The ABI is measured (`DevTools\Win32FloatArgProbe`): a float
+  parameter consumes no register slot, and stack widths are 4 / 8 / 8 / **12**
+  for `Single` / `Double` / `Currency` / `Extended`. What blocks it is the seam,
+  which carries `ArgIsFloat: array of Boolean` — enough on x64, where every
+  float is 8 bytes in an XMM register, and not enough on x86, where the width
+  decides the layout and a 10-byte `Extended` does not fit the `UInt64`
+  transporting the value. Implementing it means widening the seam to carry each
+  argument's type and rewriting the x86 placement as two passes. Scoped out of
+  the original plan; the remaining decision is whether to widen a seam the
+  working x64 path shares. (Float *returns* and `Int64` returns are implemented
+  — see "x86 return values" in `DAP_DEBUGGER_ARCHITECTURE.md`.)
 - **`TD32FileReader.GetTypeSize` still reports CodeView `$42` (`Extended`) as 8
   bytes**, which is right on Win64 and two short on Win32. Reading a variable no
   longer goes through it — `WideFloatByteSize` owns that decision now — but the

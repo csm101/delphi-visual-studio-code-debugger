@@ -376,9 +376,35 @@ of cdecl. Laying the frame out by hand, argument *i* of *n* lands at
 `[ESP + 4 + 4*(n-1-i)]`.
 
 One case is deliberately **not** implemented, because a wrong answer here is
-silent: **float arguments**. `PrepareSyntheticCall` refuses the whole call if
-any argument is a float. They do not travel in the integer registers, so placing
-one where the callee reads an integer would be quietly wrong.
+silent: **float arguments**. `PrepareSyntheticCall` refuses the whole call if any
+argument is a float.
+
+What blocks it is the seam, not the ABI. Measured with
+`DevTools\Win32FloatArgProbe`, which reports each parameter's offset from EBP
+under `-$O-` (negative = spilled from a register, positive = passed on the stack):
+
+```
+IntDoubleInt(A: Integer; B: Double; C: Integer)
+    A    EBP-8    REGISTER
+    B    EBP+8    stack
+    C    EBP-12   REGISTER
+```
+
+- **A float parameter consumes no register slot.** `C`, declared third, still
+  takes the *second* register — the allocator skips floats entirely. So the
+  positional `ArgValues[0..2]` → EAX/EDX/ECX mapping is wrong the moment a float
+  appears anywhere in the list.
+- **Stack widths are not uniform:** `Single` 4, `Double` 8, `Currency` 8,
+  `Extended` **12** (10 bytes padded to a 4-byte boundary). The x86 placement
+  writes a fixed 4-byte slot at a 4-byte stride.
+
+The seam carries `ArgIsFloat: array of Boolean`, which is sufficient on x64 —
+every float goes into an XMM register as 8 bytes — and insufficient here, where
+the width decides the layout. A 10-byte `Extended` does not even fit the `UInt64`
+that transports the value. Supporting float arguments therefore means widening
+the seam to carry each argument's *type*, then rewriting the x86 placement as two
+passes: registers to the non-floats in declaration order, stack to everything
+else at its natural width, pushed left to right.
 
 ### x86 return values: EDX:EAX and the x87 stack
 

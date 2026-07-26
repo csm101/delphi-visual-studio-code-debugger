@@ -478,6 +478,30 @@ in `ST(0)` — `Currency` included, where Win64 returns a scaled `Int64` in RAX 
 and `Currency` arrives already **scaled** (`19.95` → `199500`). That last fact is
 why `TExprEvaluator.NormaliseFloatReturn` rounds rather than rescales.
 
+#### Win32FloatArgProbe
+
+```bat
+DevTools\build_one32.bat Win32FloatArgProbe.dpr
+DevTools\Win32\Debug\Win32FloatArgProbe.exe
+```
+
+Takes no arguments; 32-bit only. Reports where a Win32 routine actually
+*receives* each parameter, by printing `@Param - EBP` for a set of deliberately
+mixed signatures. Under `-$O-` the register three are spilled to **negative**
+offsets and genuine stack parameters sit at **positive** ones, so the sign
+classifies each parameter and the spacing between consecutive positive offsets
+gives each type's stack footprint.
+
+Measured on Athens 36: a floating-point parameter consumes **no** register slot —
+in `Foo(A: Integer; B: Double; C: Integer)`, `A` takes EAX, `B` goes on the
+stack, and `C` still takes EDX. Stack footprints are `Single` 4, `Double` 8,
+`Currency` 8, `Extended` **12** (10 padded to a 4-byte boundary), pushed left to
+right so the first declared lands highest.
+
+Gotcha worth keeping: do **not** name the local that captures the frame pointer
+`Ebp`. The inline assembler resolves that to the register and emits a no-op
+`mov ebp, ebp`, so every offset comes out as an absolute address.
+
 ### Live process and adapter
 
 #### ProcessEnumProbe
