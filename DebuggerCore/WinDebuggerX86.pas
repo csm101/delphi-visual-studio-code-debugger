@@ -56,6 +56,7 @@ type
                 out Recognised: Boolean): UInt32; override;
     function  LocalsOffsetBase(SubRspN, ExtraPushBytes: UInt32): Integer; override;
     function  ParamsOffsetBase(SubRspN, ExtraPushBytes: UInt32): Integer; override;
+    function  CallerReturnAddress(TID: DWORD): UInt64; override;
 
     // Delphi's 32-bit `register` convention -- arguments in EAX/EDX/ECX and on
     // the stack at their declared widths, results out of EDX:EAX or the x87
@@ -313,6 +314,36 @@ end;
 function TWin32Debugger.ParamsOffsetBase(SubRspN, ExtraPushBytes: UInt32): Integer;
 begin
   Result := 0;
+end;
+
+// On x86 the return address needs no unwind information: `mov ebp,esp` runs
+// BEFORE the frame allocation (the opposite of x64), so inside a framed routine
+// the saved caller EBP is at [EBP] and the return address is always at [EBP+4].
+// Measured in Phase 0; see the prologue notes above.
+//
+// This matters beyond tidiness. The inherited implementation unwinds one frame
+// with StackWalk64, which needs dbghelp to know the module -- and in a real
+// 32-bit host loading runtime packages it frequently does not. Observed on the
+// Delphi IDE loading a design-time package: the walker returned a STACK address
+// as the caller, so step-over planted its run-to-return breakpoint somewhere
+// that never executes and the step hung.
+//
+// The read is validated rather than trusted: at the very first instruction of a
+// routine EBP still belongs to the caller, and a frameless routine has no such
+// slot at all. When the slot does not hold something that looks like a return
+// address, fall back to the inherited walk rather than guess.
+function TWin32Debugger.CallerReturnAddress(TID: DWORD): UInt64;
+var
+  Regs: TRegisterSnapshot;
+begin
+  Result := 0;
+  if ReadThreadRegisters(TID, Regs) and (Regs.FramePtr <> 0) then begin
+    var Ret: UInt64 := 0;
+    if ReadProcessMemoryAt(Regs.FramePtr + 4, @Ret, 4) and
+       IsPlausibleReturnAddress(Ret) then
+      Exit(Ret);
+  end;
+  Result := inherited CallerReturnAddress(TID);
 end;
 
 { ------------------------------------------------------- not yet implemented -- }

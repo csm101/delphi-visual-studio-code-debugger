@@ -289,6 +289,52 @@ REMAINING, and it predates all of this: argument kinds come from the CALLING
 EXPRESSION, not the callee's declared parameter types, which debug info does not
 surface. `Foo(0.25)` passes a Double to a `Single` parameter on x64 too.
 
+### FIELD TEST IN PROGRESS -- resume here (2026-07-26)
+
+Target: `C:\Athens\qbflibraries\qbfdesign\QBFDesignD29.dpk`, a DESIGN-TIME
+package. The debuggee is `bds.exe`, which is 32-bit, so this exercises the whole
+Win32 path against a real host with ~100 runtime packages. It has already found
+three defects that no synthetic target reproduced.
+
+FOUND AND FIXED (committed):
+1. Exception class / message / `$exception` -- the fifth host-vs-target site,
+   see the section below.
+
+FOUND AND FIXED (pending the suite that was running when the session ended):
+2. **Frame 0 rendered as `0xFFFFFFFFB5C34A23 (unknown module)`** -- the thread's
+   real PC `$B5C34A23` SIGN-extended to 64 bits by StackWalk64, so it matched no
+   module, carried no source, and VS Code had no line to open. The adapter had
+   ALREADY resolved the stop correctly: the log shows
+   `ReportStopped: reason=breakpoint VA=$B5C34A23 file=frmEnumsU.pas line=235`.
+   Fix: frame 0's PC is re-anchored to the seed PC (authoritative -- it is the
+   thread's live PC), symbolication follows `Frame.IP` rather than
+   `SF.AddrPC.Offset`, and on a 32-bit target a frame address above 4 GB stops
+   the walk. NOT root-caused: why dbghelp sign-extends it is unknown; the fix is
+   to stop asking it for a value we already hold exactly.
+   Suite after this change alone: 965/963/0.
+3. **Step-over on `inherited` hung.** Same root: `CallerReturnAddress` unwinds
+   one frame with StackWalk64, which in this stack returns `0x14FF680` -- a STACK
+   address. The run-to-return one-shot breakpoint went somewhere never executed,
+   so the step never completed. `TWin32Debugger.CallerReturnAddress` now reads
+   `[EBP+4]` directly (Phase 0 measured that `mov ebp,esp` precedes allocation on
+   x86, so that slot is always the return address), validates it with
+   `IsPlausibleReturnAddress`, and falls back to the inherited walk otherwise.
+   NOT YET CONFIRMED BY THE USER -- the suite was still running at session end.
+
+STILL BROKEN, NOT ADDRESSED: frame 1 onwards. The walker takes a stack address
+as a return address and loses the real caller, so the join into the VCL frames is
+junk. This is the Phase 0 prediction about the i386 walk in modules dbghelp knows
+nothing about. `DevTools\Wow64StackProbe` exists for investigating it.
+
+NEXT ACTION: ask the user whether step-over completed. If it still hangs, the
+distinguishing question is whether the process RUNS but never stops (breakpoint
+planted at the wrong address -- grep the log for `PlantStepBp`) or everything
+FREEZES (the separate main-thread deadlock recorded in the MCP findings).
+
+USER-SIDE ISSUE worth repeating to them: the log warns
+`qbfdesignd29.bpl RSM is OLDER than the BPL -- it will be IGNORED`, so that
+package's types/locals come from TD32 only until it is rebuilt.
+
 ### THE FIFTH host-vs-target SITE: the exception readers. Found IN THE FIELD.
 
 Reported by the user debugging a design-time package: `bds.exe` is 32-bit, so a

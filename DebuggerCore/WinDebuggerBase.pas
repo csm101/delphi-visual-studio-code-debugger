@@ -216,11 +216,20 @@ type
     procedure SetRIP(TID: DWORD; NewRIP: UInt64);
     function  CurrentRIP(TID: DWORD): UInt64;
     function  CurrentRSP(TID: DWORD): UInt64;
-    function  CallerReturnAddress(TID: DWORD): UInt64;
+  protected
+    // Where the current frame will return to. Drives step-over's run-to-return
+    // and step-out, so a wrong answer plants a one-shot breakpoint at an address
+    // that is never executed and the step simply never completes.
+    //
+    // The base implementation unwinds one frame with StackWalk64, which needs
+    // dbghelp to know the module. A 32-bit target overrides it, because there
+    // the answer is a fixed stack slot and needs no unwind information at all.
+    function  CallerReturnAddress(TID: DWORD): UInt64; virtual;
     // True when VA lies inside a module dbghelp knows about and is executable --
     // i.e. it is plausibly a return address rather than a leaf-convention guess
     // read out of an uninitialised stack slot.
     function  IsPlausibleReturnAddress(VA: UInt64): Boolean;
+  private
     procedure EnsureSymInitialized;
     procedure RegisterModuleWithDbgHelp(const Path: string; Base, ImageSize: UInt64);
     procedure PlantStepBp(VA: UInt64);
@@ -2740,6 +2749,21 @@ begin
     if SF.AddrPC.Offset = 0 then
       Break;
     Frame.IP := SF.AddrPC.Offset;
+    // Frame 0's PC is not the walker's to decide: it is the thread's live PC,
+    // which the caller already read and which the stop location was resolved
+    // from. Observed on a 32-bit target whose top frame sat in a runtime package
+    // dbghelp knew nothing about: StackWalk64 returned $FFFFFFFFB5C34A23 for a
+    // PC of $B5C34A23 -- the address SIGN-extended to 64 bits. That belongs to
+    // no module, so the frame rendered as "unknown module" with no source and
+    // the editor would not open the line, even though ReportStopped had already
+    // resolved the very same address to frmEnumsU.pas:235.
+    if Length(Result) = 0 then
+      Frame.IP := SeedRip;
+    // A WOW64 process has no user address above 4 GB, so anything wider is the
+    // walker having gone astray rather than a real frame. Stop rather than
+    // emit frames that can only mis-resolve.
+    if (not TargetLayout.Is64Bit) and (Frame.IP > $FFFFFFFF) then
+      Break;
     // StackWalk64 updates @Ctx to the unwound register state for THIS
     // frame; Ctx.Rbp is the frame's actual RBP, which the BPREL local /
     // param offset decode is relative to. SF.AddrFrame is unwind-defined
@@ -2749,7 +2773,10 @@ begin
       Frame.FrameRBP := Ctx.Rbp
     else
       Frame.FrameRBP := SF.AddrFrame.Offset;
-    var FrameRva := VAToRva(SF.AddrPC.Offset);
+    // Frame.IP, not SF.AddrPC.Offset: frame 0 was just re-anchored to the
+    // thread's live PC above, and symbolication has to follow the corrected
+    // address or it resolves the walker's bad one.
+    var FrameRva := VAToRva(Frame.IP);
     // Frame 0 is the live RIP; every caller frame carries a RETURN address,
     // i.e. the instruction AFTER the call. Looking that up maps to the line
     // following the call site (e.g. an Assert call reports the next line).
