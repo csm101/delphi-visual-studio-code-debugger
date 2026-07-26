@@ -481,6 +481,19 @@ It is present only on an exception stop (it disappears on the next breakpoint/st
 stop) and reflects the Delphi exception object; access violations have no Delphi
 object, so `$exception` is not shown for them (the class/message summary still is).
 
+> **`$exception` shows `not available` in the Watch panel?** That string is
+> VS Code's, not the debugger's — the adapter would answer
+> `<no current exception>`. VS Code prints it when it does not evaluate the
+> watch at all, which happens when **no stack frame is selected**, and it selects
+> none when no frame has a source. That is common when the raise happens deep
+> inside the RTL or the VCL, or inside third-party packages compiled without
+> debug information: the whole visible stack reads *"not covered by symbols"*.
+>
+> Click a frame belonging to code you compiled — the exception object is
+> frame-independent, so any selectable frame will do — and the watch populates.
+> Setting the breakpoint in your own code, rather than relying on the raise site,
+> avoids the situation entirely.
+
 ### Per-exception rules (`exceptionRules`)
 
 The four filters are coarse. For fine-grained control add an `exceptionRules`
