@@ -476,18 +476,17 @@ channel; `TDebugSession.OnConsole` would be the sink).
 object expansion, evaluation, multi-BPL). See "Target architecture" in
 `DAP_DEBUGGER_ARCHITECTURE.md`. These remain unanswered:
 
-- **Float arguments in an x86 synthetic call** — still refused, but no longer
-  an unknown. The ABI is measured (`DevTools\Win32FloatArgProbe`): a float
-  parameter consumes no register slot, and stack widths are 4 / 8 / 8 / **12**
-  for `Single` / `Double` / `Currency` / `Extended`. What blocks it is the seam,
-  which carries `ArgIsFloat: array of Boolean` — enough on x64, where every
-  float is 8 bytes in an XMM register, and not enough on x86, where the width
-  decides the layout and a 10-byte `Extended` does not fit the `UInt64`
-  transporting the value. Implementing it means widening the seam to carry each
-  argument's type and rewriting the x86 placement as two passes. Scoped out of
-  the original plan; the remaining decision is whether to widen a seam the
-  working x64 path shares. (Float *returns* and `Int64` returns are implemented
-  — see "x86 return values" in `DAP_DEBUGGER_ARCHITECTURE.md`.)
+- **A synthetic call's argument kinds come from the CALLING EXPRESSION, not the
+  callee's declared parameter types**, which the debug info does not surface.
+  Passing `0.25` — typed `Double` by the evaluator — to a `Single` parameter
+  therefore places 8 bytes where the callee reads 4. This is not new and not
+  x86-specific: on x64 the same expression puts Double bits in XMM0 for a callee
+  that reads the low 4 bytes as a Single. Integer literals are the case that had
+  to be worked around immediately, since the evaluator types them `Int64`:
+  `TExprValue.IsIntLiteral` marks them and a literal that fits 32 bits is passed
+  as an ordinal. The real fix is parameter types in the debug info.
+  (Float and `Int64` arguments and returns otherwise work on both
+  architectures — see `DAP_DEBUGGER_ARCHITECTURE.md`.)
 - **`TD32FileReader.GetTypeSize` still reports CodeView `$42` (`Extended`) as 8
   bytes**, which is right on Win64 and two short on Win32. Reading a variable no
   longer goes through it — `WideFloatByteSize` owns that decision now — but the

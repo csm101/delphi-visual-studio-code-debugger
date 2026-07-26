@@ -18,6 +18,33 @@ uses
 type
   TStopReason = (srEntry, srBreakpoint, srStep, srException, srPause);
 
+  // How one synthetic-call argument has to be materialised in the TARGET.
+  //
+  // This replaces a plain "is it a float" Boolean, which was sufficient on x64 --
+  // there every argument occupies exactly one 8-byte slot BY POSITION and only
+  // the register file (integer vs XMM) differs -- and is not sufficient on x86.
+  // Measured with DevTools\Win32FloatArgProbe:
+  //
+  //   * A parameter takes one of EAX/EDX/ECX only if it fits 32 bits AND is not
+  //     a float. Everything else goes on the stack and consumes NO register
+  //     slot, so ordinals declared after it keep taking registers:
+  //     `Foo(A: Integer; B: Double; C: Integer)` puts A in EAX, B on the stack
+  //     and C in EDX.
+  //   * Stack widths differ: Single 4, Double 8, Int64/Currency 8, and
+  //     Extended 12 -- ten bytes padded to a 4-byte boundary.
+  //
+  // ArgValues carries each value in the TARGET's own encoding for its type: a
+  // Single as its 4-byte pattern, a Currency as the scaled Int64. The one
+  // exception is Extended, which travels as DOUBLE bits because that is all an
+  // 8-byte slot can hold; the x86 placement widens it to 80 bits on the way in.
+  TSyntheticArgKind = (
+    sakOrdinal,    // fits one pointer-sized register slot
+    sakInt64,      // 8 bytes, integer-shaped -- Currency and Comp included
+    sakSingle,     // 4-byte IEEE
+    sakDouble,     // 8-byte IEEE, plus TDateTime and the Double aliases
+    sakExtended    // 10-byte x87 on Win32; a true alias of Double on Win64
+  );
+
   // DAP exception-filter switches. Each flag toggles whether a class of
   // exceptions stops the debuggee at the user-visible level. Defaults
   // (delphi=on, av=on, all=off, unhandled=on) match the historical
@@ -216,8 +243,8 @@ type
                 out Value: Int64; out TypeHint: string): Boolean;
     function  GetRemoteScratchSlot(MinSize: NativeUInt): UInt64;
     function  RunMethodCall(FuncVA: UInt64;
-                const ArgValues:  array of UInt64;
-                const ArgIsFloat: array of Boolean;
+                const ArgValues: array of UInt64;
+                const ArgKinds:  array of TSyntheticArgKind;
                 out IntResult, FloatResultLow: UInt64): Boolean;
     // Arguments are POSITIONAL, not register-named: which physical register (or
     // stack slot) each one lands in is the implementation's business, and the

@@ -132,6 +132,15 @@ type
     FPt:     TPoint3D;
     FChild:  TWidget;  // deliberately never assigned -> stays nil
     FBigHandle: UInt64;  // a plain UInt64 must be a leaf (never expandable)
+    // Typed sources for the synthetic-call argument test below. They are FIELDS
+    // exposed as field-backed properties so an expression can name a value whose
+    // type matches the parameter it is passed to -- a literal like 0.25 is typed
+    // Double by the evaluator and would say nothing about Single placement.
+    FArgS:   Single;
+    FArgD:   Double;
+    FArgE:   Extended;
+    FArgI64: Int64;
+    FArgCur: Currency;
     FOnNotify: TWidgetNotify;  // backing field for the OnNotify event handler
     function DoCalcScore:   Integer;     // deliberately NOT named GetScore
     function DoCalcInt64:   Int64;
@@ -172,6 +181,21 @@ type
     // an XMM register, which name-only float detection failed to do. Returns the
     // day-of-month so a wrong (0.0) argument gives a distinguishable answer.
     function DayOfDate(const D: TDateTime): Integer;
+    // Every argument class Delphi's 32-bit `register` convention treats
+    // differently, interleaved with ordinals so a wrong register/stack split
+    // shows up. A and C must still reach EAX/EDX -- floats and 8-byte values
+    // consume no register slot -- while B, D, E, F and G go on the stack at 8,
+    // 4, 12, 8 and 8 bytes. Each contributes a distinct power of two, so any
+    // argument landing in the wrong place changes the sum.
+    function SumArgs(A: Integer; B: Double; C: Integer; D: Single;
+                     E: Extended; F: Int64; G: Currency): Double;
+    // Typed sources for the call above, field-backed so naming one costs no
+    // synthetic call of its own.
+    property ArgS:   Single   read FArgS;
+    property ArgD:   Double   read FArgD;
+    property ArgE:   Extended read FArgE;
+    property ArgI64: Int64    read FArgI64;
+    property ArgCur: Currency read FArgCur;
     function Greet(const Who: string): string;
     // Step-into prologue fixture (F19): a METHOD whose Self and three
     // by-register parameters (RCX/RDX/R8/XMM3) only become readable once the
@@ -454,6 +478,13 @@ begin
   FPt.Y   := 2.5;
   FPt.Z   := 3.5;
   FBigHandle := $00ABCDEF12345678;  // UInt64 leaf: must show inline, never expand
+  // Powers of two, so SumArgs' weighted total is exact in binary and any
+  // argument that lands in the wrong register or stack slot changes it.
+  FArgS   := 0.25;
+  FArgD   := 0.5;
+  FArgE   := 0.125;
+  FArgI64 := 4;
+  FArgCur := 2.0;
 end;
 
 procedure TWidget.Compute(var AResult: Integer);
@@ -479,6 +510,22 @@ function TWidget.DoCalcSingle: Single;     begin Result := 1.5;              end
 function TWidget.DoCalcDouble: Double;     begin Result := 3.25;             end;
 function TWidget.DoCalcDate:   TDateTime;  begin Result := 45000.5;          end;
 function TWidget.DoCalcCurr:   Currency;   begin Result := 19.95;            end;
+// The weights are chosen so each argument contributes a DISTINCT power of two:
+//
+//   A=1     * 1   =  1      E=0.125 * 128 =  16
+//   B=0.5   * 4   =  2      F=4     * 8   =  32
+//   C=2     * 2   =  4      G=2.0   * 32  =  64
+//   D=0.25  * 32  =  8                      ----
+//                                    total = 127
+//
+// So a wrong total names the culprit: the deficit is the sum of the arguments
+// that failed to arrive, and no two subsets share a sum.
+function TWidget.SumArgs(A: Integer; B: Double; C: Integer; D: Single;
+  E: Extended; F: Int64; G: Currency): Double;
+begin
+  Result := A * 1 + B * 4 + C * 2 + D * 32 + E * 128 + F * 8 + G * 32;
+end;
+
 function TWidget.DoCalcReal:   Real;       begin Result := 6.75;             end;
 function TWidget.DoCalcExt:    Extended;   begin Result := 2.5;              end;
 function TWidget.DoCalcUStr:   UnicodeString; begin Result := 'u_' + FName;  end;

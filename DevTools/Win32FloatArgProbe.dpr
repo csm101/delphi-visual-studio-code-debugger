@@ -98,6 +98,26 @@ begin
      At('S', @S, FrameBase), At('D', @D, FrameBase), At('E', @E, FrameBase), At('U', @U, FrameBase)]);
 end;
 
+{ Int64 and Currency are 8 bytes and cannot fit a 32-bit register. Do they
+  behave like floats (skipped, stack) or do they consume a register slot? }
+procedure IntInt64Int(A: Integer; B: Int64; C: Integer);
+var
+  FrameBase: NativeUInt;
+begin
+  asm mov FrameBase, ebp end;
+  Show('IntInt64Int(A: Integer; B: Int64; C: Integer)',
+    [At('A', @A, FrameBase), At('B', @B, FrameBase), At('C', @C, FrameBase)]);
+end;
+
+procedure IntCurrencyInt(A: Integer; B: Currency; C: Integer);
+var
+  FrameBase: NativeUInt;
+begin
+  asm mov FrameBase, ebp end;
+  Show('IntCurrencyInt(A: Integer; B: Currency; C: Integer)',
+    [At('A', @A, FrameBase), At('B', @B, FrameBase), At('C', @C, FrameBase)]);
+end;
+
 { Four floats and nothing else: are ALL of them on the stack? }
 procedure AllFloats(A, B, C, D: Double);
 var
@@ -117,6 +137,8 @@ begin
     IntDoubleInt(1, 2.5, 3);
     DoubleIntInt(2.5, 1, 3);
     FloatWidths(1, 2, 3, 1.5, 2.5, 3.5, 4.5);
+    IntInt64Int(1, 2, 3);
+    IntCurrencyInt(1, 2.5, 3);
     AllFloats(1.5, 2.5, 3.5, 4.5);
   except
     on E: Exception do begin

@@ -386,13 +386,11 @@ pushed **last**, so stack arguments are pushed **left to right** — the opposit
 of cdecl. Laying the frame out by hand, argument *i* of *n* lands at
 `[ESP + 4 + 4*(n-1-i)]`.
 
-One case is deliberately **not** implemented, because a wrong answer here is
-silent: **float arguments**. `PrepareSyntheticCall` refuses the whole call if any
-argument is a float.
+### Argument placement, and why the seam carries a kind
 
-What blocks it is the seam, not the ABI. Measured with
-`DevTools\Win32FloatArgProbe`, which reports each parameter's offset from EBP
-under `-$O-` (negative = spilled from a register, positive = passed on the stack):
+Measured with `DevTools\Win32FloatArgProbe`, which reports each parameter's
+offset from EBP under `-$O-` (negative = spilled from a register, positive =
+passed on the stack):
 
 ```
 IntDoubleInt(A: Integer; B: Double; C: Integer)
@@ -401,21 +399,33 @@ IntDoubleInt(A: Integer; B: Double; C: Integer)
     C    EBP-12   REGISTER
 ```
 
-- **A float parameter consumes no register slot.** `C`, declared third, still
-  takes the *second* register — the allocator skips floats entirely. So the
-  positional `ArgValues[0..2]` → EAX/EDX/ECX mapping is wrong the moment a float
-  appears anywhere in the list.
-- **Stack widths are not uniform:** `Single` 4, `Double` 8, `Currency` 8,
-  `Extended` **12** (10 bytes padded to a 4-byte boundary). The x86 placement
-  writes a fixed 4-byte slot at a 4-byte stride.
+- **A parameter takes one of EAX/EDX/ECX only if it fits 32 bits AND is not a
+  float.** Everything else goes on the stack and consumes *no* slot, so ordinals
+  declared after it keep taking registers: `C` above, declared third, still gets
+  the *second* register. `Int64` and `Currency` behave exactly like floats here.
+- **Stack widths are not uniform:** `Single` 4, `Double` 8, `Int64` and
+  `Currency` 8, `Extended` **12** (10 bytes padded to a 4-byte boundary).
 
-The seam carries `ArgIsFloat: array of Boolean`, which is sufficient on x64 —
-every float goes into an XMM register as 8 bytes — and insufficient here, where
-the width decides the layout. A 10-byte `Extended` does not even fit the `UInt64`
-that transports the value. Supporting float arguments therefore means widening
-the seam to carry each argument's *type*, then rewriting the x86 placement as two
-passes: registers to the non-floats in declaration order, stack to everything
-else at its natural width, pushed left to right.
+Hence `IDebugTarget.RunMethodCall` carries `ArgKinds: array of
+TSyntheticArgKind` rather than a plain "is it a float" Boolean. On x64 the kind
+only chooses the register file — every argument occupies one 8-byte slot by
+position — so that side is unchanged. On x86 it decides both whether the
+argument competes for a register and how many stack bytes it occupies, and the
+placement runs as two passes: register slots to the ordinals in declaration
+order, then the stack in declaration order with the first argument at the
+*highest* address.
+
+`Extended` travels through the seam as **Double bits**, because that is all an
+8-byte `ArgValues` slot can carry; the x86 placement widens it to 80 bits.
+
+**Known limitation:** the kind is derived from the *calling expression's* type,
+not the callee's *declared parameter* type, which the debug info does not
+surface. Passing `0.25` (typed `Double` by the evaluator) to a `Single`
+parameter is therefore still wrong — and was equally wrong on x64 before any of
+this. Integer literals are typed `Int64` for storage, so `TExprValue.IsIntLiteral`
+marks them and a literal that fits 32 bits is passed as an ordinal; without that,
+`Foo(3)` put a 4-byte ordinal parameter on the stack as 8 bytes and the callee
+read a register that was never set.
 
 ### x86 return values: EDX:EAX and the x87 stack
 

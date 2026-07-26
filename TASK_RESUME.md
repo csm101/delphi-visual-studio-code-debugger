@@ -176,7 +176,7 @@ object recognition and field expansion, strings, and expression evaluation
 including getter-backed properties that run real code in the debuggee.
 Multi-BPL -- the project's core use case -- verified end to end.
 
-Suite: **963 found / 961 passed / 0 failed / 0 leaked / 2 ignored.**
+Suite: **964 found / 962 passed / 0 failed / 0 leaked / 2 ignored.**
 
 NOTE ON A DIRTY RUN: one full-suite run produced a block of
 `DAP request failed: unknown error` failures across `TDebuggerTests.Test_Types_*`
@@ -252,6 +252,42 @@ order of value:
    design change to a 4000-line unit rather than the "pure move" the plan
    assumed. Worth doing, but it needs a deliberate pass, not a drive-by.
 5. **`-$O+` support**, if wanted at all -- decide policy before building.
+
+### Float ARGUMENTS to synthetic calls: DONE (was the last declared gap)
+
+Seam widened: `ArgIsFloat: array of Boolean` -> `ArgKinds: array of
+TSyntheticArgKind` (`sakOrdinal`, `sakInt64`, `sakSingle`, `sakDouble`,
+`sakExtended`), declared in `DebugTarget.pas`. x64 uses the kind only to pick
+the register file and is unchanged; x86 uses it for BOTH decisions the ABI makes.
+
+Measured rules (`DevTools\Win32FloatArgProbe`, now also covering Int64/Currency):
+a parameter takes EAX/EDX/ECX only if it fits 32 bits AND is not a float;
+everything else goes on the stack consuming NO slot. Stack widths: Single 4,
+Double 8, Int64/Currency 8, Extended 12. `Extended` travels through the seam as
+Double bits and is widened to 80 bits at placement.
+
+TWO DEFECTS FOUND WHILE VERIFYING, both invisible on x64:
+
+1. **Integer literals are typed `Int64` by the parser** (`ExprEval.pas`), so
+   classifying them faithfully put `Foo(3)` on the stack as 8 bytes and left the
+   register unset -- `Self.Mult(3,4)` went 54 -> 42. `TExprValue.IsIntLiteral`
+   now marks literals; one that fits 32 bits is passed as an ordinal. A REAL
+   Int64 with a small value still gets 8 bytes, which is why value-based
+   classification was rejected.
+2. **`Self.ArgE` read 0** -- not the argument path at all, but the FIELD read.
+   `ReadFieldBackedProp` and `ResolveRsmField` both read `Min(Size,8)` raw bytes;
+   for an Extended holding 0.125 the low 8 bytes are the mantissa
+   `$8000000000000000`, i.e. -0.0, which prints as "0". Both now go through
+   `TExprEvaluator.ReadValueAt`.
+
+Verified identical on both bitnesses: `Mult(3,4)=54`, `Sum5(1..5)=12345`,
+`Scale(2.5)=5.5`, and `SumArgs` -- one argument of every class interleaved with
+ordinals, weighted by distinct powers of two -- `=127`. The weighting is what
+identified both defects: the deficit names the argument that went astray.
+
+REMAINING, and it predates all of this: argument kinds come from the CALLING
+EXPRESSION, not the callee's declared parameter types, which debug info does not
+surface. `Foo(0.25)` passes a Double to a `Single` parameter on x64 too.
 
 ### THE FOURTH host-vs-target SITE, and the biggest one: FIXED
 

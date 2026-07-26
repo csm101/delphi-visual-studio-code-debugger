@@ -356,8 +356,8 @@ type
     // the low qword of XMM0. Which registers those are is this implementation's
     // business, which is why the parameters are not named after them.
     function  RunMethodCall(FuncVA: UInt64;
-                const ArgValues:  array of UInt64;
-                const ArgIsFloat: array of Boolean;
+                const ArgValues: array of UInt64;
+                const ArgKinds:  array of TSyntheticArgKind;
                 out IntResult, FloatResultLow: UInt64): Boolean;
     // Invokes a function in the debuggee, capturing the return value (RAX).
     // Public surface for the expression evaluator's method-backed property
@@ -374,7 +374,7 @@ type
     // shared; a 32-bit target replaces exactly these two.
     function  PrepareSyntheticCall(TH: THandle; FuncVA: UInt64;
                 const ArgValues: array of UInt64;
-                const ArgIsFloat: array of Boolean;
+                const ArgKinds:  array of TSyntheticArgKind;
                 const SavedCtx: TContext): Boolean; virtual;
     function  ReadSyntheticCallResult(TH: THandle;
                 out IntResult, FloatResultLow: UInt64): Boolean; virtual;
@@ -3169,7 +3169,7 @@ end;
 // Places a synthetic call frame for POSITIONAL arguments and points the thread
 // at FuncVA, with the return address aimed at our INT3 trap page.
 function TWinDebugger.PrepareSyntheticCall(TH: THandle; FuncVA: UInt64;
-  const ArgValues: array of UInt64; const ArgIsFloat: array of Boolean;
+  const ArgValues: array of UInt64; const ArgKinds:  array of TSyntheticArgKind;
   const SavedCtx: TContext): Boolean;
 var
   CallCtx: TContext;
@@ -3187,10 +3187,16 @@ begin
   IntRegs[0] := 0; IntRegs[1] := 0; IntRegs[2] := 0; IntRegs[3] := 0;
   XmmRegs[0] := 0; XmmRegs[1] := 0; XmmRegs[2] := 0; XmmRegs[3] := 0;
   SetLength(Stack, 0);
+  // On x64 the WIDTH never matters: every argument occupies one 8-byte slot by
+  // position, and the kind only chooses the register file. A Single already
+  // arrives as its 4-byte pattern in the low half of the value, which is exactly
+  // what the callee reads out of XMM. Extended is a true alias of Double here.
   for var I := 0 to High(ArgValues) do begin
     if I < 4 then begin
-      if ArgIsFloat[I] then XmmRegs[I] := ArgValues[I]
-      else                  IntRegs[I] := ArgValues[I];
+      if ArgKinds[I] in [sakSingle, sakDouble, sakExtended] then
+        XmmRegs[I] := ArgValues[I]
+      else
+        IntRegs[I] := ArgValues[I];
     end else
       Stack := Stack + [ArgValues[I]];
   end;
@@ -3250,7 +3256,7 @@ end;
 // threads or unrelated exceptions are passed through unchanged so the
 // debuggee doesn't hang.
 function TWinDebugger.RunMethodCall(FuncVA: UInt64;
-  const ArgValues: array of UInt64; const ArgIsFloat: array of Boolean;
+  const ArgValues: array of UInt64; const ArgKinds:  array of TSyntheticArgKind;
   out IntResult, FloatResultLow: UInt64): Boolean;
 var
   TH:       THandle;
@@ -3260,7 +3266,7 @@ begin
   Result    := False;
   IntResult      := 0;
   FloatResultLow := 0;
-  if Length(ArgValues) <> Length(ArgIsFloat) then Exit;
+  if Length(ArgValues) <> Length(ArgKinds) then Exit;
   TH := ThreadHandle(FStoppedTid);
   if (TH = 0) or (FProcess = 0) or (FuncVA = 0) then Exit;
   // Stopped on a first-chance exception: the pending debug event must be
@@ -3295,7 +3301,7 @@ begin
   SavedCtx.ContextFlags := CONTEXT_FULL or CONTEXT_FLOATING_POINT;
   if not GetThreadContext(TH, SavedCtx) then Exit;
 
-  if not PrepareSyntheticCall(TH, FuncVA, ArgValues, ArgIsFloat, SavedCtx) then
+  if not PrepareSyntheticCall(TH, FuncVA, ArgValues, ArgKinds, SavedCtx) then
     Exit;
 
   ContinueDebugEvent(FProcessId, FStoppedTid, DBG_CONTINUE);
@@ -3496,7 +3502,7 @@ begin
   // (or exited the process) left WaitForDebugEvent(INFINITE) spinning and
   // hung the whole adapter.
   Result := RunMethodCall(FuncVA, [Arg0, Arg1, Arg2, Arg3],
-    [False, False, False, False], IntResult, FloatResultLow);
+    [sakOrdinal, sakOrdinal, sakOrdinal, sakOrdinal], IntResult, FloatResultLow);
 end;
 
 function TWinDebugger.SetStringVariable(VarAddr: UInt64; const Text, TypeHint: string): Boolean;

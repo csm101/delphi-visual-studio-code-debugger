@@ -57,12 +57,12 @@ type
     function  LocalsOffsetBase(SubRspN, ExtraPushBytes: UInt32): Integer; override;
     function  ParamsOffsetBase(SubRspN, ExtraPushBytes: UInt32): Integer; override;
 
-    // Delphi's 32-bit `register` convention, and results out of EDX:EAX or the
-    // x87 stack. Float ARGUMENTS are still refused outright rather than placed
-    // where the callee would read an integer.
+    // Delphi's 32-bit `register` convention -- arguments in EAX/EDX/ECX and on
+    // the stack at their declared widths, results out of EDX:EAX or the x87
+    // stack.
     function  PrepareSyntheticCall(TH: THandle; FuncVA: UInt64;
                 const ArgValues: array of UInt64;
-                const ArgIsFloat: array of Boolean;
+                const ArgKinds:  array of TSyntheticArgKind;
                 const SavedCtx: TContext): Boolean; override;
     function  ReadSyntheticCallResult(TH: THandle;
                 out IntResult, FloatResultLow: UInt64): Boolean; override;
@@ -394,81 +394,127 @@ begin
   Result := True;
 end;
 
-// Delphi's 32-bit `register` convention: the first three arguments travel in
-// EAX, EDX and ECX in declaration order, and the rest go on the stack.
+// Delphi's 32-bit `register` convention. Every rule below was MEASURED against
+// dcc32 output (DevTools\PrologProbe, DevTools\Win32FloatArgProbe) rather than
+// taken from documentation, which disagrees with itself here.
 //
-// The stack ORDER was taken from measurement, not documentation. PrologProbe
-// compiled an eight-parameter routine with dcc32 and found A/B/C spilled to
-// EBP-4/-8/-12 (the register three) and the remainder at D=+24, E=+20, F=+16,
-// G=+12, H=+8. H sitting closest to the return address means H was pushed
-// LAST, so the stack arguments are pushed left to right -- the opposite of
-// cdecl. Laying the frame out by hand, argument i of n therefore lands at
-// [ESP + 4 + 4*(n-1-i)].
-//
-// There is no shadow space and no 16-byte alignment requirement.
+//   * Three register slots exist -- EAX, EDX, ECX -- and only an argument that
+//     fits 32 bits and is NOT floating-point competes for one. Everything else
+//     goes on the stack and consumes no slot, so the ordinals after it keep
+//     taking registers: `Foo(A: Integer; B: Double; C: Integer)` puts A in EAX,
+//     B on the stack and C in EDX.
+//   * Stack arguments are pushed LEFT TO RIGHT -- the opposite of cdecl. An
+//     eight-parameter routine put its stack five at D=+24, E=+20, F=+16, G=+12,
+//     H=+8: H closest to the return address means H was pushed last. So the
+//     FIRST stack argument sits at the HIGHEST address.
+//   * Widths are not uniform: Single 4, Double 8, Int64 and Currency 8, and
+//     Extended 12 -- ten bytes of x87 padded to a 4-byte boundary.
+//   * There is no shadow space and no 16-byte alignment requirement.
+
+// Bytes one argument of this kind occupies on the x86 stack. Measured, not
+// derived from SizeOf: an Extended is ten bytes of x87 but is given TWELVE,
+// padded up to a 4-byte boundary.
+function StackWidthOf(Kind: TSyntheticArgKind): Cardinal;
+begin
+  case Kind of
+    sakInt64, sakDouble: Result := 8;
+    sakExtended:         Result := 12;
+  else
+    Result := 4;      // sakOrdinal and sakSingle
+  end;
+end;
+
+// Only a value that fits 32 bits AND is not floating-point competes for one of
+// the three register slots. Everything else goes on the stack WITHOUT consuming
+// a slot, which is why `Foo(A: Integer; B: Double; C: Integer)` puts A in EAX,
+// B on the stack, and C in EDX rather than on the stack behind B.
+function TakesRegisterSlot(Kind: TSyntheticArgKind): Boolean;
+begin
+  Result := Kind = sakOrdinal;
+end;
+
 function TWin32Debugger.PrepareSyntheticCall(TH: THandle; FuncVA: UInt64;
-  const ArgValues: array of UInt64; const ArgIsFloat: array of Boolean;
+  const ArgValues: array of UInt64; const ArgKinds:  array of TSyntheticArgKind;
   const SavedCtx: TContext): Boolean;
+const
+  REGISTER_SLOTS = 3;               // EAX, EDX, ECX
 var
   Ctx: TWow64Context;
 begin
   Result := False;
   if not EnsureFpuCaptureStub then
     Exit;
-  // Float ARGUMENTS are refused. (Float RESULTS work -- see the capture stub.)
-  //
-  // The blocker is the seam, not the ABI, and the ABI is now measured
-  // (DevTools\Win32FloatArgProbe):
-  //
-  //   * A float parameter consumes NO register slot. In
-  //     `Foo(A: Integer; B: Double; C: Integer)` the compiler puts A in EAX,
-  //     B on the stack, and C in EDX -- so the positional ArgValues[0..2] ->
-  //     EAX/EDX/ECX mapping below is wrong as soon as a float appears.
-  //   * Stack widths are NOT uniform: Single 4, Double 8, Currency 8,
-  //     Extended 12 (10 bytes padded to a 4-byte boundary), against the fixed
-  //     4-byte slot and 4-byte stride this routine writes.
-  //
-  // The seam passes `ArgIsFloat: array of Boolean`, which is enough on x64
-  // where every float goes into an XMM register as 8 bytes, and not enough
-  // here where the width decides the layout. A 10-byte Extended does not even
-  // fit the UInt64 that carries the value. Supporting these means widening the
-  // seam to carry each argument's TYPE and rewriting the placement below as
-  // two passes. Until then, refuse: putting a Double where the callee reads an
-  // integer yields a plausible wrong number, the worst failure available.
-  for var I := 0 to High(ArgIsFloat) do
-    if ArgIsFloat[I] then
-      Exit;
+  if RemoteCallTrap = 0 then
+    Exit;
+  if Length(ArgKinds) <> Length(ArgValues) then
+    Exit;
 
   Ctx := Default(TWow64Context);
   Ctx.ContextFlags := WOW64_CONTEXT_FULL;
   if not Wow64GetThreadContext(TH, Ctx) then
     Exit;
 
-  var StackArgs := Length(ArgValues) - 3;
-  if StackArgs < 0 then
-    StackArgs := 0;
-  // Return address plus the stack arguments, below the current stack pointer.
-  var Esp := (Ctx.Esp and not DWORD(3)) - DWORD(4 + 4 * StackArgs);
+  // PASS 1 -- hand out the three register slots, then record what is left over
+  // in declaration order along with the width each one will occupy.
+  var Regs: array[0..REGISTER_SLOTS - 1] of DWORD;
+  for var R := 0 to REGISTER_SLOTS - 1 do
+    Regs[R] := 0;
+  var RegsUsed  := 0;
+  var StackArgs: TArray<Integer> := [];
+  var StackBytes: Cardinal := 0;
+  for var I := 0 to High(ArgValues) do begin
+    if TakesRegisterSlot(ArgKinds[I]) and (RegsUsed < REGISTER_SLOTS) then begin
+      Regs[RegsUsed] := DWORD(ArgValues[I]);
+      Inc(RegsUsed);
+    end else begin
+      StackArgs := StackArgs + [I];
+      Inc(StackBytes, StackWidthOf(ArgKinds[I]));
+    end;
+  end;
+
+  // PASS 2 -- lay the stack out. Arguments are pushed LEFT TO RIGHT (measured;
+  // the opposite of cdecl), so the first stack argument ends up at the HIGHEST
+  // address and the last sits immediately above the return address.
+  var Esp := (Ctx.Esp and not DWORD(3)) - (4 + StackBytes);
   // Return into the FPU-capture stub rather than straight at the trap: it saves
   // the x87 state to memory and jumps on to the trap, so the pump still sees the
   // INT3 at the address it recognises.
-  if RemoteCallTrap = 0 then
-    Exit;
   var Ret32: Cardinal := Cardinal(FStubCode);
   if not WriteMemoryAt(Esp, @Ret32, 4) then
     Exit;
-  for var I := 3 to High(ArgValues) do begin
-    var Slot: Cardinal := Cardinal(ArgValues[I]);
-    var Addr := UInt64(Esp) + 4 + 4 * UInt64(High(ArgValues) - I);
-    if not WriteMemoryAt(Addr, @Slot, 4) then
-      Exit;
+
+  var Cursor: Cardinal := Esp + 4 + StackBytes;   // just past the last argument
+  for var J := 0 to High(StackArgs) do begin
+    var I     := StackArgs[J];
+    var Width := StackWidthOf(ArgKinds[I]);
+    Dec(Cursor, Width);
+    // Extended is the only kind whose value is not already in the target's own
+    // encoding: it travels through the seam as Double bits, because that is all
+    // an 8-byte slot can carry, and is widened to 80 bits here. The two padding
+    // bytes stay zero.
+    if ArgKinds[I] = sakExtended then begin
+      var Bytes: array[0..11] of Byte;
+      FillChar(Bytes, SizeOf(Bytes), 0);
+      var AsDouble: Double := 0;
+      PUInt64(@AsDouble)^ := ArgValues[I];
+      DoubleToExtendedBytes(AsDouble, Bytes);
+      if not WriteMemoryAt(Cursor, @Bytes[0], Width) then
+        Exit;
+    end else begin
+      // Everything else is written straight from the low Width bytes of the
+      // value: a Single already carries its 4-byte pattern, a Currency the
+      // scaled Int64.
+      var Raw: UInt64 := ArgValues[I];
+      if not WriteMemoryAt(Cursor, @Raw, Integer(Width)) then
+        Exit;
+    end;
   end;
 
   Ctx.Esp := Esp;
   Ctx.Eip := DWORD(FuncVA);
-  if Length(ArgValues) > 0 then Ctx.Eax := DWORD(ArgValues[0]);
-  if Length(ArgValues) > 1 then Ctx.Edx := DWORD(ArgValues[1]);
-  if Length(ArgValues) > 2 then Ctx.Ecx := DWORD(ArgValues[2]);
+  Ctx.Eax := Regs[0];
+  Ctx.Edx := Regs[1];
+  Ctx.Ecx := Regs[2];
   Ctx.EFlags := Ctx.EFlags and (not DWORD($100));   // clear TF
   Result := Wow64SetThreadContext(TH, Ctx);
 end;

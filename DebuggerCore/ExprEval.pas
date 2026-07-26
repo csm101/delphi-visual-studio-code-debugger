@@ -34,6 +34,14 @@ type
     IsTypeRef:    Boolean;  // True when this is a bare TYPE reference (a class /
                             // type name used as a value), not an instance. Drives
                             // class-reference member access: `TFoo.ClassMethod`.
+    IsIntLiteral: Boolean;  // True for an integer literal written in the
+                            // expression. Such a literal is typed Int64 for
+                            // storage, but that says nothing about the parameter
+                            // it is being passed to -- and on a 32-bit target an
+                            // Int64 argument occupies 8 stack bytes and no
+                            // register slot, while an ordinal takes a register.
+                            // Without the callee's declared parameter types, the
+                            // literal's own magnitude is the only signal there is.
   end;
 
   TExprEvaluator = class
@@ -172,6 +180,16 @@ type
     // the kind so aliases are not missed. Used for both argument marshalling and
     // the return-class heuristic so the two cannot drift.
     function  IsFloatValueHint(const TypeHint: string): Boolean;
+    // Classifies one synthetic-call argument for the target's calling
+    // convention. Resolves through the same TypeNameToKind as IsFloatValueHint,
+    // so the two cannot disagree about what counts as a float.
+    function  SyntheticArgKindOf(const V: TExprValue): TSyntheticArgKind;
+    // Reads a value into the 8-byte RawValue every formatter decodes from,
+    // routing the float types that do not fit that slot through the shared
+    // reader. FallbackSize comes from the CALLER because SizeForKind and
+    // PrimTypeSize know record and set widths that LocalReadSize does not.
+    function  ReadValueAt(Addr: UInt64; const TypeName: string;
+                FallbackSize: Integer; out Raw: UInt64): Boolean;
     // Converts a float-class return from the TARGET's wire encoding into the
     // raw encoding the value formatters expect (see AsDouble). Called from
     // every site that lifts a float result so the two cannot drift.
@@ -187,6 +205,10 @@ type
   end;
 
 implementation
+
+uses
+  DelphiValueReaders;   // WideFloatByteSize / ReadValueSlotRaw for the float
+                        // types that do not fit the 8-byte value slot
 
 { TExprEvaluator }
 
@@ -557,6 +579,60 @@ begin
   if SameText(TypeHint, 'Currency') then
     Exit(False);
   Result := TypeNameToKind(TypeHint) = TK_FLOAT;
+end;
+
+// Classifies one synthetic-call argument for the target's calling convention.
+// Sits next to IsFloatValueHint and resolves through the same TypeNameToKind, so
+// the two cannot disagree about what counts as a float.
+//
+// Currency is deliberately sakInt64 rather than a float kind: as an ARGUMENT it
+// is just its scaled Int64, on both architectures. (As a RESULT it does travel
+// with the floats on x86 -- see CurrencyReturnsWithFloats. The two directions
+// genuinely differ.)
+// Reading the low 8 of an Extended's 10 bytes keeps the MANTISSA and drops the
+// EXPONENT. For 0.125 the mantissa is $8000000000000000, which reads back as
+// -0.0 and displays as a perfectly innocent "0" -- no error, no clue.
+function TExprEvaluator.ReadValueAt(Addr: UInt64; const TypeName: string;
+  FallbackSize: Integer; out Raw: UInt64): Boolean;
+begin
+  Raw := 0;
+  var PtrSize := FDebugger.TargetLayout.PointerSize;
+  if WideFloatByteSize(TypeName, PtrSize) <> 0 then
+    Exit(ReadValueSlotRaw(
+      function(A: UInt64; Dest: Pointer; Sz: Integer): Boolean
+      begin
+        Result := FDebugger.ReadProcessMemoryAt(A, Dest, Sz);
+      end,
+      Addr, TypeName, PtrSize, Raw));
+  Result := FDebugger.ReadProcessMemoryAt(Addr, @Raw, Min(FallbackSize, 8));
+end;
+
+function TExprEvaluator.SyntheticArgKindOf(const V: TExprValue): TSyntheticArgKind;
+begin
+  if SameText(V.TypeHint, 'Single') then
+    Exit(sakSingle);
+  if SameText(V.TypeHint, 'Extended') or SameText(V.TypeHint, 'Extended80') then
+    Exit(sakExtended);
+  for var Name in ['Int64', 'UInt64', 'QWord', 'Currency', 'Comp'] do
+    if SameText(V.TypeHint, Name) then begin
+      // An integer LITERAL is typed Int64 for storage, which says nothing about
+      // the parameter it is passed to -- and the two differ sharply on x86,
+      // where an Int64 takes 8 stack bytes and no register slot while an
+      // ordinal takes a register. `Foo(3)` almost always means an ordinal
+      // parameter, so a literal that fits 32 bits is passed as one; one that
+      // does not could only be an Int64. A literal genuinely meant for an
+      // Int64 parameter but small enough to fit 32 bits is the case this gets
+      // wrong, and it is exactly the case the code got wrong before too -- the
+      // real fix is the callee's declared parameter types, which the debug info
+      // does not currently surface.
+      if V.IsIntLiteral and (Int64(V.RawValue) >= Low(Integer)) and
+         (Int64(V.RawValue) <= High(Integer)) then
+        Exit(sakOrdinal);
+      Exit(sakInt64);
+    end;
+  if IsFloatValueHint(V.TypeHint) then
+    Exit(sakDouble);        // Double, Real, TDateTime, TDate, TTime, aliases
+  Result := sakOrdinal;
 end;
 
 function TExprEvaluator.CurrencyReturnsWithFloats: Boolean;
@@ -1167,7 +1243,7 @@ var
   // the wrong registers) and the result is taken from RAX.
   SmallRecInRax: Boolean;
   Vals: TArray<UInt64>;
-  Flt:  TArray<Boolean>;
+  Kinds: TArray<TSyntheticArgKind>;
   RetTypeName: string;
   RetKind:     Byte;
   HaveBoundReturn: Boolean;
@@ -1457,13 +1533,13 @@ begin
   // free procedures skip it. For a class method, Self is the class reference
   // (VMT) rather than an instance pointer.
   SetLength(Vals, 0);
-  SetLength(Flt,  0);
+  SetLength(Kinds, 0);
   if not IsFreeProc then begin
     if ForceClassMethod then
       Vals := Vals + [ClassRefSelf]
     else
       Vals := Vals + [Base.RawValue];
-    Flt  := Flt  + [False];
+    Kinds := Kinds + [sakOrdinal];   // Self / class reference: a pointer
   end;
 
   // For a var-out return, the hidden result-slot pointer comes next (RDX for
@@ -1483,18 +1559,19 @@ begin
     if Slot = 0 then
       Exit(InvalidValue('<method scratch alloc failed>'));
     Vals := Vals + [Slot];
-    Flt  := Flt  + [False];
+    Kinds := Kinds + [sakOrdinal];   // hidden var-out slot: a pointer
   end;
 
-  // Marshall user args. A float goes into an XMM register by position; the kind
-  // fallback catches TDateTime and float aliases the old name list missed.
+  // Marshall user args. The KIND, not merely "is it a float", because the two
+  // architectures need different things from it: x64 uses it only to choose the
+  // register file, x86 to decide whether the argument competes for a register
+  // slot at all and how many stack bytes it occupies.
   for var I := 0 to High(Args) do begin
-    var IsFloat := IsFloatValueHint(Args[I].TypeHint);
-    Vals := Vals + [Args[I].RawValue];
-    Flt  := Flt  + [IsFloat];
+    Vals  := Vals  + [Args[I].RawValue];
+    Kinds := Kinds + [SyntheticArgKindOf(Args[I])];
   end;
 
-  if not FDebugger.RunMethodCall(FuncVA, Vals, Flt, Rax, Xmm0) then
+  if not FDebugger.RunMethodCall(FuncVA, Vals, Kinds, Rax, Xmm0) then
     Exit(InvalidValue('<method invocation failed>'));
 
   // Build the return TExprValue. When we have a bound-property return type,
@@ -1662,8 +1739,7 @@ function TExprEvaluator.ApplyDot(const Base: TExprValue; const Field: string): T
     Result.TypeInfoAddr := P.PropTypeInfoAddr;
     Size := SizeForKind(P.PropTypeKind, P.PropTypeName);
     Result.Size    := Size;
-    Raw := 0;
-    if FDebugger.ReadProcessMemoryAt(Result.Address, @Raw, Min(Size, 8)) then begin
+    if ReadValueAt(Result.Address, P.PropTypeName, Size, Raw) then begin
       Result.RawValue := Raw;
       Result.IsValid  := True;
     end else
@@ -1850,8 +1926,7 @@ function TExprEvaluator.ApplyDot(const Base: TExprValue; const Field: string): T
     if Size = 0 then Size := 8;
     Result.Address := ObjAddr + UInt64(M.FieldOffset);
     Result.Size    := Size;
-    Raw := 0;
-    if FDebugger.ReadProcessMemoryAt(Result.Address, @Raw, Min(Size, 8)) then begin
+    if ReadValueAt(Result.Address, Result.TypeHint, Size, Raw) then begin
       Result.RawValue := Raw;
       Result.IsValid  := True;
     end else
@@ -3208,8 +3283,9 @@ begin
   // Integer literal (decimal, $HEX, 0xHEX)
   if CharInSet(FExpr[FPos], ['0'..'9', '$']) then begin
     if ScanIntLiteral(IntV) then begin
-      Result          := Default(TExprValue);
-      Result.TypeHint := 'Int64';
+      Result              := Default(TExprValue);
+      Result.IsIntLiteral := True;
+      Result.TypeHint     := 'Int64';
       Result.RawValue := UInt64(IntV);
       Result.Size     := 8;
       Result.IsValid  := True;

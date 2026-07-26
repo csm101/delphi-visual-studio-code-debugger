@@ -102,6 +102,14 @@ type
     // same format. The readback here goes through target memory, so it is a
     // genuine round trip rather than an echo of what was requested.
     [Test] procedure Win32_SetWideFloatLocals_RoundTrip;
+    // Passing arguments INTO a call the debugger injects. Delphi's 32-bit
+    // `register` convention treats argument classes very differently -- only a
+    // non-float that fits 32 bits competes for EAX/EDX/ECX, everything else
+    // goes on the stack at 4, 8 or 12 bytes and consumes no register slot --
+    // so a single test method takes one of each, interleaved with ordinals, and
+    // weights them by distinct powers of two. Any argument landing in the wrong
+    // place changes the total, and the deficit names it.
+    [Test] procedure Win32_SyntheticCallArguments_MatchWin64;
     // Stepping. Inherited from the architecture-neutral base, but it rides on
     // SetThreadTrapFlag and the WOW64 single-step status code, both of which
     // are 32-bit specific -- and STATUS_WX86_SINGLE_STEP was measured rather
@@ -2430,9 +2438,13 @@ const
   // Each is asserted explicitly and excluded from the blanket comparison; the
   // guard at the end fails if either stops appearing, so a rename in TWidget
   // cannot silently retire the check.
-  DIVERGENT: array[0..1, PREFIX..TYPE_ON_32] of string =
+  // TWidget exposes the Extended twice -- as the field FArgE and as the
+  // field-backed property ArgE -- and the expansion lists both.
+  DIVERGENT: array[0..3, PREFIX..TYPE_ON_32] of string =
     (('AsPtr=', '[UInt64]', '[Cardinal]'),
-     ('AsExt=', '[Double]', '[Extended]'));
+     ('AsExt=', '[Double]', '[Extended]'),
+     ('ArgE=',  '[Double]', '[Extended]'),
+     ('FArgE=', '[Double]', '[Extended]'));
 
   function FieldsAt(const Exe, Map, Rsm: string; Line: Integer): TArray<string>;
   begin
@@ -2735,6 +2747,49 @@ const
         else if not NewValue.StartsWith(NEW_VALUE[I]) then
           Failures := Failures + [Format('%s %s: wrote %s, read back "%s"',
             [Bitness, NAMES[I], NEW_VALUE[I], NewValue])];
+      end;
+    finally
+      Session.Free;
+    end;
+  end;
+
+begin
+  var Line := MarkerLineInFile(TargetDir + SRC, MARKER);
+  Assert.IsTrue(Line > 0, 'marker not found: ' + MARKER);
+
+  var Failures: TArray<string> := [];
+  CollectFailures('x64', Win64Exe, Win64Map, Win64Rsm, Line, Failures);
+  CollectFailures('x86', Win32Exe, Win32Map, Win32Rsm, Line, Failures);
+  Assert.IsTrue(Length(Failures) = 0, string.Join(' | ', Failures));
+end;
+
+procedure TWin32RunControlTests.Win32_SyntheticCallArguments_MatchWin64;
+const
+  SRC    = 'TestTargetCore.pas';
+  MARKER = 'COMPUTE_BODY';
+  // Ordinals in registers, ordinals overflowing to the stack, a plain Double,
+  // and finally one argument of every class at once.
+  EXPRS: array[0..3] of string =
+    ('Self.Mult(3, 4)',
+     'Self.Sum5(1, 2, 3, 4, 5)',
+     'Self.Scale(2.5)',
+     'Self.SumArgs(1, Self.ArgD, 2, Self.ArgS, Self.ArgE, Self.ArgI64, Self.ArgCur)');
+  EXPECTED: array[0..3] of string = ('54', '12345', '5.5', '127');
+
+  procedure CollectFailures(const Bitness, Exe, Map, Rsm: string; Line: Integer;
+    var Failures: TArray<string>);
+  begin
+    var Session := OpenSessionAtMarker(Exe, Map, Rsm, TargetDir, SRC, Line);
+    try
+      if Ord(Session.State) <> Ord(dsStopped) then begin
+        Failures := Failures + [Bitness + ': did not stop'];
+        Exit;
+      end;
+      for var I := Low(EXPRS) to High(EXPRS) do begin
+        var R := Session.Evaluate(EXPRS[I]);
+        if not R.Value.StartsWith(EXPECTED[I]) then
+          Failures := Failures + [Format('%s %s: expected %s, got "%s"',
+            [Bitness, EXPRS[I], EXPECTED[I], R.Value])];
       end;
     finally
       Session.Free;

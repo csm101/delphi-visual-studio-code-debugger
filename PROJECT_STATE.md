@@ -190,9 +190,15 @@ Target architecture:
   integers. Variables of the float types that do not fit the 8-byte value slot
   read correctly too — `Extended` (10 bytes of x87 on Win32), `Extended80`
   (10 on both) and the pre-8087 `Real48` (6 on both).
+  Synthetic calls also PASS every argument class correctly: Delphi's 32-bit
+  `register` convention gives a register slot only to a non-float that fits 32
+  bits, and puts everything else on the stack at 4, 8 or 12 bytes without
+  consuming a slot.
 - **Limitation:** Win32 locals and parameters are supported for `-$O-` builds
-  only; `-$O+` omits the frame pointer routinely. A Win32 synthetic call still
-  refuses float *arguments* outright. See `KNOWN_UNKNOWNS.md`.
+  only; `-$O+` omits the frame pointer routinely. Separately, and on both
+  architectures, a synthetic call's argument types come from the calling
+  expression rather than the callee's declared parameters, which the debug info
+  does not surface. See `KNOWN_UNKNOWNS.md`.
 
 Stepping / control:
 - Launch with `DEBUG_ONLY_THIS_PROCESS`, optional `stopAtEntry`.

@@ -132,7 +132,7 @@ type
     function  TryResolveConstValue(const Name: string; out Value: Int64; out TypeHint: string): Boolean;
     function  GetRemoteScratchSlot(MinSize: NativeUInt): UInt64;
     function  RunMethodCall(FuncVA: UInt64; const ArgValues: array of UInt64;
-                const ArgIsFloat: array of Boolean; out IntResult, FloatResultLow: UInt64): Boolean;
+                const ArgKinds: array of TSyntheticArgKind; out IntResult, FloatResultLow: UInt64): Boolean;
     function  RunRemoteCallEx(FuncVA: UInt64; Arg0, Arg1, Arg2, Arg3: UInt64;
                 out IntResult, FloatResultLow: UInt64): Boolean;
     function  LookupEnumInfo(const TypeName: string; out Info: TRsmEnumInfo): Boolean;
@@ -217,7 +217,7 @@ procedure TFakeMemTarget.RequestAbortRemoteCall; begin end;
 function  TFakeMemTarget.TryResolveClassRef(const ClassName: string; out VA: UInt64): Boolean; begin VA := 0; Result := False; end;
 function  TFakeMemTarget.TryResolveConstValue(const Name: string; out Value: Int64; out TypeHint: string): Boolean; begin Value := 0; TypeHint := ''; Result := False; end;
 function  TFakeMemTarget.GetRemoteScratchSlot(MinSize: NativeUInt): UInt64; begin Result := 0; end;
-function  TFakeMemTarget.RunMethodCall(FuncVA: UInt64; const ArgValues: array of UInt64; const ArgIsFloat: array of Boolean; out IntResult, FloatResultLow: UInt64): Boolean; begin IntResult := 0; FloatResultLow := 0; Result := False; end;
+function  TFakeMemTarget.RunMethodCall(FuncVA: UInt64; const ArgValues: array of UInt64; const ArgKinds: array of TSyntheticArgKind; out IntResult, FloatResultLow: UInt64): Boolean; begin IntResult := 0; FloatResultLow := 0; Result := False; end;
 function  TFakeMemTarget.RunRemoteCallEx(FuncVA: UInt64; Arg0, Arg1, Arg2, Arg3: UInt64; out IntResult, FloatResultLow: UInt64): Boolean; begin IntResult := 0; FloatResultLow := 0; Result := False; end;
 procedure TFakeMemTarget.SetEnum(const AName: string; const AInfo: TRsmEnumInfo);
 begin
