@@ -176,7 +176,7 @@ object recognition and field expansion, strings, and expression evaluation
 including getter-backed properties that run real code in the debuggee.
 Multi-BPL -- the project's core use case -- verified end to end.
 
-Suite: **964 found / 962 passed / 0 failed / 0 leaked / 2 ignored.**
+Suite: **965 found / 963 passed / 0 failed / 0 leaked / 2 ignored.**
 
 NOTE ON A DIRTY RUN: one full-suite run produced a block of
 `DAP request failed: unknown error` failures across `TDebuggerTests.Test_Types_*`
@@ -200,7 +200,7 @@ wrong. In a debugger a plausible wrong number is worse than "unavailable".
 ### THE LESSON THIS WORK KEEPS TEACHING
 
 On x64 the host and target pointer sizes coincide, so **every site that
-conflates them is correct by accident**. Four separate such sites were found,
+conflates them is correct by accident**. Five separate such sites were found,
 each in a different layer, and each only became visible when the debugger was
 pointed at a different bitness: `LocalReadSize` for stack locals,
 `SyntheticLocal` for expanded fields, `PrimTypeSize`/`SizeForKind` in ExprEval,
@@ -288,6 +288,33 @@ identified both defects: the deficit names the argument that went astray.
 REMAINING, and it predates all of this: argument kinds come from the CALLING
 EXPRESSION, not the callee's declared parameter types, which debug info does not
 surface. `Foo(0.25)` passes a Double to a `Single` parameter on x64 too.
+
+### THE FIFTH host-vs-target SITE: the exception readers. Found IN THE FIELD.
+
+Reported by the user debugging a design-time package: `bds.exe` is 32-bit, so a
+design-time BPL session is a Win32 target. Every exception stop showed a bare
+`Delphi exception at $751C9F54` -- no class, no message, `$exception` not
+evaluatable, and therefore exception-TYPE FILTERS silently matching nothing.
+
+One root cause, four symptoms. In `WinDebuggerBase.pas`:
+
+* `ReadDelphiExceptionClass` read 8 bytes for the object's VMT pointer (4 on
+  Win32) and looked for TypeInfo at a hardcoded -168 (-72 on Win32).
+* `ReadDelphiExceptionClassChain` the same, plus ParentInfo at a literal +8.
+* `ReadDelphiExceptionMessage` had `EXCEPTION_FMESSAGE_OFF = 8`; `FMessage` is
+  the first field, so it follows the VMT pointer -- offset 4 on Win32.
+
+The cascade: `FExceptionObjAddr` is published ONLY once the class read succeeds,
+so a failed class read also removed `$exception` and left the filters nothing to
+match on. All three now go through the new `TWinDebugger.ReadTargetPointer` and
+`TargetLayout.VmtTypeInfo`.
+
+NEGATIVE CONTROL RUN: with `ReadTargetPointer` forced back to 8 bytes the new
+test reports `x64 "Exception" vs x86 "Delphi exception at $751C9F54"` -- the
+user's symptom, verbatim. Pinned by `Win32_ExceptionStop_NamesClassAndMessage`,
+which launches with `-run-exception-test` (the raise is switch-gated; without
+the argument the target exits without raising and the test passes vacuously --
+which is exactly how the first version of it failed).
 
 ### THE FOURTH host-vs-target SITE, and the biggest one: FIXED
 

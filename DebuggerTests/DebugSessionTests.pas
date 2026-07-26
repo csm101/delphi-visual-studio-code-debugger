@@ -110,6 +110,14 @@ type
     // weights them by distinct powers of two. Any argument landing in the wrong
     // place changes the total, and the deficit names it.
     [Test] procedure Win32_SyntheticCallArguments_MatchWin64;
+    // A Delphi exception stop must name the class and carry the message on both
+    // architectures. Reading either means walking the raised object's VMT, and
+    // the VMT slot offsets plus the pointer width are bitness-specific -- a
+    // 64-bit read on a 32-bit target lands nowhere, and the whole stop degrades
+    // to a bare "Delphi exception at ...": no class, no message, no $exception
+    // pseudo-local (it is only published once the class read succeeds), and
+    // therefore no working exception-type filters.
+    [Test] procedure Win32_ExceptionStop_NamesClassAndMessage;
     // Stepping. Inherited from the architecture-neutral base, but it rides on
     // SetThreadTrapFlag and the WOW64 single-step status code, both of which
     // are 32-bit specific -- and STATUS_WX86_SINGLE_STEP was measured rather
@@ -2804,6 +2812,59 @@ begin
   CollectFailures('x64', Win64Exe, Win64Map, Win64Rsm, Line, Failures);
   CollectFailures('x86', Win32Exe, Win32Map, Win32Rsm, Line, Failures);
   Assert.IsTrue(Length(Failures) = 0, string.Join(' | ', Failures));
+end;
+
+procedure TWin32RunControlTests.Win32_ExceptionStop_NamesClassAndMessage;
+
+  // Launches with NO breakpoint and lets the first-chance Delphi filter stop the
+  // target at whatever it raises first, which is what a real session does.
+  function FirstExceptionStop(const Exe, Map, Rsm: string): TSessionExceptionInfo;
+  begin
+    Result := Default(TSessionExceptionInfo);
+    var Session := TDebugSession.Create;
+    try
+      var Opts: TLaunchOptions;
+      Opts             := Default(TLaunchOptions);
+      Opts.ExePath     := Exe;
+      Opts.MapPath     := Map;
+      Opts.RsmPath     := Rsm;
+      Opts.SourceRoot  := TargetDir;
+      Opts.StopAtEntry := False;
+      // RunExceptionTest is switch-gated, so the default run raises nothing and
+      // the target would simply exit.
+      Opts.Args        := '-run-exception-test';
+      Assert.IsTrue(Session.Launch(Opts), 'Launch returned False');
+
+      var Deadline := GetTickCount64 + 60000;
+      while (Session.State <> dsStopped) and (not Session.HasExited) and
+            (GetTickCount64 < Deadline) do
+        Session.Pump;
+      if Session.State = dsStopped then
+        Result := Session.GetExceptionDetails;
+    finally
+      Session.Free;
+    end;
+  end;
+
+begin
+  var Exc64 := FirstExceptionStop(Win64Exe, Win64Map, Win64Rsm);
+  var Exc32 := FirstExceptionStop(Win32Exe, Win32Map, Win32Rsm);
+
+  // The 64-bit control first: if it stops naming nothing, the target changed and
+  // the comparison below would pass by agreeing on emptiness.
+  Assert.AreEqual('Exception', Exc64.ExceptionClass,
+    'x64 control did not name the raised class');
+  Assert.IsTrue(Exc64.Message <> '', 'x64 control carried no message');
+  Assert.IsTrue(Exc64.ObjectVA <> 0, 'x64 control published no $exception object');
+
+  Assert.AreEqual(Exc64.ExceptionClass, Exc32.ExceptionClass,
+    Format('exception class differs: x64 "%s" vs x86 "%s"',
+      [Exc64.ExceptionClass, Exc32.ExceptionClass]));
+  Assert.AreEqual(Exc64.Message, Exc32.Message,
+    Format('exception message differs: x64 "%s" vs x86 "%s"',
+      [Exc64.Message, Exc32.Message]));
+  Assert.IsTrue(Exc32.ObjectVA <> 0,
+    'x86 published no $exception object -- the class read must have failed');
 end;
 
 procedure PumpUntilStop(Session: TDebugSession; TimeoutMs: Cardinal);

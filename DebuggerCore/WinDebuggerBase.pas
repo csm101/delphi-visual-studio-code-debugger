@@ -236,6 +236,10 @@ type
     // at the next reported stop. Idempotent-safe (never stacks two freezes).
     procedure FreezeThreadsForStep(StepTid: DWORD);
     procedure ThawStepFrozenThreads;
+    // One TARGET pointer at Addr. The width follows the DEBUGGEE, not the
+    // adapter: reading 8 bytes on a 32-bit target splices the neighbouring
+    // value into the high half and produces an address that points nowhere.
+    function  ReadTargetPointer(Addr: UInt64; out V: UInt64): Boolean;
     function  ReadDelphiExceptionClass(ObjAddr: UInt64): string;
     function  ReadDelphiExceptionClassChain(ObjAddr: UInt64): TArray<string>;
     function  ReadDelphiExceptionMessage(ObjAddr: UInt64): string;
@@ -767,12 +771,13 @@ end;
 // For $0EEDFADE Delphi exceptions: ExcInfo0 = ExceptionInformation[0] =
 // address of the exception-object variable on the raiser's stack.
 // One dereference gives the TObject pointer; read VMT[-112] for ClassName.
+function TWinDebugger.ReadTargetPointer(Addr: UInt64; out V: UInt64): Boolean;
+begin
+  V := 0;
+  Result := ReadProcessMemoryAt(Addr, @V, TargetLayout.PointerSize);
+end;
+
 function TWinDebugger.ReadDelphiExceptionClass(ObjAddr: UInt64): string;
-const
-  // Athens 36 Win64 VMT layout -- see DelphiRtti.pas for the empirical
-  // mapping. TypeInfo lives at VMT+(-168) (NOT -144 like System.pas
-  // claims). TypeInfo layout: Kind(1) + ShortString(name) + TypeData.
-  VMT64_TYPEINFO_OFF = -168;
 var
   VmtAddr, TypeInfoAddr: UInt64;
   Buf: array[0..255] of AnsiChar;
@@ -781,11 +786,15 @@ var
 begin
   Result := '';
   if ObjAddr = 0 then Exit;
-  if not ReadProcessMemory(FProcess, Pointer(ObjAddr), @VmtAddr, 8, Read) or
-     (Read <> 8) then Exit;
-  if VmtAddr = 0 then Exit;
-  if not ReadProcessMemory(FProcess, Pointer(Int64(VmtAddr) + VMT64_TYPEINFO_OFF),
-       @TypeInfoAddr, 8, Read) or (Read <> 8) or (TypeInfoAddr = 0) then Exit;
+  // Both the object's VMT pointer and the TypeInfo slot inside the VMT are one
+  // TARGET pointer wide, and the slot's offset differs per bitness (-168 on
+  // Win64, -72 on Win32 -- measured, see TargetLayout.pas). Reading 8 bytes at a
+  // fixed -168 on a 32-bit target yields an address that points nowhere, the
+  // read fails, and the stop degrades to a bare "Delphi exception at ..." with
+  // no class, no message and no $exception pseudo-local.
+  if not ReadTargetPointer(ObjAddr, VmtAddr) or (VmtAddr = 0) then Exit;
+  if not ReadTargetPointer(UInt64(Int64(VmtAddr) + TargetLayout.VmtTypeInfo),
+       TypeInfoAddr) or (TypeInfoAddr = 0) then Exit;
   // TypeInfo[0] = Kind (Byte), TypeInfo[1..] = ShortString class name.
   if not ReadProcessMemory(FProcess, Pointer(TypeInfoAddr + 1), @Buf, SizeOf(Buf), Read) or
      (Read < 1) then Exit;
@@ -801,8 +810,6 @@ end;
 // TTypeData, whose ParentInfo (PPTypeInfo) sits at TypeData + sizeof(pointer);
 // TypeData starts right after the name. TObject's ParentInfo is nil.
 function TWinDebugger.ReadDelphiExceptionClassChain(ObjAddr: UInt64): TArray<string>;
-const
-  VMT64_TYPEINFO_OFF = -168;
 
   function ReadTypeName(TypeInfoAddr: UInt64; out NameLen: Byte): string;
   var
@@ -823,39 +830,37 @@ const
 
 var
   VmtAddr, TypeInfoAddr: UInt64;
-  Read: SIZE_T;
 begin
   Result := nil;
   if ObjAddr = 0 then Exit;
-  if not ReadProcessMemory(FProcess, Pointer(ObjAddr), @VmtAddr, 8, Read) or
-     (Read <> 8) or (VmtAddr = 0) then Exit;
-  if not ReadProcessMemory(FProcess, Pointer(Int64(VmtAddr) + VMT64_TYPEINFO_OFF),
-       @TypeInfoAddr, 8, Read) or (Read <> 8) or (TypeInfoAddr = 0) then Exit;
+  if not ReadTargetPointer(ObjAddr, VmtAddr) or (VmtAddr = 0) then Exit;
+  if not ReadTargetPointer(UInt64(Int64(VmtAddr) + TargetLayout.VmtTypeInfo),
+       TypeInfoAddr) or (TypeInfoAddr = 0) then Exit;
   var Depth := 0;
   while (TypeInfoAddr <> 0) and (Depth < 64) do begin
     var NameLen: Byte;
     var Nm := ReadTypeName(TypeInfoAddr, NameLen);
     if Nm = '' then Break;
     Result := Result + [Nm];
-    // ParentInfo (PPTypeInfo) at TypeData + 8; TypeData = TypeInfoAddr + 2 + NameLen.
+    // TTypeData for a class is ClassType(ptr) then ParentInfo(PPTypeInfo), so
+    // ParentInfo sits one TARGET pointer in. TypeData = TypeInfoAddr + 2 + NameLen.
     var ParentInfoPtr: UInt64;
-    if not ReadProcessMemory(FProcess,
-         Pointer(TypeInfoAddr + 2 + UInt64(NameLen) + 8), @ParentInfoPtr, 8, Read) or
-       (Read <> 8) or (ParentInfoPtr = 0) then Break;
+    if not ReadTargetPointer(
+         TypeInfoAddr + 2 + UInt64(NameLen) + TargetLayout.PointerSize,
+         ParentInfoPtr) or (ParentInfoPtr = 0) then Break;
     var ParentTypeInfo: UInt64;
-    if not ReadProcessMemory(FProcess, Pointer(ParentInfoPtr), @ParentTypeInfo, 8, Read) or
-       (Read <> 8) then Break;
+    if not ReadTargetPointer(ParentInfoPtr, ParentTypeInfo) then Break;
     TypeInfoAddr := ParentTypeInfo;
     Inc(Depth);
   end;
 end;
 
 // System.SysUtils.Exception declares `FMessage: string` as its first field, so
-// on Win64 it sits at offset 8 (right after the VMT pointer). The field holds a
-// UnicodeString: a pointer to the char data, with the element count at [data-4].
+// it sits immediately after the VMT pointer -- offset 8 on Win64, 4 on Win32.
+// The field holds a UnicodeString: a pointer to the char data, with the element
+// count at [data-4]. The string HEADER is bitness-neutral (Delphi fixed it that
+// way), so only the field offset and the handle's width follow the target.
 function TWinDebugger.ReadDelphiExceptionMessage(ObjAddr: UInt64): string;
-const
-  EXCEPTION_FMESSAGE_OFF = 8;
 var
   StrPtr: UInt64;
   Len: Integer;
@@ -863,8 +868,8 @@ var
 begin
   Result := '';
   if ObjAddr = 0 then Exit;
-  if not ReadProcessMemory(FProcess, Pointer(ObjAddr + EXCEPTION_FMESSAGE_OFF),
-       @StrPtr, 8, Read) or (Read <> 8) or (StrPtr = 0) then Exit;
+  if not ReadTargetPointer(ObjAddr + TargetLayout.PointerSize, StrPtr) or
+     (StrPtr = 0) then Exit;
   if not ReadProcessMemory(FProcess, Pointer(StrPtr - 4), @Len, 4, Read) or
      (Read <> 4) then Exit;
   if (Len <= 0) or (Len > 4096) then Exit;
@@ -2843,7 +2848,6 @@ function TWinDebugger.EvaluateGlobalName(const Name: string;
   out Value: TLocalValue): Boolean;
 var
   Rva: UInt64;
-  R:   SIZE_T;
   ScopeRva: UInt64;
 
   function TailName(const S: string): string;

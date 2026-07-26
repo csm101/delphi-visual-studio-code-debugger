@@ -694,7 +694,7 @@ function TDelphiRtti.IsInstanceOf(ObjAddr: UInt64;
 const
   MAX_DEPTH = 32;
 var
-  VmtAddr, TypeInfoAddr, TypeDataAddr, PPParent, PParent: UInt64;
+  VmtAddr, TypeInfoAddr, TypeDataAddr, PParent: UInt64;
   Kind: Byte;
   TypeName: string;
 begin
@@ -720,7 +720,7 @@ function TDelphiRtti.GetClassChainNames(ObjAddr: UInt64): TArray<string>;
 const
   MAX_DEPTH = 32;
 var
-  VmtAddr, TypeInfoAddr, TypeDataAddr, PPParent, PParent: UInt64;
+  VmtAddr, TypeInfoAddr, TypeDataAddr, PParent: UInt64;
   Kind: Byte;
   TypeName: string;
 begin
