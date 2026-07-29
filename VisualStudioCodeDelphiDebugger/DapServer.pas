@@ -244,6 +244,16 @@ type
     FLastStackTid: Cardinal;
                                          // (neutral session frames carry FrameRBP /
                                          // FuncEntryVA / IP for frame selection)
+    // Placeholder documents for frames with no source file. Without a `source`
+    // of any kind VS Code has nothing to open, so a stop in sourceless code
+    // looks like nothing happened at all -- the debug view does not come
+    // forward and no editor appears. A `sourceReference` gives the client a
+    // document to open; the text says WHY there is no source. Keyed by the
+    // frame label so the same address reuses one reference, which is what lets
+    // the client cache the content.
+    FSynthSourceRefs:    TDictionary<string, Integer>;
+    FSynthSourceTexts:   TDictionary<Integer, string>;
+    FNextSynthSourceRef: Integer;
     FExePath:    string;
     FMapPath:    string;
     FRsmPath:    string;
@@ -378,6 +388,12 @@ type
     procedure HandleStepOut(Seq: Integer; Args: TJSONObject);
     procedure HandlePause(Seq: Integer; Args: TJSONObject);
     procedure HandleStackTrace(Seq: Integer; Args: TJSONObject);
+    // Placeholder document for a frame the providers could not give source for.
+    procedure HandleSource(Seq: Integer; Args: TJSONObject);
+    function  SyntheticSourceText(const F: TSessionFrame): string;
+    function  SyntheticSourceRef(const ALabel: string; const F: TSessionFrame): Integer;
+    procedure AttachPlaceholderSource(FO: TJSONObject; const F: TSessionFrame;
+                const ALabel: string);
     procedure HandleScopes(Seq: Integer; Args: TJSONObject);
     procedure HandleVariables(Seq: Integer; Args: TJSONObject);
     procedure HandleEvaluate(Seq: Integer; Args: TJSONObject);
@@ -509,6 +525,9 @@ begin
   FRefToHandle := TDictionary<Integer, TVarHandle>.Create;
   FHandleToRef := TDictionary<TVarHandle, Integer>.Create;
   FEvalMissCache   := TDictionary<string, string>.Create;
+  FSynthSourceRefs    := TDictionary<string, Integer>.Create;
+  FSynthSourceTexts   := TDictionary<Integer, string>.Create;
+  FNextSynthSourceRef := 1;   // 0 means "use the path", so references start at 1
   FNextExpRef := EXPANSION_REF_BASE;
   FAdapterStartTick := GetTickCount64;
   // Status bar is the default rendering location; launch/attach may override it.
@@ -615,6 +634,8 @@ begin
   FRefToHandle.Free;
   FHandleToRef.Free;
   FEvalMissCache.Free;
+  FSynthSourceRefs.Free;
+  FSynthSourceTexts.Free;
   FBpIds.Free;
   FBpSourcePath.Free;
   FIO.Free;
@@ -2128,6 +2149,108 @@ begin
   Result := Format('0x%x (%s)', [F.IP, Reason]);
 end;
 
+// Text of the placeholder document opened for a frame with no source. It exists
+// to make a stop VISIBLE: without any `source` the client has nothing to bring
+// forward, so stopping in sourceless code is indistinguishable from not stopping
+// at all. Says which of the three reasons applies and what can be done about it.
+function TDapServer.SyntheticSourceText(const F: TSessionFrame): string;
+begin
+  var Reason: string;
+  var Advice: string;
+  case F.Symbols of
+    saNoSymbols: begin
+      Reason := 'no debug information of any kind was found for this module';
+      Advice := 'If the module is yours, rebuild it with -V -VN -VR. System DLLs' +
+                ' never have Delphi debug info and are expected here.';
+    end;
+    saIndexing: begin
+      Reason := 'the symbol index for this module is still being built';
+      Advice := 'Refresh the call stack in a moment -- this frame should resolve' +
+                ' on its own once indexing finishes.';
+    end;
+    saLoaded: begin
+      Reason := 'debug information was loaded, but it does not cover this address';
+      Advice := 'The module''s symbol files may be older than the binary, or this' +
+                ' code may come from a unit compiled without debug info. Rebuild' +
+                ' the module and check the console for stale-symbol warnings.';
+    end;
+  else
+    Reason := 'no loaded module owns this address';
+    Advice := 'This is usually a frame the stack walker could not resolve.' +
+              ' Frames below it may still be correct.';
+  end;
+  Result :=
+    'No source available for this stack frame.' + sLineBreak + sLineBreak +
+    Format('    Address : 0x%x', [F.IP]) + sLineBreak;
+  if F.ModuleName <> '' then
+    Result := Result + Format('    Module  : %s', [F.ModuleName]) + sLineBreak;
+  if F.FunctionName <> '' then
+    Result := Result + Format('    Function: %s', [F.FunctionName]) + sLineBreak;
+  Result := Result + sLineBreak +
+    'The debugger IS stopped here.' + sLineBreak + sLineBreak +
+    'Why there is no source: ' + Reason + '.' + sLineBreak + sLineBreak +
+    Advice + sLineBreak + sLineBreak +
+    'Selecting a frame further down the call stack will open real source if any' +
+    ' frame there has it.' + sLineBreak;
+end;
+
+// Gives a sourceless frame a `source` backed by a sourceReference instead of a
+// path, plus line 1, so the client has something to select and open.
+procedure TDapServer.AttachPlaceholderSource(FO: TJSONObject;
+  const F: TSessionFrame; const ALabel: string);
+begin
+  var Src := TJSONObject.Create;
+  Src.AddPair('name', ALabel);
+  Src.AddPair('sourceReference', TJSONNumber.Create(SyntheticSourceRef(ALabel, F)));
+  // deemphasize: the client greys the document and keeps it out of "recent
+  // files" -- it is a diagnostic, not a file the user opened.
+  Src.AddPair('presentationHint', 'deemphasize');
+  if F.ModuleName <> '' then
+    Src.AddPair('origin', F.ModuleName);
+  FO.AddPair('source', Src);
+  FO.AddPair('line',   TJSONNumber.Create(1));
+  FO.AddPair('column', TJSONNumber.Create(1));
+end;
+
+// Registers (or reuses) a placeholder document for Label and returns its DAP
+// sourceReference. Reused per label so the client can cache the content and so a
+// long session does not mint a reference per stack request.
+function TDapServer.SyntheticSourceRef(const ALabel: string; const F: TSessionFrame): Integer;
+begin
+  if FSynthSourceRefs.TryGetValue(ALabel, Result) then
+    Exit;
+  Result := FNextSynthSourceRef;
+  Inc(FNextSynthSourceRef);
+  FSynthSourceRefs.Add(ALabel, Result);
+  FSynthSourceTexts.Add(Result, SyntheticSourceText(F));
+end;
+
+procedure TDapServer.HandleSource(Seq: Integer; Args: TJSONObject);
+begin
+  var Ref := 0;
+  if Args <> nil then begin
+    Ref := Integer(Args.GetValue<Int64>('sourceReference', 0));
+    if Ref = 0 then begin
+      var Src := Args.GetValue<TJSONObject>('source', nil);
+      if Src <> nil then
+        Ref := Integer(Src.GetValue<Int64>('sourceReference', 0));
+    end;
+  end;
+  var Text: string;
+  if not FSynthSourceTexts.TryGetValue(Ref, Text) then begin
+    FIO.SendErrorResponse(Seq, 'source', Format('Unknown sourceReference %d', [Ref]));
+    Exit;
+  end;
+  var Body := TJSONObject.Create;
+  try
+    Body.AddPair('content', Text);
+    Body.AddPair('mimeType', 'text/plain');
+    FIO.SendResponse(Seq, 'source', True, Body);
+  finally
+    Body.Free;
+  end;
+end;
+
 procedure TDapServer.HandleStackTrace(Seq: Integer; Args: TJSONObject);
 var
   Body:      TJSONObject;
@@ -2199,9 +2322,13 @@ begin
           FO.AddPair('source', SrcS);
           FO.AddPair('line',   TJSONNumber.Create(SynthLine));
           FO.AddPair('column', TJSONNumber.Create(1));
-        end;
-      end else
-        FO.AddPair('name', NamelessFrameLabel(F));
+        end else
+          AttachPlaceholderSource(FO, F, F.FunctionName);
+      end else begin
+        var Nameless := NamelessFrameLabel(F);
+        FO.AddPair('name', Nameless);
+        AttachPlaceholderSource(FO, F, Nameless);
+      end;
       FrameArr.AddElement(FO);
     end;
     Body.AddPair('stackFrames', FrameArr);
@@ -2911,6 +3038,7 @@ begin
     else if Cmd = 'stepOut'           then HandleStepOut(Seq, Args)
     else if Cmd = 'pause'             then HandlePause(Seq, Args)
     else if Cmd = 'stackTrace'        then HandleStackTrace(Seq, Args)
+    else if Cmd = 'source'            then HandleSource(Seq, Args)
     else if Cmd = 'scopes'            then HandleScopes(Seq, Args)
     else if Cmd = 'variables'         then HandleVariables(Seq, Args)
     else if Cmd = 'evaluate'          then HandleEvaluate(Seq, Args)

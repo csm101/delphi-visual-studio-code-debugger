@@ -861,6 +861,17 @@ Three modes plus a none state:
     the function) and run full-speed; when it fires, resume single-stepping. On a
     return, the step completed in the caller → stop.
 
+    That `[RSP]` read is **one TARGET pointer wide** (`ReadTargetPointer`), and
+    the resume-SP guard advances by `TargetLayout.PointerSize`, not a literal 8 —
+    the width the matching RET pops. Reading 8 bytes on a 32-bit target splices
+    the next stack word into the high half; observed in the field as a resume BP
+    planted at `$5196C430B5AA25BC` (low half the real return address, high half an
+    unrelated `rtl290.bpl` address), which failed to plant and let the step-over
+    run free. The step-over FALLBACK path (import thunk / no function range)
+    validates its return address with `IsPlausibleReturnAddress`, the same guard
+    `smOut` uses, so a bad unwind degrades to single-stepping instead of patching
+    an INT3 into an arbitrary byte.
+
   The per-step decision lives in one place (`HandleSmOverStep`), called from the
   single-step handler **and** from the persistent-BP re-arm path. The latter
   matters: when the step starts on a line that carries a user BP, the re-arm
@@ -1009,6 +1020,37 @@ in three different situations: an address in no known module, a module built
 without debug info, and a module whose index is still building. The DAP frontend
 emits `moduleId` and names such a frame `0x… (module: reason)`; the MCP frontend
 emits `module` plus a `symbols` field on every frame.
+
+### Placeholder source for a frame with no source file (DAP)
+
+Naming such a frame is not enough. A DAP `stackFrame` with **no `source` at all**
+gives the client nothing to open, so a stop in sourceless code is
+indistinguishable in the editor from no stop at all: the debug view does not come
+forward, no editor appears, and the only sign the target stopped is that it went
+quiet. Reported from the field on a design-time package session, where the IDE
+stopped at `0x76549F54 (kernelbase.dll: no symbols)` and the editor did nothing.
+
+Every frame that would otherwise carry no `source` now gets one built on a
+**`sourceReference`** rather than a path (`TDapServer.AttachPlaceholderSource`),
+with `presentationHint: deemphasize` (the client greys it and keeps it out of
+recent files — it is a diagnostic, not a file the user opened) and `origin` set
+to the module. The `source` request (`HandleSource`) returns a generated document
+that names the address, the module and the function, states plainly that the
+debugger IS stopped there, and spells out which of the four
+`TSymbolAvailability` reasons applies together with what to do about it.
+
+References are minted per frame LABEL and reused (`FSynthSourceRefs` /
+`FSynthSourceTexts`), so the client can cache content and a long session does not
+mint a reference per stack request. They start at 1 because 0 means "use the
+path".
+
+MCP needs no equivalent: it has no editor to drive, and it already reports
+`module` + `symbols` on every frame.
+
+Pinned by `Test_SourcelessFrame_HasPlaceholderDocument`, which uses the parked
+worker thread (`Sleep(INFINITE)`, so the bottom of its stack is always
+ntdll/kernel32) and fails loudly if no sourceless frame is present rather than
+passing vacuously.
 
 ## Local variable readout
 

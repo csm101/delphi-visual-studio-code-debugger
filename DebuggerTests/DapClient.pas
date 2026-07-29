@@ -114,6 +114,7 @@ type
     function    StepIn(ThreadId: Integer = 1): TJSONObject;
     function    StepOut(ThreadId: Integer = 1): TJSONObject;
     function    StepOver(ThreadId: Integer = 1): TJSONObject;
+    function    SourceContent(SourceReference: Integer): TJSONObject;
     function    StackTrace(ThreadId: Integer = 1): TJSONObject;
     function    Threads: TJSONObject;
     function    ExceptionInfo(ThreadId: Integer): TJSONObject;
@@ -820,6 +821,18 @@ begin
   Args.AddPair('threadId', TJSONNumber.Create(ThreadId));
   Args.AddPair('levels',   TJSONNumber.Create(10));
   Result := WaitResp(SendCmd('stackTrace', Args));
+end;
+
+// DAP `source`: fetches the content behind a frame's sourceReference. The
+// adapter uses one only for the placeholder document it synthesises for frames
+// with no real source file.
+function TDapClient.SourceContent(SourceReference: Integer): TJSONObject;
+var
+  Args: TJSONObject;
+begin
+  Args := TJSONObject.Create;
+  Args.AddPair('sourceReference', TJSONNumber.Create(SourceReference));
+  Result := WaitResp(SendCmd('source', Args));
 end;
 
 function TDapClient.Threads: TJSONObject;

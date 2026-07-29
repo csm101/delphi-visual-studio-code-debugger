@@ -641,6 +641,10 @@ type
     [Test] procedure Test_Threads_Enumerated_NamedWorkers;
     [Test] procedure Test_Threads_NonStopped_StackInspectable;
     [Test] procedure Test_Threads_BpOnWorker_LocalVisible;
+    // A frame with no source must still carry a `source` (a sourceReference to a
+    // placeholder document), or a stop in sourceless code is invisible in the
+    // editor -- reported from the field on a design-time package session.
+    [Test] procedure Test_SourcelessFrame_HasPlaceholderDocument;
     [Test] procedure Test_Threads_ExceptionInWorker;
     [Test] procedure Test_Threads_NameThreadForDebugging_SurfacesLive;
     [Test] procedure Test_Threads_NameAnnouncement_NeverStops_WithAllFilter;
@@ -4967,6 +4971,92 @@ begin
       'worker stackTrace must contain ThreadWorker (proves it is the worker''s own stack, not main''s)');
   finally
     ST.Free;
+  end;
+end;
+
+procedure TDebuggerTests.Test_SourcelessFrame_HasPlaceholderDocument;
+// A frame the symbol providers cannot give source for must still carry a
+// `source` -- one backed by a sourceReference rather than a path. Without it the
+// client has nothing to open, and a stop in sourceless code looks in the editor
+// exactly like no stop at all: no debug view, no editor, no sign of life.
+//
+// The worker thread is parked in Sleep(INFINITE), so the bottom of its stack is
+// always inside ntdll/kernel32 -- frames no Delphi symbol provider can name.
+// That is what makes this fixture a reliable source of the case; the test fails
+// loudly rather than passing vacuously if no such frame is present.
+var
+  FrameId, LocalsRef: Integer;
+  Resp, ST: TJSONObject;
+  Arr, Frames: TJSONArray;
+
+  function WorkerTid: Integer;
+  begin
+    Result := 0;
+    Resp := FClient.Threads;
+    try
+      Arr := Resp.GetValue<TJSONArray>('threads');
+      for var I := 0 to Arr.Count - 1 do begin
+        var T := Arr.Items[I] as TJSONObject;
+        if T.GetValue<string>('name', '').Contains('TestWorker') then
+          Exit(T.GetValue<Integer>('id', 0));
+      end;
+    finally
+      Resp.Free;
+    end;
+  end;
+
+begin
+  StartSession('THREADS_READY', FrameId, LocalsRef, ['--run-threads']);
+  var Tid := WorkerTid;
+  Assert.IsTrue(Tid > 0, 'no worker thread found in the threads list');
+
+  var Ref := 0;
+  var FrameLabel := '';
+  ST := FClient.StackTrace(Tid);
+  try
+    Frames := ST.GetValue<TJSONArray>('stackFrames');
+    Assert.IsNotNull(Frames, 'stackTrace for the worker returned no frames array');
+    for var I := 0 to Frames.Count - 1 do begin
+      var F   := Frames.Items[I] as TJSONObject;
+      var Src := F.GetValue<TJSONObject>('source', nil);
+      if Src = nil then
+        Continue;
+      if Src.GetValue<string>('path', '') <> '' then
+        Continue;   // a real file: not the case under test
+      Ref := Src.GetValue<Integer>('sourceReference', 0);
+      if Ref > 0 then begin
+        FrameLabel := F.GetValue<string>('name', '');
+        Break;
+      end;
+    end;
+  finally
+    ST.Free;
+  end;
+  Assert.IsTrue(Ref > 0,
+    'no frame on the parked worker''s stack offered a placeholder sourceReference ' +
+    '(the bottom of that stack is ntdll/kernel32 and cannot have source)');
+
+  var Content := '';
+  Resp := FClient.SourceContent(Ref);
+  try
+    Content := Resp.GetValue<string>('content', '');
+  finally
+    Resp.Free;
+  end;
+  Assert.IsTrue(Content.Contains('No source available'),
+    'the placeholder document must say there is no source; got: ' + Content);
+  Assert.IsTrue(Content.Contains('The debugger IS stopped here'),
+    'the placeholder must state the target IS stopped -- that is its whole point');
+  // The label carries the address; the document must name the same one, so the
+  // user can tell WHICH frame they are looking at.
+  var HexStart := FrameLabel.IndexOf('0x');
+  if HexStart >= 0 then begin
+    var Addr := FrameLabel.Substring(HexStart);
+    var SpacePos := Addr.IndexOf(' ');
+    if SpacePos > 0 then
+      Addr := Addr.Substring(0, SpacePos);
+    Assert.IsTrue(Content.Contains(Addr),
+      Format('the placeholder must name the frame address %s; got: %s', [Addr, Content]));
   end;
 end;
 

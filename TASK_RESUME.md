@@ -335,6 +335,147 @@ USER-SIDE ISSUE worth repeating to them: the log warns
 `qbfdesignd29.bpl RSM is OLDER than the BPL -- it will be IGNORED`, so that
 package's types/locals come from TD32 only until it is rebuilt.
 
+### FIELD ROUND 2 (2026-07-29): three defects reported from the bds.exe session
+
+All three diagnosed from the adapter's OWN log (`%TEMP%\dap_adapter.log`, which
+survives the session and is append-only) rather than by re-running anything.
+That log is the first thing to reach for on a field report.
+
+**1. Frames read `TFrmColumns@Create` instead of `TFrmColumns.Create`. FIXED.**
+Traced to the provider by asking each one directly
+(`Td32AliasProbe -rvaname 24688 <bpl>` -> `TD32 : TFrmColumns@Create`), so no
+guessing about which of RSM/TD32/MAP/DCP produced it. Cause: an IDE-built package
+stores method names with NO leading `@`, i.e. with no unit component
+(`TFrmColumns@Create`), while `dcc32` on a normal build emits the anchored
+`@Unit@TClass@Method$qqr...`. `DemangleBorland` required the leading `@`, so the
+unanchored shape fell through to `Friendly := Mangled` and the raw name reached
+the call stack. It now handles both: anchored keeps its "first component is the
+unit, drop it for a plain routine" rule; unanchored treats every component as a
+real scope and a name with no `@` at all is still rejected as unmangled.
+Pinned by `TD32ReaderTests.Demangle_Borland_UnanchoredClassMethod_BecomesDotted`,
+which asserts BOTH shapes plus the two unchanged anchored ones.
+
+**2. Step-over on `inherited` ran away instead of stopping. FIXED. Sixth
+host-vs-target site, and the first one in the RUN-CONTROL layer.**
+The log line that named it:
+`PlantInt3 FAIL ReadByte VA=$5196C430B5AA25BC LastError=998` -- low half
+`$B5AA25BC` the real return address, high half `$5196C430` an unrelated rtl290
+address. `TWinDebugger.HandleSmOverStep` read the CALL-pushed return address with
+`ReadProcessMemoryAt(CurSP, @RetTop, 8)`; on a 32-bit target that splices the next
+stack word into the high half. Now `ReadTargetPointer`, and the matching
+`FStepResumeSP := CurSP + 8` (the width the RET pops) is
+`CurSP + TargetLayout.PointerSize`.
+
+Second, independent defect in the same path, fixed with it: the step-over
+fallback planted its one-shot BP after testing only `RetAddr <> 0`, where the
+step-OUT path next to it uses `IsPlausibleReturnAddress`. With the guard the
+garbage address would have been refused and the step would have degraded to
+single-stepping instead of running free.
+
+WHY NO EXISTING TEST CAUGHT IT: `Win32_StepOver_AdvancesWithinTheSameFrame` steps
+over `W.StepIntoProbe(1234, 'probe-str', 2.5)`. On x86 the first three arguments
+go in EAX/EDX/ECX and the fourth is pushed -- here the Double 2.5, whose low 4
+bytes are ZERO, so the over-wide read produced the RIGHT address by accident.
+New fixture `RunStepOverStackArg` passes `Integer($5EEDBEEF)` as the stack
+argument precisely so every byte is non-zero; pinned by
+`Win32_StepOverCallWithStackArgument_LandsOnTheNextLine`. The assertion that
+matters is "stopped at all" -- the failure mode is a runaway, not a wrong line.
+
+**3. A stop in sourceless code was INVISIBLE in the editor. FIXED (DAP only).**
+Stopping at e.g. `0x76549F54 (kernelbase.dll: no symbols)` sent a `stopped` event
+whose frames carried no `source` at all, so VS Code had nothing to bring forward:
+no debug view, no editor, no sign the target had stopped. Such a frame now gets a
+`source` backed by a `sourceReference` (plus `presentationHint: deemphasize` and
+`origin` = module), and the new `source` request returns a placeholder document
+naming the address, the module, and WHICH of the four reasons applies
+(`no symbols` / `symbols indexing` / `not covered by symbols` / `unknown module`)
+with what to do about each. `TDapServer.SyntheticSourceText` /
+`SyntheticSourceRef` / `AttachPlaceholderSource` / `HandleSource`; references are
+reused per frame label so the client can cache them.
+MCP needs no equivalent -- it has no editor to drive.
+
+NEGATIVE CONTROLS RUN, not assumed -- each new test was checked to actually bite:
+* step-over: with `ReadTargetPointer` put back to an 8-byte read,
+  `Win32_StepOverCallWithStackArgument_LandsOnTheNextLine` fails with
+  `Expected [5] but got [6] ... never stopped again`, while the OLD
+  `Win32_StepOver_AdvancesWithinTheSameFrame` still passes -- confirming it never
+  could have caught this.
+* placeholder source: with `AttachPlaceholderSource` removed from both call
+  sites, `Test_SourcelessFrame_HasPlaceholderDocument` fails in BOTH fixtures
+  with its intended message.
+* demangler: the unanchored assertion fails by construction on the old code,
+  which returned False for any name without a leading `@`.
+
+**PROCESS TRAP, cost one full 400 s run and a scare: NEVER edit a test-target
+source while `build_and_run.bat` is running.** Editing `TestTargetCore.pas`
+mid-run produced 72 failed / 39 errored across `TDebuggerTests` -- locals "not
+found", getters returning code bytes (`0xEC834853`), "method invocation failed".
+None of it was a real regression: the target `.exe` had already been compiled
+from the OLD source while `MarkerLineInFile` read the NEW one, so every
+`{BP:MARKER}` resolved to a line the binary did not have. This is the same
+signature as the recorded stale-binary line-shift trap, reached by a different
+route. If a run reports breakage on that scale, check for a source edit during
+the build BEFORE believing the failures.
+
+STILL OPEN from the same log, NOT addressed: frame 1 is still
+`0x14FF318 (unknown module)` -- a stack address taken as a return address, the
+long-standing i386-walk gap. And `FormatTyped class Raw=$47E85510
+DeclaredType="TFrmColumns" RuntimeVmtClass="TAddInExpert"` at a constructor's
+first line looks wrong (the runtime class should be a DESCENDANT of the declared
+one, and `tmp` read as garbage there); worth its own look -- possibly locals read
+before the prologue completed.
+
+### SIDE THREAD (2026-07-29): "why does TD32 lose TDateTime, when the IDE never does?"
+
+Question from the user, settled by measurement with the new
+`DevTools\Td32AliasProbe` (see `DevTools\README.md`). Full write-up in
+`TD32_FORMAT_NOTES.md` -> "Named float aliases are FLATTENED at the variable".
+
+* The compiler resolves the alias when it WRITES the variable record: a local
+  declared `TDateTime` carries CV id `$0041` (bare `Double`) on BOTH bitnesses,
+  and `TDateTime`/`Real`/`Extended`/`Currency`/... have NO record in the TYPES
+  table -- they are primitives. So the missing thing is the LINK from variable
+  to declared type, not a type dictionary; no external name source can rebuild
+  it. `S_UDT` ($0004, parsed-and-skipped) cannot help: many aliases map to
+  `$0041` and nothing points back.
+* The IDE is not reading a format -- it IS the compiler front end, with the DCU
+  symbol tables in process (its Evaluate window answers with COMPILER error
+  codes, e.g. `E2003`).
+* **`.dcp` keeps the alias.** Verified on a real Win32 package: `QBFD29.dcp`
+  reports `TDateTime` / `Currency` / `Double` / `Extended` as distinct hints. So
+  BPL code needs no DCU reader for this. Uncovered case = a plain exe with no
+  `.rsm`.
+* Incidental: the `.rsm` beside a BPL can be nearly empty (`QBFDesignD29.rsm` is
+  51 KB for a 10.9 MB BPL, **no locals at all**) -- the `.dcp` is the real
+  RSM-format provider for packages, so the "RSM is OLDER" console warning
+  matters less than it reads. That package's `.rsm` now also has the same
+  mtime as its `.bpl`, so the warning the user saw should already be gone.
+* `DEBUG_INFO_FORMATS_TODO.md` P2 (DCU = WON'T DO) amended: its "zero consumer"
+  claim was too strong. Verdict unchanged -- the payoff is rendering only, and
+  the cheap option for the uncovered case is reading the DECLARATION from the
+  source, not a DCU reader.
+
+FIXED in the same change set (two real decoding gaps, both bitness-independent):
+`PrimitiveTypeName` had no case for `$0044` (`Real48`), so such a local reported
+an EMPTY type name; `ArrayElemByteSize` (the oracle behind `TypeSizeById`, which
+feeds `TClassMember.TypeSize` and thence the evaluator's getter-return decoding)
+covered neither `$04` (Currency, 8) nor `$44` (Real48, 6) and returned 0.
+Pinned by `TD32ReaderTests.PrimitiveIds_CurrencyAndReal48_HaveNameAndSize`.
+
+NOT CHANGED, flagged deliberately: `ArrayElemByteSize` returns 8 for `$42`
+(`Extended`), commented "stored 8". `$42` only ever appears in 32-bit output,
+where the type really is 10 bytes -- so `array of Extended` strides wrong and a
+member size is wrong on Win32. Left alone because `TypeSize` feeds read widths
+into 8-byte slots (`ExprEval.pas:755/791/804`) and widening it blind could
+overflow one. Needs its own pass with a test.
+
+GATE NOTE: the full `build_and_run.bat` could NOT run -- `F2039 Could not create
+output file ...VisualStudioCodeDelphiDebugger.exe`, because a LIVE adapter
+(debugging `bds.exe`) held it. Only `build_runner.bat` + `run_tests.bat` was
+run, i.e. the reader change is compiled into RunTests.exe but the adapter binary
+under test is the previous build. Re-run the full suite once the user's session
+is closed.
+
 ### THE FIFTH host-vs-target SITE: the exception readers. Found IN THE FIELD.
 
 Reported by the user debugging a design-time package: `bds.exe` is 32-bit, so a
