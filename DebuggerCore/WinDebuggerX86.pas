@@ -19,9 +19,11 @@ unit WinDebuggerX86;
 //     shared debug loop, which accepts $4000001F and $4000001E alongside the
 //     native ones.
 //   * The register file is reached through Wow64Get/SetThreadContext.
-//   * StackWalk64 unwinds i386 correctly given a WOW64 context; dbghelp
-//     contributes nothing to that walk for a Delphi target, so no hand-rolled
-//     EBP walker is needed.
+//   * StackWalk64 unwinds i386 given a WOW64 context, and dbghelp contributes
+//     nothing to that walk for a Delphi target. Phase 0 concluded from this that
+//     no hand-rolled EBP walker was needed; the FIELD disproved it (see
+//     WalkRawFrames below), so the EBP chain now drives the walk and StackWalk64
+//     is the fallback.
 //   * `mov ebp,esp` PRECEDES the frame allocation on x86 -- the opposite of
 //     x64 -- so the return address is always [EBP+4] and no frame size is
 //     needed to find it.
@@ -51,6 +53,8 @@ type
     function  SetThreadTrapFlag(TID: DWORD; Enable: Boolean): Boolean; override;
     function  FillStackWalkContext(TH: THandle; var Buf: TContext;
                 out SeedPc, SeedSp, SeedFp: UInt64): Boolean; override;
+    function  WalkRawFrames(TH: THandle; SeedPc, SeedSp, SeedFp: UInt64;
+                MaxFrames: Integer): TArray<TRawStackFrame>; override;
 
     function  ReadPrologInfo(EntryVA: UInt64; out ExtraPushBytes: UInt32;
                 out Recognised: Boolean): UInt32; override;
@@ -183,6 +187,84 @@ begin
   SeedPc := Ctx^.Eip;
   SeedSp := Ctx^.Esp;
   SeedFp := Ctx^.Ebp;
+end;
+
+// Walks the EBP chain instead of asking dbghelp.
+//
+// On x86 `mov ebp,esp` runs BEFORE the frame allocation, so inside a framed
+// routine the saved caller EBP is at [EBP] and the return address at [EBP+4] --
+// exact, and needing no unwind information at all. dbghelp's i386 unwind is not:
+// debugging a design-time package inside bds.exe it returned $14FF318 for the
+// caller of a Delphi frame -- a STACK address -- which fabricated a bogus frame
+// and LOST the real caller, so the join into the VCL frames was junk. The same
+// defect made step-over hang until CallerReturnAddress started reading [EBP+4]
+// directly; this applies the identical reasoning to the whole walk.
+//
+// Every link is validated rather than trusted, because the chain does end: a
+// frameless routine (system DLLs are routinely built with the frame pointer
+// omitted, and a pure-`asm` body has no frame either) leaves EBP pointing at
+// some ancestor's frame or at nothing at all. When a link fails the walk stops
+// and, if it produced almost nothing, defers to the inherited StackWalk64 --
+// which for a stack that is mostly system code may still do better.
+function TWin32Debugger.WalkRawFrames(TH: THandle; SeedPc, SeedSp, SeedFp: UInt64;
+  MaxFrames: Integer): TArray<TRawStackFrame>;
+const
+  MAX_FRAME_SPAN = $100000;   // 1 MB: larger than any real single stack frame
+
+  // A frame pointer must be inside the thread's stack, above the previous one
+  // (the stack grows DOWN, so a caller's frame is at a HIGHER address), 4-byte
+  // aligned, and not absurdly far away. Anything else means the chain has run
+  // off the end of the framed region.
+  function IsPlausibleNextFramePtr(Prev, Next: UInt64): Boolean;
+  begin
+    if (Next = 0) or (Next > $FFFFFFFF) then
+      Exit(False);
+    if Next <= Prev then
+      Exit(False);
+    if Next - Prev > MAX_FRAME_SPAN then
+      Exit(False);
+    Result := (Next and 3) = 0;
+  end;
+
+begin
+  SetLength(Result, 0);
+  if MaxFrames <= 0 then
+    Exit;
+
+  var Frame0: TRawStackFrame;
+  Frame0.PC       := SeedPc;
+  Frame0.FramePtr := SeedFp;
+  Result := [Frame0];
+
+  var Fp := SeedFp;
+  while Length(Result) < MaxFrames do begin
+    if (Fp = 0) or (Fp > $FFFFFFFF) then
+      Break;
+    var Ret:    UInt64 := 0;
+    var NextFp: UInt64 := 0;
+    if not ReadTargetPointer(Fp + 4, Ret) then
+      Break;
+    if not ReadTargetPointer(Fp, NextFp) then
+      Break;
+    if not IsPlausibleReturnAddress(Ret) then
+      Break;
+    if not IsPlausibleNextFramePtr(Fp, NextFp) then
+      Break;
+    var Raw: TRawStackFrame;
+    Raw.PC       := Ret;
+    Raw.FramePtr := NextFp;
+    Result := Result + [Raw];
+    Fp := NextFp;
+  end;
+
+  // The chain died immediately -- frame 0 sits in frameless code, so there is
+  // nothing to chain from. dbghelp may still have something; take its answer
+  // when it is richer than ours.
+  if Length(Result) > 2 then
+    Exit;
+  var ViaDbgHelp := inherited WalkRawFrames(TH, SeedPc, SeedSp, SeedFp, MaxFrames);
+  if Length(ViaDbgHelp) > Length(Result) then
+    Result := ViaDbgHelp;
 end;
 
 { --------------------------------------------------------- prologue decode -- }

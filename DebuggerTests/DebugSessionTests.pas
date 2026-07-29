@@ -45,6 +45,16 @@ type
     // regression, a stack-walk regression and a symbol-resolution regression
     // without asserting any hardcoded name.
     [Test] procedure Win32_StackFrameNames_MatchWin64;
+    // Structural invariants of the walk itself: a frame's PC is CODE and a
+    // caller's frame sits at a HIGHER address than its callee's. dbghelp's i386
+    // unwind broke both in the field, returning a stack address as the caller's
+    // PC and losing the real caller with it.
+    [Test] procedure Win32_CallStack_FramesAreCodeAndFramePointersAscend;
+    // A breakpoint placed on a routine's `begin` line resolves to the routine's
+    // ENTRY, where the prologue has not spilled Self or the by-register
+    // parameters yet, so every local reads the CALLER's frame. Both bitnesses
+    // must report the values actually passed.
+    [Test] procedure BreakpointOnBeginLine_ReportsPassedParameters;
     // Stack locals. Covers the x86 prologue decoder (`add esp,-N` rather than
     // `sub esp,N`, `mov ebp,esp` before the allocation) and the zero offset
     // bases that follow from it. Compared against x64 rather than asserted
@@ -2338,6 +2348,99 @@ begin
         Inc(NamedInTarget);
     Assert.IsTrue(NamedInTarget >= 2,
       Format('expected named caller frames with Pascal sources, got %d', [NamedInTarget]));
+  finally
+    Session.Free;
+  end;
+end;
+
+procedure TWin32RunControlTests.BreakpointOnBeginLine_ReportsPassedParameters;
+const
+  STEP_SOURCE = 'TestTargetCore.pas';
+
+  // Returns 'AInt=<value>' for the named marker, or a diagnostic string.
+  function AIntAt(const Exe, Map, Rsm: string; Line: Integer): string;
+  begin
+    var Session := OpenSessionAtMarker(Exe, Map, Rsm, TargetDir, STEP_SOURCE, Line);
+    try
+      if Session.State <> dsStopped then
+        Exit('<did not stop>');
+      for var L in Session.GetLocals do
+        if SameText(L.Name, 'AInt') then
+          // The display carries a hex echo ("1234  (0x4D2)"); compare the
+          // decimal head only, which is the part the assertion is about.
+          Exit(L.Value.Split([' '])[0]);
+      Result := '<AInt not listed>';
+    finally
+      Session.Free;
+    end;
+  end;
+
+begin
+  var BeginLine := MarkerLineInFile(TargetDir + STEP_SOURCE, 'STEPIN_PROBE_BEGIN');
+  Assert.IsTrue(BeginLine > 0, 'marker STEPIN_PROBE_BEGIN not found');
+  Assert.IsTrue(FileExists(Win64Exe), '64-bit control target missing');
+
+  // The caller passes 1234. Before the fix the breakpoint bound to the routine's
+  // entry and this read whatever the CALLER's frame happened to hold at that
+  // slot -- a plausible number, never flagged.
+  // Collected rather than asserted per case: both executables are named
+  // TestTarget.exe, so a message built from the file name cannot say WHICH
+  // bitness failed, and stopping at the first failure hides the other.
+  var Failures := '';
+  var Got64 := AIntAt(Win64Exe, Win64Map, Win64Rsm, BeginLine);
+  if Got64 <> '1234' then
+    Failures := Failures + 'x64 AInt=' + Got64 + '; ';
+  var Got32 := AIntAt(Win32Exe, Win32Map, Win32Rsm, BeginLine);
+  if Got32 <> '1234' then
+    Failures := Failures + 'x86 AInt=' + Got32 + '; ';
+  Assert.AreEqual('', Failures,
+    'a breakpoint on `begin` must report the parameter the caller passed -- ' + Failures);
+end;
+
+procedure TWin32RunControlTests.Win32_CallStack_FramesAreCodeAndFramePointersAscend;
+begin
+  var Line := MarkerLine(W32_SOURCE, W32_MARKER);
+  Assert.IsTrue(Line > 0, 'marker not found: ' + W32_MARKER);
+  var Session := OpenSessionAtMarker(Win32Exe, Win32Map, Win32Rsm, TargetDir,
+    W32_SOURCE, Line);
+  try
+    Assert.AreEqual(Ord(dsStopped), Ord(Session.State), 'did not stop');
+    var Frames := Session.GetCallStack;
+    Assert.IsTrue(Length(Frames) >= 5,
+      Format('expected the recursion to unwind, got %d frame(s)', [Length(Frames)]));
+
+    // The stack region, taken from the frame pointers themselves. A PC that
+    // lands inside it is the walker having read a stack slot and called it a
+    // return address -- exactly the field failure, where a caller came back as
+    // 0x14FF318 while the frame pointers around it were 0x14FF3xx.
+    var LoFp := High(UInt64);
+    var HiFp: UInt64 := 0;
+    for var F in Frames do
+      if F.FrameRBP <> 0 then begin
+        if F.FrameRBP < LoFp then LoFp := F.FrameRBP;
+        if F.FrameRBP > HiFp then HiFp := F.FrameRBP;
+      end;
+    Assert.IsTrue(HiFp > 0, 'no frame reported a frame pointer');
+
+    for var I := 0 to High(Frames) do
+      Assert.IsFalse((Frames[I].IP >= LoFp) and (Frames[I].IP <= HiFp),
+        Format('frame %d PC $%x lies inside the stack region [$%x..$%x] -- ' +
+               'the walker took a stack slot for a return address',
+               [I, Frames[I].IP, LoFp, HiFp]));
+
+    // The stack grows DOWN, so each caller's frame pointer must be strictly
+    // above its callee's. Frames with no frame pointer (frameless system code)
+    // are skipped rather than treated as a violation.
+    var Prev: UInt64 := 0;
+    for var I := 0 to High(Frames) do begin
+      if Frames[I].FrameRBP = 0 then
+        Continue;
+      if Prev <> 0 then
+        Assert.IsTrue(Frames[I].FrameRBP > Prev,
+          Format('frame %d frame pointer $%x is not above its callee''s $%x',
+                 [I, Frames[I].FrameRBP, Prev]));
+      Prev := Frames[I].FrameRBP;
+    end;
   finally
     Session.Free;
   end;

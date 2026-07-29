@@ -18,6 +18,15 @@ uses
   TargetLayout, DelphiValueReaders;
 
 type
+  // One unwound frame before symbolication: where the code is and where its
+  // frame pointer is. Separating the WALK from the naming is what lets a target
+  // architecture replace the unwind strategy without touching the (identical)
+  // source/function/line resolution that follows it.
+  TRawStackFrame = record
+    PC:       UInt64;
+    FramePtr: UInt64;
+  end;
+
   TWinDebugger = class(TInterfacedObject, IDebugTarget)
   private
     FProcess:      THandle;
@@ -203,6 +212,12 @@ type
     // start of the same storage.
     function  FillStackWalkContext(TH: THandle; var Buf: TContext;
                 out SeedPc, SeedSp, SeedFp: UInt64): Boolean; virtual;
+    // Produces the raw (PC, frame pointer) pairs of a call stack, before any
+    // symbolication. The base drives StackWalk64; x86 overrides it because
+    // dbghelp's i386 unwind is demonstrably wrong in modules it knows nothing
+    // about, while the x86 frame model makes the answer a fixed stack slot.
+    function  WalkRawFrames(TH: THandle; SeedPc, SeedSp, SeedFp: UInt64;
+                MaxFrames: Integer): TArray<TRawStackFrame>; virtual;
     // Bases that turn a debug-info frame-relative offset into a real one.
     // ARCH: x64 Delphi encodes a local relative to the TOP of the locals area,
     // so the (rounded) frame size has to be added back, and a parameter sits
@@ -229,6 +244,11 @@ type
     // i.e. it is plausibly a return address rather than a leaf-convention guess
     // read out of an uninitialised stack slot.
     function  IsPlausibleReturnAddress(VA: UInt64): Boolean;
+    // One TARGET pointer at Addr. The width follows the DEBUGGEE, not the
+    // adapter: reading 8 bytes on a 32-bit target splices the neighbouring
+    // value into the high half and produces an address that points nowhere.
+    // Protected because the x86 stack walk chains through target pointers.
+    function  ReadTargetPointer(Addr: UInt64; out V: UInt64): Boolean;
   private
     procedure EnsureSymInitialized;
     procedure RegisterModuleWithDbgHelp(const Path: string; Base, ImageSize: UInt64);
@@ -239,16 +259,15 @@ type
     function  StepOverAtNewLine(Rva: UInt64): Boolean;
     procedure HandleSmOverStep(Tid: DWORD; PcVA: UInt64);
     procedure ApplyAllBreakpoints;
+    // Moves a breakpoint that landed on a routine's ENTRY (a `begin` line) to
+    // the first address of its body, where the parameters are actually spilled.
+    function  BreakpointBodyRva(Rva: UInt64): UInt64;
     procedure ClearBreakpointsByFile(const SourceFile: string);
     procedure UnpatchBpAtRip(Tid: DWORD = 0);
     // Freeze every thread except StepTid for the duration of a step; thaw them
     // at the next reported stop. Idempotent-safe (never stacks two freezes).
     procedure FreezeThreadsForStep(StepTid: DWORD);
     procedure ThawStepFrozenThreads;
-    // One TARGET pointer at Addr. The width follows the DEBUGGEE, not the
-    // adapter: reading 8 bytes on a 32-bit target splices the neighbouring
-    // value into the high half and produces an address that points nowhere.
-    function  ReadTargetPointer(Addr: UInt64; out V: UInt64): Boolean;
     function  ReadDelphiExceptionClass(ObjAddr: UInt64): string;
     function  ReadDelphiExceptionClassChain(ObjAddr: UInt64): TArray<string>;
     function  ReadDelphiExceptionMessage(ObjAddr: UInt64): string;
@@ -892,6 +911,18 @@ procedure TWinDebugger.PlantInt3(var BP: TBreakpointRec);
 begin
   if BP.IsPlanted then
     Exit;
+  // Two breakpoints can legitimately resolve to ONE address: two source lines
+  // mapping to the same code, or the same unit answering from two providers.
+  // Planting twice would read the $CC the first one wrote and save THAT as the
+  // original byte, so unplanting would restore a breakpoint instruction and
+  // leave the target trapping forever at an address no breakpoint owns any more.
+  // Adopt the first planter's original byte and skip the write.
+  for var I := 0 to FBreakpoints.Count - 1 do
+    if FBreakpoints[I].IsPlanted and (FBreakpoints[I].VA = BP.VA) then begin
+      BP.OrigByte  := FBreakpoints[I].OrigByte;
+      BP.IsPlanted := True;
+      Exit;
+    end;
   if not ReadByte(BP.VA, BP.OrigByte) then begin
     DapLog(Format('PlantInt3 FAIL ReadByte VA=$%x LastError=%d', [BP.VA, GetLastError]));
     Exit;
@@ -1339,6 +1370,51 @@ begin
   end;
 end;
 
+// A breakpoint on a routine's `begin` line resolves to the routine's ENTRY
+// address, where the prologue has not yet spilled Self or any by-register
+// parameter. Every local read there returns the CALLER's frame bytes -- typed
+// correctly, flagged as nothing. Reported from the field: a breakpoint on the
+// `begin` of a constructor showed `Self` as an unrelated class and an
+// uninitialised local as a plausible-looking number.
+//
+// Move such a breakpoint to the first address inside the routine whose line
+// record differs from the entry's. That is the same boundary
+// FunctionBodyStartVA derives for the step-into pivot, but taken from the line
+// table alone: this runs before the image base is known and, on a 32-bit target,
+// there is no `.pdata` for that function to consult at all.
+//
+// A routine whose body shares the entry's line record (one-liner, or a
+// frameless `asm` body) has no such address. Then the entry IS the answer and
+// the RVA is returned unchanged, rather than guessing past the prologue.
+function TWinDebugger.BreakpointBodyRva(Rva: UInt64): UInt64;
+const
+  PREAMBLE_SCAN_LIMIT = 4096;
+var
+  EntryLoc: TSourceLocation;
+begin
+  Result := Rva;
+  var FuncStart: UInt64;
+  if not FDebugInfo.RvaToFunctionStart(Rva, FuncStart) then
+    Exit;
+  // Already on a statement: the user picked a real line, leave it alone.
+  if Rva <> FuncStart then
+    Exit;
+  if not FDebugInfo.RvaToSourceLine(Rva, EntryLoc) then
+    Exit;
+  for var Scan := Rva + 1 to Rva + PREAMBLE_SCAN_LIMIT do begin
+    var ScanFuncStart: UInt64;
+    if not FDebugInfo.RvaToFunctionStart(Scan, ScanFuncStart) or
+       (ScanFuncStart <> FuncStart) then
+      Exit;   // ran out of the routine without finding a new line record
+    var Loc: TSourceLocation;
+    if not FDebugInfo.RvaToSourceLine(Scan, Loc) then
+      Continue;
+    if (Loc.Line <> EntryLoc.Line) or
+       not SameText(Loc.SourceFile, EntryLoc.SourceFile) then
+      Exit(Scan);
+  end;
+end;
+
 procedure TWinDebugger.DoSetBreakpoints(const Spec: TBpSpec);
 
   function NthOrEmpty(const Arr: TArray<string>; Idx: Integer): string;
@@ -1356,7 +1432,8 @@ begin
     // package -- both answer; taking the first hit bound the breakpoint to the
     // WRONG module's copy while still reporting it verified, so it either never
     // fired or stopped in the other file while the UI highlighted the user's.
-    for var Rva in FDebugInfo.SourceLineToRvaCandidates(Spec.SourceFile, Line) do begin
+    for var Candidate in FDebugInfo.SourceLineToRvaCandidates(Spec.SourceFile, Line) do begin
+      var Rva := BreakpointBodyRva(Candidate);
       var BP: TBreakpointRec;
       BP.Rva          := Rva;
       BP.VA           := RvaToVA(Rva);  // may be wrong if FImageBase not yet known
@@ -2688,15 +2765,58 @@ begin
   Result := GetStackFrames(FStoppedTid);
 end;
 
+// x64: dbghelp drives the unwind off .pdata, which is exact. It mutates its own
+// context copy as it goes, so this owns a private one rather than borrowing the
+// caller's.
+function TWinDebugger.WalkRawFrames(TH: THandle; SeedPc, SeedSp, SeedFp: UInt64;
+  MaxFrames: Integer): TArray<TRawStackFrame>;
+var
+  Ctx: TContext;
+  SF:  TDbgStackFrame64;
+begin
+  SetLength(Result, 0);
+  var IgnorePc, IgnoreSp, IgnoreFp: UInt64;
+  if not FillStackWalkContext(TH, Ctx, IgnorePc, IgnoreSp, IgnoreFp) then
+    Exit;
+
+  SF := Default(TDbgStackFrame64);
+  SF.AddrPC.Offset    := SeedPc;
+  SF.AddrPC.Mode      := AddrModeFlat;
+  SF.AddrFrame.Offset := SeedFp;
+  SF.AddrFrame.Mode   := AddrModeFlat;
+  SF.AddrStack.Offset := SeedSp;
+  SF.AddrStack.Mode   := AddrModeFlat;
+
+  while StackWalk64(StackWalkMachineType, FProcess, TH, SF, @Ctx,
+      nil, @SymFunctionTableAccess64, @SymGetModuleBase64, nil) do begin
+    if SF.AddrPC.Offset = 0 then
+      Break;
+    var Raw: TRawStackFrame;
+    Raw.PC := SF.AddrPC.Offset;
+    // StackWalk64 updates Ctx to the unwound register state for THIS frame;
+    // Ctx.Rbp is the frame's actual RBP, which the BPREL local / param offset
+    // decode is relative to. SF.AddrFrame is unwind-defined and not a reliable
+    // RBP for Delphi frames, so prefer Ctx.Rbp.
+    if Ctx.Rbp <> 0 then
+      Raw.FramePtr := Ctx.Rbp
+    else
+      Raw.FramePtr := SF.AddrFrame.Offset;
+    Result := Result + [Raw];
+    if Length(Result) >= MaxFrames then
+      Break;
+  end;
+end;
+
 // Walk the call stack of an arbitrary thread. While stopped at a debug event the
 // whole process is frozen, so every thread's context is valid and can be walked
 // read-only. Frame records carry RBP/IP, so the locals decode (which reads
 // process memory at the frame's RBP) works for any thread without further work.
 function TWinDebugger.GetStackFrames(TID: DWORD): TArray<TStackFrame>;
+const
+  MAX_FRAMES = 30;
 var
   TH:    THandle;
   Ctx:   TContext;
-  SF:    TDbgStackFrame64;
   Frame: TStackFrame;
   Loc:   TSourceLocation;
 begin
@@ -2746,19 +2866,10 @@ begin
   // HandleLoadDll -- this sweep sees only what exists right now.
   EnsureSymInitialized;
 
-  SF := Default(TDbgStackFrame64);
-  SF.AddrPC.Offset    := SeedRip;
-  SF.AddrPC.Mode      := AddrModeFlat;
-  SF.AddrFrame.Offset := SeedRbp;
-  SF.AddrFrame.Mode   := AddrModeFlat;
-  SF.AddrStack.Offset := SeedRsp;
-  SF.AddrStack.Mode   := AddrModeFlat;
-
-  while StackWalk64(StackWalkMachineType, FProcess, TH, SF, @Ctx,
-      nil, @SymFunctionTableAccess64, @SymGetModuleBase64, nil) do begin
-    if SF.AddrPC.Offset = 0 then
+  for var Raw in WalkRawFrames(TH, SeedRip, SeedRsp, SeedRbp, MAX_FRAMES) do begin
+    if Raw.PC = 0 then
       Break;
-    Frame.IP := SF.AddrPC.Offset;
+    Frame.IP := Raw.PC;
     // Frame 0's PC is not the walker's to decide: it is the thread's live PC,
     // which the caller already read and which the stop location was resolved
     // from. Observed on a 32-bit target whose top frame sat in a runtime package
@@ -2774,16 +2885,8 @@ begin
     // emit frames that can only mis-resolve.
     if (not TargetLayout.Is64Bit) and (Frame.IP > $FFFFFFFF) then
       Break;
-    // StackWalk64 updates @Ctx to the unwound register state for THIS
-    // frame; Ctx.Rbp is the frame's actual RBP, which the BPREL local /
-    // param offset decode is relative to. SF.AddrFrame is unwind-defined
-    // and not a reliable RBP for Delphi frames, so prefer Ctx.Rbp (fall
-    // back to AddrFrame only if the context RBP is zero).
-    if Ctx.Rbp <> 0 then
-      Frame.FrameRBP := Ctx.Rbp
-    else
-      Frame.FrameRBP := SF.AddrFrame.Offset;
-    // Frame.IP, not SF.AddrPC.Offset: frame 0 was just re-anchored to the
+    Frame.FrameRBP := Raw.FramePtr;
+    // Frame.IP, not the walker's raw PC: frame 0 was just re-anchored to the
     // thread's live PC above, and symbolication has to follow the corrected
     // address or it resolves the walker's bad one.
     var FrameRva := VAToRva(Frame.IP);
@@ -2810,7 +2913,7 @@ begin
     else
       Frame.FuncEntryVA := 0;
     Result := Result + [Frame];
-    if Length(Result) >= 30 then
+    if Length(Result) >= MAX_FRAMES then
       Break;
   end;
 

@@ -335,6 +335,76 @@ USER-SIDE ISSUE worth repeating to them: the log warns
 `qbfdesignd29.bpl RSM is OLDER than the BPL -- it will be IGNORED`, so that
 package's types/locals come from TD32 only until it is rebuilt.
 
+### FIELD ROUND 3 (2026-07-29): the three items left open by round 2
+
+**A. The i386 walk now chains EBP instead of asking dbghelp. Phase 0's "no
+hand-rolled EBP walker needed" is RETRACTED -- it was measured on a synthetic
+target and the field disproved it.**
+The walk was split behind a new seam: `TWinDebugger.WalkRawFrames` yields raw
+`(PC, FramePtr)` pairs and `GetStackFrames` symbolicates them, identically for
+both architectures. x64 keeps StackWalk64 (`.pdata` is exact).
+`TWin32Debugger.WalkRawFrames` chains `[EBP+4]` / `[EBP]` -- exact on x86, where
+`mov ebp,esp` precedes the allocation -- validating EVERY link (return address
+must be executable code in a known module; the next frame pointer must be
+4-aligned, strictly ABOVE the current one, and within 1 MB). When the chain dies
+at depth <= 1 it defers to the inherited StackWalk64, which for a stack that is
+mostly frameless system code may still do better.
+Pinned by `Win32_CallStack_FramesAreCodeAndFramePointersAscend`, which asserts
+the two structural invariants the field failure broke: no frame's PC may lie
+inside the stack region spanned by the frame pointers, and each caller's frame
+pointer must be strictly above its callee's.
+HONEST LIMIT: the field condition (a caller in a module dbghelp knows nothing
+about) cannot be reproduced in the suite, since dbghelp knows every test module.
+The existing `Win32_CallStack_UnwindsPastRecursion` and
+`Win32_StackFrameNames_MatchWin64` prove no regression; the fix is correct by
+construction from the measured x86 frame model, and the same reasoning already
+fixed step-over in the field.
+
+**B. A breakpoint on a routine's `begin` line bound to the routine's ENTRY, so
+every parameter read the CALLER's frame. NOT a Win32 bug -- both bitnesses.**
+This is what made the user's `Self` show as `TAddInExpert` and `tmp` as garbage:
+their breakpoint was on line 233, which is `begin`. The F19 work had fixed the
+same hazard for STEP-INTO and its comment claimed "breakpoints were never
+affected" -- true for a breakpoint on the first STATEMENT, false for one on
+`begin`. `FunctionBodyStartVA` could not have helped anyway: it derives the
+extent from `.pdata`, which does not exist on Win32.
+`TWinDebugger.BreakpointBodyRva` now moves a breakpoint that landed exactly on
+a function's entry to the first address inside it whose line record differs --
+the same boundary, taken from the line table alone so it needs neither `.pdata`
+nor a known image base. A routine whose body shares the entry's line record
+(one-liner, frameless `asm`) is left at the entry rather than guessed past.
+NEGATIVE CONTROL: with the move disabled the new
+`BreakpointOnBeginLine_ReportsPassedParameters` reports
+`x64 AInt=99; x86 AInt=13023708` for a parameter the caller passed as 1234 --
+plausible numbers, never flagged, on BOTH bitnesses.
+
+ONE EXISTING TEST ASSERTED THE OLD BEHAVIOUR AS CORRECT.
+`Test_Step_Over_FromFunctionEntry_LandsNextLine` reached its entry stop by
+putting a breakpoint on `begin` and asserting it bound to the entry -- exactly
+what B changes. Updated to assert the MOVE instead, then the step from the first
+statement to the next line. Its fixture (`StepMultiLine(Seed: Integer)`) has a
+parameter, so it was demonstrating the same defect it enshrined.
+COVERAGE HONESTLY LOST: stepping over from the RAW entry address is no longer
+reachable, since neither a breakpoint nor a step-into parks there any more.
+`HandleSmOverStep`'s entry-RSP handling is now defensive rather than exercised;
+this is recorded in the test's own comment so it is not mistaken for coverage.
+
+**C. `PlantInt3` had no duplicate-address guard.** Two source lines can resolve
+to one address (the user had breakpoints on both 233 and 234, and B now maps
+them together). The second plant read the `$CC` the first wrote and saved THAT
+as the original byte, so unplanting restored a breakpoint instruction and left
+the target trapping forever at an address no breakpoint owns. It now adopts the
+first planter's original byte and skips the write. Pre-existing, not introduced
+by B -- but B makes it reachable, so it had to land first.
+
+**D. `ArrayElemByteSize` reported 8 for `$42` (`Extended`), now 10.** `$42` only
+ever appears in 32-bit output (Win64 emits `$41`, a true `Double` alias), so it
+is unconditionally the 10-byte x87 type and `array of Extended` was striding
+short by 2 bytes per element. Deliberately deferred in round 2 for fear of
+widening a read into an 8-byte slot; checked before changing -- `TypeSizeById`'s
+only size-sensitive consumers are the SET and RECORD return paths in
+`ApplyMethodCall` (`ExprEval.pas:1477`, `:1501`), and a float reaches neither.
+
 ### FIELD ROUND 2 (2026-07-29): three defects reported from the bds.exe session
 
 All three diagnosed from the adapter's OWN log (`%TEMP%\dap_adapter.log`, which

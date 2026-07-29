@@ -552,7 +552,7 @@ end;
 // address (before the prologue spilled RCX/RDX/R8/XMM3) still claims to be here
 // while Self and every parameter still hold the CALLER's frame bytes.
 function TWidget.StepIntoProbe(AInt: Integer; const AStr: string; ADbl: Double): Integer;
-begin
+begin                                       // {BP:STEPIN_PROBE_BEGIN}
   Result := AInt + FValue;                  // {BP:STEPIN_PROBE_BODY}
   GSink.Use([AStr, ADbl, Result]);
 end;

@@ -808,6 +808,26 @@ Plant lifecycle:
    `ApplyAllBreakpoints`, which recomputes VA from `Rva + ImageBase`
    and plants every registered persistent breakpoint.
 
+**A breakpoint on `begin` is moved to the body** (`BreakpointBodyRva`). A
+routine's `begin` line resolves to its ENTRY address, where the prologue has not
+yet spilled `Self` or any by-register parameter — so every local read there
+returns the CALLER's frame bytes, correctly typed and flagged as nothing.
+Measured on a parameter the caller passed as 1234: without the move it reads 99
+on x64 and 13023708 on x86. The destination is the first address inside the
+routine whose line record differs from the entry's — the same boundary
+`FunctionBodyStartVA` derives for the step-into pivot, but taken from the line
+table alone, because this runs before the image base is known and a 32-bit
+target has no `.pdata` to consult. A routine whose body shares the entry's line
+record (a one-liner, a frameless `asm` body) has no such address and is left at
+the entry rather than guessed past.
+
+**Planting is duplicate-safe.** Two source lines can resolve to one address (and
+the move above maps `begin` onto the first statement). A second plant would read
+the `$CC` the first wrote and save THAT as its original byte, so unplanting
+would restore a breakpoint instruction and leave the target trapping forever at
+an address no breakpoint owns. `PlantInt3` adopts the first planter's original
+byte and skips the write.
+
 Hit lifecycle:
 
 1. `EXCEPTION_BREAKPOINT` at `ExceptionAddress = VA`. `RIP` is already
@@ -1003,6 +1023,32 @@ stop replayed the same blank frames and the client could not retry short of
 resuming. Re-walking during that bounded window costs a repeated `StackWalk64`,
 never blocks, and stops as soon as the indexes are ready — the first complete
 result is the one that gets pinned.
+
+### The walk is a seam; x86 chains EBP
+
+`TWinDebugger.WalkRawFrames` yields the raw `(PC, FramePtr)` pairs and
+`GetStackFrames` symbolicates them. Separating the two lets a target
+architecture replace the unwind strategy without touching the (identical)
+source/function/line resolution that follows.
+
+- **x64** drives StackWalk64. `.pdata`/UNWIND_INFO is exact, and dbghelp's
+  context copy carries the unwound RBP each frame's BPREL decode needs.
+- **x86** chains the frame pointer directly: `[EBP+4]` is the return address and
+  `[EBP]` the caller's EBP, because `mov ebp,esp` runs BEFORE the frame
+  allocation. Phase 0 concluded from a synthetic target that dbghelp's i386
+  unwind was good enough; the field disproved it. Debugging a design-time
+  package inside `bds.exe`, dbghelp returned `0x14FF318` — a **stack address** —
+  as the caller of a Delphi frame, fabricating a bogus frame and losing the real
+  caller, so the join into the VCL frames was junk. The same defect made
+  step-over hang until `CallerReturnAddress` started reading `[EBP+4]`.
+
+Every x86 link is validated, never trusted: the return address must be
+executable code inside a known module, and the next frame pointer must be
+4-byte aligned, strictly ABOVE the current one (the stack grows down) and within
+1 MB of it. The chain genuinely does end — system DLLs are routinely built with
+the frame pointer omitted — so when it dies at depth ≤ 1 the walk defers to the
+inherited StackWalk64, which on a stack that is mostly frameless system code may
+still do better.
 
 ## Frame symbol attribution
 

@@ -8483,26 +8483,33 @@ begin
 end;
 
 procedure TDebuggerTests.Test_Step_Over_FromFunctionEntry_LandsNextLine;
-// Step over while stopped at a function's ENTRY line -- the `begin`, before the
-// prologue has established the frame (RSP is at its entry value). The step must
-// advance to the next line in the SAME function. The earlier RSP-based step-over
-// captured the entry RSP and then treated every post-prologue same-frame line as
-// a deeper recursive frame, skipping them all and running free out of the
-// function -> the debugger appeared to freeze.
+// A breakpoint on a routine's `begin` line, then a step over.
 //
-// The entry stop is reached with a BREAKPOINT on the `begin` line, which binds to
-// the function's entry address. A step-into no longer parks there: it runs on to
-// the first statement, because at the entry the register arguments are not yet
-// spilled and every local would be read out of the caller's frame (see
-// DebugSessionTests.StepInto_Method_ReportsSpilledSelfAndParams).
+// TWO behaviours in one flow. First the BINDING: the `begin` line resolves to
+// the routine's ENTRY address, where the prologue has not yet spilled the
+// by-register parameters -- reading `Seed` there returns the CALLER's frame
+// bytes -- so the breakpoint is moved to the first statement
+// (TWinDebugger.BreakpointBodyRva). Second the STEP: it must advance to the next
+// line in the SAME function. The earlier RSP-based step-over captured the entry
+// RSP and then treated every post-prologue same-frame line as a deeper recursive
+// frame, skipping them all and running free out of the function -> the debugger
+// appeared to freeze.
+//
+// COVERAGE NOTE: stepping over from the raw ENTRY address is no longer reachable
+// through this route, since neither a breakpoint nor a step-into parks there any
+// more (both run on to the first statement, see
+// DebugSessionTests.BreakpointOnBeginLine_ReportsPassedParameters and
+// StepInto_Method_ReportsSpilledSelfAndParams). HandleSmOverStep's entry-RSP
+// handling is therefore defensive now rather than exercised here.
 var
-  BeginLine, L1Line, GotLine: Integer;
+  BeginLine, L1Line, L2Line, GotLine: Integer;
   Reason: string;
 begin
   BeginLine := Bp('STEP_ML_BEGIN');
   L1Line    := Bp('STEP_ML_L1');
-  Assert.IsTrue((BeginLine > 0) and (L1Line > 0),
-    'STEP_ML_BEGIN / STEP_ML_L1 markers must resolve');
+  L2Line    := Bp('STEP_ML_L2');
+  Assert.IsTrue((BeginLine > 0) and (L1Line > 0) and (L2Line > 0),
+    'STEP_ML_BEGIN / STEP_ML_L1 / STEP_ML_L2 markers must resolve');
   FClient := TDapClient.Create;
   FClient.Start(AdapterExe);
   FClient.Initialize.Free;
@@ -8513,12 +8520,14 @@ begin
   FClient.SetExceptionBreakpoints([]).Free;
   LaunchTarget.Free;
   FClient.ConfigDone.Free;
-  FClient.WaitForStopped.Free;            // at STEP_ML_BEGIN, the function entry
+  FClient.WaitForStopped.Free;            // moved off the entry, onto STEP_ML_L1
   Assert.IsTrue(SameText(TopFrameName(FClient), 'StepMultiLine'),
     'breakpoint must stop inside StepMultiLine; got: ' + TopFrameName(FClient));
-  Assert.AreEqual(BeginLine, TopFrameLine(FClient),
-    Format('breakpoint must bind to the function entry line %d', [BeginLine]));
-  // Step over from the entry line: must advance to the next line in the function.
+  Assert.AreEqual(L1Line, TopFrameLine(FClient),
+    Format('a breakpoint on the `begin` line %d must be moved to the first ' +
+           'statement %d, where the parameters are actually spilled',
+           [BeginLine, L1Line]));
+  // Step over from there: must advance to the next line in the function.
   FClient.StepOver.Free;
   var S := FClient.WaitForStopped(8000);
   try
@@ -8526,10 +8535,10 @@ begin
   finally S.Free; end;
   GotLine := TopFrameLine(FClient);
   Assert.IsTrue(SameText(TopFrameName(FClient), 'StepMultiLine'),
-    'step-over from entry must stay in StepMultiLine; got: ' + TopFrameName(FClient));
-  Assert.AreEqual(L1Line, GotLine,
-    Format('step-over from the entry line must land on the next line %d; landed on %d',
-      [L1Line, GotLine]));
+    'step-over must stay in StepMultiLine; got: ' + TopFrameName(FClient));
+  Assert.AreEqual(L2Line, GotLine,
+    Format('step-over from line %d must land on the next line %d; landed on %d',
+      [L1Line, L2Line, GotLine]));
   Assert.AreEqual('step', Reason, 'stop must be a step, not a runaway');
 end;
 

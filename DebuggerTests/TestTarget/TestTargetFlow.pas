@@ -95,9 +95,9 @@ begin
 end;
 
 function StepMultiLine(Seed: Integer): Integer;
-begin                            // {BP:STEP_ML_BEGIN}  a BP here binds to the function entry (pre-prologue)
-  Result := Seed;                // {BP:STEP_ML_L1}     step-over from the entry must land here
-  Result := Result + 1;          // {BP:STEP_ML_L2}
+begin                            // {BP:STEP_ML_BEGIN}  a BP here is MOVED to the first statement
+  Result := Seed;                // {BP:STEP_ML_L1}     ...i.e. it binds HERE, where Seed is spilled
+  Result := Result + 1;          // {BP:STEP_ML_L2}     step-over from L1 must land here
   Result := Result * 3;          // {BP:STEP_ML_L3}
 end;
 
