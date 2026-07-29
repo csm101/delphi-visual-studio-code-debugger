@@ -3162,10 +3162,45 @@ begin
       end;
     end;
 
+    // A code-resident exact match used to be restored here as a last resort,
+    // and that is how a DATA read ended up serving a CODE address.
+    //
+    // Measured on `Application` in a bds.exe session: vcl290.map carries BOTH
+    // `Vcl.Forms.Application` (0004:02F4) and `Vcl.SvcMgr.Application`
+    // (0003:1C38); the name index is keyed on the bare name, so which one wins
+    // depends on registration order, and early in startup it was SvcMgr's.
+    // Worse, a DLL's MAP is registered unscoped, so RvaToVA turned that RVA into
+    // $2D1C38 using the MAIN image's base -- an address inside bds.exe. It read
+    // back $F8BAE850 with no type and rendered as a bare pointer. The same watch
+    // later in the session, once vcl290's providers had registered, answered
+    // `$4295900 (TApplication)` correctly: the wrong answer was purely a matter
+    // of WHEN it was asked.
+    //
+    // An executability test cannot separate the two cases -- the bad address IS
+    // executable, that is the whole problem. Neither can "is it in the main
+    // image": $2D1C38 lands inside bds.exe just as a real main-image symbol
+    // would. Refusing every code-resident match is wrong too, and measurably so:
+    // it broke `Now`, `DoWork` and an interface method's `Name`, which are
+    // genuinely code and genuinely what the user asked for.
+    //
+    // The discriminator that does hold: a callable symbol's address is a
+    // FUNCTION ENTRY, and a data global's address never is. The providers answer
+    // that directly. For the bogus `Application` the RVA lands in a module with
+    // no symbols at all, so there is no function to find and the match is
+    // refused; for `Now` it is the entry of a proc the providers know, so it is
+    // kept.
     if (Rva = 0) and (ExactRva <> 0) then begin
-      Rva := ExactRva;
-      DapLog(Format('EvaluateGlobalName "%s": accept code-resident exact match Rva=$%x (no data candidate)',
-        [Name, Rva]));
+      var FuncStart: UInt64 := 0;
+      if FDebugInfo.RvaToFunctionStart(ExactRva, FuncStart) and
+         (FuncStart = ExactRva) then begin
+        Rva := ExactRva;
+        DapLog(Format('EvaluateGlobalName "%s": accept code-resident exact match Rva=$%x ' +
+          '(no data candidate; it is a function entry)', [Name, Rva]));
+      end
+      else
+        DapLog(Format('EvaluateGlobalName "%s": REFUSED code-resident match Rva=$%x VA=$%x ' +
+          '-- not a function entry, so it is neither a data global nor a callable symbol',
+          [Name, ExactRva, RvaToVA(ExactRva)]));
     end;
 
     if Rva = 0 then begin

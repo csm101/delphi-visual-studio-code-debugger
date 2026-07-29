@@ -335,6 +335,63 @@ USER-SIDE ISSUE worth repeating to them: the log warns
 `qbfdesignd29.bpl RSM is OLDER than the BPL -- it will be IGNORED`, so that
 package's types/locals come from TD32 only until it is rebuilt.
 
+### FIELD ROUND 4 (2026-07-29): driving a REAL bds.exe session from a probe
+
+`DevTools\LiveSessionProbe` launches a host application, plants breakpoints,
+and keeps the session alive -- continuing after every stop -- so a human can
+trigger the interesting stops from the target's own UI. Built because the
+design-time-package cases cannot be provoked from a fixture. It also reports
+breakpoint VERIFICATION TRANSITIONS, which is how the deferred bind became
+observable: all four breakpoints came up `verified=False` at set time and
+flipped to `True` once `qbfdesignd29.bpl` loaded.
+
+**The x86 walk, measured on the real host: 30 frames** across dclteepro929 /
+rtl290 / coreide290 / delphicoreide290 / bds.exe / vcl290, naming
+`VCLTee.TeeChartPro.pas:930` and `@@PackageLoad`, with no truncation and no
+duplicates. That is round 3's item A confirmed outside the suite.
+
+**The splice was WRONG first, and my own new test caught it.** Re-seeding
+dbghelp at the join (its PC and frame pointer, SP guessed at the frame pointer)
+restarts it in the MIDDLE of the stack: on the recursion fixture frames 0..7
+were correct and frames 8..14 were a verbatim replay of 1..7. A duplicated stack
+is worse than a short one -- every frame in it looks real. It also imported
+64-bit garbage frame pointers ($117600000893E3C on a 32-bit target), because the
+base implementation reads `Ctx.Rbp` from a context the WOW64 path never wrote.
+Now dbghelp runs from the ORIGINAL seed and is spliced at a MATCHED join: find
+our last frame's PC in its walk, take only what follows, validate each frame,
+and zero a frame pointer that is not a plausible 32-bit stack slot. No join
+found -> leave the stack short rather than invent a tail. x86 and x64 now report
+the same 8 Pascal frames on the fixture.
+
+**`Application` renders as a bare pointer -- root-caused, dangerous, only
+partly fixed.** From the field log:
+`EvaluateGlobalName "Application": accept code-resident exact match Rva=$1C38`
+-> `VA=$2D1C38 Raw=$F8BAE850 TypeHint=""`. Three defects stacked:
+1. `vcl290.map` carries BOTH `Vcl.Forms.Application` (0004:02F4) and
+   `Vcl.SvcMgr.Application` (0003:1C38). The name index is keyed on the BARE
+   name, so which one wins depends on registration order. Cross-unit
+   disambiguation exists only for TD32; the MAP path has none.
+2. **A DLL's MAP is registered UNSCOPED**, so `RvaToVA` turns its module-relative
+   RVA into an address using the MAIN image's base. This is not specific to
+   `Application`: it corrupts ANY global resolved through a DLL's MAP.
+3. A MAP public carries no type, hence the bare pointer.
+MEASURED CONFIRMATION that it is a timing bug: the same watch answered
+`$F8BAE850 []` early in startup and `$4295900 (TApplication)` later in the same
+session, once vcl290's providers had registered.
+
+Fixed here: only the false VALUE. Two wrong attempts first, both worth recording.
+Requiring the address to be EXECUTABLE does not bite -- the bad address IS code,
+that is the whole problem. Refusing every code-resident match broke `Now`,
+`DoWork` and an interface method's `Name` (3 tests x 2 fixtures), which are
+genuinely code and genuinely what the user asked for. The discriminator that
+holds: **a callable symbol's address is a FUNCTION ENTRY and a data global's
+never is**, which the providers answer directly -- and for the bogus RVA there
+is no function to find, because it lands in a module with no symbols.
+
+STILL OPEN: making `Vcl.Forms.Application` actually resolve needs unit-scoped
+AND module-scoped MAP globals. Defect 2 above is the dangerous one and is not
+fixed.
+
 ### FIELD ROUND 3 (2026-07-29): the three items left open by round 2
 
 **A. The i386 walk now chains EBP instead of asking dbghelp. Phase 0's "no

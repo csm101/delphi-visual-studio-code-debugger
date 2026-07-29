@@ -212,6 +212,28 @@ parses the SOURCE_MODULE entries, reports the total line-pair count, prints the
 first and last five RVA→source:line mappings and one reverse lookup. Run it
 after changing the TD32 reader.
 
+#### LiveSessionProbe
+
+```bat
+DevTools\Win64\Debug\LiveSessionProbe.exe ^
+  "C:\Program Files (x86)\Embarcadero\Studio\23.0\bin\bds.exe" ^
+  C:\Athens\qbflibraries\qbfdesign ^
+  qbfDelphiMenu.pas:378,TemplateDsgnTableFrmU.pas:63 ^
+  -seconds 3600 -eval Application
+```
+
+Drives a real `TDebugSession` against a long-lived HOST application and keeps it
+running, so a human can trigger the breakpoints from the target's own UI while
+the probe reports what the debugger saw. Written for the design-time-package
+case, where the interesting stops cannot be provoked from a fixture: they need
+somebody to open a form in the IDE.
+
+On every stop it dumps the call stack, the locals and any `-eval` expressions,
+then **continues**, so the target stays usable and the same breakpoint can fire
+again. It also reports every breakpoint verification transition (`[bp] ...
+verified=True`), which is the only way to see that a breakpoint in a package
+bound LATER, when its module loaded.
+
 #### Td32AliasProbe
 
 ```bat

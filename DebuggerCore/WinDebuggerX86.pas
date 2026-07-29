@@ -210,6 +210,10 @@ function TWin32Debugger.WalkRawFrames(TH: THandle; SeedPc, SeedSp, SeedFp: UInt6
   MaxFrames: Integer): TArray<TRawStackFrame>;
 const
   MAX_FRAME_SPAN = $100000;   // 1 MB: larger than any real single stack frame
+  // How far above ESP to look for the pushed return address when frame 0's
+  // frame is not established. A prologue has pushed at most a handful of words
+  // by then; a wider window would start finding stale addresses.
+  PROLOGUE_PROBE_SLOTS = 8;
 
   // A frame pointer must be inside the thread's stack, above the previous one
   // (the stack grows DOWN, so a caller's frame is at a HIGHER address), 4-byte
@@ -226,6 +230,61 @@ const
     Result := (Next and 3) = 0;
   end;
 
+  // True when VA is the instruction immediately AFTER a call -- i.e. a real
+  // return address rather than a stale one left on the stack. Distinguishing
+  // those is what makes scanning the top of the stack safe rather than a
+  // guess. Both x86 call encodings are checked:
+  //   E8 rel32          direct   -> the call starts 5 bytes back
+  //   FF /2 (+modrm...) indirect -> 2..7 bytes back, reg field = 2
+  function IsAfterCallSite(VA: UInt64): Boolean;
+  var
+    B: array[0..7] of Byte;
+  begin
+    Result := False;
+    if VA < 8 then
+      Exit;
+    if not ReadProcessMemoryAt(VA - 8, @B[0], 8) then
+      Exit;
+    if B[3] = $E8 then          // VA-5
+      Exit(True);
+    for var Back := 2 to 7 do begin
+      var Op := B[8 - Back];
+      if Op <> $FF then
+        Continue;
+      // modrm reg field 2 (near call) or 3 (far call) -- the byte after FF.
+      var Modrm := B[8 - Back + 1];
+      if ((Modrm shr 3) and 7) in [2, 3] then
+        Exit(True);
+    end;
+  end;
+
+  // Appends frames by following the saved-EBP chain from StartFp, stopping at
+  // the first link that does not hold up. Shared by the normal walk and the
+  // prologue recovery below, which differ only in where the chain starts.
+  procedure ChainFrom(StartFp: UInt64);
+  begin
+    var Fp := StartFp;
+    while Length(Result) < MaxFrames do begin
+      if (Fp = 0) or (Fp > $FFFFFFFF) then
+        Break;
+      var Ret:    UInt64 := 0;
+      var NextFp: UInt64 := 0;
+      if not ReadTargetPointer(Fp + 4, Ret) then
+        Break;
+      if not ReadTargetPointer(Fp, NextFp) then
+        Break;
+      if not IsPlausibleReturnAddress(Ret) then
+        Break;
+      if not IsPlausibleNextFramePtr(Fp, NextFp) then
+        Break;
+      var Raw: TRawStackFrame;
+      Raw.PC       := Ret;
+      Raw.FramePtr := NextFp;
+      Result := Result + [Raw];
+      Fp := NextFp;
+    end;
+  end;
+
 begin
   SetLength(Result, 0);
   if MaxFrames <= 0 then
@@ -236,35 +295,98 @@ begin
   Frame0.FramePtr := SeedFp;
   Result := [Frame0];
 
-  var Fp := SeedFp;
-  while Length(Result) < MaxFrames do begin
-    if (Fp = 0) or (Fp > $FFFFFFFF) then
+  ChainFrom(SeedFp);
+
+  // The chain produced nothing beyond frame 0. The usual cause is that frame 0's
+  // frame is NOT ESTABLISHED YET: inside a routine's prologue -- and Delphi
+  // constructors have a compiler-generated preamble that the line table already
+  // attributes to the routine's first lines -- EBP still belongs to the CALLER,
+  // so [EBP+4] is not this routine's return address. Observed in the field:
+  // stopping on the first line of a constructor gave a ONE-frame call stack,
+  // while the very next line gave a correct one, with a DIFFERENT EBP for the
+  // same function.
+  //
+  // The pushed return address is then still near the top of the stack, at [ESP]
+  // before `push ebp` and one slot higher after it. Probe a small window for a
+  // word that is not merely executable but sits immediately after a CALL, which
+  // is what separates a live return address from a stale one; EBP is already the
+  // caller's frame pointer, so the chain resumes from it unchanged.
+  if Length(Result) < 2 then begin
+    var Recovered := False;
+    for var Slot := 0 to PROLOGUE_PROBE_SLOTS - 1 do begin
+      var Ret: UInt64 := 0;
+      if not ReadTargetPointer(SeedSp + UInt64(Slot * 4), Ret) then
+        Break;
+      if not IsPlausibleReturnAddress(Ret) or not IsAfterCallSite(Ret) then
+        Continue;
+      var Raw: TRawStackFrame;
+      Raw.PC       := Ret;
+      Raw.FramePtr := SeedFp;
+      Result := Result + [Raw];
+      Recovered := True;
       Break;
-    var Ret:    UInt64 := 0;
-    var NextFp: UInt64 := 0;
-    if not ReadTargetPointer(Fp + 4, Ret) then
-      Break;
-    if not ReadTargetPointer(Fp, NextFp) then
-      Break;
-    if not IsPlausibleReturnAddress(Ret) then
-      Break;
-    if not IsPlausibleNextFramePtr(Fp, NextFp) then
-      Break;
-    var Raw: TRawStackFrame;
-    Raw.PC       := Ret;
-    Raw.FramePtr := NextFp;
-    Result := Result + [Raw];
-    Fp := NextFp;
+    end;
+    if Recovered then
+      // EBP is already the caller's frame pointer, so the chain resumes from it.
+      ChainFrom(SeedFp);
   end;
 
-  // The chain died immediately -- frame 0 sits in frameless code, so there is
-  // nothing to chain from. dbghelp may still have something; take its answer
-  // when it is richer than ours.
-  if Length(Result) > 2 then
+  // Still nothing to chain from: frame 0 is in frameless code. dbghelp may have
+  // something; take its answer when it is richer.
+  if Length(Result) < 2 then begin
+    var ViaDbgHelp := inherited WalkRawFrames(TH, SeedPc, SeedSp, SeedFp, MaxFrames);
+    if Length(ViaDbgHelp) > Length(Result) then
+      Result := ViaDbgHelp;
     Exit;
-  var ViaDbgHelp := inherited WalkRawFrames(TH, SeedPc, SeedSp, SeedFp, MaxFrames);
-  if Length(ViaDbgHelp) > Length(Result) then
-    Result := ViaDbgHelp;
+  end;
+
+  // The chain ended where FRAMING ends, which is normal: system DLLs are built
+  // with the frame pointer omitted, so the walk runs out exactly at the boundary
+  // between Delphi code and the OS. Truncating there would drop the whole
+  // VCL/OS tail -- the first version of this walker did, and the call stack
+  // collapsed to "only the frames whose source we found". Hand the remainder to
+  // dbghelp instead, re-seeded from the last frame the chain vouched for: each
+  // mechanism then covers the region it is actually good at.
+  if Length(Result) >= MaxFrames then
+    Exit;
+  var Last := Result[High(Result)];
+  if (Last.PC = 0) or (Last.FramePtr = 0) then
+    Exit;
+  // dbghelp is run from the ORIGINAL seed and spliced at a MATCHED join: find
+  // our last frame's PC in its walk and take only what follows.
+  //
+  // Re-seeding dbghelp at the join instead (PC and frame pointer of our last
+  // frame, SP guessed at the frame pointer) was tried first and is wrong: it
+  // restarts in the middle of the stack and walks the SAME frames again.
+  // Measured on the recursion fixture -- frames 0..7 correct, then frames 8..14
+  // were a verbatim replay of 1..7. A duplicated stack is worse than a short
+  // one, because every frame in it looks real.
+  //
+  // Frames are still validated on the way in: dbghelp's i386 unwind is the thing
+  // that could not be trusted to begin with, and it fills the frame pointer from
+  // the amd64 field of a context it never wrote -- measured as $117600000893E3C
+  // on a 32-bit target, which is not an address at all.
+  var Full := inherited WalkRawFrames(TH, SeedPc, SeedSp, SeedFp, MaxFrames);
+  var JoinAt := -1;
+  for var I := High(Full) downto 0 do
+    if Full[I].PC = Last.PC then begin
+      JoinAt := I;
+      Break;
+    end;
+  if JoinAt < 0 then
+    Exit;   // no verified join: leave the stack short rather than guess a tail
+  for var I := JoinAt + 1 to High(Full) do begin
+    var Cand := Full[I];
+    if (Cand.PC = 0) or (Cand.PC > $FFFFFFFF) then
+      Break;
+    if not IsPlausibleReturnAddress(Cand.PC) then
+      Break;
+    if (Cand.FramePtr > $FFFFFFFF) or ((Cand.FramePtr and 3) <> 0) then
+      Cand.FramePtr := 0;   // unknown, which the locals decode already handles
+    Result := Result + [Cand];
+    if Length(Result) >= MaxFrames then
+      Break;
+  end;
 end;
 
 { --------------------------------------------------------- prologue decode -- }
