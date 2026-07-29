@@ -3165,16 +3165,14 @@ begin
     // A code-resident exact match used to be restored here as a last resort,
     // and that is how a DATA read ended up serving a CODE address.
     //
-    // Measured on `Application` in a bds.exe session: vcl290.map carries BOTH
-    // `Vcl.Forms.Application` (0004:02F4) and `Vcl.SvcMgr.Application`
-    // (0003:1C38); the name index is keyed on the bare name, so which one wins
-    // depends on registration order, and early in startup it was SvcMgr's.
-    // Worse, a DLL's MAP is registered unscoped, so RvaToVA turned that RVA into
-    // $2D1C38 using the MAIN image's base -- an address inside bds.exe. It read
-    // back $F8BAE850 with no type and rendered as a bare pointer. The same watch
-    // later in the session, once vcl290's providers had registered, answered
-    // `$4295900 (TApplication)` correctly: the wrong answer was purely a matter
-    // of WHEN it was asked.
+    // Measured on `Application` in a bds.exe session: NameToRva answered
+    // Rva=$1C38, RvaToVA made that $2D1C38, and the read came back $F8BAE850
+    // with no type -- rendered in the UI as a bare pointer. The same watch later
+    // in the same session answered `$4295900 (TApplication)` correctly, so the
+    // wrong answer is a matter of WHEN it is asked, i.e. of which providers have
+    // registered by then. WHICH provider produces $1C38 is not established: a
+    // module MAP is shifted into exe-RVA space and range-scoped, so it cannot be
+    // vcl290's. That is what the candidate dump below is for.
     //
     // An executability test cannot separate the two cases -- the bad address IS
     // executable, that is the whole problem. Neither can "is it in the main
@@ -3197,10 +3195,25 @@ begin
         DapLog(Format('EvaluateGlobalName "%s": accept code-resident exact match Rva=$%x ' +
           '(no data candidate; it is a function entry)', [Name, Rva]));
       end
-      else
+      else begin
         DapLog(Format('EvaluateGlobalName "%s": REFUSED code-resident match Rva=$%x VA=$%x ' +
           '-- not a function entry, so it is neither a data global nor a callable symbol',
           [Name, ExactRva, RvaToVA(ExactRva)]));
+        // Dump every candidate when the name could not be resolved to anything
+        // usable. Knowing which RVAs were on offer -- and how each one classifies
+        // -- is what turns "Application came back wrong" into a specific
+        // provider, and it costs nothing on the path that already failed.
+        for var Cand in FDebugInfo.NameToRvaCandidates(Name) do begin
+          var CandVA := RvaToVA(Cand);
+          var FS: UInt64 := 0;
+          var IsEntry := FDebugInfo.RvaToFunctionStart(Cand, FS) and (FS = Cand);
+          var FuncName := '';
+          FDebugInfo.RvaToFunctionName(Cand, FuncName);
+          DapLog(Format('  candidate Rva=$%x VA=$%x data=%s funcEntry=%s nearest="%s"',
+            [Cand, CandVA, BoolToStr(LooksLikeDataAddress(CandVA), True),
+             BoolToStr(IsEntry, True), FuncName]));
+        end;
+      end;
     end;
 
     if Rva = 0 then begin

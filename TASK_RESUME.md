@@ -335,6 +335,37 @@ USER-SIDE ISSUE worth repeating to them: the log warns
 `qbfdesignd29.bpl RSM is OLDER than the BPL -- it will be IGNORED`, so that
 package's types/locals come from TD32 only until it is rebuilt.
 
+## PENDING LIVE VERIFICATION BY THE USER (2026-07-29) -- READ THIS FIRST
+
+Three fixes are committed and suite-green but have NOT been seen working on a
+real target, because they need somebody to drive the Delphi IDE. Do not report
+them as confirmed.
+
+Run: `DevTools\LiveSessionProbe.exe "<...>\bds.exe" C:\Athens\qbflibraries\qbfdesign
+qbfDelphiMenu.pas:378,TemplateDsgnTableFrmU.pas:63,TemplateDsgnTableFrmU.pas:64,frmColumnsU.pas:233
+-seconds 1800 -eval Application`
+then open the Columns editor in the IDE so the breakpoints fire. All four bind
+(`verified=True`) once `qbfdesignd29.bpl` loads -- already observed; what is
+missing is a stop.
+
+| # | what to check | expected | why it is not settled |
+|---|---|---|---|
+| 1 | call stack at `TemplateDsgnTableFrmU.pas:63` (the `begin`) | more than ONE frame | the prologue-recovery probe (scan above ESP for a word that is executable AND sits after a CALL) cannot be reproduced in the suite: the synthetic constructor has no compiler-generated preamble |
+| 2 | call stack at `:64` | full depth, no duplicated frames | the 30-frame walk WAS observed on a real host, but not at this specific stop |
+| 3 | `Application` at `qbfDelphiMenu.pas:378` | either `TApplication`, or absent -- never a bare number | see below; the failure is timing-dependent and may not reproduce once startup has finished |
+| 4 | a stop with no source anywhere | an editor opens with the placeholder text, AND a `>>> DEBUGGER STOPPED` line appears in the Debug Console | `deemphasize` was removed after the field showed the source WAS attached and still did not open; the console line is the belt-and-braces path |
+| 5 | breakpoint on a `begin` line | stops on the first STATEMENT, parameters correct | proved on both bitnesses in the suite; worth one look in the field |
+
+`Application` is the one still genuinely unresolved. What is established: the
+value is wrong only EARLY in startup (`$F8BAE850`, no type) and correct later in
+the same session (`$4295900 (TApplication)`), so it depends on which providers
+have registered. What is NOT established is which provider offers `Rva=$1C38`.
+An earlier note in this file blamed "DLL MAP registered unscoped" -- that was
+WRONG and has been corrected: `EnsureModuleMap` shifts a module MAP into exe-RVA
+space and range-scopes it, so $1C38 cannot be vcl290's. `EvaluateGlobalName` now
+dumps every candidate with its VA, data/code classification and nearest function
+name when it refuses, so the next live run answers this instead of another guess.
+
 ### FIELD ROUND 4 (2026-07-29): driving a REAL bds.exe session from a probe
 
 `DevTools\LiveSessionProbe` launches a host application, plants breakpoints,
@@ -363,21 +394,27 @@ and zero a frame pointer that is not a plausible 32-bit stack slot. No join
 found -> leave the stack short rather than invent a tail. x86 and x64 now report
 the same 8 Pascal frames on the fixture.
 
-**`Application` renders as a bare pointer -- root-caused, dangerous, only
-partly fixed.** From the field log:
+**`Application` renders as a bare pointer -- partly diagnosed, false value
+removed, root cause NOT established.** From the field log:
 `EvaluateGlobalName "Application": accept code-resident exact match Rva=$1C38`
--> `VA=$2D1C38 Raw=$F8BAE850 TypeHint=""`. Three defects stacked:
-1. `vcl290.map` carries BOTH `Vcl.Forms.Application` (0004:02F4) and
-   `Vcl.SvcMgr.Application` (0003:1C38). The name index is keyed on the BARE
-   name, so which one wins depends on registration order. Cross-unit
-   disambiguation exists only for TD32; the MAP path has none.
-2. **A DLL's MAP is registered UNSCOPED**, so `RvaToVA` turns its module-relative
-   RVA into an address using the MAIN image's base. This is not specific to
-   `Application`: it corrupts ANY global resolved through a DLL's MAP.
-3. A MAP public carries no type, hence the bare pointer.
-MEASURED CONFIRMATION that it is a timing bug: the same watch answered
-`$F8BAE850 []` early in startup and `$4295900 (TApplication)` later in the same
-session, once vcl290's providers had registered.
+-> `VA=$2D1C38 Raw=$F8BAE850 TypeHint=""`.
+
+MEASURED: it is timing-dependent. The same watch answered `$F8BAE850 []` early in
+startup and `$4295900 (TApplication)` later in the SAME session, so it turns on
+which providers have registered.
+
+A FIRST DIAGNOSIS RECORDED HERE WAS WRONG and is retracted: it blamed
+`vcl290.map`'s two `Application` publics (`Vcl.Forms` at 0004:02F4 and
+`Vcl.SvcMgr` at 0003:1C38) combined with "a DLL's MAP is registered UNSCOPED".
+The second half does not hold -- `EnsureModuleMap` loads a module MAP with
+`Shift = Module.Base - ImageBase` and registers it through `AddModuleProvider`,
+so its RVAs are already in exe-RVA space and range-scoped. A vcl290 RVA could
+therefore never surface as $1C38. The bare-name collision across units is real,
+but it is not what produced this address.
+
+WHICH provider offers $1C38 is still unknown, and no further guess belongs here.
+`EvaluateGlobalName` now dumps every candidate (RVA, VA, data/code, function
+entry, nearest function name) whenever it refuses, so the next live run names it.
 
 Fixed here: only the false VALUE. Two wrong attempts first, both worth recording.
 Requiring the address to be EXECUTABLE does not bite -- the bad address IS code,
