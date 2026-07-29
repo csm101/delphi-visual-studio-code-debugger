@@ -417,6 +417,9 @@ type
     procedure OnSessionExited(ExitCode: Integer);
     procedure OnSessionOutput(Kind: TOutputKind; const Text: string);
     procedure SendOutputEvent(const Text, Category: string);
+    // Says so in the Debug Console when a stop has no source anywhere on the
+    // stack -- the one case where the client may show nothing at all.
+    procedure AnnounceSourcelessStop(const Info: TStopInfo);
     // OnDllLoadedHook subscriber: the DAP-side PACKAGEINFO-gated eager BP-probe,
     // stale-sidecar warnings, startup progress and background enqueue. The session
     // has already registered the module record before firing this.
@@ -1444,9 +1447,78 @@ begin
       Body.AddPair('line', TJSONNumber.Create(EffSourceLine));
     end;
     FIO.SendEvent('stopped', Body);
+    // Belt and braces for the case the user actually complained about: a stop
+    // where nothing on the stack has real source. Whether the client opens the
+    // placeholder document is the client's choice; this is not.
+    if EffSourceFile = '' then
+      AnnounceSourcelessStop(Info);
   finally
     Body.Free;
   end;
+end;
+
+// Label for a frame the symbol providers could not name. A bare `0x...` hides
+// three different situations behind one rendering; spelling the reason out lets
+// the user act on it (rebuild that module / wait for the index / nothing to do).
+// Declared here rather than beside HandleStackTrace because the sourceless-stop
+// announcement below needs it too.
+function NamelessFrameLabel(const F: TSessionFrame): string;
+begin
+  var Reason: string;
+  case F.Symbols of
+    saNoSymbols: Reason := 'no symbols';
+    saIndexing:  Reason := 'symbols indexing';
+    saLoaded:    Reason := 'not covered by symbols';
+  else
+    Reason := 'unknown module';
+  end;
+  if F.ModuleName <> '' then
+    Exit(Format('0x%x (%s: %s)', [F.IP, F.ModuleName, Reason]));
+  Result := Format('0x%x (%s)', [F.IP, Reason]);
+end;
+
+// A stop where NO frame has real source is the one that cannot be seen: there is
+// no file for the client to bring forward, so the screen may not change at all
+// and the target simply goes quiet. `AttachPlaceholderSource` gives the client
+// something to open; this states the stop somewhere always visible regardless.
+// `important` is the DAP output category VS Code renders prominently and reveals
+// the Debug Console for.
+procedure TDapServer.AnnounceSourcelessStop(const Info: TStopInfo);
+begin
+  // The exception path already walked the stack into FLastFrames; other reasons
+  // have not, and this is the rare branch, so paying for a walk here is fine.
+  if Length(FLastFrames) = 0 then
+    FLastFrames := FSession.GetCallStack;
+
+  var Where := '<location unknown>';
+  if Length(FLastFrames) > 0 then begin
+    var F := FLastFrames[0];
+    if F.FunctionName <> '' then
+      Where := Format('%s  (0x%x in %s)', [F.FunctionName, F.IP, F.ModuleName])
+    else
+      Where := NamelessFrameLabel(F);
+  end;
+
+  var What: string;
+  case Info.Reason of
+    srEntry:      What := 'STOPPED at the process entry point';
+    srBreakpoint: What := 'STOPPED at a breakpoint';
+    srStep:       What := 'STOPPED after a step';
+    srException:  What := 'STOPPED on an exception';
+    srPause:      What := 'PAUSED';
+  else
+    What := 'STOPPED';
+  end;
+
+  var Msg := '>>> DEBUGGER ' + What + ' -- no source available for this stack' + sLineBreak +
+             '    at ' + Where + sLineBreak;
+  if (Info.Reason = srException) and (Info.ExceptionDescription <> '') then
+    Msg := Msg + '    ' + Info.ExceptionDescription + sLineBreak;
+  Msg := Msg +
+    '    No frame in this call stack carries debug info the adapter can read,' + sLineBreak +
+    '    so there is no line to open. The target IS stopped: use the CALL STACK' + sLineBreak +
+    '    view, or select a frame to open its placeholder description.' + sLineBreak;
+  SendOutputEvent(Msg, 'important');
 end;
 
 procedure TDapServer.OnSessionExited(ExitCode: Integer);
@@ -2131,24 +2203,6 @@ begin
   end;
 end;
 
-// Label for a frame the symbol providers could not name. A bare `0x...` hides
-// three different situations behind one rendering; spelling the reason out lets
-// the user act on it (rebuild that module / wait for the index / nothing to do).
-function NamelessFrameLabel(const F: TSessionFrame): string;
-begin
-  var Reason: string;
-  case F.Symbols of
-    saNoSymbols: Reason := 'no symbols';
-    saIndexing:  Reason := 'symbols indexing';
-    saLoaded:    Reason := 'not covered by symbols';
-  else
-    Reason := 'unknown module';
-  end;
-  if F.ModuleName <> '' then
-    Exit(Format('0x%x (%s: %s)', [F.IP, F.ModuleName, Reason]));
-  Result := Format('0x%x (%s)', [F.IP, Reason]);
-end;
-
 // Text of the placeholder document opened for a frame with no source. It exists
 // to make a stop VISIBLE: without any `source` the client has nothing to bring
 // forward, so stopping in sourceless code is indistinguishable from not stopping
@@ -2202,9 +2256,13 @@ begin
   var Src := TJSONObject.Create;
   Src.AddPair('name', ALabel);
   Src.AddPair('sourceReference', TJSONNumber.Create(SyntheticSourceRef(ALabel, F)));
-  // deemphasize: the client greys the document and keeps it out of "recent
-  // files" -- it is a diagnostic, not a file the user opened.
-  Src.AddPair('presentationHint', 'deemphasize');
+  // NO presentationHint. `deemphasize` was set here first, to grey the entry and
+  // keep it out of recent files -- and it defeated the entire point: VS Code
+  // treats a deemphasized source as one the user is not meant to look at and
+  // will NOT open it when the frame is focused, so the stop stayed just as
+  // invisible as it was with no source at all. Verified in the field: the frame
+  // label rendered as `0x76549F54 (kernelbase.dll: no symbols):1`, proving the
+  // source WAS attached, while no editor ever appeared.
   if F.ModuleName <> '' then
     Src.AddPair('origin', F.ModuleName);
   FO.AddPair('source', Src);
