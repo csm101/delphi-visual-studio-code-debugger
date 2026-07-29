@@ -212,6 +212,29 @@ parses the SOURCE_MODULE entries, reports the total line-pair count, prints the
 first and last five RVA→source:line mappings and one reverse lookup. Run it
 after changing the TD32 reader.
 
+#### Td32AliasProbe
+
+```bat
+rem Are the named float aliases in the TYPES table? (default name list)
+DevTools\Win64\Debug\Td32AliasProbe.exe DebuggerTests\TestTarget\Win64\Debug\TestTarget.exe
+
+rem What raw CV type id does each local of a routine actually carry?
+DevTools\Win64\Debug\Td32AliasProbe.exe <exe> -proc ComputeNested
+DevTools\Win64\Debug\Td32AliasProbe.exe <exe> -class TWidget
+
+rem Same question asked of an RSM-format provider (.rsm or a package's .dcp)
+DevTools\Win64\Debug\Td32AliasProbe.exe <file.dcp> -rsmproc ComputeNested
+DevTools\Win64\Debug\Td32AliasProbe.exe <file.dcp> -rsmscan TDateTime 10
+```
+
+Answers "why does this variable report `Double` when it is declared
+`TDateTime`?". Prints the raw TypeId next to the resolved name, so a flattened
+alias (id `$0041`, no name record anywhere) is distinguishable from a decoding
+gap. The `-rsm*` modes ask the same of `.rsm` / `.dcp` — use `-rsmscan` to FIND a
+subject in a real package instead of guessing a routine name. Findings are
+recorded in `TD32_FORMAT_NOTES.md` → "Named float aliases are FLATTENED at the
+variable".
+
 #### Td32LineLookup
 
 ```bat

@@ -157,6 +157,28 @@ the SOLE debug-info source for code the debugger runs. Reject unless a concrete 
 ever requires it. (Verified with a one-off two-unit sample project; conclusion recorded
 here.)
 
+**Amendment (2026-07-29): the "zero consumer" claim was too strong.** The linker
+propagates the `.dcu`'s LINES and SYMBOLS into the binary's TD32, which is what the
+2026-07-18 recon measured — but it does NOT propagate named float ALIASES. Measured
+with `DevTools\Td32AliasProbe`: a local declared `TDateTime` carries CV type id
+`$0041` (the bare `Double` primitive) on both bitnesses, and `TDateTime` has no
+record in the TYPES table at all. See TD32_FORMAT_NOTES.md → "Named float aliases
+are FLATTENED at the variable". So there IS something only the compiler's symbol
+tables hold.
+
+The verdict does not change, for two reasons:
+- The gap is already covered where it matters. `.rsm` keeps the alias, and so does
+  the RSM-format `.dcp` we already load for packages (verified on `QBFD29.dcp`:
+  `TDateTime` / `Currency` / `Double` / `Extended` come back as distinct hints).
+  Uncovered case = a plain exe with no `.rsm`.
+- The payoff is rendering only: `TDateTime` shown as a date rather than `45000.5`,
+  and `Real` distinguished from `Double`. No value or read-width is affected.
+
+If it is ever wanted for the uncovered case, the cheap option is reading the
+DECLARATION from the source (unit + routine + variable name are all known, and the
+fallback to the TD32 name is clean) — not a DCU reader, which stays undocumented and
+version-specific.
+
 ## P2 — DCP linked debug info — CONFIRMED covered, no gap (2026-07-18)
 
 A BPL's debug info is served by TWO providers that both load today (verified on the

@@ -69,6 +69,17 @@ type
     // exact CV type id (not the descriptor id, not a re-lookup by name). This is
     // what lets the evaluator pick a getter's return ABI deterministically.
     [Test] procedure GetClassMembers_PropertyReturn_KindAndSizeResolvedById;
+    // Currency ($04) and Real48 ($44) are TD32 primitives the id tables used to
+    // skip: Real48 resolved to an EMPTY type name and both resolved to a ZERO
+    // byte size. Unlike TDateTime (a Double alias the compiler flattens onto
+    // $41, unrecoverable from TD32) these are distinct primitive ids, so the
+    // information is present and was simply not decoded.
+    [Test] procedure PrimitiveIds_CurrencyAndReal48_HaveNameAndSize;
+    // An IDE-built package stores method names with NO leading '@', i.e. no unit
+    // component: `TFrmColumns@Create`. The anchored-only demangler rejected that
+    // shape, so the raw name reached the call stack (reported from the field on
+    // QBFDesignD29.bpl). Both shapes must present as `Class.Method`.
+    [Test] procedure Demangle_Borland_UnanchoredClassMethod_BecomesDotted;
     // A free function's declared parameter count, from its LF_PROCEDURE
     // signature. Lets the evaluator refuse to auto-call a bare `Foo` that
     // actually takes arguments (F1). Also validates the GPROC32 proctype offset.
@@ -601,6 +612,92 @@ begin
     Assert.IsTrue(FindMember(Members, 'FValue', M), 'FValue field must be present');
     Assert.AreEqual(0, Integer(M.TypeKind), 'a primitive field must leave TypeKind 0');
     Assert.AreEqual(4, M.TypeSize, 'FValue is an Integer -> 4 bytes');
+  finally R.Free; end;
+end;
+
+procedure TTD32ReaderTests.Demangle_Borland_UnanchoredClassMethod_BecomesDotted;
+var
+  Inner, Parent: string;
+begin
+  // The shape from the field: no unit component, so BOTH parts are real scopes.
+  Assert.IsTrue(TTD32FileReader.DemangleBorland('TFrmColumns@Create', Inner, Parent),
+    'an unanchored Class@Method must demangle');
+  Assert.AreEqual('Create', Inner);
+  Assert.AreEqual('TFrmColumns', Parent);
+
+  // With the parameter encoding attached, as a real record carries it.
+  Assert.IsTrue(TTD32FileReader.DemangleBorland('TFrmColumns@Create$qqrp20System@TComponent',
+    Inner, Parent), 'the $ suffix must be stripped');
+  Assert.AreEqual('Create', Inner);
+  Assert.AreEqual('TFrmColumns', Parent);
+
+  // ANCHORED shapes are unchanged: the leading '@' still marks the unit, which
+  // is dropped for a plain routine and kept out of a method's Class.Method.
+  Assert.IsTrue(TTD32FileReader.DemangleBorland('@Testtargetedge@EdgeFactorial$qqri',
+    Inner, Parent), 'unit + routine must still demangle');
+  Assert.AreEqual('EdgeFactorial', Inner);
+  Assert.AreEqual('', Parent, 'the unit must not become the parent scope');
+
+  Assert.IsTrue(TTD32FileReader.DemangleBorland('@Forms@TApplication@Run$qqrv',
+    Inner, Parent), 'unit + class + method must still demangle');
+  Assert.AreEqual('Run', Inner);
+  Assert.AreEqual('TApplication', Parent);
+
+  // A name with no '@' at all is not mangled and must be left alone -- otherwise
+  // every plain symbol would be rewritten.
+  Assert.IsFalse(TTD32FileReader.DemangleBorland('PlainName', Inner, Parent),
+    'a name with no separator is not Borland-mangled');
+
+  // The initialization/finalization special case survives in both shapes.
+  Assert.IsTrue(TTD32FileReader.DemangleBorland('@Testtarget@initialization', Inner, Parent));
+  Assert.AreEqual('Testtarget', Inner, 'a unit main block reads as the unit name');
+  Assert.IsTrue(TTD32FileReader.DemangleBorland('Testtarget@finalization', Inner, Parent));
+  Assert.AreEqual('Testtarget', Inner);
+end;
+
+procedure TTD32ReaderTests.PrimitiveIds_CurrencyAndReal48_HaveNameAndSize;
+
+  function FindMember(const Members: TArray<TClassMember>;
+    const Name: string; out M: TClassMember): Boolean;
+  begin
+    Result := False;
+    for var Cand in Members do
+      if SameText(Cand.Name, Name) then begin
+        M := Cand;
+        Exit(True);
+      end;
+  end;
+
+begin
+  var R := TTD32FileReader.Create;
+  try
+    R.LoadFromFile(ExePath);
+
+    // Real48 NAME. `ComputeNested` declares `R48: Real48`; its CV id is $0044 on
+    // both bitnesses. Before the fix PrimitiveTypeName had no case for it, so the
+    // hint came back '' and the variables view had no type to show.
+    R.ExposeLocals := True;
+    var Locs: TArray<TLocalSymbol>;
+    Assert.IsTrue(R.GetLocalsForFunction('ComputeNested', Locs),
+      'ComputeNested must expose its BPREL32 locals');
+    var FoundR48 := False;
+    for var L in Locs do
+      if SameText(L.Name, 'R48') then begin
+        FoundR48 := True;
+        Assert.AreEqual('Real48', L.TypeHint,
+          'a Real48 local must report its primitive name, not an empty hint');
+      end;
+    Assert.IsTrue(FoundR48, 'ComputeNested must declare the R48 local');
+
+    // Currency SIZE. TypeSizeById feeds the evaluator's getter-return decoding,
+    // so a 0 here is a wrong read width, not a cosmetic gap.
+    var Members: TArray<TClassMember>;
+    Assert.IsTrue(R.GetClassMembers('TWidget', Members), 'TWidget must resolve');
+    var M: TClassMember;
+    Assert.IsTrue(FindMember(Members, 'FArgCur', M), 'FArgCur field must be present');
+    Assert.AreEqual(8, M.TypeSize, 'Currency is a scaled Int64 -> 8 bytes');
+    Assert.IsTrue(FindMember(Members, 'AsCurr', M), 'AsCurr property must be present');
+    Assert.AreEqual(8, M.TypeSize, 'a Currency-returning property must size at 8 bytes');
   finally R.Free; end;
 end;
 

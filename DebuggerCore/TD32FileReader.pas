@@ -1183,15 +1183,29 @@ end;
 // Deliberately mirrors the Itanium demangler's presentation so a stack from a
 // 32-bit target reads identically to one from a 64-bit target: the unit prefix
 // is dropped for a plain routine, and a method keeps its Class.Method form.
+//
+// The leading `@` is what marks the FIRST component as the unit. Names stored
+// WITHOUT it carry no unit component, so every component is a real scope:
+//
+//   TFrmColumns@Create                     class + method, no unit
+//
+// That shape is what an IDE-built package emits -- it is why a frame in
+// `QBFDesignD29.bpl` read `TFrmColumns@Create` instead of `TFrmColumns.Create`
+// (the anchored branch rejected it, so the raw name was shown). `@` is not a
+// legal character in a Pascal identifier, so its presence is always a mangling
+// separator and never part of a name; a name with no `@` at all is not mangled.
 class function TTD32FileReader.DemangleBorland(const Mangled: string;
   out InnerName, ParentName: string): Boolean;
 begin
   InnerName  := '';
   ParentName := '';
   Result := False;
-  if not Mangled.StartsWith('@') then
+  if Mangled = '' then
     Exit;
-  var Body := Mangled.Substring(1);
+  var Anchored := Mangled.StartsWith('@');
+  var Body := Mangled;
+  if Anchored then
+    Body := Body.Substring(1);
   var DollarPos := Body.IndexOf('$');
   if DollarPos >= 0 then
     Body := Body.Substring(0, DollarPos);
@@ -1201,21 +1215,30 @@ begin
   for var P in Parts do
     if P = '' then
       Exit;   // a stray '@' means this is not the shape we think it is
+  if Length(Parts) = 0 then
+    Exit;
+  // A unit's initialization/finalization section is presented as the OWNING
+  // UNIT's name, not as the section keyword -- the same special case the
+  // Itanium demangler already makes, so a main block reads the same on both
+  // bitnesses. Without this, a 64-bit stack says `Testtarget` where a 32-bit
+  // one says `initialization`.
+  if (Length(Parts) >= 2) and
+     (SameText(Parts[High(Parts)], 'initialization') or
+      SameText(Parts[High(Parts)], 'finalization')) then begin
+    InnerName := Parts[0];
+    Exit(True);
+  end;
+  if not Anchored then begin
+    // No unit component: a single part is a plain, unmangled name.
+    if Length(Parts) = 1 then
+      Exit;
+    InnerName  := Parts[High(Parts)];
+    ParentName := Parts[High(Parts) - 1];
+    Exit(True);
+  end;
   case Length(Parts) of
-    0: Exit;
     1: InnerName := Parts[0];
-    2: begin
-         // A unit's initialization/finalization section is presented as the
-         // OWNING UNIT's name, not as the section keyword -- the same
-         // special case the Itanium demangler already makes, so a main block
-         // reads the same on both bitnesses. Without this, a 64-bit stack says
-         // `Testtarget` where a 32-bit one says `initialization`.
-         if SameText(Parts[1], 'initialization') or
-            SameText(Parts[1], 'finalization') then
-           InnerName := Parts[0]
-         else
-           InnerName := Parts[1];                   // unit + routine
-       end;
+    2: InnerName := Parts[1];                       // unit + routine
   else
     InnerName  := Parts[High(Parts)];               // unit + ... + class + method
     ParentName := Parts[High(Parts) - 1];
@@ -3080,6 +3103,12 @@ begin
                                     // table, can recover those names
     $0042: Result := 'Extended';    // 32-bit only: a genuine 10-byte x87 type,
                                     // which on Win64 collapses into $0041
+    $0044: Result := 'Real48';      // the pre-8087 6-byte Borland software float.
+                                    // Measured on BOTH bitnesses (Td32AliasProbe
+                                    // on TestTarget Win32/Win64: `R48: Real48`
+                                    // is id $0044 in each). Unlike TDateTime it
+                                    // is a distinct primitive, not a Double
+                                    // alias, so the name IS recoverable here.
     $0061: Result := 'AnsiChar';
     $0071: Result := 'Char';        // = WideChar on Win64
     $0072: Result := 'SmallInt';
@@ -3137,8 +3166,10 @@ begin
     $11, $21, $70, $71, $72, $73:      Result := 2;  // Int16/UInt16/WideChar
     $12, $22, $74, $75:                Result := 4;  // Int32/UInt32/Integer/Cardinal
     $13, $23, $76, $77:                Result := 8;  // Int64/UInt64
+    $04:                               Result := 8;  // Currency (scaled Int64)
     $40:                               Result := 4;  // Single
     $41, $42:                          Result := 8;  // Double/Extended(stored 8)
+    $44:                               Result := 6;  // Real48
   else
     Result := 0;
   end;

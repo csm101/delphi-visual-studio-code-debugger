@@ -315,6 +315,8 @@ The mapping observed across TestTarget + SampleApp globals:
 | `$0030`   | Boolean   |
 | `$0040`   | Single    |
 | `$0041`   | Double    |
+| `$0042`   | Extended (32-bit only; a true 10-byte x87 type) |
+| `$0044`   | Real48    |
 | `$0061`   | AnsiChar  |
 | `$0071`   | Char      |
 | `$0072`   | SmallInt  |
@@ -325,6 +327,37 @@ The mapping observed across TestTarget + SampleApp globals:
 | `$0077`   | UInt64    |
 
 `GetTypeName` decodes these before the record-table lookup.
+
+#### Named float aliases are FLATTENED at the variable — measured, not inferred
+
+`DevTools\Td32AliasProbe` (`-proc <name>` dumps a routine's locals with the raw
+TypeId; `<exe>` alone looks the alias names up in the TYPES table). Against
+`TestTarget`'s `ComputeNested`, which declares `D1: TDateTime`, `Ext1: Extended`
+and `R48: Real48`:
+
+| declared | Win64 TypeId | Win32 TypeId |
+|---|---|---|
+| `TDateTime` | `$0041` → `Double` | `$0041` → `Double` |
+| `Extended`  | `$0041` → `Double` (correct: a true alias there) | `$0042` → `Extended` |
+| `Real48`    | `$0044` | `$0044` |
+
+And `TDateTime` / `TDate` / `TTime` / `Real` / `Extended` / `Double` / `Currency`
+/ `Single` are **all absent from the TYPES table** — they are primitives, so no
+name record exists for any of them.
+
+So the compiler resolves the alias when it WRITES the variable record: the id is
+the underlying primitive and nothing points back at the declared name. This is
+not a missing type dictionary — the *link* from variable to declared type is
+gone, so no external name source can rebuild it. Only a provider that stores
+per-variable type identity can: `.rsm` does (`hint=TDateTime`), and so does the
+RSM-format `.dcp` (verified on a real Win32 package: `QBFD29.dcp` reports
+`hint=TDateTime` / `Currency` / `Double` / `Extended` as distinct hints), which
+is why a BPL needs no DCU reader for this. `Real48` is different and IS
+recoverable: it is a distinct primitive id, not a `Double` alias.
+
+Corollary for BPLs: the `.rsm` emitted beside a package can be nearly empty
+(`QBFDesignD29.rsm` is 51 KB for a 10.9 MB BPL and exposes **no locals at all**);
+the `.dcp` is the real RSM-format provider there.
 
 ### Itanium demangler (Borland-augmented)
 
@@ -346,6 +379,26 @@ Beyond the basic `_ZN ... E` shape, the demangler now handles:
 - Borland's `_ZTR` / `_ZTI` / `_ZTS` / `_ZTV` / `_ZTT` prefixes are
   stripped before parsing the embedded name (typeref / typeinfo /
   type-name string / vtable / VTT respectively).
+
+#### Unanchored names: an IDE-built package drops the unit component
+
+A package built by the IDE stores method names with **no leading `@`**, i.e. with
+no unit component at all:
+
+```
+TFrmColumns@Create                     class + method, no unit
+```
+
+The leading `@` is what marks the first component as the unit, so the two shapes
+cannot share one rule: anchored `@Unit@Proc` drops its first component, while
+unanchored `TClass@Method` must keep both. `DemangleBorland` handles both;
+a name with no `@` anywhere is still rejected as unmangled, which is what keeps
+plain symbols untouched.
+
+Measured on `QBFDesignD29.bpl` (`Td32AliasProbe -rvaname 24688 <bpl>`), where the
+anchored-only rule let the raw name through and a call-stack frame read
+`TFrmColumns@Create`. `@` is not legal in a Pascal identifier, so its presence is
+always a mangling separator.
 
 ### Borland demangler (what `dcc32` emits) — confirmed
 
