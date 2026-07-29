@@ -3168,7 +3168,15 @@ begin
     $13, $23, $76, $77:                Result := 8;  // Int64/UInt64
     $04:                               Result := 8;  // Currency (scaled Int64)
     $40:                               Result := 4;  // Single
-    $41, $42:                          Result := 8;  // Double/Extended(stored 8)
+    $41:                               Result := 8;  // Double
+    // $42 appears ONLY in 32-bit output -- on Win64 `Extended` is a true alias of
+    // `Double` and the compiler emits $41 -- so it is unconditionally the 10-byte
+    // x87 type. It used to report 8, the width of the value SLOT, which made
+    // `array of Extended` stride short by 2 bytes per element. The value slot is
+    // not this function's concern: ReadValueSlotRaw narrows wide floats to Double
+    // bits, and TypeSizeById's only size-sensitive consumers are set and record
+    // returns, neither of which a float can be.
+    $42:                               Result := 10; // Extended (x87, 32-bit only)
     $44:                               Result := 6;  // Real48
   else
     Result := 0;
