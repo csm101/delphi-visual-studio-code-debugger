@@ -1163,14 +1163,20 @@ begin
   // crossing instruction => a CALL just pushed a return address that points
   // back into the function: run full-speed to it, then resume single-stepping.
   if CurSP < FStepPrevSP then begin
+    // The pushed return address is ONE TARGET POINTER wide. Reading 8 bytes on a
+    // 32-bit target splices the next stack word into the high half: observed in
+    // the field as a run-to-return breakpoint planted at $5196C430B5AA25BC (low
+    // half the real return address, high half an unrelated rtl290 address), which
+    // failed to plant and let the step-over run free.
     var RetTop: UInt64 := 0;
-    if ReadProcessMemoryAt(CurSP, @RetTop, 8) and (RetTop <> 0) then begin
+    if ReadTargetPointer(CurSP, RetTop) and (RetTop <> 0) then begin
       FStepResumeVA := RetTop;
-      // CurSP is the RSP just after the CALL pushed the return address; the
-      // matching RET pops it, so the stepped frame resumes at CurSP + 8. A hit
-      // below that is a deeper recursive incarnation returning to the same site.
+      // CurSP is the SP just after the CALL pushed the return address; the
+      // matching RET pops exactly that pointer, so the stepped frame resumes at
+      // CurSP + PointerSize. A hit below that is a deeper recursive incarnation
+      // returning to the same site.
       {$Q-}
-      FStepResumeSP := CurSP + 8;
+      FStepResumeSP := CurSP + UInt64(TargetLayout.PointerSize);
       {$Q+}
       PlantStepBp(RetTop);
       ContinueDebugEvent(FProcessId, Tid, DBG_CONTINUE);
@@ -1513,9 +1519,13 @@ begin
           end;
         end;
 
-        // Import thunk or no function range found: use return address (same as step-out).
+        // Import thunk or no function range found: use return address (same as
+        // step-out) -- and validate it the same way. A non-zero test is not
+        // enough: an unwind that fails on a 32-bit host returns a wide or
+        // stack-resident value, and patching an INT3 there corrupts an unrelated
+        // byte and leaves the step with nothing to stop it.
         var RetAddr := CallerReturnAddress(StepTid);
-        if RetAddr <> 0 then begin
+        if IsPlausibleReturnAddress(RetAddr) then begin
           FStepMode   := smOver;
           FStepOverVA := RetAddr;
           FStepMinSP  := 0;

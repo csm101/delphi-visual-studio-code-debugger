@@ -1051,6 +1051,30 @@ begin
   GSink.Use(['calls']);  // {BP:STEP_CALLS_END}
 end;
 
+// Step-over stack-argument fixture. On x86 the first three parameters travel in
+// EAX/EDX/ECX and the FOURTH is pushed on the stack -- so at the moment of the
+// CALL it sits immediately above the return address. Reading that return address
+// eight bytes wide therefore splices this value into its high half, which is
+// exactly the defect this fixture pins (observed in the field as a run-to-return
+// breakpoint planted at $5196C430B5AA25BC).
+//
+// The existing STEPIN_CALLSITE fixture could not catch it: its stack argument is
+// the Double 2.5, whose low 4 bytes are ZERO, so the over-wide read happened to
+// produce the correct address. The marker value here is chosen to have every
+// byte non-zero for that reason.
+function StepOverStackArgProbe(A, B, C, D: Integer): Integer;
+begin
+  Result := A + B + C + (D and $FF);
+end;
+
+procedure RunStepOverStackArg;
+var
+  R: Integer;
+begin
+  R := StepOverStackArgProbe(1, 2, 3, Integer($5EEDBEEF));  // {BP:STEPOVER_STACKARG}
+  GSink.Use([R]);                                           // {BP:STEPOVER_STACKARG_NEXT}
+end;
+
 // Step-into prologue fixture (F19). Stopping at STEPIN_CALLSITE and stepping
 // into TWidget.StepIntoProbe must report Self and the three by-register
 // parameters with their PASSED values, not the caller's leftover frame bytes.
@@ -1990,6 +2014,7 @@ begin
   RunDateTimeAliasTest;
   RunStepConsecutiveCalls;
   RunStepIntoPrologue;
+  RunStepOverStackArg;
   RunStepManagedClear;
   RunIndexedPropTest;
   RunVariantTests;

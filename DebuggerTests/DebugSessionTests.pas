@@ -124,6 +124,11 @@ type
     // than assumed, so it deserves a test that actually steps.
     [Test] procedure Win32_StepInto_LandsInTheCallee;
     [Test] procedure Win32_StepOver_AdvancesWithinTheSameFrame;
+    // Step over a call whose FOURTH argument goes on the stack, i.e. directly
+    // above the return address the CALL pushes. Reading that return address at
+    // host width splices the argument into its high half and the run-to-return
+    // breakpoint is planted nowhere, so the step never completes.
+    [Test] procedure Win32_StepOverCallWithStackArgument_LandsOnTheNextLine;
     // An application split across runtime packages is this project's core use
     // case and the shape where debugger bugs have historically surfaced, so it
     // has to hold on both bitnesses rather than only x64. The breakpoint is
@@ -2931,6 +2936,38 @@ begin
       'step-over left the frame it started in');
     Assert.IsTrue(LineAfter <> LineBefore,
       Format('step-over did not advance: still on line %d', [LineAfter]));
+  finally
+    Session.Free;
+  end;
+end;
+
+procedure TWin32RunControlTests.Win32_StepOverCallWithStackArgument_LandsOnTheNextLine;
+const
+  STEP_SOURCE = 'TestTargetCore.pas';
+begin
+  var CallSite := MarkerLineInFile(TargetDir + STEP_SOURCE, 'STEPOVER_STACKARG');
+  var NextLine := MarkerLineInFile(TargetDir + STEP_SOURCE, 'STEPOVER_STACKARG_NEXT');
+  Assert.IsTrue(CallSite > 0, 'marker STEPOVER_STACKARG not found');
+  Assert.IsTrue(NextLine > 0, 'marker STEPOVER_STACKARG_NEXT not found');
+
+  var Session := OpenSessionAtMarker(Win32Exe, Win32Map, Win32Rsm, TargetDir,
+    STEP_SOURCE, CallSite);
+  try
+    Assert.AreEqual(Ord(dsStopped), Ord(Session.State), 'did not stop at the call site');
+    Session.StepOver;
+    PumpUntilStop(Session, 30000);
+    // The failure mode is a RUNAWAY, not a wrong line: the run-to-return
+    // breakpoint is planted at a spliced 64-bit address, fails to plant, and
+    // nothing stops the target again -- so this assertion is the real one.
+    Assert.AreEqual(Ord(dsStopped), Ord(Session.State),
+      'step-over over a call with a stack argument never stopped again');
+
+    var FnAfter, SrcAfter: string;
+    var LineAfter: Integer;
+    Assert.IsTrue(Session.GetCurrentLocation(FnAfter, SrcAfter, LineAfter),
+      'no location after the step');
+    Assert.AreEqual(NextLine, LineAfter,
+      Format('step-over landed on line %d, expected %d', [LineAfter, NextLine]));
   finally
     Session.Free;
   end;
