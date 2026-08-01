@@ -124,6 +124,9 @@ type
     // stack locals. Surface the captured vars by locating Self in the frame and
     // reading its debug-info fields.
     function  IsAnonBodyFunc(const Fn: string): Boolean;
+    // A bare identifier, so the closure-capture fallback in EvaluateForFrame is
+    // only tried for names a captured variable could have.
+    function  IsPlainIdentifier(const S: string): Boolean;
     // Finds the closure Self ($ActRec object) for the stopped frame by scanning the
     // param registers + RBP/RSP-relative slots for a VMT-valid object whose class is
     // an $ActRec activation record with debug-info members. False when not found.
@@ -1624,6 +1627,22 @@ begin
   end;
 end;
 
+// True for a bare identifier -- no dots, indexing, calls or operators. Keeps the
+// closure-capture fallback to names a captured variable could actually have,
+// rather than retrying it for every failed expression.
+function TDebugSession.IsPlainIdentifier(const S: string): Boolean;
+begin
+  Result := False;
+  if S = '' then
+    Exit;
+  if not CharInSet(S[1], ['A'..'Z', 'a'..'z', '_']) then
+    Exit;
+  for var I := 2 to Length(S) do
+    if not CharInSet(S[I], ['A'..'Z', 'a'..'z', '0'..'9', '_']) then
+      Exit;
+  Result := True;
+end;
+
 function TDebugSession.IsAnonBodyFunc(const Fn: string): Boolean;
 begin
   // Compiler-generated closure body, e.g. `RunClosureSampler$ActRec.$0$Body`.
@@ -1633,16 +1652,82 @@ end;
 function TDebugSession.TryFindClosureSelf(out SelfAddr: UInt64;
   out ClassName: string): Boolean;
 
-  function Consider(P: UInt64): Boolean;
+  // Last dot-separated segment, so a qualified runtime class name and an
+  // unqualified one compare equal.
+  function Unqualified(const S: string): string;
+  begin
+    Result := S;
+    var Dot := Result.LastIndexOf('.');
+    if Dot >= 0 then
+      Result := Result.Substring(Dot + 1);
+  end;
+
+  // The $ActRec class THIS frame belongs to, taken from its own function name:
+  // `Unit.RunClosureSampler$ActRec.$0$Body` -> `RunClosureSampler$ActRec`.
+  function ExpectedActRecClass: string;
+  begin
+    Result := '';
+    var Fn, Src: string;
+    var Ln: Integer;
+    if not GetCurrentLocation(Fn, Src, Ln) then
+      Exit;
+    var Dot := Fn.LastIndexOf('.');       // drop `.$0$Body`
+    if Dot < 0 then
+      Exit;
+    Result := Unqualified(Fn.Substring(0, Dot));
+    if not Result.Contains('$ActRec') then
+      Result := '';
+  end;
+
+var
+  WantClass: string;
+
+  function Consider(P: UInt64; RequireExactClass: Boolean): Boolean;
   begin
     Result := False;
     if (P < 65536) or (FRtti = nil) or not FRtti.IsClassInstance(P) then Exit;
     var Cn := FRtti.GetInstanceClassName(P);
     if (Cn = '') or not Cn.Contains('$ActRec') then Exit;
+    // Accepting ANY activation record found by the scan is how a STALE pointer
+    // left by an earlier closure gets picked up -- and on a 32-bit target the
+    // scan is the only path, because there is no parameter home slot to read
+    // Self from. That made the captured set depend on leftover register and
+    // stack contents: the same test listed CapStr but not CapInt on some runs
+    // and both on others. The frame's own name says which activation record it
+    // belongs to, so demand that one.
+    if RequireExactClass and (WantClass <> '') and
+       not SameText(Unqualified(Cn), WantClass) then
+      Exit;
     var Members: TArray<TClassMember>;
     if (FDebugInfo = nil) or not FDebugInfo.GetClassMembers(Cn, Members) or
        (Length(Members) = 0) then Exit;
     SelfAddr := P; ClassName := Cn; Result := True;
+  end;
+
+  // Registers first, then a bounded stack window around the frame and stack
+  // pointers. Stack slots are the TARGET's pointer size, not the debugger's:
+  // an 8-byte stride over a 32-bit stack visits every other slot and covers
+  // twice the intended window.
+  function ScanFor(RequireExactClass: Boolean): Boolean;
+  begin
+    Result := False;
+    var Layout := FDebugger.TargetLayout;
+    var Regs := FDebugger.GetRegisters;
+    for var R in [Regs.Rcx, Regs.Rdx, Regs.R8, Regs.R9, Regs.Rbx,
+                  Regs.Rsi, Regs.Rdi, Regs.R12, Regs.R13, Regs.R14, Regs.R15] do
+      if Consider(R, RequireExactClass) then Exit(True);
+    for var Anchor in [Regs.FramePtr, Regs.StackPtr] do begin
+      if Anchor = 0 then Continue;
+      for var K := -16 to 32 do begin
+        var Slot: UInt64 := 0;
+        {$Q-}{$R-}
+        var SlotAddr := Anchor + UInt64(Int64(K) * Layout.PointerSize);
+        {$Q+}{$R+}
+        if FDebugger.ReadProcessMemoryAt(SlotAddr, @Slot, Layout.PointerSize) and
+           Consider(Slot, RequireExactClass) then
+          Exit(True);
+      end;
+    end;
   end;
 
 begin
@@ -1653,35 +1738,23 @@ begin
   // home slot. Read it DIRECTLY -- exact, and (unlike a blind register/stack scan)
   // it cannot pick up a STALE `$ActRec` pointer left on the stack by an unrelated
   // closure that ran earlier, which would resolve the wrong class + methods.
+  WantClass := ExpectedActRecClass;
   var Layout := FDebugger.TargetLayout;
   var SelfHome := FDebugger.CurrentFrameParamHomeAddr(0);
   if SelfHome <> 0 then begin
     var SelfPtr: UInt64 := 0;
     if FDebugger.ReadProcessMemoryAt(SelfHome, @SelfPtr, Layout.PointerSize) and
-       Consider(SelfPtr) then
+       Consider(SelfPtr, True) then
       Exit(True);
   end;
-  // Fallback (home slot unreadable / prologue not recognised): scan the param
-  // registers, then a bounded stack window around RBP/RSP.
-  var Regs := FDebugger.GetRegisters;
-  for var R in [Regs.Rcx, Regs.Rdx, Regs.R8, Regs.R9, Regs.Rbx,
-                Regs.Rsi, Regs.Rdi, Regs.R12, Regs.R13, Regs.R14, Regs.R15] do
-    if Consider(R) then Exit(True);
-  // Stack slots are the TARGET's pointer size, not the debugger's: an 8-byte
-  // stride over a 32-bit stack visits every other slot and covers twice the
-  // intended window.
-  for var Anchor in [Regs.FramePtr, Regs.StackPtr] do begin
-    if Anchor = 0 then Continue;
-    for var K := -16 to 32 do begin
-      var Slot: UInt64 := 0;
-      {$Q-}{$R-}
-      var SlotAddr := Anchor + UInt64(Int64(K) * Layout.PointerSize);
-      {$Q+}{$R+}
-      if FDebugger.ReadProcessMemoryAt(SlotAddr, @Slot, Layout.PointerSize) and
-         Consider(Slot) then
-        Exit(True);
-    end;
-  end;
+  // Fallback (home slot unreadable / prologue not recognised / no home-slot
+  // formula at all, which is the case on x86). Two passes: first demanding the
+  // activation record this frame actually belongs to, then -- only if that
+  // finds nothing, e.g. because the runtime class name is spelled differently
+  // from the symbol -- accepting any, which is the pre-existing behaviour.
+  if ScanFor(True) then
+    Exit(True);
+  Result := ScanFor(False);
 end;
 
 procedure TDebugSession.AppendClosureCapturedLocals(
@@ -1693,7 +1766,21 @@ begin
   if not GetCurrentLocation(FnName, Src, Line) or not IsAnonBodyFunc(FnName) then Exit;
   var SelfAddr: UInt64;
   var CloClass: string;
-  if not TryFindClosureSelf(SelfAddr, CloClass) then Exit;
+  if not TryFindClosureSelf(SelfAddr, CloClass) then begin
+    // We KNOW this frame is an anonymous-method body, so it has captured
+    // variables whether or not we can reach them. Resolving them needs the
+    // $ActRec class members from the symbol index, and every interactive read
+    // waits only a bounded time for that index -- so on a cold one the captures
+    // silently vanish and the variables view looks like the closure captured
+    // nothing. Say so instead: an empty list is indistinguishable from a
+    // truthful answer, and this one is not truthful.
+    var Pending := Default(TSessionVariable);
+    Pending.Name         := '<captured>';
+    Pending.Value        := '<symbols not ready -- refresh to retry>';
+    Pending.EvaluateName := '';
+    Locals := Locals + [Pending];
+    Exit;
+  end;
   var Members: TArray<TClassMember>;
   if FDebugInfo.GetClassMembers(CloClass, Members) then
     for var M in Members do begin
@@ -1708,7 +1795,13 @@ begin
       LV.Address    := SelfAddr + UInt64(M.FieldOffset);
       LV.TypeHint   := M.TypeName;
       LV.Kind       := lkLocal;
-      LV.ValueValid := FDebugger.ReadProcessMemoryAt(LV.Address, @LV.RawValue, 8);
+      // Read the field at its OWN width. Eight bytes unconditionally folds the
+      // NEXT field into the high half on a 32-bit target: a captured `string`
+      // came back as $2A030181CC -- a ten-digit address in a four-byte process --
+      // and rendered as a read failure. An Integer survived it only because the
+      // formatter masks the high half away.
+      LV.ValueValid := FDebugger.ReadProcessMemoryAt(LV.Address, @LV.RawValue,
+        LocalReadSize(LV.TypeHint, FDebugger.TargetLayout.PointerSize));
       Locals := Locals + [LocalToSession(LV)];
     end;
   AppendAnonMethodParams(Locals, FnName, CloClass);
@@ -1740,7 +1833,9 @@ begin
     LV.Address    := Addr;
     LV.TypeHint   := Params[I].TypeName;
     LV.Kind       := lkLocal;
-    LV.ValueValid := FDebugger.ReadProcessMemoryAt(Addr, @LV.RawValue, 8);
+    // Same rule as the captured fields above: the parameter's own width, not 8.
+    LV.ValueValid := FDebugger.ReadProcessMemoryAt(Addr, @LV.RawValue,
+      LocalReadSize(LV.TypeHint, FDebugger.TargetLayout.PointerSize));
     // A single param that fails to read / format must not lose the other locals.
     try
       Locals := Locals + [LocalToSession(LV)];
@@ -1833,6 +1928,27 @@ begin
         Display := Val.TypeHint;  // error message like '<X: not found>'
     finally
       Eval.Free;
+    end;
+
+    // A variable CAPTURED by an anonymous method is listed among the locals but
+    // was not resolvable by name: inside a closure body the captured variables
+    // are fields of the hidden $ActRec Self object, and only this layer knows
+    // that -- the evaluator sees an empty stack-local set and answers
+    // `<CapStr: not found>` for a name the variables view is displaying right
+    // next to it. Look it up the same way the locals list builds it.
+    if not Val.IsValid and IsPlainIdentifier(Expr) then begin
+      var Captured: TArray<TSessionVariable>;
+      AppendClosureCapturedLocals(Captured);
+      for var C in Captured do
+        if SameText(C.Name, Expr) then begin
+          Result.Success    := True;
+          Result.IsValid    := True;
+          Result.Value      := C.Value;
+          Result.TypeName   := C.TypeName;
+          Result.Handle     := C.Handle;
+          Result.Expandable := C.Expandable;
+          Exit;
+        end;
     end;
 
     // Nil-class fallback for globals: a bare known global whose value is nil with

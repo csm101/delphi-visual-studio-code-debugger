@@ -66,6 +66,20 @@ Still open:
 
 ## Per-unit / per-binary type resolution
 
+- **Closure-captured variables can vanish while the symbol index is cold** —
+  measured 2026-08-02: the same test, same binary, listed `CapStr` and `CapInt`
+  on some runs, only `CapStr` on others, and neither on one. Not a stale
+  `$ActRec`: resolving the captured set needs that class's members from the
+  symbol index, every interactive read waits only `INTERACTIVE_WAIT_BUDGET_MS`
+  for it (the F14 hang guard), and on a cold index the lookup simply returns
+  nothing. The WATCH path recovers because the frontend warms and retries on a
+  miss; the LOCALS path has no equivalent, so the variables view can show a
+  closure as having captured nothing.
+  Mitigated, not fixed: `AppendClosureCapturedLocals` now emits a visible
+  `<captured> = <symbols not ready -- refresh to retry>` row instead of an
+  empty list, so the state is at least distinguishable from the truth. The
+  real fix is a warm-up + retry on the locals path to match the watch path.
+
 - **dcc32 emits generics UN-INSTANTIATED, so a `TList<T>`'s element type is
   wrong on Win32** — measured 2026-08-01 on TestTarget's `GenList: TList<Integer>`.
   dcc64 emits a record per instantiation, `TList__1<Integer>`, whose `FItems`

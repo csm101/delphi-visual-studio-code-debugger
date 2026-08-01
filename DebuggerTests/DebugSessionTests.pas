@@ -115,6 +115,11 @@ type
     // only. Both evaluate an expression in the debuggee before deciding to
     // stop, so both depend on the 32-bit locals and calling convention.
     [Test] procedure ConditionalBreakpoints_StopAtTheRightIterationOnBothBitnesses;
+    // Variables captured by an anonymous method live in a hidden $ActRec object.
+    // Each field was read eight bytes wide regardless of target, so on Win32 a
+    // captured string picked up its neighbour and rendered as a read failure.
+    // They were also listed but not resolvable by NAME, on either bitness.
+    [Test] procedure ClosureCaptures_ReadAndResolveOnBothBitnesses;
     // TD32 stores globals mangled, and dcc32 mangles Borland-style where dcc64
     // mangles Itanium-style; only the latter was decoded, so NO unit global
     // resolved on a 32-bit target.
@@ -3140,6 +3145,87 @@ begin
   Assert.AreEqual('', Failures,
     'a conditional or hit-count breakpoint must stop at the iteration it ' +
     'names, on both bitnesses -- ' + Failures);
+end;
+
+procedure TWin32RunControlTests.ClosureCaptures_ReadAndResolveOnBothBitnesses;
+const
+  SOURCE = 'TestTargetCore.pas';
+  MARKER = 'CLOSURE_BODY';
+
+  // Reports "<name>=<value>" for a captured variable as the LOCALS view shows
+  // it, or an error marker. The string is the one that mattered: read eight
+  // bytes wide on a 32-bit target it came back as $2A030181CC -- a ten-digit
+  // address in a four-byte process -- and rendered `(string read failed)`.
+  function LocalNamed(const Exe, Map, Rsm, Name: string; Line: Integer): string;
+  begin
+    var Session := OpenSessionAtMarker(Exe, Map, Rsm, TargetDir, SOURCE, Line);
+    try
+      if Session.State <> dsStopped then
+        Exit('<did not stop>');
+      // Resolving the captured set needs the $ActRec class members, which come
+      // from the symbol index. That index builds in the background and every
+      // interactive read waits only a bounded time for it, so a cold index
+      // silently yields no captures at all -- see the KNOWN_UNKNOWNS entry.
+      // Reading the stack first is what a frontend does before showing
+      // variables, and it gives the index the same chance here.
+      Session.GetCallStack;
+      for var Attempt := 1 to 5 do begin
+        for var V in Session.GetLocals do
+          if SameText(V.Name, Name) then
+            Exit(V.Value);
+        Sleep(200);
+      end;
+      Result := '<not listed>';
+    finally
+      Session.Free;
+    end;
+  end;
+
+  // The same variable reached the way a WATCH reaches it. Listing a variable
+  // the user then cannot type is the second half of the defect.
+  function EvalNamed(const Exe, Map, Rsm, Name: string; Line: Integer): string;
+  begin
+    var Session := OpenSessionAtMarker(Exe, Map, Rsm, TargetDir, SOURCE, Line);
+    try
+      if Session.State <> dsStopped then
+        Exit('<did not stop>');
+      var R := Session.Evaluate(Name);
+      if not R.Success then
+        Exit('<' + R.ErrorText + '>');
+      Result := R.Value;
+    finally
+      Session.Free;
+    end;
+  end;
+
+begin
+  var Line := MarkerLineInFile(TargetDir + SOURCE, MARKER);
+  Assert.IsTrue(Line > 0, 'marker ' + MARKER + ' not found');
+  Assert.IsTrue(FileExists(Win64Exe), '64-bit control target missing');
+
+  var Failures := '';
+  for var Name in ['CapStr', 'CapInt'] do begin
+    var Expected: string;
+    if Name = 'CapStr' then Expected := 'captured' else Expected := '42';
+
+    var Listed64 := LocalNamed(Win64Exe, Win64Map, Win64Rsm, Name, Line);
+    if not Listed64.Contains(Expected) then
+      Failures := Failures + Format('x64 locals %s -> %s; ', [Name, Listed64]);
+    var Listed32 := LocalNamed(Win32Exe, Win32Map, Win32Rsm, Name, Line);
+    if not Listed32.Contains(Expected) then
+      Failures := Failures + Format('x86 locals %s -> %s; ', [Name, Listed32]);
+
+    var Eval64 := EvalNamed(Win64Exe, Win64Map, Win64Rsm, Name, Line);
+    if not Eval64.Contains(Expected) then
+      Failures := Failures + Format('x64 watch %s -> %s; ', [Name, Eval64]);
+    var Eval32 := EvalNamed(Win32Exe, Win32Map, Win32Rsm, Name, Line);
+    if not Eval32.Contains(Expected) then
+      Failures := Failures + Format('x86 watch %s -> %s; ', [Name, Eval32]);
+  end;
+
+  Assert.AreEqual('', Failures,
+    'a variable captured by an anonymous method must read correctly and be ' +
+    'reachable by name, on both bitnesses -- ' + Failures);
 end;
 
 procedure TWin32RunControlTests.BreakpointOnBeginLine_ReportsPassedParameters;
