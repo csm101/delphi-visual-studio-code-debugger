@@ -171,6 +171,7 @@ type
                           IUnitScopedFuncProvider,
                           IClassMemberProvider, IEnumInfoProvider,
                           ITypeSizeProvider, IClassHierarchyProvider,
+                          ITypePointeeKindProvider,
                           IMethodSignatureProvider)
   private
     FFileHandle:    THandle;
@@ -368,6 +369,8 @@ type
     // name path handles them without loss (and drives float-in-XMM correctly).
     function  TypeKindById(TypeId: Cardinal; Depth: Integer = 0): Byte;
     function  TypeSizeById(TypeId: Cardinal): Integer;
+    // True for the array descriptor a DYNAMIC array's pointer leads to.
+    function  IsDynArrayDescriptor(const Rec: TTD32TypeRecord): Boolean;
     procedure HandleBpRel32(Payload: PByte; PayloadEnd: PByte;
                             const ScopeName: string; ScopeRva: UInt64;
                             BlockStartRva, BlockEndRva: UInt64);
@@ -445,6 +448,9 @@ type
                   out Params: TArray<TMethodParam>; out HasSelf: Boolean): Boolean;
     function    TryGetFreeFunctionParamCount(const FuncName: string;
                   out Count: Integer): Boolean;
+    // ITypePointeeKindProvider -- what a pointer type id leads to, which is the
+    // only way to tell a dynamic array from a plain pointer (both read `^T`).
+    function    PointeeKindById(TypeId: Cardinal): Byte;
     // ITypeSizeProvider
     function    GetTypeSize(const TypeName: string; out Size: Integer): Boolean;
     // IClassHierarchyProvider
@@ -3515,17 +3521,53 @@ begin
       // A Delphi class-typed value is internally a POINTER to the class layout,
       // yet its TTypeKind is tkClass (matching GetTypeName, which strips the
       // caret, and LookupTypeKind by name). Deref one level: a pointee that is a
-      // class -> tkClass; anything else (^TRecord, PInteger) stays tkPointer.
+      // class -> tkClass; a pointee that is a DYNAMIC-ARRAY descriptor ->
+      // tkDynArray; anything else (^TRecord, PInteger) stays tkPointer.
       var PtIdx: Integer;
       if (FTypes[Idx].BaseTypeId >= $1000) and
          FTypeIdToRecord.TryGetValue(FTypes[Idx].BaseTypeId, PtIdx) and
-         (PtIdx >= 0) and (PtIdx < Length(FTypes)) and
-         (FTypes[PtIdx].Kind = tkClass) then
-        Result := 7    // tkClass
+         (PtIdx >= 0) and (PtIdx < Length(FTypes)) then begin
+        if FTypes[PtIdx].Kind = tkClass then
+          Result := 7                                    // tkClass
+        else if IsDynArrayDescriptor(FTypes[PtIdx]) then
+          Result := 17                                   // tkDynArray
+        else
+          Result := 20;                                  // tkPointer
+      end
       else
         Result := 20;  // tkPointer
     end;
   end;
+end;
+
+// A Delphi dynamic array is a POINTER to an array descriptor. Both a dynamic
+// and a static array use leaf $0032, and the two are told apart by what the
+// decoder could extract: a STATIC array carries a real element count, so it
+// lands as tkArray with a non-zero Size, while the dynamic form has neither and
+// falls through as tkModifier with Size 0.
+//
+// Measured on TestTarget (DevTools\Td32AliasProbe -proc):
+//   DoCalcDynArr.Result  ptr -> ptr -> [leaf=$32 kind=13 size=0] -> Integer
+//   RunEvalTests.Scores         ptr -> [leaf=$32 kind=13 size=0] -> Integer
+//   ScanTime..DateSeq                  [leaf=$32 kind=2  size=256] -> TDateItem
+// i.e. the working local `Scores` is literally the next link of the Result's
+// own chain, which is what identifies the extra pointer as the var-out slot.
+function TTD32FileReader.IsDynArrayDescriptor(const Rec: TTD32TypeRecord): Boolean;
+begin
+  Result := (Rec.LeafCode = $0032) and (Rec.Kind = tkModifier) and (Rec.Size = 0);
+end;
+
+function TTD32FileReader.PointeeKindById(TypeId: Cardinal): Byte;
+var
+  Idx: Integer;
+begin
+  Result := 0;
+  if TypeId < $1000 then Exit;
+  if not FTypeIdToRecord.TryGetValue(TypeId, Idx) then Exit;
+  if (Idx < 0) or (Idx >= Length(FTypes)) then Exit;
+  if FTypes[Idx].Kind <> tkPointer then Exit;
+  if FTypes[Idx].BaseTypeId = 0 then Exit;
+  Result := TypeKindById(FTypes[Idx].BaseTypeId);
 end;
 
 function TTD32FileReader.TypeSizeById(TypeId: Cardinal): Integer;

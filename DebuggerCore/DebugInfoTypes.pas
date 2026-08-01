@@ -303,6 +303,21 @@ type
     function GetParentClassName(const ClassName: string; out Parent: string): Boolean;
   end;
 
+  // What a POINTER type id points at, as a Delphi TTypeKind. Asked by TYPE ID
+  // rather than by name because a name cannot answer it: TD32 renders both a
+  // dynamic array and a plain pointer as `^Element`, and only the type graph
+  // separates them (a dynamic array is a pointer to an array descriptor).
+  //
+  // The var-out return path needs exactly this. A function returning through
+  // the hidden slot has its Result typed one pointer deeper than the value it
+  // yields -- `^Variant`, `^TPoint3D`, and for a dynamic array `^^Element` --
+  // so deciding whether to strip that indirection means asking what the pointer
+  // actually leads to. Returns 0 when the id is unknown or is not a pointer.
+  ITypePointeeKindProvider = interface
+    ['{2F1B7C46-98AD-4E30-B5C7-6D02E9A41F3C}']
+    function PointeeKindById(TypeId: Cardinal): Byte;
+  end;
+
   // Byte size of a named type (record / structure / class / primitive).
   // Used to compute dynamic-array element stride when the array is a
   // local whose TD32 type is `^Element` (no RTTI dyn-array TypeInfo).

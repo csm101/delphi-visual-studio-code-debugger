@@ -1218,6 +1218,19 @@ function TExprEvaluator.ApplyMethodCall(const Base: TExprValue;
         if RetTypeName.StartsWith('^') then begin
           var Pointee     := RetTypeName.Substring(1);
           var PointeeKind := TypeNameToKind(Pointee);
+          // A NAME cannot separate a dynamic array from a plain pointer -- TD32
+          // renders both as `^Element`, so `W.DoCalcDynArr()` (Result typed
+          // `^^Integer`) looked like a pointer-to-pointer and kept its
+          // indirection, decoding the array with a pointer-sized stride:
+          // [85899345930, 30, []], where 85899345930 is 0x14_0000000A, the
+          // elements 20 and 10 read as ONE 8-byte element. The TYPE GRAPH does
+          // separate them -- a dynamic array is a pointer to an array
+          // descriptor -- so ask by id when the name came back unhelpful.
+          if (PointeeKind = 0) or (PointeeKind = TK_POINTER) then begin
+            var ByIdKind := FDebugInfo.PointeeKindById(Cardinal(L.TypeId));
+            if ByIdKind <> 0 then
+              PointeeKind := ByIdKind;
+          end;
           // Same set as IsManagedReturnKind below, plus records; spelled out
           // because that helper is declared after this one.
           if PointeeKind in [TK_LSTRING, TK_USTRING, TK_WSTRING, TK_DYNARRAY,

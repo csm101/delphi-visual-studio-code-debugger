@@ -65,6 +65,7 @@ type
     FMemberProviders: TList<IClassMemberProvider>;
     FSigProviders:    TList<IMethodSignatureProvider>;
     FSizeProviders:   TList<ITypeSizeProvider>;
+    FPointeeKindProviders: TList<ITypePointeeKindProvider>;
     FHierProviders:   TList<IClassHierarchyProvider>;
     FBgIndexProviders: TList<IBackgroundIndexProvider>;
     function IsSuspectMisTag(const T: string): Boolean;
@@ -177,6 +178,10 @@ type
     function  TryGetFreeFunctionParamCount(const FuncName: string;
                 out Count: Integer): Boolean;
     function  GetTypeSize(const TypeName: string; out Size: Integer): Boolean;
+    // Delphi TTypeKind of what a POINTER type id leads to; 0 when unknown or
+    // not a pointer. The only way to separate a dynamic array from a plain
+    // pointer, since TD32 renders both as `^Element`.
+    function  PointeeKindById(TypeId: Cardinal): Byte;
     // Immediate parent (base) class name of ClassName, via the first hierarchy
     // provider that knows it (TD32). False when unknown / no base.
     function  GetParentClassName(const ClassName: string; out Parent: string): Boolean;
@@ -217,6 +222,7 @@ begin
   FMemberProviders := TList<IClassMemberProvider>.Create;
   FSigProviders    := TList<IMethodSignatureProvider>.Create;
   FSizeProviders   := TList<ITypeSizeProvider>.Create;
+  FPointeeKindProviders := TList<ITypePointeeKindProvider>.Create;
   FHierProviders   := TList<IClassHierarchyProvider>.Create;
   FBgIndexProviders := TList<IBackgroundIndexProvider>.Create;
 end;
@@ -238,6 +244,7 @@ begin
   FMemberProviders.Free;
   FSigProviders.Free;
   FSizeProviders.Free;
+  FPointeeKindProviders.Free;
   FHierProviders.Free;
   FBgIndexProviders.Free;
   inherited;
@@ -300,6 +307,9 @@ begin
       FSigProviders.Add(SigP);
   if Supports(Provider, ITypeSizeProvider, SizeP) then
     FSizeProviders.Add(SizeP);
+  var PointeeP: ITypePointeeKindProvider;
+  if Supports(Provider, ITypePointeeKindProvider, PointeeP) then
+    FPointeeKindProviders.Add(PointeeP);
   var BgIdxP: IBackgroundIndexProvider;
   if Supports(Provider, IBackgroundIndexProvider, BgIdxP) then
     FBgIndexProviders.Add(BgIdxP);
@@ -403,6 +413,9 @@ begin
     FSigProviders.Remove(SigP);
   if Supports(Provider, ITypeSizeProvider, SizeP) then
     FSizeProviders.Remove(SizeP);
+  var PointeeR: ITypePointeeKindProvider;
+  if Supports(Provider, ITypePointeeKindProvider, PointeeR) then
+    FPointeeKindProviders.Remove(PointeeR);
   var BgIdxP: IBackgroundIndexProvider;
   if Supports(Provider, IBackgroundIndexProvider, BgIdxP) then
     FBgIndexProviders.Remove(BgIdxP);
@@ -1316,6 +1329,17 @@ begin
   for var P in FSizeProviders do
     if P.GetTypeSize(TypeName, Size) and (Size > 0) then
       Exit(True);
+end;
+
+function TDebugInfoSet.PointeeKindById(TypeId: Cardinal): Byte;
+begin
+  Result := 0;
+  if TypeId = 0 then Exit;
+  for var P in FPointeeKindProviders do begin
+    Result := P.PointeeKindById(TypeId);
+    if Result <> 0 then
+      Exit;
+  end;
 end;
 
 function TDebugInfoSet.TryResolveEnumLiteral(const Name: string;

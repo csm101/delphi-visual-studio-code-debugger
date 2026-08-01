@@ -3688,6 +3688,22 @@ begin
     Resp.Free;
   end;
 
+  // A DYNAMIC ARRAY returned through the slot. Its Result is typed `^^Integer`,
+  // and a NAME cannot tell a dynamic array from a pointer -- TD32 renders both
+  // as `^Element` -- so the indirection stayed on and the array was decoded with
+  // a pointer-sized stride: [85899345930, 30, []], where 85899345930 is
+  // 0x14_0000000A, the elements 20 and 10 read as ONE 8-byte element. The type
+  // GRAPH separates them, which is what PointeeKindById asks.
+  Resp := FClient.Evaluate('W.DoCalcDynArr()', FrameId, 'watch');
+  try
+    Display := Resp.GetValue<string>('result', '');
+    Assert.IsTrue(Display.Contains('[10, 20, 30]'),
+      'a dynamic array returned through the var-out slot must decode with the ' +
+      'ELEMENT stride, not the pointer stride; got: ' + Display);
+  finally
+    Resp.Free;
+  end;
+
   // The case that already worked -- kept so a fix here cannot silently break it.
   Resp := FClient.Evaluate('W.DoCalcUStr()', FrameId, 'watch');
   try
