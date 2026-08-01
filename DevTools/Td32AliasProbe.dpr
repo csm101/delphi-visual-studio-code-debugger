@@ -89,9 +89,10 @@ begin
     var KindText := 'local';
     if L.Kind = lkVarParam then
       KindText := 'varParam';
-    Writeln(Format('  %-20s kind=%-10s TypeId=$%.4x  name=%-20s hint=%s',
+    Writeln(Format('  %-20s kind=%-10s TypeId=$%.4x  name=%-16s chain=%s',
       [L.Name, KindText, L.TypeId,
-       Reader.GetTypeName(Cardinal(L.TypeId)), L.TypeHint]));
+       Reader.GetTypeName(Cardinal(L.TypeId)),
+       Reader.DescribeTypeChain(Cardinal(L.TypeId))]));
   end;
 end;
 

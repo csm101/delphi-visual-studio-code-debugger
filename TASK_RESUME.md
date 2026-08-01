@@ -380,9 +380,22 @@ fail with the exact field symptom, in both the mono and BPL fixtures.
 ### OPEN, characterised, NOT fixed
 
 * **`W.DoCalcDynArr()` still returns `[85899345930, 30, []]`** -- `0x14_0000000A`
-  is elements 20 and 10 read as ONE 8-byte element. Not the caret: the RSM
-  records no `Result` local for that function at all, so there is no return hint
-  to correct and the decode falls back to a heuristic.
+  is elements 20 and 10 read as ONE 8-byte element. CAUSE MEASURED (an earlier
+  note in this file guessed "the RSM has no Result local" -- true of the RSM,
+  irrelevant, because TD32 is the primary provider and DOES have one):
+  ```
+  DoCalcDynArr.Result  $B4B9  LF_POINTER -> $B4BA LF_POINTER -> $B4BC leaf=$32 -> Integer
+  RunEvalTests.Scores  $B4BA             LF_POINTER -> $B4BC leaf=$32 -> Integer
+  ```
+  A dyn array is `LF_POINTER -> leaf $32`; the var-out Result is the SAME chain
+  with one extra pointer -- `Scores`, which formats correctly, is literally its
+  next link. The caret-strip declines because it decides by NAME and
+  `TypeNameToKind('^Integer')` cannot tell a dyn array from a pointer.
+  THE FIX IS A DESIGN CALL, deliberately not taken while unattended:
+  decide by TYPE ID (`TTD32FileReader.TypeKindById` answers it exactly, but is
+  private and not surfaced through `TDebugInfoSet` -- exposing it is a new
+  provider interface), or strip a caret whenever the pointee also starts with
+  `^` (a heuristic that misfires on a pointer-to-pointer returned by value).
 * **Program main-block locals carry false types** (`TWidget` -> `EPrivilege` on
   Win32, `RunClosureParamSampler$2$Intf` on Win64) and list a local `Cmp` that
   does not exist in the source, twice. Localised to the RSM parser

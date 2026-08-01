@@ -279,8 +279,27 @@ Variant's value, the record's type AND expandability, and keeps the string case
 as a control.
 
 STILL OPEN: `W.DoCalcDynArr()` returns `[85899345930, 30, []]` (`0x14_0000000A`
-= elements 20 and 10 read as one 8-byte element). Different cause — the RSM
-records NO `Result` local for it at all, so there is no hint to correct.
+= elements 20 and 10 read as one 8-byte element). The cause is now measured, and
+it is NOT the same one:
+
+```
+DoCalcDynArr.Result  $B4B9  LF_POINTER -> $B4BA LF_POINTER -> $B4BC leaf=$32 -> Integer
+RunEvalTests.Scores  $B4BA             LF_POINTER -> $B4BC leaf=$32 -> Integer
+```
+
+A dynamic array is `LF_POINTER -> leaf $32` in TD32, and the var-out `Result`
+carries exactly ONE extra `LF_POINTER` — it is literally the next link of the
+same chain as the working local. So stripping one caret would be right here too;
+the caret-strip above declines to do it because it decides by NAME, and
+`TypeNameToKind('^Integer')` cannot tell a dyn array from a pointer.
+
+Fixing it properly means deciding by the TYPE ID rather than the name.
+`TTD32FileReader.TypeKindById` already answers exactly this question, but it is
+private and not surfaced through `TDebugInfoSet`; exposing it is a new provider
+interface, i.e. a cross-cutting change rather than a patch. The alternative — 
+strip a caret whenever the pointee itself starts with `^` — is a heuristic that
+would misfire on a function returning a pointer-to-pointer by value. Deliberately
+left for a reviewed decision.
 
 #### `WideString` is a BSTR, not a Delphi long string
 
