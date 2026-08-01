@@ -248,6 +248,40 @@ primitive `$0041` collapses `Double`, `TDateTime` and `Real` onto one id, so a
 alias survives only in the debuggee's live RTTI (and in the `.rsm` type table);
 TD32 cannot express it.
 
+#### A var-out `Result` is typed `^T`, and the caret is the ABI
+
+TD32 renders the `Result` local of a function that returns through the hidden
+var-out slot as a POINTER to the real return type — measured on TestTarget:
+
+| function | declared return | TD32 `Result` hint |
+|---|---|---|
+| `DoCalcUStr` | `UnicodeString` | `^string` |
+| `DoCalcVariant` | `Variant` | `^Variant` |
+| `DoCalcBigRec` | `TPoint3D` | `^TPoint3D` |
+
+That is faithful — the slot really does hold a pointer the routine writes
+through — but it is the calling convention, not the type. `TryGetReturnTypeFromResultLocal`
+fed the hint straight to `TypeNameToKind`, which resolves nothing for `^Variant`
+or `^TPoint3D`, so the return kind stayed unknown and the slot was read as an
+8-byte scalar: `W.DoCalcVariant()` showed `3` (the `varInteger` VType word) and
+`W.DoCalcBigRec()` showed `0x3FF8000000000000`, the double `1.5`, which is the
+record's FIRST FIELD. Strings escaped it only because the caret is stripped
+separately further down the string path — which is precisely why the defect
+survived: the one case anybody tried worked.
+
+The caret is now stripped at the source, but ONLY when the pointee's kind is one
+that genuinely travels through the var-out slot (managed families plus records).
+A function returning a pointer BY VALUE in RAX also has a caret in its `Result`
+hint, and stripping that one would read the pointee instead of the pointer.
+
+Pinned by `Test_Eval_VarOutReturn_DirectCall_IsDecoded`, which asserts the
+Variant's value, the record's type AND expandability, and keeps the string case
+as a control.
+
+STILL OPEN: `W.DoCalcDynArr()` returns `[85899345930, 30, []]` (`0x14_0000000A`
+= elements 20 and 10 read as one 8-byte element). Different cause — the RSM
+records NO `Result` local for it at all, so there is no hint to correct.
+
 #### `WideString` is a BSTR, not a Delphi long string
 
 The two look identical — a pointer to UTF-16 data with a 4-byte prefix below it

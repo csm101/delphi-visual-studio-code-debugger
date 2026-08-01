@@ -85,10 +85,14 @@ begin
     Exit;
   end;
   Writeln('== locals of ' + ProcName + ' ==');
-  for var L in Locals do
-    Writeln(Format('  %-20s TypeId=$%.4x  name=%-20s hint=%-20s chain=%s',
-      [L.Name, L.TypeId, Reader.GetTypeName(Cardinal(L.TypeId)), L.TypeHint,
-       Reader.DescribeTypeChain(Cardinal(L.TypeId))]));
+  for var L in Locals do begin
+    var KindText := 'local';
+    if L.Kind = lkVarParam then
+      KindText := 'varParam';
+    Writeln(Format('  %-20s kind=%-10s TypeId=$%.4x  name=%-20s hint=%s',
+      [L.Name, KindText, L.TypeId,
+       Reader.GetTypeName(Cardinal(L.TypeId)), L.TypeHint]));
+  end;
 end;
 
 procedure ReportClassMembers(Reader: TTD32FileReader; const ClassName: string);

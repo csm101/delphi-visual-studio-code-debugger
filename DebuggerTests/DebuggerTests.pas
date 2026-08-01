@@ -522,6 +522,9 @@ type
     // `Obj.M` without parentheses is a CALL in Pascal; it used to resolve to
     // the method's own code address and read it as data.
     [Test] procedure Test_Eval_ParameterlessMethod_NoParens_IsCalled;
+    // A var-out return (Variant / record / string) called DIRECTLY: TD32 types
+    // the Result as `^T` and the caret used to defeat the kind dispatch.
+    [Test] procedure Test_Eval_VarOutReturn_DirectCall_IsDecoded;
     // WideString is a BSTR (byte-length prefix), not a Delphi long string.
     [Test] procedure Test_Eval_WideStringProperty_HasNoTrailingGarbage;
 
@@ -3641,6 +3644,58 @@ begin
       'aliased Integer must show its value 42: ' + Display);
   finally
     AliasVar.Free;
+  end;
+end;
+
+procedure TDebuggerTests.Test_Eval_VarOutReturn_DirectCall_IsDecoded;
+// TD32 renders the Result of a VAR-OUT function as a POINTER to the real return
+// type (`^Variant`, `^TPoint3D`, `^string`), because the hidden slot is what the
+// routine writes through. The caret is the ABI, not the type; leaving it on
+// meant the return KIND never resolved and the slot was read as a scalar:
+// DoCalcVariant() showed 3 -- the varInteger VType word -- and DoCalcBigRec()
+// showed 0x3FF8000000000000, the double 1.5, which is the record's first field.
+// DoCalcUStr() worked only because the string path strips the caret separately,
+// which is exactly why this went unnoticed.
+var
+  FrameId, LocalsRef: Integer;
+  Resp: TJSONObject;
+  Display: string;
+begin
+  StartSession('EVAL_BODY', FrameId, LocalsRef);
+
+  // FValue + 100 = 142, and it must arrive as a decoded Variant, not a VType.
+  Resp := FClient.Evaluate('W.DoCalcVariant()', FrameId, 'watch');
+  try
+    Display := Resp.GetValue<string>('result', '');
+    Assert.IsTrue(Display.Contains('142'),
+      'a Variant returned through the var-out slot must decode to its VALUE ' +
+      '(142); got: ' + Display);
+  finally
+    Resp.Free;
+  end;
+
+  // A record returned by value through the slot must be a record, not the
+  // first 8 bytes of one.
+  Resp := FClient.Evaluate('W.DoCalcBigRec()', FrameId, 'watch');
+  try
+    Display := Resp.GetValue<string>('result', '');
+    Assert.IsTrue(Display.Contains('TPoint3D'),
+      'a record returned through the var-out slot must be typed as the record; ' +
+      'got: ' + Display);
+    Assert.IsTrue(Resp.GetValue<Integer>('variablesReference', 0) > 0,
+      'and it must be expandable into its fields');
+  finally
+    Resp.Free;
+  end;
+
+  // The case that already worked -- kept so a fix here cannot silently break it.
+  Resp := FClient.Evaluate('W.DoCalcUStr()', FrameId, 'watch');
+  try
+    Display := Resp.GetValue<string>('result', '');
+    Assert.IsTrue(Display.Contains('u_hello'),
+      'a string returned through the var-out slot must still decode; got: ' + Display);
+  finally
+    Resp.Free;
   end;
 end;
 

@@ -366,15 +366,23 @@ None of them was a Win32 regression. Full log with evidence and controls:
 Negative controls run for the last two: with the fixes disabled the new tests
 fail with the exact field symptom, in both the mono and BPL fixtures.
 
+* **Var-out RETURNS on the direct method-call path -- FIXED.** TD32 types the
+  `Result` of a var-out function as `^T` (`^Variant`, `^TPoint3D`, `^string`);
+  the caret is the ABI, not the type, and it defeated the kind dispatch, so the
+  slot was read as a scalar. `W.DoCalcVariant()` gave `3` (the VType word),
+  `W.DoCalcBigRec()` gave the double `1.5` -- the record's first field. Strings
+  worked only because the string path strips the caret separately, which is why
+  nobody noticed. Now stripped at the source, but ONLY when the pointee is a
+  kind that really travels through the slot.
+  I FIRST CALLED THIS ONE CLUSTER WITH THE DYN-ARRAY CASE. That was wrong: they
+  are different causes and only these two shared one.
+
 ### OPEN, characterised, NOT fixed
 
-* **Managed/structured RETURNS are not decoded on the direct method-call path.**
-  `W.DoCalcBigRec()` -> the record's first field as an integer;
-  `W.DoCalcDynArr()` -> `[85899345930, 30, []]` (elements 20 and 10 packed into
-  one 8-byte read); `W.DoCalcVariant()` -> `3`, the VType word. The PROPERTY
-  path decodes all three correctly, which is the control. Same shape as the
-  July float-return defect, where the fix had to land at BOTH return sites --
-  only `InvokeGetter` was ever treated, `ApplyMethodCall` was not.
+* **`W.DoCalcDynArr()` still returns `[85899345930, 30, []]`** -- `0x14_0000000A`
+  is elements 20 and 10 read as ONE 8-byte element. Not the caret: the RSM
+  records no `Result` local for that function at all, so there is no return hint
+  to correct and the decode falls back to a heuristic.
 * **Program main-block locals carry false types** (`TWidget` -> `EPrivilege` on
   Win32, `RunClosureParamSampler$2$Intf` on Win64) and list a local `Cmp` that
   does not exist in the source, twice. Localised to the RSM parser

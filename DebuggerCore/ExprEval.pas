@@ -1202,6 +1202,30 @@ function TExprEvaluator.ApplyMethodCall(const Base: TExprValue;
       if SameText(L.Name, 'Result') and (L.TypeHint <> '') then begin
         RetTypeName := L.TypeHint;
         RetKind     := TypeNameToKind(RetTypeName);
+        // TD32 renders the Result of a VAR-OUT function as a POINTER to the
+        // real return type -- `^Variant`, `^TPoint3D`, `^string` -- because the
+        // hidden slot is what the routine actually writes through. The caret is
+        // the ABI, not the type, and leaving it on means the kind never
+        // resolves: `W.DoCalcVariant()` returned 3 (the VType word) and
+        // `W.DoCalcBigRec()` the record's first field as an integer, while
+        // `W.DoCalcUStr()` worked only because the string path strips it
+        // separately further down.
+        //
+        // Strip it ONLY when the stripped name is a type that is genuinely
+        // returned through the var-out slot. A function returning a pointer BY
+        // VALUE (RAX) also has a caret in its Result hint, and stripping that
+        // one would read the pointee instead of the pointer.
+        if RetTypeName.StartsWith('^') then begin
+          var Pointee     := RetTypeName.Substring(1);
+          var PointeeKind := TypeNameToKind(Pointee);
+          // Same set as IsManagedReturnKind below, plus records; spelled out
+          // because that helper is declared after this one.
+          if PointeeKind in [TK_LSTRING, TK_USTRING, TK_WSTRING, TK_DYNARRAY,
+                             TK_INTERFACE, TK_VARIANT, TK_RECORD, TK_MRECORD] then begin
+            RetTypeName := Pointee;
+            RetKind     := PointeeKind;
+          end;
+        end;
         Exit(True);
       end;
   end;
