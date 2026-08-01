@@ -1580,6 +1580,18 @@ begin
   // Attach an expansion handle when the value is a class/record/array/Variant.
   SyncExpander;
   FExpander.ClassifyLocal(LV, Result);
+
+  // A RECORD has no scalar value, so the generic formatter rendered its first
+  // bytes as a number: a `packed record A: Byte; B: Integer; C: Word` holding
+  // 1/2/3 was listed as 513 -- which is $0201, the first two fields read as an
+  // integer -- and a TPoint2D as 0. The watch path already presents a record as
+  // `$addr (TypeName)` and expands its fields; the locals list did not, so the
+  // same variable read differently depending on where you looked at it.
+  // Records only: a set renders as [Red, Blue], a dynamic array as [10, 20, 30]
+  // and a string as its text, all of which are already right.
+  if (LV.Address <> 0) and (LV.TypeHint <> '') and (FDebugInfo <> nil) and
+     (FDebugInfo.LookupTypeKind(LV.TypeHint) in [TK_RECORD, TK_MRECORD]) then
+    Result.Value := Format('$%x (%s)', [LV.Address, LV.TypeHint]);
 end;
 
 function TDebugSession.GetChildren(Handle: TVarHandle): TArray<TSessionVariable>;

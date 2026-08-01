@@ -251,6 +251,39 @@ Committed this run:
   with a valid VMT whose instance size REACHES the reference -- exact, not
   heuristic, since only the containing object can cover that address.
 
+Continued in the same run (suite 992 / 988 passed / 0 failed / 4 ignored):
+
+* `a76cc30` `ApplyDot` on an already-invalid base discarded the diagnosis:
+  `ArrRec[2].A` said "no field A" instead of "index out of bounds", and
+  `E.ClassName` on an unresolved `E` returned prologue bytes as a number.
+  Harness gained target-args passing (several TestTarget scenarios only run
+  behind a switch) and continue-to-line (with an exception the first stop is
+  the raise).
+* `da57f0d` WRITE path, both bitnesses: a WideString was built as a Delphi
+  TStrRec and assigned with `@UStrAsg`, so `changed-wide` read back as
+  `change` -- and that helper writes a refcount over the four bytes that ARE a
+  BSTR's length. Now a real BSTR plus `@WStrAsg`, which copies, so our block is
+  never SysFreeString'd. Also every negative literal was rejected, making
+  signed variables unwritable below zero.
+* `583a70d` Conditional / hit-count breakpoints: no defect, coverage added for
+  the 32-bit target (they evaluate in the debuggee, so they depend on it).
+* `ca132ca` Closures: captured fields read 8 bytes wide regardless of target
+  (a captured string was unreadable on x86); captured variables listed but not
+  reachable by NAME on either bitness; and -- found by the new test being flaky
+  in the suite while passing alone -- captured variables VANISH SILENTLY when
+  the symbol index is cold, because the interactive wait is bounded. The watch
+  path recovers via frontend warm-up/retry, the locals path has none. Made
+  visible with a `<captured> = <symbols not ready>` row; real fix logged.
+  Also hardened `TryFindClosureSelf` to prefer the $ActRec its own frame names
+  (the scan could latch a stale one; on x86 the scan is the ONLY path) -- that
+  was my first hypothesis for the flakiness and it was wrong, but the hazard is
+  real, so it stayed.
+
+Verified with no defect found: step in/out/over through doubly-nested procs;
+call stacks from an inner nested proc to the main block; exception handler
+locals (`E`, `E.Message`, `E.ClassName`, and a flag proving the inner `finally`
+ran); indexed properties; record / dyn-array / generic-list EXPANSION.
+
 Still open, logged not fixed:
 
 * RSM resolves nested type names wrongly on Win32 too (`Col` -> `PPCharArray`).

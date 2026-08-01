@@ -120,6 +120,11 @@ type
     // captured string picked up its neighbour and rendered as a read failure.
     // They were also listed but not resolvable by NAME, on either bitness.
     [Test] procedure ClosureCaptures_ReadAndResolveOnBothBitnesses;
+    // A record has no scalar value, but the locals list rendered its first
+    // bytes as one: a packed record holding 1/2/3 was listed as 513. The watch
+    // path already showed `$addr (TypeName)`, so the same variable read
+    // differently depending on where you looked at it.
+    [Test] procedure RecordLocals_ShowTheirTypeOnBothBitnesses;
     // TD32 stores globals mangled, and dcc32 mangles Borland-style where dcc64
     // mangles Itanium-style; only the latter was decoded, so NO unit global
     // resolved on a 32-bit target.
@@ -3226,6 +3231,76 @@ begin
   Assert.AreEqual('', Failures,
     'a variable captured by an anonymous method must read correctly and be ' +
     'reachable by name, on both bitnesses -- ' + Failures);
+end;
+
+procedure TWin32RunControlTests.RecordLocals_ShowTheirTypeOnBothBitnesses;
+type
+  TExprCheck = record Name, Fragment: string end;
+const
+  SOURCE = 'TestTargetTypes.pas';
+  MARKER = 'TYPES_BODY';
+
+  // The records must name their type. PRec is the sharp case: `packed record
+  // A: Byte; B: Integer; C: Word` holding 1/2/3 was listed as 513, which is
+  // $0201 -- the first two fields read as an integer, a plausible number rather
+  // than an obvious error.
+  //
+  // The last three are controls. A set, a dynamic array and a string all
+  // already rendered as their CONTENTS, and must keep doing so: the fix must
+  // not turn every aggregate into an address.
+  CHECKS: array[0..5] of TExprCheck = (
+    (Name: 'PRec';      Fragment: 'TPackedRec'),
+    (Name: 'Pt';        Fragment: 'TPoint2D'),
+    (Name: 'MRec';      Fragment: 'TManagedRec'),
+    (Name: 'Cols';      Fragment: '[Red, Blue]'),
+    (Name: 'EmptyCols'; Fragment: '[]'),
+    (Name: 'SS1';       Fragment: 'short-string-ascii'));
+
+  function LocalNamed(const Exe, Map, Rsm, Name: string; Line: Integer): string;
+  begin
+    var Session := OpenSessionAtMarker(Exe, Map, Rsm, TargetDir, SOURCE, Line);
+    try
+      if Session.State <> dsStopped then
+        Exit('<did not stop>');
+      Session.GetCallStack;   // let the symbol index warm, as a frontend does
+      for var V in Session.GetLocals do
+        if SameText(V.Name, Name) then
+          Exit(V.Value);
+      Result := '<not listed>';
+    finally
+      Session.Free;
+    end;
+  end;
+
+begin
+  var Line := MarkerLineInFile(TargetDir + SOURCE, MARKER);
+  Assert.IsTrue(Line > 0, 'marker ' + MARKER + ' not found');
+  Assert.IsTrue(FileExists(Win64Exe), '64-bit control target missing');
+
+  var Failures := '';
+  for var Check in CHECKS do begin
+    var Got64 := LocalNamed(Win64Exe, Win64Map, Win64Rsm, Check.Name, Line);
+    if not Got64.Contains(Check.Fragment) then
+      Failures := Failures + Format('x64 %s -> %s; ', [Check.Name, Got64]);
+    var Got32 := LocalNamed(Win32Exe, Win32Map, Win32Rsm, Check.Name, Line);
+    if not Got32.Contains(Check.Fragment) then
+      Failures := Failures + Format('x86 %s -> %s; ', [Check.Name, Got32]);
+  end;
+
+  // And specifically NOT the old misread: 513 is PRec's first two fields.
+  for var Bits in [64, 32] do begin
+    var Got: string;
+    if Bits = 64 then
+      Got := LocalNamed(Win64Exe, Win64Map, Win64Rsm, 'PRec', Line)
+    else
+      Got := LocalNamed(Win32Exe, Win32Map, Win32Rsm, 'PRec', Line);
+    if Got.Contains('513') then
+      Failures := Failures + Format('x%d PRec still a scalar -> %s; ', [Bits, Got]);
+  end;
+
+  Assert.AreEqual('', Failures,
+    'a record local must be listed as its type, and other aggregates as ' +
+    'their contents, on both bitnesses -- ' + Failures);
 end;
 
 procedure TWin32RunControlTests.BreakpointOnBeginLine_ReportsPassedParameters;
