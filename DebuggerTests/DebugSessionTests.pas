@@ -55,6 +55,10 @@ type
     // parameters yet, so every local reads the CALLER's frame. Both bitnesses
     // must report the values actually passed.
     [Test] procedure BreakpointOnBeginLine_ReportsPassedParameters;
+    // The hidden var-out result pointer sits after Self on Win64 but LAST on
+    // Win32; a string-returning method that also takes an argument is the only
+    // shape where the difference shows.
+    [Test] procedure StringArgToStringReturningMethod_WorksOnBothBitnesses;
     // Stack locals. Covers the x86 prologue decoder (`add esp,-N` rather than
     // `sub esp,N`, `mov ebp,esp` before the allocation) and the zero offset
     // bases that follow from it. Compared against x64 rather than asserted
@@ -2351,6 +2355,48 @@ begin
   finally
     Session.Free;
   end;
+end;
+
+procedure TWin32RunControlTests.StringArgToStringReturningMethod_WorksOnBothBitnesses;
+const
+  STEP_SOURCE = 'TestTargetCore.pas';
+
+  function GreetAt(const Exe, Map, Rsm: string; Line: Integer): string;
+  begin
+    var Session := OpenSessionAtMarker(Exe, Map, Rsm, TargetDir, STEP_SOURCE, Line);
+    try
+      if Session.State <> dsStopped then
+        Exit('<did not stop>');
+      var R := Session.Evaluate('W.Greet(Caption)');
+      if not R.Success then
+        Exit('<' + R.ErrorText + '>');
+      Result := R.Value;
+    finally
+      Session.Free;
+    end;
+  end;
+
+begin
+  var Line := MarkerLineInFile(TargetDir + STEP_SOURCE, 'EVAL_BODY');
+  Assert.IsTrue(Line > 0, 'marker EVAL_BODY not found');
+  Assert.IsTrue(FileExists(Win64Exe), '64-bit control target missing');
+
+  // `function Greet(const Who: string): string` returns through the hidden
+  // var-out slot AND takes an argument, which is the combination the two ABIs
+  // order differently: Win64 puts the slot right after Self, Win32 puts it
+  // LAST. Placing it second unconditionally made the callee write its result
+  // through the argument's character data and abort -- on Win32 only, which is
+  // why a no-argument string return (DoCalcUStr) kept working and hid it.
+  var Failures := '';
+  var Got64 := GreetAt(Win64Exe, Win64Map, Win64Rsm, Line);
+  if not Got64.Contains('hi_Hello!_hello') then
+    Failures := Failures + 'x64: ' + Got64 + '; ';
+  var Got32 := GreetAt(Win32Exe, Win32Map, Win32Rsm, Line);
+  if not Got32.Contains('hi_Hello!_hello') then
+    Failures := Failures + 'x86: ' + Got32 + '; ';
+  Assert.AreEqual('', Failures,
+    'a string argument to a string-returning method must work on both ' +
+    'bitnesses -- ' + Failures);
 end;
 
 procedure TWin32RunControlTests.BreakpointOnBeginLine_ReportsPassedParameters;

@@ -1566,10 +1566,10 @@ begin
     Kinds := Kinds + [sakOrdinal];   // Self / class reference: a pointer
   end;
 
-  // For a var-out return, the hidden result-slot pointer comes next (RDX for
-  // methods, RCX for free procs since there's no Self), then user args. A
-  // Variant needs the whole 24-byte TVarData zeroed, not just 8 bytes, so a
-  // field the getter leaves untouched cannot read as stale VType/data.
+  // For a var-out return the callee is handed a hidden pointer to write its
+  // result through. A Variant needs the whole 24-byte TVarData zeroed, not just
+  // 8 bytes, so a field the getter leaves untouched cannot read as stale
+  // VType/data.
   Slot := 0;
   if WantsStringReturn or WantsVariantReturn or WantsRecordReturn or WantsSetReturn then begin
     if WantsVariantReturn then
@@ -1582,7 +1582,19 @@ begin
       Slot := FDebugger.GetRemoteScratchSlot(8);
     if Slot = 0 then
       Exit(InvalidValue('<method scratch alloc failed>'));
-    Vals := Vals + [Slot];
+  end;
+
+  // WHERE that hidden pointer goes is the ABI's business, and the two targets
+  // disagree: on Win64 it follows Self (RDX for a method, RCX for a free proc),
+  // on Win32 it is the LAST parameter, after every declared argument. Placing
+  // it second unconditionally was right only by accident for a function taking
+  // NO arguments -- Self, @Result lands in EAX, EDX either way. With one
+  // argument it put @Result in EDX and the argument in ECX, so `W.Greet(x)`
+  // made the callee write its result string through the address of the
+  // argument's character data and the call aborted, on Win32 only.
+  var SlotGoesLast := FDebugger.TargetLayout.HiddenResultParamIsLast;
+  if (Slot <> 0) and not SlotGoesLast then begin
+    Vals  := Vals  + [Slot];
     Kinds := Kinds + [sakOrdinal];   // hidden var-out slot: a pointer
   end;
 
@@ -1593,6 +1605,11 @@ begin
   for var I := 0 to High(Args) do begin
     Vals  := Vals  + [Args[I].RawValue];
     Kinds := Kinds + [SyntheticArgKindOf(Args[I])];
+  end;
+
+  if (Slot <> 0) and SlotGoesLast then begin
+    Vals  := Vals  + [Slot];
+    Kinds := Kinds + [sakOrdinal];
   end;
 
   if not FDebugger.RunMethodCall(FuncVA, Vals, Kinds, Rax, Xmm0) then

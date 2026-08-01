@@ -81,6 +81,23 @@ type
     //     the two it is looking at.
     FloatResultsUseX87: Boolean;
 
+    // Where the HIDDEN result pointer sits among a synthetic call's arguments
+    // when the function returns through a var-out slot (string, Variant,
+    // interface, dynamic array, big record).
+    //
+    //   Win64: it follows Self  -- RCX = Self, RDX = @Result, args from R8.
+    //   Win32: it is the LAST parameter -- EAX = Self, then the declared
+    //          arguments, and @Result after them.
+    //
+    // Measured, not read off a manual: with the slot always placed second,
+    // `W.DoCalcUStr()` (no arguments) worked on both -- Self, @Result lands in
+    // EAX, EDX either way -- while `W.Greet(Caption)` failed ONLY on Win32,
+    // because Self, @Result, Who put @Result in EDX and `Who` in ECX, so the
+    // callee wrote its result string through the address of the argument's
+    // character data and the call aborted. That is why the defect looked like
+    // "string arguments are unsupported" when it was really about the slot.
+    HiddenResultParamIsLast: Boolean;
+
     // Units built with CPP_ABI_SUPPORT shift every negative slot by this much,
     // so two layouts coexist in one image and the reader has to detect which
     // one a given VMT follows. Zero when the target has no such variation --
@@ -120,6 +137,7 @@ begin
   Result.VmtInstanceSizeFromTypeInfo := 40;
   Result.VmtCppAbiShift         := 24;
   Result.FloatResultsUseX87     := False;   // SSE: XMM0 carries the result
+  Result.HiddenResultParamIsLast := False;  // it follows Self, in RDX
 end;
 
 class function TTargetLayout.For32Bit: TTargetLayout;
@@ -141,6 +159,7 @@ begin
   // every class uses one layout and there is nothing to detect.
   Result.VmtCppAbiShift         := 0;
   Result.FloatResultsUseX87     := True;
+  Result.HiddenResultParamIsLast := True;
 end;
 
 class function TTargetLayout.ForBitness(Bitness: TTargetBitness): TTargetLayout;
