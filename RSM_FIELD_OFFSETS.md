@@ -136,12 +136,41 @@ caller's storage rather than the value.
 | 2+LEN+1     | u1    | Reserved     | `0x00`                                 |
 | 2+LEN+2     | u1    | FormatFlag   | `0x01` (parser filters out `0x00`)     |
 | 2+LEN+3     | u1    | ?            | Unknown                                |
-| 2+LEN+4     | u1    | TypeId       |                                        |
-| 2+LEN+5     | i1    | RbpOffset    |                                        |
+| 2+LEN+4     | u1/u2 | TypeId       | VLE: bit 0 clear = 1 byte, set = 2 bytes (LE) |
+| 2+LEN+5/6   | i1    | RbpOffset    | follows the TypeId, so the record is 6 or 7 bytes past the name |
 
-Total: `2 + LEN + 6` bytes. Filtering on `FormatFlag = 1` is required to
-exclude RTL globals whose bytes happen to contain `0x46` in the same
-spot.
+Total: `2 + LEN + 6` for the narrow form, `2 + LEN + 7` for the wide one.
+Filtering on `FormatFlag = 1` is required to exclude RTL globals whose bytes
+happen to contain `0x46` in the same spot.
+
+The variable width was measured directly (hexdump of `TestTarget.rsm` at
+`0xB4B888`), which is why it is stated as confirmed rather than inferred:
+
+```
+20 09 "TheWidget" 46 00 01 04 01 04 E0     <- 7-byte tail, TypeId $0401
+20 08 "TheStuff"  46 00 01 04 05 04 F0     <- 7-byte tail, TypeId $0405
+20 03 "Res"       46 00 01 04 06    D8     <- 6-byte tail, TypeId $0006
+20 01 "X"         46 00 01 04 06    D0     <- 6-byte tail, TypeId $0006
+```
+
+The `RbpOffset` bytes (`E0 F0 D8 D0`, i.e. -32/-16/-40/-48) land correctly in
+both forms, which independently confirms the widening.
+
+**Narrow TypeId resolves; wide TypeId does not.** `Res`/`X` carry `$0006`,
+which is `Idx = TypeId div 2 - 1` = 2 = `Integer` in the user-type table, and
+that is right. `TheWidget: TWidget` carries `$0401` = 1025, but that table
+holds 246 entries (highest valid TypeId `$01EC`): `shr 1` gives index 255
+(past the end) and `shr 2` gives index 127, which is `PVariant`. `TWidget` is
+absent from the table entirely — its module type id is `$62C9` — and it is
+also absent from the unit's `$66` import list. Win32 shows the same shape with
+different values (`$03ED`/`$03F1`), so it is not a 64-bit quirk.
+
+Whatever space the wide ids address has not been identified. Until it is,
+`CollectMainBlockLocals` deliberately leaves `TypeHint` empty for the wide
+form: resolving it against the user-type table yielded a confidently wrong
+name (`EPrivilege` on Win32, `RunClosureParamSampler$2$Intf` on Win64). The
+value still renders from the runtime VMT, so class-typed main-block locals
+display as `$28CB370 (TWidget)` rather than carrying a false declared type.
 
 ## Named constant (tag 0x25)
 

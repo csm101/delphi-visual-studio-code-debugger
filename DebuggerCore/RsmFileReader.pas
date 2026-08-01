@@ -305,6 +305,11 @@ type
                   out Members: TArray<TClassMember>; PreferInstanceSize: Integer = 0): Boolean;
     function    AllProcedureNames: TArray<string>;
     function    DiagModuleTypeIds: TArray<TPair<Integer, string>>;
+    // Diagnostic: the per-unit `$66` import tables, as `unit=N entries`. A
+    // symbol's TypeId is an INDEX into its owning unit's table, so when a hint
+    // resolves to an unrelated type this says whether the owning unit was found
+    // at all and how many entries it has to index into.
+    function    DiagUnitImportSummary: TArray<string>;
     property    Loaded: Boolean read FLoaded;
     property    UserTypes: TArray<string> read FUserTypes;
   end;
@@ -1425,9 +1430,17 @@ begin
             var Sym: TLocalSymbol;
             Sym.Name := VarName;
             Sym.Kind := lkLocal;
+            // Record tail, measured on TestTarget (DevTools\HexDump over the
+            // `$20`/`$46` records of the program main block):
+            //   "Res"       46 00 01 04 | 06    | D8      6-byte tail
+            //   "TheWidget" 46 00 01 04 | 01 04 | E0      7-byte tail
+            // so the width really does vary with bit 0 of the byte at +4, and
+            // consuming two bytes for the odd form is correct -- the offset that
+            // follows lands where it should either way.
             var TypeIdByte := FData[TypeRefPos + 4];
             var OffsetPos:  Int64;
-            if (TypeIdByte and 1) = 0 then begin
+            var WideTypeId := (TypeIdByte and 1) <> 0;
+            if not WideTypeId then begin
               Sym.TypeId := TypeIdByte;
               OffsetPos  := TypeRefPos + 5;
             end else begin
@@ -1440,8 +1453,42 @@ begin
               var OUnit: string;
               var OImports: TArray<string>;
               OwningUnitContext(Off, OUnit, OImports);
-              Sym.TypeHint  := ResolveTypeIdInUnit(OUnit, OImports, Sym.TypeId);
-              Orphans       := Orphans + [Sym];
+              // The SINGLE-byte form indexes the user-type table by the same
+              // rule as everywhere else -- `Res` carries $06, i.e. idx 2, which
+              // is `Integer`, and it is right.
+              //
+              // The TWO-byte form does NOT, and no decoding of it does. Measured
+              // on TestTarget: `TheWidget: TWidget` carries $0401 = 1025, while
+              // that table holds 246 entries (max valid TypeId $01EC); `shr 1`
+              // gives idx 255 (past the end) and `shr 2` gives idx 127
+              // (`PVariant`). `TWidget` is not in the table at all -- its module
+              // type id is $62C9 -- so the value belongs to some other space
+              // that is not yet identified.
+              //
+              // Until it is, resolving it produces a CONFIDENTLY WRONG name:
+              // LookupTypeName(1025) returned `EPrivilege` on Win32 and
+              // `RunClosureParamSampler$2$Intf` on Win64 -- whatever happened to
+              // sit at that index in each build. Leave the hint EMPTY instead.
+              // The value still renders correctly from the runtime VMT
+              // (`$28CB370 (TWidget)`), so the user loses a declared type they
+              // never really had and stops being told a false one.
+              if not WideTypeId then
+                Sym.TypeHint := ResolveTypeIdInUnit(OUnit, OImports, Sym.TypeId)
+              else
+                Sym.TypeHint := '';
+              // This is a byte-by-byte scan of the WHOLE file for a record
+              // shape, so the same variable can match more than once -- `Cmp`
+              // was listed twice in TestTarget's main block. A repeated
+              // (name, slot) pair is never a second variable.
+              var AlreadySeen := False;
+              for var Prev in Orphans do
+                if SameText(Prev.Name, Sym.Name) and
+                   (Prev.RbpOffset = Sym.RbpOffset) then begin
+                  AlreadySeen := True;
+                  Break;
+                end;
+              if not AlreadySeen then
+                Orphans := Orphans + [Sym];
             end;
           end;
         end;
@@ -2839,6 +2886,19 @@ begin
     SetLength(Result, 0);
     for var Pair in FTypeIdToName do
       Result := Result + [TPair<Integer, string>.Create(Pair.Key, Pair.Value)];
+  finally
+    FLock.Release;
+  end;
+end;
+
+function TRsmFile.DiagUnitImportSummary: TArray<string>;
+begin
+  WaitForIndex;
+  FLock.Acquire;
+  try
+    SetLength(Result, 0);
+    for var Pair in FUnitImports do
+      Result := Result + [Format('%s = %d entries', [Pair.Key, Length(Pair.Value)])];
   finally
     FLock.Release;
   end;

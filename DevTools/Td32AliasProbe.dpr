@@ -135,6 +135,34 @@ begin
   end;
 end;
 
+// Dumps the RSM's own typeId -> name table for entries matching Filter. The
+// decisive measurement when a local's hint is wrong: it says what id the type
+// ACTUALLY has, so the id read out of the variable record can be compared
+// against it instead of guessed at.
+procedure ReportRsmTypeIds(const RsmPath, Filter: string);
+begin
+  var R := TRsmFile.Create;
+  try
+    R.LoadFromFile(RsmPath);
+    if not R.Loaded then begin
+      Writeln('  not loaded: ' + RsmPath);
+      Exit;
+    end;
+    Writeln(Format('== RSM typeIds matching "%s" ==', [Filter]));
+    var Hits := 0;
+    for var Pair in R.DiagModuleTypeIds do
+      if Pos(LowerCase(Filter), LowerCase(Pair.Value)) > 0 then begin
+        Writeln(Format('  id=$%.4x (%d)  name=%s', [Pair.Key, Pair.Key, Pair.Value]));
+        Inc(Hits);
+        if Hits >= 20 then Break;
+      end;
+    if Hits = 0 then
+      Writeln('  (no type with that name in the module type map)');
+  finally
+    R.Free;
+  end;
+end;
+
 // Lists every proc in an RSM/DCP whose locals carry a type hint matching Filter.
 // Used to FIND a subject in a real package instead of guessing a routine name.
 procedure ScanRsmForTypeHint(const RsmPath, Filter: string; MaxHits: Integer);
@@ -331,6 +359,62 @@ begin
       if ParamCount >= 4 then
         MaxHits := StrToIntDef(ParamStr(4), 20);
       ReportProcNames(ParamStr(1), ParamStr(3), MaxHits);
+      Halt(0);
+    end;
+    if (ParamCount >= 2) and SameText(ParamStr(2), '-rsmunits') then begin
+      var RU := TRsmFile.Create;
+      try
+        RU.LoadFromFile(ParamStr(1));
+        Writeln('== per-unit import tables ==');
+        for var Line in RU.DiagUnitImportSummary do
+          Writeln('  ' + Line);
+      finally
+        RU.Free;
+      end;
+      Halt(0);
+    end;
+    if (ParamCount >= 3) and SameText(ParamStr(2), '-rsmusertypes') then begin
+      var RT := TRsmFile.Create;
+      try
+        RT.LoadFromFile(ParamStr(1));
+        var From := StrToIntDef(ParamStr(3), 0);
+        var Cnt  := 12;
+        if ParamCount >= 4 then
+          Cnt := StrToIntDef(ParamStr(4), 12);
+        var UT := RT.UserTypes;
+        Writeln(Format('== FUserTypes (%d entries) from %d ==', [Length(UT), From]));
+        var Last := From + Cnt - 1;
+        if Last > High(UT) then
+          Last := High(UT);
+        for var I := From to Last do
+          // The TypeId that selects this slot, per Idx = TypeId div 2 - 1.
+          Writeln(Format('  idx=%-4d typeId=$%.4x  %s', [I, (I + 1) * 2, UT[I]]));
+      finally
+        RT.Free;
+      end;
+      Halt(0);
+    end;
+    if (ParamCount >= 3) and SameText(ParamStr(2), '-rsmimports') then begin
+      var RI := TRsmFile.Create;
+      try
+        RI.LoadFromFile(ParamStr(1));
+        Writeln(Format('== import table of unit "%s" ==', [ParamStr(3)]));
+        var Want := '';
+        if ParamCount >= 4 then
+          Want := LowerCase(ParamStr(4));
+        var Imports := RI.DiagUnitImports(ParamStr(3));
+        for var I := 0 to High(Imports) do
+          // The raw index AND the TypeId that would select it, so a value read
+          // out of a variable record can be matched straight against this list.
+          if (Want = '') or (Pos(Want, LowerCase(Imports[I])) > 0) then
+            Writeln(Format('  idx=%-4d typeId=$%.4x  %s', [I, (I + 1) * 2, Imports[I]]));
+      finally
+        RI.Free;
+      end;
+      Halt(0);
+    end;
+    if (ParamCount >= 3) and SameText(ParamStr(2), '-rsmtypes') then begin
+      ReportRsmTypeIds(ParamStr(1), ParamStr(3));
       Halt(0);
     end;
     if (ParamCount >= 3) and SameText(ParamStr(2), '-rsmproc') then begin

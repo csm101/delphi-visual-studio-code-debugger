@@ -264,6 +264,19 @@ identifiers. Not blocking any current test.
   layout / member metadata to expand in the Variables tree. The current
   user type table only exposes a name string per type. Where do the
   fields live?
+- **Wide TypeId space in main-block locals (tag `0x20` / marker `0x46`)** —
+  the record's TypeId is VLE-encoded, and the *narrow* form resolves against
+  the user-type table by the usual `Idx = TypeId div 2 - 1` rule (`Res: Integer`
+  carries `$0006` → idx 2 → `Integer`, verified). The *wide* form does not
+  resolve against any table found so far: `TheWidget: TWidget` carries `$0401`
+  = 1025 while the table holds 246 entries, and neither `shr 1` (idx 255, out
+  of range) nor `shr 2` (idx 127 = `PVariant`) lands on `TWidget`. `TWidget` is
+  in neither the user-type table nor the unit's `$66` import list; its module
+  type id is `$62C9`. Same shape on Win32 with different values (`$03ED`), so
+  not a bitness artifact. Byte-level evidence is in `RSM_FIELD_OFFSETS.md`.
+  Candidates not yet dumped: the EXE-wide `$65`-anchored import table, and
+  whether the wide id is an offset rather than an index. Until this is
+  answered the parser leaves the hint empty rather than emitting a wrong name.
 - **`0xC6` global variant payload** — used for Delphi runtime globals
   (`ModuleIsLib`, …). Length and meaning of the payload after the tag
   are unknown; the parser captures the name and abandons the rest.

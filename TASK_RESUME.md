@@ -396,14 +396,27 @@ fail with the exact field symptom, in both the mono and BPL fixtures.
   private and not surfaced through `TDebugInfoSet` -- exposing it is a new
   provider interface), or strip a caret whenever the pointee also starts with
   `^` (a heuristic that misfires on a pointer-to-pointer returned by value).
-* **Program main-block locals carry false types** (`TWidget` -> `EPrivilege` on
-  Win32, `RunClosureParamSampler$2$Intf` on Win64) and list a local `Cmp` that
-  does not exist in the source, twice. Localised to the RSM parser
-  (`Td32AliasProbe -rsmproc Testtarget` shows the same). TWO fixes were tried
-  and BOTH REVERTED -- details and what not to repeat are in the defect log; the
-  next step is a byte-level probe of the `$20`/`$46` main-block record, because
-  `RSM_FIELD_OFFSETS.md:128` and `CollectMainBlockLocals` disagree about whether
-  its TypeId is one byte or two.
+* **Program main-block locals carry false types** -- MEASURED AND CONTAINED,
+  root cause still open. The byte-level probe was done (hexdump at `0xB4B888`
+  in `TestTarget.rsm`, reproduced in `RSM_FIELD_OFFSETS.md:128`) and settles
+  the spec-vs-code disagreement in the CODE's favour: the TypeId is VLE, 6-byte
+  tail for the narrow form and 7-byte for the wide one, and the `RbpOffset`
+  lands correctly in both. So the two-byte widening was never the bug.
+  What IS wrong: the wide id resolves against nothing known. `TheWidget`
+  carries `$0401` = 1025 against a 246-entry user-type table; `shr 1` = idx 255
+  (out of range), `shr 2` = idx 127 = `PVariant`, and `TWidget` is in neither
+  that table nor the unit's `$66` imports (its module type id is `$62C9`).
+  Win32 shows the same shape (`$03ED`). Three decodings tried, three refuted --
+  do not guess a fourth; the open question is logged in `KNOWN_UNKNOWNS.md`
+  with the two candidate tables that have not been dumped yet (the EXE-wide
+  `$65`-anchored table, and the possibility that the wide id is an offset
+  rather than an index).
+  SHIPPED INSTEAD: `CollectMainBlockLocals` leaves `TypeHint` EMPTY for the
+  wide form instead of emitting whatever name sits at the bogus index, and
+  dedups repeated (name, slot) pairs -- which is what produced the phantom
+  second `Cmp`, a consequence of scanning the whole file for a record shape.
+  Class-typed main-block locals now render from the runtime VMT
+  (`$28CB370 (TWidget)`): no declared type, but no false one either.
 * **Unit globals resolve over DAP but NOT over MCP** (`GCounter` ->
   `<not found>` while `DebuggerTests.pas:1717` asserts the DAP finds it). The
   provider warm-up + retry lives only in `TDapServer`; `McpServer.pas:695` calls
