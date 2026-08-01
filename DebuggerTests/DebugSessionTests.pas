@@ -125,6 +125,11 @@ type
     // path already showed `$addr (TypeName)`, so the same variable read
     // differently depending on where you looked at it.
     [Test] procedure RecordLocals_ShowTheirTypeOnBothBitnesses;
+    // Multi-dimensional arrays, and the Variant auto-recovery that misfired on
+    // one of their elements: the FIRST element of a static array shares its
+    // address with the whole array, and a slot that big was converted to a
+    // Variant on size alone, so a plain zero displayed as `<empty>`.
+    [Test] procedure MultiDimArrays_ReadAndBoundCheckOnBothBitnesses;
     // TD32 stores globals mangled, and dcc32 mangles Borland-style where dcc64
     // mangles Itanium-style; only the latter was decoded, so NO unit global
     // resolved on a 32-bit target.
@@ -3301,6 +3306,98 @@ begin
   Assert.AreEqual('', Failures,
     'a record local must be listed as its type, and other aggregates as ' +
     'their contents, on both bitnesses -- ' + Failures);
+end;
+
+procedure TWin32RunControlTests.MultiDimArrays_ReadAndBoundCheckOnBothBitnesses;
+type
+  TExprCheck = record Expr, Fragment: string end;
+const
+  // `MStatic: array[0..2, 0..2] of Integer` is filled with I*10+J, and
+  // `MDyn: TArray<TArray<Integer>>` holds [1,2,3] and [4,5].
+  //
+  // MStatic[0,0] is the case that was broken: its value is 0 and its address is
+  // also the start of the whole 36-byte array, which the Variant auto-recovery
+  // treated as a Variant slot on SIZE alone and rendered `<empty>`. A zero
+  // reported as "empty" is a wrong answer that reads like a considered one.
+  // MStatic[0,1] = 1 is next to it and was always fine, so the pair localises
+  // the defect to the first element rather than to static arrays generally.
+  MDIM_CHECKS: array[0..8] of TExprCheck = (
+    (Expr: 'MStatic[0,0]';  Fragment: '0'),
+    (Expr: 'MStatic[0,1]';  Fragment: '1'),
+    (Expr: 'MStatic[1,2]';  Fragment: '12'),
+    (Expr: 'MStatic[2,2]';  Fragment: '22'),
+    (Expr: 'MStatic[3,0]';  Fragment: 'out of bounds'),
+    (Expr: 'MDyn[0][1]';    Fragment: '2'),
+    (Expr: 'MDyn[1][1]';    Fragment: '5'),
+    (Expr: 'MDyn[0][9]';    Fragment: 'out of bounds'),
+    (Expr: 'Length(MDyn)';  Fragment: '2'));
+
+  // The recovery this guards must still work. A Variant alias local and a byRef
+  // Variant live in RunEvalTests; the zero Integer that must never read as
+  // `<empty>` lives in RunTypeSampler, hence the two markers.
+  VARIANT_CHECKS: array[0..1] of TExprCheck = (
+    (Expr: 'NVarLocal'; Fragment: '1234'),
+    (Expr: 'ByRefVar';  Fragment: '12345'));
+  ZERO_CHECKS: array[0..1] of TExprCheck = (
+    (Expr: 'ZeroInt';   Fragment: '0'),
+    (Expr: 'TrickyOne'; Fragment: '1'));
+
+  function EvalAt(const Exe, Map, Rsm, SourceFile, Marker, Expr: string): string;
+  begin
+    var Line := MarkerLineInFile(TargetDir + SourceFile, Marker);
+    if Line <= 0 then
+      Exit('<marker ' + Marker + ' not found>');
+    var Session := OpenSessionAtMarker(Exe, Map, Rsm, TargetDir, SourceFile, Line);
+    try
+      if Session.State <> dsStopped then
+        Exit('<did not stop>');
+      var R := Session.Evaluate(Expr);
+      if not R.Success then
+        Exit('<' + R.ErrorText + '>');
+      Result := R.Value;
+    finally
+      Session.Free;
+    end;
+  end;
+
+var
+  Failures: string;
+
+  procedure RunChecks(const Checks: array of TExprCheck;
+    const SourceFile, Marker: string);
+  begin
+    for var Check in Checks do begin
+      var Got64 := EvalAt(Win64Exe, Win64Map, Win64Rsm, SourceFile, Marker, Check.Expr);
+      if not Got64.Contains(Check.Fragment) then
+        Failures := Failures + Format('x64 %s -> %s; ', [Check.Expr, Got64]);
+      var Got32 := EvalAt(Win32Exe, Win32Map, Win32Rsm, SourceFile, Marker, Check.Expr);
+      if not Got32.Contains(Check.Fragment) then
+        Failures := Failures + Format('x86 %s -> %s; ', [Check.Expr, Got32]);
+    end;
+  end;
+
+begin
+  Assert.IsTrue(FileExists(Win64Exe), '64-bit control target missing');
+
+  Failures := '';
+  RunChecks(MDIM_CHECKS,    'TestTargetEdge2.pas', 'EDGE2_BODY');
+  RunChecks(VARIANT_CHECKS, 'TestTargetCore.pas',  'EVAL_BODY');
+  RunChecks(ZERO_CHECKS,    'TestTargetTypes.pas', 'TYPES_BODY');
+
+  // `<empty>` for a real zero is the specific regression.
+  for var Bits in [64, 32] do begin
+    var Got: string;
+    if Bits = 64 then
+      Got := EvalAt(Win64Exe, Win64Map, Win64Rsm, 'TestTargetEdge2.pas', 'EDGE2_BODY', 'MStatic[0,0]')
+    else
+      Got := EvalAt(Win32Exe, Win32Map, Win32Rsm, 'TestTargetEdge2.pas', 'EDGE2_BODY', 'MStatic[0,0]');
+    if Got.Contains('empty') then
+      Failures := Failures + Format('x%d MStatic[0,0] -> %s; ', [Bits, Got]);
+  end;
+
+  Assert.AreEqual('', Failures,
+    'multi-dimensional array elements must read and bound-check, without a ' +
+    'zero being mistaken for an empty Variant, on both bitnesses -- ' + Failures);
 end;
 
 procedure TWin32RunControlTests.BreakpointOnBeginLine_ReportsPassedParameters;

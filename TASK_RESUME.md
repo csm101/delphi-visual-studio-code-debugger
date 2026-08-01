@@ -279,10 +279,23 @@ Continued in the same run (suite 992 / 988 passed / 0 failed / 4 ignored):
   was my first hypothesis for the flakiness and it was wrong, but the hazard is
   real, so it stayed.
 
+* `2ec6401` A RECORD local was listed as a number: the generic formatter turned
+  its first bytes into one, so a packed record holding 1/2/3 read as 513
+  ($0201). The watch path already showed `$addr (Type)`, so the same variable
+  read differently depending on the view.
+* (this commit) The Variant auto-recovery converted a value on SLOT SIZE alone.
+  The first element of a static array shares the array's address, so
+  `MStatic[0,0]` -- a plain 0 in a 36-byte array -- displayed as `<empty>`.
+  Now the bytes must also look like a TVarData; 24 zero bytes still recover, so
+  a genuinely mis-tagged empty Variant is unaffected.
+
 Verified with no defect found: step in/out/over through doubly-nested procs;
 call stacks from an inner nested proc to the main block; exception handler
 locals (`E`, `E.Message`, `E.ClassName`, and a flag proving the inner `finally`
-ran); indexed properties; record / dyn-array / generic-list EXPANSION.
+ran); indexed properties; record / dyn-array / generic-list EXPANSION;
+conditional and hit-count breakpoints; worker-thread breakpoints, thread
+enumeration and per-thread stepping; multi-dimensional static and nested
+dynamic array indexing and bounds.
 
 Still open, logged not fixed:
 

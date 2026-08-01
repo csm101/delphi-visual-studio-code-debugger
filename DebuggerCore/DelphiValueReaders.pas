@@ -1518,7 +1518,16 @@ begin
         Exit(FormatVariantAt(Ptr));
     end;
     // In-body local: slot IS the TVarData (24 bytes at slot address).
-    if SlotSizeAt(V.Address) >= 24 then
+    //
+    // Size alone is not enough. A big local is not necessarily a Variant, and
+    // an INDEXED element inherits the address of the local it starts in: the
+    // first element of `MStatic: array[0..2, 0..2] of Integer` shares its
+    // address with the whole 36-byte array, so `MStatic[0,0]` -- a plain zero --
+    // was converted and displayed as `<empty>`. Require the bytes to actually
+    // look like a TVarData as well. A genuinely mis-tagged EMPTY Variant is 24
+    // zero bytes, which still passes; an array of 0,1,2,10,11,... does not,
+    // because its reserved words are non-zero.
+    if (SlotSizeAt(V.Address) >= 24) and LooksLikeVariantAt(V.Address) then
       Exit(FormatVariantAt(V.Address));
     // Strict pattern recovery, used ONLY when slot size is genuinely
     // unknown (SlotSizeAt = 0) AND the local has no concrete type hint.
