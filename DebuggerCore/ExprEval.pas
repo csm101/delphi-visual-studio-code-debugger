@@ -115,6 +115,9 @@ type
     // does not recognise really is a pointer-sized handle.
     function  ElementStride(const ElemType: string): Integer;
     function  IsPointerSizedFallback(const TypeName: string): Boolean;
+    // Record / set / static array: stored by value, so it is addressed rather
+    // than lifted into an 8-byte RawValue.
+    function  IsByValueAggregate(const TypeName: string): Boolean;
     // `Obj[X]` on a class instance: finds the class's `default` array property,
     // walking the ancestor chain (TStringList's default is TStrings.Strings).
     // False when the receiver is not an instance or no ancestor declares one.
@@ -548,6 +551,20 @@ end;
 // therefore walked in 8-byte steps on x64 and 4-byte steps on x86: element 0
 // read correctly and every later element was skewed, silently, into the middle
 // of its neighbour.
+// True when a value of this type is stored BY VALUE rather than as a
+// pointer-sized handle: a record, a set, or a static array. The families that
+// need an Address rather than a RawValue.
+function TExprEvaluator.IsByValueAggregate(const TypeName: string): Boolean;
+begin
+  Result := False;
+  if (TypeName = '') or (FDebugInfo = nil) then
+    Exit;
+  if not IsPointerSizedFallback(TypeName) then
+    Exit;   // a recognised primitive is never an aggregate
+  Result := FDebugInfo.LookupTypeKind(TypeName) in
+              [TK_RECORD, TK_MRECORD, TK_SET, TK_ARRAY];
+end;
+
 function TExprEvaluator.ElementStride(const ElemType: string): Integer;
 begin
   Result := PrimTypeSize(ElemType);
@@ -2269,6 +2286,24 @@ begin
     end;
   end;
 
+  // Delphi lets a pointer-to-record be dotted without the caret -- `RecP.B` is
+  // `RecP^.B` -- so accept it here rather than making the user write a caret
+  // the language does not require. Only for a pointee that is genuinely an
+  // aggregate: a `^Integer` has no fields, and a dynamic array (also spelled
+  // `^Element` by TD32) must keep falling through to the array paths.
+  if (Base.TypeHint <> '') and (Base.TypeHint[1] = '^') and Base.IsValid then begin
+    var Pointee := Copy(Base.TypeHint, 2, MaxInt);
+    if IsByValueAggregate(Pointee) and (Base.RawValue >= 65536) then begin
+      var AsRecord := Default(TExprValue);
+      AsRecord.TypeHint := Pointee;
+      AsRecord.Address  := Base.RawValue;
+      AsRecord.RawValue := 0;
+      AsRecord.Size     := ElementStride(Pointee);
+      AsRecord.IsValid  := True;
+      Exit(ApplyDot(AsRecord, Field));
+    end;
+  end;
+
   DapLog(Format('  ApplyDot field="%s" Base=$%x BaseValid=%s BaseHint="%s" FRtti=%s IsClassInst=%s',
     [Field, Base.RawValue, BoolToStr(Base.IsValid, True), Base.TypeHint,
      BoolToStr(FRtti <> nil, True),
@@ -2574,11 +2609,29 @@ begin
                 SameText(InnerHint, 'Int32')    or SameText(InnerHint, 'UInt32')   or
                 SameText(InnerHint, 'Single') then
           ReadBytes := 4;
+        // A record (or set / static array) pointee is an AGGREGATE: there is no
+        // scalar to lift into RawValue, and reading 8 bytes there produced a
+        // value with no Address at all -- `RecP^` rendered as `$0 (TPackedRec)`
+        // and `RecP^.B` could not find a field, because the field resolver
+        // needs the record's address. Point Address at the record instead, the
+        // same shape a by-value record takes everywhere else.
+        if IsByValueAggregate(InnerHint) then begin
+          if Addr < 65536 then
+            Exit(InvalidValue(Format('<deref of nil %s>', [Result.TypeHint])));
+          Result := Default(TExprValue);
+          Result.TypeHint := InnerHint;
+          Result.Address  := Addr;
+          Result.RawValue := 0;
+          Result.Size     := ElementStride(InnerHint);
+          Result.IsValid  := True;
+          Continue;
+        end;
         var Deref: UInt64 := 0;
         if FDebugger.ReadProcessMemoryAt(Addr, @Deref, ReadBytes) then begin
           Result := Default(TExprValue);
           Result.RawValue := Deref;
           Result.TypeHint := InnerHint;
+          Result.Address  := Addr;
           Result.IsValid  := True;
         end else
           Exit(InvalidValue(Format('<deref failed at $%x>', [Addr])));

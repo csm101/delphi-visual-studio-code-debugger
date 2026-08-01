@@ -88,6 +88,12 @@ type
     // look up and printed raw ordinals. dcc64 emits a plain name and never
     // showed this.
     [Test] procedure NestedTypeNames_ResolveOnBothBitnesses;
+    // `P^` on a pointer-to-RECORD read 8 bytes into RawValue and left Address
+    // at zero, so the record rendered as `$0 (TPackedRec)` and none of its
+    // fields could be found -- the field resolver works from the address. A
+    // record is an aggregate: it is addressed, not lifted into a value slot.
+    // Also covers the caret-less form Delphi allows, `P.Field`.
+    [Test] procedure PointerToRecord_DereferencesAndFindsFieldsOnBothBitnesses;
     // TD32 stores globals mangled, and dcc32 mangles Borland-style where dcc64
     // mangles Itanium-style; only the latter was decoded, so NO unit global
     // resolved on a 32-bit target.
@@ -2751,6 +2757,77 @@ begin
   Assert.AreEqual('', Failures,
     'a type declared inside a routine must keep its own name on both ' +
     'bitnesses -- ' + Failures);
+end;
+
+procedure TWin32RunControlTests.PointerToRecord_DereferencesAndFindsFieldsOnBothBitnesses;
+type
+  TExprCheck = record Expr, Fragment: string end;
+const
+  SOURCE = 'TestTargetTypes.pas';
+  MARKER = 'TYPES_BODY';
+
+  // `RecP: ^TPackedRec` points at PRec, whose fields are 1 / 2 / 3. The record
+  // is `packed`, so the three fields sit at offsets 0, 1 and 5 -- a layout that
+  // catches a deref landing on the wrong address rather than merely reading the
+  // wrong width.
+  //
+  // `PI^` and `PCh` are the controls: a pointer to a PRIMITIVE must still lift
+  // its value into the value slot rather than being treated as an aggregate,
+  // and a PChar must still render as text.
+  CHECKS: array[0..6] of TExprCheck = (
+    (Expr: 'RecP^';    Fragment: 'TPackedRec'),
+    (Expr: 'RecP^.A';  Fragment: '1'),
+    (Expr: 'RecP^.B';  Fragment: '2'),
+    (Expr: 'RecP^.C';  Fragment: '3'),
+    (Expr: 'RecP.B';   Fragment: '2'),
+    (Expr: 'PI^';      Fragment: '2'),
+    (Expr: 'PCh';      Fragment: 'pchar-content'));
+
+  function EvalAt(const Exe, Map, Rsm, Expr: string; Line: Integer): string;
+  begin
+    var Session := OpenSessionAtMarker(Exe, Map, Rsm, TargetDir, SOURCE, Line);
+    try
+      if Session.State <> dsStopped then
+        Exit('<did not stop>');
+      var R := Session.Evaluate(Expr);
+      if not R.Success then
+        Exit('<' + R.ErrorText + '>');
+      Result := R.Value;
+    finally
+      Session.Free;
+    end;
+  end;
+
+begin
+  var Line := MarkerLineInFile(TargetDir + SOURCE, MARKER);
+  Assert.IsTrue(Line > 0, 'marker ' + MARKER + ' not found');
+  Assert.IsTrue(FileExists(Win64Exe), '64-bit control target missing');
+
+  var Failures := '';
+  for var Check in CHECKS do begin
+    var Got64 := EvalAt(Win64Exe, Win64Map, Win64Rsm, Check.Expr, Line);
+    if not Got64.Contains(Check.Fragment) then
+      Failures := Failures + Format('x64 %s -> %s; ', [Check.Expr, Got64]);
+    var Got32 := EvalAt(Win32Exe, Win32Map, Win32Rsm, Check.Expr, Line);
+    if not Got32.Contains(Check.Fragment) then
+      Failures := Failures + Format('x86 %s -> %s; ', [Check.Expr, Got32]);
+  end;
+
+  // The dereferenced record must carry a real address, which is exactly what
+  // was missing: `$0 (TPackedRec)` was the old output.
+  for var Bits in [64, 32] do begin
+    var Got: string;
+    if Bits = 64 then
+      Got := EvalAt(Win64Exe, Win64Map, Win64Rsm, 'RecP^', Line)
+    else
+      Got := EvalAt(Win32Exe, Win32Map, Win32Rsm, 'RecP^', Line);
+    if Got.Contains('$0 ') then
+      Failures := Failures + Format('x%d RecP^ has no address -> %s; ', [Bits, Got]);
+  end;
+
+  Assert.AreEqual('', Failures,
+    'dereferencing a pointer to a record must yield the record at its ' +
+    'address, with fields reachable, on both bitnesses -- ' + Failures);
 end;
 
 procedure TWin32RunControlTests.BreakpointOnBeginLine_ReportsPassedParameters;
