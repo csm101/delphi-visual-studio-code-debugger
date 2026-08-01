@@ -106,6 +106,10 @@ type
     function  ParseStringLiteral(out S: string): Boolean;
     function  ApplySuffixes(const Base: TExprValue): TExprValue;
     function  ApplyIndex(const Base: TExprValue; Idx: Int64): TExprValue;
+    // Distinguishes a real dynamic array from a bare pointer-to-element by
+    // looking for a live dyn-array header below the data pointer, which is the
+    // only reliable signal: TD32 renders both as `^Element`.
+    function  TryDynArrayCountFromHeader(DataPtr: UInt64; out Count: Int64): Boolean;
     // `Obj[X]` on a class instance: finds the class's `default` array property,
     // walking the ancestor chain (TStringList's default is TStrings.Strings).
     // False when the receiver is not an instance or no ancestor declares one.
@@ -329,6 +333,38 @@ begin
   var Layout := FDebugger.TargetLayout;
   Result := FDebugger.ReadProcessMemoryAt(Layout.DynArrayLengthAddr(DataPtr),
               @Len, Layout.DynArrayLengthSize);
+end;
+
+// True when a live dynamic-array header sits below DataPtr, in which case Count
+// is its element count. Used to tell a real dynamic array from a bare
+// pointer-to-element when the NAME cannot: TD32 renders both as `^Element`.
+//
+// The same sanity test the dyn-array formatter applies, and for the same reason
+// -- an arbitrary pointer has SOMETHING at ptr-8, so the value only counts as a
+// header when both fields are self-consistent: a length within a sane range and
+// a refcount that is either -1 (a constant/literal array) or a live count.
+function TExprEvaluator.TryDynArrayCountFromHeader(DataPtr: UInt64;
+  out Count: Int64): Boolean;
+const
+  MAX_PLAUSIBLE_LEN = 1 shl 24;
+begin
+  Count  := 0;
+  Result := False;
+  if DataPtr < 65536 then
+    Exit;
+  var Len: UInt64;
+  if not ReadDynArrayLength(DataPtr, Len) then
+    Exit;
+  if Int64(Len) > MAX_PLAUSIBLE_LEN then
+    Exit;
+  var RefCnt: Int32 := 0;
+  if not FDebugger.ReadProcessMemoryAt(
+           FDebugger.TargetLayout.DynArrayRefCountAddr(DataPtr), @RefCnt, 4) then
+    Exit;
+  if not ((RefCnt = -1) or ((RefCnt >= 1) and (RefCnt <= MAX_PLAUSIBLE_LEN))) then
+    Exit;
+  Count  := Int64(Len);
+  Result := True;
 end;
 
 { Value construction }
@@ -859,11 +895,28 @@ begin
 
   // Dynamic array: 0-based; length at DataPtr[-8] (NativeInt = Int64 on Win64).
   if TryArrayElemInfo(Base.TypeHint, ElemType, ElemSize) then begin
+    // Every array form indexed here is 0-based, so a negative index is wrong
+    // whatever the base turns out to be. Rejecting it up front matters because
+    // the bytes BELOW the data pointer are the array's own header: `A[-1]`
+    // returned the length field as if it were an element.
+    if Idx < 0 then
+      Exit(InvalidValue(Format('<index %d out of bounds (arrays are 0-based)>', [Idx])));
+
     // Pointer-to-element (`^X`) covers open-array parameters, which Delphi
     // passes as a bare (ptr, high) pair with NO dyn-array length header at
-    // ptr-8. Index such a base directly; the high bound is not in scope here,
-    // so an out-of-range read fails gracefully at the memory layer rather than
-    // being rejected up front.
+    // ptr-8, so their bounds genuinely are not in scope here.
+    //
+    // But a real DYNAMIC array reaches this branch too: TD32 has no dyn-array
+    // encoding and renders `TArray<Integer>` as `^Integer`, indistinguishable
+    // BY NAME from a pointer. Skipping the check for both meant `Scores[3]` on
+    // a 3-element array returned a plausible integer from past the end and
+    // `Scores[-1]` returned the length -- silently wrong values, not errors.
+    //
+    // So ask memory instead of the name: if a valid dyn-array header sits below
+    // the data pointer, the base IS a dynamic array and its bounds apply. An
+    // open array fails that test (whatever precedes it is unrelated data) and
+    // keeps the previous unchecked behaviour, so this can only add rejections
+    // that were genuine errors.
     var IsPtrToElem := (Base.TypeHint <> '') and (Base.TypeHint[1] = '^');
     if IsPtrToElem then begin
       // A var/reference-param base presents the pointee in RawValue; the actual
@@ -871,11 +924,15 @@ begin
       // first element reinterpreted as an address.
       if Base.DerefPtr then
         DataPtr := Base.Address;
+      var HeaderCount: Int64;
+      if TryDynArrayCountFromHeader(DataPtr, HeaderCount) and (Idx >= HeaderCount) then
+        Exit(InvalidValue(Format('<index %d out of bounds [0..%d]>',
+          [Idx, HeaderCount - 1])));
     end else begin
       if not ReadDynArrayLength(DataPtr, ArrLen) then
         Exit(InvalidValue('<cannot read array length>'));
       var Count := Int64(ArrLen);
-      if (Idx < 0) or (Idx >= Count) then
+      if Idx >= Count then
         Exit(InvalidValue(Format('<index %d out of bounds [0..%d]>', [Idx, Count - 1])));
     end;
 
@@ -2814,6 +2871,16 @@ function TExprEvaluator.ApplyIntrinsic(const Name: string;
   var L: UInt64;
   begin
     if A.RawValue = 0 then Exit(MakeInt64(0));
+    // An OPEN ARRAY parameter has no length header -- Delphi passes it as a
+    // bare (pointer, high) pair -- so the bytes below the data pointer are
+    // unrelated. Reading them anyway returned whatever was there: on a 32-bit
+    // target `Length(A)` on an open array reported 50013, and on a 64-bit one
+    // it happened to fail the read instead. Verify the header before trusting
+    // it, and say why when there is none.
+    var HeaderCount: Int64;
+    if not TryDynArrayCountFromHeader(A.RawValue, HeaderCount) then
+      Exit(InvalidValue('<Length: no dynamic-array header; an open-array ' +
+        'parameter carries its bound separately>'));
     if not ReadDynArrayLength(A.RawValue, L) then
       Exit(InvalidValue('<Length: array length read failed>'));
     Result := MakeInt64(Int64(L));
@@ -2847,10 +2914,21 @@ function TExprEvaluator.ApplyIntrinsic(const Name: string;
     if SameText(A.TypeHint, 'Integer') then begin
       if UseMax then Exit(MakeInt64(MaxInt)) else Exit(MakeInt64(-MaxInt - 1));
     end;
-    // Dynarrays: Low=0, High=Length-1.
-    if A.TypeHint.StartsWith('TArray<', True) or A.TypeHint.StartsWith('array of ', True) then begin
+    // Dynarrays: Low=0, High=Length-1. Matched by NAME here, but TD32 renders a
+    // dynamic array as `^Element`, so a `TArray<Integer>` local reached the
+    // "not supported" line below while `Length()` on the very same value
+    // worked. Confirm by header instead when the name is a bare pointer -- the
+    // same discriminator ApplyIndex uses, so the three intrinsics agree about
+    // what is an array.
+    var LooksLikeDynArrayByName :=
+      A.TypeHint.StartsWith('TArray<', True) or A.TypeHint.StartsWith('array of ', True);
+    var HeaderCount: Int64;
+    var HasHeader := (A.TypeHint <> '') and (A.TypeHint[1] = '^') and
+                     TryDynArrayCountFromHeader(A.RawValue, HeaderCount);
+    if LooksLikeDynArrayByName or HasHeader then begin
       if not UseMax then Exit(MakeInt64(0));
       var Len := DynArrayLength(A);
+      if not Len.IsValid then Exit(Len);
       Exit(MakeInt64(Int64(Len.RawValue) - 1));
     end;
     // Strings: Low=1 (Delphi 1-based), High=Length.

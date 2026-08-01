@@ -67,6 +67,14 @@ type
     // rather than 24. A miss here renders the slot's ADDRESS instead of the
     // value, which reads as a plausible pointer rather than as an error.
     [Test] procedure VarOutReturns_DecodeOnBothBitnesses;
+    // Indexing past the end of a dynamic array returned a plausible NUMBER
+    // rather than an error, and a negative index returned the array's own
+    // length field. The bounds check existed but was skipped for any base whose
+    // type name began with `^` -- which is how TD32 renders every dynamic
+    // array, there being no dyn-array encoding in the format. The negative
+    // control is an open-array parameter, which genuinely has no length header
+    // and must keep indexing without one.
+    [Test] procedure ArrayBounds_AreEnforcedOnBothBitnesses;
     // TD32 stores globals mangled, and dcc32 mangles Borland-style where dcc64
     // mangles Itanium-style; only the latter was decoded, so NO unit global
     // resolved on a 32-bit target.
@@ -2507,6 +2515,90 @@ begin
   Assert.AreEqual('', Failures,
     'a value returned through the hidden var-out slot must decode to its ' +
     'CONTENTS on both bitnesses -- ' + Failures);
+end;
+
+procedure TWin32RunControlTests.ArrayBounds_AreEnforcedOnBothBitnesses;
+type
+  TExprCheck = record Expr, Fragment: string end;
+const
+  // `Scores` is a TArray<Integer> holding [10, 20, 30].
+  //
+  // Rejections. `Scores[3]` returned 6553600 on x64 and 52074928 on x86 -- both
+  // plausible integers read from past the end -- and `Scores[-1]` returned 3,
+  // which is the LENGTH field sitting just below the data pointer. A wrong
+  // number is worse than an error, so assert the refusal itself rather than
+  // merely that the two bitnesses agree.
+  //
+  // The in-range cases keep the check honest, and High/Low are here because
+  // they shared the defect: both reported "not supported" for the same
+  // `^Integer` naming reason while Length() on the same value worked.
+  DYN_CHECKS: array[0..9] of TExprCheck = (
+    (Expr: 'Scores[3]';            Fragment: 'out of bounds'),
+    (Expr: 'Scores[99]';           Fragment: 'out of bounds'),
+    (Expr: 'Scores[-1]';           Fragment: 'out of bounds'),
+    (Expr: 'Scores[100000]';       Fragment: 'out of bounds'),
+    (Expr: 'Scores[0]';            Fragment: '10'),
+    (Expr: 'Scores[2]';            Fragment: '30'),
+    (Expr: 'Length(Scores)';       Fragment: '3'),
+    (Expr: 'High(Scores)';         Fragment: '2'),
+    (Expr: 'Low(Scores)';          Fragment: '0'),
+    (Expr: 'Scores[High(Scores)]'; Fragment: '30'));
+
+  // Negative control: an open-array parameter arrives as a bare (pointer, high)
+  // pair with NO length header, so indexing must still work unchecked -- if the
+  // header probe ever starts claiming a header here, the first two break. Its
+  // length is genuinely not recoverable from memory and must be refused rather
+  // than guessed; x86 answered 50013 before this.
+  OPEN_CHECKS: array[0..2] of TExprCheck = (
+    (Expr: 'A[0]';      Fragment: '10'),
+    (Expr: 'A[2]';      Fragment: '30'),
+    (Expr: 'Length(A)'; Fragment: 'no dynamic-array header'));
+
+  // Returns the rendered value, or `<error text>` when the evaluation refused.
+  function EvalAt(const Exe, Map, Rsm, SourceFile, Marker, Expr: string): string;
+  begin
+    var Line := MarkerLineInFile(TargetDir + SourceFile, Marker);
+    if Line <= 0 then
+      Exit('<marker ' + Marker + ' not found>');
+    var Session := OpenSessionAtMarker(Exe, Map, Rsm, TargetDir, SourceFile, Line);
+    try
+      if Session.State <> dsStopped then
+        Exit('<did not stop>');
+      var R := Session.Evaluate(Expr);
+      if not R.Success then
+        Exit('<' + R.ErrorText + '>');
+      Result := R.Value;
+    finally
+      Session.Free;
+    end;
+  end;
+
+var
+  Failures: string;
+
+  procedure RunChecks(const Checks: array of TExprCheck;
+    const SourceFile, Marker: string);
+  begin
+    for var Check in Checks do begin
+      var Got64 := EvalAt(Win64Exe, Win64Map, Win64Rsm, SourceFile, Marker, Check.Expr);
+      if not Got64.Contains(Check.Fragment) then
+        Failures := Failures + Format('x64 %s -> %s; ', [Check.Expr, Got64]);
+      var Got32 := EvalAt(Win32Exe, Win32Map, Win32Rsm, SourceFile, Marker, Check.Expr);
+      if not Got32.Contains(Check.Fragment) then
+        Failures := Failures + Format('x86 %s -> %s; ', [Check.Expr, Got32]);
+    end;
+  end;
+
+begin
+  Assert.IsTrue(FileExists(Win64Exe), '64-bit control target missing');
+
+  Failures := '';
+  RunChecks(DYN_CHECKS,  'TestTargetCore.pas',  'EVAL_BODY');
+  RunChecks(OPEN_CHECKS, 'TestTargetEdge2.pas', 'OPEN_ARRAY_BODY');
+
+  Assert.AreEqual('', Failures,
+    'array bounds must be enforced, and an absent bound refused rather than ' +
+    'invented, on both bitnesses -- ' + Failures);
 end;
 
 procedure TWin32RunControlTests.BreakpointOnBeginLine_ReportsPassedParameters;
