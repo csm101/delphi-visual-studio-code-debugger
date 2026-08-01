@@ -51,6 +51,10 @@ type
     FDebugInfo: TDebugInfoSet;   // optional -- when present, RSM-driven member resolution
     FExpr:      string;
     FPos:       Integer;
+    // Guards the interface-to-object fallback in ApplyDot against re-entering
+    // itself: the retry runs against a real class, and if that also misses the
+    // answer is "no such member", not another recovery attempt.
+    FRecoveringInterfaceSelf: Boolean;
 
     // Tokenizer
     procedure SkipWS;
@@ -118,6 +122,14 @@ type
     // Record / set / static array: stored by value, so it is addressed rather
     // than lifted into an 8-byte RawValue.
     function  IsByValueAggregate(const TypeName: string): Boolean;
+    // An interface reference points at a field INSIDE the implementing object.
+    // Recovers that object so members can be resolved against its class, which
+    // is the only place they are described.
+    function  TryObjectBehindInterface(IntfPtr: UInt64; out Obj: UInt64;
+                out ClassName: string): Boolean;
+    // Target-width pointer read that yields 0 rather than failing, for the
+    // "try this address too" probes where an unreadable address is just a miss.
+    function  ReadPointerOrZero(Addr: UInt64): UInt64;
     // `Obj[X]` on a class instance: finds the class's `default` array property,
     // walking the ancestor chain (TStringList's default is TStrings.Strings).
     // False when the receiver is not an instance or no ancestor declares one.
@@ -551,6 +563,63 @@ end;
 // therefore walked in 8-byte steps on x64 and 4-byte steps on x86: element 0
 // read correctly and every later element was skewed, silently, into the middle
 // of its neighbour.
+function TExprEvaluator.ReadPointerOrZero(Addr: UInt64): UInt64;
+begin
+  Result := 0;
+  if Addr < 65536 then
+    Exit;
+  if not FDebugger.ReadProcessMemoryAt(Addr, @Result,
+           FDebugger.TargetLayout.PointerSize) then
+    Result := 0;
+end;
+
+// Recovers the OBJECT that an interface reference points into.
+//
+// Delphi implements an interface with a hidden field inside the object holding
+// a pointer to that interface's method table, so an interface reference is the
+// ADDRESS OF THAT FIELD -- somewhere in the middle of the object, not the
+// object itself. Debug information does not help here: an interface type is
+// emitted with no member list at all (ICounter appears nowhere in TD32's class
+// table, in the RSM type table, or among the function names), so a method
+// cannot be resolved against the interface. It can be resolved against the
+// implementing CLASS, which is why finding the object is the whole problem.
+//
+// Walk backwards a pointer at a time and accept the first candidate that both
+// carries a valid VMT and whose declared instance size REACHES the interface
+// pointer. That second condition is what makes this exact rather than a guess:
+// requiring the candidate's storage to cover the address means only the object
+// that actually contains the field can qualify -- a neighbouring heap block
+// would have to overlap it, which distinct live objects never do.
+function TExprEvaluator.TryObjectBehindInterface(IntfPtr: UInt64;
+  out Obj: UInt64; out ClassName: string): Boolean;
+const
+  // An interface field beyond this depth into an object would be extraordinary;
+  // the bound just keeps a bad pointer from walking the whole address space.
+  MAX_FIELD_OFFSET = 4096;
+begin
+  Obj       := 0;
+  ClassName := '';
+  Result    := False;
+  if (FRtti = nil) or (IntfPtr < 65536) then
+    Exit;
+  var Step := UInt64(FDebugger.TargetLayout.PointerSize);
+  var Offset: UInt64 := 0;
+  while Offset <= MAX_FIELD_OFFSET do begin
+    var Candidate := IntfPtr - Offset;
+    if FRtti.IsClassInstance(Candidate) then begin
+      var InstSize := FRtti.GetInstanceSize(Candidate);
+      if (InstSize > 0) and (Offset + Step <= UInt64(InstSize)) then begin
+        ClassName := FRtti.GetInstanceClassName(Candidate);
+        if ClassName <> '' then begin
+          Obj := Candidate;
+          Exit(True);
+        end;
+      end;
+    end;
+    Inc(Offset, Step);
+  end;
+end;
+
 // True when a value of this type is stored BY VALUE rather than as a
 // pointer-sized handle: a record, a set, or a static array. The families that
 // need an Address rather than a RawValue.
@@ -2379,8 +2448,27 @@ begin
   // name still wins there.
   if Base.IsValid and (FDebugInfo <> nil) then begin
     var CallClass := '';
+    var CallBase  := Base;
     if (FRtti <> nil) and (Base.RawValue >= 65536) then
       CallClass := FRtti.GetInstanceClassName(Base.RawValue);
+    // Not a class instance: the receiver may be an INTERFACE reference, which
+    // addresses a field inside the implementing object rather than the object.
+    // Resolve against the real class and, just as importantly, pass the OBJECT
+    // as Self -- calling with the interface pointer is what produced
+    // `<method invocation failed>` for `Cnt.NextValue`.
+    if CallClass = '' then begin
+      var Obj: UInt64;
+      var ImplClass: string;
+      for var Candidate in [Base.RawValue, ReadPointerOrZero(Base.Address)] do
+        if (Candidate >= 65536) and
+           TryObjectBehindInterface(Candidate, Obj, ImplClass) then begin
+          CallClass         := ImplClass;
+          CallBase.RawValue := Obj;
+          CallBase.Address  := 0;
+          CallBase.TypeHint := ImplClass;
+          Break;
+        end;
+    end;
     if CallClass = '' then
       CallClass := Base.TypeHint;
     if CallClass <> '' then begin
@@ -2388,7 +2476,7 @@ begin
       var MethodHasSelf: Boolean;
       if FDebugInfo.TryGetMethodParams(CallClass, Field, MethodParams, MethodHasSelf) and
          (Length(MethodParams) = 0) then
-        Exit(ApplyMethodCall(Base, Field, [], CallClass, '', 0, False, False));
+        Exit(ApplyMethodCall(CallBase, Field, [], CallClass, '', 0, False, False));
     end;
   end;
 
@@ -2396,6 +2484,43 @@ begin
   var LV: TLocalValue;
   if FDebugger.EvaluateName(Field, LV) then
     Exit(LocalToExpr(LV));
+
+  // 5. Last resort: the base may be an INTERFACE reference. Debug information
+  // describes no interface members -- an interface type is not emitted with a
+  // member list at all -- so every path above necessarily missed, and
+  // `Cnt.NextValue` ended up resolving a same-named symbol elsewhere and
+  // calling it with the interface pointer as Self, hence
+  // `<method invocation failed>`. The members ARE described on the implementing
+  // class, so recover the object the reference points into and retry there.
+  //
+  // Deliberately placed after every other path: it runs only where the answer
+  // would otherwise be an error, so it cannot change a case that already works,
+  // and it needs no test on the declared type -- which is just as well, since a
+  // type absent from the tables cannot be recognised as an interface.
+  if Base.IsValid and (not FRecoveringInterfaceSelf) then begin
+    // An interface-typed local presents the reference in RawValue; a var/ref
+    // parameter presents it through Address instead.
+    for var Candidate in [Base.RawValue, ReadPointerOrZero(Base.Address)] do begin
+      if Candidate < 65536 then
+        Continue;
+      var Obj: UInt64;
+      var ImplClass: string;
+      if not TryObjectBehindInterface(Candidate, Obj, ImplClass) then
+        Continue;
+      var AsObject := Base;
+      AsObject.RawValue := Obj;
+      AsObject.Address  := 0;
+      AsObject.TypeHint := ImplClass;
+      FRecoveringInterfaceSelf := True;   // one level only: no retry loop
+      try
+        var ViaClass := ApplyDot(AsObject, Field);
+        if ViaClass.IsValid then
+          Exit(ViaClass);
+      finally
+        FRecoveringInterfaceSelf := False;
+      end;
+    end;
+  end;
 
   Result := InvalidValue(Format('<.%s not found>', [Field]));
 end;

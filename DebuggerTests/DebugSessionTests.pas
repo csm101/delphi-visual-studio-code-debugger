@@ -94,6 +94,11 @@ type
     // record is an aggregate: it is addressed, not lifted into a value slot.
     // Also covers the caret-less form Delphi allows, `P.Field`.
     [Test] procedure PointerToRecord_DereferencesAndFindsFieldsOnBothBitnesses;
+    // Nothing could be read or called through an interface reference: debug
+    // info emits no member list for an interface type, and the reference
+    // addresses a hidden field inside the implementing object rather than the
+    // object, so it is not recognised as a class instance either.
+    [Test] procedure InterfaceMembers_ResolveThroughTheObjectOnBothBitnesses;
     // TD32 stores globals mangled, and dcc32 mangles Borland-style where dcc64
     // mangles Itanium-style; only the latter was decoded, so NO unit global
     // resolved on a 32-bit target.
@@ -2828,6 +2833,64 @@ begin
   Assert.AreEqual('', Failures,
     'dereferencing a pointer to a record must yield the record at its ' +
     'address, with fields reachable, on both bitnesses -- ' + Failures);
+end;
+
+procedure TWin32RunControlTests.InterfaceMembers_ResolveThroughTheObjectOnBothBitnesses;
+type
+  TExprCheck = record Expr, Fragment: string end;
+const
+  SOURCE = 'TestTargetTypes.pas';
+  MARKER = 'COLLECTIONS_BODY';
+
+  // `Cnt: ICounter` is a TCounter created with 55.
+  //
+  // Each expression runs in its OWN session, so the object is freshly
+  // constructed every time and the reads are independent: Value is 55 before
+  // anything touches it, and NextValue -- which increments and returns -- is 56
+  // rather than a running total. That also makes NextValue proof the method
+  // really ran in the debuggee, not that some number was read out of memory.
+  //
+  // RefCount is the interesting third case: it is a PROPERTY of TCounter, so it
+  // exercises the recovered object through a different resolution path than the
+  // field and the method.
+  CHECKS: array[0..2] of TExprCheck = (
+    (Expr: 'Cnt.Value';     Fragment: '55'),
+    (Expr: 'Cnt.RefCount';  Fragment: '1'),
+    (Expr: 'Cnt.NextValue'; Fragment: '56'));
+
+  function EvalAt(const Exe, Map, Rsm, Expr: string; Line: Integer): string;
+  begin
+    var Session := OpenSessionAtMarker(Exe, Map, Rsm, TargetDir, SOURCE, Line);
+    try
+      if Session.State <> dsStopped then
+        Exit('<did not stop>');
+      var R := Session.Evaluate(Expr);
+      if not R.Success then
+        Exit('<' + R.ErrorText + '>');
+      Result := R.Value;
+    finally
+      Session.Free;
+    end;
+  end;
+
+begin
+  var Line := MarkerLineInFile(TargetDir + SOURCE, MARKER);
+  Assert.IsTrue(Line > 0, 'marker ' + MARKER + ' not found');
+  Assert.IsTrue(FileExists(Win64Exe), '64-bit control target missing');
+
+  var Failures := '';
+  for var Check in CHECKS do begin
+    var Got64 := EvalAt(Win64Exe, Win64Map, Win64Rsm, Check.Expr, Line);
+    if not Got64.Contains(Check.Fragment) then
+      Failures := Failures + Format('x64 %s -> %s; ', [Check.Expr, Got64]);
+    var Got32 := EvalAt(Win32Exe, Win32Map, Win32Rsm, Check.Expr, Line);
+    if not Got32.Contains(Check.Fragment) then
+      Failures := Failures + Format('x86 %s -> %s; ', [Check.Expr, Got32]);
+  end;
+
+  Assert.AreEqual('', Failures,
+    'fields, properties and methods must be reachable through an interface ' +
+    'reference on both bitnesses -- ' + Failures);
 end;
 
 procedure TWin32RunControlTests.BreakpointOnBeginLine_ReportsPassedParameters;
