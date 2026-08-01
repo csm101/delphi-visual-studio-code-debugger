@@ -128,6 +128,12 @@ type
 
     // Delphi long-string readers given a pointer to the character buffer.
     function ReadDelphiUnicodeString(Ptr: UInt64; out S: string): Boolean;
+    // WideString is a COM BSTR, not a Delphi long string: the 4 bytes below the
+    // data are a length in BYTES, where UnicodeString's are a length in
+    // ELEMENTS. Reading one with the other's rule returns twice the characters.
+    function ReadDelphiWideString(Ptr: UInt64; out S: string): Boolean;
+    function ReadUtf16Prefixed(Ptr: UInt64; LengthIsBytes: Boolean;
+               out S: string): Boolean;
     function ReadDelphiAnsiString(Ptr: UInt64; out S: string): Boolean;
     function ReadDelphiAnsiBytes(Ptr: UInt64; out Bytes: TBytes): Boolean;
     // Encoding recorded in the string's own header (TStrRec.codePage, a Word at
@@ -415,6 +421,22 @@ begin
 end;
 
 function TDelphiValueReader.ReadDelphiUnicodeString(Ptr: UInt64; out S: string): Boolean;
+begin
+  Result := ReadUtf16Prefixed(Ptr, False, S);
+end;
+
+// A WideString is an OLE BSTR. SysAllocStringLen stores the length in BYTES in
+// the 4 bytes below the data, whereas a Delphi UnicodeString's TStrRec.length
+// counts ELEMENTS. Decoding one with the other's rule reads twice as far:
+// measured on TWidget.AsWStr, 'w_hello' (7 chars) came back as 14 characters --
+// the string, its terminator, and six words of heap fill (`BAADF00D`).
+function TDelphiValueReader.ReadDelphiWideString(Ptr: UInt64; out S: string): Boolean;
+begin
+  Result := ReadUtf16Prefixed(Ptr, True, S);
+end;
+
+function TDelphiValueReader.ReadUtf16Prefixed(Ptr: UInt64; LengthIsBytes: Boolean;
+  out S: string): Boolean;
 const
   MAX_LEN = 4096;
 var
@@ -430,6 +452,8 @@ begin
   end;
   if not Debugger.ReadProcessMemoryAt(Ptr - 4, @StrLen, 4) then
     Exit;
+  if LengthIsBytes then
+    StrLen := StrLen div SizeOf(WideChar);
   if StrLen < 0 then begin
     S := '';
     Result := True;
@@ -1261,8 +1285,14 @@ function TDelphiValueReader.FormatLocalValue(const V: TLocalValue): string;
       Kind := DebugInfo.LookupTypeKind(TypeName);
 
     case Kind of
-      TK_USTRING, TK_WSTRING: begin
+      TK_USTRING: begin
         if ReadDelphiUnicodeString(Ptr, Decoded) then
+          Exit(Format('''%s''  (@0x%x)', [Decoded, Ptr]));
+        Exit(Format('@0x%x (string read failed)', [Ptr]));
+      end;
+      TK_WSTRING: begin
+        // BSTR: the prefix is a byte count, not an element count.
+        if ReadDelphiWideString(Ptr, Decoded) then
           Exit(Format('''%s''  (@0x%x)', [Decoded, Ptr]));
         Exit(Format('@0x%x (string read failed)', [Ptr]));
       end;

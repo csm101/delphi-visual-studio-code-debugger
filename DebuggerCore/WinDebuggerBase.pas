@@ -4269,8 +4269,22 @@ begin
     Exit;
   EnsureSymInitialized;
   var RF: PRuntimeFunctionEntry := SymFunctionTableAccess64(FProcess, VA);
-  if RF = nil then
+  if RF = nil then begin
+    // No `.pdata` for this address. On a 32-bit target there is none for ANY
+    // address, so without this the step-into pivot never ran there at all and
+    // a step into a routine parked on its ENTRY -- pre-prologue, where the
+    // parameters are still the caller's frame bytes and the stack walk silently
+    // drops the immediate caller. Measured on Win32 stepping into GetFortyTwo:
+    // the stop was at funcStart+0 (`55 8B EC ...`, the push ebp itself) and the
+    // call stack showed RunAllScenarios where RunEvalTests belonged.
+    //
+    // The line table alone answers the same question -- it is what
+    // BreakpointBodyRva already uses for a breakpoint landing on a `begin`.
+    var BodyRva := BreakpointBodyRva(VAToRva(VA));
+    if BodyRva <> VAToRva(VA) then
+      Result := RvaToVA(BodyRva);
     Exit;
+  end;
   var ImageBase: UInt64 := SymGetModuleBase64(FProcess, VA);
   if ImageBase = 0 then
     Exit;

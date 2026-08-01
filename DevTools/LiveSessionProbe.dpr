@@ -44,6 +44,148 @@ begin
   Result := Req.Line > 0;
 end;
 
+// True when the current stop is in one of the files we set breakpoints in.
+function StopIsInBpFile(Session: TDebugSession; const Bps: TArray<TBpRequest>): Boolean;
+begin
+  Result := False;
+  var FnName, SrcFile: string;
+  var Line: Integer;
+  if not Session.GetCurrentLocation(FnName, SrcFile, Line) then
+    Exit;
+  var Base := ExtractFileName(SrcFile);
+  for var B in Bps do
+    if SameText(ExtractFileName(B.SourceFile), Base) then
+      Exit(True);
+end;
+
+// Runs a scripted debugging session at a stop: the commands a developer would
+// actually issue, in order, with every answer recorded. This is the difference
+// between "the breakpoint fired" and "the debugger is usable" -- the second only
+// shows up when you step, expand, evaluate a property and call a function.
+//
+//   stack                  call stack
+//   locals                 frame 0 locals
+//   expand <name>          expand a local (or an expression) two levels deep
+//   eval <expr>            evaluate an expression
+//   setvar <name> <value>  write a local, then read it back
+//   stepin / stepover / stepout
+//   frame <n>              evaluate the next `eval`s in frame n
+//
+// Anything unrecognised is reported rather than skipped silently, so a typo in
+// a script cannot look like a debugger result.
+procedure RunScript(Session: TDebugSession; const Script: TArray<string>);
+
+  procedure ShowVar(const Prefix: string; const V: TSessionVariable);
+  begin
+    Writeln(Format('%s%-22s = %-46s [%s]%s',
+      [Prefix, V.Name, V.Value, V.TypeName,
+       IfThen(V.Expandable, ' (expandable)', '')]));
+  end;
+
+  procedure ExpandHandle(H: TVarHandle; Depth: Integer; const Indent: string);
+  begin
+    if (H = 0) or (Depth <= 0) then
+      Exit;
+    for var C in Session.GetChildren(H) do begin
+      ShowVar(Indent, C);
+      if C.Expandable then
+        ExpandHandle(C.Handle, Depth - 1, Indent + '    ');
+    end;
+  end;
+
+  procedure DoStep(const Kind: string);
+  begin
+    var Before := Session.StopGeneration;
+    if Kind = 'stepin' then
+      Session.StepInto
+    else if Kind = 'stepout' then
+      Session.StepOut
+    else
+      Session.StepOver;
+    var Deadline := GetTickCount64 + 15000;
+    while (Session.StopGeneration = Before) and (not Session.HasExited) and
+          (GetTickCount64 < Deadline) do
+      Session.Pump;
+    if Session.StopGeneration = Before then begin
+      Writeln('    !! ' + Kind + ' DID NOT COMPLETE within 15 s');
+      Exit;
+    end;
+    var FnName, SrcFile: string;
+    var Line: Integer;
+    if Session.GetCurrentLocation(FnName, SrcFile, Line) then
+      Writeln(Format('    -> %s at %s:%d', [FnName, ExtractFileName(SrcFile), Line]))
+    else
+      Writeln('    -> <no location>');
+  end;
+
+begin
+  var FrameIdx := 0;
+  for var Raw in Script do begin
+    var Line := Raw.Trim;
+    if (Line = '') or Line.StartsWith('#') then
+      Continue;
+    Writeln('  $ ' + Line);
+    var SpacePos := Line.IndexOf(' ');
+    var Cmd  := Line;
+    var Arg  := '';
+    if SpacePos > 0 then begin
+      Cmd := Line.Substring(0, SpacePos);
+      Arg := Line.Substring(SpacePos + 1).Trim;
+    end;
+
+    if SameText(Cmd, 'stack') then begin
+      for var F in Session.GetCallStack do
+        Writeln(Format('    #%-2d %-44s %s:%d  [%s]',
+          [F.Index, IfThen(F.FunctionName <> '', F.FunctionName, '<no name>'),
+           IfThen(F.SourceFile <> '', ExtractFileName(F.SourceFile), '-'),
+           F.SourceLine, F.ModuleName]));
+    end
+    else if SameText(Cmd, 'locals') then begin
+      var L := Session.GetLocals;
+      for var V in L do
+        ShowVar('    ', V);
+      if Length(L) = 0 then
+        Writeln('    (none)');
+    end
+    else if SameText(Cmd, 'expand') then begin
+      var Found := False;
+      for var V in Session.GetLocals do
+        if SameText(V.Name, Arg) then begin
+          Found := True;
+          ShowVar('    ', V);
+          ExpandHandle(V.Handle, 2, '        ');
+        end;
+      if not Found then begin
+        var R := Session.Evaluate(Arg);
+        Writeln(Format('    %s => %s [%s]', [Arg, R.Value, R.TypeName]));
+        ExpandHandle(R.Handle, 2, '        ');
+      end;
+    end
+    else if SameText(Cmd, 'eval') then begin
+      var R := Session.EvaluateForFrame(Arg, FrameIdx);
+      if R.Success then
+        Writeln(Format('    => %-48s [%s]', [R.Value, R.TypeName]))
+      else
+        Writeln(Format('    => FAILED: %s', [R.ErrorText]));
+    end
+    else if SameText(Cmd, 'frame') then begin
+      FrameIdx := StrToIntDef(Arg, 0);
+      Writeln(Format('    (evaluating in frame %d)', [FrameIdx]));
+    end
+    else if SameText(Cmd, 'threads') then begin
+      var T := Session.GetThreads;
+      Writeln(Format('    %d thread(s), stopped tid=%d',
+        [Length(T), Session.GetStoppedThreadId]));
+    end
+    else if SameText(Cmd, 'stepin') or SameText(Cmd, 'stepover') or
+            SameText(Cmd, 'stepout') then
+      DoStep(LowerCase(Cmd))
+    else
+      Writeln('    !! unknown command');
+    Flush(Output);
+  end;
+end;
+
 procedure DumpStop(Session: TDebugSession; const Evals: TArray<string>;
   StopIndex: Integer);
 begin
@@ -92,7 +234,7 @@ begin
 end;
 
 procedure Run(const ExePath, SourceRoot: string; const Bps: TArray<TBpRequest>;
-  const Evals: TArray<string>; Seconds: Integer);
+  const Evals, Script: TArray<string>; Seconds: Integer);
 begin
   var Session := TDebugSession.Create;
   try
@@ -167,6 +309,14 @@ begin
           Continue;
         Inc(StopIndex);
         DumpStop(Session, Evals, StopIndex);
+        // The script runs only at a stop in one of OUR breakpoint files: the
+        // startup of a host application produces dozens of unrelated exception
+        // stops, and driving a scripted session through those would say nothing.
+        if (Length(Script) > 0) and StopIsInBpFile(Session, Bps) then begin
+          Writeln('  --- scripted session ---');
+          RunScript(Session, Script);
+          Writeln('  --- end of script ---');
+        end;
         Session.ContinueExecution;
       end;
     finally
@@ -202,7 +352,8 @@ begin
       Bps := Bps + [Req];
     end;
 
-    var Evals: TArray<string>;
+    var Evals:  TArray<string>;
+    var Script: TArray<string>;
     var Seconds := 300;
     var I := 4;
     while I <= ParamCount do begin
@@ -214,11 +365,21 @@ begin
         Evals := Evals + [ParamStr(I + 1)];
         Inc(I, 2);
       end
+      else if SameText(ParamStr(I), '-script') and (I < ParamCount) then begin
+        var SL := TStringList.Create;
+        try
+          SL.LoadFromFile(ParamStr(I + 1));
+          Script := SL.ToStringArray;
+        finally
+          SL.Free;
+        end;
+        Inc(I, 2);
+      end
       else
         Inc(I);
     end;
 
-    Run(ParamStr(1), ParamStr(2), Bps, Evals, Seconds);
+    Run(ParamStr(1), ParamStr(2), Bps, Evals, Script, Seconds);
   except
     on E: Exception do begin
       Writeln(E.ClassName + ': ' + E.Message);
