@@ -99,6 +99,13 @@ type
     // addresses a hidden field inside the implementing object rather than the
     // object, so it is not recognised as a class instance either.
     [Test] procedure InterfaceMembers_ResolveThroughTheObjectOnBothBitnesses;
+    // Member access on an already-failed base discarded the reason for the
+    // failure. `ArrRec[2].A` reported that no field `A` was found rather than
+    // that the index was out of bounds, and `E.ClassName` on an unresolved `E`
+    // reported a NUMBER read from wherever it landed. The exception handler is
+    // in here too: the same expressions must work once the frame really does
+    // hold an `E`.
+    [Test] procedure FailedBaseKeepsItsDiagnosisOnBothBitnesses;
     // TD32 stores globals mangled, and dcc32 mangles Borland-style where dcc64
     // mangles Itanium-style; only the latter was decoded, so NO unit global
     // resolved on a 32-bit target.
@@ -384,7 +391,8 @@ end;
 // arbitrary sleeps). Bounded by a wall-clock deadline so a hang fails the test
 // rather than blocking forever. The caller owns Session.Free.
 function OpenSessionAtMarker(const ExePath, MapPath, RsmPath, SourceRoot,
-  SourceBaseName: string; Line: Integer): TDebugSession;
+  SourceBaseName: string; Line: Integer;
+  const TargetArgs: string = ''): TDebugSession;
 begin
   Result := TDebugSession.Create;
   var Opts: TLaunchOptions;
@@ -394,6 +402,9 @@ begin
   Opts.RsmPath     := RsmPath;
   Opts.SourceRoot  := SourceRoot;
   Opts.StopAtEntry := False;
+  // Several TestTarget scenarios only run behind a command-line switch, so
+  // without this a breakpoint inside one verifies and then never hits.
+  Opts.Args        := TargetArgs;
 
   Assert.IsTrue(Result.Launch(Opts), 'Launch returned False');
 
@@ -2891,6 +2902,94 @@ begin
   Assert.AreEqual('', Failures,
     'fields, properties and methods must be reachable through an interface ' +
     'reference on both bitnesses -- ' + Failures);
+end;
+
+procedure TWin32RunControlTests.FailedBaseKeepsItsDiagnosisOnBothBitnesses;
+type
+  TExprCheck = record Expr, Fragment: string end;
+const
+  // Dotting a base that already failed must report WHY it failed. The in-range
+  // case is here so the propagation cannot be satisfied by refusing everything.
+  DIAG_CHECKS: array[0..3] of TExprCheck = (
+    (Expr: 'ArrRec[2].A';       Fragment: 'out of bounds'),
+    (Expr: 'ArrObj[9].BaseTag'; Fragment: 'out of bounds'),
+    (Expr: 'Nope.Anything';     Fragment: 'Nope'),
+    (Expr: 'ArrRec[0].A';       Fragment: '11'));
+
+  // In the handler the frame really does hold an E, and everything must
+  // resolve. FinallyRan = 1 also proves the inner `finally` ran before the
+  // outer `except` was entered, so this is the handler frame and not the raise.
+  HANDLER_CHECKS: array[0..3] of TExprCheck = (
+    (Expr: 'E';           Fragment: 'Exception'),
+    (Expr: 'E.Message';   Fragment: 'flow-exc'),
+    (Expr: 'E.ClassName'; Fragment: 'Exception'),
+    (Expr: 'FinallyRan';  Fragment: '1'));
+
+  function EvalAt(const Exe, Map, Rsm, SourceFile, Marker, Expr,
+    TargetArgs: string): string;
+  begin
+    var Line := MarkerLineInFile(TargetDir + SourceFile, Marker);
+    if Line <= 0 then
+      Exit('<marker ' + Marker + ' not found>');
+    var Session := OpenSessionAtMarker(Exe, Map, Rsm, TargetDir, SourceFile,
+                     Line, TargetArgs);
+    try
+      // The exception scenario RAISES before it reaches the handler, and the
+      // debugger stops on the raise -- correctly, and the user asked for that
+      // behaviour explicitly. So the first stop is not necessarily the
+      // breakpoint: continue until the requested line is the one we are on.
+      var Attempts := 0;
+      while (Session.State = dsStopped) and (Attempts < 10) do begin
+        var Frames := Session.GetCallStack;
+        if (Length(Frames) > 0) and (Frames[0].SourceLine = Line) then
+          Break;
+        Session.ContinueExecution;
+        Inc(Attempts);
+        var Deadline := GetTickCount64 + 30000;
+        while (Session.State <> dsStopped) and (not Session.HasExited) and
+              (GetTickCount64 < Deadline) do
+          Session.Pump;
+      end;
+      if Session.State <> dsStopped then
+        Exit('<did not stop>');
+      var R := Session.Evaluate(Expr);
+      if not R.Success then
+        Exit('<' + R.ErrorText + '>');
+      Result := R.Value;
+    finally
+      Session.Free;
+    end;
+  end;
+
+var
+  Failures: string;
+
+  procedure RunChecks(const Checks: array of TExprCheck;
+    const SourceFile, Marker, TargetArgs: string);
+  begin
+    for var Check in Checks do begin
+      var Got64 := EvalAt(Win64Exe, Win64Map, Win64Rsm, SourceFile, Marker,
+                     Check.Expr, TargetArgs);
+      if not Got64.Contains(Check.Fragment) then
+        Failures := Failures + Format('x64 %s -> %s; ', [Check.Expr, Got64]);
+      var Got32 := EvalAt(Win32Exe, Win32Map, Win32Rsm, SourceFile, Marker,
+                     Check.Expr, TargetArgs);
+      if not Got32.Contains(Check.Fragment) then
+        Failures := Failures + Format('x86 %s -> %s; ', [Check.Expr, Got32]);
+    end;
+  end;
+
+begin
+  Assert.IsTrue(FileExists(Win64Exe), '64-bit control target missing');
+
+  Failures := '';
+  RunChecks(DIAG_CHECKS,    'TestTargetTypes.pas', 'COLLECTIONS_BODY',  '');
+  RunChecks(HANDLER_CHECKS, 'TestTargetFlow.pas',  'EXC_NESTED_CATCH',
+    '--run-exc-flow');
+
+  Assert.AreEqual('', Failures,
+    'a failed base must keep its diagnosis, and an exception handler must ' +
+    'resolve its E, on both bitnesses -- ' + Failures);
 end;
 
 procedure TWin32RunControlTests.BreakpointOnBeginLine_ReportsPassedParameters;

@@ -214,6 +214,52 @@ number. Assume any remaining one is currently invisible.
 
 ### CURRENT CURSOR
 
+Unattended bug-hunting run (2026-08-01), driving both bitnesses through
+`DevTools\LiveSessionProbe` against TestTarget and comparing x64 vs x86 answer
+by answer. Six defects found, each measured before it was touched, each closed
+with a both-bitness test. Suite 988 / 984 passed / 0 failed / 4 ignored.
+
+Committed this run:
+
+* `1a6de90` Variant returned through the var-out slot: the class/record
+  decoration in `EvaluateForFrame` overwrote the already-decoded value with
+  `$addr (Variant)`. A Variant IS a TVarData, so whether the decoration fired
+  depended on what a binary's type table exposed -- latent on both targets,
+  visible on x86.
+* `888154c` Dynamic-array bounds were not checked: the check was skipped for any
+  base named `^...`, which is how TD32 spells EVERY dynamic array. `Scores[3]`
+  returned a plausible integer, `Scores[-1]` returned the length field. Now
+  discriminated by probing for a live header rather than by the type name;
+  `Length()` on an open array refuses instead of inventing; `High`/`Low` share
+  the discriminator.
+* `9803494` Arrays of RECORDS walked with a pointer-sized stride. Also corrected
+  `SizeOf`, which exposed that a type SIZE cannot be uses-scoped (see
+  KNOWN_UNKNOWNS + the TODO-RED `Test_UsesScope_TypeSize_PicksUsedUnit`); the
+  old test passed only because pointer size on x64 equals the expected 8.
+* `738824c` Win32: a type declared inside a routine took the ROUTINE's name,
+  because `DemangleBorland` truncated at the `$` signature marker.
+  `@Unit@Proc$qqrv@TColor` is the type TColor. Enums and sets lost their
+  identity with it -- `Big` printed 10 not beK, `EmptyCols` printed `Red` for an
+  EMPTY set. Signature-internal `@` (a class-typed argument is
+  `$qqrx20System@UnicodeString`) is skipped by consuming length-prefixed runs.
+* `8571deb` `P^` on a pointer-to-record read 8 bytes into RawValue and left
+  Address at zero, so the record had no address and no field resolved. Plus the
+  caret-less `P.Field` form Delphi allows.
+* `cfbc3ad` Nothing was reachable through an interface reference. Debug info
+  emits no member list for an interface, and the reference addresses a field
+  INSIDE the object. Recover the object by walking back to the first candidate
+  with a valid VMT whose instance size REACHES the reference -- exact, not
+  heuristic, since only the containing object can cover that address.
+
+Still open, logged not fixed:
+
+* RSM resolves nested type names wrongly on Win32 too (`Col` -> `PPCharArray`).
+  TD32 wins at runtime so nothing is visibly broken, but a binary with RSM and
+  no TD32 would show it.
+* `<.Field not found>` loses the receiver: it should name the class.
+* `Length()` returns Int64 where Delphi says Integer; a dyn array reports
+  `^Element` as its type rather than `TArray<T>`.
+
 Win32 support is functionally complete for `-$O-` targets. Remaining work, in
 order of value:
 

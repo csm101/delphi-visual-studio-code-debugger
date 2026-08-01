@@ -2332,6 +2332,16 @@ function TExprEvaluator.ApplyDot(const Base: TExprValue; const Field: string): T
   end;
 
 begin
+  // An invalid base carries the REASON it is invalid, and that reason is what
+  // the user needs. Continuing past it replaced a real diagnosis with a worse
+  // one, or with no diagnosis at all: `ArrRec[2].A` reported `<.A not found>`
+  // instead of the index being out of bounds, and `E.ClassName` on an
+  // unresolved `E` reported a NUMBER -- 0xEC834853, function prologue bytes --
+  // rather than saying E was not found. ApplyIndex already propagates; this is
+  // the same rule.
+  if not Base.IsValid then
+    Exit(Base);
+
   // Intrinsic on every Delphi class: ClassName is a method that returns
   // the type's ShortString name -- handled via the runtime VMT slot
   // rather than a remote method call so it works even when the class's

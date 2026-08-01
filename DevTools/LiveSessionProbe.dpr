@@ -234,7 +234,7 @@ begin
 end;
 
 procedure Run(const ExePath, SourceRoot: string; const Bps: TArray<TBpRequest>;
-  const Evals, Script: TArray<string>; Seconds: Integer);
+  const Evals, Script: TArray<string>; Seconds: Integer; const TargetArgs: string);
 begin
   var Session := TDebugSession.Create;
   try
@@ -242,6 +242,9 @@ begin
     Opts.ExePath     := ExePath;
     Opts.SourceRoot  := SourceRoot;
     Opts.StopAtEntry := False;
+    // Several TestTarget scenarios only run behind a command-line switch, so a
+    // breakpoint in them verifies and then never hits without this.
+    Opts.Args        := TargetArgs;
 
     if not Session.Launch(Opts) then begin
       Writeln('LAUNCH FAILED: ' + ExePath);
@@ -339,7 +342,8 @@ begin
   try
     if ParamCount < 3 then begin
       Writeln('usage: LiveSessionProbe <exe> <sourceRoot> <file:line>[,<file:line>...]');
-      Writeln('                        [-seconds N] [-eval <expr>] ...');
+      Writeln('                        [-seconds N] [-eval <expr>] [-script <file>]');
+      Writeln('                        [-targetargs "<args passed to the debuggee>"]');
       Halt(1);
     end;
     var Bps: TArray<TBpRequest>;
@@ -354,6 +358,7 @@ begin
 
     var Evals:  TArray<string>;
     var Script: TArray<string>;
+    var TargetArgs := '';
     var Seconds := 300;
     var I := 4;
     while I <= ParamCount do begin
@@ -363,6 +368,10 @@ begin
       end
       else if SameText(ParamStr(I), '-eval') and (I < ParamCount) then begin
         Evals := Evals + [ParamStr(I + 1)];
+        Inc(I, 2);
+      end
+      else if SameText(ParamStr(I), '-targetargs') and (I < ParamCount) then begin
+        TargetArgs := ParamStr(I + 1);
         Inc(I, 2);
       end
       else if SameText(ParamStr(I), '-script') and (I < ParamCount) then begin
@@ -379,7 +388,7 @@ begin
         Inc(I);
     end;
 
-    Run(ParamStr(1), ParamStr(2), Bps, Evals, Script, Seconds);
+    Run(ParamStr(1), ParamStr(2), Bps, Evals, Script, Seconds, TargetArgs);
   except
     on E: Exception do begin
       Writeln(E.ClassName + ': ' + E.Message);
