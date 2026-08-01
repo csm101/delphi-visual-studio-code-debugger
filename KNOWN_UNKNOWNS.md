@@ -66,6 +66,37 @@ Still open:
 
 ## Per-unit / per-binary type resolution
 
+- **dcc32 emits generics UN-INSTANTIATED, so a `TList<T>`'s element type is
+  wrong on Win32** — measured 2026-08-01 on TestTarget's `GenList: TList<Integer>`.
+  dcc64 emits a record per instantiation, `TList__1<Integer>`, whose `FItems`
+  is correctly `^Integer`. dcc32 emits ONE shared record named `%TList__1`
+  (methods appear as `%TList__1.GetList$qqrv`), and its `FItems` is typed
+  `^TComponent` -- the element type of a DIFFERENT instantiation that was
+  merged into the same name. The RSM side is no better: it answers `PWord`,
+  `TCloProc`, `PExpectedMemoryLeaks` and `RunClosureSampler$ActRec` for
+  `FItems` / `List` / `Items` / `PList`, which are coincidental hits in the
+  user-type table (see the sibling entry on nested types below).
+  Values are read correctly today because the pointer widths happen to agree;
+  the risk is an expansion that trusts the element type and walks with the
+  wrong stride.
+  A recovery route exists and is NOT yet taken: runtime RTTI does know the
+  instantiated name -- the same local already renders as
+  `$33EF4E0 (TList<System.Integer>)` through the VMT -- so a class whose static
+  name is a `%X__1` placeholder could prefer the runtime name, and its member
+  element types could be derived from the instantiated RTTI rather than the
+  shared static record.
+
+- **RSM resolves a type id that does not belong to it, on Win32** — a type
+  declared inside a routine is absent from the Win32 RSM module type map
+  entirely (`TColor` is simply not there, where the Win64 RSM has it as
+  `$0239`). The local's id `$00CA` then lands in the user-type table at index
+  100 and yields `PPCharArray`: a confident wrong name from a coincidental hit
+  in the wrong table -- the same failure mode already fixed for main-block
+  locals. Harmless in practice today only because TD32 wins at runtime for
+  these (see the nested-type demangler fix), so a binary carrying RSM without
+  TD32 would show it. The fix needs a way to tell "this id belongs to that
+  table" from "this index happens to exist".
+
 - **A type's SIZE cannot be uses-scoped** — `TDebugInfoSet.GetTypeSize` is flat
   first-wins across providers, so when two used units declare the same type
   name the wrong width can win. `SizeOf(TDupRec)` answers 4 (unit A) where the

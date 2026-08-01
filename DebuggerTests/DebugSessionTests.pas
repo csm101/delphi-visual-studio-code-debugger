@@ -106,6 +106,11 @@ type
     // in here too: the same expressions must work once the frame really does
     // hold an `E`.
     [Test] procedure FailedBaseKeepsItsDiagnosisOnBothBitnesses;
+    // Writing a variable. A WideString was written as a Delphi string through
+    // the WRONG RTL helper, so half of it was lost on read-back, and every
+    // negative value was rejected outright because the literal parser only
+    // accepted unsigned digits.
+    [Test] procedure VariableWrites_RoundTripOnBothBitnesses;
     // TD32 stores globals mangled, and dcc32 mangles Borland-style where dcc64
     // mangles Itanium-style; only the latter was decoded, so NO unit global
     // resolved on a 32-bit target.
@@ -2990,6 +2995,73 @@ begin
   Assert.AreEqual('', Failures,
     'a failed base must keep its diagnosis, and an exception handler must ' +
     'resolve its E, on both bitnesses -- ' + Failures);
+end;
+
+procedure TWin32RunControlTests.VariableWrites_RoundTripOnBothBitnesses;
+type
+  TWriteCheck = record Name, NewValue, Fragment: string end;
+const
+  SOURCE = 'TestTargetTypes.pas';
+  MARKER = 'TYPES_BODY';
+
+  // Written, then READ BACK through a fresh evaluation. Asserting the value the
+  // debugger reports after the write is what catches a write of the right bytes
+  // in the wrong shape.
+  //
+  // `WS1` is the reason this test exists: a WideString is an OLE BSTR, and
+  // writing it as a Delphi string truncated `changed-wide` to `change` --
+  // exactly half, the character count having been stored where the BYTE count
+  // belongs. The negative values were rejected outright, so no signed variable
+  // could be set below zero; -2147483648 is here because it is the one value
+  // whose two's-complement form has nothing else that could produce it.
+  CHECKS: array[0..5] of TWriteCheck = (
+    (Name: 'WS1';       NewValue: 'changed-wide'; Fragment: 'changed-wide'),
+    (Name: 'ZeroInt';   NewValue: '-7';           Fragment: '-7'),
+    (Name: 'TrickyOne'; NewValue: '-2147483648';  Fragment: '-2147483648'),
+    (Name: 'OutResult'; NewValue: '-1';           Fragment: '-1'),
+    (Name: 'Col';       NewValue: 'Blue';         Fragment: 'Blue'),
+    (Name: 'BB1';       NewValue: 'False';        Fragment: 'False'));
+
+  // Returns the value the debugger reports AFTER the write, or `<error>`.
+  function WriteAndReadBack(const Exe, Map, Rsm: string;
+    const Check: TWriteCheck; Line: Integer): string;
+  begin
+    var Session := OpenSessionAtMarker(Exe, Map, Rsm, TargetDir, SOURCE, Line);
+    try
+      if Session.State <> dsStopped then
+        Exit('<did not stop>');
+      var NewValue, NewType: string;
+      if not Session.SetLocalVariable(Check.Name, Check.NewValue, NewValue, NewType) then
+        Exit('<write failed: ' + NewValue + '>');
+      var R := Session.Evaluate(Check.Name);
+      if not R.Success then
+        Exit('<read back failed: ' + R.ErrorText + '>');
+      Result := R.Value;
+    finally
+      Session.Free;
+    end;
+  end;
+
+begin
+  var Line := MarkerLineInFile(TargetDir + SOURCE, MARKER);
+  Assert.IsTrue(Line > 0, 'marker ' + MARKER + ' not found');
+  Assert.IsTrue(FileExists(Win64Exe), '64-bit control target missing');
+
+  var Failures := '';
+  for var Check in CHECKS do begin
+    var Got64 := WriteAndReadBack(Win64Exe, Win64Map, Win64Rsm, Check, Line);
+    if not Got64.Contains(Check.Fragment) then
+      Failures := Failures + Format('x64 %s:=%s -> %s; ',
+        [Check.Name, Check.NewValue, Got64]);
+    var Got32 := WriteAndReadBack(Win32Exe, Win32Map, Win32Rsm, Check, Line);
+    if not Got32.Contains(Check.Fragment) then
+      Failures := Failures + Format('x86 %s:=%s -> %s; ',
+        [Check.Name, Check.NewValue, Got32]);
+  end;
+
+  Assert.AreEqual('', Failures,
+    'a written value must read back as what was written, on both ' +
+    'bitnesses -- ' + Failures);
 end;
 
 procedure TWin32RunControlTests.BreakpointOnBeginLine_ReportsPassedParameters;

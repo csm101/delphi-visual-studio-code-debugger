@@ -3308,6 +3308,29 @@ begin
   if FProcess = 0 then
     Exit;
 
+  // A WideString is an OLE BSTR, not a Delphi string: the four bytes before the
+  // data are a BYTE count, and there is no code page, element size or refcount
+  // header at all. Building a TStrRec here and handing it over as a WideString
+  // put the CHARACTER count where the byte count belongs, so reading the value
+  // back gave half of it -- `changed-wide` came back as `change`.
+  if TypeHint = 'WideString' then begin
+    var WideBytes := Length(Text) * 2;
+    var BstrSize: NativeUInt := 4 + NativeUInt(WideBytes) + 2;  // len + data + #0#0
+    var BstrBase := VirtualAllocEx(FProcess, nil, BstrSize,
+                      MEM_COMMIT or MEM_RESERVE, PAGE_READWRITE);
+    if BstrBase = nil then
+      Exit;
+    var BstrBlock: TBytes;
+    SetLength(BstrBlock, BstrSize);
+    PInteger(@BstrBlock[0])^ := WideBytes;
+    if WideBytes > 0 then
+      Move(PChar(Text)^, BstrBlock[4], WideBytes);
+    if not WriteMemoryAt(UInt64(BstrBase), @BstrBlock[0], BstrSize) then
+      Exit;
+    Ptr := UInt64(BstrBase) + 4;
+    Exit(True);
+  end;
+
   if (TypeHint = 'AnsiString') or (TypeHint = 'RawByteString') or
      (TypeHint = 'UTF8String') then begin
     ElemSize := 1;
@@ -3704,9 +3727,15 @@ var
   NewPtr:     UInt64;
 begin
   Result := False;
-  if (TypeHint = 'UnicodeString') or (TypeHint = 'string') or
-     (TypeHint = 'WideString') then
+  if (TypeHint = 'UnicodeString') or (TypeHint = 'string') then
     HelperName := '@UStrAsg'
+  // A WideString needs its OWN helper. _UStrAsg treats the destination as a
+  // refcounted Delphi string and touches a refcount field that a BSTR does not
+  // have, writing over the four bytes that ARE its length. _WStrAsg copies the
+  // source into a BSTR the RTL allocates itself, which also means the block
+  // allocated above is never handed to SysFreeString.
+  else if TypeHint = 'WideString' then
+    HelperName := '@WStrAsg'
   else if (TypeHint = 'AnsiString') or (TypeHint = 'RawByteString') or
           (TypeHint = 'UTF8String') then
     HelperName := '@LStrAsg'

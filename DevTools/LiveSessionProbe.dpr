@@ -161,6 +161,24 @@ begin
         ExpandHandle(R.Handle, 2, '        ');
       end;
     end
+    else if SameText(Cmd, 'set') then begin
+      // `set <Name> <Value>` -- write a local, then show what the debugger
+      // reads back, which is what catches a write at the wrong width.
+      var NameEnd := Arg.IndexOf(' ');
+      if NameEnd <= 0 then
+        Writeln('    set needs: set <name> <value>')
+      else begin
+        var VarName  := Arg.Substring(0, NameEnd).Trim;
+        var NewText  := Arg.Substring(NameEnd + 1).Trim;
+        var NewValue, NewType: string;
+        if Session.SetLocalVariable(VarName, NewText, NewValue, NewType) then
+          Writeln(Format('    set %s := %s -> %s [%s]',
+            [VarName, NewText, NewValue, NewType]))
+        else
+          Writeln(Format('    set %s := %s FAILED: %s',
+            [VarName, NewText, NewValue]));
+      end;
+    end
     else if SameText(Cmd, 'eval') then begin
       var R := Session.EvaluateForFrame(Arg, FrameIdx);
       if R.Success then

@@ -86,6 +86,19 @@ begin
     V := Int;
     Exit(True);
   end;
+  // A NEGATIVE decimal literal. `Val` into a UInt64 rejects the sign outright,
+  // so `set ZeroInt -7` failed with `"-7" is not an integer` -- every signed
+  // type was unwritable below zero. Parse it signed and keep the bit pattern;
+  // the caller truncates to the target's width, which is exactly two's
+  // complement for that width. Decimal only: a negative hex literal is not a
+  // form Delphi writes.
+  if S[1] = '-' then begin
+    var Signed: Int64;
+    Val(S, Signed, Code);
+    if Code <> 0 then Exit;
+    V := UInt64(Signed);
+    Exit(True);
+  end;
   Val(S, Int, Code);
   if Code <> 0 then Exit;
   V := Int;
