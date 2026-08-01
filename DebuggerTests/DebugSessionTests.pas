@@ -59,6 +59,14 @@ type
     // Win32; a string-returning method that also takes an argument is the only
     // shape where the difference shows.
     [Test] procedure StringArgToStringReturningMethod_WorksOnBothBitnesses;
+    // The other three families that travel through that same hidden slot: a
+    // Variant (the slot holds a TVarData BY VALUE, not a data pointer), a
+    // record too large for a register, and a dynamic array. The 64-bit suite
+    // covers them one by one; nothing covered them on a 32-bit target, where
+    // the slot moves to the end of the argument list and TVarData is 16 bytes
+    // rather than 24. A miss here renders the slot's ADDRESS instead of the
+    // value, which reads as a plausible pointer rather than as an error.
+    [Test] procedure VarOutReturns_DecodeOnBothBitnesses;
     // TD32 stores globals mangled, and dcc32 mangles Borland-style where dcc64
     // mangles Itanium-style; only the latter was decoded, so NO unit global
     // resolved on a 32-bit target.
@@ -2446,6 +2454,59 @@ begin
   Assert.AreEqual('', Failures,
     'a string argument to a string-returning method must work on both ' +
     'bitnesses -- ' + Failures);
+end;
+
+procedure TWin32RunControlTests.VarOutReturns_DecodeOnBothBitnesses;
+const
+  STEP_SOURCE = 'TestTargetCore.pas';
+
+  // Each expression is paired with a fragment of what it must render, so a
+  // regression that reports the SLOT rather than what it points at fails on
+  // the text instead of merely differing between bitnesses.
+  //
+  // A Variant and a dynamic array are LEAF values and must decode inline: 142
+  // is FValue + 100, and [10, 20, 30] is the array with the element stride.
+  // A record is not a leaf -- the established contract (mirrored from the
+  // 64-bit DAP test) is that it renders as its TYPE and expands into fields,
+  // so asserting a field value here would be asserting the wrong thing. The
+  // type name still catches a collapse to a bare pointer.
+  EXPECTED: array[0..2] of record Expr, Fragment: string end = (
+    (Expr: 'W.DoCalcVariant()'; Fragment: '142'),
+    (Expr: 'W.DoCalcBigRec()';  Fragment: 'TPoint3D'),
+    (Expr: 'W.DoCalcDynArr()';  Fragment: '[10, 20, 30]'));
+
+  function EvalAt(const Exe, Map, Rsm, Expr: string; Line: Integer): string;
+  begin
+    var Session := OpenSessionAtMarker(Exe, Map, Rsm, TargetDir, STEP_SOURCE, Line);
+    try
+      if Session.State <> dsStopped then
+        Exit('<did not stop>');
+      var R := Session.Evaluate(Expr);
+      if not R.Success then
+        Exit('<' + R.ErrorText + '>');
+      Result := R.Value;
+    finally
+      Session.Free;
+    end;
+  end;
+
+begin
+  var Line := MarkerLineInFile(TargetDir + STEP_SOURCE, 'EVAL_BODY');
+  Assert.IsTrue(Line > 0, 'marker EVAL_BODY not found');
+  Assert.IsTrue(FileExists(Win64Exe), '64-bit control target missing');
+
+  var Failures := '';
+  for var Case_ in EXPECTED do begin
+    var Got64 := EvalAt(Win64Exe, Win64Map, Win64Rsm, Case_.Expr, Line);
+    if not Got64.Contains(Case_.Fragment) then
+      Failures := Failures + Format('x64 %s -> %s; ', [Case_.Expr, Got64]);
+    var Got32 := EvalAt(Win32Exe, Win32Map, Win32Rsm, Case_.Expr, Line);
+    if not Got32.Contains(Case_.Fragment) then
+      Failures := Failures + Format('x86 %s -> %s; ', [Case_.Expr, Got32]);
+  end;
+  Assert.AreEqual('', Failures,
+    'a value returned through the hidden var-out slot must decode to its ' +
+    'CONTENTS on both bitnesses -- ' + Failures);
 end;
 
 procedure TWin32RunControlTests.BreakpointOnBeginLine_ReportsPassedParameters;

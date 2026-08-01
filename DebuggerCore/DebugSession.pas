@@ -1877,7 +1877,19 @@ begin
     var Kind: Byte := 0;
     if (Val.TypeHint <> '') and (FDebugInfo <> nil) then
       Kind := FDebugInfo.LookupTypeKind(Val.TypeHint);
-    if Val.IsValid and (Val.TypeHint <> '') and
+    // A Variant is a LEAF: FormatLocalValue has already decoded the TVarData
+    // into `varInteger: 142`, and overwriting that with the address form throws
+    // the value away. It gets here because the underlying TVarData IS a struct,
+    // so whether the decoration fires depends on what the binary's type table
+    // happens to expose -- on Win32 `Variant` reported members and every
+    // Variant-returning call rendered as `$1060000 (Variant)`, while the same
+    // expression on Win64 rendered correctly. Same test the reader dispatches
+    // on, so the two cannot disagree about what counts as a Variant.
+    // The VarArray expansion below still runs: it only mints a handle.
+    var RendersAsVariant :=
+      SameText(Val.TypeHint, 'Variant') or SameText(Val.TypeHint, 'OleVariant') or
+      SameText(Val.TypeHint, 'TVarData') or (Kind = TK_VARIANT);
+    if Val.IsValid and (Val.TypeHint <> '') and (not RendersAsVariant) and
        ((Kind = 0) or IsExpandableTKind(Kind)) then begin
       var Members: TArray<TClassMember>;
       var HasMembers := FExpander.GetDisplayMembers(Val.TypeHint, Members) and
