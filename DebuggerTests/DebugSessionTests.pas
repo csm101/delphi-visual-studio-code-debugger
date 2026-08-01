@@ -111,6 +111,10 @@ type
     // negative value was rejected outright because the literal parser only
     // accepted unsigned digits.
     [Test] procedure VariableWrites_RoundTripOnBothBitnesses;
+    // Conditional and hit-count breakpoints were covered on the 64-bit target
+    // only. Both evaluate an expression in the debuggee before deciding to
+    // stop, so both depend on the 32-bit locals and calling convention.
+    [Test] procedure ConditionalBreakpoints_StopAtTheRightIterationOnBothBitnesses;
     // TD32 stores globals mangled, and dcc32 mangles Borland-style where dcc64
     // mangles Itanium-style; only the latter was decoded, so NO unit global
     // resolved on a 32-bit target.
@@ -3062,6 +3066,80 @@ begin
   Assert.AreEqual('', Failures,
     'a written value must read back as what was written, on both ' +
     'bitnesses -- ' + Failures);
+end;
+
+procedure TWin32RunControlTests.ConditionalBreakpoints_StopAtTheRightIterationOnBothBitnesses;
+const
+  SOURCE = 'TestTargetCore.pas';
+  MARKER = 'BP_LOOP';
+
+  // The loop runs I = 1..5 accumulating into Acc, so each iteration is
+  // distinguishable by BOTH variables and a stop at the wrong one is visible.
+  //
+  // Condition `I = 4`: Acc is 1+2+3 = 6 on entry to that iteration.
+  // HitCondition `>= 3`: the third hit is I = 3, where Acc is 1+2 = 3.
+  // Asserting Acc as well as I means a condition that silently never
+  // evaluated -- stopping on the first hit regardless -- cannot pass.
+
+  // An integer renders as `4  (0x4)`; the hex annotation is noise here.
+  function JustTheNumber(const Rendered: string): string;
+  begin
+    Result := Rendered;
+    var Cut := Pos('  (', Result);
+    if Cut > 0 then
+      Result := Copy(Result, 1, Cut - 1);
+    Result := Trim(Result);
+  end;
+
+  // Returns "I=<i> Acc=<acc>" at the stop, or an error marker.
+  function StopStateAt(const Exe, Map, Rsm, Cond, HitCond: string;
+    Line: Integer): string;
+  begin
+    var Session := OpenSessionWithBp(Exe, Map, Rsm, TargetDir, SOURCE, Line,
+                     Cond, HitCond, '');
+    try
+      if Session.State <> dsStopped then
+        Exit('<did not stop>');
+      var RI := Session.Evaluate('I');
+      var RA := Session.Evaluate('Acc');
+      if not (RI.Success and RA.Success) then
+        Exit('<eval failed>');
+      Result := Format('I=%s Acc=%s',
+                  [JustTheNumber(RI.Value), JustTheNumber(RA.Value)]);
+    finally
+      Session.Free;
+    end;
+  end;
+
+  function Check(const What, Cond, HitCond, Expected: string;
+    Line: Integer): string;
+  begin
+    Result := '';
+    var Got64 := StopStateAt(Win64Exe, Win64Map, Win64Rsm, Cond, HitCond, Line);
+    if Got64 <> Expected then
+      Result := Result + Format('x64 %s -> %s (wanted %s); ',
+        [What, Got64, Expected]);
+    var Got32 := StopStateAt(Win32Exe, Win32Map, Win32Rsm, Cond, HitCond, Line);
+    if Got32 <> Expected then
+      Result := Result + Format('x86 %s -> %s (wanted %s); ',
+        [What, Got32, Expected]);
+  end;
+
+begin
+  var Line := MarkerLineInFile(TargetDir + SOURCE, MARKER);
+  Assert.IsTrue(Line > 0, 'marker ' + MARKER + ' not found');
+  Assert.IsTrue(FileExists(Win64Exe), '64-bit control target missing');
+
+  var Failures := '';
+  Failures := Failures + Check('condition I=4', 'I = 4', '',  'I=4 Acc=6', Line);
+  Failures := Failures + Check('hit >= 3',      '',      '>= 3', 'I=3 Acc=3', Line);
+  // No condition at all: the first iteration, which is also the control that
+  // the two above are not simply stopping wherever they like.
+  Failures := Failures + Check('unconditional',  '',      '',    'I=1 Acc=0', Line);
+
+  Assert.AreEqual('', Failures,
+    'a conditional or hit-count breakpoint must stop at the iteration it ' +
+    'names, on both bitnesses -- ' + Failures);
 end;
 
 procedure TWin32RunControlTests.BreakpointOnBeginLine_ReportsPassedParameters;
