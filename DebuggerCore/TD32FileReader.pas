@@ -1663,7 +1663,22 @@ begin
   var Mangled := ResolveNameByIndex(NameIdx);
   var Inner, Parent: string;
   var Friendly: string;
+  // Itanium (dcc64) THEN Borland (dcc32), mirroring HandleProcRecord. The
+  // Borland branch was missing here, and that is why no unit-level global
+  // resolved on a 32-bit target: TD32 stores the symbol mangled, and the two
+  // compilers mangle differently --
+  //   dcc64  _ZN14Testtargetcore8GCounterE
+  //   dcc32  @Testtargetcore@GCounter
+  // Only the first was decoded, so on Win32 `GCounter` was indexed under its
+  // raw mangled name and a watch on `GCounter` answered "<not found>" while the
+  // identical target built for Win64 answered correctly. The DAP suite runs
+  // against the 64-bit target only, which is why it never showed.
   if DemangleItanium(Mangled, Inner, Parent) then begin
+    if Parent <> '' then
+      Friendly := Parent + '.' + Inner
+    else
+      Friendly := Inner;
+  end else if DemangleBorland(Mangled, Inner, Parent) then begin
     if Parent <> '' then
       Friendly := Parent + '.' + Inner
     else

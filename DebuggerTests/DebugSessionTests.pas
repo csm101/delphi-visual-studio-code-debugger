@@ -59,6 +59,10 @@ type
     // Win32; a string-returning method that also takes an argument is the only
     // shape where the difference shows.
     [Test] procedure StringArgToStringReturningMethod_WorksOnBothBitnesses;
+    // TD32 stores globals mangled, and dcc32 mangles Borland-style where dcc64
+    // mangles Itanium-style; only the latter was decoded, so NO unit global
+    // resolved on a 32-bit target.
+    [Test] procedure UnitGlobals_ResolveOnBothBitnesses;
     // Stack locals. Covers the x86 prologue decoder (`add esp,-N` rather than
     // `sub esp,N`, `mov ebp,esp` before the allocation) and the zero offset
     // bases that follow from it. Compared against x64 rather than asserted
@@ -2355,6 +2359,51 @@ begin
   finally
     Session.Free;
   end;
+end;
+
+procedure TWin32RunControlTests.UnitGlobals_ResolveOnBothBitnesses;
+const
+  MAIN_SOURCE = 'TestTarget.dpr';
+
+  function EvalAt(const Exe, Map, Rsm: string; Line: Integer;
+    const Expr: string): string;
+  begin
+    var Session := OpenSessionAtMarker(Exe, Map, Rsm, TargetDir, MAIN_SOURCE, Line);
+    try
+      if Session.State <> dsStopped then
+        Exit('<did not stop>');
+      var R := Session.Evaluate(Expr);
+      if not R.Success then
+        Exit('<' + R.ErrorText + '>');
+      Result := R.Value + ' [' + R.TypeName + ']';
+    finally
+      Session.Free;
+    end;
+  end;
+
+begin
+  var Line := MarkerLineInFile(TargetDir + MAIN_SOURCE, 'MAIN_GCOUNTER');
+  Assert.IsTrue(Line > 0, 'marker MAIN_GCOUNTER not found');
+  Assert.IsTrue(FileExists(Win64Exe), '64-bit control target missing');
+
+  // TD32 stores a unit-level global under its MANGLED name, and the two
+  // compilers mangle differently: dcc64 emits `_ZN14Testtargetcore8GCounterE`,
+  // dcc32 emits `@Testtargetcore@GCounter`. HandleGData32 decoded only the
+  // Itanium form, so on Win32 every global was indexed under its raw mangled
+  // name and a watch answered "<not found>" -- while the identical source built
+  // for Win64 answered correctly. The DAP suite exercises the 64-bit target
+  // only, which is why nothing caught it; this test runs BOTH.
+  var Failures := '';
+  for var Expr in ['GCounter', 'GSink'] do begin
+    var Got64 := EvalAt(Win64Exe, Win64Map, Win64Rsm, Line, Expr);
+    if Got64.Contains('not found') then
+      Failures := Failures + 'x64 ' + Expr + ': ' + Got64 + '; ';
+    var Got32 := EvalAt(Win32Exe, Win32Map, Win32Rsm, Line, Expr);
+    if Got32.Contains('not found') then
+      Failures := Failures + 'x86 ' + Expr + ': ' + Got32 + '; ';
+  end;
+  Assert.AreEqual('', Failures,
+    'a unit-level global must resolve on both bitnesses -- ' + Failures);
 end;
 
 procedure TWin32RunControlTests.StringArgToStringReturningMethod_WorksOnBothBitnesses;
