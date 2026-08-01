@@ -386,6 +386,10 @@ type
     // dcc32 mangles differently from dcc64. Public for the same reason.
     class function DemangleBorland(const Mangled: string;
                     out InnerName, ParentName: string): Boolean; static;
+    // Locates the `@` that introduces an entity nested in a routine, skipping
+    // the length-prefixed names that can appear inside the signature itself.
+    class function TopLevelAtAfterSignature(const Body: string;
+                    DollarPos: Integer): Integer; static;
     constructor Create;
     destructor  Destroy; override;
     procedure   LoadFromFile(const ExePath: string; OutputRvaShift: UInt64 = 0);
@@ -1200,6 +1204,38 @@ end;
 // (the anchored branch rejected it, so the raw name was shown). `@` is not a
 // legal character in a Pascal identifier, so its presence is always a mangling
 // separator and never part of a name; a name with no `@` at all is not mangled.
+class function TTD32FileReader.TopLevelAtAfterSignature(const Body: string;
+  DollarPos: Integer): Integer;
+// Index (0-based) of the first `@` that follows the signature at TOP LEVEL, or
+// -1 when there is none.
+//
+// A `@` inside the signature does not count, and they do occur: an argument of
+// a class type is encoded as `<length><QualifiedName>`, e.g.
+// `$qqrx20System@UnicodeString`, where `System@UnicodeString` is exactly the 20
+// characters the prefix announces. Consuming each length-prefixed run is what
+// separates that from the nested-entity suffix in `$qqrv@TColor`, where the `@`
+// sits directly in the signature text. Digits appear in Borland signatures only
+// as those length prefixes -- the type codes themselves are letters.
+begin
+  Result := -1;
+  var I := DollarPos;
+  while I < Length(Body) do begin
+    var C := Body.Chars[I];
+    if C = '@' then
+      Exit(I);
+    if CharInSet(C, ['0'..'9']) then begin
+      var NameLen := 0;
+      while (I < Length(Body)) and CharInSet(Body.Chars[I], ['0'..'9']) do begin
+        NameLen := NameLen * 10 + (Ord(Body.Chars[I]) - Ord('0'));
+        Inc(I);
+      end;
+      Inc(I, NameLen);   // skip the announced name, `@` and all
+      Continue;
+    end;
+    Inc(I);
+  end;
+end;
+
 class function TTD32FileReader.DemangleBorland(const Mangled: string;
   out InnerName, ParentName: string): Boolean;
 begin
@@ -1213,8 +1249,29 @@ begin
   if Anchored then
     Body := Body.Substring(1);
   var DollarPos := Body.IndexOf('$');
-  if DollarPos >= 0 then
+  // Everything from the signature marker on is normally noise -- `@Unit@Proc$qqrv`
+  // is just `Proc`. But an entity declared INSIDE a routine is mangled as the
+  // routine's full name plus `@EntityName`, so the tail after the signature can
+  // carry the only part that matters. A type declared in a procedure body --
+  // `procedure RunTypeSampler; type TColor = (Red, Green, Blue);` -- arrives as
+  // `@Testtargettypes@RunTypeSampler$qqrv@TColor`, and truncating at the `$`
+  // named it `RunTypeSampler`. Every enum and set declared inside a routine
+  // therefore lost its type on a 32-bit target: the value formatter had no enum
+  // to look up, so `Big` printed 10 instead of `beK` and `Cols` printed 5
+  // instead of `[Red, Blue]`. dcc64 emits a plain `TColor` and never showed it.
+  if DollarPos >= 0 then begin
+    var NestedAt := TopLevelAtAfterSignature(Body, DollarPos);
+    if NestedAt >= 0 then begin
+      InnerName := Body.Substring(NestedAt + 1);
+      // The enclosing routine is the scope; keep it as the parent so a caller
+      // that wants qualification can build `RunTypeSampler.TColor`.
+      var Scope := Body.Substring(0, DollarPos).Split(['@']);
+      if Length(Scope) > 0 then
+        ParentName := Scope[High(Scope)];
+      Exit(InnerName <> '');
+    end;
     Body := Body.Substring(0, DollarPos);
+  end;
   if Body = '' then
     Exit;
   var Parts := Body.Split(['@']);

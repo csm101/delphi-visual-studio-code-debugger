@@ -428,6 +428,43 @@ begin
       ScanRsmForTypeHint(ParamStr(1), ParamStr(3), MaxHits);
       Halt(0);
     end;
+    // Raw bytes of one TYPES record, so a suspected layout difference can be
+    // read off the file instead of inferred from a wrong decoded name.
+    if (ParamCount >= 3) and SameText(ParamStr(2), '-typerec') then begin
+      var IdTxt := ParamStr(3);
+      if IdTxt.StartsWith('$') then
+        IdTxt := IdTxt.Substring(1);
+      var Rdr := TTD32FileReader.Create;
+      try
+        Rdr.LoadFromFile(ParamStr(1));
+        var Rec: TTD32TypeRecord;
+        if not Rdr.GetTypeRecord(Cardinal(StrToInt64('$' + IdTxt)), Rec) then begin
+          Writeln('  no type record $' + IdTxt);
+          Halt(0);
+        end;
+        Writeln(Format('== type $%s in %s ==', [IdTxt, ParamStr(1)]));
+        Writeln(Format('  leaf=$%.4x kind=%d size=%d nameIdx=%d name="%s" payloadLen=%d',
+          [Rec.LeafCode, Ord(Rec.Kind), Rec.Size, Rec.NameIdx, Rec.Name, Rec.PayloadLen]));
+        var Hex := '';
+        var Dwords := '';
+        for var I := 0 to Rec.PayloadLen - 1 do
+          Hex := Hex + Format('%.2x ', [PByte(Rec.PayloadPtr + I)^]);
+        // Every u32 in the payload plus the name it would resolve to, which is
+        // what identifies the real nameIdx offset at a glance.
+        var I32 := 0;
+        while I32 + 4 <= Rec.PayloadLen do begin
+          var V := PCardinal(Rec.PayloadPtr + I32)^;
+          Dwords := Dwords + Format('    +%-3d u32=%-10u -> "%s"'#13#10,
+            [I32, V, Rdr.DiagResolveName(V)]);
+          Inc(I32, 2);
+        end;
+        Writeln('  payload: ' + Hex);
+        Write(Dwords);
+      finally
+        Rdr.Free;
+      end;
+      Halt(0);
+    end;
     if (ParamCount >= 3) and SameText(ParamStr(2), '-proc') then begin
       var R1 := TTD32FileReader.Create;
       try

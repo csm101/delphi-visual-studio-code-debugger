@@ -81,6 +81,13 @@ type
     // element landed inside its neighbour. The control is an array of class
     // instances, whose elements genuinely ARE pointer-sized.
     [Test] procedure RecordArrayStride_IsTheRecordWidthOnBothBitnesses;
+    // A type declared INSIDE a routine is mangled by dcc32 as the routine's
+    // full name plus `@TypeName`, and the demangler truncated at the signature
+    // marker -- so every such type was named after its enclosing procedure.
+    // Enums and sets lost their identity with it: the formatter had no enum to
+    // look up and printed raw ordinals. dcc64 emits a plain name and never
+    // showed this.
+    [Test] procedure NestedTypeNames_ResolveOnBothBitnesses;
     // TD32 stores globals mangled, and dcc32 mangles Borland-style where dcc64
     // mangles Itanium-style; only the latter was decoded, so NO unit global
     // resolved on a 32-bit target.
@@ -2668,6 +2675,81 @@ begin
   end;
   Assert.AreEqual('', Failures,
     'an array of records must be walked with the RECORD width on both ' +
+    'bitnesses -- ' + Failures);
+end;
+
+procedure TWin32RunControlTests.NestedTypeNames_ResolveOnBothBitnesses;
+type
+  TExprCheck = record Expr, Fragment: string end;
+const
+  SOURCE = 'TestTargetTypes.pas';
+  MARKER = 'TYPES_BODY';
+
+  // RunTypeSampler declares TColor, TColors and TBigEnum in its own `type`
+  // section, so dcc32 mangles them `@Testtargettypes@RunTypeSampler$qqrv@TColor`.
+  // Truncating at the `$` named all three `RunTypeSampler`, and the damage was
+  // not cosmetic: with no enum type to resolve, `Big` printed 10 rather than
+  // beK, `Cols` printed 5 rather than [Red, Blue], and `EmptyCols` -- an empty
+  // set -- printed `Red`.
+  //
+  // TBigEnum matters specifically because it has 20 members: its ordinal 10 is
+  // a plausible-looking number, where a 3-member enum would more likely fail
+  // visibly.
+  CHECKS: array[0..7] of TExprCheck = (
+    (Expr: 'Col';           Fragment: 'Green'),
+    (Expr: 'Big';           Fragment: 'beK'),
+    (Expr: 'Cols';          Fragment: '[Red, Blue]'),
+    (Expr: 'EmptyCols';     Fragment: '[]'),
+    (Expr: 'Ord(Col)';      Fragment: '1'),
+    (Expr: 'Ord(Big)';      Fragment: '10'),
+    (Expr: 'Red in Cols';   Fragment: 'True'),
+    (Expr: 'Green in Cols'; Fragment: 'False'));
+
+  // The reported TYPE must be the declared one, never the enclosing routine --
+  // the symptom that pointed at the demangler in the first place.
+  TYPE_CHECKS: array[0..2] of TExprCheck = (
+    (Expr: 'Col';  Fragment: 'TColor'),
+    (Expr: 'Big';  Fragment: 'TBigEnum'),
+    (Expr: 'Cols'; Fragment: 'TColors'));
+
+  function EvalAt(const Exe, Map, Rsm, Expr: string; Line: Integer): string;
+  begin
+    var Session := OpenSessionAtMarker(Exe, Map, Rsm, TargetDir, SOURCE, Line);
+    try
+      if Session.State <> dsStopped then
+        Exit('<did not stop>');
+      var R := Session.Evaluate(Expr);
+      if not R.Success then
+        Exit('<' + R.ErrorText + '>');
+      Result := R.Value + '  [' + R.TypeName + ']';
+    finally
+      Session.Free;
+    end;
+  end;
+
+begin
+  var Line := MarkerLineInFile(TargetDir + SOURCE, MARKER);
+  Assert.IsTrue(Line > 0, 'marker ' + MARKER + ' not found');
+  Assert.IsTrue(FileExists(Win64Exe), '64-bit control target missing');
+
+  var Failures := '';
+  for var Check in CHECKS do begin
+    var Got64 := EvalAt(Win64Exe, Win64Map, Win64Rsm, Check.Expr, Line);
+    if not Got64.Contains(Check.Fragment) then
+      Failures := Failures + Format('x64 %s -> %s; ', [Check.Expr, Got64]);
+    var Got32 := EvalAt(Win32Exe, Win32Map, Win32Rsm, Check.Expr, Line);
+    if not Got32.Contains(Check.Fragment) then
+      Failures := Failures + Format('x86 %s -> %s; ', [Check.Expr, Got32]);
+  end;
+
+  for var Named in TYPE_CHECKS do begin
+    var Got32 := EvalAt(Win32Exe, Win32Map, Win32Rsm, Named.Expr, Line);
+    if not Got32.Contains('[' + Named.Fragment + ']') then
+      Failures := Failures + Format('x86 typeof(%s) -> %s; ', [Named.Expr, Got32]);
+  end;
+
+  Assert.AreEqual('', Failures,
+    'a type declared inside a routine must keep its own name on both ' +
     'bitnesses -- ' + Failures);
 end;
 
