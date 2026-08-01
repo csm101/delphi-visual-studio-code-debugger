@@ -110,6 +110,11 @@ type
     // looking for a live dyn-array header below the data pointer, which is the
     // only reliable signal: TD32 renders both as `^Element`.
     function  TryDynArrayCountFromHeader(DataPtr: UInt64; out Count: Int64): Boolean;
+    // Stride of one array element. A record / set / static array element is
+    // stored by value and is as wide as itself; everything else PrimTypeSize
+    // does not recognise really is a pointer-sized handle.
+    function  ElementStride(const ElemType: string): Integer;
+    function  IsPointerSizedFallback(const TypeName: string): Boolean;
     // `Obj[X]` on a class instance: finds the class's `default` array property,
     // walking the ancestor chain (TStringList's default is TStrings.Strings).
     // False when the receiver is not an instance or no ancestor declares one.
@@ -533,6 +538,46 @@ begin
   end;
 end;
 
+// Stride of one ELEMENT of an array of TypeName. Differs from PrimTypeSize for
+// exactly one family: a record, set or static array is stored BY VALUE, so its
+// stride is its own width, while a string / class / interface / dynamic array
+// element is a handle and really is pointer-sized.
+//
+// PrimTypeSize alone returned pointer size for every name it did not recognise,
+// records included. Indexing a `TArray<TPackedRec>` (a 7-byte packed record)
+// therefore walked in 8-byte steps on x64 and 4-byte steps on x86: element 0
+// read correctly and every later element was skewed, silently, into the middle
+// of its neighbour.
+function TExprEvaluator.ElementStride(const ElemType: string): Integer;
+begin
+  Result := PrimTypeSize(ElemType);
+  if not IsPointerSizedFallback(ElemType) then
+    Exit;
+  if FDebugInfo = nil then
+    Exit;
+  var Kind := FDebugInfo.LookupTypeKind(ElemType);
+  if not (Kind in [TK_RECORD, TK_MRECORD, TK_SET, TK_ARRAY]) then
+    Exit;
+  var Sz: Integer;
+  if FDebugInfo.GetTypeSize(ElemType, Sz) and (Sz > 0) then
+    Result := Sz;
+end;
+
+// True when PrimTypeSize did not RECOGNISE the name and fell through to its
+// pointer-sized default, as opposed to a type that is genuinely pointer-sized.
+function TExprEvaluator.IsPointerSizedFallback(const TypeName: string): Boolean;
+begin
+  for var Known in ['Byte', 'ShortInt', 'Boolean', 'AnsiChar', 'ByteBool',
+                    'Word', 'SmallInt', 'Char', 'WideChar', 'WordBool',
+                    'Integer', 'LongInt', 'Cardinal', 'LongWord', 'Single',
+                    'LongBool', 'Int64', 'UInt64', 'QWord', 'Double',
+                    'Currency', 'Comp', 'Extended', 'Real', 'TDateTime',
+                    'TDate', 'TTime'] do
+    if SameText(TypeName, Known) then
+      Exit(False);
+  Result := True;
+end;
+
 function TExprEvaluator.PrimTypeSize(const TypeName: string): Integer;
 begin
   if SameText(TypeName, 'Byte')     or SameText(TypeName, 'ShortInt')  or
@@ -573,7 +618,7 @@ begin
   if TypeHint.StartsWith('array of ', True) then begin
     Inner    := Trim(TypeHint.Substring(9));
     ElemType := Inner;
-    ElemSize := PrimTypeSize(Inner);
+    ElemSize := ElementStride(Inner);
     Exit(True);
   end;
   if TypeHint.StartsWith('TArray<', True) and TypeHint.EndsWith('>') then begin
@@ -581,7 +626,7 @@ begin
     if Inner.StartsWith('System.', True) then
       Inner := Inner.Substring(7);
     ElemType := Inner;
-    ElemSize := PrimTypeSize(Inner);
+    ElemSize := ElementStride(Inner);
     Exit(True);
   end;
   // TD32 emits dynamic arrays as `^Element` (pointer-to-element) when no
@@ -590,7 +635,7 @@ begin
   // case is reachable via the `^` deref operator instead.
   if (Length(TypeHint) >= 2) and (TypeHint[1] = '^') then begin
     Inner := Copy(TypeHint, 2, MaxInt);
-    var Sz := PrimTypeSize(Inner);
+    var Sz := ElementStride(Inner);
     if Sz > 0 then begin
       ElemType := Inner;
       ElemSize := Sz;
@@ -2957,9 +3002,12 @@ begin
     Exit(InvalidValue(Format('<Length: type "%s" unsupported>', [Args[0].TypeHint])));
   end;
   if SameText(Name, 'SizeOf') then begin
-    var Sz := PrimTypeSize(Args[0].TypeHint);
-    if Sz = 0 then Sz := 8;
-    Exit(MakeInt64(Sz));
+    // Same rule as an array element's stride, and for the same reason: a
+    // record / set / static array is as wide as itself, while a string, class
+    // or interface is a pointer-sized handle -- which is also what Delphi's
+    // SizeOf reports for them. PrimTypeSize alone answered 8 (x64) or 4 (x86)
+    // for a 7-byte packed record.
+    Exit(MakeInt64(ElementStride(Args[0].TypeHint)));
   end;
   if SameText(Name, 'Ord')  then Exit(MakeInt64(MaskByType(Args[0].RawValue, Args[0].TypeHint)));
   if SameText(Name, 'Low')  then Exit(OrdinalLimit(Args[0], False));

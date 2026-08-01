@@ -75,6 +75,12 @@ type
     // control is an open-array parameter, which genuinely has no length header
     // and must keep indexing without one.
     [Test] procedure ArrayBounds_AreEnforcedOnBothBitnesses;
+    // An array of RECORDS was walked with a pointer-sized stride, because the
+    // element-size helper fell back to pointer size for every type name it did
+    // not recognise as a primitive. Element 0 read correctly and every later
+    // element landed inside its neighbour. The control is an array of class
+    // instances, whose elements genuinely ARE pointer-sized.
+    [Test] procedure RecordArrayStride_IsTheRecordWidthOnBothBitnesses;
     // TD32 stores globals mangled, and dcc32 mangles Borland-style where dcc64
     // mangles Itanium-style; only the latter was decoded, so NO unit global
     // resolved on a 32-bit target.
@@ -2599,6 +2605,70 @@ begin
   Assert.AreEqual('', Failures,
     'array bounds must be enforced, and an absent bound refused rather than ' +
     'invented, on both bitnesses -- ' + Failures);
+end;
+
+procedure TWin32RunControlTests.RecordArrayStride_IsTheRecordWidthOnBothBitnesses;
+type
+  TExprCheck = record Expr, Fragment: string end;
+const
+  SOURCE = 'TestTargetTypes.pas';
+  MARKER = 'COLLECTIONS_BODY';
+
+  // `ArrRec` is a TArray<TPackedRec> of two elements. TPackedRec is
+  // `packed record A: Byte; B: Integer; C: Word end` -- SEVEN bytes, a width no
+  // pointer-size fallback can produce on either target, which is what makes it
+  // a usable fixture. Element 0 was always right; the assertions that matter
+  // are on element 1, which was read at the wrong offset and returned
+  // 385875968 for B on x64 and 0 for C on x86.
+  //
+  // `ArrObj` is a TArray<TBase>: its elements really are pointer-sized, so it
+  // is the control that keeps the fix from becoming "use the declared size for
+  // everything".
+  CHECKS: array[0..10] of TExprCheck = (
+    (Expr: 'ArrRec[0].A';       Fragment: '11'),
+    (Expr: 'ArrRec[0].B';       Fragment: '12'),
+    (Expr: 'ArrRec[0].C';       Fragment: '13'),
+    (Expr: 'ArrRec[1].A';       Fragment: '21'),
+    (Expr: 'ArrRec[1].B';       Fragment: '22'),
+    (Expr: 'ArrRec[1].C';       Fragment: '23'),
+    (Expr: 'SizeOf(ArrRec[0])'; Fragment: '7'),
+    (Expr: 'Length(ArrRec)';    Fragment: '2'),
+    (Expr: 'ArrObj[0].BaseTag'; Fragment: '1000'),
+    (Expr: 'ArrObj[1].BaseTag'; Fragment: '2000'),
+    (Expr: 'ArrObj[2]';         Fragment: 'out of bounds'));
+
+  function EvalAt(const Exe, Map, Rsm, Expr: string; Line: Integer): string;
+  begin
+    var Session := OpenSessionAtMarker(Exe, Map, Rsm, TargetDir, SOURCE, Line);
+    try
+      if Session.State <> dsStopped then
+        Exit('<did not stop>');
+      var R := Session.Evaluate(Expr);
+      if not R.Success then
+        Exit('<' + R.ErrorText + '>');
+      Result := R.Value;
+    finally
+      Session.Free;
+    end;
+  end;
+
+begin
+  var Line := MarkerLineInFile(TargetDir + SOURCE, MARKER);
+  Assert.IsTrue(Line > 0, 'marker ' + MARKER + ' not found');
+  Assert.IsTrue(FileExists(Win64Exe), '64-bit control target missing');
+
+  var Failures := '';
+  for var Check in CHECKS do begin
+    var Got64 := EvalAt(Win64Exe, Win64Map, Win64Rsm, Check.Expr, Line);
+    if not Got64.Contains(Check.Fragment) then
+      Failures := Failures + Format('x64 %s -> %s; ', [Check.Expr, Got64]);
+    var Got32 := EvalAt(Win32Exe, Win32Map, Win32Rsm, Check.Expr, Line);
+    if not Got32.Contains(Check.Fragment) then
+      Failures := Failures + Format('x86 %s -> %s; ', [Check.Expr, Got32]);
+  end;
+  Assert.AreEqual('', Failures,
+    'an array of records must be walked with the RECORD width on both ' +
+    'bitnesses -- ' + Failures);
 end;
 
 procedure TWin32RunControlTests.BreakpointOnBeginLine_ReportsPassedParameters;

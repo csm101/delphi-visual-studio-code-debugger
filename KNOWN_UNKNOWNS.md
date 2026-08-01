@@ -66,6 +66,20 @@ Still open:
 
 ## Per-unit / per-binary type resolution
 
+- **A type's SIZE cannot be uses-scoped** — `TDebugInfoSet.GetTypeSize` is flat
+  first-wins across providers, so when two used units declare the same type
+  name the wrong width can win. `SizeOf(TDupRec)` answers 4 (unit A) where the
+  frame's uses list makes unit B's 8 correct. The two formats each hold half of
+  what a scoped lookup needs: RSM has the uses graph (and drives
+  `TryResolveConstScoped` / `TryResolveClassVmtScoped`) but implements no
+  `ITypeSizeProvider`; TD32 implements it but is flat, with no per-unit
+  attribution to scope by. Closing this means adding sizes to the RSM provider
+  or unit attribution to the TD32 one. Asserted by the TODO-RED test
+  `Test_UsesScope_TypeSize_PicksUsedUnit`.
+  Note this was invisible until `SizeOf` started reporting declared widths:
+  the old pointer-size fallback returned 8 for every unrecognised name, which
+  happened to equal the expected answer on a 64-bit target.
+
 RSM TypeIds are **per-unit**, not global. A symbol's type must be resolved
 against its OWNING unit's import list (`ResolveTypeIdInUnit` / `OwningUnitContext`
 in `RsmFileReader.pas`), then the global map. This is now applied uniformly to

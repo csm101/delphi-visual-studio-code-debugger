@@ -202,6 +202,12 @@ type
     //     (compiler-resolved, last-wins), never A or C. ---
     [Test]
     procedure Test_UsesScope_Type_PicksUsedUnit;
+    // A type's SIZE cannot be uses-scoped today: RSM carries the uses graph but
+    // no type sizes, TD32 carries the sizes but is flat -- it has no per-unit
+    // attribution to scope BY. Closing this needs either sizes in the RSM
+    // provider or unit attribution in the TD32 one.
+    [Test] [Ignore('TODO-RED: type size lookup is flat first-wins; no provider has both sizes and unit attribution')]
+    procedure Test_UsesScope_TypeSize_PicksUsedUnit;
     [Test]
     procedure Test_UsesScope_Const_PicksUsedUnit;
     [Test]
@@ -4206,13 +4212,41 @@ begin
   try Tg := ExtractDisplayValue(R.GetValue<string>('result', '')); finally R.Free; end;
 
   // Unit A=1, B=2, C=3; TDupRec SizeOf A=4, B=8, C=12. Host uses A,B (B last,
-  // not C) -> the unqualified TYPE and FREE FUNCTION resolve to B. (Const and
+  // not C) -> the unqualified FREE FUNCTION resolves to B. (Const and
   // class-method scoping are covered by the [Ignore]d follow-up tests below.)
+  //
+  // This used to assert SizeOf(TDupRec)=8 as well, but that assertion had no
+  // discriminating power: SizeOf fell back to POINTER size for every type name
+  // it did not recognise as a primitive, and pointer size on the 64-bit target
+  // this suite runs is also 8. It would have answered 8 for a type that does
+  // not exist. Now that SizeOf reports the declared record width it answers 4,
+  // unit A's copy, because a type SIZE cannot currently be uses-scoped: RSM
+  // carries the uses graph but no sizes, TD32 carries sizes but is flat with no
+  // unit attribution. Tracked in KNOWN_UNKNOWNS and asserted by the TODO-RED
+  // test below, rather than papered over here.
   All := Format('SizeOf(TDupRec)=%s | DupFunc=%s | DupConst=%s | TDup.Tag=%s',
     [SzRec, Fn, Cn, Tg]);
   Assert.IsTrue(
-    (SzRec = '8') and (Fn = '2'),
-    'type + free function must resolve to unit B (8 / 2), not A/C. got: ' + All);
+    Fn = '2',
+    'a free function must resolve to unit B (2), not A/C. got: ' + All);
+end;
+
+procedure TDebuggerTests.Test_UsesScope_TypeSize_PicksUsedUnit;
+var
+  FrameId, LocalsRef: Integer;
+  R: TJSONObject;
+  SzRec: string;
+begin
+  SkipIfNoRsm('cross-unit uses-scoped resolution is RSM-format-only; TD32 has no uses-graph');
+  StartSession('USES_SCOPE', FrameId, LocalsRef, ['--run-uses-scope']);
+  R := FClient.Evaluate('SizeOf(TDupRec)', FrameId);
+  try SzRec := ExtractDisplayValue(R.GetValue<string>('result', '')); finally R.Free; end;
+  // TDupRec is 4 bytes in unit A, 8 in B, 12 in C. The host uses A and B with B
+  // last, so B's 8 must win. Answers 4 today: the size lookup is flat first-wins
+  // across providers, with no way to scope it.
+  Assert.AreEqual('8', SzRec,
+    'SizeOf must resolve the type through the frame''s uses list (B=8), not ' +
+    'first-wins (A=4); got: ' + SzRec);
 end;
 
 procedure TDebuggerTests.Test_UsesScope_Const_PicksUsedUnit;
