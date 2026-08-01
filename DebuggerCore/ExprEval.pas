@@ -2173,6 +2173,34 @@ begin
       Exit(RsmVal2);
   end;
 
+  // 3c. A parameterless METHOD named without parentheses. In Pascal `Obj.M` IS
+  // a call -- the same rule the bare-identifier path already applies to a free
+  // function (`Now` = `Now()`), never extended to a method on an object.
+  // Without it the name fell through to the qualified-name lookup below, which
+  // found the METHOD'S OWN CODE ADDRESS and read it as data: `W.GetSelf`
+  // returned 0x83EC8B55 on Win32 and 0xEC834855 on Win64 -- `push ebp; mov
+  // ebp,esp` and `push rbp; sub rsp`, the prologue of GetSelf itself. It also
+  // poisoned every chain built on it (`W.GetSelf.Name`).
+  //
+  // A method that TAKES arguments must not be auto-called; the declared
+  // parameter count is what decides, exactly as the free-function guard does.
+  // Fields and properties are resolved above, so a member sharing a method's
+  // name still wins there.
+  if Base.IsValid and (FDebugInfo <> nil) then begin
+    var CallClass := '';
+    if (FRtti <> nil) and (Base.RawValue >= 65536) then
+      CallClass := FRtti.GetInstanceClassName(Base.RawValue);
+    if CallClass = '' then
+      CallClass := Base.TypeHint;
+    if CallClass <> '' then begin
+      var MethodParams: TArray<TMethodParam>;
+      var MethodHasSelf: Boolean;
+      if FDebugInfo.TryGetMethodParams(CallClass, Field, MethodParams, MethodHasSelf) and
+         (Length(MethodParams) = 0) then
+        Exit(ApplyMethodCall(Base, Field, [], CallClass, '', 0, False, False));
+    end;
+  end;
+
   // 4. Qualified-name lookup: nested-proc parent locals stored as "Parent.Field".
   var LV: TLocalValue;
   if FDebugger.EvaluateName(Field, LV) then

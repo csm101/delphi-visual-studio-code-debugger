@@ -519,6 +519,11 @@ type
     // watch panel must accept `Now` (and `Now()`) as a valid expression,
     // not return `<Now: not found>` or a parser error.
     [Test] procedure Test_Eval_ParameterlessSystemFunc_Now;
+    // `Obj.M` without parentheses is a CALL in Pascal; it used to resolve to
+    // the method's own code address and read it as data.
+    [Test] procedure Test_Eval_ParameterlessMethod_NoParens_IsCalled;
+    // WideString is a BSTR (byte-length prefix), not a Delphi long string.
+    [Test] procedure Test_Eval_WideStringProperty_HasNoTrailingGarbage;
 
     // Hover on `foo` (just the class-instance local, no dot) inside the
     // caller frame must give an expandable popup -- user reports it shows
@@ -3636,6 +3641,67 @@ begin
       'aliased Integer must show its value 42: ' + Display);
   finally
     AliasVar.Free;
+  end;
+end;
+
+procedure TDebuggerTests.Test_Eval_ParameterlessMethod_NoParens_IsCalled;
+// `Obj.M` with no parentheses IS a call in Pascal, exactly like the bare `Now`
+// the test below covers. It was not: the name fell through to the qualified
+// symbol lookup, which found the METHOD'S OWN CODE ADDRESS and read it as data.
+// `W.GetSelf` returned 0x83EC8B55 on Win32 / 0xEC834855 on Win64 -- the
+// `push ebp; mov ebp,esp` / `push rbp; sub rsp` of GetSelf itself -- and every
+// chain built on it inherited the garbage.
+var
+  FrameId, LocalsRef: Integer;
+  Resp: TJSONObject;
+  Display: string;
+begin
+  StartSession('EVAL_BODY', FrameId, LocalsRef);
+
+  Resp := FClient.Evaluate('W.GetSelf', FrameId, 'watch');
+  try
+    Display := Resp.GetValue<string>('result', '');
+    Assert.IsTrue(Display.Contains('TWidget'),
+      'W.GetSelf (no parens) must CALL the method and yield the TWidget it ' +
+      'returns; got: ' + Display);
+  finally
+    Resp.Free;
+  end;
+
+  // The chain on top of it is the reason this matters in practice.
+  Resp := FClient.Evaluate('W.GetSelf.Name', FrameId, 'watch');
+  try
+    Display := Resp.GetValue<string>('result', '');
+    Assert.IsTrue(Display.Contains('hello'),
+      'W.GetSelf.Name must read Name off the returned instance; got: ' + Display);
+  finally
+    Resp.Free;
+  end;
+end;
+
+procedure TDebuggerTests.Test_Eval_WideStringProperty_HasNoTrailingGarbage;
+// A WideString is an OLE BSTR: the 4 bytes below the data are a length in
+// BYTES, while a Delphi UnicodeString's TStrRec.length counts ELEMENTS. Reading
+// one with the other's rule returns exactly twice the characters -- measured as
+// 'w_hello' + #0 + three words of BAADF00D heap fill, on both bitnesses.
+// Asserting the exact content is the point: a `Contains` check passed happily
+// while the trailing garbage was there.
+var
+  FrameId, LocalsRef: Integer;
+  Resp: TJSONObject;
+  Display: string;
+begin
+  StartSession('EVAL_BODY', FrameId, LocalsRef);
+  Resp := FClient.Evaluate('W.AsWStr', FrameId, 'watch');
+  try
+    Display := Resp.GetValue<string>('result', '');
+    Assert.IsTrue(Display.StartsWith(''''  + 'w_hello' + ''''),
+      'W.AsWStr must be exactly ''w_hello'' with nothing after the closing ' +
+      'quote; got: ' + Display);
+    Assert.IsFalse(Display.Contains(#0),
+      'the BSTR terminator must not be part of the decoded string: ' + Display);
+  finally
+    Resp.Free;
   end;
 end;
 

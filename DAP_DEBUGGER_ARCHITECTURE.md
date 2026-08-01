@@ -248,6 +248,29 @@ primitive `$0041` collapses `Double`, `TDateTime` and `Real` onto one id, so a
 alias survives only in the debuggee's live RTTI (and in the `.rsm` type table);
 TD32 cannot express it.
 
+#### `WideString` is a BSTR, not a Delphi long string
+
+The two look identical — a pointer to UTF-16 data with a 4-byte prefix below it
+— and the prefix means different things:
+
+| Type | Prefix at `Ptr-4` | Read as |
+|---|---|---|
+| `UnicodeString` | `TStrRec.length`, in **elements** | `len` chars |
+| `WideString` | `SysAllocStringLen` byte count, in **BYTES** | `len div 2` chars |
+
+One reader served both, so every `WideString` came back at exactly twice its
+length: `'w_hello'` (7 chars) rendered as `'w_hello'` + the NUL terminator +
+three words of `BAADF00D` heap fill, on both bitnesses. `AnsiString`,
+`UTF8String` and `RawByteString` were unaffected, which is what isolated it to
+the BSTR rule rather than to the UTF-16 decode.
+
+`ReadDelphiWideString` and `ReadDelphiUnicodeString` now share
+`ReadUtf16Prefixed(Ptr, LengthIsBytes)` and `FormatStringByPointer` dispatches
+`TK_WSTRING` to the former. Pinned by
+`Test_Eval_WideStringProperty_HasNoTrailingGarbage`, which asserts the EXACT
+rendering — a `Contains('w_hello')` check passed happily while the garbage was
+still there.
+
 #### Float types wider than the value slot
 
 Every value is decoded from an 8-byte `RawValue`. Three float types do not fit
@@ -1333,6 +1356,19 @@ A bare name is resolved in this order, matching Delphi scope rules:
    global lookup.
 5. Data global / public symbol (`EvaluateGlobalName` → `NameToRva`).
 6. Named constant (`$25` RSM records), then enum literal, then type name.
+
+**The same rule on a MEMBER (`ExprEval.ApplyDot`).** `Obj.M` with no
+parentheses is a call too, and for a long time it was not treated as one: a
+member that matched no property (path 1), no field (path 2) and no RSM class
+member (path 3) fell through to the qualified-name lookup, which found the
+METHOD'S OWN CODE ADDRESS and read it as data. `W.GetSelf` returned
+`0x83EC8B55` on Win32 and `0xEC834855` on Win64 — the `push ebp; mov ebp,esp`
+and `push rbp; sub rsp` of `GetSelf` itself — and every chain built on it
+(`W.GetSelf.Name`) inherited the garbage. Path **3c** now calls a member whose
+declared parameter list is EMPTY, using `TryGetMethodParams` as the guard, so a
+method that takes arguments is still never auto-called. Properties and fields
+resolve first, so a member sharing a method's name is unaffected. Pinned by
+`Test_Eval_ParameterlessMethod_NoParens_IsCalled`.
 
 **Data-global-not-callable guard.** Step 4 resolves the name via
 `TryResolveSymbolVA` → `NameToRva`, which indexes data globals as well as

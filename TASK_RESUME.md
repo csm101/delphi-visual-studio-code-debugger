@@ -335,6 +335,65 @@ USER-SIDE ISSUE worth repeating to them: the log warns
 `qbfdesignd29.bpl RSM is OLDER than the BPL -- it will be IGNORED`, so that
 package's types/locals come from TD32 only until it is rebuilt.
 
+## DOGFOODING ROUND (2026-08-01): driving the shipped MCP frontend as a user
+
+The user's point was that he cannot use this debugger for five minutes without
+hitting something, and that the same should be done from this side. So: a real
+session over the MCP tools against `DebuggerTests\TestTarget`, BOTH bitnesses
+and the multi-BPL host -- evaluating properties, calling methods, expanding
+objects, stepping -- rather than running the suite.
+
+Eleven defects in one sitting, every one checked on Win32 AND Win64 because that
+is what separates "regression from the Win32 work" from "always been wrong".
+None of them was a Win32 regression. Full log with evidence and controls:
+`X:\Temp\...\scratchpad\defects.md` (transient) -- the substance is below.
+
+### FIXED, gated, negative-controlled
+
+* **`WideString` read at twice its length, both bitnesses.** A BSTR's 4-byte
+  prefix is a BYTE count; `UnicodeString`'s is an ELEMENT count. One reader
+  served both. See DAP_DEBUGGER_ARCHITECTURE.md -> "`WideString` is a BSTR".
+* **Step-into parks on the function ENTRY on Win32.** `FunctionBodyStartVA`
+  takes the routine extent from `.pdata`, which does not exist on Win32, so the
+  F19 pivot never ran there. Two silent consequences: locals read the CALLER's
+  frame, and the walk drops exactly one frame (`RunAllScenarios` shown where
+  `RunEvalTests` belonged). Now falls back to `BreakpointBodyRva`.
+* **`Obj.M` without parentheses read as DATA.** Fell through to the qualified
+  symbol lookup, which returned the method's own code address:
+  `W.GetSelf` = `0x83EC8B55` (`push ebp; mov ebp,esp`). Path 3c in `ApplyDot`
+  now calls a member whose declared parameter list is empty.
+
+Negative controls run for the last two: with the fixes disabled the new tests
+fail with the exact field symptom, in both the mono and BPL fixtures.
+
+### OPEN, characterised, NOT fixed
+
+* **Managed/structured RETURNS are not decoded on the direct method-call path.**
+  `W.DoCalcBigRec()` -> the record's first field as an integer;
+  `W.DoCalcDynArr()` -> `[85899345930, 30, []]` (elements 20 and 10 packed into
+  one 8-byte read); `W.DoCalcVariant()` -> `3`, the VType word. The PROPERTY
+  path decodes all three correctly, which is the control. Same shape as the
+  July float-return defect, where the fix had to land at BOTH return sites --
+  only `InvokeGetter` was ever treated, `ApplyMethodCall` was not.
+* **Program main-block locals carry false types** (`TWidget` -> `EPrivilege` on
+  Win32, `RunClosureParamSampler$2$Intf` on Win64) and list a local `Cmp` that
+  does not exist in the source, twice. Localised to the RSM parser
+  (`Td32AliasProbe -rsmproc Testtarget` shows the same). TWO fixes were tried
+  and BOTH REVERTED -- details and what not to repeat are in the defect log; the
+  next step is a byte-level probe of the `$20`/`$46` main-block record, because
+  `RSM_FIELD_OFFSETS.md:128` and `CollectMainBlockLocals` disagree about whether
+  its TypeId is one byte or two.
+* **Unit globals resolve over DAP but NOT over MCP** (`GCounter` ->
+  `<not found>` while `DebuggerTests.pas:1717` asserts the DAP finds it). The
+  provider warm-up + retry lives only in `TDapServer`; `McpServer.pas:695` calls
+  `EvaluateForFrame` once. Design call -- duplicate it, or move warm-up into the
+  session and keep the DAP's miss-cache (an unresolved watch measured ~6.2 s).
+* **String ARGUMENTS to a synthetic call fail** with a bare
+  `<method invocation failed>` that does not say why. Float / Int64 / Currency
+  arguments work.
+* Minor: `TArray<Integer>` reports `^Integer`; `Length(s)` reports `Int64`;
+  a Win32-only duplicate `Testtarget` frame in the main block.
+
 ## PENDING LIVE VERIFICATION BY THE USER (2026-07-29) -- READ THIS FIRST
 
 Three fixes are committed and suite-green but have NOT been seen working on a
