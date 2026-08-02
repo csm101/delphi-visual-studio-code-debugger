@@ -66,112 +66,6 @@ Still open:
 
 ## Per-unit / per-binary type resolution
 
-- **x86: the stack loses the caller across sourceless RTL frames** — the
-  user's field report from a design package inside bds.exe ("the call stack
-  shows only the code it found sources for"), now REPRODUCED deterministically
-  by `RunRtlCallback` in TestTargetEdge2: a comparer invoked by
-  `TStringList.CustomSort`. x64 gives
-  `CompareNames <- QuickSort <- CustomSort <- RunRtlCallback <- RunAllScenarios`;
-  x86 gives the same list with `RunRtlCallback` absent.
-  Neither mechanism has that frame. The saved-EBP chain steps over the region
-  in a single link, and merging in whatever dbghelp reports BETWEEN two frames
-  the chain already vouched for -- implemented, measured, reverted -- changed
-  nothing, which shows dbghelp does not know the frame either. So the cause is
-  NOT "the splice can only append a tail", and is not yet identified.
-  Hypotheses ELIMINATED so far, each by measurement rather than argument:
-    * "dbghelp knows the frame and the splice can only append a tail" -- no:
-      merging frames dbghelp places BETWEEN two chain-vouched frames changed
-      nothing, so dbghelp does not have it either.
-    * "RunRtlCallback has no EBP frame under dcc32" -- no: its prologue is
-      `55 8B EC` (push ebp; mov ebp,esp) at RVA $DE294, and CompareNames is
-      `55 8B EC 83 C4 D0` at $DE18C. Both frames are established normally, so
-      the saved-EBP chain has everything it needs in principle.
-    * "the fixture itself was broken" -- it WAS (a nested comparer passed to
-      CustomSort faulted on every call), but the frame is still missing after
-      making the comparer unit-level, so the finding survives its own fixture
-      bug.
-  MECHANISM FOUND (2026-08-02), by tracing every link of the walk:
-
-      chain fp=$FCF6E8 -> ret=$10AF4CB (QuickSort)       nextFp=$FCF708
-      chain fp=$FCF708 -> ret=$10AF63A (CustomSort)      nextFp=$FCF730
-      chain fp=$FCF730 -> ret=$10EEFC4 (RunAllScenarios) nextFp=$FCF7DC
-
-  `$FCF730` IS RunRtlCallback's frame -- `[$FCF730+4]` holds its own return
-  address, into RunAllScenarios. So the chain reaches the frame correctly. What
-  is missing is the return address INTO RunRtlCallback, the one that would
-  become its current PC: that word sits where CustomSort's frame would be, and
-  CustomSort does not establish one (the RTL is built with the frame pointer
-  omitted), so QuickSort's saved EBP skips straight past it.
-
-  The general statement: WHEN A CALLEE OMITS ITS FRAME POINTER, THE RETURN
-  ADDRESS INTO ITS CALLER IS NOT REACHABLE FROM THE EBP CHAIN, AND THAT CALLER
-  DISAPPEARS FROM THE STACK. It is a hole in the middle, not a truncated tail,
-  which is why the tail-splice cannot help; dbghelp's own list does not contain
-  the address either ($10DE1F4, $10AF4CB, $10AF63A, $10EEFC4, $10F3E8E).
-
-  DESIGN for the fix, worked out but NOT implemented:
-
-  The missing word lies in the stack region between two consecutive chain frame
-  pointers ($FCF708 and $FCF730 here) -- pushed by the caller's `call` before
-  it entered the frameless callee. Finding it by "looks like a return address"
-  would be a guess; there is an EXACT test available instead.
-
-  We already know the PC inside the frameless callee (it is the previous
-  chain frame's PC, $10AF63A in CustomSort). Resolve that PC to its FUNCTION
-  ENTRY, then scan the gap for a word W where the instruction ending at W is a
-  DIRECT call (`E8 rel32`) whose computed target equals that entry. Such a W is
-  the return address from that exact function -- not a plausible one, the right
-  one -- and it is the missing frame's PC.
-
-  That design was IMPLEMENTED and REVERTED: it cannot fire on this case, and
-  the reason rules it out as a complete answer. Disassembling the call site in
-  RunRtlCallback shows `FF 91 A8 00 00 00` -- `call dword ptr [ecx+0A8h]`.
-  `TStringList.CustomSort` is VIRTUAL, so the call is indirect through the VMT
-  and there is no static target to match. The reported scenario is virtual
-  methods and VCL event dispatch, i.e. exactly the indirect case, so a
-  direct-call-only test answers nothing where it matters.
-
-  BETTER DESIGN, from that measurement, not yet implemented. Identify the
-  missing frame's FUNCTION from the other side. The next chain frame's PC is
-  the missing frame's own return address (into RunAllScenarios here); the
-  instruction ending there is the call that INVOKED the missing function, and
-  for ordinary user code that one IS direct (`E8 rel32`). Its target is the
-  missing function's entry. Then look in the gap for a word that lies inside
-  that function and sits immediately after a call site -- `IsAfterCallSite`
-  already implements the second half. Both halves are structural, so the
-  candidate is identified rather than guessed.
-
-  That design was implemented too, and it DID recover the frame -- x86 showed
-  `RunRtlCallback` where it had been missing -- but with the WRONG LINE: 81
-  (`Names.Free`) instead of 79 (`Names.CustomSort(...)`). The candidate it
-  accepted is the FINALLY HANDLER address stored in the try/finally exception
-  record, which lives on the stack in the same gap, is inside the right
-  function, and passes `IsAfterCallSite` on its preceding bytes. Reverted: a
-  frame pointing at the wrong statement is a wrong frame, and one that names
-  the right routine is more misleading than an absent one, not less.
-
-  So the remaining problem is precise: DISTINGUISHING the return address the
-  `call` pushed from other code addresses of the same function that are also on
-  the stack. `IsAfterCallSite` is too weak for that -- it scans a few bytes back
-  for a call-shaped encoding and arbitrary bytes satisfy it. Candidate
-  directions, none verified:
-    * decode the indirect call at the site properly (`FF /2` with its modrm and
-      displacement) and confirm the VMT slot it reads holds the frameless
-      callee's entry -- exact, but needs the object pointer at that moment;
-    * find the exception-record layout and EXCLUDE addresses that are fields of
-      one, rather than trying to out-rank them.
-
-  Constraints to respect either way:
-    * One level at a time, re-running per adjacent pair, since several
-      frameless callees can nest.
-    * When the invoking call is itself indirect, nothing is identifiable --
-      leave the hole rather than invent a frame.
-    * A wrong frame in a stack is worse than a missing one, which is why
-      acceptance must be a structural identification and never a byte shape
-      that merely looks plausible.
-  Asserted by the TODO-RED test
-  `StackAcrossRtlCallback_KeepsTheCallerOnBothBitnesses`.
-
 - **Dynamic-array bounds are not applied to an array reached indirectly** —
   bounds checking requires a POSITIVE identification that the value is a
   dynamic array, which comes from the declared type of a symbol
@@ -692,12 +586,16 @@ object expansion, evaluation, multi-BPL). See "Target architecture" in
   as an ordinal. The real fix is parameter types in the debug info.
   (Float and `Int64` arguments and returns otherwise work on both
   architectures — see `DAP_DEBUGGER_ARCHITECTURE.md`.)
-- **`TD32FileReader.GetTypeSize` still reports CodeView `$42` (`Extended`) as 8
-  bytes**, which is right on Win64 and two short on Win32. Reading a variable no
-  longer goes through it — `WideFloatByteSize` owns that decision now — but the
-  number is still consulted for dynamic-array element strides, so an array of
-  `Extended` on Win32 would stride wrongly. `TTD32FileReader` has no notion of
-  target bitness at all, so fixing it means threading one in.
+- **A constructor's declared name is unavailable from TD32 alone.** dcc32
+  mangles it as `@Unit@TClass@$bctr$qqrv` with the name component EMPTY — only
+  the `$bctr` / `$bdtr` marker is recorded, so `Create` is genuinely not in the
+  symbol. The declared name is currently taken from the MAP, which stores it in
+  plain text (see `TD32_FORMAT_NOTES.md`). With TD32 and no MAP, the mangled
+  form is all the stack can show. A class's TD32 member list does record methods
+  by their source names, so the name IS reachable — walking from a procedure
+  record to the owning class's member list has not been implemented. Mapping
+  `$bctr` onto `Create` is not an option: a constructor may be declared with any
+  name, and the guess would print something the source does not contain.
 - **Does `dcc32 -$O+` emit usable local symbols?** Win32 locals/params are
   declared supported for `-$O-` builds only, because `-$O+` omits the frame
   pointer routinely. Whether the debug info of an optimised 32-bit build still

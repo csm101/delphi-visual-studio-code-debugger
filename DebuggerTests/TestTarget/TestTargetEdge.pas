@@ -146,7 +146,7 @@ end;
 
 constructor TCtorProbe.Create;
 begin
-  inherited Create;
+  inherited Create;                        // {BP:CTOR_FIRST_LINE}  frame not established yet on x86
   FirstField := 111;
   GSink.Use('ctor-mid', [FirstField]);   // {BP:CTOR_MID_BODY}  SecondField not set yet
   SecondField := 222;

@@ -176,14 +176,22 @@ type
     // CompareNames <- QuickSort <- CustomSort <- RunRtlCallback <- ...; x86
     // shows the same but with RunRtlCallback simply absent.
     //
-    // Neither mechanism has it: the saved-EBP chain steps over the region in
-    // one link, and inserting whatever dbghelp reports between two frames the
-    // chain vouched for -- tried, then reverted -- changed nothing, so dbghelp
-    // does not know the frame either. Cause NOT identified; the fixture is
-    // committed so the next attempt starts from a reproduction rather than a
-    // description.
-    [Test] [Ignore('TODO-RED: x86 stack loses the caller across sourceless RTL frames; mechanism not yet identified')]
-    procedure StackAcrossRtlCallback_KeepsTheCallerOnBothBitnesses;
+    // Cause: `TStringList.CustomSort` is FRAMELESS, so the link from its callee
+    // steps straight over it to RunRtlCallback's frame, and RunRtlCallback's own
+    // return address was never stored anywhere. dbghelp does not know the frame
+    // either. The walker now identifies the missing routine from the frame ABOVE
+    // (a direct call names its target) and confirms which skipped stack word is
+    // its return address by DECODING, requiring the match to be unique.
+    [Test] procedure StackAcrossRtlCallback_KeepsTheCallerOnBothBitnesses;
+    // On x86 a routine's frame is not established until `push ebp; mov ebp,esp`
+    // has run, and a Delphi constructor's compiler-generated preamble is already
+    // attributed to the routine's first source line -- so stopping there leaves
+    // EBP pointing at the CALLER's frame and the chain walk produces a single
+    // frame. The walker recovers the pushed return address from the top of the
+    // stack, and that recovery is only sound because it PROVES the word follows
+    // a call. This is the test for that path; it had none, which is how a
+    // recovery that accepted `push offset @@handler` went unnoticed.
+    [Test] procedure StoppedInCtorPreamble_StackStillReachesTheCallerOnBothBitnesses;
     // TD32 stores globals mangled, and dcc32 mangles Borland-style where dcc64
     // mangles Itanium-style; only the latter was decoded, so NO unit global
     // resolved on a 32-bit target.
@@ -3953,6 +3961,75 @@ const
   // comparer and the routine that started the sort there are RTL frames with no
   // debug info -- the same shape as breaking inside a VCL event handler, which
   // is where this was first reported.
+  //
+  // Frames are rendered as `Name@Line` on purpose. Naming the routine is only
+  // half the job: the first working recovery produced `RunRtlCallback` pointing
+  // at the `finally` block rather than at the call, because it had accepted the
+  // exception record's handler address instead of the return address. That
+  // frame was wrong while looking right, so the LINE is asserted too.
+  function FrameSigsAt(const Exe, Map, Rsm: string; Line: Integer): string;
+  begin
+    var Session := OpenSessionAtMarker(Exe, Map, Rsm, TargetDir, SOURCE, Line);
+    try
+      if Session.State <> dsStopped then
+        Exit('<did not stop>');
+      Result := '';
+      for var F in Session.GetCallStack do
+        if F.FunctionName <> '' then
+          Result := Result + F.FunctionName + '@' + IntToStr(F.SourceLine) + ' ';
+    finally
+      Session.Free;
+    end;
+  end;
+
+  // Line reported for the named routine, or -1 when it is absent.
+  function LineOf(const Sigs, Func: string): Integer;
+  begin
+    var P := Pos(Func + '@', Sigs);
+    if P = 0 then
+      Exit(-1);
+    var Rest := Copy(Sigs, P + Length(Func) + 1, MaxInt);
+    var SpacePos := Pos(' ', Rest);
+    if SpacePos > 0 then
+      Rest := Copy(Rest, 1, SpacePos - 1);
+    Result := StrToIntDef(Rest, -1);
+  end;
+
+begin
+  var Line := MarkerLineInFile(TargetDir + SOURCE, MARKER);
+  Assert.IsTrue(Line > 0, 'marker ' + MARKER + ' not found');
+  Assert.IsTrue(FileExists(Win64Exe), '64-bit control target missing');
+
+  var Failures := '';
+  // Both the comparer and the routine that set the sort up must be present:
+  // the comparer alone proves nothing, since it is frame 0.
+  var Got64 := FrameSigsAt(Win64Exe, Win64Map, Win64Rsm, Line);
+  if not (Got64.Contains('CompareNames@') and Got64.Contains('RunRtlCallback@')) then
+    Failures := Failures + 'x64: ' + Got64 + '; ';
+  var Got32 := FrameSigsAt(Win32Exe, Win32Map, Win32Rsm, Line);
+  if not (Got32.Contains('CompareNames@') and Got32.Contains('RunRtlCallback@')) then
+    Failures := Failures + 'x86: ' + Got32 + '; ';
+
+  // x64 unwinds from .pdata and is the reference. The recovered x86 frame must
+  // point at the same statement, not merely name the same routine.
+  if Failures = '' then begin
+    var Line64 := LineOf(Got64, 'RunRtlCallback');
+    var Line32 := LineOf(Got32, 'RunRtlCallback');
+    if (Line64 <= 0) or (Line32 <> Line64) then
+      Failures := Format('caller line differs: x64=%d x86=%d (x64: %s | x86: %s); ',
+        [Line64, Line32, Got64, Got32]);
+  end;
+
+  Assert.AreEqual('', Failures,
+    'the stack must reach the caller across sourceless RTL frames, at the ' +
+    'right line, on both bitnesses -- ' + Failures);
+end;
+
+procedure TWin32RunControlTests.StoppedInCtorPreamble_StackStillReachesTheCallerOnBothBitnesses;
+const
+  SOURCE = 'TestTargetEdge.pas';
+  MARKER = 'CTOR_FIRST_LINE';
+
   function FrameNamesAt(const Exe, Map, Rsm: string; Line: Integer): string;
   begin
     var Session := OpenSessionAtMarker(Exe, Map, Rsm, TargetDir, SOURCE, Line);
@@ -3974,18 +4051,18 @@ begin
   Assert.IsTrue(FileExists(Win64Exe), '64-bit control target missing');
 
   var Failures := '';
-  // Both the comparer and the routine that set the sort up must be present:
-  // the comparer alone proves nothing, since it is frame 0.
+  // The constructor alone proves nothing -- it is frame 0. The caller is what
+  // the chain walk cannot produce unaided on x86.
   var Got64 := FrameNamesAt(Win64Exe, Win64Map, Win64Rsm, Line);
-  if not (Got64.Contains('CompareNames') and Got64.Contains('RunRtlCallback')) then
+  if not (Got64.Contains('TCtorProbe.Create') and Got64.Contains('RunCtorProbe')) then
     Failures := Failures + 'x64: ' + Got64 + '; ';
   var Got32 := FrameNamesAt(Win32Exe, Win32Map, Win32Rsm, Line);
-  if not (Got32.Contains('CompareNames') and Got32.Contains('RunRtlCallback')) then
+  if not (Got32.Contains('TCtorProbe.Create') and Got32.Contains('RunCtorProbe')) then
     Failures := Failures + 'x86: ' + Got32 + '; ';
 
   Assert.AreEqual('', Failures,
-    'the stack must reach the caller across sourceless RTL frames, on both ' +
-    'bitnesses -- ' + Failures);
+    'a stack taken in a constructor preamble must still name the caller, on ' +
+    'both bitnesses -- ' + Failures);
 end;
 
 procedure TWin32RunControlTests.BreakpointOnBeginLine_ReportsPassedParameters;

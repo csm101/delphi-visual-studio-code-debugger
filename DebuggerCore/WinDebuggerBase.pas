@@ -171,6 +171,17 @@ type
     // lazily by RunMethodCall before it hands over to PrepareSyntheticCall, so
     // an override can rely on it being set.
     function  RemoteCallTrap: UInt64;
+    // Greatest address strictly below VA that is known to start an instruction,
+    // taken from the line table, and belonging to the same routine as VA. The
+    // x86 walker decodes forward from here to prove whether an address follows
+    // a call; x86 cannot be decoded backwards. Exposed as a narrow helper
+    // rather than handing descendants the whole debug-info set.
+    function  NearestInstructionBoundaryBefore(VA: UInt64;
+                out BoundaryVA: UInt64): Boolean;
+    // Entry address of the routine containing VA, as a VA. Lets a descendant
+    // ask "are these two addresses in the same routine" without reaching into
+    // the debug-info set or doing its own RVA arithmetic.
+    function  FunctionEntryOf(VA: UInt64; out EntryVA: UInt64): Boolean;
   private
     function  FindBreakpointByVA(VA: UInt64): Integer;
     function  ReadFrameSize(EntryVA: UInt64): UInt32;
@@ -706,6 +717,54 @@ begin
     Result := VA - FImageBase
   else
     Result := 0;
+end;
+
+function TWinDebugger.NearestInstructionBoundaryBefore(VA: UInt64;
+  out BoundaryVA: UInt64): Boolean;
+begin
+  BoundaryVA := 0;
+  if (FDebugInfo = nil) or (VA <= FImageBase) then
+    Exit(False);
+  var TargetRva := VAToRva(VA);
+  // A boundary is only usable if it belongs to the same routine: decoding
+  // forward from an unrelated address could otherwise land on the target by
+  // coincidence and manufacture an answer out of nothing. The routine's own
+  // entry is therefore both the containment test and the last-resort boundary.
+  var FuncStart: UInt64;
+  if not FDebugInfo.RvaToFunctionStart(TargetRva, FuncStart) then
+    Exit(False);
+  if FuncStart >= TargetRva then
+    Exit(False);
+
+  // Prefer the closest line record: the shorter the span, the less chance of
+  // meeting the exception table dcc32 emits inline in the code stream.
+  var Rva: UInt64;
+  if FDebugInfo.NearestLineRvaBefore(TargetRva, Rva) and (Rva > FuncStart) then begin
+    var FuncOfBoundary: UInt64;
+    if FDebugInfo.RvaToFunctionStart(Rva, FuncOfBoundary) and
+       (FuncOfBoundary = FuncStart) then begin
+      BoundaryVA := RvaToVA(Rva);
+      Exit(True);
+    end;
+  end;
+
+  // No line record inside the routine, which is normal for a module that has
+  // symbols but no line table. The entry is still a guaranteed instruction
+  // boundary, so the decode is longer but no less exact.
+  BoundaryVA := RvaToVA(FuncStart);
+  Result := True;
+end;
+
+function TWinDebugger.FunctionEntryOf(VA: UInt64; out EntryVA: UInt64): Boolean;
+begin
+  EntryVA := 0;
+  if (FDebugInfo = nil) or (VA <= FImageBase) then
+    Exit(False);
+  var FuncRva: UInt64;
+  if not FDebugInfo.RvaToFunctionStart(VAToRva(VA), FuncRva) then
+    Exit(False);
+  EntryVA := RvaToVA(FuncRva);
+  Result := True;
 end;
 
 function TWinDebugger.ReadByte(VA: UInt64; out B: Byte): Boolean;

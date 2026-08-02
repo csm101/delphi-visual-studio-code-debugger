@@ -50,6 +50,12 @@ type
   TDebugInfoSet = class
   private
     FRevision:        UInt64;
+    // Cache behind NearestLineRvaAtOrBefore. SortedRvas concatenates and
+    // re-sorts every provider on each call, which is fine for the once-per-step
+    // callers but not for a stack walk that asks per candidate word.
+    FSortedRvaCache:    TArray<UInt64>;
+    FSortedRvaCacheRev: UInt64;
+    FSortedRvaCacheOk:  Boolean;
     FRangedLocals:    TList<TRangedLocalProvider>;
     FRangedGlobals:   TList<TRangedGlobalProvider>;
     FRangedLine:      TList<TRangedLineProvider>;
@@ -196,6 +202,14 @@ type
     // why a function the MAP knows about can't be looked up via RSM.
     function  DiagAllProcNames: TArray<string>;
     function  SortedRvas: TArray<UInt64>;
+    // Greatest line-table RVA STRICTLY BEFORE Rva. Every line record marks an
+    // instruction boundary, so this is the nearest address a caller can start
+    // decoding forward from and still be sure it is aligned to real
+    // instructions -- which is what the x86 return-address test needs. Strict
+    // rather than inclusive because the caller has to decode SOMETHING: a
+    // return address is very often itself a line address, and starting there
+    // would leave nothing to prove.
+    function  NearestLineRvaBefore(Rva: UInt64; out FoundRva: UInt64): Boolean;
   end;
 
 implementation
@@ -494,20 +508,66 @@ end;
 
 function TDebugInfoSet.RvaToFunctionName(Rva: UInt64;
   out Name: string): Boolean;
+
+  // True for a name that came back still mangled, i.e. one the demangler could
+  // not decode. That is not a name a user should be shown, so the remaining
+  // providers get a chance to supply the declared one before it is accepted.
+  //
+  // The case that forced this: dcc32 mangles a constructor as
+  // `@Unit@TClass@$bctr$qqrv`, where the method-name component is EMPTY -- the
+  // declared name is simply not in the symbol, only the `$bctr` marker is. The
+  // Borland demangler therefore fails, and a 32-bit call stack showed
+  // `@Testtargetedge@TCtorProbe@$bctr$qqrv` where the 64-bit one showed
+  // `TCtorProbe.Create`. The MAP knows the declared name, but was never asked
+  // because TD32 had already answered.
+  //
+  // An Itanium-demangled name never looks like this, so x64 is unaffected, and
+  // RTL symbols such as `@UStrAsg` carry no `$` and are not caught either.
+  function IsStillMangled(const S: string): Boolean;
+  begin
+    if not S.StartsWith('@') then
+      Exit(False);
+    Result := S.Contains('$');
+  end;
+
+  // First non-mangled answer wins; a mangled one is remembered in case nothing
+  // better turns up, since a mangled name still beats no name at all.
+  function AskProvider(const Prov: IFunctionNameProvider;
+    var Best, Fallback: string): Boolean;
+  begin
+    Result := False;
+    var Candidate: string;
+    if not Prov.RvaToFunctionName(Rva, Candidate) then
+      Exit;
+    if Candidate = '' then
+      Exit;
+    if not IsStillMangled(Candidate) then begin
+      Best := Candidate;
+      Exit(True);
+    end;
+    if Fallback = '' then
+      Fallback := Candidate;
+  end;
+
 begin
+  Name := '';
+  var Fallback := '';
   var Owned := False;
   for var RG in FRangedFunc do
     if (Rva >= RG.Lo) and (Rva < RG.Hi) then begin
       Owned := True;
-      if RG.Prov.RvaToFunctionName(Rva, Name) then
+      if AskProvider(RG.Prov, Name, Fallback) then
         Exit(True);
     end;
-  if Owned then
-    Exit(False);
+  if Owned then begin
+    Name := Fallback;
+    Exit(Fallback <> '');
+  end;
   for var P in FFuncProviders do
-    if P.RvaToFunctionName(Rva, Name) then
+    if AskProvider(P, Name, Fallback) then
       Exit(True);
-  Result := False;
+  Name := Fallback;
+  Result := Fallback <> '';
 end;
 
 function TDebugInfoSet.RvaToFunctionStart(Rva: UInt64;
@@ -1402,6 +1462,35 @@ begin
       Result[Last] := Result[I];
     end;
   SetLength(Result, Last + 1);
+end;
+
+function TDebugInfoSet.NearestLineRvaBefore(Rva: UInt64;
+  out FoundRva: UInt64): Boolean;
+begin
+  FoundRva := 0;
+  if (not FSortedRvaCacheOk) or (FSortedRvaCacheRev <> FRevision) then begin
+    FSortedRvaCache    := SortedRvas;
+    FSortedRvaCacheRev := FRevision;
+    FSortedRvaCacheOk  := True;
+  end;
+  if Length(FSortedRvaCache) = 0 then
+    Exit(False);
+
+  // Lower bound, then step back one: the entry before the first one at or
+  // greater than Rva is the greatest entry strictly below it.
+  var Lo := 0;
+  var Hi := Length(FSortedRvaCache);
+  while Lo < Hi do begin
+    var Mid := (Lo + Hi) div 2;
+    if FSortedRvaCache[Mid] < Rva then
+      Lo := Mid + 1
+    else
+      Hi := Mid;
+  end;
+  if Lo = 0 then
+    Exit(False);
+  FoundRva := FSortedRvaCache[Lo - 1];
+  Result := True;
 end;
 
 end.

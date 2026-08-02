@@ -2866,78 +2866,99 @@ Two goals, both substantially done:
 1. Make the project installable with a clear, interactive flow.
 2. Remove all Italian from the project (messages, comments, identifiers, docs).
 
-## Current substep
+## Current substep (2026-08-02)
 
-Finalizing and verifying. Code, docs, installer, and README are updated; final
-verification grep pending.
+Continuous bug hunt toward a publishable debugger on BOTH bitnesses. Standing
+constraint from the user: **no heuristics**. A fix must be deterministic; a
+solution that patches the observed case and misleads elsewhere is worse than
+leaving the defect open and documented.
 
-## Last completed action
+Working on the x86 stack walker, which is the riskiest component in the project.
 
-- Renamed the only Italian identifiers/strings in the code (`Debugme.dpr`) to
-  English: the `var`-parameter procedure is now `Increment`, the nested
-  constant is now `FOO = 'foo'`, the sample literal is now `'foo!'`, and the
-  sample raise message is now `'Test error'`.
-- Updated the references to those names in `DevTools\TestNested.dpr` and in the
-  living-spec docs (`RSM_FORMAT_NOTES.md`, `RSM_RECORD_TYPES.md`,
-  `PROJECT_STATE.md`) plus a comment in `WinDebuggerBase.pas`. The RSM byte-table
-  in `RSM_FORMAT_NOTES.md` is now marked as a historical/illustrative example.
-- Rebuilt `Debugme.exe` / `.rsm` / `.map` and the adapter via `build_debug.bat`
-  (clean; only known hints/warnings). DevTools rebuilt; `ScanRsmMethods` OK,
-  `TestRsmParser` still fails to build (pre-existing `RsmTags` unit-path issue,
-  unrelated).
-- Added an interactive installer: `install\Install.dpr` + `build_installer.bat`
-  (output `install\Install.exe`). It builds the adapter if missing, stages it
-  into `install\local.delphi-win64-debug\`, detects VS Code / VS Code Insiders,
-  and copies the extension with overwrite confirmation. Compiles clean.
-- Rewrote `README.md`: added a Quick start section, an installer-first
-  extension-setup section, refreshed the architecture file table, the
-  What-works list, the roadmap, the diagnostic-logging note (now opt-in), and
-  the known-limitations section (removed the false "no type information" claim).
-- Fixed stale content in `install\INSTALL_INSTRUCTIONS.md`.
-- Rewrote this file in English.
+### Last completed action
 
-## Next action if interrupted right now
+`X86Decode.pas` — a 32-bit instruction-length decoder — plus `X86DecodeProbe`
+and `X86DecodeTests`, and it is now wired into the walker's prologue recovery.
 
-Run the final Italian-detection grep across the repo (distinctly-Italian words
-and accented characters in `*.pas *.dpr *.dpk *.inc *.md *.js`) and fix any
-remaining hit. Then optionally run the full test suite.
+Why it exists: the walker decided whether a stack word was a return address by
+reading a few bytes BACKWARDS looking for a call-shaped encoding. That is not a
+test — arbitrary bytes satisfy it, and measured, the address Delphi pushes for
+`push offset @@finallyHandler` passed. x86 is not self-synchronising, so the
+only exact method is to decode FORWARD from a known instruction boundary (the
+line table supplies one: every line record starts an instruction) and see
+whether a boundary lands on the candidate.
 
-## Files involved
+Contract: **exact or nothing**. Unknown opcode -> length 0 -> caller declines.
+`CallSiteEndsAt` returns `csaYes` / `csaNo` / `csaUndecidable`, and only
+`csaYes` accepts.
 
-- `Debugme.dpr`, `DevTools\TestNested.dpr`
-- `install\Install.dpr`, `build_installer.bat`, `install\INSTALL_INSTRUCTIONS.md`
-- `README.md`, `RSM_FORMAT_NOTES.md`, `RSM_RECORD_TYPES.md`, `PROJECT_STATE.md`
-- `DebuggerCore\WinDebuggerBase.pas` (comment only)
+Validated empirically against ground truth the binaries already carry: over
+9 940 routines and 70 476 line-to-line spans of production 32-bit Delphi code
+(`C:\Athens\hydra_2\ExtApps\*\Win32\Debug`) plus the test targets, **zero
+unknown opcodes**. 0.8 % of spans undecidable, all of them crossing the
+exception-handler table dcc32 emits inline after `jmp @HandleAnyException`
+(data in the code stream; no linear decode can cross it).
 
-## What works
+Committed: `8e951b7` (decoder + probe, no behaviour change). The wiring, the
+DUnitX tests and the new ctor-preamble test are NOT yet committed.
 
-- `build_debug.bat`, `build_dap.bat`, `build_installer.bat` all build clean.
-- `install\Install.exe` compiles; not auto-run (it modifies the user's VS Code
-  and blocks on interactive input).
+### Next action if interrupted right now
 
-## What is failing
+Read the running suite's output; if green, commit the wiring + tests. Then
+re-attempt the frameless-callee recovery (see below) on top of the exact test.
 
-- Nothing functional. `DevTools\TestRsmParser` build failure is pre-existing and
-  out of scope (unit search path for `RsmTags`).
+### Files involved
 
-## Last test result
+- `DebuggerCore\X86Decode.pas` (new), `DevTools\X86DecodeProbe.dpr` (new)
+- `DebuggerTests\X86DecodeTests.pas` (new), `DebuggerTests\RunTests.dpr`
+- `DebuggerCore\WinDebuggerX86.pas` — `IsAfterCallSite` now proves rather than guesses
+- `DebuggerCore\WinDebuggerBase.pas` — `NearestInstructionBoundaryBefore`
+- `DebuggerCore\DebugInfoSet.pas` — `NearestLineRvaBefore` + revision-keyed cache
+- `DebuggerTests\DebugSessionTests.pas` — `StoppedInCtorPreamble_...`
+- `DebuggerTests\TestTarget\TestTargetEdge.pas` — marker `{BP:CTOR_FIRST_LINE}`
 
-Full DUnitX suite not re-run this session. Rationale: no adapter or RSM-parser
-logic changed (only a comment, the test target, docs, and new install files).
-The DUnitX suite targets `TestTarget.exe`, not `Debugme.exe`.
+### What works
 
-## Exact next step
+Suite green at 1003 found / 998 passed / 0 failed / 5 ignored, both before and
+after wiring the exact call-site test into the prologue-recovery path.
 
-Final verification grep; fix stragglers if any.
+### What is failing
 
-## Traps / hypotheses
+Nothing known. Open (documented in `KNOWN_UNKNOWNS.md`), not failing:
 
-- `for var x in ['a','b']` over string literals is fine in a for-in, but
-  `Exit(['a'])` / building a `TArray<string>` result from a `[...]` literal is
-  parsed as a set ("Ordinal type required"); use `TArray<string>.Create(...)`.
-- The staged `install\local.delphi-win64-debug\package.json` has no `main`
-  field, so it needs no `extension.js` (a pure debug-type contribution that
-  launches the external adapter exe). Do not "fix" the manual instructions to
-  copy `extension.js`.
-- Renaming test-target symbols shifts RSM/MAP byte offsets; the doc example
-  tables are illustrative, not tracked against the current binary.
+- x86 loses a framed caller when a FRAMELESS routine sits between two framed
+  ones (`StackAcrossRtlCallback_...`, still `[Ignore]` TODO-RED).
+- interface concrete-class label, x86 only (EIntOverflow, cause unlocated).
+
+### Exact next step
+
+Re-attempt the frameless-callee recovery, now that a candidate can be PROVEN to
+follow a call. Design, all parts deterministic:
+
+1. Detect the gap: the chain emits a frame whose PC is inside routine C while
+   the next frame's PC is inside routine A. If A's call site (decode `A`'s
+   return address minus its instruction) is a DIRECT call, its target names the
+   missing routine B exactly.
+2. Scan the stack words between the two frame pointers for one that is inside B
+   AND proven by `CallSiteEndsAt` to follow a call.
+3. Require the match to be **unique**. More than one candidate -> decline.
+
+What killed the previous attempt: the `finally` handler address from the
+try/finally exception record sits in the same gap, inside the same routine, and
+passed the old byte-scan test. It should now be rejected, because it is the
+target of a `push imm32`, not the address after a call — `X86DecodeTests.
+PushImmediate_IsNotACallSite` pins exactly that.
+
+### Traps / hypotheses
+
+- A recovered frame with the RIGHT function but the WRONG line is still a wrong
+  frame. The previous attempt produced `RunRtlCallback` at line 81 (`Names.Free`,
+  the `finally`) instead of 79 (the call). Assert the LINE, not just the name.
+- `build_runner.bat` does NOT rebuild the adapter, and DevTools probes are not
+  rebuilt by it either. Rebuild both before trusting any measurement — stale
+  binaries produced three wrong conclusions in the previous session.
+- Do not edit `DebuggerTests\TestTarget\*.pas` while the suite is running: the
+  runner reads those files at run time to resolve `{BP:...}` markers, and a
+  mid-run edit fakes a large regression.
+- `for var x in ['a','b']` is fine in a for-in, but `Exit(['a'])` is parsed as a
+  set ("Ordinal type required"); use `TArray<string>.Create(...)`.

@@ -33,7 +33,8 @@ interface
 
 uses
   Winapi.Windows,
-  DebugTarget, DebugInfoSet, TargetLayout, DelphiValueReaders, WinDebuggerBase;
+  DebugTarget, DebugInfoSet, TargetLayout, DelphiValueReaders, WinDebuggerBase,
+  X86Decode;
 
 type
   TWin32Debugger = class(TWinDebugger)
@@ -230,31 +231,139 @@ const
     Result := (Next and 3) = 0;
   end;
 
-  // True when VA is the instruction immediately AFTER a call -- i.e. a real
-  // return address rather than a stale one left on the stack. Distinguishing
-  // those is what makes scanning the top of the stack safe rather than a
-  // guess. Both x86 call encodings are checked:
-  //   E8 rel32          direct   -> the call starts 5 bytes back
-  //   FF /2 (+modrm...) indirect -> 2..7 bytes back, reg field = 2
+  // PROVES that VA is the instruction immediately after a call -- i.e. a live
+  // return address rather than some other code address that happens to be on
+  // the stack. Only csaYes is an acceptance; csaNo and csaUndecidable both
+  // reject, so the walker declines instead of guessing.
+  //
+  // This cannot be answered by reading backwards. x86 is not self-
+  // synchronising, and the earlier version of this test -- scan a few bytes
+  // back for something call-shaped -- accepted the address Delphi pushes with
+  // `push offset @@finallyHandler`, which produced a frame naming the right
+  // routine while pointing at its `finally` block. Decoding forward from a
+  // known instruction boundary is the only exact method; the line table
+  // supplies the boundary, since every line record starts an instruction.
   function IsAfterCallSite(VA: UInt64): Boolean;
-  var
-    B: array[0..7] of Byte;
   begin
-    Result := False;
-    if VA < 8 then
-      Exit;
-    if not ReadProcessMemoryAt(VA - 8, @B[0], 8) then
-      Exit;
-    if B[3] = $E8 then          // VA-5
-      Exit(True);
-    for var Back := 2 to 7 do begin
-      var Op := B[8 - Back];
-      if Op <> $FF then
+    var StartVA: UInt64;
+    if not NearestInstructionBoundaryBefore(VA, StartVA) then
+      Exit(False);
+    Result := CallSiteEndsAt(
+      function(At: UInt64; Buf: Pointer; Size: Integer): Boolean
+      begin
+        Result := ReadProcessMemoryAt(At, Buf, Size);
+      end,
+      StartVA, VA) = csaYes;
+  end;
+
+  // A FRAMELESS routine between two framed ones is invisible to the chain: it
+  // never pushed EBP, so the link from its callee steps straight over it to its
+  // caller. What goes missing is not the frameless routine -- its PC is still
+  // reported, as the return address its callee saved -- but the FRAMED CALLER
+  // above it, whose own return address nobody stored. That is the shape the
+  // user reported: stopped in a comparer System.Classes calls back into, the
+  // routine that started the sort was simply absent while every frame on screen
+  // was real.
+  //
+  // Recovering it needs no guessing, because the missing routine can be
+  // identified from the OTHER side and then confirmed on the stack:
+  //
+  //   1. the frame ABOVE the gap sits at the return address of a call, and if
+  //      that call is DIRECT its target names the missing routine exactly;
+  //   2. the missing routine's own return address lies in the stack region the
+  //      chain skipped, and CallSiteEndsAt can PROVE which word follows a call;
+  //   3. requiring that match to be UNIQUE removes the last degree of freedom.
+  //
+  // All three, or nothing. An earlier attempt took the first word that merely
+  // looked call-adjacent and picked up the `finally` handler address out of the
+  // try/finally exception record: right routine, wrong statement. A frame that
+  // names the correct function while pointing at the wrong line is still a
+  // wrong frame, and worse than an absent one, because nothing marks it.
+  procedure RecoverFramelessCallers;
+  const
+    // The skipped region is one framed frame plus a frameless routine's own
+    // stack use. Beyond this the walk declines rather than scan further; a
+    // wider window buys nothing and costs a decode attempt per word.
+    MAX_SKIPPED_SPAN = $4000;
+  begin
+    var ReadCode: TReadCodeProc :=
+      function(At: UInt64; Buf: Pointer; Size: Integer): Boolean
+      begin
+        Result := ReadProcessMemoryAt(At, Buf, Size);
+      end;
+
+    var I := 1;
+    while (I < Length(Result) - 1) and (Length(Result) < MaxFrames) do begin
+      var Below := Result[I - 1];   // nearer the top of the stack
+      var Here  := Result[I];
+      var Above := Result[I + 1];
+
+      // Step 1: name the routine the frame above called.
+      var MissingEntry: UInt64 := 0;
+      var BoundaryVA: UInt64;
+      var CallInsn: TX86Insn;
+      if NearestInstructionBoundaryBefore(Above.PC, BoundaryVA) and
+         (CallSiteEndsAt(ReadCode, BoundaryVA, Above.PC, CallInsn) = csaYes) and
+         CallInsn.CallIsDirect then
+        MissingEntry := CallInsn.DirectTarget;
+
+      var HereEntry: UInt64 := 0;
+      FunctionEntryOf(Here.PC, HereEntry);
+
+      // Nothing to do when the chain already produced that routine, which is
+      // the normal case for framed code.
+      if (MissingEntry = 0) or (MissingEntry = HereEntry) then begin
+        Inc(I);
         Continue;
-      // modrm reg field 2 (near call) or 3 (far call) -- the byte after FF.
-      var Modrm := B[8 - Back + 1];
-      if ((Modrm shr 3) and 7) in [2, 3] then
-        Exit(True);
+      end;
+
+      // Step 2: the words the chain stepped over.
+      var LoAddr := Below.FramePtr;
+      var HiAddr := Here.FramePtr;
+      if (LoAddr = 0) or (HiAddr < LoAddr + 8) or
+         (HiAddr - LoAddr > MAX_SKIPPED_SPAN) then begin
+        Inc(I);
+        Continue;
+      end;
+
+      // One read for the whole region. Word-at-a-time would be a syscall per
+      // stack slot, and this runs for every adjacent triple of every walk.
+      var Gap: TArray<UInt32>;
+      SetLength(Gap, (HiAddr - LoAddr - 4) div 4);
+      if (Length(Gap) = 0) or
+         not ReadProcessMemoryAt(LoAddr + 4, @Gap[0], Length(Gap) * 4) then begin
+        Inc(I);
+        Continue;
+      end;
+
+      var Found: UInt64 := 0;
+      var Matches := 0;
+      for var Slot := 0 to High(Gap) do begin
+        var W := UInt64(Gap[Slot]);
+        var WEntry: UInt64;
+        if IsPlausibleReturnAddress(W) and FunctionEntryOf(W, WEntry) and
+           (WEntry = MissingEntry) and IsAfterCallSite(W) then begin
+          Inc(Matches);
+          Found := W;
+          if Matches > 1 then
+            Break;
+        end;
+      end;
+
+      // Step 3: exactly one, or the walk says nothing.
+      if Matches <> 1 then begin
+        Inc(I);
+        Continue;
+      end;
+
+      var Raw: TRawStackFrame;
+      Raw.PC := Found;
+      // The missing routine IS framed -- it is its callee that was not -- and
+      // the frame pointer the chain attributed to the frameless entry is in
+      // fact this routine's.
+      Raw.FramePtr := Here.FramePtr;
+      System.Insert([Raw], Result, I + 1);
+      Inc(I, 2);
     end;
   end;
 
@@ -330,6 +439,12 @@ begin
       // EBP is already the caller's frame pointer, so the chain resumes from it.
       ChainFrom(SeedFp);
   end;
+
+  // Fill in framed callers the chain stepped over because a frameless routine
+  // sat between them and their callee. Runs on the chain's own output, before
+  // any dbghelp tail is spliced on, so it only ever inserts between two frames
+  // the chain already vouched for.
+  RecoverFramelessCallers;
 
   // Still nothing to chain from: frame 0 is in frameless code. dbghelp may have
   // something; take its answer when it is richer.

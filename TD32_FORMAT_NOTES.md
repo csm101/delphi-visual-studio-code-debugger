@@ -430,6 +430,40 @@ Confirmed by comparing the same recursive stack on both bitnesses name for name
 (`Win32_StackFrameNames_MatchWin64`, which caught the missing
 `initialization` case on its first run).
 
+#### Constructors and destructors carry NO declared name — confirmed
+
+A third shape exists that the demangler **cannot** decode, because the name is
+genuinely absent from the symbol:
+
+```
+@Testtargetedge@TCtorProbe@$bctr$qqrv    constructor
+@Testtargetedge@TCtorProbe@$bdtr$qqrv    destructor
+```
+
+The component where a method name would sit is EMPTY; all that is recorded is
+the `$bctr` / `$bdtr` marker. `Create` is not in there, and mapping the marker
+onto `Create` / `Destroy` would be a guess — a constructor may be declared with
+any name (`CreateFromFile`), and the guess would then print a name the source
+does not contain.
+
+So `DemangleBorland` declines, and the DECLARED name is taken from another
+provider instead: `TDebugInfoSet.RvaToFunctionName` treats a result that is
+still mangled (leading `@` plus a `$`) as "not an answer" and keeps asking, so
+the MAP — which stores `TestTargetEdge.TCtorProbe.Create` in plain text —
+supplies it. A mangled name is kept only if no provider offers a decoded one,
+since it still beats no name at all. An Itanium-demangled name never has that
+shape, so x64 is unaffected.
+
+Before this, a 32-bit call stack stopped in a constructor read
+`@Testtargetedge@TCtorProbe@$bctr$qqrv` where the 64-bit one read
+`TCtorProbe.Create`. Asserted by
+`StoppedInCtorPreamble_StackStillReachesTheCallerOnBothBitnesses`.
+
+STILL OPEN: with TD32 but no MAP, the mangled form is all there is. The
+declared name is recoverable — a class's TD32 member list records methods by
+their source names — but reaching it from a procedure record has not been
+implemented.
+
 Three call sites, because Borland mangling is not confined to procedure names:
 
 | Site | What it demangles |

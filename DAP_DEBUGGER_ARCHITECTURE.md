@@ -1126,6 +1126,68 @@ the frame pointer omitted — so when it dies at depth ≤ 1 the walk defers to 
 inherited StackWalk64, which on a stack that is mostly frameless system code may
 still do better.
 
+### Proving a stack word is a return address (x86)
+
+One x86 path cannot use the chain at all: when execution is inside a routine's
+prologue the frame is not established yet, so `[EBP+4]` belongs to the CALLER
+and the walk yields a single frame. Delphi makes this ordinary rather than
+exotic, because a constructor's compiler-generated preamble is already
+attributed to the routine's first source line. The pushed return address is
+still near the top of the stack, so the walker probes a small window above ESP.
+
+That probe is only sound if it can tell a live return address from any other
+code address lying on the stack, and the test for that is exact:
+
+- `X86Decode.CallSiteEndsAt` decodes FORWARD from a known instruction boundary
+  and reports whether a boundary lands on the candidate with a `call` ending
+  there. x86 is not self-synchronising, so reading backwards cannot answer this.
+- The boundary comes from the line table (every line record starts an
+  instruction), restricted to the candidate's own routine; the routine entry is
+  the fallback when the module has symbols but no lines.
+- Three outcomes, and only `csaYes` accepts. `csaUndecidable` is deliberately
+  distinct from `csaNo`: an opcode the decoder does not know, or a span it
+  cannot resolve, must never be read as "not a call".
+
+The earlier version scanned a few bytes backwards for a call-shaped encoding.
+It accepted the address Delphi pushes with `push offset @@finallyHandler`, and
+the recovered frame named the right routine while pointing at its `finally`
+block — a wrong frame is worse than a missing one, because every frame on
+screen looks equally real.
+
+### Recovering a caller the chain stepped over (x86)
+
+A FRAMELESS routine between two framed ones is invisible to the chain: it never
+pushed EBP, so the link from its callee steps straight over it to its caller.
+What goes missing is not the frameless routine — its PC is still reported, as
+the return address its callee saved — but the FRAMED CALLER above it, whose own
+return address nobody stored. `TStringList.CustomSort` is exactly this shape:
+stopped in a comparer the RTL calls back into, the routine that started the sort
+was absent while every frame on screen was real. dbghelp does not know the frame
+either, so there is nothing to defer to.
+
+The walker recovers it by identifying the routine from the other side and then
+confirming it on the stack — three conditions, all required:
+
+1. the frame ABOVE the gap sits at the return address of a call; if that call is
+   DIRECT, its target names the missing routine exactly (an indirect call names
+   nothing, and the hole is left alone);
+2. the missing routine's own return address is one of the stack words the chain
+   skipped, and `CallSiteEndsAt` PROVES which word follows a call;
+3. the match must be UNIQUE — two candidates mean decline.
+
+Measured on the RTL-callback fixture, the recovered x86 stack is now identical
+to the x64 one frame for frame, including the caller's line number (79, the
+call site) rather than 81 (the `finally`), which is what the first, unsound
+attempt produced.
+
+Validation is empirical, against ground truth the binaries already carry: every
+line-table address is an instruction boundary, so decoding must land on each
+one. Over 9 940 routines and 70 476 line-to-line spans of production 32-bit
+Delphi code (`DevTools\X86DecodeProbe.exe`), there were **zero unknown
+opcodes**. The 0.8 % of spans that do not resolve all cross the exception-handler
+table dcc32 emits inline in the code stream after `jmp @HandleAnyException`,
+which is data no linear decode can cross; there the decoder reports undecidable.
+
 ## Frame symbol attribution
 
 Every `TSessionFrame` carries `ModuleName` and

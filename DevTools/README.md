@@ -547,6 +547,42 @@ Gotcha worth keeping: do **not** name the local that captures the frame pointer
 `Ebp`. The inline assembler resolves that to the register and emits a no-op
 `mov ebp, ebp`, so every offset comes out as an absolute address.
 
+#### X86DecodeProbe
+
+```bat
+DevTools\Win64\Debug\X86DecodeProbe.exe <exe-or-bpl> [-v] [-max N]
+```
+
+Validates `DebuggerCore\X86Decode.pas` — the instruction-length decoder the x86
+stack walker uses to prove that a stack word follows a `call` — against real
+dcc32 output. Needs no reference disassembler, because the binary already
+carries ground truth: **every line-table address is an instruction boundary**,
+so decoding must land on each one. A single wrong length desynchronises the
+stream and the probe sees the misses.
+
+Two measures are reported. *Line-to-line spans* is what the walker actually
+relies on (it decodes a short span from a known boundary, never a whole
+routine). *Whole-routine decode from entry* is stricter than needed and will
+always show some failures, because dcc32 emits the exception-handler table
+inline in the code stream after `jmp @HandleAnyException`:
+
+```
+E9 7C BF F2 FF   jmp @HandleAnyException
+01 00 00 00      handler count
+70 A3 41 00      Exception VMT
+C8 D6 4D 00      handler address    <- also a line-table address
+89 45 FC         handler body
+```
+
+That is data, and no linear decode can cross it. The decoder reports
+undecidable there, which is the correct answer.
+
+The number that matters is **unknown opcodes**, which must be zero: any opcode
+outside the map yields length 0 and makes callers decline rather than guess.
+Measured over 9 940 routines / 70 476 spans of production 32-bit Delphi code
+(`C:\Athens\hydra_2\ExtApps\*\Win32\Debug`) plus the test targets: zero unknown
+opcodes, 0.8 % of spans undecidable, all of them exception-table crossings.
+
 ### Live process and adapter
 
 #### ProcessEnumProbe

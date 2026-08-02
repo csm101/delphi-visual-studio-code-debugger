@@ -57,7 +57,14 @@ type
 // data sits in between), or when the span exceeds MaxBytes. Callers must treat
 // it as "unknown", never as "no".
 function CallSiteEndsAt(const ReadCode: TReadCodeProc;
-  StartVA, EndVA: UInt64; MaxBytes: Integer = 4096): TCallSiteAnswer;
+  StartVA, EndVA: UInt64; MaxBytes: Integer = 4096): TCallSiteAnswer; overload;
+
+// Same, and also hands back the call instruction itself. A DIRECT call is the
+// only one whose target is knowable without running the program, which is how
+// the walker names a routine that left no frame behind.
+function CallSiteEndsAt(const ReadCode: TReadCodeProc;
+  StartVA, EndVA: UInt64; out CallInsn: TX86Insn;
+  MaxBytes: Integer = 4096): TCallSiteAnswer; overload;
 
 implementation
 
@@ -264,6 +271,14 @@ begin
   if (Flags and fBad) <> 0 then
     Exit;
 
+  // In 32-bit mode C4/C5 are LES/LDS only when they address memory. With
+  // mod=3 they are the AVX VEX prefixes instead, and decoding them as LES/LDS
+  // would yield a wrong length rather than no length. dcc32 does not emit AVX,
+  // but a hand-written asm block or a future RTL might, so refuse instead.
+  if (not TwoByte) and (Op in [$C4, $C5]) and (Pos < Avail) and
+     ((Bytes[Pos] shr 6) = 3) then
+    Exit;
+
   // ModRM, SIB and displacement.
   if (Flags and fModRM) <> 0 then begin
     var Modrm: Byte;
@@ -359,9 +374,19 @@ end;
 
 function CallSiteEndsAt(const ReadCode: TReadCodeProc;
   StartVA, EndVA: UInt64; MaxBytes: Integer): TCallSiteAnswer;
+var
+  Ignored: TX86Insn;
+begin
+  Result := CallSiteEndsAt(ReadCode, StartVA, EndVA, Ignored, MaxBytes);
+end;
+
+function CallSiteEndsAt(const ReadCode: TReadCodeProc;
+  StartVA, EndVA: UInt64; out CallInsn: TX86Insn;
+  MaxBytes: Integer): TCallSiteAnswer;
 const
   WINDOW = 16;   // longest legal x86 instruction is 15 bytes
 begin
+  CallInsn := Default(TX86Insn);
   if (EndVA <= StartVA) or (EndVA - StartVA > UInt64(MaxBytes)) then
     Exit(csaUndecidable);
 
@@ -383,10 +408,10 @@ begin
 
     var Next := VA + UInt64(Insn.Length);
     if Next = EndVA then begin
-      if Insn.IsCall then
-        Exit(csaYes)
-      else
+      if not Insn.IsCall then
         Exit(csaNo);
+      CallInsn := Insn;
+      Exit(csaYes);
     end;
     if Next > EndVA then
       // A boundary skipped over EndVA, so StartVA was not a real instruction
