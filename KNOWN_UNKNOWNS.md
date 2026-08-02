@@ -455,11 +455,25 @@ in `ValueReaderTests.pas` for deterministic memory-pattern unit tests):
   call was tried and changed nothing, so `Tags` is not reaching that function
   either.
 
-  So the remaining work is plumbing, not discovery: find every path that turns a
-  field or member into a `TLocalValue` and carry the kind the caller already
-  knows (RTTI states it for a live object, which is authoritative about runtime
-  layout). Tightening the gate before that is a net loss — it degrades output
-  that is currently correct while leaving the aliasing reachable elsewhere.
+  CORRECTION (2026-08-03). An earlier revision of this entry said the remaining
+  work was "plumbing, not discovery" -- carry the kind the caller already knows.
+  That is WRONG and would send the next attempt looking for something that is
+  not there. Measured: expanding `MRec` renders `Tags` as `[4, 5, 6]` with the
+  type label `^Integer` on both bitnesses. The label is TD32's flattened
+  spelling, so on that path NO provider says "dynamic array" -- the caller does
+  not know either. The RTTI-driven expander (`ExpandRecord`) does pass a real
+  `TypeKind` and would satisfy a gate, but it is not what produced this child.
+
+  So the honest position is a genuine trade, not a missing wire:
+    * keep the header check, and a `^T2` aimed at a live `array of T1` renders a
+      wrong length and strides past the buffer;
+    * gate on a positive kind, and `MRec.Tags` -- which renders CORRECTLY today
+      -- becomes a bare pointer.
+
+  Closing it properly means making the RECORD's own RTTI (`TMixedRec`'s
+  TypeInfo, which does describe `Tags` as `tkDynArray`) reach this path, so the
+  gate has something to be satisfied by. Whether that TypeInfo is resolvable
+  from a record LOCAL is the open question, and it is a discovery question.
 
 ## Wrong-data heuristics — audit round 2, 2026-07-19 (value/type computation)
 
