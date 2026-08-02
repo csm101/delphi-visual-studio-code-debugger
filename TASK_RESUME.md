@@ -297,6 +297,48 @@ conditional and hit-count breakpoints; worker-thread breakpoints, thread
 enumeration and per-thread stepping; multi-dimensional static and nested
 dynamic array indexing and bounds.
 
+Second wave (2026-08-02), after the user's rule "no heuristics -- nothing should
+be more deterministic than a debugger". Suite 998 / 994 passed / 0 failed / 4
+ignored. Commits `3743b14` .. `2f98e1d`:
+
+* Replaced MY OWN worst heuristic: telling a dynamic array from a pointer by
+  PROBING MEMORY for a plausible header. Now decided from the type graph. Three
+  facts had to be established first: a TypeId is meaningless across providers
+  (TD32 calls `Scores` $B4BA, RSM $020D), so the PROVIDER resolves the question
+  and the ANSWER travels; a local IS the array while a var-out `Result` POINTS
+  at one, so both TypeKind and PointeeKind are needed; and an open array has an
+  IDENTICAL type record to a dynamic array, separable only by being a parameter
+  -- which the offset SIGN cannot tell (positive on x64, negative on x86), so
+  RSM's record tag supplies it. `TSymbolParamStatus` is a TRI-STATE on purpose:
+  "nobody said" is not "it is a local".
+* Attach on Win32: covered, no defect. Discovered the x64 attach test had been
+  passing in 0.1 s WITHOUT attaching -- gated on SeDebugPrivilege, which is only
+  needed for ANOTHER user's process. Ungated, both really attach.
+* RTTI field-table header is `2 + PointerSize`, not 10. On x86 the whole walk
+  was shifted: field names from unrelated memory, offsets like -2025889729.
+  This also recovers generic element types, which the static tables cannot give
+  (dcc32 emits one un-instantiated `%TList__1`).
+* Var PARAMETERS showed their pointer on x86: only RSM records by-reference-ness
+  and `Kind` was not merged across providers, so whichever provider was the base
+  decided -- and that differs by bitness.
+* Four pointer reads hardcoded to 8 bytes, now target width.
+* Dynamic arrays are recognised under EVERY spelling (`^E`, `TArray<E>`,
+  `array of E`). Matching only `^` became a live bug the moment RTTI supplied
+  real names: `FItems` expanded into ITSELF and failed the request.
+* `EvaluateForFrame(expr, N>0)` silently answered with the TOP frame's locals
+  when no stack had been fetched -- the cache it indexes was empty.
+* Session destruction now terminates what it launched (ownership).
+
+REVERTED, and why: labelling an interface with its concrete class via the
+interface-table search. Reached from an arbitrary formatted value it walks into
+module data where the RTTI readers raise EIntOverflow and fail the whole
+`variables` request. Bounding by the OS allocation did not help (object and
+reference share a region), and bisection did NOT converge -- IsClassInstance,
+GetInstanceSize, GetInstanceClassName and the table walk each stayed implicated.
+Cause NOT located. The display path keeps its original IMT-thunk decoding, so
+that label stays x64-only exactly as before. The interface-table mechanism IS
+used, and green, for member ACCESS through an interface.
+
 Still open, logged not fixed:
 
 * RSM resolves nested type names wrongly on Win32 too (`Col` -> `PPCharArray`).

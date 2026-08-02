@@ -154,6 +154,15 @@ type
     // now; no defect found, but the x86 stack walk is a different
     // implementation from the x64 one, so the coverage is not redundant.
     [Test] procedure FrameScopedEvaluation_SeesTheRightLocalsOnBothBitnesses;
+    // Writing a FIELD of an object, which is a different path from writing a
+    // local: it goes through the expansion handle, and the refresh afterwards
+    // reads the field at its own width. Covered on the 64-bit target only until
+    // now, and a string field additionally exercises the RTL assignment helper.
+    [Test] procedure SetFieldVariable_WritesAndReadsBackOnBothBitnesses;
+    // A logpoint evaluates its message IN the debuggee and resumes without
+    // stopping, so it depends on the 32-bit locals reader and on run control
+    // continuing correctly. Covered on the 64-bit target only until now.
+    [Test] procedure LogPoints_EmitTheirMessageWithoutStoppingOnBothBitnesses;
     // TD32 stores globals mangled, and dcc32 mangles Borland-style where dcc64
     // mangles Itanium-style; only the latter was decoded, so NO unit global
     // resolved on a 32-bit target.
@@ -3677,6 +3686,113 @@ begin
   Assert.AreEqual('', Failures,
     'selecting a stack frame must scope evaluation to that frame, on both ' +
     'bitnesses -- ' + Failures);
+end;
+
+procedure TWin32RunControlTests.SetFieldVariable_WritesAndReadsBackOnBothBitnesses;
+const
+  SOURCE = 'TestTargetCore.pas';
+  MARKER = 'EVAL_BODY';
+
+  // Writes an Integer field and a STRING field of `W`, then RE-EXPANDS the
+  // object through the normal read path. The re-read is the point: the value
+  // the write call reports comes from its own refresh, so only reading the
+  // object again proves the debuggee's memory actually changed.
+  function WriteFieldsAndReRead(const Exe, Map, Rsm: string; Line: Integer): string;
+  begin
+    var Session := OpenSessionAtMarker(Exe, Map, Rsm, TargetDir, SOURCE, Line);
+    try
+      if Session.State <> dsStopped then
+        Exit('<did not stop>');
+      var W: TSessionVariable;
+      if not FindVar(Session.GetLocals, 'W', W) then
+        Exit('<local W not found>');
+      if W.Handle = 0 then
+        Exit('<W has no expansion handle>');
+
+      var NewValue, NewType: string;
+      if not Session.SetFieldVariable(W.Handle, 'FValue', '123', NewValue, NewType) then
+        Exit('<FValue write failed: ' + NewValue + '>');
+      if not Session.SetFieldVariable(W.Handle, 'FName', 'renamed', NewValue, NewType) then
+        Exit('<FName write failed: ' + NewValue + '>');
+
+      var FValue, FName: TSessionVariable;
+      if not FindMemberField(Session, W, 'FValue', FValue) then
+        Exit('<FValue not found on re-read>');
+      if not FindMemberField(Session, W, 'FName', FName) then
+        Exit('<FName not found on re-read>');
+      Result := Format('FValue=%s FName=%s', [Trim(FValue.Value), Trim(FName.Value)]);
+    finally
+      Session.Free;
+    end;
+  end;
+
+begin
+  var Line := MarkerLineInFile(TargetDir + SOURCE, MARKER);
+  Assert.IsTrue(Line > 0, 'marker ' + MARKER + ' not found');
+  Assert.IsTrue(FileExists(Win64Exe), '64-bit control target missing');
+
+  var Failures := '';
+  var Got64 := WriteFieldsAndReRead(Win64Exe, Win64Map, Win64Rsm, Line);
+  if not (Got64.Contains('123') and Got64.Contains('renamed')) then
+    Failures := Failures + 'x64: ' + Got64 + '; ';
+  var Got32 := WriteFieldsAndReRead(Win32Exe, Win32Map, Win32Rsm, Line);
+  if not (Got32.Contains('123') and Got32.Contains('renamed')) then
+    Failures := Failures + 'x86: ' + Got32 + '; ';
+
+  Assert.AreEqual('', Failures,
+    'writing an object field must change the debuggee and read back, on both ' +
+    'bitnesses -- ' + Failures);
+end;
+
+procedure TWin32RunControlTests.LogPoints_EmitTheirMessageWithoutStoppingOnBothBitnesses;
+const
+  SOURCE = 'TestTargetCore.pas';
+  MARKER = 'BP_LOOP';
+
+  // A logpoint on the loop body, interpolating the loop counter. Two things
+  // must hold and both are asserted: the message must carry the EVALUATED
+  // value (so the expression really ran in the debuggee), and the target must
+  // RUN TO COMPLETION rather than stop -- a logpoint that stops is a
+  // breakpoint, and asserting only the text would not notice.
+  function LogOutputOf(const Exe, Map, Rsm: string; Line: Integer): string;
+  begin
+    var Session := OpenSessionWithBp(Exe, Map, Rsm, TargetDir, SOURCE, Line,
+                     '', '', 'loop I={I} Acc={Acc}');
+    try
+      var Deadline := GetTickCount64 + 40000;
+      while (not Session.HasExited) and (GetTickCount64 < Deadline) do begin
+        if Session.State = dsStopped then
+          Exit('<logpoint STOPPED the target>');
+        Session.Pump;
+      end;
+      if not Session.HasExited then
+        Exit('<target did not finish>');
+      Result := string.Join(' | ', Session.DrainDebuggerOutput);
+    finally
+      Session.Free;
+    end;
+  end;
+
+begin
+  var Line := MarkerLineInFile(TargetDir + SOURCE, MARKER);
+  Assert.IsTrue(Line > 0, 'marker ' + MARKER + ' not found');
+  Assert.IsTrue(FileExists(Win64Exe), '64-bit control target missing');
+
+  // The loop runs I = 1..5. Asserting the FIRST and LAST iterations proves the
+  // counter was interpolated from the debuggee and that every pass logged.
+  // Matched on `loop I=n` alone: an integer renders with a hex annotation
+  // (`1  (0x1)`), which is formatting this test has no business pinning.
+  var Failures := '';
+  var Got64 := LogOutputOf(Win64Exe, Win64Map, Win64Rsm, Line);
+  if not (Got64.Contains('loop I=1') and Got64.Contains('loop I=5')) then
+    Failures := Failures + 'x64: ' + Got64 + '; ';
+  var Got32 := LogOutputOf(Win32Exe, Win32Map, Win32Rsm, Line);
+  if not (Got32.Contains('loop I=1') and Got32.Contains('loop I=5')) then
+    Failures := Failures + 'x86: ' + Got32 + '; ';
+
+  Assert.AreEqual('', Failures,
+    'a logpoint must emit its evaluated message and let the target run, on ' +
+    'both bitnesses -- ' + Failures);
 end;
 
 procedure TWin32RunControlTests.BreakpointOnBeginLine_ReportsPassedParameters;
