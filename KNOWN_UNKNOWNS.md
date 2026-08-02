@@ -696,6 +696,54 @@ No cheap containment exists: the wrong names are structurally indistinguishable
 from right ones, so "refuse when unreliable" needs the same decoding the fix
 needs.
 
+### Win32: a nested procedure cannot see its parent's variables
+
+Standing at `INNER_BODY` inside `ComputeNested.Inner`, the locals view differs
+completely by bitness:
+
+    x64:  S, ComputeNested.X, ComputeNested.D1, ComputeNested.Ext1,
+          ComputeNested.R48, ComputeNested.D
+    x86:  S
+
+The whole enclosing scope is missing on Win32 -- not merely `evaluate`, the
+LOCALS list too. A nested routine reading its parent's variables is ordinary
+Delphi structure, so this is a real gap rather than an edge case. Note the
+existing `FrameScopedEvaluation_...` test does NOT cover it: it selects the
+parent FRAME explicitly with `EvaluateForFrame`, which works on both bitnesses.
+What fails is Delphi's LEXICAL scoping -- the parent's locals reachable from the
+child by bare name.
+
+Cause: `TWinDebugger.ReadParentFramePointer` is hardcoded to the Win64 ABI --
+the static link arrives in RCX and is spilled to the first home slot at
+`RBP + frameSize + extraPushes + 16`. Win32 has no home slots, so the read
+returns whatever is at that address and the climb produces nothing. It is an
+architecture seam that was never overridden for the 32-bit target.
+
+MEASURED (`DevTools\Win32NestedLinkProbe.dpr`, four shapes): dcc32 passes the
+static link as a hidden STACK parameter pushed LAST, so it sits immediately
+above the declared stack parameters:
+
+| Nested routine | Static link at |
+|---|---|
+| `procedure Inner` (no params) | `[EBP+8]` |
+| `procedure Inner(Depth: Integer)` (1 register param) | `[EBP+8]` |
+| `procedure Inner(A, B, C, D: Integer)` (1 stack param) | `[EBP+12]` |
+
+i.e. `[EBP + 8 + declaredStackParamBytes]`. The probe needed a RECURSIVE shape
+to establish that: when the nested routine is called directly by its parent --
+every other shape -- the saved caller EBP at `[EBP+0]` also equals the parent's
+EBP, and that coincidence looks exactly like a match.
+
+TD32 does NOT record the link as a symbol on either bitness (checked with
+`Td32AliasProbe -proc Inner`), so the address has to be computed.
+
+NOT implemented, and deliberately not rushed: getting
+`declaredStackParamBytes` wrong yields a plausible WRONG parent frame, i.e.
+confident wrong values for every parent local. Whatever computes it must be
+VERIFIED before use -- the candidate has to match the nearest frame on the walked
+stack whose function is the enclosing routine, and the climb must decline (and
+show only the child's own locals, as today) when it does not.
+
 ### A non-virtual getter in a symbol-less module cannot be invoked
 
 Measured in the same real-application session. On a live `TfrmMain`:

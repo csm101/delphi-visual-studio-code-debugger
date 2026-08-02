@@ -2568,11 +2568,18 @@ begin
   // is a ROUTINE name and there is no receiver at all, so the guard leaves it
   // working. A record base is not covered here yet: it is not a class instance,
   // so it still reaches this path.
-  var HasReceiver := Base.IsValid and (FRtti <> nil) and
-                     (Base.RawValue >= 65536) and
-                     FRtti.IsClassInstance(Base.RawValue);
+  // A RECORD base leaked through a class-instance-only guard: measured on both
+  // bitnesses, `PRec.GSink` answered `(TLocalSink)` -- the unit global's own
+  // value, for a member TPackedRec does not have. So the test is simply whether
+  // the base is a VALUE at all. If the user got something to dot into, the
+  // answer must come from that something.
+  //
+  // Note the documented case does not currently reach here anyway:
+  // `ComputeNested.X` fails at the BASE (`<ComputeNested requires 1
+  // argument(s)>`), so the qualified form never gets this far. The path is kept
+  // for a base that resolves to nothing, which is what it was written for.
   var LV: TLocalValue;
-  if (not HasReceiver) and FDebugger.EvaluateName(Field, LV) then
+  if (not Base.IsValid) and FDebugger.EvaluateName(Field, LV) then
     Exit(LocalToExpr(LV));
 
   // 5. Last resort: the base may be an INTERFACE reference. Debug information

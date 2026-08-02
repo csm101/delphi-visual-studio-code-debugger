@@ -4096,10 +4096,16 @@ const
   // TBase has neither as a member, so asking for them THROUGH the object must
   // fail -- and the real member must keep working, or the guard would just be a
   // blanket refusal.
-  CHECKS: array[0..2] of TExprCheck = (
+  // A RECORD base leaked through the first version of the guard, which only
+  // recognised class instances: `PRec.GSink` answered with the global's value
+  // for a member `TPackedRec` does not have. Both base kinds are pinned.
+  CHECKS: array[0..5] of TExprCheck = (
     (Expr: 'ArrObj[0].GCounter'; Expect: 'has no member'),
     (Expr: 'ArrObj[0].GSink';    Expect: 'has no member'),
-    (Expr: 'ArrObj[0].BaseTag';  Expect: ''));   // '' = must SUCCEED
+    (Expr: 'ArrObj[0].BaseTag';  Expect: ''),    // '' = must SUCCEED
+    (Expr: 'ArrRec[0].GSink';    Expect: 'has no member'),
+    (Expr: 'ArrRec[0].GCounter'; Expect: 'has no member'),
+    (Expr: 'ArrRec[0].A';        Expect: '11'));
 
   function EvalAt(const Exe, Map, Rsm, Expr: string; Line: Integer): string;
   begin

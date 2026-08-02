@@ -25,7 +25,7 @@ rem Probes that contain x86 asm and cannot build under dcc64 at all - build thos
 rem with build_one32.bat. (Win32FloatAbiProbe is NOT one of them: it guards its
 rem asm with {$IFDEF CPUX86} so it dual-compiles, and its size table is only
 rem meaningful when both columns are available.)
-set WIN32_ONLY=Win32FloatArgProbe Win32ImtThunkProbe
+set WIN32_ONLY=Win32FloatArgProbe Win32ImtThunkProbe Win32NestedLinkProbe
 
 set FAILED=
 
