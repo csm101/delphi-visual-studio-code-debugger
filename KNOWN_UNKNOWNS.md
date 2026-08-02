@@ -141,6 +141,26 @@ Still open:
   already implements the second half. Both halves are structural, so the
   candidate is identified rather than guessed.
 
+  That design was implemented too, and it DID recover the frame -- x86 showed
+  `RunRtlCallback` where it had been missing -- but with the WRONG LINE: 81
+  (`Names.Free`) instead of 79 (`Names.CustomSort(...)`). The candidate it
+  accepted is the FINALLY HANDLER address stored in the try/finally exception
+  record, which lives on the stack in the same gap, is inside the right
+  function, and passes `IsAfterCallSite` on its preceding bytes. Reverted: a
+  frame pointing at the wrong statement is a wrong frame, and one that names
+  the right routine is more misleading than an absent one, not less.
+
+  So the remaining problem is precise: DISTINGUISHING the return address the
+  `call` pushed from other code addresses of the same function that are also on
+  the stack. `IsAfterCallSite` is too weak for that -- it scans a few bytes back
+  for a call-shaped encoding and arbitrary bytes satisfy it. Candidate
+  directions, none verified:
+    * decode the indirect call at the site properly (`FF /2` with its modrm and
+      displacement) and confirm the VMT slot it reads holds the frameless
+      callee's entry -- exact, but needs the object pointer at that moment;
+    * find the exception-record layout and EXCLUDE addresses that are fields of
+      one, rather than trying to out-rank them.
+
   Constraints to respect either way:
     * One level at a time, re-running per adjacent pair, since several
       frameless callees can nest.
