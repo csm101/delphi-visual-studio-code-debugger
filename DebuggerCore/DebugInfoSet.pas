@@ -895,6 +895,17 @@ begin
         if SameText(A.Name, Locals[Idx].Name) then begin
           if IsBetterHint(A.TypeHint, Locals[Idx].TypeHint) then
             Locals[Idx].TypeHint := A.TypeHint;
+          // Being a PARAMETER is a fact about the source, not about a format, so
+          // whichever provider records it is right and the others simply do not
+          // know. RSM tags it on the record; TD32 does not distinguish parameters
+          // from body locals at all and calls everything lkLocal.
+          //
+          // It cannot be recovered from the offset sign either: parameters sit at
+          // POSITIVE offsets on x64 (`A` at +24) but at NEGATIVE ones on x86
+          // (`A` at -4, among body locals at -20 and -24), so a sign test would
+          // be right on one target and silently wrong on the other.
+          if A.ParamStatus <> spsUnknown then
+            Locals[Idx].ParamStatus := A.ParamStatus;
           Break;
         end;
   end;
@@ -995,6 +1006,14 @@ begin
       for var Idx := 0 to High(Locals) do
         for var A in Augment do
           if SameText(A.Name, Locals[Idx].Name) then begin
+            // Being a PARAMETER is a fact about the source, so whichever
+            // provider records it is right and the others simply do not know:
+            // RSM tags it, TD32 calls every symbol a local. Merged before the
+            // ambiguity guard below, which is about which TYPE HINT to trust
+            // and says nothing about this. See the sibling merge in
+            // GetLocalsForFunction for why the offset sign cannot substitute.
+            if A.ParamStatus <> spsUnknown then
+              Locals[Idx].ParamStatus := A.ParamStatus;
             var Cur := Locals[Idx].TypeHint;
             var DupCount: Integer;
             DupNames.TryGetValue(AnsiLowerCase(A.Name), DupCount);

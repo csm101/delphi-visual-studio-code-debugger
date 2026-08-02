@@ -21,6 +21,26 @@ uses
 type
   TExprValue = record
     TypeHint:     string;   // Delphi type name, or error message when IsValid=False
+    ValueKind:    Byte;     // The kind of the VALUE this expression yields
+                            // (TK_DYNARRAY, ...; 0 = unknown), resolved by the
+                            // provider that owns the type table. The NAME cannot
+                            // answer this: TD32 spells a dynamic array and a
+                            // pointer to its element identically. A local
+                            // supplies it from its own type, a var-out return
+                            // from what its hidden Result points at.
+    ParamStatus: TSymbolParamStatus;
+                            // Parameter, body local, or unstated. An open array
+                            // and a dynamic array have identical type records,
+                            // and an open array only ever occurs as a parameter,
+                            // so this is what separates "has a length header"
+                            // from "its bound is passed separately and is not in
+                            // the debug info at all".
+    IsSymbolRef:  Boolean;  // The value IS a declared symbol (a local or a
+                            // parameter), as opposed to one derived by indexing,
+                            // field access or a call. Only a symbol can be an
+                            // open array, so ParamStatus only means anything
+                            // here -- for a derived value the open-array
+                            // question does not arise at all.
     TypeInfoAddr: UInt64;   // PTypeInfo in debuggee; 0 when unknown
     Address:      UInt64;   // lvalue address in debuggee; 0 for rvalues
     RawValue:     UInt64;   // up to 8 bytes of value data
@@ -113,7 +133,14 @@ type
     // Distinguishes a real dynamic array from a bare pointer-to-element by
     // looking for a live dyn-array header below the data pointer, which is the
     // only reliable signal: TD32 renders both as `^Element`.
-    function  TryDynArrayCountFromHeader(DataPtr: UInt64; out Count: Int64): Boolean;
+    // True when the DECLARED type is a dynamic array. Answered from the type
+    // graph: a NAME cannot tell `TArray<Integer>` from `^Integer`, and the
+    // bytes in memory are not evidence about what a value IS.
+    function  IsDeclaredDynArray(const V: TExprValue): Boolean;
+    // True when a dyn-array header may be read at this value's data pointer,
+    // i.e. when it cannot be an open-array parameter. Weaker than
+    // IsDeclaredDynArray, which also demands a positive identification.
+    function  MayReadDynArrayHeader(const V: TExprValue): Boolean;
     // Stride of one array element. A record / set / static array element is
     // stored by value and is as wide as itself; everything else PrimTypeSize
     // does not recognise really is a pointer-sized handle.
@@ -355,36 +382,52 @@ begin
               @Len, Layout.DynArrayLengthSize);
 end;
 
-// True when a live dynamic-array header sits below DataPtr, in which case Count
-// is its element count. Used to tell a real dynamic array from a bare
-// pointer-to-element when the NAME cannot: TD32 renders both as `^Element`.
+// True when the DECLARED type of this value is a dynamic array, decided from
+// the type graph rather than from the shape of memory.
 //
-// The same sanity test the dyn-array formatter applies, and for the same reason
-// -- an arbitrary pointer has SOMETHING at ptr-8, so the value only counts as a
-// header when both fields are self-consistent: a length within a sane range and
-// a refcount that is either -1 (a constant/literal array) or a live count.
-function TExprEvaluator.TryDynArrayCountFromHeader(DataPtr: UInt64;
-  out Count: Int64): Boolean;
-const
-  MAX_PLAUSIBLE_LEN = 1 shl 24;
+// The distinction matters and the NAME cannot make it: TD32 has no dynamic-array
+// encoding, so `TArray<Integer>` and a genuine `^Integer` are both spelled
+// `^Integer`. The graph does separate them -- a dynamic array is a pointer to an
+// array descriptor -- which is what PointeeKindById reports.
+//
+// An earlier version of this probed memory for a "plausible" header instead:
+// length under some bound, refcount either -1 or a small positive. That answers
+// a different question -- "do these bytes look like a header" -- and would call
+// an open-array parameter a dynamic array whenever the unrelated words in front
+// of it happened to fit. A debugger's answers should not depend on what the
+// neighbouring memory looks like.
+// True when reading a dynamic-array header at this value's data pointer is
+// sound -- i.e. when the value cannot be an open-array parameter.
+//
+// The open-array hazard applies to SYMBOLS only: `array of T` as a parameter
+// type compiles to the same type record as a dynamic array but has no header,
+// its bound travelling as a hidden argument that no debug-info format records.
+// A value produced by indexing, field access or a call is never an open array,
+// so for those the question does not arise.
+function TExprEvaluator.MayReadDynArrayHeader(const V: TExprValue): Boolean;
 begin
-  Count  := 0;
-  Result := False;
-  if DataPtr < 65536 then
-    Exit;
-  var Len: UInt64;
-  if not ReadDynArrayLength(DataPtr, Len) then
-    Exit;
-  if Int64(Len) > MAX_PLAUSIBLE_LEN then
-    Exit;
-  var RefCnt: Int32 := 0;
-  if not FDebugger.ReadProcessMemoryAt(
-           FDebugger.TargetLayout.DynArrayRefCountAddr(DataPtr), @RefCnt, 4) then
-    Exit;
-  if not ((RefCnt = -1) or ((RefCnt >= 1) and (RefCnt <= MAX_PLAUSIBLE_LEN))) then
-    Exit;
-  Count  := Int64(Len);
-  Result := True;
+  if not V.IsSymbolRef then
+    Exit(True);
+  Result := V.ParamStatus = spsLocal;
+end;
+
+function TExprEvaluator.IsDeclaredDynArray(const V: TExprValue): Boolean;
+begin
+  if V.ValueKind <> TK_DYNARRAY then
+    Exit(False);
+  // An OPEN ARRAY parameter compiles to the same type record as a dynamic array
+  // -- `^Element` pointing at an array descriptor, in both TD32 and RSM -- but
+  // it has no length header: Delphi passes its bound as a separate hidden
+  // argument that neither format records. The one thing that separates them is
+  // that an open array can only ever BE a parameter, so a value known to be a
+  // body local and of this shape is a dynamic array and nothing else.
+  //
+  // For a SYMBOL, anything other than a known body local answers False,
+  // INCLUDING the unknown state. Treating "no provider said" as "it is a local"
+  // would be the guess this is here to avoid: it is how `Length(A)` on an open
+  // array came to report 50013, read from the unrelated words that happened to
+  // precede the data.
+  Result := MayReadDynArrayHeader(V);
 end;
 
 { Value construction }
@@ -399,8 +442,11 @@ end;
 function TExprEvaluator.LocalToExpr(const L: TLocalValue): TExprValue;
 begin
   Result          := Default(TExprValue);
-  Result.TypeHint := L.TypeHint;
-  Result.Size     := 8;
+  Result.TypeHint    := L.TypeHint;
+  Result.ValueKind     := L.TypeKind;
+  Result.ParamStatus   := L.ParamStatus;
+  Result.IsSymbolRef   := True;
+  Result.Size        := 8;
   if L.Kind = lkVarParam then begin
     // Dereference transparently: the slot holds a pointer; we present the pointee.
     Result.Address  := L.RawValue;
@@ -1043,11 +1089,10 @@ begin
     // a 3-element array returned a plausible integer from past the end and
     // `Scores[-1]` returned the length -- silently wrong values, not errors.
     //
-    // So ask memory instead of the name: if a valid dyn-array header sits below
-    // the data pointer, the base IS a dynamic array and its bounds apply. An
-    // open array fails that test (whatever precedes it is unrelated data) and
-    // keeps the previous unchecked behaviour, so this can only add rejections
-    // that were genuine errors.
+    // The TYPE GRAPH separates them, so ask it. When it says dynamic array the
+    // header is there by construction and its bounds apply; when it does not --
+    // including when the id is unknown -- nothing is claimed and the read is
+    // left unchecked, as before.
     var IsPtrToElem := (Base.TypeHint <> '') and (Base.TypeHint[1] = '^');
     if IsPtrToElem then begin
       // A var/reference-param base presents the pointee in RawValue; the actual
@@ -1055,10 +1100,13 @@ begin
       // first element reinterpreted as an address.
       if Base.DerefPtr then
         DataPtr := Base.Address;
-      var HeaderCount: Int64;
-      if TryDynArrayCountFromHeader(DataPtr, HeaderCount) and (Idx >= HeaderCount) then
-        Exit(InvalidValue(Format('<index %d out of bounds [0..%d]>',
-          [Idx, HeaderCount - 1])));
+      if IsDeclaredDynArray(Base) then begin
+        if not ReadDynArrayLength(DataPtr, ArrLen) then
+          Exit(InvalidValue('<cannot read array length>'));
+        if Idx >= Int64(ArrLen) then
+          Exit(InvalidValue(Format('<index %d out of bounds [0..%d]>',
+            [Idx, Int64(ArrLen) - 1])));
+      end;
     end else begin
       if not ReadDynArrayLength(DataPtr, ArrLen) then
         Exit(InvalidValue('<cannot read array length>'));
@@ -1379,16 +1427,21 @@ function TExprEvaluator.ApplyMethodCall(const Base: TExprValue;
   // of $20 -- the parser accepts both. Procedures (no return) have no
   // `Result` local; the caller falls back to the legacy heuristic.
   function TryGetReturnTypeFromResultLocal(const FullProcName: string;
-    out RetTypeName: string; out RetKind: Byte): Boolean;
+    out RetTypeName: string; out RetKind: Byte; out RetPointeeKind: Byte): Boolean;
   var
     Locals: TArray<TLocalSymbol>;
   begin
-    Result := False;
+    Result    := False;
+    RetPointeeKind := 0;
     if FDebugInfo = nil then Exit;
     if not FDebugInfo.GetLocalsForFunction(FullProcName, Locals) then Exit;
     for var L in Locals do
       if SameText(L.Name, 'Result') and (L.TypeHint <> '') then begin
         RetTypeName := L.TypeHint;
+        // Carried out so the returned value keeps the resolved answer its NAME
+        // cannot give -- a returned dynamic array is spelled `^Element` exactly
+        // like a returned pointer.
+        RetPointeeKind := L.PointeeKind;
         RetKind     := TypeNameToKind(RetTypeName);
         // TD32 renders the Result of a VAR-OUT function as a POINTER to the
         // real return type -- `^Variant`, `^TPoint3D`, `^string` -- because the
@@ -1606,8 +1659,9 @@ begin
   // by hash, take the return ABI from the property's typeId. This catches
   // string-returning unpublished methods (`GetMyLabel: string`) where the
   // first-argument heuristic would otherwise hang the debuggee.
+  var RetPointeeKind: Byte;
   HaveBoundReturn   := TryGetReturnTypeFromResultLocal(FullName,
-                        RetTypeName, RetKind);
+                        RetTypeName, RetKind, RetPointeeKind);
   // VCL/RTL getters (e.g. TApplication.GetExeName) have no locals in our debug
   // info, so the Result-local probe above misses and the return ABI would
   // default to RAX. A managed return (string/interface/...) is passed via a
@@ -1862,6 +1916,10 @@ begin
        IsStringTypeHint(Copy(Result.TypeHint, 2, MaxInt)) then
       Result.TypeHint := Copy(Result.TypeHint, 2, MaxInt);
     Result.Size     := 8;
+    // Keep the declared id: this branch also carries a returned DYNAMIC ARRAY,
+    // and indexing it must be bound-checked from the type, not from whatever
+    // precedes the data pointer.
+    Result.ValueKind   := RetPointeeKind;
     if not FDebugger.ReadProcessMemoryAt(Slot, @Result.RawValue, 8) then
       Exit(InvalidValue('<string result deref failed>'));
   end else begin
@@ -3108,12 +3166,17 @@ function TExprEvaluator.ApplyIntrinsic(const Name: string;
     // bare (pointer, high) pair -- so the bytes below the data pointer are
     // unrelated. Reading them anyway returned whatever was there: on a 32-bit
     // target `Length(A)` on an open array reported 50013, and on a 64-bit one
-    // it happened to fail the read instead. Verify the header before trusting
-    // it, and say why when there is none.
-    var HeaderCount: Int64;
-    if not TryDynArrayCountFromHeader(A.RawValue, HeaderCount) then
-      Exit(InvalidValue('<Length: no dynamic-array header; an open-array ' +
-        'parameter carries its bound separately>'));
+    // it happened to fail the read instead. The declared type says which this
+    // is; the bytes in front of the pointer do not.
+    // Gated on the open-array hazard only, NOT on a positive dyn-array
+    // identification. A field, a property result or an array element is never
+    // an open array, and its declared kind is not always resolvable -- refusing
+    // those would drop `Length(S.PubTriple)`, which is a plain dynamic array
+    // reached through a property.
+    if not MayReadDynArrayHeader(A) then
+      Exit(InvalidValue('<Length: no dynamic-array header here; an open-array ' +
+        'parameter carries its bound as a hidden argument that the debug ' +
+        'information does not record>'));
     if not ReadDynArrayLength(A.RawValue, L) then
       Exit(InvalidValue('<Length: array length read failed>'));
     Result := MakeInt64(Int64(L));
@@ -3147,18 +3210,16 @@ function TExprEvaluator.ApplyIntrinsic(const Name: string;
     if SameText(A.TypeHint, 'Integer') then begin
       if UseMax then Exit(MakeInt64(MaxInt)) else Exit(MakeInt64(-MaxInt - 1));
     end;
-    // Dynarrays: Low=0, High=Length-1. Matched by NAME here, but TD32 renders a
-    // dynamic array as `^Element`, so a `TArray<Integer>` local reached the
-    // "not supported" line below while `Length()` on the very same value
-    // worked. Confirm by header instead when the name is a bare pointer -- the
-    // same discriminator ApplyIndex uses, so the three intrinsics agree about
-    // what is an array.
-    var LooksLikeDynArrayByName :=
-      A.TypeHint.StartsWith('TArray<', True) or A.TypeHint.StartsWith('array of ', True);
-    var HeaderCount: Int64;
-    var HasHeader := (A.TypeHint <> '') and (A.TypeHint[1] = '^') and
-                     TryDynArrayCountFromHeader(A.RawValue, HeaderCount);
-    if LooksLikeDynArrayByName or HasHeader then begin
+    // Dynarrays: Low=0, High=Length-1. The NAME alone misses them -- TD32
+    // renders a dynamic array as `^Element`, so a `TArray<Integer>` local
+    // reached the "not supported" line below while `Length()` on the very same
+    // value worked. Ask the type graph, the same discriminator ApplyIndex and
+    // Length use, so the three intrinsics agree about what is an array.
+    var IsDynArray :=
+      A.TypeHint.StartsWith('TArray<', True) or
+      A.TypeHint.StartsWith('array of ', True) or
+      IsDeclaredDynArray(A);
+    if IsDynArray then begin
       if not UseMax then Exit(MakeInt64(0));
       var Len := DynArrayLength(A);
       if not Len.IsValid then Exit(Len);

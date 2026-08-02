@@ -4440,8 +4440,10 @@ begin
       Continue;
     var V: TLocalValue;
     V.Name       := NamePrefix + Sym.Name;
-    V.TypeHint   := Sym.TypeHint;
-    V.Kind       := Sym.Kind;
+    V.TypeHint    := Sym.TypeHint;
+    V.TypeKind    := Sym.TypeKind;
+    V.ParamStatus := Sym.ParamStatus;
+    V.Kind        := Sym.Kind;
     V.RawValue   := 0;
     V.ValueValid := False;
     V.DerefValue := 0;

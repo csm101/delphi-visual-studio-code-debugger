@@ -130,6 +130,12 @@ type
     // address with the whole array, and a slot that big was converted to a
     // Variant on size alone, so a plain zero displayed as `<empty>`.
     [Test] procedure MultiDimArrays_ReadAndBoundCheckOnBothBitnesses;
+    // ATTACHING to an already-running process was covered on the 64-bit target
+    // only, yet it is the flow used to debug a design package inside the IDE.
+    // A 64-bit adapter attaching to a WOW64 process has to get the initial
+    // break, module enumeration and PE32 parsing right before anything else
+    // works, so the assertion covers locals as well as the stop location.
+    [Test] procedure Attach_ToRunningTarget_StopsWithLocalsOnBothBitnesses;
     // TD32 stores globals mangled, and dcc32 mangles Borland-style where dcc64
     // mangles Itanium-style; only the latter was decoded, so NO unit global
     // resolved on a 32-bit target.
@@ -1383,10 +1389,10 @@ var
   SI: TStartupInfo;
   PI: TProcessInformation;
 begin
-  if not HaveDebugPrivilege then begin
-    Assert.Pass('Skipped: SeDebugPrivilege not held; run elevated to exercise attach.');
-    Exit;
-  end;
+  // No SeDebugPrivilege gate: it is needed to attach to ANOTHER user's process,
+  // and this test spawns its own target as the same user. With the gate this
+  // reported a pass in a tenth of a second while attaching to nothing, which is
+  // worse than having no test at all.
 
   // Spawn the target with --attach-pause: it Sleep(5000)s at startup, giving us a
   // window to attach before it races through MAIN_GCOUNTER.
@@ -3321,7 +3327,7 @@ const
   // reported as "empty" is a wrong answer that reads like a considered one.
   // MStatic[0,1] = 1 is next to it and was always fine, so the pair localises
   // the defect to the first element rather than to static arrays generally.
-  MDIM_CHECKS: array[0..8] of TExprCheck = (
+  MDIM_CHECKS: array[0..7] of TExprCheck = (
     (Expr: 'MStatic[0,0]';  Fragment: '0'),
     (Expr: 'MStatic[0,1]';  Fragment: '1'),
     (Expr: 'MStatic[1,2]';  Fragment: '12'),
@@ -3329,7 +3335,12 @@ const
     (Expr: 'MStatic[3,0]';  Fragment: 'out of bounds'),
     (Expr: 'MDyn[0][1]';    Fragment: '2'),
     (Expr: 'MDyn[1][1]';    Fragment: '5'),
-    (Expr: 'MDyn[0][9]';    Fragment: 'out of bounds'),
+    // NOTE: no `MDyn[0][9]` bounds assertion. The INNER index is applied to an
+    // element, and an element carries no resolved type kind, so there is no
+    // positive evidence that it is a dynamic array -- TD32 spells the element
+    // `^Integer`, which a plain pointer also is. Bounds are applied only where
+    // the array is identified, never on the strength of the memory looking
+    // right. Recorded in KNOWN_UNKNOWNS.
     (Expr: 'Length(MDyn)';  Fragment: '2'));
 
   // The recovery this guards must still work. A Variant alias local and a byRef
@@ -3398,6 +3409,89 @@ begin
   Assert.AreEqual('', Failures,
     'multi-dimensional array elements must read and bound-check, without a ' +
     'zero being mistaken for an empty Variant, on both bitnesses -- ' + Failures);
+end;
+
+procedure TWin32RunControlTests.Attach_ToRunningTarget_StopsWithLocalsOnBothBitnesses;
+const
+  SOURCE = 'TestTargetCore.pas';
+  MARKER = 'EVAL_BODY';
+
+  // Spawns the target paused, attaches to it, plants a breakpoint and reports
+  // 'line|Caption' at the stop. Locals are part of the assertion on purpose: a
+  // 64-bit adapter attaching to a WOW64 process has to get the initial break,
+  // the module list and PE32 parsing right before a local can be read at all,
+  // so a correct line with unreadable locals would be a half-working attach.
+  function AttachAndRead(const Exe, Map, Rsm: string; Line: Integer): string;
+  var
+    SI: TStartupInfo;
+    PI: TProcessInformation;
+  begin
+    SI := Default(TStartupInfo);
+    SI.cb := SizeOf(SI);
+    // --attach-pause makes the target sleep at startup, which is the window the
+    // attach has to land in.
+    var CmdLine := '"' + Exe + '" --attach-pause';
+    if not CreateProcess(nil, PChar(CmdLine), nil, nil, False,
+             CREATE_NEW_CONSOLE, nil, nil, SI, PI) then
+      Exit('<CreateProcess failed>');
+    CloseHandle(PI.hThread);
+
+    var Session := TDebugSession.Create;
+    try
+      var Opts: TAttachOptions;
+      Opts             := Default(TAttachOptions);
+      Opts.ProgramPath := Exe;
+      Opts.MapPath     := Map;
+      Opts.RsmPath     := Rsm;
+      Opts.SourceRoot  := TargetDir;
+      Session.Attach(PI.dwProcessId, True, Opts);   // own the target
+
+      var Spec: TBpLineSpec;
+      Spec      := Default(TBpLineSpec);
+      Spec.Line := Line;
+      Session.SetBreakpoints(SOURCE, [Spec]);
+
+      var Deadline := GetTickCount64 + 40000;
+      while (Session.State <> dsStopped) and (not Session.HasExited) and
+            (GetTickCount64 < Deadline) do
+        Session.Pump;
+      if Session.State <> dsStopped then
+        Exit('<did not stop>');
+
+      var Fn, Src: string;
+      var StopLine: Integer;
+      Session.GetCurrentLocation(Fn, Src, StopLine);
+      var R := Session.Evaluate('Caption');
+      var CaptionText: string;
+      if R.Success then CaptionText := R.Value else CaptionText := '<' + R.ErrorText + '>';
+      Result := Format('%d|%s', [StopLine, CaptionText]);
+    finally
+      Session.Terminate;   // killOnDetach = True, so this ends the target
+      Session.Free;
+    end;
+  end;
+
+begin
+  // Deliberately NOT gated on SeDebugPrivilege. That privilege is required to
+  // attach to a process owned by someone else; this test spawns its own target
+  // as the same user, which needs no privilege at all. Gating it made the test
+  // report a pass in 0.1 s while exercising nothing -- worse than no test.
+  var Line := MarkerLineInFile(TargetDir + SOURCE, MARKER);
+  Assert.IsTrue(Line > 0, 'marker ' + MARKER + ' not found');
+  Assert.IsTrue(FileExists(Win64Exe), '64-bit control target missing');
+
+  var Expected := Format('%d|''Hello''', [Line]);
+  var Failures := '';
+  var Got64 := AttachAndRead(Win64Exe, Win64Map, Win64Rsm, Line);
+  if not Got64.StartsWith(Expected) then
+    Failures := Failures + Format('x64 -> %s (wanted %s); ', [Got64, Expected]);
+  var Got32 := AttachAndRead(Win32Exe, Win32Map, Win32Rsm, Line);
+  if not Got32.StartsWith(Expected) then
+    Failures := Failures + Format('x86 -> %s (wanted %s); ', [Got32, Expected]);
+
+  Assert.AreEqual('', Failures,
+    'attaching to a running target must stop at the breakpoint and read its ' +
+    'locals, on both bitnesses -- ' + Failures);
 end;
 
 procedure TWin32RunControlTests.BreakpointOnBeginLine_ReportsPassedParameters;

@@ -2310,6 +2310,15 @@ begin
         Local.Kind := lkVarParam
       else
         Local.Kind := lkLocal;
+      // RSM tags parameters on the record, so this reader can state the fact
+      // rather than leave it unknown. `$22` is a var/reference parameter and
+      // `$23` an out parameter; `$20` is a body local. Consumers rely on this
+      // to tell an open-array PARAMETER (no length header, bound passed
+      // separately) from a dynamic-array LOCAL, which have identical types.
+      if FData[Off] in [$22, $23] then
+        Local.ParamStatus := spsParameter
+      else
+        Local.ParamStatus := spsLocal;
       Local.TypeHint  := ResolveTypeIdInUnit(ProcUnit, ProcUnitImports, TypeId);
       // The implicit `Self` parameter always points to an instance of the
       // method's enclosing class. The RSM TypeId for Self is per-unit, so on

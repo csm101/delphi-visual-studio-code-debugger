@@ -1872,6 +1872,12 @@ begin
   // parameter slots, negative offsets are locals -- caller distinguishes.
   L.Kind            := lkLocal;
   L.TypeHint        := GetTypeName(Typ);
+  // Resolve the type questions HERE, where the id is meaningful. The name alone
+  // cannot answer them: TD32 spells a dynamic array and a pointer to its
+  // element identically (`^Integer`), and only the graph -- pointer to an array
+  // descriptor -- separates them.
+  L.PointeeKind     := PointeeKindById(Typ);
+  L.TypeKind        := TypeKindById(Typ);
   // TD32 BPREL32 offsets in Delphi follow the same RSM-encoded
   // convention (offset relative to the per-direction base, NOT
   // literal RBP). Setting UseDirectOffset=False lets the adapter's
@@ -1910,6 +1916,8 @@ begin
   L.TypeId          := Integer(Typ);
   L.Kind            := lkLocal;
   L.TypeHint        := GetTypeName(Typ);
+  L.PointeeKind     := PointeeKindById(Typ);   // see HandleBpRel32
+  L.TypeKind        := TypeKindById(Typ);
   L.UseDirectOffset := False;
   L.RegId           := RegId;
   L.BlockStartRva   := BlockStartRva;

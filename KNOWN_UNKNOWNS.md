@@ -66,6 +66,22 @@ Still open:
 
 ## Per-unit / per-binary type resolution
 
+- **Dynamic-array bounds are not applied to an array reached indirectly** —
+  bounds checking requires a POSITIVE identification that the value is a
+  dynamic array, which comes from the declared type of a symbol
+  (`TLocalSymbol.TypeKind`, resolved by the provider owning the type table).
+  A value obtained by INDEXING, field access or a call carries no resolved
+  kind, so `MDyn[0][9]` on a `TArray<TArray<Integer>>` reads past the inner
+  array's end instead of refusing. Deliberately left unchecked rather than
+  inferred from the memory at the pointer: TD32 spells the element `^Integer`,
+  which a plain pointer also is, and a header-shaped read is not evidence of a
+  header. Closing it means carrying the element / member type kind through
+  indexing and field resolution the way locals already do.
+  The related open-array hazard IS handled -- see `MayReadDynArrayHeader`: an
+  open array only ever occurs as a parameter symbol, so a derived value can
+  never be one, which is why `Length()` still answers for a property-reached
+  array while refusing for an open-array parameter.
+
 - **Closure-captured variables can vanish while the symbol index is cold** —
   measured 2026-08-02: the same test, same binary, listed `CapStr` and `CapInt`
   on some runs, only `CapStr` on others, and neither on one. Not a stale

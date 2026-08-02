@@ -94,6 +94,21 @@ type
     ValueValid: Boolean;
     DerefValue: UInt64;
     DerefValid: Boolean;
+    ParamStatus: TSymbolParamStatus;
+                             // Parameter, body local, or not stated by any
+                             // provider. Decides a question the TYPE cannot: an
+                             // open array and a dynamic array have identical
+                             // type records, and an open array only ever occurs
+                             // as a parameter. The unknown state is load-bearing
+                             // -- see TSymbolParamStatus.
+    TypeKind:    Byte;       // The kind of this local's own declared type, already
+                             // resolved by the provider that produced it
+                             // (TK_DYNARRAY, TK_RECORD, ...; 0 = unknown).
+                             // A resolved ANSWER rather than a type id, because
+                             // an id only means something inside the table it
+                             // came from -- TD32 and RSM number the same local
+                             // differently, and swapping them resolves to an
+                             // unrelated type.
     RegId:      Word;        // 0 = stack-allocated (Address valid).
                              // > 0 = register-allocated; runtime value
                              // read through GetRegisters instead of

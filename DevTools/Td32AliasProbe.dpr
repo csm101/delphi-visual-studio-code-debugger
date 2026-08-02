@@ -89,8 +89,8 @@ begin
     var KindText := 'local';
     if L.Kind = lkVarParam then
       KindText := 'varParam';
-    Writeln(Format('  %-20s kind=%-10s TypeId=$%.4x  name=%-16s chain=%s',
-      [L.Name, KindText, L.TypeId,
+    Writeln(Format('  %-20s kind=%-10s off=%-6d TypeId=$%.4x  name=%-16s chain=%s',
+      [L.Name, KindText, L.RbpOffset, L.TypeId,
        Reader.GetTypeName(Cardinal(L.TypeId)),
        Reader.DescribeTypeChain(Cardinal(L.TypeId))]));
   end;
@@ -128,8 +128,13 @@ begin
       Exit;
     end;
     Writeln('== RSM/DCP locals of ' + ProcName + ' (' + RsmPath + ') ==');
-    for var L in Locals do
-      Writeln(Format('  %-20s TypeId=$%.4x  hint=%s', [L.Name, L.TypeId, L.TypeHint]));
+    for var L in Locals do begin
+      var KindText := 'local';
+      if L.Kind = lkVarParam then
+        KindText := 'varParam';
+      Writeln(Format('  %-20s kind=%-9s off=%-6d TypeId=$%.4x  hint=%s',
+        [L.Name, KindText, L.RbpOffset, L.TypeId, L.TypeHint]));
+    end;
   finally
     R.Free;
   end;

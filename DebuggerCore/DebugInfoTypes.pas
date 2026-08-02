@@ -20,10 +20,34 @@ type
     lkVarParam   // var/reference parameter (RSM tag 0x22) -- the stack slot holds a pointer to the real storage
   );
 
+  // Whether a symbol is a parameter, a body local, or whether the debug info
+  // consulted does not say. The third state is the point: an open array and a
+  // dynamic array are the same TYPE record, and only "this is a parameter"
+  // separates them -- so "nobody told us" must not be read as "it is a local".
+  TSymbolParamStatus = (spsUnknown, spsLocal, spsParameter);
+
   TLocalSymbol = record
     Name:            string;
     RbpOffset:       Integer;    // signed offset from RBP; may be negative (locals) or positive (parameters)
     TypeId:          Integer;    // raw type identifier from the record; references a per-procedure type table (not yet fully decoded). Same for variables of the same type.
+    // What this symbol's type POINTS AT, resolved by the provider that produced
+    // the symbol -- TK_DYNARRAY, TK_RECORD, ... or 0 when that provider cannot
+    // tell. Answered here, at the source, because a TypeId is only meaningful
+    // inside the type table it came from: TD32 calls `Scores` $B4BA and RSM
+    // calls it $020D, and handing either id to the other reader resolves to an
+    // unrelated type. Consumers need the ANSWER, not the id.
+    PointeeKind:     Byte;
+    // The kind of the symbol's OWN declared type, resolved the same way. Both
+    // are needed and they are different questions: a `TArray<Integer>` local is
+    // itself the dynamic array (TypeKind), while the hidden `Result` of a
+    // function returning one is a POINTER to it (PointeeKind).
+    TypeKind:        Byte;
+    // Whether this symbol is a parameter or a body local -- and, as a third
+    // state, whether that is known at all. Deliberately not a Boolean: "no
+    // provider said parameter" is NOT the same claim as "it is a local", and
+    // conflating them is what turns a missing fact into a wrong answer. RSM
+    // tags every symbol; TD32 calls them all locals and so records nothing.
+    ParamStatus:     TSymbolParamStatus;
     Kind:            TLocalKind;
     TypeHint:        string;     // optional type name, empty if unknown
     UseDirectOffset: Boolean;    // True for TYPEREF_MARKER_MAIN ($46) locals: RbpOffset is the direct RBP slot, not RSM-encoded (no div-2/FrameSize)
