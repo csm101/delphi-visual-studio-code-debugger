@@ -16,6 +16,12 @@ procedure RunOpenArray;
 // debug info, so the stack has to bridge a run of SOURCELESS frames and still
 // reach the caller. Same shape as breaking inside a VCL event handler.
 procedure RunRtlCallback;
+// A THREADVAR has no address in the image: it lives in the per-thread TLS block,
+// reached through the thread's own TEB. A debugger that resolves it like an
+// ordinary global lands inside the PE headers and shows those bytes as the
+// value, with nothing to mark the answer as wrong. The marker value below is
+// deliberately unmistakable so a bad read cannot pass for a plausible one.
+procedure RunThreadVar;
 
 type
   TInner3  = record X, Y: Integer; end;
@@ -150,6 +156,15 @@ begin
   Chain.A.B.C.Free; Chain.A.B.Free; Chain.A.Free; Chain.Free;
   NestList[0].Free; NestList.Free;
   Dict.Free;
+end;
+
+threadvar
+  GTlsMarker: Integer;
+
+procedure RunThreadVar;
+begin
+  GTlsMarker := Integer($5A5A5A5A);
+  GSink.Use('tls-body', [GTlsMarker]);   // {BP:TLS_BODY}
 end;
 
 initialization

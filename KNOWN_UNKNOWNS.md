@@ -600,11 +600,38 @@ object expansion, evaluation, multi-BPL). See "Target architecture" in
   declared supported for `-$O-` builds only, because `-$O+` omits the frame
   pointer routinely. Whether the debug info of an optimised 32-bit build still
   carries offsets that can be anchored to something else has not been measured.
-- **Win32 TLS segment bases.** The MAP's TLS segment `Start` is not the PE
-  `.tls` `VirtualAddress` — on either platform. On a 32-bit build the TLS
-  segment's `Start` is 0, i.e. below the preferred base, so it stays
-  unregistered and any TLS-relative address is unresolved. The correct
-  derivation for a TLS segment base is unknown.
+- **Threadvars are not resolved (both bitnesses).** A `threadvar` has NO address
+  in the image: it lives in the per-thread TLS block. The question was
+  previously filed as "what is the TLS segment base", which has no answer —
+  there is no single base, only one per thread.
+
+  What WAS wrong and is now fixed: the MAP's TLS segment resolved to base RVA 0
+  on both platforms (Win32 prints `Start` as 0; Win64 prints the preferred base,
+  which subtracts to the same thing), so a threadvar resolved to a low RVA and
+  the debugger read the **PE headers** and reported those bytes as the value.
+  Measured on the `GTlsMarker` fixture: the debugger answered `0  (0x0)` for a
+  variable holding `$5A5A5A5A`, on x64 and x86 alike, with nothing marking the
+  answer as wrong. TLS-segment symbols now get no RVA at all, and a lookup says
+  `threadvar -- per-thread storage is not resolved yet`. Asserted by
+  `ThreadVar_IsNeverSilentlyWrongOnBothBitnesses`, which accepts the right value
+  OR an honest refusal and rejects a wrong number, so it stays valid once
+  resolution lands.
+
+  What is still needed to actually READ one:
+    * `TlsIndex` — from the module's PE TLS directory (`IMAGE_DIRECTORY_ENTRY_TLS`,
+      index 9), whose `AddressOfIndex` field points at the DWORD holding it.
+      Static, per module, readable from the target.
+    * the thread's TEB — `NtQueryInformationThread(ThreadBasicInformation)` gives
+      `TebBaseAddress`. For a WOW64 target seen from a 64-bit debugger the
+      32-bit TEB is NOT that address; where it sits must be MEASURED before it
+      is relied on, exactly as the VMT offsets and the IMT thunk encodings were.
+    * `ThreadLocalStoragePointer` inside the TEB, then
+      `block := [TlsPointer + TlsIndex * PointerSize]`, and finally
+      `address := block + segmentOffset`.
+
+  Note the answer is PER THREAD, so whatever resolves it has to take the frame's
+  thread — a value cached against an address, as the current global path does,
+  would be wrong the moment another thread is selected.
 
 ## Class-member field typeId encoding on large type spaces (BLOCKS #2)
 

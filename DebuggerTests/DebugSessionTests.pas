@@ -192,6 +192,17 @@ type
     // a call. This is the test for that path; it had none, which is how a
     // recovery that accepted `push offset @@handler` went unnoticed.
     [Test] procedure StoppedInCtorPreamble_StackStillReachesTheCallerOnBothBitnesses;
+    // A threadvar has NO address in the image. The MAP's TLS segment resolves to
+    // a zero base on both bitnesses -- Win32 prints Start as 0, Win64 prints the
+    // preferred base, which subtracts to the same thing -- so resolving one like
+    // an ordinary global lands inside the PE HEADERS and reports those bytes as
+    // the value. Silently wrong, and indistinguishable from a real read.
+    //
+    // The assertion is deliberately two-sided: the debugger may say it cannot
+    // read the variable, or it may report the right value, but it must not
+    // report a WRONG one. That keeps the test valid both now and after the
+    // runtime TLS resolution (TEB -> ThreadLocalStoragePointer) is implemented.
+    [Test] procedure ThreadVar_IsNeverSilentlyWrongOnBothBitnesses;
     // TD32 stores globals mangled, and dcc32 mangles Borland-style where dcc64
     // mangles Itanium-style; only the latter was decoded, so NO unit global
     // resolved on a 32-bit target.
@@ -4051,6 +4062,56 @@ begin
   Assert.AreEqual('', Failures,
     'the stack must reach the caller across sourceless RTL frames, at the ' +
     'right line, on both bitnesses -- ' + Failures);
+end;
+
+procedure TWin32RunControlTests.ThreadVar_IsNeverSilentlyWrongOnBothBitnesses;
+const
+  SOURCE   = 'TestTargetEdge2.pas';
+  MARKER   = 'TLS_BODY';
+  // $5A5A5A5A. Distinctive on purpose: a value read from the wrong place cannot
+  // coincide with it, so "right" and "wrong" are never ambiguous.
+  EXPECTED = '1515870810';
+
+  function EvalAt(const Exe, Map, Rsm: string; Line: Integer): string;
+  begin
+    var Session := OpenSessionAtMarker(Exe, Map, Rsm, TargetDir, SOURCE, Line);
+    try
+      if Session.State <> dsStopped then
+        Exit('<did not stop>');
+      var R := Session.Evaluate('GTlsMarker');
+      if not R.Success then
+        Exit('<' + R.ErrorText + '>');
+      Result := R.Value;
+    finally
+      Session.Free;
+    end;
+  end;
+
+  // An answer is acceptable if it is the real value, or an honest refusal.
+  // Anything else is a number the user would believe.
+  function IsAcceptable(const Got: string): Boolean;
+  begin
+    if Got.Contains(EXPECTED) then
+      Exit(True);
+    Result := Got.StartsWith('<');
+  end;
+
+begin
+  var Line := MarkerLineInFile(TargetDir + SOURCE, MARKER);
+  Assert.IsTrue(Line > 0, 'marker ' + MARKER + ' not found');
+  Assert.IsTrue(FileExists(Win64Exe), '64-bit control target missing');
+
+  var Failures := '';
+  var Got64 := EvalAt(Win64Exe, Win64Map, Win64Rsm, Line);
+  if not IsAcceptable(Got64) then
+    Failures := Failures + 'x64: ' + Got64 + '; ';
+  var Got32 := EvalAt(Win32Exe, Win32Map, Win32Rsm, Line);
+  if not IsAcceptable(Got32) then
+    Failures := Failures + 'x86: ' + Got32 + '; ';
+
+  Assert.AreEqual('', Failures,
+    'a threadvar must read correctly or be reported as unavailable -- never a ' +
+    'wrong number -- on both bitnesses. Got ' + Failures);
 end;
 
 procedure TWin32RunControlTests.StoppedInCtorPreamble_StackStillReachesTheCallerOnBothBitnesses;

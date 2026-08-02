@@ -62,6 +62,7 @@ type
     FRangedFunc:      TList<TRangedFuncProvider>;
     FLineProviders:   TList<ISourceLineProvider>;
     FFuncProviders:   TList<IFunctionNameProvider>;
+    FTlsNameProviders: TList<IThreadLocalNameProvider>;
     FLocalProviders:  TList<ILocalSymbolProvider>;
     FGlobalProviders: TList<IGlobalSymbolProvider>;
     FUsesProviders:   TList<IUnitUsesProvider>;
@@ -210,6 +211,10 @@ type
     // return address is very often itself a line address, and starting there
     // would leave nothing to prove.
     function  NearestLineRvaBefore(Rva: UInt64; out FoundRva: UInt64): Boolean;
+    // True when the name is a THREADVAR -- present in the debug info but with
+    // no address in the image. Lets a failed lookup say why instead of the
+    // misleading "not found".
+    function  NameIsThreadLocal(const Name: string): Boolean;
   end;
 
 implementation
@@ -227,6 +232,7 @@ begin
   FRangedFunc      := TList<TRangedFuncProvider>.Create;
   FLineProviders   := TList<ISourceLineProvider>.Create;
   FFuncProviders   := TList<IFunctionNameProvider>.Create;
+  FTlsNameProviders := TList<IThreadLocalNameProvider>.Create;
   FLocalProviders  := TList<ILocalSymbolProvider>.Create;
   FGlobalProviders := TList<IGlobalSymbolProvider>.Create;
   FUsesProviders   := TList<IUnitUsesProvider>.Create;
@@ -249,6 +255,7 @@ begin
   FRangedFunc.Free;
   FLineProviders.Free;
   FFuncProviders.Free;
+  FTlsNameProviders.Free;
   FLocalProviders.Free;
   FGlobalProviders.Free;
   FUsesProviders.Free;
@@ -294,6 +301,9 @@ begin
       FLocalProviders.Add(LocalP);
   if Supports(Provider, IGlobalSymbolProvider, GlobalP) then
     FGlobalProviders.Add(GlobalP);
+  var TlsP: IThreadLocalNameProvider;
+  if Supports(Provider, IThreadLocalNameProvider, TlsP) then
+    FTlsNameProviders.Add(TlsP);
   var UsesP: IUnitUsesProvider;
   if Supports(Provider, IUnitUsesProvider, UsesP) then
     FUsesProviders.Add(UsesP);
@@ -397,6 +407,9 @@ begin
       if FRangedFunc[I].Prov = FuncP then
         FRangedFunc.Delete(I);
   end;
+  var TlsP: IThreadLocalNameProvider;
+  if Supports(Provider, IThreadLocalNameProvider, TlsP) then
+    FTlsNameProviders.Remove(TlsP);
   if Supports(Provider, ILocalSymbolProvider, LocalP) then begin
     FLocalProviders.Remove(LocalP);
     for var I := FRangedLocals.Count - 1 downto 0 do
@@ -1462,6 +1475,14 @@ begin
       Result[Last] := Result[I];
     end;
   SetLength(Result, Last + 1);
+end;
+
+function TDebugInfoSet.NameIsThreadLocal(const Name: string): Boolean;
+begin
+  for var P in FTlsNameProviders do
+    if P.NameIsThreadLocal(Name) then
+      Exit(True);
+  Result := False;
 end;
 
 function TDebugInfoSet.NearestLineRvaBefore(Rva: UInt64;

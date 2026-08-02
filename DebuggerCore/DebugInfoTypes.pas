@@ -182,6 +182,17 @@ type
     function FindGlobal(const Name: string; out Global: TGlobalSymbol): Boolean;
   end;
 
+  // Optional: recognise a name as a THREADVAR. Such a symbol appears in the
+  // debug info but has no address in the image -- it lives in the per-thread
+  // TLS block -- so no address-based provider can return it. Without this a
+  // threadvar is reported as "not found", which sends the user looking for a
+  // typo in a name that is plainly there in the source. Only providers that can
+  // SEE the distinction (the MAP has a TLS segment class) implement it.
+  IThreadLocalNameProvider = interface
+    ['{2F5A6C01-1111-4A42-8C3D-53ABAABB0011}']
+    function NameIsThreadLocal(const Name: string): Boolean;
+  end;
+
   // Optional: disambiguate a same-named GLOBAL by the UNIT that declares it.
   // A global var name can collide across units in ONE binary; the plain
   // FindGlobal (first-hit) then returns the wrong unit's metadata (type). A

@@ -2883,6 +2883,20 @@ Working on the x86 stack walker, which is the riskiest component in the project.
 
 ### In flight (not committed)
 
+0. **Threadvars read the PE headers — FIXED, reproduced on BOTH bitnesses first.**
+   The MAP's TLS segment resolves to base RVA 0 everywhere (Win32 prints `Start`
+   as 0, Win64 prints the preferred base), so a `threadvar` got a low RVA and the
+   debugger reported header bytes as its value. Measured with a new fixture
+   (`GTlsMarker` = `$5A5A5A5A`): the debugger answered `0  (0x0)` on x64 and x86
+   alike. Reproduction was verified by stashing the fix, running, and unstashing.
+   TLS-segment symbols now get no RVA; a lookup answers
+   `threadvar -- per-thread storage is not resolved yet` via the new
+   `IThreadLocalNameProvider`. MAP sidecar magic bumped MIX3 -> MIX4, since
+   existing sidecars have the bogus addresses baked in.
+   Real resolution (TEB -> ThreadLocalStoragePointer[TlsIndex] + offset) is
+   specified in KNOWN_UNKNOWNS, including the part that must be MEASURED: where
+   the 32-bit TEB sits for a WOW64 target seen from a 64-bit debugger.
+
 1. **EIntOverflow in the RTTI reader — FIXED and reproduced first.**
    `ReadVmtSlot` computed `UInt64(Int64(VmtAddr) + Offset)`, which underflows for
    a VmtAddr at the sign boundary; the adapter ships with `-$Q+`, so it RAISED

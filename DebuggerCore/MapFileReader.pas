@@ -28,7 +28,8 @@ type
   end;
 
   TMapFile = class(TInterfacedObject,
-    ISourceLineProvider, IFunctionNameProvider, IBackgroundIndexProvider)
+    ISourceLineProvider, IFunctionNameProvider, IBackgroundIndexProvider,
+    IThreadLocalNameProvider)
   private
     // Memory-mapped file
     FFileHandle:     THandle;
@@ -82,6 +83,16 @@ type
     // publics that live in them. Filled eagerly (segments) and during the
     // publics scan (RVAs).
     FDataSegments:      TDictionary<Integer, Boolean>;
+    // Segments of class TLS. Their symbols are thread-local: they have NO
+    // address in the image, so a static RVA for one is not merely imprecise, it
+    // points somewhere else entirely. See TryParseSegOffset.
+    FTlsSegments:       TDictionary<Integer, Boolean>;
+    // Names of the publics that live in those segments, full and unit-stripped,
+    // lower-cased. They get no RVA, so this is the only record that they exist
+    // -- which is what lets a lookup answer "thread-local" instead of the
+    // actively misleading "not found". Filled during the publics scan; valid
+    // once FPubsReady.
+    FTlsPubNames:       TDictionary<string, Boolean>;
     FDataRvas:          TDictionary<UInt64, Boolean>;
     // Real SizeOfImage of the module this MAP describes (0 = unknown). Bounds
     // RvaIsInImage so an Rva from another module cannot be attributed here.
@@ -139,6 +150,8 @@ type
     function    RvaToFunctionName(Rva: UInt64; out Name: string): Boolean;
     function    RvaToFunctionStart(Rva: UInt64; out FuncRva: UInt64): Boolean;
     function    NameToRva(const Name: string; out Rva: UInt64): Boolean;
+    // IThreadLocalNameProvider
+    function    NameIsThreadLocal(const Name: string): Boolean;
     function    SourceLineToRva(const FileName: string; Line: Integer;
                   out Rva: UInt64): Boolean;
     function    FirstUserRva: UInt64;
@@ -368,6 +381,8 @@ begin
   FPubDataTailLowerToRva := TDictionary<string, UInt64>.Create;
   FPubClassMethodLowerToRva := TDictionary<string, UInt64>.Create;
   FDataSegments      := TDictionary<Integer, Boolean>.Create;
+  FTlsSegments       := TDictionary<Integer, Boolean>.Create;
+  FTlsPubNames       := TDictionary<string, Boolean>.Create;
   FDataRvas          := TDictionary<UInt64, Boolean>.Create;
   FInnerToParent   := TDictionary<string, string>.Create;
   FRvaToParent     := TDictionary<UInt64, string>.Create;
@@ -389,6 +404,8 @@ begin
   FPubDataTailLowerToRva.Free;
   FPubClassMethodLowerToRva.Free;
   FDataSegments.Free;
+  FTlsSegments.Free;
+  FTlsPubNames.Free;
   FDataRvas.Free;
   FInnerToParent.Free;
   FRvaToParent.Free;
@@ -454,6 +471,8 @@ begin
   FRvaToParent.Clear;
   FRvaToParentRva.Clear;
   FSegmentBaseRvas.Clear;
+  FTlsSegments.Clear;
+  FTlsPubNames.Clear;
   FSortedRvas    := nil;
   FSortedPubRvas := nil;
   FSectionsByRva := nil;
@@ -519,6 +538,8 @@ begin
       var Cls := SegTokens[High(SegTokens)].ToUpper;
       if (Cls = 'DATA') or (Cls = 'BSS') or (Cls = 'TLS') then
         FDataSegments.AddOrSetValue(SegNum, True);
+      if Cls = 'TLS' then
+        FTlsSegments.AddOrSetValue(SegNum, True);
     end;
     // Delphi prints the Start column at the TARGET's pointer width: 8 hex
     // digits for PE32, 16 for PE32+. Scan the run rather than assuming one
@@ -548,10 +569,11 @@ end;
 { --------------------------------------------------------------------------- }
 
 const
-  // 'MIX3' -- bumped when the segment-table parse learned the PE32 (8 hex digit)
-  // Start column. Sidecars written by the previous build baked MinRva values
-  // computed from an empty segment table, so they must not be reused.
-  MAP_SIDECAR_MAGIC: UInt32 = $4D495833;
+  // 'MIX4' -- bumped when symbols in a TLS segment stopped being given a static
+  // RVA. Sidecars written by the previous build baked those bogus addresses in,
+  // so reusing one would keep resolving a threadvar to the PE headers.
+  // ('MIX3' was the bump for learning the PE32 8-hex-digit Start column.)
+  MAP_SIDECAR_MAGIC: UInt32 = $4D495834;
 
 function MapSidecarIsFresh(const MapPath, SidecarPath: string): Boolean;
 begin
@@ -942,13 +964,25 @@ begin
           Continue;
       end;
 
-      var Rva: UInt64;
-      if not SegmentRvaFromToken(AddrToken, Rva) then Continue;
-
       var SegColon := AddrToken.IndexOf(':');
       var PubSeg := -1;
       if SegColon > 0 then
         PubSeg := StrToIntDef('$' + AddrToken.Substring(0, SegColon), -1);
+
+      // A threadvar gets NO address, but its NAME is remembered, so a lookup
+      // can say why it has no value instead of "not found". The variable is
+      // plainly there in the source; reporting it as missing sends the user
+      // hunting for a typo that does not exist.
+      if (PubSeg > 0) and FTlsSegments.ContainsKey(PubSeg) then begin
+        FTlsPubNames.AddOrSetValue(LowerCase(SymName), True);
+        var TlsDot := SymName.IndexOf('.');
+        if TlsDot >= 0 then
+          FTlsPubNames.AddOrSetValue(LowerCase(SymName.Substring(TlsDot + 1)), True);
+        Continue;
+      end;
+
+      var Rva: UInt64;
+      if not SegmentRvaFromToken(AddrToken, Rva) then Continue;
 
       var DotPos := SymName.IndexOf('.');
       var Stripped := SymName;
@@ -1199,6 +1233,21 @@ begin
   ColonPos := Token.IndexOf(':');
   if ColonPos < 1 then Exit;
   SegNum  := StrToIntDef('$' + Token.Substring(0, ColonPos), 0);
+  // A threadvar lives in the per-thread TLS block, not in the image, so it has
+  // no static RVA at all. Emitting one is worse than emitting nothing: the
+  // segment base resolves to 0 (Win32 prints Start as 0; Win64 prints the
+  // preferred base, which is the same thing after subtraction), so the address
+  // lands inside the PE HEADERS and the debugger shows whatever bytes are there
+  // as the variable's value -- silently wrong on both bitnesses, with nothing
+  // to distinguish it from a real read.
+  //
+  // Refusing makes it visibly unavailable instead. Resolving it properly needs
+  // the runtime chain TEB -> ThreadLocalStoragePointer[TlsIndex] + offset, with
+  // TlsIndex read from the module's PE TLS directory; that is recorded in
+  // KNOWN_UNKNOWNS as the next step, and is a per-thread answer this
+  // static-lookup path cannot give anyway.
+  if FTlsSegments.ContainsKey(SegNum) then
+    Exit(False);
   BaseRva := 0;
   FSegmentBaseRvas.TryGetValue(SegNum, BaseRva);
   Offset := StrToInt64Def('$' + Token.Substring(ColonPos + 1), 0);
@@ -1384,6 +1433,20 @@ begin
     end;
   end;
   FPubReverseReady := True;
+end;
+
+function TMapFile.NameIsThreadLocal(const Name: string): Boolean;
+begin
+  WaitForPubs;
+  if FTlsPubNames.Count = 0 then
+    Exit(False);
+  var Key := LowerCase(Name);
+  if FTlsPubNames.ContainsKey(Key) then
+    Exit(True);
+  // The caller may hold the unit-qualified spelling where the MAP recorded the
+  // bare one, or the reverse; both spellings were indexed, so try the tail too.
+  var Dot := Key.LastIndexOf('.');
+  Result := (Dot >= 0) and FTlsPubNames.ContainsKey(Key.Substring(Dot + 1));
 end;
 
 function TMapFile.NameToRva(const Name: string; out Rva: UInt64): Boolean;

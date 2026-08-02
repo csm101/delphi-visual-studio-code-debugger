@@ -563,6 +563,14 @@ begin
     Exit;
   end;
 
+  // A THREADVAR reaches here: it is in the debug info, but it has no address in
+  // the image, so every address-based lookup above declines. Reporting it as
+  // "not found" would send the user hunting for a typo in a name that is
+  // plainly there in the source, so say what is actually true.
+  if (FDebugInfo <> nil) and FDebugInfo.NameIsThreadLocal(Name) then
+    Exit(InvalidValue(Format(
+      '<%s: threadvar -- per-thread storage is not resolved yet>', [Name])));
+
   Result := InvalidValue(Format('<%s: not found>', [Name]));
 end;
 

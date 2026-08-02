@@ -2042,6 +2042,7 @@ begin
   RunEdge2;
   RunOpenArray;
   RunRtlCallback;
+  RunThreadVar;
   RunReal;
   RunRobust;
   RunStepFlow;
