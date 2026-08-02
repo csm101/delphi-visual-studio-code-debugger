@@ -4501,6 +4501,7 @@ begin
     V.Name       := NamePrefix + Sym.Name;
     V.TypeHint    := Sym.TypeHint;
     V.TypeKind    := Sym.TypeKind;
+    V.PointeeKind := Sym.PointeeKind;
     V.ParamStatus := Sym.ParamStatus;
     V.Kind        := Sym.Kind;
     V.RawValue   := 0;

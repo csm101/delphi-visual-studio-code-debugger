@@ -193,6 +193,15 @@ type
     // for why the alternatives were dropped.
     function TryRecoverObjectFromInterface(IntfPtr: UInt64; out Obj: UInt64;
       out ConcreteClass: string): Boolean;
+    // Recovers the object an interface reference points INTO, by decoding the
+    // IMT adjustor thunk. Bounded: three reads at addresses the reference
+    // itself supplies, no search of any kind. Returns 0 when the thunk is not
+    // recognised or the result is not a class instance -- never a guess.
+    //
+    // Lives here rather than in a value reader because more than one caller
+    // needs it: rendering an interface with its concrete class, and recovering
+    // the activation record behind a closure.
+    function ObjectFromInterfaceThunk(IfacePtr: UInt64): UInt64;
 
     // Reads the (un-decorated) class name from the VMT of the instance at
     // ObjAddr. Returns '' on read failure.
@@ -675,6 +684,83 @@ begin
     end;
     Inc(Offset, Step);
   end;
+end;
+
+function TDelphiRtti.ObjectFromInterfaceThunk(IfacePtr: UInt64): UInt64;
+// The encodings were MEASURED, not inferred from one another
+// (DevTools\Win32ImtThunkProbe.dpr, four IOffsets from 12 to 316). dcc64
+// adjusts Self in RCX, dcc32 adjusts the stack slot at [esp+4]; in both the
+// immediate is exactly `-IOffset`, so the object is `IfacePtr + immediate`.
+var
+  Code:  array[0..15] of Byte;
+  Delta: Integer;
+
+  // 48 83 C1 ib      add rcx, imm8      48 8D 49 ib   lea rcx,[rcx+ib]
+  // 48 81 C1 id      add rcx, imm32     48 8D 89 id   lea rcx,[rcx+id]
+  function DecodeX64Thunk(out D: Integer): Boolean;
+  begin
+    Result := True;
+    if Code[0] <> $48 then
+      Exit(False);
+    if (Code[1] = $83) and (Code[2] = $C1) then
+      D := ShortInt(Code[3])
+    else if (Code[1] = $81) and (Code[2] = $C1) then
+      D := PInteger(@Code[3])^
+    else if (Code[1] = $8D) and (Code[2] = $49) then
+      D := ShortInt(Code[3])
+    else if (Code[1] = $8D) and (Code[2] = $89) then
+      D := PInteger(@Code[3])^
+    else
+      Result := False;
+  end;
+
+  // 83 44 24 04 ib   add dword ptr [esp+4], imm8
+  // 81 44 24 04 id   add dword ptr [esp+4], imm32
+  function DecodeX86Thunk(out D: Integer): Boolean;
+  begin
+    Result := (Code[1] = $44) and (Code[2] = $24) and (Code[3] = $04);
+    if not Result then
+      Exit;
+    if Code[0] = $83 then
+      D := ShortInt(Code[4])
+    else if Code[0] = $81 then
+      D := PInteger(@Code[4])^
+    else
+      Result := False;
+  end;
+
+begin
+  Result := 0;
+  if (FProcess = 0) or (IfacePtr < 65536) then
+    Exit;
+
+  // IfacePtr -> IMT pointer -> first method (the adjustor thunk).
+  var Imt: UInt64;
+  if not ReadTargetPointer(IfacePtr, Imt) or (Imt < 65536) then
+    Exit;
+  var M0: UInt64;
+  if not ReadTargetPointer(Imt, M0) or (M0 < 65536) then
+    Exit;
+  var Read: SIZE_T;
+  if not ReadProcessMemory(FProcess, Pointer(M0), @Code[0], SizeOf(Code), Read) or
+     (Read < SizeOf(Code)) then
+    Exit;
+
+  // Gated on the TARGET's pointer size rather than tried in turn: an x86
+  // encoding is a valid (different) x64 instruction and vice versa, so
+  // accepting either would be guessing which compiler produced the bytes.
+  var Decoded: Boolean;
+  if FLayout.PointerSize = 8 then
+    Decoded := DecodeX64Thunk(Delta)
+  else
+    Decoded := DecodeX86Thunk(Delta);
+  if not Decoded then
+    Exit;
+
+  // Accept only a verified result: the recovered address must carry a real VMT.
+  var Obj := OffsetTargetAddress(IfacePtr, Delta);
+  if IsClassInstance(Obj) then
+    Result := Obj;
 end;
 
 function TDelphiRtti.IsClassInstance(ObjAddr: UInt64): Boolean;

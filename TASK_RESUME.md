@@ -2883,6 +2883,31 @@ Working on the x86 stack walker, which is the riskiest component in the project.
 
 ### In flight (not committed)
 
+-1. **Closure recovery no longer scans.** `TryRecoverClosureObject` walked eight
+    pointer slots BACKWARDS taking the first `$ActRec` it met; in a closure-heavy
+    target activation records are dense on the stack, so it could latch a
+    neighbouring one and expand a FOREIGN closure's captured variables. A closure
+    variable is an INTERFACE REFERENCE, so the record is derivable exactly by
+    decoding the IMT adjustor thunk -- the same mechanism the interface label
+    uses, now shared as `TDelphiRtti.ObjectFromInterfaceThunk` instead of living
+    twice. All 21 closure tests pass with the scan gone.
+
+-2. **A frame name depended on who won a race.** The constructor-naming fix
+    relies on the MAP supplying the declared name, but
+    `TMapFile.RvaToFunctionName` is deliberately NON-BLOCKING while its publics
+    scan runs. Measured: the ctor test passed 5/5 in isolation and failed under
+    the full suite. `TDebugInfoSet.RvaToFunctionName` now retries while any
+    provider is still indexing, capped at 5 s, stopping the instant nothing is
+    pending -- the same shape and bound as the existing `NameToRva` retry in
+    `WinDebuggerBase`, which exists for this exact reason.
+
+-3. **Dyn-array `^T` gate: ATTEMPTED, REVERTED.** See KNOWN_UNKNOWNS. The
+    approach is right (accept `^T` only on a positive TypeKind/PointeeKind) but
+    the kind does not reach the renderer on field paths, so gating turned a real
+    `array of Integer` field into a raw pointer. The PLUMBING landed
+    (`TLocalValue.PointeeKind`, and both kinds now merged across providers
+    instead of the base provider deciding); the gate did not.
+
 0. **Threadvars read the PE headers — FIXED, reproduced on BOTH bitnesses first.**
    The MAP's TLS segment resolves to base RVA 0 everywhere (Win32 prints `Start`
    as 0, Win64 prints the preferred base), so a `threadvar` got a low RVA and the

@@ -101,6 +101,15 @@ type
                              // type records, and an open array only ever occurs
                              // as a parameter. The unknown state is load-bearing
                              // -- see TSymbolParamStatus.
+    PointeeKind: Byte;       // What this local's type POINTS AT (0 = unknown).
+                             // A different question from TypeKind and not
+                             // derivable from the spelling: a dynamic array and
+                             // a plain typed pointer both read `^T`, so only the
+                             // provider that owns the type table can say which
+                             // one a `^T` local really is. Reading a genuine
+                             // `^T2` as an array of T2 because it happens to
+                             // point at a live `array of T1` header renders a
+                             // wrong length and strides past the buffer.
     TypeKind:    Byte;       // The kind of this local's own declared type, already
                              // resolved by the provider that produced it
                              // (TK_DYNARRAY, TK_RECORD, ...; 0 = unknown).

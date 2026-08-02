@@ -214,28 +214,51 @@ end;
 
 function TVariableExpander.TryRecoverClosureObject(InterfaceRef: UInt64;
   out ObjBase: UInt64; out ClassName: string): Boolean;
-const
-  SCAN_SLOTS = 8;   // search up to 8 pointer slots below the interface reference
+
+  // Accepts a candidate only if it really is a closure activation record.
+  function IsActivationRecord(Cand: UInt64; out Cn: string): Boolean;
+  begin
+    Cn := '';
+    if (Cand < 65536) or not Rtti.IsClassInstance(Cand) then
+      Exit(False);
+    Cn := Rtti.GetInstanceClassName(Cand);
+    Result := (Cn <> '') and Cn.Contains('$ActRec') and HasMembers(Cn);
+  end;
+
 begin
   Result := False;
   ObjBase := 0;
   ClassName := '';
   if (Rtti = nil) or (Debugger = nil) or (InterfaceRef < 65536) then Exit;
-  // Stride by the TARGET's pointer size, not the debugger's. SizeOf(Pointer) is
-  // always 8 in this binary, so on a 32-bit target it stepped over every other
-  // candidate slot and the closure object was simply never found.
-  var SlotSize := Debugger.TargetLayout.PointerSize;
-  for var K := 0 to SCAN_SLOTS do begin
-    {$Q-}
-    var Cand := InterfaceRef - UInt64(K) * SlotSize;
-    {$Q+}
-    if not Rtti.IsClassInstance(Cand) then Continue;
-    var Cn := Rtti.GetInstanceClassName(Cand);
-    if (Cn <> '') and Cn.Contains('$ActRec') and HasMembers(Cn) then begin
-      ObjBase := Cand;
-      ClassName := Cn;
-      Exit(True);
-    end;
+
+  // A closure variable holds an INTERFACE REFERENCE into its activation record,
+  // so the record's address is derivable exactly -- decode the IMT adjustor
+  // thunk the reference itself points at. Two cases, both exact:
+  //
+  //   * the interface field sits at a non-zero offset inside the record, which
+  //     is the normal shape (the record descends from TInterfacedObject), and
+  //     the thunk carries -IOffset;
+  //   * the reference already IS the object, when the interface sits at offset
+  //     zero and no adjustor thunk is emitted.
+  //
+  // What this replaces was a backward scan of eight pointer slots taking the
+  // first `$ActRec` it met. In a closure-heavy target activation records are
+  // dense on the stack, so it could latch an UNRELATED neighbouring record and
+  // expand a FOREIGN closure's captured variables -- values that look entirely
+  // real and belong to something else. No amount of tightening makes a scan
+  // exact; asking the reference where its object is does not need to be
+  // tightened.
+  var Cn: string;
+  var ViaThunk := Rtti.ObjectFromInterfaceThunk(InterfaceRef);
+  if (ViaThunk <> 0) and IsActivationRecord(ViaThunk, Cn) then begin
+    ObjBase := ViaThunk;
+    ClassName := Cn;
+    Exit(True);
+  end;
+  if IsActivationRecord(InterfaceRef, Cn) then begin
+    ObjBase := InterfaceRef;
+    ClassName := Cn;
+    Exit(True);
   end;
 end;
 

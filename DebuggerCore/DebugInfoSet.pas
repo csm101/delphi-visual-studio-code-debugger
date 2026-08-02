@@ -220,6 +220,7 @@ type
 implementation
 
 uses
+  Winapi.Windows,   // GetTickCount64 / Sleep for the indexing-retry bound
   DapProtocol;
 
 constructor TDebugInfoSet.Create;
@@ -562,23 +563,61 @@ function TDebugInfoSet.RvaToFunctionName(Rva: UInt64;
       Fallback := Candidate;
   end;
 
+  // One pass over the providers. Returns True when a decoded name was found;
+  // Fallback carries the best mangled answer seen, if any.
+  function AskAll(var Best, Fallback: string; out Owned: Boolean): Boolean;
+  begin
+    Owned := False;
+    for var RG in FRangedFunc do
+      if (Rva >= RG.Lo) and (Rva < RG.Hi) then begin
+        Owned := True;
+        if AskProvider(RG.Prov, Best, Fallback) then
+          Exit(True);
+      end;
+    if Owned then
+      Exit(False);
+    for var P in FFuncProviders do
+      if AskProvider(P, Best, Fallback) then
+        Exit(True);
+    Result := False;
+  end;
+
 begin
   Name := '';
   var Fallback := '';
-  var Owned := False;
-  for var RG in FRangedFunc do
-    if (Rva >= RG.Lo) and (Rva < RG.Hi) then begin
-      Owned := True;
-      if AskProvider(RG.Prov, Name, Fallback) then
+  var Owned: Boolean;
+  if AskAll(Name, Fallback, Owned) then
+    Exit(True);
+
+  // Only a mangled answer so far. The provider that could decode it may simply
+  // not have finished parsing: the MAP publics scan runs on a background thread
+  // and RvaToFunctionName is deliberately non-blocking while it does, so which
+  // name a caller sees would otherwise depend on who won a race -- measured, a
+  // constructor rendered as `TCtorProbe.Create` in isolation and as
+  // `@Testtargetedge@TCtorProbe@$bctr$qqrv` under a loaded machine.
+  //
+  // Retry while ANY provider is still indexing, and stop the instant nothing is
+  // pending, so a genuinely undecodable name costs nothing at a warm stop. Same
+  // shape and same 5 s safety bound as the NameToRva retry in WinDebuggerBase,
+  // which exists for exactly this reason.
+  if (Fallback <> '') and AnyBackgroundIndexingPending then begin
+    var Deadline := GetTickCount64 + 5000;
+    while True do begin
+      if not AnyBackgroundIndexingPending then
+        Break;
+      if GetTickCount64 > Deadline then
+        Break;
+      Sleep(25);
+      var Retry := '';
+      var RetryFallback := '';
+      var RetryOwned: Boolean;
+      if AskAll(Retry, RetryFallback, RetryOwned) then begin
+        Name := Retry;
         Exit(True);
+      end;
     end;
-  if Owned then begin
-    Name := Fallback;
-    Exit(Fallback <> '');
   end;
-  for var P in FFuncProviders do
-    if AskProvider(P, Name, Fallback) then
-      Exit(True);
+
   Name := Fallback;
   Result := Fallback <> '';
 end;
@@ -979,6 +1018,13 @@ begin
           // be right on one target and silently wrong on the other.
           if A.ParamStatus <> spsUnknown then
             Locals[Idx].ParamStatus := A.ParamStatus;
+          // Same reasoning for the resolved type kinds: only the provider that
+          // owns the type table can answer, and 0 means "this one could not",
+          // never "the answer is none".
+          if A.TypeKind <> 0 then
+            Locals[Idx].TypeKind := A.TypeKind;
+          if A.PointeeKind <> 0 then
+            Locals[Idx].PointeeKind := A.PointeeKind;
           Break;
         end;
   end;
@@ -1094,6 +1140,12 @@ begin
             // was dereferenced on x64 and displayed as its POINTER on x86.
             if A.Kind = lkVarParam then
               Locals[Idx].Kind := lkVarParam;
+            // Resolved type kinds, same rule: 0 means the provider could not
+            // tell, not that there is nothing to tell.
+            if A.TypeKind <> 0 then
+              Locals[Idx].TypeKind := A.TypeKind;
+            if A.PointeeKind <> 0 then
+              Locals[Idx].PointeeKind := A.PointeeKind;
             var Cur := Locals[Idx].TypeHint;
             var DupCount: Integer;
             DupNames.TryGetValue(AnsiLowerCase(A.Name), DupCount);

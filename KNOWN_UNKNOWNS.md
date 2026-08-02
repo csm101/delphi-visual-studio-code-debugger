@@ -433,11 +433,33 @@ in `ValueReaderTests.pas` for deterministic memory-pattern unit tests):
   local to nil at scope exit, so a later `^T` reading the same slot shows `[]`). The
   survivor is cross-type aliasing: a `^T2` pointing at a live `array of T1` passes the
   header bounds (it IS a real header) and renders `T2[len_of_T1]`, striding sizeof(T2)
-  past the buffer. Candidate fix: after the header bounds pass, require the FULL
-  `Len*ElemSize` span to be readable + `DataPtr` 16-byte aligned; only trust the
-  heuristic for the genuinely ambiguous flattened-`^T` case, preferring
-  `LookupTypeKind = TK_DYNARRAY` where metadata exists. Needs care not to reject
-  legitimate arrays at page boundaries.
+  past the buffer.
+
+  ATTEMPTED and reverted (2026-08-02). The intended fix is right and is not a
+  bounds tweak: accept `^T` as a dynamic array only on a POSITIVE statement from
+  whoever owns the type table, never on the pointed-to memory resembling a
+  header. `TSymbol` already carries `TypeKind` and `PointeeKind` for exactly
+  this, TD32 fills both, and `TLocalValue` now carries `PointeeKind` too (that
+  plumbing LANDED, along with merging both kinds across providers — previously
+  whichever provider happened to be the base decided, the same defect that was
+  fixed for `ParamStatus` and `lkVarParam`).
+
+  What blocked it: the kind does not REACH the renderer on the paths that matter.
+  Gating on it turned `MRec.Tags` — a real `array of Integer` — into a raw
+  pointer on both bitnesses (`Win32_RecordAndDynArrayExpansion_MatchWin64`).
+  `Tags` is a record FIELD, and the field paths build a `TLocalValue` through
+  `VariableExpander.SyntheticLocal`, which carries a name, a type spelling and
+  an address and nothing else. `MemberFieldToSession` does consult the live
+  object's RTTI at the same byte offset, but only AFTER formatting and only to
+  fix expandability and the type label; hoisting that lookup above the format
+  call was tried and changed nothing, so `Tags` is not reaching that function
+  either.
+
+  So the remaining work is plumbing, not discovery: find every path that turns a
+  field or member into a `TLocalValue` and carry the kind the caller already
+  knows (RTTI states it for a live object, which is authoritative about runtime
+  layout). Tightening the gate before that is a net loss — it degrades output
+  that is currently correct while leaving the aliasing reachable elsewhere.
 
 ## Wrong-data heuristics — audit round 2, 2026-07-19 (value/type computation)
 
