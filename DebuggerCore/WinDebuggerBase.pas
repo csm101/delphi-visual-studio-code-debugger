@@ -194,8 +194,13 @@ type
     function  ReadPrologInfo(EntryVA: UInt64; out ExtraPushBytes: UInt32;
                 out Recognised: Boolean): UInt32; virtual;
     function  FunctionBodyStartVA(VA: UInt64): UInt64;
+    // The Win64 answer: the static link arrives in RCX and is spilled to the
+    // first home slot. VIRTUAL because that formula is ABI-specific and Win32
+    // has no home slots at all -- the 32-bit override declines rather than
+    // reading an arbitrary stack slot, and the caller then searches the stack.
     function  ReadParentFramePointer(ChildRBP: UInt64;
-                ChildFrameSize, ChildExtraPushBytes: UInt32): UInt64;
+                ChildFrameSize, ChildExtraPushBytes: UInt32): UInt64; virtual;
+    function  FindParentFrameOnStack(ParentEntryVA, ChildRBP: UInt64): UInt64;
     function  CollectLocalsForFrame(FrameRBP: UInt64; FuncEntryVA: UInt64;
                 const FuncName, NamePrefix: string;
                 FramePcRva: UInt64): TArray<TLocalValue>;
@@ -4451,6 +4456,35 @@ end;
 // parameter is passed in RCX (Win64 ABI) and Delphi spills it to the home
 // slot at RBP + FrameSize + 0x10. Returns 0 if the read fails or the proc
 // has no recognisable parent frame pointer.
+// Locates an enclosing routine's frame on the CURRENT call stack: the nearest
+// frame above the child whose function entry is the parent's.
+//
+// This is the architecture-independent way to reach a nested procedure's static
+// link, and it is why Win32 does not need the hidden-parameter offset measured
+// in DevTools\Win32NestedLinkProbe.dpr. Computing that offset means computing
+// the byte size of the child's declared stack parameters, and getting it wrong
+// does not fail -- it produces a plausible WRONG frame, i.e. confident wrong
+// values for every one of the parent's variables. Searching cannot do that: it
+// either finds a frame the walker already vouched for, or nothing.
+//
+// "Above" is by stack address, since the stack grows down and a caller's frame
+// is always at a higher address than its callee's. The NEAREST such frame is
+// the right one when the parent recurses.
+function TWinDebugger.FindParentFrameOnStack(ParentEntryVA, ChildRBP: UInt64): UInt64;
+begin
+  Result := 0;
+  if (ParentEntryVA = 0) or (ChildRBP = 0) then
+    Exit;
+  for var Frame in GetStackFrames(FStoppedTid) do begin
+    if Frame.FuncEntryVA <> ParentEntryVA then
+      Continue;
+    if (Frame.FrameRBP = 0) or (Frame.FrameRBP <= ChildRBP) then
+      Continue;
+    if (Result = 0) or (Frame.FrameRBP < Result) then
+      Result := Frame.FrameRBP;
+  end;
+end;
+
 function TWinDebugger.ReadParentFramePointer(
   ChildRBP: UInt64; ChildFrameSize, ChildExtraPushBytes: UInt32): UInt64;
 var
@@ -4736,24 +4770,39 @@ begin
     if not FDebugInfo.GetEnclosingProcedureByRva(CurInnerRva, ParentName) then
       if not FDebugInfo.GetEnclosingProcedure(CurName, ParentName) then
         Break;
-    var ChildExtraPushes: UInt32;
-    var ChildRecognised:  Boolean;
-    var ChildFrameSize   := ReadPrologInfo(CurEntry, ChildExtraPushes, ChildRecognised);
-    // Walking to the parent frame from an unrecognised prologue would follow a
-    // pointer read from an arbitrary stack slot. Stop the walk instead.
-    if not ChildRecognised then
-      Break;
-    var ParentRBP        := ReadParentFramePointer(CurRBP, ChildFrameSize, ChildExtraPushes);
-    if ParentRBP = 0 then
-      Break;
     // Resolve the parent's body RVA. Prefer the RVA-keyed map (unique,
     // same-unit) over a name round-trip -- NameToRva on a bare parent
     // leaf (e.g. `Mid`) collides when two units each have one.
+    //
+    // Resolved BEFORE the frame pointer, because the fallback below needs to
+    // know which routine it is looking for.
     var ParentRva: UInt64;
     if not FDebugInfo.GetEnclosingProcedureRvaByRva(CurInnerRva, ParentRva) then
       if not FDebugInfo.NameToRva(ParentName, ParentRva) then
         Break;
     var ParentEntry := RvaToVA(ParentRva);
+
+    var ChildExtraPushes: UInt32;
+    var ChildRecognised:  Boolean;
+    var ChildFrameSize   := ReadPrologInfo(CurEntry, ChildExtraPushes, ChildRecognised);
+    // Walking to the parent frame from an unrecognised prologue would follow a
+    // pointer read from an arbitrary stack slot. Ask for the static link only
+    // when the prologue was understood.
+    var ParentRBP: UInt64 := 0;
+    if ChildRecognised then
+      ParentRBP := ReadParentFramePointer(CurRBP, ChildFrameSize, ChildExtraPushes);
+    // No static link available -- which is the normal case on x86, where the
+    // Win64 home-slot formula does not apply and the 32-bit override declines
+    // rather than reading an arbitrary slot. The parent's frame is still on the
+    // stack whenever the nested routine was entered from it, so LOOK for it
+    // instead of computing an address: the nearest frame above the child whose
+    // function entry is the parent's. That needs no ABI knowledge, is the same
+    // answer on both bitnesses, and finds nothing (so the climb simply stops)
+    // when the parent is genuinely not on the stack.
+    if ParentRBP = 0 then
+      ParentRBP := FindParentFrameOnStack(ParentEntry, CurRBP);
+    if ParentRBP = 0 then
+      Break;
     Result := Result + CollectLocalsForFrame(
       ParentRBP, ParentEntry, ParentName, ParentName + '.', {FramePcRva=}0);
     CurName     := ParentName;

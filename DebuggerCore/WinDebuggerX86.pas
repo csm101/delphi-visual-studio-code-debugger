@@ -59,6 +59,9 @@ type
 
     function  ReadPrologInfo(EntryVA: UInt64; out ExtraPushBytes: UInt32;
                 out Recognised: Boolean): UInt32; override;
+    // A nested procedure's static link. Declines on purpose -- see the body.
+    function  ReadParentFramePointer(ChildRBP: UInt64;
+                ChildFrameSize, ChildExtraPushBytes: UInt32): UInt64; override;
     function  LocalsOffsetBase(SubRspN, ExtraPushBytes: UInt32): Integer; override;
     function  ParamsOffsetBase(SubRspN, ExtraPushBytes: UInt32): Integer; override;
     function  CallerReturnAddress(TID: DWORD): UInt64; override;
@@ -502,6 +505,28 @@ begin
     if Length(Result) >= MaxFrames then
       Break;
   end;
+end;
+
+// Declines, deliberately.
+//
+// The inherited Win64 formula reads the first HOME SLOT, and Win32 has none, so
+// inheriting it means reading an arbitrary stack slot and climbing to a frame
+// that is not the parent's. That is what made a 32-bit target show only the
+// nested routine's own locals, where the same source built for Win64 also
+// showed the enclosing routine's.
+//
+// dcc32 DOES pass a static link -- measured in DevTools\Win32NestedLinkProbe:
+// a hidden stack parameter pushed last, at `[EBP + 8 + declaredStackParamBytes]`.
+// It is not read here because that byte count has to be derived from the
+// child's declared parameter types, and getting it wrong yields a plausible
+// WRONG frame rather than a failure: confident wrong values for every parent
+// variable. Returning 0 sends the caller to FindParentFrameOnStack, which
+// locates the parent among frames the walker has already vouched for and needs
+// no ABI knowledge on either bitness.
+function TWin32Debugger.ReadParentFramePointer(ChildRBP: UInt64;
+  ChildFrameSize, ChildExtraPushBytes: UInt32): UInt64;
+begin
+  Result := 0;
 end;
 
 { --------------------------------------------------------- prologue decode -- }
