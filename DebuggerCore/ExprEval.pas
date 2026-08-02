@@ -2555,8 +2555,24 @@ begin
   end;
 
   // 4. Qualified-name lookup: nested-proc parent locals stored as "Parent.Field".
+  //
+  // This resolves the LEAF name on its own, so it must not run when the base is
+  // a real receiver -- otherwise `Obj.Member` and a bare `Member` become the
+  // same query and the object is silently discarded. Measured on a live VCL
+  // form: `Self.HandleAllocated` and `HandleAllocated` both answered
+  // 1362375204 with no type, because the VCL method name also exists as a
+  // symbol and got read as data. `Self.Perform` did the same. The user is told
+  // a number about an object that has no such member.
+  //
+  // The case this path exists for is `ComputeNested.X`, where `ComputeNested`
+  // is a ROUTINE name and there is no receiver at all, so the guard leaves it
+  // working. A record base is not covered here yet: it is not a class instance,
+  // so it still reaches this path.
+  var HasReceiver := Base.IsValid and (FRtti <> nil) and
+                     (Base.RawValue >= 65536) and
+                     FRtti.IsClassInstance(Base.RawValue);
   var LV: TLocalValue;
-  if FDebugger.EvaluateName(Field, LV) then
+  if (not HasReceiver) and FDebugger.EvaluateName(Field, LV) then
     Exit(LocalToExpr(LV));
 
   // 5. Last resort: the base may be an INTERFACE reference. Debug information

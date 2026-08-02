@@ -1505,6 +1505,26 @@ A bare name is resolved in this order, matching Delphi scope rules:
 5. Data global / public symbol (`EvaluateGlobalName` → `NameToRva`).
 6. Named constant (`$25` RSM records), then enum literal, then type name.
 
+#### A member lookup stays scoped to its receiver
+
+`ApplyDot`'s step 4 resolves a nested-proc parent local (`ComputeNested.X`) by
+looking the LEAF name up on its own, because there is no receiver in that form —
+`ComputeNested` is a routine name.
+
+That step must not run when there IS a receiver, or `Obj.Member` and a bare
+`Member` become the same query. Measured on a live VCL form,
+`Self.HandleAllocated` and `HandleAllocated` both answered 1362375204 with no
+type: the VCL method name also exists as a symbol, so the leaf lookup found it
+and read it as data. `Self.Perform` did the same, and it is the same mechanism
+that made `Application.Title` answer with code bytes. The user is shown a number
+about an object that has no such member.
+
+It is now gated on the base being a class instance. `ComputeNested.X` keeps
+working because a routine name is not one. A RECORD base is not covered yet — it
+is not a class instance either, so it still reaches the leaf lookup. Asserted by
+`MemberLookup_DoesNotFallBackToAGlobalOnBothBitnesses`, which also checks a real
+member still resolves, so the guard cannot degenerate into a blanket refusal.
+
 #### A callable reports its ADDRESS, not the code at it
 
 Step 5 may legitimately land on a CODE address: a routine referenced by name is

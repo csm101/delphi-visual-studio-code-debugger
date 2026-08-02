@@ -216,6 +216,14 @@ type
     // thunk -- presented as the symbol's value. Found in a real 32-bit VCL
     // application. The address is what a debugger should report for a callable.
     [Test] procedure ProcedureName_ReportsItsAddressNotItsCodeOnBothBitnesses;
+    // `Obj.Member` must be scoped to Obj. A member lookup that missed used to
+    // fall through to resolving the LEAF name on its own, so `Obj.Member` and a
+    // bare `Member` became the same query and the receiver was discarded.
+    // Measured on a live VCL form: `Self.HandleAllocated` and `HandleAllocated`
+    // both answered 1362375204, because the VCL method name also exists as a
+    // symbol and got read as data -- a number about an object that has no such
+    // member.
+    [Test] procedure MemberLookup_DoesNotFallBackToAGlobalOnBothBitnesses;
     // TD32 stores globals mangled, and dcc32 mangles Borland-style where dcc64
     // mangles Itanium-style; only the latter was decoded, so NO unit global
     // resolved on a 32-bit target.
@@ -4075,6 +4083,65 @@ begin
   Assert.AreEqual('', Failures,
     'the stack must reach the caller across sourceless RTL frames, at the ' +
     'right line, on both bitnesses -- ' + Failures);
+end;
+
+procedure TWin32RunControlTests.MemberLookup_DoesNotFallBackToAGlobalOnBothBitnesses;
+type
+  TExprCheck = record Expr, Expect: string end;
+const
+  SOURCE = 'TestTargetTypes.pas';
+  MARKER = 'COLLECTIONS_BODY';
+  // `GCounter` and `GSink` are real unit globals of the target, asserted
+  // resolvable by bare name elsewhere (UnitGlobals_ResolveOnBothBitnesses). A
+  // TBase has neither as a member, so asking for them THROUGH the object must
+  // fail -- and the real member must keep working, or the guard would just be a
+  // blanket refusal.
+  CHECKS: array[0..2] of TExprCheck = (
+    (Expr: 'ArrObj[0].GCounter'; Expect: 'has no member'),
+    (Expr: 'ArrObj[0].GSink';    Expect: 'has no member'),
+    (Expr: 'ArrObj[0].BaseTag';  Expect: ''));   // '' = must SUCCEED
+
+  function EvalAt(const Exe, Map, Rsm, Expr: string; Line: Integer): string;
+  begin
+    var Session := OpenSessionAtMarker(Exe, Map, Rsm, TargetDir, SOURCE, Line);
+    try
+      if Session.State <> dsStopped then
+        Exit('<did not stop>');
+      var R := Session.Evaluate(Expr);
+      if not R.Success then
+        Exit('<' + R.ErrorText + '>');
+      Result := R.Value;
+    finally
+      Session.Free;
+    end;
+  end;
+
+  function Wrong(const Got, Expect: string): Boolean;
+  begin
+    if Expect = '' then
+      Result := Got.StartsWith('<')            // expected a value, got an error
+    else
+      Result := not Got.Contains(Expect);
+  end;
+
+begin
+  var Line := MarkerLineInFile(TargetDir + SOURCE, MARKER);
+  Assert.IsTrue(Line > 0, 'marker ' + MARKER + ' not found');
+  Assert.IsTrue(FileExists(Win64Exe), '64-bit control target missing');
+
+  var Failures := '';
+  for var Check in CHECKS do begin
+    var Got64 := EvalAt(Win64Exe, Win64Map, Win64Rsm, Check.Expr, Line);
+    if Wrong(Got64, Check.Expect) then
+      Failures := Failures + Format('x64 %s -> %s; ', [Check.Expr, Got64]);
+    var Got32 := EvalAt(Win32Exe, Win32Map, Win32Rsm, Check.Expr, Line);
+    if Wrong(Got32, Check.Expect) then
+      Failures := Failures + Format('x86 %s -> %s; ', [Check.Expr, Got32]);
+  end;
+
+  Assert.AreEqual('', Failures,
+    'a member lookup must stay scoped to its receiver on both bitnesses -- ' +
+    Failures);
 end;
 
 procedure TWin32RunControlTests.ProcedureName_ReportsItsAddressNotItsCodeOnBothBitnesses;

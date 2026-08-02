@@ -719,12 +719,15 @@ That makes the failure honest rather than wrong, and no fix is obvious short of
 symbols for the VCL. Recorded because "why does Caption work and ComponentCount
 not" is otherwise a puzzling report.
 
-UNVERIFIED, from the same run: `Self.Handle` answered `1354031002`
-($50B4DF9A), which does not look like an HWND for a 32-bit process. `Handle` is
-also getter-backed and the form had not been shown yet. Whether that is a real
-handle, a field read of an uninitialised `FHandle`, or a bad synthetic-call
-return was not established -- do not treat it as a known defect without
-measuring it.
+The suspicious `Self.Handle` value noted alongside this turned out to be a
+DIFFERENT and worse defect, since fixed: `Obj.Member` fell back to resolving the
+leaf name as a global, so `Self.HandleAllocated` and a bare `HandleAllocated`
+answered the same number. See "a member lookup stays scoped to its receiver" in
+`DAP_DEBUGGER_ARCHITECTURE.md`.
+
+STILL UNVERIFIED after that fix: `Self.Handle` itself. It is an RTTI property,
+so it takes the property path rather than the leaf fallback, and it has not been
+re-measured. Do not treat it as a known defect without doing so.
 
 ### A bare identifier can resolve to an enum member of a NESTED type
 
