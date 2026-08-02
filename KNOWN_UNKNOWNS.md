@@ -123,14 +123,32 @@ Still open:
   the return address from that exact function -- not a plausible one, the right
   one -- and it is the missing frame's PC.
 
-  Constraints to respect:
-    * Direct calls only. For an indirect call (`FF /2`) the target cannot be
-      resolved statically, so no match is possible and NO frame should be
-      invented -- leave the hole rather than guess.
+  That design was IMPLEMENTED and REVERTED: it cannot fire on this case, and
+  the reason rules it out as a complete answer. Disassembling the call site in
+  RunRtlCallback shows `FF 91 A8 00 00 00` -- `call dword ptr [ecx+0A8h]`.
+  `TStringList.CustomSort` is VIRTUAL, so the call is indirect through the VMT
+  and there is no static target to match. The reported scenario is virtual
+  methods and VCL event dispatch, i.e. exactly the indirect case, so a
+  direct-call-only test answers nothing where it matters.
+
+  BETTER DESIGN, from that measurement, not yet implemented. Identify the
+  missing frame's FUNCTION from the other side. The next chain frame's PC is
+  the missing frame's own return address (into RunAllScenarios here); the
+  instruction ending there is the call that INVOKED the missing function, and
+  for ordinary user code that one IS direct (`E8 rel32`). Its target is the
+  missing function's entry. Then look in the gap for a word that lies inside
+  that function and sits immediately after a call site -- `IsAfterCallSite`
+  already implements the second half. Both halves are structural, so the
+  candidate is identified rather than guessed.
+
+  Constraints to respect either way:
     * One level at a time, re-running per adjacent pair, since several
       frameless callees can nest.
-    * A wrong frame in a stack is worse than a missing one, which is why the
-      acceptance test is the call target and not the shape of the bytes.
+    * When the invoking call is itself indirect, nothing is identifiable --
+      leave the hole rather than invent a frame.
+    * A wrong frame in a stack is worse than a missing one, which is why
+      acceptance must be a structural identification and never a byte shape
+      that merely looks plausible.
   Asserted by the TODO-RED test
   `StackAcrossRtlCallback_KeepsTheCallerOnBothBitnesses`.
 
