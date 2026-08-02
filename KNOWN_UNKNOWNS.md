@@ -455,25 +455,35 @@ in `ValueReaderTests.pas` for deterministic memory-pattern unit tests):
   call was tried and changed nothing, so `Tags` is not reaching that function
   either.
 
-  CORRECTION (2026-08-03). An earlier revision of this entry said the remaining
-  work was "plumbing, not discovery" -- carry the kind the caller already knows.
-  That is WRONG and would send the next attempt looking for something that is
-  not there. Measured: expanding `MRec` renders `Tags` as `[4, 5, 6]` with the
-  type label `^Integer` on both bitnesses. The label is TD32's flattened
-  spelling, so on that path NO provider says "dynamic array" -- the caller does
-  not know either. The RTTI-driven expander (`ExpandRecord`) does pass a real
-  `TypeKind` and would satisfy a gate, but it is not what produced this child.
+  STATE OF THE INVESTIGATION (2026-08-03), after two wrong turns worth recording
+  so they are not repeated:
 
-  So the honest position is a genuine trade, not a missing wire:
-    * keep the header check, and a `^T2` aimed at a live `array of T1` renders a
-      wrong length and strides past the buffer;
-    * gate on a positive kind, and `MRec.Tags` -- which renders CORRECTLY today
-      -- becomes a bare pointer.
+  1. TD32 CAN tell the two apart. `Td32AliasProbe -class TManagedRec` shows the
+     member `Tags` as `$AD28 leaf=$2 kind=1 -> $AD2A leaf=$32 kind=13 -> prim
+     $74 Integer` on both bitnesses. A genuine `^Integer` goes from the pointer
+     node straight to the primitive; the dynamic array has the extra
+     `$32/kind=13` hop. `PointeeKindById` is the existing decoder for exactly
+     that shape. So an earlier note here claiming "no provider says dynamic
+     array" was too pessimistic.
 
-  Closing it properly means making the RECORD's own RTTI (`TMixedRec`'s
-  TypeInfo, which does describe `Tags` as `tkDynArray`) reach this path, so the
-  gate has something to be satisfied by. Whether that TypeInfo is resolvable
-  from a record LOCAL is the open question, and it is a discovery question.
+  2. But promoting it at the member level did NOT change the rendering. Adding
+     `PointeeKind` to `TClassMember`, filling it from `PointeeKindById` in
+     TD32's `GetClassMembers`, and treating `PointeeKind = TK_DYNARRAY` as
+     dynamic in `MemberFieldToSession` left `MRec.Tags` rendering exactly as
+     before -- `[4, 5, 6]`, i.e. still through the header heuristic, not through
+     `FormatMemberValue`'s TK_DYNARRAY branch (which would print `^Integer[3]`).
+     Those edits were REVERTED rather than shipped, because shipping a change
+     whose lack of effect is unexplained is worse than not shipping it.
+
+  So the next step is a measurement, not a design: find out which provider
+  actually supplies `TManagedRec`'s members in a live session, and whether that
+  child reaches `MemberFieldToSession` at all. `Tags` renders CORRECTLY today,
+  so there is no urgency and no excuse for guessing.
+
+  The trade, if it ever has to be made: keep the header check and a `^T2` aimed
+  at a live `array of T1` renders a wrong length and strides past the buffer;
+  gate without a working positive signal and a correct render becomes a bare
+  pointer.
 
 ## Wrong-data heuristics — audit round 2, 2026-07-19 (value/type computation)
 
