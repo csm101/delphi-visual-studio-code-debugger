@@ -2897,6 +2897,15 @@ and, where noted, reproduced BEFORE the fix.
 - `412602a` AVX decoding -- the Athens RTL emits it and `System.Move` was
   undecodable. Found only by running the probe against a 497 MB binary.
 
+- `2eb92cb` + `78e0cc3` `Obj.Member` discarded the receiver and answered with a
+  same-named global; class and record bases both pinned.
+- `a2b0d6c` the nested-proc static link is a per-architecture seam now; x86
+  declines rather than reading the Win64 home slot, and the caller searches the
+  walked stack for the parent's frame instead of computing an address.
+- `fe54740` TD32 `pParent` read, so a Win32 nested procedure sees its parent's
+  scope. The cause was two levels above where the investigation started: nothing
+  knew the routines were related.
+
 ### What the real-application runs proved (and cost)
 
 Running against `hydra_2\ExtApps\AppContainer` (a real 32-bit VCL app) found two

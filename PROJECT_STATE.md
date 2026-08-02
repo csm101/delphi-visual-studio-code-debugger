@@ -207,6 +207,11 @@ Target architecture:
   bitnesses, by decoding the IMT adjustor thunk — three reads at addresses the
   reference itself supplies, no search. The dcc32 encodings were measured
   (`DevTools\Win32ImtThunkProbe.dpr`), not inferred from the x64 ones.
+  A nested procedure sees its enclosing routine's variables by bare name, as
+  Delphi's lexical scoping says it should. That needed CodeView's `pParent`
+  back-pointer: dcc32 emits every proc at top level in the symbol stream and a
+  flat `Unit.Inner` in the MAP, so `pParent` is the only record that the two
+  routines are related at all (`TD32_FORMAT_NOTES.md`).
 - **Limitation:** Win32 locals and parameters are supported for `-$O-` builds
   only; `-$O+` omits the frame pointer routinely. Separately, and on both
   architectures, a synthetic call's argument types come from the calling
