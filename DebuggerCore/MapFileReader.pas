@@ -1487,12 +1487,25 @@ const
 begin
   MaxBytes := 0;
   Result := False;
-  if not RvaIsInImage(Rva) then
+  // No mapping means no worker will ever publish the publics, so the wait below
+  // would burn its full budget on every call for nothing.
+  if (FMapData = nil) or not RvaIsInImage(Rva) then
     Exit;
-  // Blocking, unlike RvaToFunctionName: the callers of this are asking so they
-  // can decide how many bytes to READ, and an answer that depends on whether a
-  // background parse has finished would make the VALUE depend on timing.
-  WaitForPubs;
+  // Waits properly, unlike RvaToFunctionName: the caller is asking so it can
+  // decide how many bytes to READ, and an answer that depended on whether a
+  // background parse had finished would make the VALUE depend on timing.
+  //
+  // WaitForPubs is NOT enough for that -- it gives up after 50 ms and returns
+  // either way, which is the right courtesy for a name lookup and the wrong
+  // thing here. Wait for the publics themselves, bounded at 5 s the same way
+  // the NameToRva retry is. A module whose publics are already built costs one
+  // lock acquisition.
+  var Deadline := GetTickCount64 + 5000;
+  while BackgroundIndexingPending do begin   // locked read of FPubsReady
+    if GetTickCount64 > Deadline then
+      Break;
+    Sleep(5);
+  end;
 
   var Arr: TArray<UInt64>;
   FLock.Acquire;

@@ -696,6 +696,36 @@ No cheap containment exists: the wrong names are structurally indistinguishable
 from right ones, so "refuse when unreliable" needs the same decoding the fix
 needs.
 
+### A non-virtual getter in a symbol-less module cannot be invoked
+
+Measured in the same real-application session. On a live `TfrmMain`:
+
+| Expression | Result |
+|---|---|
+| `Self.ClassName` | `'TfrmMain'` |
+| `Self.Caption` | `'Gestione Allestimenti Container in Magazzino'` |
+| `Self.Name` | `'frmMain'` |
+| `Self.Width` | `1081` (field-backed, read directly) |
+| `Self.Owner` | `$21D9E8B0 (TComponent)` |
+| `Self.ComponentCount` | `<method invocation failed>` |
+| `Self.ControlCount` | `<method invocation failed>` |
+
+The pattern that fits: the ones that work are VIRTUAL getters, whose address
+comes from the object's VMT, or fields. `TComponent.GetComponentCount` and
+`TWinControl.GetControlCount` are not virtual, so invoking them needs a SYMBOL —
+and the VCL in this application is linked without debug info.
+
+That makes the failure honest rather than wrong, and no fix is obvious short of
+symbols for the VCL. Recorded because "why does Caption work and ComponentCount
+not" is otherwise a puzzling report.
+
+UNVERIFIED, from the same run: `Self.Handle` answered `1354031002`
+($50B4DF9A), which does not look like an HWND for a 32-bit process. `Handle` is
+also getter-backed and the form had not been shown yet. Whether that is a real
+handle, a field read of an uninitialised `FHandle`, or a bad synthetic-call
+return was not established -- do not treat it as a known defect without
+measuring it.
+
 ### A bare identifier can resolve to an enum member of a NESTED type
 
 Found by running the debugger against a real 32-bit VCL application
