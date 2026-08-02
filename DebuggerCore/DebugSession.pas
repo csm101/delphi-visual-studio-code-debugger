@@ -448,6 +448,25 @@ end;
 
 destructor TDebugSession.Destroy;
 begin
+  // A session going away still OWNS whatever it started. Dropping the engine
+  // reference without saying so left a launched debuggee running with nobody
+  // able to control it any more: during a suite run hundreds piled up, alive
+  // until the runner exited and Windows collected them, loading the machine
+  // enough to make timing-sensitive behaviour (the symbol-index warm-up) worse.
+  //
+  // StopDebugging already encodes the ownership rule -- terminate what we
+  // launched, DETACH from what we attached to -- so an attached process we were
+  // asked to leave running is still left running.
+  if FDebugger <> nil then
+    try
+      StopDebugging;
+    except
+      // Teardown must not raise out of a destructor; the engine may already be
+      // gone (target exited, adapter shutting down).
+      on E: Exception do
+        DapLog('TDebugSession.Destroy: StopDebugging raised ' + E.ClassName +
+               ': ' + E.Message);
+    end;
   FDebugger := nil;  // release the IDebugTarget refcount (engine teardown)
   FReaders.Free;
   FRtti.Free;
