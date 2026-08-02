@@ -141,6 +141,11 @@ type
     // Synchronization between background index builder and foreground callers.
     FIndexReady:     Boolean;
     FLock:           TCriticalSection;
+    // Kept, not detached: an anonymous thread capturing Self and never joined
+    // outlives the object it mutates, and the destructor then frees FLock and
+    // the mapped view out from under it. Same defect and same fix as TMapFile.
+    FIndexThread:    TThread;
+    FStopIndexing:   Integer;   // interlocked
 
     procedure OpenMappedFile(const Path: string);
     procedure CloseMappedFile;
@@ -160,6 +165,10 @@ type
     // The whole cold-path index build, as run on the background index thread:
     // the two phase waves, then serialise -> publish readiness -> write.
     procedure BuildIndexAndPublish(const SidecarPath: string);
+    // Signals the background indexer to stop and JOINS it. Must run before any
+    // state it touches is freed.
+    procedure StopIndexThread;
+    function  IndexingCancelled: Boolean;
     // Serialises the whole index into memory under FLock. Returns nil if it
     // failed; the caller owns the stream.
     function  SerializeIndexToStream: TMemoryStream;
@@ -563,6 +572,9 @@ end;
 
 destructor TRsmFile.Destroy;
 begin
+  // FIRST: nothing below may run while the worker is still touching this
+  // object's state, its critical section, or the memory-mapped view.
+  StopIndexThread;
   CloseMappedFile;
   FProcOffsets.Free;
   FProcLocals.Free;
@@ -703,10 +715,29 @@ begin
 
   FLoaded := True;
 
-  TThread.CreateAnonymousThread(procedure
+  // The thread reference is KEPT and joined by the destructor.
+  StopIndexThread;   // a re-load must not leave a second worker running
+  AtomicExchange(FStopIndexing, 0);
+  FIndexThread := TThread.CreateAnonymousThread(procedure
   begin
     BuildIndexAndPublish(SidecarPath);
-  end).Start;
+  end);
+  FIndexThread.FreeOnTerminate := False;
+  FIndexThread.Start;
+end;
+
+procedure TRsmFile.StopIndexThread;
+begin
+  if FIndexThread = nil then
+    Exit;
+  AtomicExchange(FStopIndexing, 1);
+  FIndexThread.WaitFor;
+  FreeAndNil(FIndexThread);
+end;
+
+function TRsmFile.IndexingCancelled: Boolean;
+begin
+  Result := AtomicCmpExchange(FStopIndexing, 0, 0) <> 0;
 end;
 
 procedure TRsmFile.BuildIndexAndPublish(const SidecarPath: string);

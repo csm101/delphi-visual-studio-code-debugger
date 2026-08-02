@@ -49,6 +49,14 @@ type
     FIndexReady:     Boolean;
     FPubsReady:      Boolean;
     FLock:           TCriticalSection;
+    // The background indexer, kept rather than detached. An anonymous thread
+    // that captures Self and is never joined outlives the object it mutates:
+    // the destructor was freeing FLock while the worker was inside it, which
+    // surfaced as an intermittent "Invalid pointer operation" during teardown --
+    // seen only under a loaded machine, where the parse is still running when a
+    // short-lived session is freed.
+    FIndexThread:    TThread;
+    FStopIndexing:   Integer;   // interlocked; the worker bails at loop boundaries
     // Per-unit load cache (main thread only; no lock needed).
     FLoadedUnits:    TDictionary<string, Boolean>;
     // Symbol tables (main thread only; populated lazily as units load).
@@ -114,6 +122,10 @@ type
     procedure CloseMappedFile;
     procedure ParseSegmentTableEager;
     procedure BuildIndexBackground;
+    // Signals the background indexer to stop and JOINS it. Must run before any
+    // state it touches is freed.
+    procedure StopIndexThread;
+    function  IndexingCancelled: Boolean;
     procedure ParseUnitSectionAt(const UnitKey, FullPath: string; DataOffset: Int64);
     procedure ParsePublicsAt(DataOffset: Int64);
     procedure EnsureUnitByKey(const UnitKey: string);
@@ -394,6 +406,9 @@ end;
 
 destructor TMapFile.Destroy;
 begin
+  // FIRST: nothing below may run while the worker is still touching this
+  // object's dictionaries, its critical section, or the memory-mapped view.
+  StopIndexThread;
   CloseMappedFile;
   FSegmentBaseRvas.Free;
   FUnitSections.Free;
@@ -495,11 +510,30 @@ begin
   end else
     DapLog('[MAP] SegTable skipped (PreferredBase=0)');
 
-  // All remaining work is in background.
-  TThread.CreateAnonymousThread(procedure
+  // All remaining work is in background. The thread reference is KEPT and
+  // joined by the destructor -- see FIndexThread.
+  StopIndexThread;   // a re-load must not leave a second worker running
+  AtomicExchange(FStopIndexing, 0);
+  FIndexThread := TThread.CreateAnonymousThread(procedure
   begin
     BuildIndexBackground;
-  end).Start;
+  end);
+  FIndexThread.FreeOnTerminate := False;
+  FIndexThread.Start;
+end;
+
+procedure TMapFile.StopIndexThread;
+begin
+  if FIndexThread = nil then
+    Exit;
+  AtomicExchange(FStopIndexing, 1);
+  FIndexThread.WaitFor;
+  FreeAndNil(FIndexThread);
+end;
+
+function TMapFile.IndexingCancelled: Boolean;
+begin
+  Result := AtomicCmpExchange(FStopIndexing, 0, 0) <> 0;
 end;
 
 { --------------------------------------------------------------------------- }
@@ -743,6 +777,10 @@ begin
   Sections := TList<TRvaSectionEntry>.Create;
   try
     while ScanLine(P, PEnd, Line) do begin
+      // Checked per line so a destructor's join returns promptly instead of
+      // waiting out a scan of a multi-megabyte MAP.
+      if IndexingCancelled then
+        Exit;
       var Trimmed := Line.Trim;
 
       if Trimmed.StartsWith('Line numbers for ') then begin
@@ -934,6 +972,10 @@ begin
   Pubs              := TList<TPubRecord>.Create;
   try
     while ScanLine(P, PEnd, Line) do begin
+      // Same reason as the section scan: a pending destructor must not wait out
+      // the whole Publics section.
+      if IndexingCancelled then
+        Break;
       var Trimmed := Line.Trim;
       if Trimmed.StartsWith('Bound resource files') or
          Trimmed.StartsWith('Line numbers') or

@@ -3048,6 +3048,10 @@ function TWinDebugger.EvaluateGlobalName(const Name: string;
 var
   Rva: UInt64;
   ScopeRva: UInt64;
+  // Set when the name resolved to a CALLABLE (a function entry) rather than to
+  // a variable. What the user wants then is the routine's ADDRESS, not the
+  // machine code stored at it -- see the read below.
+  AcceptedCodeEntry: Boolean;
 
   function TailName(const S: string): string;
   begin
@@ -3141,6 +3145,7 @@ begin
   ScopeRva := VAToRva(CurrentRIP(FStoppedTid));
 
   Rva := 0;
+  AcceptedCodeEntry := False;
   var GSym := Default(TGlobalSymbol);
   var HaveGSym := False;
 
@@ -3251,6 +3256,7 @@ begin
       if FDebugInfo.RvaToFunctionStart(ExactRva, FuncStart) and
          (FuncStart = ExactRva) then begin
         Rva := ExactRva;
+        AcceptedCodeEntry := True;
         DapLog(Format('EvaluateGlobalName "%s": accept code-resident exact match Rva=$%x ' +
           '(no data candidate; it is a function entry)', [Name, Rva]));
       end
@@ -3309,6 +3315,24 @@ begin
   // fact from the MAP rather than an assumption: two symbols cannot overlap, so
   // whatever lives here ends before the next one starts. On the measured
   // fixture that bound is exactly 1 byte and the answer becomes 5.
+  // A CALLABLE is not a variable, so there is nothing at its address to read as
+  // a value -- the bytes there are its machine code. Reading them anyway is how
+  // a watch on `VCL` came back as 1796744703, which is `FF 25 18 6B`, the first
+  // four bytes of an import thunk. Measured in a real 32-bit VCL application.
+  //
+  // The address IS the answer a debugger should give for a routine name, so
+  // report that. Nothing is invented: this branch is only reached because the
+  // resolver already established the symbol is a function ENTRY and no data
+  // candidate existed.
+  if AcceptedCodeEntry and (Value.TypeHint = '') then begin
+    Value.TypeHint   := 'Pointer';
+    Value.RawValue   := Value.Address;
+    Value.ValueValid := True;
+    DapLog(Format('EvaluateGlobalName "%s": callable at $%x -- reporting its ADDRESS, ' +
+      'not the code stored there', [Name, Value.Address]));
+    Exit(True);
+  end;
+
   var ReadCap := 0;
   if Value.TypeHint = '' then
     if not FDebugInfo.MaxSymbolBytesAt(Rva, ReadCap) then

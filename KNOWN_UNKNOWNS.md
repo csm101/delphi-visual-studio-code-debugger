@@ -665,6 +665,64 @@ object expansion, evaluation, multi-BPL). See "Target architecture" in
   thread — a value cached against an address, as the current global path does,
   would be wrong the moment another thread is selected.
 
+### Measured scope of the RSM typeId mis-resolution (2026-08-02)
+
+The defect is wider than "nested type names": past a certain typeId, RSM names
+almost every local wrongly, and it does so on BOTH bitnesses. Measured with
+`Td32AliasProbe -rsmproc RunTypeSampler` against `TestTarget.rsm`, compared with
+the source declarations:
+
+| Local | Declared | RSM says (x64) | RSM says (x86) |
+|---|---|---|---|
+| `Cnt` | `ICounter` | `TClassHelperBaseClass` | `TContainedObject` |
+| `ClsRef` | `TClassRef` | `UTF8String` | `TUCS4CharArray` |
+| `GenList` | `TList<Integer>` | `TInfoFlags` | `PError` |
+| `PI` | `^Integer` | `TThreeByteData` | `PPUnknown` |
+| `RecP` | `^TPackedRec` | `TBaseType` | `PInterface` |
+
+Everything up to `TGUID` (small ids) resolves correctly, so the failure begins
+where the id encoding does. The names it produces are real RTL type names from
+an unrelated part of the table, which is why nothing about them looks wrong.
+
+NOT user-visible in these binaries: verified live on both bitnesses that the
+displayed types are correct (`ICounter`, `TBase`, `TList<System.Integer>`,
+`^Integer`, `^TPackedRec`), because TD32 answers first wherever it is present.
+The exposure is a module where RSM/DCP is the ONLY provider -- a package built
+without TD32, which is the multi-BPL shape the debugger has to support. There
+each of the names above would be shown as the variable's type, and expansion
+would follow the wrong type's layout.
+
+No cheap containment exists: the wrong names are structurally indistinguishable
+from right ones, so "refuse when unreliable" needs the same decoding the fix
+needs.
+
+### A bare identifier can resolve to an enum member of a NESTED type
+
+Found by running the debugger against a real 32-bit VCL application
+(`hydra_2\ExtApps\AppContainer`), which is the only way it would have surfaced:
+the target has TD32 for 5 source files, an `.rsm`, and no MAP, so the VCL's
+`Application` variable is in none of them.
+
+Evaluating `Application` answers with the member of DevExpress's
+`TPopupMenuKind = (External, VCL, Application)` — declared INSIDE a class in
+`dxPopupMenus.pas`. `Ord(Application)` returns 2, consistent with that. The
+value is not fabricated: the symbol exists. It is simply not the one the user
+asked for, and Pascal says so — the members of a NESTED type are not reachable
+by a bare name from anywhere. `ExprEval` falls back to
+`TryResolveEnumLiteral(Name, ...)` after `ResolveIdent` misses, and that lookup
+applies no scoping at all.
+
+Contrast `Screen`, which honestly answers "not found" in the same session.
+
+Fix direction, in order of preference:
+  * Do not let an enum member satisfy a bare identifier when its enum type is
+    NESTED. That is a language fact, not a preference. Needs the provider to
+    report the nesting — `TryResolveEnumLiteral` currently returns only the leaf
+    type name (`TPopupMenuKind`), with the qualification already lost.
+  * Failing that, apply the frame's uses scope, as `TryResolveConstScoped`
+    already does for constants. Weaker here, because a `.dpr` transitively uses
+    almost everything.
+
 ## Class-member field typeId encoding on large type spaces (BLOCKS #2)
 
 On SampleApp the type NAME shown for a class field/property is wrong whenever the

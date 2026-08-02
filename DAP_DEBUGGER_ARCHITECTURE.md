@@ -638,6 +638,25 @@ the container, parses the user-type table synchronously, then forks an
 anonymous thread that builds the index (`BuildIndexAndPublish`) and persists it
 to the `<file>.idx` sidecar.
 
+That thread is **kept and joined**, not detached. `TRsmFile` and `TMapFile` both
+used to start it with `TThread.CreateAnonymousThread(...).Start` and drop the
+reference, so the worker outlived nothing in particular — including the object
+whose dictionaries, critical section and mapped view it was writing. The
+destructor freed all three while the worker was inside them.
+
+That surfaced as an intermittent `Invalid pointer operation` during teardown, in
+`FreeingASession_TerminatesWhatItLaunchedOnBothBitnesses`: it errored once in a
+full suite run and then passed 6/6 in isolation, because in isolation the parse
+finishes before the session is freed. Freeing a critical section another thread
+is inside is not a race that shows up reliably — it shows up when the machine is
+busy, which is exactly when a user is debugging.
+
+Both readers now keep the reference (`FIndexThread`, `FreeOnTerminate := False`)
+and join it first thing in the destructor, with an interlocked cancel flag the
+MAP worker checks per line so the join returns promptly instead of waiting out a
+multi-megabyte scan. `TSymbolPrefetcher` already did exactly this; the two file
+readers did not. A re-load also joins before starting a second worker.
+
 The tail of that thread has a fixed order: **serialise → publish readiness →
 write the file**.
 
@@ -1471,6 +1490,41 @@ A bare name is resolved in this order, matching Delphi scope rules:
    global lookup.
 5. Data global / public symbol (`EvaluateGlobalName` → `NameToRva`).
 6. Named constant (`$25` RSM records), then enum literal, then type name.
+
+#### A callable reports its ADDRESS, not the code at it
+
+Step 5 may legitimately land on a CODE address: a routine referenced by name is
+in an executable page and is the symbol the user asked for. The resolver already
+distinguishes that from a mis-match — it accepts a code-resident hit only when
+the address is a FUNCTION ENTRY, which a data global's address never is.
+
+What it then reports has to differ, because a callable is not a variable: there
+is nothing at its address to read as a value, only its machine code. Reading it
+anyway produced, measured on a real 32-bit VCL application, `VCL` = 1796744703
+(`FF 25 18 6B`, the start of an import thunk) and, in the test target on both
+bitnesses, `0xEC834855` (`push rbp; sub rsp`) and `0x55EC8B55`
+(`push ebp; mov ebp,esp`). Prologues presented as values, with nothing marking
+them.
+
+The address is reported instead, typed `Pointer`. Nothing is inferred: the
+branch is only reached once the resolver has established the symbol is a
+function entry and that no data candidate exists. Asserted by
+`ProcedureName_ReportsItsAddressNotItsCodeOnBothBitnesses`.
+
+#### A typeless global reads only its own bytes
+
+Step 5 can also resolve an address with no TYPE, which is what a release build
+gives — a detailed MAP and no embedded debug info. With no type there is no
+width, and the fallback read a full pointer's worth, folding the following
+globals into the value: on the `MapOnlyGlobals` fixture a `Byte` holding 5 read
+back as -1091589627 on both bitnesses.
+
+The read is bounded by the distance to the next symbol (`ISymbolExtentProvider`,
+answered by the MAP). That is a fact rather than an estimate — two symbols
+cannot overlap — and it only ever narrows, so a known type still decides the
+width. The query blocks on the publics parse on purpose: an answer that depended
+on whether a background thread had finished would make the VALUE depend on
+timing.
 
 **The same rule on a MEMBER (`ExprEval.ApplyDot`).** `Obj.M` with no
 parentheses is a call too, and for a long time it was not treated as one: a

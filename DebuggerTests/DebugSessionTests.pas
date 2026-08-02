@@ -210,6 +210,12 @@ type
     // -1091589627 on both bitnesses. The read is now bounded by the distance to
     // the next symbol, which is a fact from the MAP rather than an assumption.
     [Test] procedure TypelessGlobals_ReadTheirOwnBytesOnBothBitnesses;
+    // A routine name is not a variable: there is nothing at its address to read
+    // as a value, only its machine code. Reading it anyway produced numbers like
+    // 1796744703 -- which is `FF 25 18 6B`, the first four bytes of an import
+    // thunk -- presented as the symbol's value. Found in a real 32-bit VCL
+    // application. The address is what a debugger should report for a callable.
+    [Test] procedure ProcedureName_ReportsItsAddressNotItsCodeOnBothBitnesses;
     // TD32 stores globals mangled, and dcc32 mangles Borland-style where dcc64
     // mangles Itanium-style; only the latter was decoded, so NO unit global
     // resolved on a 32-bit target.
@@ -4069,6 +4075,55 @@ begin
   Assert.AreEqual('', Failures,
     'the stack must reach the caller across sourceless RTL frames, at the ' +
     'right line, on both bitnesses -- ' + Failures);
+end;
+
+procedure TWin32RunControlTests.ProcedureName_ReportsItsAddressNotItsCodeOnBothBitnesses;
+const
+  SOURCE = 'TestTargetEdge2.pas';
+  MARKER = 'TLS_BODY';
+  // A free procedure of the target, resolvable by bare name and with no data
+  // symbol of the same name to compete with it.
+  CALLABLE = 'RunOpenArray';
+
+  function EvalAt(const Exe, Map, Rsm: string; Line: Integer): string;
+  begin
+    var Session := OpenSessionAtMarker(Exe, Map, Rsm, TargetDir, SOURCE, Line);
+    try
+      if Session.State <> dsStopped then
+        Exit('<did not stop>');
+      var R := Session.Evaluate(CALLABLE);
+      if not R.Success then
+        Exit('<' + R.ErrorText + '>');
+      Result := R.Value;
+    finally
+      Session.Free;
+    end;
+  end;
+
+  // An address renders as `0x...`. The defect rendered the CODE at that address
+  // as a decimal integer, so the two are easy to tell apart -- and the failure
+  // message carries the value either way.
+  function LooksLikeAnAddress(const S: string): Boolean;
+  begin
+    Result := S.TrimLeft.StartsWith('0x', True) or S.TrimLeft.StartsWith('$');
+  end;
+
+begin
+  var Line := MarkerLineInFile(TargetDir + SOURCE, MARKER);
+  Assert.IsTrue(Line > 0, 'marker ' + MARKER + ' not found');
+  Assert.IsTrue(FileExists(Win64Exe), '64-bit control target missing');
+
+  var Failures := '';
+  var Got64 := EvalAt(Win64Exe, Win64Map, Win64Rsm, Line);
+  if not LooksLikeAnAddress(Got64) then
+    Failures := Failures + 'x64: ' + Got64 + '; ';
+  var Got32 := EvalAt(Win32Exe, Win32Map, Win32Rsm, Line);
+  if not LooksLikeAnAddress(Got32) then
+    Failures := Failures + 'x86: ' + Got32 + '; ';
+
+  Assert.AreEqual('', Failures,
+    'a routine name must report its ADDRESS, never the machine code stored ' +
+    'there, on both bitnesses -- ' + Failures);
 end;
 
 procedure TWin32RunControlTests.TypelessGlobals_ReadTheirOwnBytesOnBothBitnesses;
