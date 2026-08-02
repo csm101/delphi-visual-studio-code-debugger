@@ -136,6 +136,13 @@ type
     // break, module enumeration and PE32 parsing right before anything else
     // works, so the assertion covers locals as well as the stop location.
     [Test] procedure Attach_ToRunningTarget_StopsWithLocalsOnBothBitnesses;
+    // The runtime RTTI field-table walk assumed a 10-byte header, which is
+    // 2 + a POINTER: correct on x64, four bytes too many on x86. That shifted
+    // the whole walk, so a 32-bit target produced field names made of unrelated
+    // memory and offsets like -2025889729. It also matters for generics: RTTI
+    // is the only source that knows a `TList<Integer>`'s element type, because
+    // dcc32 emits the generic un-instantiated.
+    [Test] procedure RttiFieldTable_ReadsRealFieldsOnBothBitnesses;
     // TD32 stores globals mangled, and dcc32 mangles Borland-style where dcc64
     // mangles Itanium-style; only the latter was decoded, so NO unit global
     // resolved on a 32-bit target.
@@ -3492,6 +3499,60 @@ begin
   Assert.AreEqual('', Failures,
     'attaching to a running target must stop at the breakpoint and read its ' +
     'locals, on both bitnesses -- ' + Failures);
+end;
+
+procedure TWin32RunControlTests.RttiFieldTable_ReadsRealFieldsOnBothBitnesses;
+const
+  SOURCE = 'TestTargetTypes.pas';
+  MARKER = 'TYPES_BODY';
+
+  // `GenList: TList<Integer>`. Its first two fields are FItems and FCount, and
+  // asserting the ELEMENT TYPE is the point: dcc32 emits the generic
+  // un-instantiated (one shared `%TList__1` whose FItems is typed from a
+  // different instantiation), so runtime RTTI is the only source that knows
+  // this list holds Integers.
+  //
+  // Offsets are asserted too, per bitness, because a mis-sized header shifts
+  // the walk without necessarily emptying it.
+  function FieldSummary(const Exe, Map, Rsm: string; Line: Integer): string;
+  begin
+    var Session := OpenSessionAtMarker(Exe, Map, Rsm, TargetDir, SOURCE, Line);
+    try
+      if Session.State <> dsStopped then
+        Exit('<did not stop>');
+      var R := Session.Evaluate('GenList');
+      if not R.Success then
+        Exit('<' + R.ErrorText + '>');
+      var Fields := Session.Rtti.ExpandClass(R.RawValue);
+      if Length(Fields) = 0 then
+        Exit('<no fields>');
+      for var F in Fields do
+        if SameText(F.Name, 'FItems') then
+          Exit(Format('FItems type=%s off=%d count=%d',
+            [F.TypeName, F.FieldOffset, Length(Fields)]));
+      Result := '<FItems not found>';
+    finally
+      Session.Free;
+    end;
+  end;
+
+begin
+  var Line := MarkerLineInFile(TargetDir + SOURCE, MARKER);
+  Assert.IsTrue(Line > 0, 'marker ' + MARKER + ' not found');
+  Assert.IsTrue(FileExists(Win64Exe), '64-bit control target missing');
+
+  var Failures := '';
+  var Got64 := FieldSummary(Win64Exe, Win64Map, Win64Rsm, Line);
+  if Got64 <> 'FItems type=TArray<System.Integer> off=8 count=8' then
+    Failures := Failures + 'x64: ' + Got64 + '; ';
+  // Same fields, half the offsets: FItems sits at 4 rather than 8.
+  var Got32 := FieldSummary(Win32Exe, Win32Map, Win32Rsm, Line);
+  if Got32 <> 'FItems type=TArray<System.Integer> off=4 count=8' then
+    Failures := Failures + 'x86: ' + Got32 + '; ';
+
+  Assert.AreEqual('', Failures,
+    'runtime RTTI must report a generic''s real, instantiated fields on both ' +
+    'bitnesses -- ' + Failures);
 end;
 
 procedure TWin32RunControlTests.BreakpointOnBeginLine_ReportsPassedParameters;

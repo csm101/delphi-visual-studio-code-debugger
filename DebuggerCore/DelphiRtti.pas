@@ -450,10 +450,17 @@ begin
   if not ReadVmtSlot(VmtAddr, FLayout.VmtFieldTable, FieldTablePtr) then Exit;
   if FieldTablePtr = 0 then Exit;
 
-  // TVmtFieldTable (packed): Count(u16=2) + ClassTab(ptr8=8) = 10 bytes header,
-  // then Count TVmtFieldEntry records, then ExCount(u16), then ExCount TFieldExEntry.
+  // TVmtFieldTable (packed): Count(u16) + ClassTab(POINTER), then Count
+  // TVmtFieldEntry records, then ExCount(u16), then ExCount TFieldExEntry.
+  //
+  // The header is 2 + pointer size, NOT a constant 10: ClassTab is a target
+  // pointer, so the header is 10 bytes on x64 and 6 on x86. Hardcoding 10
+  // over-read by four bytes on a 32-bit target and shifted the whole walk --
+  // field names came out as fragments of unrelated memory, kinds as 0 and
+  // offsets as values like -2025889729, which then addressed arbitrary memory.
+  var PtrSize := UInt64(FLayout.PointerSize);
   if not ReadU16(FieldTablePtr, ClassicCount) then Exit;
-  Pos := FieldTablePtr + 10;
+  Pos := FieldTablePtr + 2 + PtrSize;
 
   // Skip ClassicCount TVmtFieldEntry records.
   // Each (packed): FieldOffset(4) + TypeIndex(2) + Name(ShortString) + AttrData.
@@ -469,7 +476,6 @@ begin
   // Read ExCount TFieldExEntry records. Each (packed), in TARGET pointers:
   //   Flags(1) + TypeRef:PPTypeInfo(ptr) + Offset(4) + Name(ShortString) + AttrData
   // so the fixed part is 5 + ptr bytes, not a constant 13.
-  var PtrSize := UInt64(FLayout.PointerSize);
   for var I := 0 to Integer(ExCount) - 1 do begin
     var Flags:       Byte;
     var TypeRefPPtr: UInt64;

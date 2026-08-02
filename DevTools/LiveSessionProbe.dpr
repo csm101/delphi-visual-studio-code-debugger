@@ -161,6 +161,25 @@ begin
         ExpandHandle(R.Handle, 2, '        ');
       end;
     end
+    else if SameText(Cmd, 'rtti') then begin
+      // Runtime RTTI view of a local's class, independent of the static member
+      // tables -- the measurement that says whether RTTI carries INSTANTIATED
+      // generic types where dcc32's debug info carries only `%TList__1`.
+      var Target := Session.Evaluate(Arg);
+      if not Target.Success then
+        Writeln('    rtti ' + Arg + ' => ' + Target.ErrorText)
+      else begin
+        var Obj := Target.RawValue;
+        Writeln(Format('    rtti %s: runtimeClass="%s" obj=$%x',
+          [Arg, Session.Rtti.GetInstanceClassName(Obj), Obj]));
+        for var P in Session.Rtti.GetClassProperties(Obj) do
+          Writeln(Format('        prop  %-14s kind=%-3d type="%s"',
+            [P.Name, P.PropTypeKind, P.PropTypeName]));
+        for var F in Session.Rtti.ExpandClass(Obj) do
+          Writeln(Format('        field %-14s kind=%-3d type="%s" off=%d',
+            [F.Name, F.TypeKind, F.TypeName, F.FieldOffset]));
+      end;
+    end
     else if SameText(Cmd, 'set') then begin
       // `set <Name> <Value>` -- write a local, then show what the debugger
       // reads back, which is what catches a write at the wrong width.

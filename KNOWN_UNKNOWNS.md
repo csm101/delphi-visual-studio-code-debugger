@@ -96,8 +96,19 @@ Still open:
   empty list, so the state is at least distinguishable from the truth. The
   real fix is a warm-up + retry on the locals path to match the watch path.
 
-- **dcc32 emits generics UN-INSTANTIATED, so a `TList<T>`'s element type is
-  wrong on Win32** — measured 2026-08-01 on TestTarget's `GenList: TList<Integer>`.
+- **dcc32 emits generics UN-INSTANTIATED — FIELDS now recovered via RTTI, the
+  PROPERTY node still wrong on Win32.** Largely closed 2026-08-02: runtime RTTI
+  reports `FItems: TArray<System.Integer>` correctly on BOTH bitnesses now that
+  the field-table header size is right (it is 2 + a pointer, and hardcoding 10
+  shifted the whole walk on x86 into garbage). So the element type of a generic
+  container is available again despite the static tables being
+  un-instantiated. What remains wrong on Win32 is the PROPERTY node --
+  `Items` -> `PExpectedMemoryLeaks`, `List` -> `TCloProc` -- and that is NOT an
+  RTTI problem: `GetClassProperties` returns nothing on either bitness, so
+  those names come from the static tables and are an instance of the RSM
+  Win32 type-id mis-resolution described in the next entry. The original
+  finding follows.
+  measured 2026-08-01 on TestTarget's `GenList: TList<Integer>`.
   dcc64 emits a record per instantiation, `TList__1<Integer>`, whose `FItems`
   is correctly `^Integer`. dcc32 emits ONE shared record named `%TList__1`
   (methods appear as `%TList__1.GetList$qqrv`), and its `FItems` is typed
