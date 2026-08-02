@@ -277,13 +277,55 @@ begin
   if (Flags and fBad) <> 0 then
     Exit;
 
-  // In 32-bit mode C4/C5 are LES/LDS only when they address memory. With
-  // mod=3 they are the AVX VEX prefixes instead, and decoding them as LES/LDS
-  // would yield a wrong length rather than no length. dcc32 does not emit AVX,
-  // but a hand-written asm block or a future RTL might, so refuse instead.
+  // In 32-bit mode C4/C5 are LES/LDS only when they address memory. With mod=3
+  // they are the AVX VEX prefixes instead. The RTL DOES emit AVX -- `System.Move`
+  // starts `C5 FC 10 08` (vmovups xmm1,[eax]) in a stock Athens build -- and
+  // Move is one of the most-stepped-through routines there is, so refusing here
+  // would blind the walker inside it.
+  //
+  // VEX only re-encodes the OPCODE MAP and the operand size; the modrm / SIB /
+  // displacement / immediate structure that determines LENGTH is unchanged. So
+  // the existing maps are reused, restricted to the forms that are actually
+  // valid under VEX: anything else refuses rather than guessing a length.
   if (not TwoByte) and (Op in [$C4, $C5]) and (Pos < Avail) and
-     ((Bytes[Pos] shr 6) = 3) then
-    Exit;
+     ((Bytes[Pos] shr 6) = 3) then begin
+    var VexMap := 1;   // 1 = 0F, 2 = 0F38, 3 = 0F3A
+    if Op = $C5 then begin
+      Inc(Pos);        // one payload byte: R.vvvv.L.pp, always the 0F map
+    end
+    else begin
+      if Pos + 1 >= Avail then
+        Exit;
+      VexMap := Bytes[Pos] and $1F;
+      Inc(Pos, 2);     // RXB.mmmmm and W.vvvv.L.pp
+    end;
+    var VexOp: Byte;
+    if not Take(VexOp) then
+      Exit;
+    case VexMap of
+      1: begin
+           // 0F 77 is EMMS without VEX and VZEROUPPER / VZEROALL with it. Both
+           // take no operands, so the shared map already gives the right
+           // length; it is listed explicitly because it is the ONE no-operand
+           // form valid here. `System.Move` ends with it.
+           if VexOp = $77 then
+             Flags := fNone
+           else begin
+             Flags := TwoByteFlags(VexOp);
+             // Only the SSE/AVX shapes are meaningful otherwise. A jcc or a
+             // bswap reached through VEX is not a real encoding, and taking its
+             // length would desynchronise the stream.
+             if (Flags <> fModRM) and (Flags <> (fModRM or fImm8)) then
+               Exit;
+           end;
+         end;
+      2: Flags := fModRM;                // 0F38: no immediate
+      3: Flags := fModRM or fImm8;       // 0F3A: always an imm8
+    else
+      Exit;                              // reserved map
+    end;
+    TwoByte := True;                     // suppress the direct-call check below
+  end;
 
   // ModRM, SIB and displacement.
   if (Flags and fModRM) <> 0 then begin

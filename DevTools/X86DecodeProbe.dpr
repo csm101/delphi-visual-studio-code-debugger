@@ -21,6 +21,7 @@ program X86DecodeProbe;
 uses
   System.SysUtils,
   System.Classes,
+  System.Math,
   Winapi.Windows,
   System.Generics.Collections,
   System.Generics.Defaults,
@@ -333,12 +334,23 @@ begin
     Writeln('missed line    : ', Counts[ocMissedLine]);
     Writeln('unreadable     : ', Counts[ocUnreadable]);
     Writeln;
-    if (Broken = 0) and (Counts[ocUnknownOpcode] = 0) then
-      Writeln('RESULT: every line-to-line span decodes exactly, and no opcode was unknown.')
-    else if Counts[ocUnknownOpcode] > 0 then
-      Writeln('RESULT: UNKNOWN OPCODES present -- the opcode map is incomplete.')
-    else
-      Writeln('RESULT: some spans do not resolve -- see the first break address.');
+    // Deliberately no pass/fail verdict on the raw counts. Neither measure can
+    // reach zero on a real binary, because dcc32 puts DATA in the code stream --
+    // the exception-handler table after `jmp @HandleAnyException`, and the jump
+    // table of every large `case`. Both are indistinguishable from an unknown
+    // instruction to a linear decoder, and refusing is the right answer for both.
+    //
+    // What to look at instead: run the probe before and after a decoder change.
+    // A change that ADDS coverage lowers the unknown count without raising the
+    // broken-span count; one that gets a length WRONG desynchronises the stream
+    // and RAISES broken spans. That comparison is the signal -- an absolute
+    // number is not.
+    if Verbose then
+      Writeln('NOTE: inspect the bytes above. Repeated small values and pairs of ' +
+              'in-image addresses are jump tables, i.e. data, not gaps in the map.');
+    Writeln(Format('RESULT: %d/%d spans unresolved (%.2f%%), %d routines hit an ' +
+      'unknown opcode. Compare against the previous run rather than against zero.',
+      [Broken, Spans, (Broken * 100.0) / Max(Spans, 1), Counts[ocUnknownOpcode]]));
   finally
     Reader.Free;
     Img.Free;

@@ -629,11 +629,28 @@ C8 D6 4D 00      handler address    <- also a line-table address
 That is data, and no linear decode can cross it. The decoder reports
 undecidable there, which is the correct answer.
 
-The number that matters is **unknown opcodes**, which must be zero: any opcode
-outside the map yields length 0 and makes callers decline rather than guess.
-Measured over 9 940 routines / 70 476 spans of production 32-bit Delphi code
-(`C:\Athens\hydra_2\ExtApps\*\Win32\Debug`) plus the test targets: zero unknown
-opcodes, 0.8 % of spans undecidable, all of them exception-table crossings.
+**Read it as a comparison, not as a pass/fail.** Neither count reaches zero on a
+real binary, because the exception table is not the only data in the code
+stream: every large `case` has its jump table there too, and a jump table is
+indistinguishable from an unknown instruction to a linear decoder. What the two
+numbers say together is the useful part — a change that ADDS coverage lowers the
+unknown count without raising broken spans, while a change that gets a length
+WRONG desynchronises and RAISES broken spans.
+
+Run at two scales, because they find different things:
+
+| Module | Routines | Spans | Broken | Unknown opcodes |
+|---|---|---|---|---|
+| test targets + `hydra_2\ExtApps\*\Win32\Debug` | 9 940 | 70 476 | 588 (0.8 %) | 0 |
+| `hydra_2\Win32\Debug\Hydra2SingleEXE.exe` (497 MB) | 393 124 | 2 354 868 | 6 502 (0.28 %) | 48 |
+
+The small set said "zero unknown opcodes" and that was misleading: the 497 MB
+binary surfaced 61, and one of them was a real gap rather than data —
+`System.Move` opens with `C5 FC 10 08` (`vmovups xmm1,[eax]`) and ends with
+`C5 F8 77` (`vzeroupper`), so the Athens RTL **does** emit AVX. Decoding VEX
+brought unknowns to 48 and broken spans DOWN (6 528 → 6 502), which is what
+confirms the added lengths are right. Every remaining case inspected is data:
+repeated small values, or pairs of in-image addresses.
 
 ### Live process and adapter
 

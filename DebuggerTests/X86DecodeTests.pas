@@ -179,11 +179,16 @@ begin
   Assert.AreEqual(0, Decode([$0F, $04]).Length,
     'an unmapped opcode must report length 0');
 
-  // C5 with mod=3 is the 2-byte AVX VEX prefix, not LDS. Decoding it as LDS
-  // would produce a plausible wrong length, which is the one outcome the
-  // design forbids.
-  Assert.AreEqual(0, Decode([$C5, $F8, $57, $C0]).Length,
-    'a VEX prefix must report length 0, not an LDS length');
+  // C5 with mod=3 is the 2-byte AVX VEX prefix, not LDS -- and the RTL does
+  // emit AVX, so it must DECODE rather than be refused: `System.Move` opens
+  // with `C5 FC 10 08` in a stock Athens build.
+  Assert.AreEqual(4, Decode([$C5, $F8, $57, $C0]).Length,
+    'vxorps xmm0,xmm0,xmm0 is C5 + payload + opcode + modrm');
+  Assert.AreEqual(4, Decode([$C5, $FC, $10, $08]).Length,
+    'vmovups xmm1,[eax] -- the first instruction of System.Move');
+  // 3-byte VEX on the 0F3A map always carries an imm8.
+  Assert.AreEqual(6, Decode([$C4, $E3, $79, $17, $C0, $01]).Length,
+    'vextractps eax,xmm0,1 is C4 + 2 payload + opcode + modrm + imm8');
 
   // The memory form of the same opcode IS LDS and must still decode.
   Assert.AreEqual(3, Decode([$C5, $45, $FC]).Length,

@@ -1200,12 +1200,26 @@ call site) rather than 81 (the `finally`), which is what the first, unsound
 attempt produced.
 
 Validation is empirical, against ground truth the binaries already carry: every
-line-table address is an instruction boundary, so decoding must land on each
-one. Over 9 940 routines and 70 476 line-to-line spans of production 32-bit
-Delphi code (`DevTools\X86DecodeProbe.exe`), there were **zero unknown
-opcodes**. The 0.8 % of spans that do not resolve all cross the exception-handler
-table dcc32 emits inline in the code stream after `jmp @HandleAnyException`,
-which is data no linear decode can cross; there the decoder reports undecidable.
+line-table address is an instruction boundary, so decoding must land on each one
+(`DevTools\X86DecodeProbe.exe`).
+
+Scale mattered. Over 9 940 routines and 70 476 spans there were zero unknown
+opcodes — and that was misleading. A 497 MB production binary (393 124 routines,
+2 354 868 spans) surfaced 61, of which one was a genuine gap rather than data:
+the Athens RTL emits **AVX**, so `System.Move` opens `C5 FC 10 08`
+(`vmovups xmm1,[eax]`) and ends `C5 F8 77` (`vzeroupper`). Refusing there would
+blind the walker inside one of the most-stepped routines in any program. VEX is
+now decoded — the prefix changes the opcode map and the operand size, never the
+modrm/SIB/displacement/immediate structure that determines LENGTH, so the
+existing maps are reused and any form outside them still refuses.
+
+The remaining unresolved spans (0.28 % at scale) are DATA in the code stream:
+the exception-handler table after `jmp @HandleAnyException`, and the jump table
+of every large `case`. No linear decode can cross either, and there the decoder
+reports undecidable. That is why the probe reports counts rather than a verdict:
+adding coverage lowers unknowns without raising broken spans, whereas a WRONG
+length desynchronises and raises them — which is how the VEX work was confirmed
+(6 528 → 6 502 broken).
 
 ## Frame symbol attribution
 
