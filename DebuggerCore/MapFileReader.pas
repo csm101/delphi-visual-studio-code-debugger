@@ -29,7 +29,7 @@ type
 
   TMapFile = class(TInterfacedObject,
     ISourceLineProvider, IFunctionNameProvider, IBackgroundIndexProvider,
-    IThreadLocalNameProvider)
+    IThreadLocalNameProvider, ISymbolExtentProvider)
   private
     // Memory-mapped file
     FFileHandle:     THandle;
@@ -152,6 +152,8 @@ type
     function    NameToRva(const Name: string; out Rva: UInt64): Boolean;
     // IThreadLocalNameProvider
     function    NameIsThreadLocal(const Name: string): Boolean;
+    // ISymbolExtentProvider
+    function    MaxSymbolBytesAt(Rva: UInt64; out MaxBytes: Integer): Boolean;
     function    SourceLineToRva(const FileName: string; Line: Integer;
                   out Rva: UInt64): Boolean;
     function    FirstUserRva: UInt64;
@@ -1433,6 +1435,52 @@ begin
     end;
   end;
   FPubReverseReady := True;
+end;
+
+function TMapFile.MaxSymbolBytesAt(Rva: UInt64; out MaxBytes: Integer): Boolean;
+const
+  // Beyond this the answer stops being useful as a width bound, and a huge gap
+  // usually means the next symbol is simply in another section.
+  SANE_CAP = 4096;
+begin
+  MaxBytes := 0;
+  Result := False;
+  if not RvaIsInImage(Rva) then
+    Exit;
+  // Blocking, unlike RvaToFunctionName: the callers of this are asking so they
+  // can decide how many bytes to READ, and an answer that depends on whether a
+  // background parse has finished would make the VALUE depend on timing.
+  WaitForPubs;
+
+  var Arr: TArray<UInt64>;
+  FLock.Acquire;
+  try
+    Arr := FSortedPubRvas;
+  finally
+    FLock.Release;
+  end;
+  if Length(Arr) = 0 then
+    Exit;
+
+  // First public strictly above Rva. Two symbols cannot overlap, so the
+  // distance to it bounds whatever lives here.
+  var Lo := 0;
+  var Hi := Length(Arr);
+  while Lo < Hi do begin
+    var Mid := (Lo + Hi) div 2;
+    if Arr[Mid] <= Rva then
+      Lo := Mid + 1
+    else
+      Hi := Mid;
+  end;
+  if Lo >= Length(Arr) then
+    Exit;
+
+  var Gap := Arr[Lo] - Rva;
+  if (Gap = 0) or (Gap > SANE_CAP) then
+    Exit;
+  MaxBytes := Integer(Gap);
+  Result := True;
 end;
 
 function TMapFile.NameIsThreadLocal(const Name: string): Boolean;

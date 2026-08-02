@@ -203,6 +203,13 @@ type
     // report a WRONG one. That keeps the test valid both now and after the
     // runtime TLS resolution (TEB -> ThreadLocalStoragePointer) is implemented.
     [Test] procedure ThreadVar_IsNeverSilentlyWrongOnBothBitnesses;
+    // A release-shaped build -- detailed MAP, no embedded debug info -- gives an
+    // ADDRESS for a global but no TYPE, and with no type there is no width. The
+    // reader fell back to a full pointer's worth and folded the following,
+    // packed globals into the value: a `Byte` holding 5 read back as
+    // -1091589627 on both bitnesses. The read is now bounded by the distance to
+    // the next symbol, which is a fact from the MAP rather than an assumption.
+    [Test] procedure TypelessGlobals_ReadTheirOwnBytesOnBothBitnesses;
     // TD32 stores globals mangled, and dcc32 mangles Borland-style where dcc64
     // mangles Itanium-style; only the latter was decoded, so NO unit global
     // resolved on a 32-bit target.
@@ -4062,6 +4069,67 @@ begin
   Assert.AreEqual('', Failures,
     'the stack must reach the caller across sourceless RTL frames, at the ' +
     'right line, on both bitnesses -- ' + Failures);
+end;
+
+procedure TWin32RunControlTests.TypelessGlobals_ReadTheirOwnBytesOnBothBitnesses;
+type
+  TExprCheck = record Expr, Expected: string end;
+const
+  SOURCE = 'MapOnlyGlobals.dpr';
+  MARKER = 'MAPONLY_BODY';
+  // The fixture packs these at +0, +1, +2 and +4, so an over-wide read produces
+  // an unmistakable number rather than a nearly-right one: GSmallA came back as
+  // -1091589627 ($BEEFAA05) before the read was bounded.
+  CHECKS: array[0..2] of TExprCheck = (
+    (Expr: 'GSmallA'; Expected: '5'),
+    (Expr: 'GSmallB'; Expected: '170'),
+    (Expr: 'GWordC';  Expected: '48879'));
+
+  function EvalAt(const Exe, Map, Expr: string; Line: Integer): string;
+  begin
+    // No .rsm and no TD32 in the exe: the MAP is the only debug info, which is
+    // the whole point of the fixture.
+    var Session := OpenSessionAtMarker(Exe, Map, '', TargetDir, SOURCE, Line);
+    try
+      if Session.State <> dsStopped then
+        Exit('<did not stop>');
+      var R := Session.Evaluate(Expr);
+      if not R.Success then
+        Exit('<' + R.ErrorText + '>');
+      Result := R.Value;
+    finally
+      Session.Free;
+    end;
+  end;
+
+begin
+  var Line := MarkerLineInFile(TargetDir + SOURCE, MARKER);
+  Assert.IsTrue(Line > 0, 'marker ' + MARKER + ' not found');
+  var Exe64 := TargetDir + 'Win64\Debug\MapOnlyGlobals.exe';
+  var Map64 := TargetDir + 'Win64\Debug\MapOnlyGlobals.map';
+  var Exe32 := TargetDir + 'Win32\Debug\MapOnlyGlobals.exe';
+  var Map32 := TargetDir + 'Win32\Debug\MapOnlyGlobals.map';
+  Assert.IsTrue(FileExists(Exe64) and FileExists(Map64),
+    'MAP-only 64-bit fixture missing -- run build_target.bat');
+  Assert.IsTrue(FileExists(Exe32) and FileExists(Map32),
+    'MAP-only 32-bit fixture missing -- run build_target.bat');
+
+  var Failures := '';
+  for var Check in CHECKS do begin
+    // Compared as a leading fragment: the display carries a hex echo
+    // ("5  (0x5)"), and asserting the whole string would fail on formatting
+    // rather than on the value.
+    var Got64 := EvalAt(Exe64, Map64, Check.Expr, Line);
+    if not Got64.StartsWith(Check.Expected) then
+      Failures := Failures + Format('x64 %s -> %s; ', [Check.Expr, Got64]);
+    var Got32 := EvalAt(Exe32, Map32, Check.Expr, Line);
+    if not Got32.StartsWith(Check.Expected) then
+      Failures := Failures + Format('x86 %s -> %s; ', [Check.Expr, Got32]);
+  end;
+
+  Assert.AreEqual('', Failures,
+    'a global with no type must still read only its OWN bytes, on both ' +
+    'bitnesses -- ' + Failures);
 end;
 
 procedure TWin32RunControlTests.ThreadVar_IsNeverSilentlyWrongOnBothBitnesses;

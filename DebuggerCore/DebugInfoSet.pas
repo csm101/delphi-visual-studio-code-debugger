@@ -63,6 +63,7 @@ type
     FLineProviders:   TList<ISourceLineProvider>;
     FFuncProviders:   TList<IFunctionNameProvider>;
     FTlsNameProviders: TList<IThreadLocalNameProvider>;
+    FExtentProviders:  TList<ISymbolExtentProvider>;
     FLocalProviders:  TList<ILocalSymbolProvider>;
     FGlobalProviders: TList<IGlobalSymbolProvider>;
     FUsesProviders:   TList<IUnitUsesProvider>;
@@ -215,6 +216,12 @@ type
     // no address in the image. Lets a failed lookup say why instead of the
     // misleading "not found".
     function  NameIsThreadLocal(const Name: string): Boolean;
+    // Upper bound, in bytes, on what a symbol at this RVA can occupy: the
+    // distance to the next symbol. Used to bound a read when the symbol's TYPE
+    // -- and so its width -- is unknown. Takes the SMALLEST bound any provider
+    // offers, since each one is a valid upper bound and the tightest is the
+    // safest.
+    function  MaxSymbolBytesAt(Rva: UInt64; out MaxBytes: Integer): Boolean;
   end;
 
 implementation
@@ -234,6 +241,7 @@ begin
   FLineProviders   := TList<ISourceLineProvider>.Create;
   FFuncProviders   := TList<IFunctionNameProvider>.Create;
   FTlsNameProviders := TList<IThreadLocalNameProvider>.Create;
+  FExtentProviders  := TList<ISymbolExtentProvider>.Create;
   FLocalProviders  := TList<ILocalSymbolProvider>.Create;
   FGlobalProviders := TList<IGlobalSymbolProvider>.Create;
   FUsesProviders   := TList<IUnitUsesProvider>.Create;
@@ -257,6 +265,7 @@ begin
   FLineProviders.Free;
   FFuncProviders.Free;
   FTlsNameProviders.Free;
+  FExtentProviders.Free;
   FLocalProviders.Free;
   FGlobalProviders.Free;
   FUsesProviders.Free;
@@ -305,6 +314,9 @@ begin
   var TlsP: IThreadLocalNameProvider;
   if Supports(Provider, IThreadLocalNameProvider, TlsP) then
     FTlsNameProviders.Add(TlsP);
+  var ExtentP: ISymbolExtentProvider;
+  if Supports(Provider, ISymbolExtentProvider, ExtentP) then
+    FExtentProviders.Add(ExtentP);
   var UsesP: IUnitUsesProvider;
   if Supports(Provider, IUnitUsesProvider, UsesP) then
     FUsesProviders.Add(UsesP);
@@ -411,6 +423,9 @@ begin
   var TlsP: IThreadLocalNameProvider;
   if Supports(Provider, IThreadLocalNameProvider, TlsP) then
     FTlsNameProviders.Remove(TlsP);
+  var ExtentR: ISymbolExtentProvider;
+  if Supports(Provider, ISymbolExtentProvider, ExtentR) then
+    FExtentProviders.Remove(ExtentR);
   if Supports(Provider, ILocalSymbolProvider, LocalP) then begin
     FLocalProviders.Remove(LocalP);
     for var I := FRangedLocals.Count - 1 downto 0 do
@@ -1527,6 +1542,21 @@ begin
       Result[Last] := Result[I];
     end;
   SetLength(Result, Last + 1);
+end;
+
+function TDebugInfoSet.MaxSymbolBytesAt(Rva: UInt64;
+  out MaxBytes: Integer): Boolean;
+begin
+  MaxBytes := 0;
+  Result := False;
+  for var P in FExtentProviders do begin
+    var Bound: Integer;
+    if not P.MaxSymbolBytesAt(Rva, Bound) then
+      Continue;
+    if (not Result) or (Bound < MaxBytes) then
+      MaxBytes := Bound;
+    Result := True;
+  end;
 end;
 
 function TDebugInfoSet.NameIsThreadLocal(const Name: string): Boolean;

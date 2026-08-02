@@ -2883,6 +2883,17 @@ Working on the x86 stack walker, which is the riskiest component in the project.
 
 ### In flight (not committed)
 
+-4. **A global with no type read its neighbours' bytes — FIXED, reproduced
+    first.** Needed a fixture that did not exist: `MapOnlyGlobals.dpr`, built
+    with `-GD` and WITHOUT `-V`/`-VR`/`-VN`, so the MAP carries publics and line
+    numbers and the exe carries no TD32. That is the realistic release shape and
+    the only one where the debugger has an address but no type. Its globals are
+    packed at +0/+1/+2/+4; a `Byte` holding 5 read back as `-1091589627` on both
+    bitnesses. Reads are now bounded by the distance to the next symbol
+    (`ISymbolExtentProvider`), which is exact here (1, 1 and 2 bytes) and only
+    ever narrows. `System.IsConsole` was tried as a repro first and does NOT
+    work: TD32 types it, so it already read 1 byte correctly.
+
 -1. **Closure recovery no longer scans.** `TryRecoverClosureObject` walked eight
     pointer slots BACKWARDS taking the first `$ActRec` it met; in a closure-heavy
     target activation records are dense on the stack, so it could latch a

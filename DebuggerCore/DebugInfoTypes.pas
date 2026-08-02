@@ -188,6 +188,21 @@ type
   // threadvar is reported as "not found", which sends the user looking for a
   // typo in a name that is plainly there in the source. Only providers that can
   // SEE the distinction (the MAP has a TLS segment class) implement it.
+  // Optional: how many bytes a symbol at an RVA can possibly occupy, taken as
+  // the distance to the next symbol. Not the symbol's size -- padding may be
+  // included -- but a hard UPPER BOUND, because two symbols cannot overlap.
+  //
+  // It exists for the case where an address is known and a TYPE is not, which
+  // is what a MAP-only (release) build gives: with no type there is no width
+  // either, and reading a fixed 8 bytes folds the following variables into the
+  // value. Measured on a packed fixture, a `Byte` holding 5 read back as
+  // -1091589627. Only the MAP can answer, since only it enumerates publics by
+  // address.
+  ISymbolExtentProvider = interface
+    ['{2F5A6C01-1111-4A42-8C3D-53ABAABB0012}']
+    function MaxSymbolBytesAt(Rva: UInt64; out MaxBytes: Integer): Boolean;
+  end;
+
   IThreadLocalNameProvider = interface
     ['{2F5A6C01-1111-4A42-8C3D-53ABAABB0011}']
     function NameIsThreadLocal(const Name: string): Boolean;

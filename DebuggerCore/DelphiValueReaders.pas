@@ -56,8 +56,14 @@ function Real48BytesToDoubleBits(const Bytes: array of Byte): UInt64;
 // narrowing the wide float types on the way. Use this rather than calling
 // LocalReadSize and reading into a UInt64 directly: that pattern silently
 // truncates any type WideFloatByteSize knows about.
+// MaxBytes, when non-zero, caps the read. It exists for a symbol whose TYPE is
+// unknown: there is then no width either, and the fallback is a full pointer's
+// worth, which folds whatever is packed after it into the value. The cap is a
+// bound derived from the debug info (the distance to the next symbol), never a
+// guess about the type.
 function ReadValueSlotRaw(const Read: TSlotReader; Addr: UInt64;
-  const TypeName: string; PointerSize: Integer; out Raw: UInt64): Boolean;
+  const TypeName: string; PointerSize: Integer; out Raw: UInt64;
+  MaxBytes: Integer = 0): Boolean;
 
 // The WRITE direction of the two conversions above: build the target's own
 // representation from a Double. Writing 8 bytes of IEEE double into a 10-byte
@@ -326,12 +332,19 @@ begin
 end;
 
 function ReadValueSlotRaw(const Read: TSlotReader; Addr: UInt64;
-  const TypeName: string; PointerSize: Integer; out Raw: UInt64): Boolean;
+  const TypeName: string; PointerSize: Integer; out Raw: UInt64;
+  MaxBytes: Integer): Boolean;
 begin
   Raw := 0;
   var Wide := WideFloatByteSize(TypeName, PointerSize);
-  if Wide = 0 then
-    Exit(Read(Addr, @Raw, LocalReadSize(TypeName, PointerSize)));
+  if Wide = 0 then begin
+    var Size := LocalReadSize(TypeName, PointerSize);
+    // Only ever narrows. A cap wider than the type would say nothing, and a cap
+    // must never widen a read the type already settled.
+    if (MaxBytes > 0) and (MaxBytes < Size) then
+      Size := MaxBytes;
+    Exit(Read(Addr, @Raw, Size));
+  end;
 
   var Bytes: array[0..9] of Byte;
   FillChar(Bytes, SizeOf(Bytes), 0);

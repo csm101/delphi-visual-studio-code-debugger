@@ -3299,12 +3299,27 @@ begin
   // Width-aware read (same rule as locals): narrow primitives leave the
   // upper RawValue bytes zeroed instead of folding in the neighbouring
   // global's bytes.
+  //
+  // With NO type there is no width either, and the fallback is a full pointer's
+  // worth. That is how a release build -- a MAP with publics and no embedded
+  // debug info, which is a shape real applications ship in -- turned a `Byte`
+  // holding 5 into -1091589627: the three following globals were packed at +1,
+  // +2 and +4 and got folded into the value, with nothing marking it as
+  // unreliable. Bound the read by the distance to the next symbol, which is a
+  // fact from the MAP rather than an assumption: two symbols cannot overlap, so
+  // whatever lives here ends before the next one starts. On the measured
+  // fixture that bound is exactly 1 byte and the answer becomes 5.
+  var ReadCap := 0;
+  if Value.TypeHint = '' then
+    if not FDebugInfo.MaxSymbolBytesAt(Rva, ReadCap) then
+      ReadCap := 0;
   Value.ValueValid := ReadValueSlotRaw(
     function(A: UInt64; Dest: Pointer; Size: Integer): Boolean
     begin
       Result := ReadProcessMemoryAt(A, Dest, Size);
     end,
-    Value.Address, Value.TypeHint, TargetLayout.PointerSize, Value.RawValue);
+    Value.Address, Value.TypeHint, TargetLayout.PointerSize, Value.RawValue,
+    ReadCap);
 
   DapLog(Format('EvaluateGlobalName "%s": Rva=$%x VA=$%x Raw=$%x ' +
     'rsmGlobal=%s TypeHint="%s"',

@@ -504,13 +504,23 @@ FIXED:
   `Test_Eval_SmallRecordReturn_NotZero`. FOLLOW-UP: expanding such a
   register-returned record field-by-field (it currently shows as a packed integer).
 
-STILL OPEN (low, from round 2):
-- **Typeless MAP-only global reads 8 bytes.** When no provider carries a global's
-  TYPE (MAP Publics resolve the address only), `EvaluateGlobalName` leaves
-  `TypeHint=''`, `LocalReadSize('')` returns 8, and the formatter's unknown-width
-  fallback masks 4 — so a `Byte`/`Word` global folds in the following global's
-  bytes (e.g. shows `16901` instead of `5`). Candidate fix: clamp the read to the
-  gap to the next DATA public RVA (`MapFileReader.FDataRvas` is already sorted).
+FIXED (was: typeless MAP-only global reads 8 bytes) — 2026-08-02. Confirmed on a
+purpose-built fixture rather than argued from the code: `MapOnlyGlobals.dpr` is
+compiled with a detailed MAP (`-GD`) and NO embedded debug info, which is the
+realistic release-build shape and the only one where an address is known and a
+type is not. Its globals are packed at +0/+1/+2/+4, and a `Byte` holding 5 read
+back as `-1091589627` ($BEEFAA05) on BOTH bitnesses — the three following
+variables folded into the value, with nothing marking it unreliable.
+
+The read is now bounded by the distance to the next symbol
+(`ISymbolExtentProvider`, answered by the MAP, which is the only reader that
+enumerates publics by address). That is a fact, not an estimate: two symbols
+cannot overlap, so whatever lives at an address ends before the next one starts.
+On the fixture the bound is exactly 1, 1 and 2 bytes and the values read 5, 170
+and 48879. The cap only ever NARROWS — a type that already settles the width
+wins. The query blocks on the publics parse deliberately, because an answer that
+depended on whether a background thread had finished would make the VALUE depend
+on timing. Test `TypelessGlobals_ReadTheirOwnBytesOnBothBitnesses`.
 
 REFUTED in round 2: ExprEval `MaskByType`/casts (the RTL fixed-width aliases never
 reach it as TypeHints, and the local read is already width-limited) and RSM
