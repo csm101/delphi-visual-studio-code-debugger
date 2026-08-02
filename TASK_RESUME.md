@@ -2875,88 +2875,51 @@ leaving the defect open and documented.
 
 Working on the x86 stack walker, which is the riskiest component in the project.
 
-### Landed this session (committed)
+### Landed and committed this session
 
-- `8e951b7` — `X86Decode.pas`, the decoder, plus its probe. No behaviour change.
-- `06db0f8` — wired in; x86 frameless-caller recovery and constructor naming.
-  Suite 1011/1007/0/4.
+All verified by the full suite (1018 found / 1014 passed / 0 failed / 4 ignored)
+and, where noted, reproduced BEFORE the fix.
 
-### In flight (not committed)
+- `8e951b7` x86 instruction-length decoder, exact-or-nothing, plus its probe.
+- `06db0f8` x86 frameless-caller stack recovery; constructor naming from the MAP.
+- `036c97f` RTTI EIntOverflow (an arithmetic exception lost a whole `variables`
+  response); interface concrete-class label on x86; receiver-naming diagnostics.
+- `6043126` threadvars resolved into the PE headers on BOTH bitnesses -- a `Byte`
+  holding `$5A5A5A5A` answered `0`. Now refused with a reason.
+- `55bc6e1` closure activation record derived instead of scanned (the scan could
+  expand a FOREIGN closure); frame naming no longer depends on which provider
+  won a race.
+- `c471562` a global with no type read its neighbours' bytes; needed a new
+  MAP-only fixture to reproduce at all.
+- `e60b6e6` a routine name reported the machine code at its address; the symbol
+  index threads outlived the readers they were writing (`Invalid pointer
+  operation` on teardown).
+- `412602a` AVX decoding -- the Athens RTL emits it and `System.Move` was
+  undecodable. Found only by running the probe against a 497 MB binary.
 
--4. **A global with no type read its neighbours' bytes — FIXED, reproduced
-    first.** Needed a fixture that did not exist: `MapOnlyGlobals.dpr`, built
-    with `-GD` and WITHOUT `-V`/`-VR`/`-VN`, so the MAP carries publics and line
-    numbers and the exe carries no TD32. That is the realistic release shape and
-    the only one where the debugger has an address but no type. Its globals are
-    packed at +0/+1/+2/+4; a `Byte` holding 5 read back as `-1091589627` on both
-    bitnesses. Reads are now bounded by the distance to the next symbol
-    (`ISymbolExtentProvider`), which is exact here (1, 1 and 2 bytes) and only
-    ever narrows. `System.IsConsole` was tried as a repro first and does NOT
-    work: TD32 types it, so it already read 1 byte correctly.
+### What the real-application runs proved (and cost)
 
--1. **Closure recovery no longer scans.** `TryRecoverClosureObject` walked eight
-    pointer slots BACKWARDS taking the first `$ActRec` it met; in a closure-heavy
-    target activation records are dense on the stack, so it could latch a
-    neighbouring one and expand a FOREIGN closure's captured variables. A closure
-    variable is an INTERFACE REFERENCE, so the record is derivable exactly by
-    decoding the IMT adjustor thunk -- the same mechanism the interface label
-    uses, now shared as `TDelphiRtti.ObjectFromInterfaceThunk` instead of living
-    twice. All 21 closure tests pass with the scan gone.
+Running against `hydra_2\ExtApps\AppContainer` (a real 32-bit VCL app) found two
+defects no fixture exposed, and confirmed working: breakpoints inside a VCL form
+method, the caller chain with lines, `Self` expansion, a DevExpress-derived
+control typed correctly, a parameterless function CALLED in the debuggee
+(`GetKey` -> `'APPCONTAINER'`), three step-overs and a step-in that grew the
+stack correctly.
 
--2. **A frame name depended on who won a race.** The constructor-naming fix
-    relies on the MAP supplying the declared name, but
-    `TMapFile.RvaToFunctionName` is deliberately NON-BLOCKING while its publics
-    scan runs. Measured: the ctor test passed 5/5 in isolation and failed under
-    the full suite. `TDebugInfoSet.RvaToFunctionName` now retries while any
-    provider is still indexing, capped at 5 s, stopping the instant nothing is
-    pending -- the same shape and bound as the existing `NameToRva` retry in
-    `WinDebuggerBase`, which exists for this exact reason.
+Deliberately NOT run: `hydra_2\Win32\Debug\Hydra2.exe`. It is a real ERP client
+and may connect to a production database; that is not a side effect to cause
+unattended. The 497 MB `Hydra2SingleEXE.exe` is used for STATIC validation
+instead, which is safe and is what surfaced the AVX gap.
 
--3. **Dyn-array `^T` gate: ATTEMPTED, REVERTED.** See KNOWN_UNKNOWNS. The
-    approach is right (accept `^T` only on a positive TypeKind/PointeeKind) but
-    the kind does not reach the renderer on field paths, so gating turned a real
-    `array of Integer` field into a raw pointer. The PLUMBING landed
-    (`TLocalValue.PointeeKind`, and both kinds now merged across providers
-    instead of the base provider deciding); the gate did not.
+### Known limitation confirmed, not a defect
 
-0. **Threadvars read the PE headers — FIXED, reproduced on BOTH bitnesses first.**
-   The MAP's TLS segment resolves to base RVA 0 everywhere (Win32 prints `Start`
-   as 0, Win64 prints the preferred base), so a `threadvar` got a low RVA and the
-   debugger reported header bytes as its value. Measured with a new fixture
-   (`GTlsMarker` = `$5A5A5A5A`): the debugger answered `0  (0x0)` on x64 and x86
-   alike. Reproduction was verified by stashing the fix, running, and unstashing.
-   TLS-segment symbols now get no RVA; a lookup answers
-   `threadvar -- per-thread storage is not resolved yet` via the new
-   `IThreadLocalNameProvider`. MAP sidecar magic bumped MIX3 -> MIX4, since
-   existing sidecars have the bogus addresses baked in.
-   Real resolution (TEB -> ThreadLocalStoragePointer[TlsIndex] + offset) is
-   specified in KNOWN_UNKNOWNS, including the part that must be MEASURED: where
-   the 32-bit TEB sits for a WOW64 target seen from a 64-bit debugger.
-
-1. **EIntOverflow in the RTTI reader — FIXED and reproduced first.**
-   `ReadVmtSlot` computed `UInt64(Int64(VmtAddr) + Offset)`, which underflows for
-   a VmtAddr at the sign boundary; the adapter ships with `-$Q+`, so it RAISED
-   and lost the whole `variables` response instead of rejecting one address.
-   Now `TargetLayout.OffsetTargetAddress`, shared with the two identical spots in
-   `WinDebuggerBase`. `TryRecoverObjectFromInterface` also guards its subtraction.
-   New fixture `RttiRobustnessTests`: adversarial addresses AND a sweep over 64 KB
-   of real mapped memory, which is the shape the original failure took. Suite
-   1015/1011/0/4 with this in.
-2. **Harness gap found:** the adapter compiles `-$Q+ -$R+`, the test runner and
-   the DevTools probes do not, so arithmetic defects in `DebuggerCore` were
-   invisible to the suite. `DelphiRtti.pas` now pins `{$Q+}{$R+}` IN THE SOURCE.
-   The other DebuggerCore units have NOT been swept yet — do that one unit at a
-   time, driven by tests, not in one blanket change.
-3. **Interface concrete-class label now works on x86** (previously x64-only, and
-   the interface-table search that was tried instead had been reverted). Two
-   defects: the dcc32 adjustor-thunk encodings were not decoded, and `Imt`/`M0`
-   were `UInt64` locals filled by a 4-byte read, leaving an uninitialised high
-   half that made every recovered address garbage. Encodings MEASURED via the new
-   `DevTools\Win32ImtThunkProbe.dpr`; `LiveSessionProbe` gained an `imt <expr>`
-   command that prints every link of the chain. The "deliberately no assertion"
-   note in `InterfaceMembers_ResolveThroughTheObjectOnBothBitnesses` is now a
-   real assertion. Full suite running.
-
+On x86 a stack truncates at the last FRAMED Delphi routine when the caller chain
+runs into VCL/RTL code built without frame pointers -- measured:
+`LeggiCollegamentoVegaRest <- TfrmMain.Create` and nothing above. There is no
+unwind data on i386, and scanning for return addresses cannot distinguish a LIVE
+one from a stale one left on the stack; the exact call-site test proves "this IS
+a return address", not "this is on the current chain". Stopping is the correct
+answer, and inventing the tail is the one thing that must not happen.
 ### Earlier this session
 
 `X86Decode.pas` — a 32-bit instruction-length decoder — plus `X86DecodeProbe`
@@ -2974,10 +2937,11 @@ Contract: **exact or nothing**. Unknown opcode -> length 0 -> caller declines.
 `CallSiteEndsAt` returns `csaYes` / `csaNo` / `csaUndecidable`, and only
 `csaYes` accepts.
 
-Validated empirically against ground truth the binaries already carry: over
-9 940 routines and 70 476 line-to-line spans of production 32-bit Delphi code
-(`C:\Athens\hydra_2\ExtApps\*\Win32\Debug`) plus the test targets, **zero
-unknown opcodes**. 0.8 % of spans undecidable, all of them crossing the
+Validated empirically against ground truth the binaries already carry. NOTE the
+sample size caveat learned later: over 9 940 routines / 70 476 spans this showed
+**zero unknown opcodes**, and that was too small a sample to justify the claim --
+a 497 MB binary (2 354 868 spans) surfaced 61, one of which was a real gap (AVX
+in `System.Move`, fixed in `412602a`). 0.8 % of spans undecidable, crossing the
 exception-handler table dcc32 emits inline after `jmp @HandleAnyException`
 (data in the code stream; no linear decode can cross it).
 
