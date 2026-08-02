@@ -90,9 +90,32 @@ Still open:
       CustomSort faulted on every call), but the frame is still missing after
       making the comparer unit-level, so the finding survives its own fixture
       bug.
-  Next step: instrument the x86 walker itself and log each link -- the frame
-  the chain produces between CustomSort and RunAllScenarios, and what happens
-  to it -- rather than inferring from the rendered stack.
+  MECHANISM FOUND (2026-08-02), by tracing every link of the walk:
+
+      chain fp=$FCF6E8 -> ret=$10AF4CB (QuickSort)       nextFp=$FCF708
+      chain fp=$FCF708 -> ret=$10AF63A (CustomSort)      nextFp=$FCF730
+      chain fp=$FCF730 -> ret=$10EEFC4 (RunAllScenarios) nextFp=$FCF7DC
+
+  `$FCF730` IS RunRtlCallback's frame -- `[$FCF730+4]` holds its own return
+  address, into RunAllScenarios. So the chain reaches the frame correctly. What
+  is missing is the return address INTO RunRtlCallback, the one that would
+  become its current PC: that word sits where CustomSort's frame would be, and
+  CustomSort does not establish one (the RTL is built with the frame pointer
+  omitted), so QuickSort's saved EBP skips straight past it.
+
+  The general statement: WHEN A CALLEE OMITS ITS FRAME POINTER, THE RETURN
+  ADDRESS INTO ITS CALLER IS NOT REACHABLE FROM THE EBP CHAIN, AND THAT CALLER
+  DISAPPEARS FROM THE STACK. It is a hole in the middle, not a truncated tail,
+  which is why the tail-splice cannot help; dbghelp's own list does not contain
+  the address either ($10DE1F4, $10AF4CB, $10AF63A, $10EEFC4, $10F3E8E).
+
+  Fixing it means recovering that word from the stack region BETWEEN two known
+  frame pointers. `IsAfterCallSite` already exists and is the structural test
+  that makes such a read evidence rather than a guess -- it is what the
+  prologue recovery uses. The open question is how to bound the search so it
+  cannot attach a stale return address to the wrong frame; that has to be
+  settled before writing the code, since a wrong frame in a stack is worse than
+  a missing one.
   Asserted by the TODO-RED test
   `StackAcrossRtlCallback_KeepsTheCallerOnBothBitnesses`.
 
