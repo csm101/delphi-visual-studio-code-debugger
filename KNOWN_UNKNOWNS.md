@@ -109,13 +109,28 @@ Still open:
   which is why the tail-splice cannot help; dbghelp's own list does not contain
   the address either ($10DE1F4, $10AF4CB, $10AF63A, $10EEFC4, $10F3E8E).
 
-  Fixing it means recovering that word from the stack region BETWEEN two known
-  frame pointers. `IsAfterCallSite` already exists and is the structural test
-  that makes such a read evidence rather than a guess -- it is what the
-  prologue recovery uses. The open question is how to bound the search so it
-  cannot attach a stale return address to the wrong frame; that has to be
-  settled before writing the code, since a wrong frame in a stack is worse than
-  a missing one.
+  DESIGN for the fix, worked out but NOT implemented:
+
+  The missing word lies in the stack region between two consecutive chain frame
+  pointers ($FCF708 and $FCF730 here) -- pushed by the caller's `call` before
+  it entered the frameless callee. Finding it by "looks like a return address"
+  would be a guess; there is an EXACT test available instead.
+
+  We already know the PC inside the frameless callee (it is the previous
+  chain frame's PC, $10AF63A in CustomSort). Resolve that PC to its FUNCTION
+  ENTRY, then scan the gap for a word W where the instruction ending at W is a
+  DIRECT call (`E8 rel32`) whose computed target equals that entry. Such a W is
+  the return address from that exact function -- not a plausible one, the right
+  one -- and it is the missing frame's PC.
+
+  Constraints to respect:
+    * Direct calls only. For an indirect call (`FF /2`) the target cannot be
+      resolved statically, so no match is possible and NO frame should be
+      invented -- leave the hole rather than guess.
+    * One level at a time, re-running per adjacent pair, since several
+      frameless callees can nest.
+    * A wrong frame in a stack is worse than a missing one, which is why the
+      acceptance test is the call target and not the shape of the bytes.
   Asserted by the TODO-RED test
   `StackAcrossRtlCallback_KeepsTheCallerOnBothBitnesses`.
 
