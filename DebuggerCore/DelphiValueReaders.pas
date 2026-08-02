@@ -621,42 +621,82 @@ function TDelphiValueReader.RecoverObjectFromInterface(IfacePtr: UInt64): UInt64
 // adjustor thunk. Bounded and cheap: three reads at addresses the reference
 // itself supplies, no search.
 //
-// The x64 instruction encodings are the only ones matched, so this answers
-// nothing on a 32-bit target -- an interface there keeps showing its raw
-// pointer. Replacing it with the bitness-independent interface-table search
-// was tried and REVERTED: reached from an arbitrary formatted value, that
-// search walks into module data where the RTTI readers raise EIntOverflow and
-// fail the whole `variables` request. A missing label beats a failed request.
-// See KNOWN_UNKNOWNS.
+// Both bitnesses are decoded, from encodings MEASURED rather than assumed
+// (DevTools\Win32ImtThunkProbe.dpr, four IOffsets from 12 to 316). The two
+// compilers adjust Self in different places -- dcc64 in RCX, dcc32 in the stack
+// slot at [esp+4] -- but the immediate is `-IOffset` in both, so the object is
+// always `IfacePtr + immediate`.
+//
+// The alternative, a bitness-independent search backwards for an interface
+// table, was tried and REVERTED: reached from an arbitrary formatted value it
+// walks into module data, where a stretch of bytes can pass the VMT identity
+// check. Decoding the thunk asks the reference itself where its object is, and
+// cannot wander.
 var
   Imt:   UInt64;          // interface method table (value stored at IfacePtr)
   M0:    UInt64;          // address of the first IMT method (adjustor thunk)
-  Code:  array[0..7] of Byte;
+  Code:  array[0..15] of Byte;
   Delta: Int64;
   Obj:   UInt64;
+
+  // 48 83 C1 ib      add rcx, imm8       (small IOffset)
+  // 48 81 C1 id      add rcx, imm32      (large IOffset)
+  // 48 8D 49 ib      lea rcx,[rcx+ib]
+  // 48 8D 89 id      lea rcx,[rcx+id]
+  function DecodeX64Thunk(out D: Int64): Boolean;
+  begin
+    Result := True;
+    if (Code[0] = $48) and (Code[1] = $83) and (Code[2] = $C1) then
+      D := ShortInt(Code[3])
+    else if (Code[0] = $48) and (Code[1] = $81) and (Code[2] = $C1) then
+      D := PInteger(@Code[3])^
+    else if (Code[0] = $48) and (Code[1] = $8D) and (Code[2] = $49) then
+      D := ShortInt(Code[3])
+    else if (Code[0] = $48) and (Code[1] = $8D) and (Code[2] = $89) then
+      D := PInteger(@Code[3])^
+    else
+      Result := False;
+  end;
+
+  // 83 44 24 04 ib   add dword ptr [esp+4], imm8    (small IOffset)
+  // 81 44 24 04 id   add dword ptr [esp+4], imm32   (large IOffset)
+  function DecodeX86Thunk(out D: Int64): Boolean;
+  begin
+    Result := (Code[1] = $44) and (Code[2] = $24) and (Code[3] = $04);
+    if not Result then
+      Exit;
+    if Code[0] = $83 then
+      D := ShortInt(Code[4])
+    else if Code[0] = $81 then
+      D := PInteger(@Code[4])^
+    else
+      Result := False;
+  end;
+
 begin
   Result := 0;
   if (Debugger = nil) or (Rtti = nil) or (IfacePtr < 65536) then Exit;
   var PtrSize := Debugger.TargetLayout.PointerSize;
+  // Zeroed because a 32-bit target fills only the low half of each of these,
+  // and a local is not initialised: the leftover high half turned every
+  // recovered address into garbage, so the whole mechanism silently answered
+  // nothing on x86 while looking correct on x64.
+  Imt := 0;
+  M0  := 0;
   // IfacePtr -> IMT pointer -> first method (adjustor thunk).
   if not Debugger.ReadProcessMemoryAt(IfacePtr, @Imt, PtrSize) or (Imt < 65536) then Exit;
   if not Debugger.ReadProcessMemoryAt(Imt, @M0, PtrSize) or (M0 < 65536) then Exit;
-  if not Debugger.ReadProcessMemoryAt(M0, @Code[0], 8) then Exit;
+  if not Debugger.ReadProcessMemoryAt(M0, @Code[0], SizeOf(Code)) then Exit;
 
-  //   48 83 C1 ib        add rcx, imm8     (small IOffset)
-  //   48 81 C1 id        add rcx, imm32    (large IOffset)
-  //   48 8D 49 ib        lea rcx,[rcx+ib]
-  //   48 8D 89 id        lea rcx,[rcx+id]
-  // The immediate is -IOffset, so Obj = IfacePtr + imm.
-  if (Code[0] = $48) and (Code[2] = $C1) and (Code[1] = $83) then
-    Delta := ShortInt(Code[3])
-  else if (Code[0] = $48) and (Code[2] = $C1) and (Code[1] = $81) then
-    Delta := PInteger(@Code[3])^
-  else if (Code[0] = $48) and (Code[1] = $8D) and (Code[2] = $49) then
-    Delta := ShortInt(Code[3])
-  else if (Code[0] = $48) and (Code[1] = $8D) and (Code[2] = $89) then
-    Delta := PInteger(@Code[3])^
+  // Gated on the target's pointer size rather than tried in turn: an x86
+  // encoding is a valid (different) x64 instruction and vice versa, so
+  // accepting either would be guessing at which compiler produced the bytes.
+  var Decoded: Boolean;
+  if PtrSize = 8 then
+    Decoded := DecodeX64Thunk(Delta)
   else
+    Decoded := DecodeX86Thunk(Delta);
+  if not Decoded then
     Exit;  // no recognized adjustor thunk -> leave it unknown (never guess)
 
   Obj := UInt64(Int64(IfacePtr) + Delta);
@@ -1113,14 +1153,9 @@ function TDelphiValueReader.FormatLocalValue(const V: TLocalValue): string;
       Exit('nil');
 
     // Interface reference: the slot points INTO the implementing object
-    // (Obj + IOffset), so IsClassInstance(Raw) is False. Recover the object
-    // from the class's interface table and label the slot with its CONCRETE
-    // class.
-    //
-    // Interface reference: the slot points INTO the implementing object
     // (Obj + IOffset), so IsClassInstance(Raw) is False. Recover the object via
-    // the IMT adjustor thunk -- bounded, x64-only -- and label the slot with
-    // its CONCRETE class.
+    // the IMT adjustor thunk -- bounded, both bitnesses -- and label the slot
+    // with its CONCRETE class.
     if (Raw >= 65536) and (Rtti <> nil) and not Rtti.IsClassInstance(Raw) and
        ((Kind = TK_INTERFACE) or
         ((Length(TypeName) >= 2) and (TypeName[1] = 'I') and

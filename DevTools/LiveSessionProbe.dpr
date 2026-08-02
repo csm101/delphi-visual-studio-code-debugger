@@ -180,6 +180,48 @@ begin
             [F.Name, F.TypeKind, F.TypeName, F.FieldOffset]));
       end;
     end
+    else if SameText(Cmd, 'imt') then begin
+      // `imt <expr>` -- walks the exact chain the adapter walks to recover the
+      // object behind an interface reference:
+      //   IfacePtr -> [IfacePtr] = IMT -> [IMT] = first method = adjustor thunk
+      // and dumps the thunk's leading bytes. Every link is printed, so a broken
+      // assumption shows at the step where it breaks instead of as a silent
+      // "no label".
+      var Target := Session.Evaluate(Arg);
+      if not Target.Success then
+        Writeln('    imt ' + Arg + ' => ' + Target.ErrorText)
+      else begin
+        var IfacePtr := Target.RawValue;
+        // IsClassInstance is printed because the display path GATES the whole
+        // recovery on it being False: an interface reference points INTO an
+        // object, so a True here silently disables the label.
+        Writeln(Format('    imt %s: iface=$%x type="%s" isClassInstance=%s',
+          [Arg, IfacePtr, Target.TypeName,
+           BoolToStr(Session.Rtti.IsClassInstance(IfacePtr), True)]));
+        var Imt: UInt64 := 0;
+        if not Session.Rtti.ReadTargetPointer(IfacePtr, Imt) then
+          Writeln('        [IfacePtr] unreadable')
+        else begin
+          Writeln(Format('        IMT       = $%x', [Imt]));
+          var M0: UInt64 := 0;
+          if not Session.Rtti.ReadTargetPointer(Imt, M0) then
+            Writeln('        [IMT] unreadable')
+          else begin
+            Writeln(Format('        method[0] = $%x', [M0]));
+            var Dump := '';
+            var Step := UInt64(Session.Rtti.PointerSize);
+            for var K := 0 to 3 do begin
+              var W: UInt64 := 0;
+              if not Session.Rtti.ReadTargetPointer(M0 + UInt64(K) * Step, W) then
+                Break;
+              for var B := 0 to Integer(Step) - 1 do
+                Dump := Dump + IntToHex((W shr (B * 8)) and $FF, 2) + ' ';
+            end;
+            Writeln('        thunk     = ', Trim(Dump));
+          end;
+        end;
+      end;
+    end
     else if SameText(Cmd, 'set') then begin
       // `set <Name> <Value>` -- write a local, then show what the debugger
       // reads back, which is what catches a write at the wrong width.

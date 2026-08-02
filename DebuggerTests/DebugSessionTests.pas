@@ -2985,13 +2985,35 @@ begin
       Failures := Failures + Format('x86 %s -> %s; ', [Check.Expr, Got32]);
   end;
 
-  // NOTE: deliberately no assertion that the locals view LABELS the interface
-  // with its concrete class. Doing that needs the object, and the recovery that
-  // finds it walks into memory the RTTI readers cannot survive when the value
-  // comes from an arbitrary formatted slot -- it fails the whole `variables`
-  // request with an integer overflow. Recorded in KNOWN_UNKNOWNS; the label is
-  // off until that is understood. Member ACCESS through the interface, asserted
-  // above, does not go through that path.
+  // The locals view must also LABEL the interface with the class behind it, on
+  // both bitnesses. This was off for a long time on x86: only the x64 adjustor
+  // thunk encodings were decoded, so a 32-bit target showed a bare pointer. The
+  // dcc32 encodings are now decoded too, measured rather than assumed
+  // (DevTools\Win32ImtThunkProbe).
+  var LabelFailures := '';
+  for var Bitness in [64, 32] do begin
+    var Exe := Win64Exe; var Map := Win64Map; var Rsm := Win64Rsm;
+    if Bitness = 32 then begin
+      Exe := Win32Exe; Map := Win32Map; Rsm := Win32Rsm;
+    end;
+    var Session := OpenSessionAtMarker(Exe, Map, Rsm, TargetDir, SOURCE, Line);
+    try
+      var Shown := '<Cnt not in locals>';
+      if Session.State = dsStopped then
+        for var L in Session.GetLocals do
+          if SameText(L.Name, 'Cnt') then begin
+            Shown := L.Value;
+            Break;
+          end;
+      if not Shown.Contains('TCounter') then
+        LabelFailures := LabelFailures + Format('x%d Cnt -> %s; ', [Bitness, Shown]);
+    finally
+      Session.Free;
+    end;
+  end;
+  Assert.AreEqual('', LabelFailures,
+    'an interface local must be labelled with its concrete class on both ' +
+    'bitnesses -- ' + LabelFailures);
 
   Assert.AreEqual('', Failures,
     'fields, properties and methods must be reachable through an interface ' +
@@ -3004,10 +3026,16 @@ type
 const
   // Dotting a base that already failed must report WHY it failed. The in-range
   // case is here so the propagation cannot be satisfied by refusing everything.
-  DIAG_CHECKS: array[0..3] of TExprCheck = (
+  DIAG_CHECKS: array[0..4] of TExprCheck = (
     (Expr: 'ArrRec[2].A';       Fragment: 'out of bounds'),
     (Expr: 'ArrObj[9].BaseTag'; Fragment: 'out of bounds'),
     (Expr: 'Nope.Anything';     Fragment: 'Nope'),
+    // A member missing from a base that RESOLVED must name the base's type.
+    // `<.Nope not found>` left the user unable to tell, in a chain like
+    // `A.B.C`, whether B resolved to something unexpected or C is absent. The
+    // phrasing here is only produced when the receiver's type is known, so
+    // asserting it also asserts that the receiver was named.
+    (Expr: 'ArrRec[0].Nope';    Fragment: 'has no member Nope'),
     (Expr: 'ArrRec[0].A';       Fragment: '11'));
 
   // In the handler the frame really does hold an E, and everything must

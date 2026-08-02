@@ -880,7 +880,7 @@ begin
   // read fails, and the stop degrades to a bare "Delphi exception at ..." with
   // no class, no message and no $exception pseudo-local.
   if not ReadTargetPointer(ObjAddr, VmtAddr) or (VmtAddr = 0) then Exit;
-  if not ReadTargetPointer(UInt64(Int64(VmtAddr) + TargetLayout.VmtTypeInfo),
+  if not ReadTargetPointer(OffsetTargetAddress(VmtAddr, TargetLayout.VmtTypeInfo),
        TypeInfoAddr) or (TypeInfoAddr = 0) then Exit;
   // TypeInfo[0] = Kind (Byte), TypeInfo[1..] = ShortString class name.
   if not ReadProcessMemory(FProcess, Pointer(TypeInfoAddr + 1), @Buf, SizeOf(Buf), Read) or
@@ -921,7 +921,7 @@ begin
   Result := nil;
   if ObjAddr = 0 then Exit;
   if not ReadTargetPointer(ObjAddr, VmtAddr) or (VmtAddr = 0) then Exit;
-  if not ReadTargetPointer(UInt64(Int64(VmtAddr) + TargetLayout.VmtTypeInfo),
+  if not ReadTargetPointer(OffsetTargetAddress(VmtAddr, TargetLayout.VmtTypeInfo),
        TypeInfoAddr) or (TypeInfoAddr = 0) then Exit;
   var Depth := 0;
   while (TypeInfoAddr <> 0) and (Depth < 64) do begin

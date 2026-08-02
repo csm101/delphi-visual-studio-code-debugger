@@ -123,6 +123,12 @@ type
     function Is64Bit: Boolean;
   end;
 
+// Applies a signed byte offset to a TARGET address, total over every input.
+// Shared because the same subtraction appears wherever a debuggee pointer is
+// walked -- VMT slots, RTTI headers, interface tables -- and under the `-$Q+`
+// the adapter ships with, the obvious spelling raises instead of wrapping.
+function OffsetTargetAddress(Base: UInt64; Delta: Integer): UInt64;
+
 implementation
 
 class function TTargetLayout.For64Bit: TTargetLayout;
@@ -174,6 +180,23 @@ begin
     Result := For32Bit
   else
     Result := For64Bit;
+end;
+
+function OffsetTargetAddress(Base: UInt64; Delta: Integer): UInt64;
+begin
+  // Address arithmetic on a foreign pointer wraps modulo 2^64 by definition,
+  // and every base here comes out of the debuggee: a stale pointer, an interior
+  // pointer, a field that was never a pointer. A value at the sign boundary is
+  // ordinary input, not an error.
+  //
+  // The naive `UInt64(Int64(Base) + Delta)` raises EIntOverflow for it under the
+  // `-$Q+` the adapter ships with -- `Int64($8000000000000000) - 176` underflows
+  // -- and one such exception loses an entire `variables` response rather than
+  // rejecting the single bad address. Wrapping yields an address the following
+  // read rejects on its own, which is the wanted answer.
+  {$Q-}{$R-}
+  Result := Base + UInt64(Int64(Delta));
+  {$Q+}{$R+}
 end;
 
 function TTargetLayout.DynArrayLengthAddr(DataPtr: UInt64): UInt64;

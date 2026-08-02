@@ -41,6 +41,14 @@ type
     // which underflows for any pointer smaller than the offset.
     [Test]
     procedure InterfaceRecovery_SmallPointer_DoesNotUnderflow;
+
+    // The extremes above are the easy half. The failure that actually happened
+    // was at a PLAUSIBLE address: the interface search ran off the end of a heap
+    // block into a loaded module's data, a stretch of bytes there passed the VMT
+    // identity check, and the readers raised on it. So sweep real mapped memory
+    // and hand every word in it to the readers.
+    [Test]
+    procedure SweepingRealModuleMemory_NeverRaises;
   end;
 
 implementation
@@ -48,6 +56,7 @@ implementation
 uses
   System.SysUtils,
   System.Classes,
+  System.Generics.Collections,
   Winapi.Windows,
   DelphiRtti;
 
@@ -90,30 +99,47 @@ procedure TRttiRobustnessTests.GarbageAddresses_AnswerNoInsteadOfRaising;
 begin
   var Rtti := TDelphiRtti.Create(GetCurrentProcess);
   try
-    for var Addr in ADVERSARIAL do begin
-      // Each call is reported with the address that provoked it, because
-      // "something raised" is useless without knowing which input did it.
-      var Where := '$' + IntToHex(Addr, 16);
-      try
-        Rtti.IsClassInstance(Addr);
-        Rtti.IsValidVmt(Addr);
-        Rtti.VmtLayoutShift(Addr);
-        Rtti.GetInstanceClassName(Addr);
-        Rtti.GetInstanceSize(Addr);
-        Rtti.GetClassChainNames(Addr);
-        Rtti.IsInstanceOf(Addr, 'TObject');
-        Rtti.DeclaresInterfaceAtOffset(Addr, 0);
-        Rtti.DeclaresInterfaceAtOffset(Addr, $10000);
-        Rtti.ExpandClass(Addr);
-        Rtti.GetClassProperties(Addr);
-        var Len: UInt64;
-        Rtti.ReadDynArrayLength(Addr, Len);
-      except
-        on E: Exception do
-          Assert.Fail(Format('%s raised on %s: %s',
-            [E.ClassName, Where, E.Message]));
-      end;
-    end;
+    // Named, so a failure says WHICH entry point broke on WHICH address.
+    // "something raised" is not a usable report.
+    var Calls: TArray<TPair<string, TProc<UInt64>>> := [
+      TPair<string, TProc<UInt64>>.Create('IsClassInstance',
+        procedure(A: UInt64) begin Rtti.IsClassInstance(A) end),
+      TPair<string, TProc<UInt64>>.Create('IsValidVmt',
+        procedure(A: UInt64) begin Rtti.IsValidVmt(A) end),
+      TPair<string, TProc<UInt64>>.Create('VmtLayoutShift',
+        procedure(A: UInt64) begin Rtti.VmtLayoutShift(A) end),
+      TPair<string, TProc<UInt64>>.Create('GetInstanceClassName',
+        procedure(A: UInt64) begin Rtti.GetInstanceClassName(A) end),
+      TPair<string, TProc<UInt64>>.Create('GetInstanceSize',
+        procedure(A: UInt64) begin Rtti.GetInstanceSize(A) end),
+      TPair<string, TProc<UInt64>>.Create('GetClassChainNames',
+        procedure(A: UInt64) begin Rtti.GetClassChainNames(A) end),
+      TPair<string, TProc<UInt64>>.Create('IsInstanceOf',
+        procedure(A: UInt64) begin Rtti.IsInstanceOf(A, 'TObject') end),
+      TPair<string, TProc<UInt64>>.Create('DeclaresInterfaceAtOffset(0)',
+        procedure(A: UInt64) begin Rtti.DeclaresInterfaceAtOffset(A, 0) end),
+      TPair<string, TProc<UInt64>>.Create('DeclaresInterfaceAtOffset(64K)',
+        procedure(A: UInt64) begin Rtti.DeclaresInterfaceAtOffset(A, $10000) end),
+      TPair<string, TProc<UInt64>>.Create('ExpandClass',
+        procedure(A: UInt64) begin Rtti.ExpandClass(A) end),
+      TPair<string, TProc<UInt64>>.Create('GetClassProperties',
+        procedure(A: UInt64) begin Rtti.GetClassProperties(A) end),
+      TPair<string, TProc<UInt64>>.Create('ReadDynArrayLength',
+        procedure(A: UInt64)
+        begin
+          var Len: UInt64;
+          Rtti.ReadDynArrayLength(A, Len);
+        end)];
+
+    for var Addr in ADVERSARIAL do
+      for var Call in Calls do
+        try
+          Call.Value(Addr);
+        except
+          on E: Exception do
+            Assert.Fail(Format('%s raised in %s on $%s: %s',
+              [E.ClassName, Call.Key, IntToHex(Addr, 16), E.Message]));
+        end;
   finally
     Rtti.Free;
   end;
@@ -133,6 +159,36 @@ begin
           Assert.Fail(Format('%s raised recovering from $%s: %s',
             [E.ClassName, IntToHex(Addr, 16), E.Message]));
       end;
+    end;
+  finally
+    Rtti.Free;
+  end;
+end;
+
+procedure TRttiRobustnessTests.SweepingRealModuleMemory_NeverRaises;
+const
+  SWEEP_BYTES = $10000;   // 64 KB of this module, which spans code and data
+begin
+  var Rtti := TDelphiRtti.Create(GetCurrentProcess);
+  try
+    var Base := UInt64(NativeUInt(GetModuleHandle(nil)));
+    Assert.IsTrue(Base > 0, 'no module base');
+    var Addr := Base;
+    while Addr < Base + SWEEP_BYTES do begin
+      try
+        Rtti.IsClassInstance(Addr);
+        Rtti.IsValidVmt(Addr);
+        Rtti.GetInstanceSize(Addr);
+        Rtti.GetInstanceClassName(Addr);
+        var Obj: UInt64 := 0;
+        var ConcreteClass: string := '';
+        Rtti.TryRecoverObjectFromInterface(Addr, Obj, ConcreteClass);
+      except
+        on E: Exception do
+          Assert.Fail(Format('%s raised sweeping $%s: %s',
+            [E.ClassName, IntToHex(Addr, 16), E.Message]));
+      end;
+      Inc(Addr, 8);
     end;
   finally
     Rtti.Free;

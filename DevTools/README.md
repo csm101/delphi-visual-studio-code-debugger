@@ -234,6 +234,20 @@ again. It also reports every breakpoint verification transition (`[bp] ...
 verified=True`), which is the only way to see that a breakpoint in a package
 bound LATER, when its module loaded.
 
+`-script <file>` runs one command per line at each stop. Beyond `stack`,
+`locals`, `frame`, `threads`, `step*`, `eval`, `set` and `expand`, two commands
+exist to ask the runtime a question the static tables cannot answer:
+
+| Command | What it shows |
+|---|---|
+| `rtti <expr>` | the runtime class of a value plus its RTTI properties and fields — the measurement that says whether RTTI carries INSTANTIATED generic types where dcc32's debug info carries only `%TList__1` |
+| `imt <expr>` | every link of the interface→object chain (`IfacePtr` → IMT → adjustor thunk bytes), plus the `IsClassInstance` result the display path gates the concrete-class label on |
+
+`imt` exists because "the interface shows no class" has four possible causes —
+an unreadable link, an unrecognised thunk encoding, a gate that rejected the
+value, or a stale build — and printing each link tells them apart instead of
+leaving one guess per attempt.
+
 #### Td32AliasProbe
 
 ```bat
@@ -546,6 +560,44 @@ right so the first declared lands highest.
 Gotcha worth keeping: do **not** name the local that captures the frame pointer
 `Ebp`. The inline assembler resolves that to the register and emits a no-op
 `mov ebp, ebp`, so every offset comes out as an absolute address.
+
+#### Win32ImtThunkProbe
+
+```bat
+DevTools\build_one32.bat Win32ImtThunkProbe.dpr
+DevTools\Win32\Debug\Win32ImtThunkProbe.exe
+```
+
+Takes no arguments; 32-bit only, because it must be COMPILED BY dcc32 to observe
+dcc32 output. Prints how the compiler encodes the IMT **adjustor thunk**, which
+is what lets the debugger label an interface reference with the class behind it.
+
+The mechanism is deliberately bounded — three reads at addresses the reference
+itself supplies, no search:
+
+```
+IfacePtr -> [IfacePtr] = interface method table (IMT)
+         -> [IMT]      = first method = the adjustor thunk
+         -> the thunk's immediate is -IOffset, so Obj = IfacePtr + immediate
+```
+
+Measured on Athens 36 over four IOffsets (12, 16, 12, 316):
+
+| Compiler | Encoding | Meaning |
+|---|---|---|
+| dcc64 | `48 83 C1 ib` / `48 81 C1 id` | `add rcx, imm` |
+| dcc64 | `48 8D 49 ib` / `48 8D 89 id` | `lea rcx,[rcx+imm]` |
+| dcc32 | `83 44 24 04 ib` | `add dword ptr [esp+4], imm8` |
+| dcc32 | `81 44 24 04 id` | `add dword ptr [esp+4], imm32` |
+
+The two compilers adjust Self in different places — RCX versus the stack slot at
+`[esp+4]` — but the immediate is `-IOffset` in both, exactly. Only the x64 forms
+were decoded until this was measured, which is why a 32-bit target used to show
+an interface as a bare pointer.
+
+To see the same chain in a LIVE target rather than in this probe's own process,
+`LiveSessionProbe` has an `imt <expr>` script command that walks and prints every
+link, including the `IsClassInstance` result the display path gates on.
 
 #### X86DecodeProbe
 

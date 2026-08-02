@@ -2875,10 +2875,42 @@ leaving the defect open and documented.
 
 Working on the x86 stack walker, which is the riskiest component in the project.
 
-### Last completed action
+### Landed this session (committed)
+
+- `8e951b7` — `X86Decode.pas`, the decoder, plus its probe. No behaviour change.
+- `06db0f8` — wired in; x86 frameless-caller recovery and constructor naming.
+  Suite 1011/1007/0/4.
+
+### In flight (not committed)
+
+1. **EIntOverflow in the RTTI reader — FIXED and reproduced first.**
+   `ReadVmtSlot` computed `UInt64(Int64(VmtAddr) + Offset)`, which underflows for
+   a VmtAddr at the sign boundary; the adapter ships with `-$Q+`, so it RAISED
+   and lost the whole `variables` response instead of rejecting one address.
+   Now `TargetLayout.OffsetTargetAddress`, shared with the two identical spots in
+   `WinDebuggerBase`. `TryRecoverObjectFromInterface` also guards its subtraction.
+   New fixture `RttiRobustnessTests`: adversarial addresses AND a sweep over 64 KB
+   of real mapped memory, which is the shape the original failure took. Suite
+   1015/1011/0/4 with this in.
+2. **Harness gap found:** the adapter compiles `-$Q+ -$R+`, the test runner and
+   the DevTools probes do not, so arithmetic defects in `DebuggerCore` were
+   invisible to the suite. `DelphiRtti.pas` now pins `{$Q+}{$R+}` IN THE SOURCE.
+   The other DebuggerCore units have NOT been swept yet — do that one unit at a
+   time, driven by tests, not in one blanket change.
+3. **Interface concrete-class label now works on x86** (previously x64-only, and
+   the interface-table search that was tried instead had been reverted). Two
+   defects: the dcc32 adjustor-thunk encodings were not decoded, and `Imt`/`M0`
+   were `UInt64` locals filled by a 4-byte read, leaving an uninitialised high
+   half that made every recovered address garbage. Encodings MEASURED via the new
+   `DevTools\Win32ImtThunkProbe.dpr`; `LiveSessionProbe` gained an `imt <expr>`
+   command that prints every link of the chain. The "deliberately no assertion"
+   note in `InterfaceMembers_ResolveThroughTheObjectOnBothBitnesses` is now a
+   real assertion. Full suite running.
+
+### Earlier this session
 
 `X86Decode.pas` — a 32-bit instruction-length decoder — plus `X86DecodeProbe`
-and `X86DecodeTests`, and it is now wired into the walker's prologue recovery.
+and `X86DecodeTests`, wired into the walker's prologue recovery.
 
 Why it exists: the walker decided whether a stack word was a return address by
 reading a few bytes BACKWARDS looking for a call-shaped encoding. That is not a
@@ -2956,7 +2988,14 @@ PushImmediate_IsNotACallSite` pins exactly that.
   the `finally`) instead of 79 (the call). Assert the LINE, not just the name.
 - `build_runner.bat` does NOT rebuild the adapter, and DevTools probes are not
   rebuilt by it either. Rebuild both before trusting any measurement — stale
-  binaries produced three wrong conclusions in the previous session.
+  binaries produced three wrong conclusions in the previous session, and one
+  more in this one: a fix verified working through `LiveSessionProbe` still
+  failed in the suite, because `RunTests.exe` links `DebuggerCore` statically
+  and only `build_dap.bat` had been re-run.
+- Overflow/range checking differs per project: the adapter builds `-$Q+ -$R+`,
+  `RunTests.cfg` and the DevTools flags do not. A defect that only exists under
+  checking will pass the suite. Pin the directive in the unit source when a unit
+  does arithmetic on debuggee-supplied addresses.
 - Do not edit `DebuggerTests\TestTarget\*.pas` while the suite is running: the
   runner reads those files at run time to resolve `{BP:...}` markers, and a
   mid-run edit fakes a large regression.

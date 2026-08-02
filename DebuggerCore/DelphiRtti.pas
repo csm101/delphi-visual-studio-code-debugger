@@ -7,6 +7,14 @@ unit DelphiRtti;
 
 {$APPTYPE CONSOLE}
 
+// Overflow and range checking are pinned IN THE SOURCE rather than left to
+// whichever project compiles the unit. The shipped adapter builds with
+// `-$Q+ -$R+` while the test runner and the DevTools probes do not, so a
+// defect that only exists under checking was invisible to every test -- and
+// this unit is precisely where that matters, since every address it handles
+// comes out of the debuggee and may be garbage.
+{$Q+}{$R+}
+
 interface
 
 uses
@@ -145,6 +153,10 @@ type
     // One TARGET pointer at Addr. Same read as a VMT slot, named for the many
     // places that are walking an RTTI record rather than a VMT.
     function ReadTargetPointer(Addr: UInt64; out V: UInt64): Boolean;
+    // Width ReadTargetPointer actually reads. Exposed so a caller stepping
+    // through target memory advances by the TARGET's pointer size rather than
+    // its own -- the difference is invisible on x64 and wrong on x86.
+    function PointerSize: Integer;
     // Follows TTypeData.ParentInfo to the ancestor class's TypeInfo.
     function TryReadParentTypeInfo(TypeDataAddr: UInt64;
       out ParentTypeInfo: UInt64): Boolean;
@@ -349,7 +361,7 @@ var
   R: SIZE_T;
 begin
   V := 0;
-  var Addr := UInt64(Int64(VmtAddr) + Offset);
+  var Addr := OffsetTargetAddress(VmtAddr, Offset);
   Result := (FProcess <> 0) and (Addr > 4096) and
     ReadProcessMemory(FProcess, Pointer(Addr), @V, FLayout.PointerSize, R) and
     (R = FLayout.PointerSize);
@@ -358,6 +370,11 @@ end;
 function TDelphiRtti.ReadTargetPointer(Addr: UInt64; out V: UInt64): Boolean;
 begin
   Result := ReadVmtSlot(Addr, 0, V);
+end;
+
+function TDelphiRtti.PointerSize: Integer;
+begin
+  Result := FLayout.PointerSize;
 end;
 
 // TTypeData.tkClass is ClassType(ptr) followed by ParentInfo(ptr), so the parent
@@ -640,6 +657,8 @@ begin
   var Step := UInt64(FLayout.PointerSize);
   var Offset: UInt64 := 0;
   while Offset <= MAX_SEARCH_BYTES do begin
+    if Offset > IntfPtr then
+      Break;   // an object cannot start below address zero
     var Candidate := IntfPtr - Offset;
     if (LowestCandidate <> 0) and (Candidate < LowestCandidate) then
       Break;

@@ -194,6 +194,19 @@ Target architecture:
   `register` convention gives a register slot only to a non-float that fits 32
   bits, and puts everything else on the stack at 4, 8 or 12 bytes without
   consuming a slot.
+  The x86 stack walk holds up in the two places a saved-EBP chain cannot
+  answer on its own, and in both the answer is PROVEN rather than guessed, by
+  decoding instruction lengths forward from a known boundary
+  (`DebuggerCore\X86Decode.pas`, validated over 70 476 spans of production
+  32-bit Delphi code with zero unknown opcodes): stopping inside a prologue,
+  where the frame is not established yet and a constructor's preamble makes
+  that ordinary; and a FRAMELESS routine between two framed ones, which hides
+  its caller from the chain entirely. Constructors are named from the MAP,
+  because dcc32 records no declared name for them.
+  An interface local is labelled with the CONCRETE class behind it on both
+  bitnesses, by decoding the IMT adjustor thunk — three reads at addresses the
+  reference itself supplies, no search. The dcc32 encodings were measured
+  (`DevTools\Win32ImtThunkProbe.dpr`), not inferred from the x64 ones.
 - **Limitation:** Win32 locals and parameters are supported for `-$O-` builds
   only; `-$O+` omits the frame pointer routinely. Separately, and on both
   architectures, a synthetic call's argument types come from the calling

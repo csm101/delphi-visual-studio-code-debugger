@@ -2588,7 +2588,15 @@ begin
     end;
   end;
 
-  Result := InvalidValue(Format('<.%s not found>', [Field]));
+  // Name the RECEIVER. `<.Foo not found>` says nothing about WHERE the member
+  // was looked for, which is the whole question when a chain like `A.B.C`
+  // fails: the user cannot tell whether `B` resolved to something unexpected or
+  // `C` is genuinely absent. The receiver's type is known here whenever it is
+  // known at all, so spending it costs nothing.
+  if Base.TypeHint <> '' then
+    Result := InvalidValue(Format('<%s has no member %s>', [Base.TypeHint, Field]))
+  else
+    Result := InvalidValue(Format('<.%s not found>', [Field]));
 end;
 
 { Suffix chain }

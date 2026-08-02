@@ -166,7 +166,13 @@ begin
     $05..$07: Result := fNone;                 // syscall / clts / sysret
     $08..$09: Result := fNone;                 // invd / wbinvd
     $0B:      Result := fNone;                 // ud2
-    $0D..$1F: Result := fModRM;                // prefetch / SSE / hint nop
+    $0D:      Result := fModRM;                // prefetch
+    // 0F 0E is FEMMS (no modrm) and 0F 0F is the 3DNow! escape (modrm plus a
+    // trailing opcode byte). Both are obsolete and dcc32 emits neither, so they
+    // are refused rather than given a length that would be wrong for one of
+    // them.
+    $0E, $0F: Result := fBad;
+    $10..$1F: Result := fModRM;                // SSE / hint nop
     $20..$23: Result := fModRM;                // mov cr/dr
     $28..$37: Result := fModRM;                // SSE moves and converts
     $40..$6F: Result := fModRM;                // cmovcc / SSE
