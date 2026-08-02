@@ -163,6 +163,14 @@ type
     // stopping, so it depends on the 32-bit locals reader and on run control
     // continuing correctly. Covered on the 64-bit target only until now.
     [Test] procedure LogPoints_EmitTheirMessageWithoutStoppingOnBothBitnesses;
+    // A program main-block local whose RSM type id resolves to nothing useful
+    // must carry NO type rather than a confidently wrong one -- it used to be
+    // reported as `EPrivilege` on x86 and `RunClosureParamSampler$2$Intf` on
+    // x64, whichever name sat at the bogus index.
+    [Test] procedure MainBlockLocals_NeverCarryAnInventedTypeOnBothBitnesses;
+    // A session owns what it LAUNCHED: freeing it must not leave the debuggee
+    // running with nothing able to control it.
+    [Test] procedure FreeingASession_TerminatesWhatItLaunchedOnBothBitnesses;
     // The user's field report, reproduced: stopped in a callback the RTL calls,
     // the 32-bit stack LOSES the routine that set the callback up. x64 shows
     // CompareNames <- QuickSort <- CustomSort <- RunRtlCallback <- ...; x86
@@ -3561,6 +3569,9 @@ const
     try
       if Session.State <> dsStopped then
         Exit('<did not stop>');
+      var GenListVar: TSessionVariable;
+      if not FindVar(Session.GetLocals, 'GenList', GenListVar) then
+        Exit('<GenList not found>');
       var R := Session.Evaluate('GenList');
       if not R.Success then
         Exit('<' + R.ErrorText + '>');
@@ -3568,9 +3579,22 @@ const
       if Length(Fields) = 0 then
         Exit('<no fields>');
       for var F in Fields do
-        if SameText(F.Name, 'FItems') then
-          Exit(Format('FItems type=%s off=%d count=%d',
-            [F.TypeName, F.FieldOffset, Length(Fields)]));
+        if SameText(F.Name, 'FItems') then begin
+          // The backing array must also EXPAND TO ITS ELEMENTS. Asserting the
+          // type name alone missed a live bug: once RTTI supplied the real name
+          // `TArray<System.Integer>`, the expander -- which recognised a dynamic
+          // array only by a leading `^` -- stopped seeing it as one, took the
+          // class path instead and expanded the field into ITSELF, failing the
+          // whole request.
+          var ItemsVar: TSessionVariable;
+          var Elements := '';
+          if FindMemberField(Session, GenListVar, 'FItems', ItemsVar) and
+             (ItemsVar.Handle <> 0) then
+            for var C in Session.GetChildren(ItemsVar.Handle) do
+              Elements := Elements + C.Name + '=' + Trim(C.Value) + ' ';
+          Exit(Format('FItems type=%s off=%d count=%d elems=[%s]',
+            [F.TypeName, F.FieldOffset, Length(Fields), Trim(Elements)]));
+        end;
       Result := '<FItems not found>';
     finally
       Session.Free;
@@ -3584,12 +3608,16 @@ begin
 
   var Failures := '';
   var Got64 := FieldSummary(Win64Exe, Win64Map, Win64Rsm, Line);
-  if Got64 <> 'FItems type=TArray<System.Integer> off=8 count=8' then
+  if not Got64.StartsWith('FItems type=TArray<System.Integer> off=8 count=8') then
     Failures := Failures + 'x64: ' + Got64 + '; ';
   // Same fields, half the offsets: FItems sits at 4 rather than 8.
   var Got32 := FieldSummary(Win32Exe, Win32Map, Win32Rsm, Line);
-  if Got32 <> 'FItems type=TArray<System.Integer> off=4 count=8' then
+  if not Got32.StartsWith('FItems type=TArray<System.Integer> off=4 count=8') then
     Failures := Failures + 'x86: ' + Got32 + '; ';
+  // ...and the elements must be reachable, on both.
+  for var Got in [Got64, Got32] do
+    if not (Got.Contains('[0]=10') and Got.Contains('[2]=30')) then
+      Failures := Failures + 'elements unreachable: ' + Got + '; ';
 
   Assert.AreEqual('', Failures,
     'runtime RTTI must report a generic''s real, instantiated fields on both ' +
@@ -3806,6 +3834,114 @@ begin
   Assert.AreEqual('', Failures,
     'a logpoint must emit its evaluated message and let the target run, on ' +
     'both bitnesses -- ' + Failures);
+end;
+
+procedure TWin32RunControlTests.MainBlockLocals_NeverCarryAnInventedTypeOnBothBitnesses;
+const
+  SOURCE = 'TestTarget.dpr';
+  MARKER = 'MAIN_GCOUNTER';
+
+  // `TheWidget` is declared in the program's begin..end block, whose locals live
+  // only in the RSM main-block table. Its type id resolves against no table we
+  // can identify, so the debugger must decline to name the type -- the runtime
+  // VMT still gives the class, so the VALUE stays informative either way.
+  function WidgetLocal(const Exe, Map, Rsm: string; Line: Integer): string;
+  begin
+    var Session := OpenSessionAtMarker(Exe, Map, Rsm, TargetDir, SOURCE, Line);
+    try
+      if Session.State <> dsStopped then
+        Exit('<did not stop>');
+      Session.GetCallStack;   // warm the symbol index, as a frontend does
+      for var V in Session.GetLocals do
+        if SameText(V.Name, 'TheWidget') then
+          Exit(Format('value=%s type=%s', [Trim(V.Value), Trim(V.TypeName)]));
+      Result := '<TheWidget not listed>';
+    finally
+      Session.Free;
+    end;
+  end;
+
+begin
+  var Line := MarkerLineInFile(TargetDir + SOURCE, MARKER);
+  Assert.IsTrue(Line > 0, 'marker ' + MARKER + ' not found');
+  Assert.IsTrue(FileExists(Win64Exe), '64-bit control target missing');
+
+  var Failures := '';
+  for var Bits in [64, 32] do begin
+    var Got: string;
+    if Bits = 64 then
+      Got := WidgetLocal(Win64Exe, Win64Map, Win64Rsm, Line)
+    else
+      Got := WidgetLocal(Win32Exe, Win32Map, Win32Rsm, Line);
+    // The runtime class must still come through...
+    if not Got.Contains('TWidget') then
+      Failures := Failures + Format('x%d %s; ', [Bits, Got]);
+    // ...and the two names that used to be invented must not appear.
+    for var Bogus in ['EPrivilege', 'RunClosureParamSampler'] do
+      if Got.Contains(Bogus) then
+        Failures := Failures + Format('x%d invented type %s in %s; ',
+          [Bits, Bogus, Got]);
+  end;
+
+  Assert.AreEqual('', Failures,
+    'a main-block local must show its runtime class and never an invented ' +
+    'declared type, on both bitnesses -- ' + Failures);
+end;
+
+procedure TWin32RunControlTests.FreeingASession_TerminatesWhatItLaunchedOnBothBitnesses;
+
+  // Launches, stops, then frees the session WITHOUT calling Terminate, and asks
+  // the OS whether the debuggee is still alive. Freeing used to drop the engine
+  // reference and leave a launched process running with nothing able to control
+  // it; during a suite run hundreds accumulated.
+  function DebuggeeSurvivesFree(const Exe, Map, Rsm: string; Line: Integer): string;
+  begin
+    var Pid: Cardinal := 0;
+    var Session := OpenSessionAtMarker(Exe, Map, Rsm, TargetDir,
+                     'TestTargetCore.pas', Line);
+    try
+      if Session.State <> dsStopped then
+        Exit('<did not stop>');
+      Pid := Session.DebuggeeProcessId;
+      if Pid = 0 then
+        Exit('<no pid>');
+    finally
+      Session.Free;
+    end;
+
+    // A handle that opens AND reports still-running means it outlived us.
+    // PROCESS_QUERY_LIMITED_INFORMATION, spelled out: Winapi.Windows in this
+    // Delphi version does not export the constant.
+    var H := OpenProcess($1000, False, Pid);
+    if H = 0 then
+      Exit('gone');
+    try
+      var Code: DWORD := 0;
+      if GetExitCodeProcess(H, Code) and (Code = STILL_ACTIVE) then
+        Exit('ALIVE')
+      else
+        Exit('gone');
+    finally
+      CloseHandle(H);
+    end;
+  end;
+
+begin
+  var Line := MarkerLineInFile(TargetDir + 'TestTargetCore.pas', 'EVAL_BODY');
+  Assert.IsTrue(Line > 0, 'marker EVAL_BODY not found');
+  Assert.IsTrue(FileExists(Win64Exe), '64-bit control target missing');
+
+  var Failures := '';
+  var Got64 := DebuggeeSurvivesFree(Win64Exe, Win64Map, Win64Rsm, Line);
+  if Got64 <> 'gone' then
+    Failures := Failures + 'x64: ' + Got64 + '; ';
+  var Got32 := DebuggeeSurvivesFree(Win32Exe, Win32Map, Win32Rsm, Line);
+  if Got32 <> 'gone' then
+    Failures := Failures + 'x86: ' + Got32 + '; ';
+
+  Assert.AreEqual('', Failures,
+    'freeing a session must terminate the debuggee it launched, on both ' +
+    'bitnesses -- ' + Failures);
 end;
 
 procedure TWin32RunControlTests.StackAcrossRtlCallback_KeepsTheCallerOnBothBitnesses;
