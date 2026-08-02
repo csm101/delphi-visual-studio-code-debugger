@@ -2041,6 +2041,7 @@ begin
   RunCtorProbe;
   RunEdge2;
   RunOpenArray;
+  RunRtlCallback;
   RunReal;
   RunRobust;
   RunStepFlow;

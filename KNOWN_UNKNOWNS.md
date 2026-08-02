@@ -66,6 +66,36 @@ Still open:
 
 ## Per-unit / per-binary type resolution
 
+- **x86: the stack loses the caller across sourceless RTL frames** — the
+  user's field report from a design package inside bds.exe ("the call stack
+  shows only the code it found sources for"), now REPRODUCED deterministically
+  by `RunRtlCallback` in TestTargetEdge2: a comparer invoked by
+  `TStringList.CustomSort`. x64 gives
+  `CompareNames <- QuickSort <- CustomSort <- RunRtlCallback <- RunAllScenarios`;
+  x86 gives the same list with `RunRtlCallback` absent.
+  Neither mechanism has that frame. The saved-EBP chain steps over the region
+  in a single link, and merging in whatever dbghelp reports BETWEEN two frames
+  the chain already vouched for -- implemented, measured, reverted -- changed
+  nothing, which shows dbghelp does not know the frame either. So the cause is
+  NOT "the splice can only append a tail", and is not yet identified.
+  Hypotheses ELIMINATED so far, each by measurement rather than argument:
+    * "dbghelp knows the frame and the splice can only append a tail" -- no:
+      merging frames dbghelp places BETWEEN two chain-vouched frames changed
+      nothing, so dbghelp does not have it either.
+    * "RunRtlCallback has no EBP frame under dcc32" -- no: its prologue is
+      `55 8B EC` (push ebp; mov ebp,esp) at RVA $DE294, and CompareNames is
+      `55 8B EC 83 C4 D0` at $DE18C. Both frames are established normally, so
+      the saved-EBP chain has everything it needs in principle.
+    * "the fixture itself was broken" -- it WAS (a nested comparer passed to
+      CustomSort faulted on every call), but the frame is still missing after
+      making the comparer unit-level, so the finding survives its own fixture
+      bug.
+  Next step: instrument the x86 walker itself and log each link -- the frame
+  the chain produces between CustomSort and RunAllScenarios, and what happens
+  to it -- rather than inferring from the rendered stack.
+  Asserted by the TODO-RED test
+  `StackAcrossRtlCallback_KeepsTheCallerOnBothBitnesses`.
+
 - **Dynamic-array bounds are not applied to an array reached indirectly** —
   bounds checking requires a POSITIVE identification that the value is a
   dynamic array, which comes from the declared type of a symbol

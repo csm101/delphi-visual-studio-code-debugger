@@ -163,6 +163,19 @@ type
     // stopping, so it depends on the 32-bit locals reader and on run control
     // continuing correctly. Covered on the 64-bit target only until now.
     [Test] procedure LogPoints_EmitTheirMessageWithoutStoppingOnBothBitnesses;
+    // The user's field report, reproduced: stopped in a callback the RTL calls,
+    // the 32-bit stack LOSES the routine that set the callback up. x64 shows
+    // CompareNames <- QuickSort <- CustomSort <- RunRtlCallback <- ...; x86
+    // shows the same but with RunRtlCallback simply absent.
+    //
+    // Neither mechanism has it: the saved-EBP chain steps over the region in
+    // one link, and inserting whatever dbghelp reports between two frames the
+    // chain vouched for -- tried, then reverted -- changed nothing, so dbghelp
+    // does not know the frame either. Cause NOT identified; the fixture is
+    // committed so the next attempt starts from a reproduction rather than a
+    // description.
+    [Test] [Ignore('TODO-RED: x86 stack loses the caller across sourceless RTL frames; mechanism not yet identified')]
+    procedure StackAcrossRtlCallback_KeepsTheCallerOnBothBitnesses;
     // TD32 stores globals mangled, and dcc32 mangles Borland-style where dcc64
     // mangles Itanium-style; only the latter was decoded, so NO unit global
     // resolved on a 32-bit target.
@@ -3793,6 +3806,50 @@ begin
   Assert.AreEqual('', Failures,
     'a logpoint must emit its evaluated message and let the target run, on ' +
     'both bitnesses -- ' + Failures);
+end;
+
+procedure TWin32RunControlTests.StackAcrossRtlCallback_KeepsTheCallerOnBothBitnesses;
+const
+  SOURCE = 'TestTargetEdge2.pas';
+  MARKER = 'RTL_CALLBACK_BODY';
+
+  // Stopped inside a comparer that System.Classes calls back into. Between the
+  // comparer and the routine that started the sort there are RTL frames with no
+  // debug info -- the same shape as breaking inside a VCL event handler, which
+  // is where this was first reported.
+  function FrameNamesAt(const Exe, Map, Rsm: string; Line: Integer): string;
+  begin
+    var Session := OpenSessionAtMarker(Exe, Map, Rsm, TargetDir, SOURCE, Line);
+    try
+      if Session.State <> dsStopped then
+        Exit('<did not stop>');
+      Result := '';
+      for var F in Session.GetCallStack do
+        if F.FunctionName <> '' then
+          Result := Result + F.FunctionName + ' ';
+    finally
+      Session.Free;
+    end;
+  end;
+
+begin
+  var Line := MarkerLineInFile(TargetDir + SOURCE, MARKER);
+  Assert.IsTrue(Line > 0, 'marker ' + MARKER + ' not found');
+  Assert.IsTrue(FileExists(Win64Exe), '64-bit control target missing');
+
+  var Failures := '';
+  // Both the comparer and the routine that set the sort up must be present:
+  // the comparer alone proves nothing, since it is frame 0.
+  var Got64 := FrameNamesAt(Win64Exe, Win64Map, Win64Rsm, Line);
+  if not (Got64.Contains('CompareNames') and Got64.Contains('RunRtlCallback')) then
+    Failures := Failures + 'x64: ' + Got64 + '; ';
+  var Got32 := FrameNamesAt(Win32Exe, Win32Map, Win32Rsm, Line);
+  if not (Got32.Contains('CompareNames') and Got32.Contains('RunRtlCallback')) then
+    Failures := Failures + 'x86: ' + Got32 + '; ';
+
+  Assert.AreEqual('', Failures,
+    'the stack must reach the caller across sourceless RTL frames, on both ' +
+    'bitnesses -- ' + Failures);
 end;
 
 procedure TWin32RunControlTests.BreakpointOnBeginLine_ReportsPassedParameters;

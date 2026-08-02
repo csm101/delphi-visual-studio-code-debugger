@@ -11,6 +11,11 @@ uses
 
 procedure RunEdge2;
 procedure RunOpenArray;
+// Stops inside a comparer that the RTL calls back into. The frames between
+// this routine and the comparer belong to System.Classes, which ships without
+// debug info, so the stack has to bridge a run of SOURCELESS frames and still
+// reach the caller. Same shape as breaking inside a VCL event handler.
+procedure RunRtlCallback;
 
 type
   TInner3  = record X, Y: Integer; end;
@@ -27,7 +32,7 @@ type
 implementation
 
 uses
-  System.SysUtils;
+  System.SysUtils, System.Classes;
 
 type
   TLocalSink = class
@@ -44,6 +49,37 @@ var
 procedure PlainTarget(X: Integer);
 begin
   GSink.Use('plain', [X]);
+end;
+
+// Called by System.Classes' sort, so the stack here is:
+//   CompareNames  <- (sourceless RTL frames)  <- RunRtlCallback
+//
+// UNIT-LEVEL on purpose. As a nested function this took the address of a
+// routine that needs a static link to reach its parent's frame, and the RTL
+// calls it through a plain function pointer with no link to give -- so every
+// invocation faulted. That is a bug in the fixture, not in the debugger, and it
+// is exactly the access violation that was popping dialogs.
+function CompareNames(List: TStringList; Index1, Index2: Integer): Integer;
+begin
+  var Left  := List[Index1];
+  var Right := List[Index2];
+  Result := CompareStr(Left, Right);
+  GSink.Use('rtl-callback', [Left, Right, Result]);   // {BP:RTL_CALLBACK_BODY}
+end;
+
+procedure RunRtlCallback;
+var
+  Names: TStringList;
+begin
+  Names := TStringList.Create;
+  try
+    Names.Add('pear');
+    Names.Add('apple');
+    Names.Add('fig');
+    Names.CustomSort(@CompareNames);
+  finally
+    Names.Free;
+  end;
 end;
 
 // const open array parameter: A arrives as (pointer, high).

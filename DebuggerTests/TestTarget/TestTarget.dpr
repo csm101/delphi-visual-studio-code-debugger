@@ -14,6 +14,9 @@ program TestTarget;
 // main-block table and have no BPL/TD32 equivalent.
 
 uses
+  // FIRST: installs the silent-failure handlers before any fixture can fault.
+  // Deliberate exceptions must not pop a modal dialog in an unattended run.
+  TestTargetQuiet in 'TestTargetQuiet.pas',
   TestTargetCore in 'TestTargetCore.pas';
 
 begin
