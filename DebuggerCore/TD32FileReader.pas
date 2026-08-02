@@ -241,6 +241,13 @@ type
     FProcs:         TArray<TTD32ProcRange>;   // sorted by StartRva ascending
     FNameToRva:     TDictionary<string, UInt64>;
     FInnerToParent: TDictionary<string, string>;
+    // Nested-proc parent, keyed by the INNER proc's RVA. Built from CodeView's
+    // `pParent` back-pointer, which is the only record of nesting dcc32 emits
+    // -- its symbol stream puts every proc at top level and its MAP is flat.
+    // RVA-keyed because a bare inner name (`Inner`, `Mid`) collides across
+    // units.
+    FRvaToParentName: TDictionary<UInt64, string>;
+    FRvaToParentRva:  TDictionary<UInt64, UInt64>;
 
     // Global data symbols (built from GDATA32 records).
     FGlobals:       TArray<TGlobalSymbol>;
@@ -315,7 +322,9 @@ type
     procedure ParseAllAlignSymbols;
     procedure ParseAlignSymbols(const Entry: TTD32DirectoryEntry);
     procedure ParseGlobalSymbols(const Entry: TTD32DirectoryEntry);
-    procedure ParseSymbolStream(Base, Stop: PByte; IncludeGData: Boolean;
+    // SubsecBase is the subsection origin `pParent` offsets are measured from;
+    // Base is where its records start (+4 or +32 depending on the kind).
+    procedure ParseSymbolStream(SubsecBase, Base, Stop: PByte; IncludeGData: Boolean;
                 OwningModIndex: Integer = -1);
     procedure HandleProcRecord(Payload: PByte; PayloadEnd: PByte;
                                IsGlobal: Boolean;
@@ -582,6 +591,8 @@ begin
   FLineToRva     := TDictionary<string, UInt64>.Create;
   FNameToRva     := TDictionary<string, UInt64>.Create;
   FInnerToParent := TDictionary<string, string>.Create;
+  FRvaToParentName := TDictionary<UInt64, string>.Create;
+  FRvaToParentRva  := TDictionary<UInt64, UInt64>.Create;
   FGlobalByName  := TDictionary<string, Integer>.Create;
   FProcLocalChains := TDictionary<string, TTD32LocalChain>.Create;
   FRvaLocalChains  := TDictionary<UInt64, TTD32LocalChain>.Create;
@@ -601,6 +612,8 @@ begin
   FLineToRva.Free;
   FNameToRva.Free;
   FInnerToParent.Free;
+  FRvaToParentName.Free;
+  FRvaToParentRva.Free;
   FGlobalByName.Free;
   FProcLocalChains.Free;
   FRvaLocalChains.Free;
@@ -1925,9 +1938,20 @@ begin
   AppendLocalToScope(L, ScopeName, ScopeRva);
 end;
 
-procedure TTD32FileReader.ParseSymbolStream(Base, Stop: PByte;
+procedure TTD32FileReader.ParseSymbolStream(SubsecBase, Base, Stop: PByte;
   IncludeGData: Boolean; OwningModIndex: Integer);
+type
+  // One proc record's position and its `pParent` back-pointer, kept so the
+  // nesting can be resolved once the whole subsection has been seen -- a parent
+  // may appear AFTER its child in the stream.
+  TProcLink = record
+    OffFromSubsec: Cardinal;
+    PParent:       Cardinal;
+    Rva:           UInt64;
+    Name:          string;
+  end;
 var
+  ProcLinks:     TArray<TProcLink>;
   ScopeStack:    TArray<string>;
   ScopeRvaStack: TArray<UInt64>;
   // Parallel to ScopeStack: the lexical-block code range for each scope level.
@@ -1948,6 +1972,22 @@ begin
         var Nm:  string;
         var ProcRva: UInt64;
         HandleProcRecord(Payload, PayloadEnd, Kind = $0205, Nm, ProcRva, OwningModIndex);
+        // CodeView's `pParent` back-pointer, at payload+0. It is the ONLY place
+        // dcc32 records that a procedure is nested: the 32-bit stream emits
+        // every proc at top level (so the scope stack above never nests), and
+        // the MAP carries a flat `Unit.Inner` with nothing to correlate.
+        // Measured with DevTools\Td32ProcNesting: 196 of 208 nested procs
+        // resolve, and the offset is from the SUBSECTION BASE -- 196/196 that
+        // way against 0/196 measured from the first record, which starts at +4
+        // or +32 depending on the subsection kind.
+        if (Nm <> '') and (PayloadEnd - Payload >= 4) then begin
+          var Link: TProcLink;
+          Link.OffFromSubsec := Cardinal(Cur - SubsecBase);
+          Link.PParent       := PCardinal(Payload)^;
+          Link.Rva           := ProcRva;
+          Link.Name          := Nm;
+          ProcLinks := ProcLinks + [Link];
+        end;
         ScopeStack    := ScopeStack    + [Nm];
         ScopeRvaStack := ScopeRvaStack + [ProcRva];
         ScopeBlkStart := ScopeBlkStart + [0];   // proc level: function-wide scope
@@ -2027,6 +2067,27 @@ begin
     end;
     Inc(Cur, 2 + Int64(RecSize));
   end;
+
+  // Resolve the `pParent` back-pointers now that every record in the
+  // subsection has a known offset -- a parent can appear after its child.
+  for var I := 0 to High(ProcLinks) do begin
+    if ProcLinks[I].PParent = 0 then
+      Continue;
+    for var J := 0 to High(ProcLinks) do begin
+      if ProcLinks[J].OffFromSubsec <> ProcLinks[I].PParent then
+        Continue;
+      if ProcLinks[J].Rva = ProcLinks[I].Rva then
+        Break;   // a record pointing at itself says nothing
+      FRvaToParentName.AddOrSetValue(ProcLinks[I].Rva, ProcLinks[J].Name);
+      FRvaToParentRva.AddOrSetValue(ProcLinks[I].Rva, ProcLinks[J].Rva);
+      // The by-name map is a fallback for callers without an RVA. It collides
+      // when two units declare a nested proc with the same short name, which is
+      // exactly why the RVA-keyed maps above exist and are preferred.
+      if not FInnerToParent.ContainsKey(AnsiLowerCase(ProcLinks[I].Name)) then
+        FInnerToParent.Add(AnsiLowerCase(ProcLinks[I].Name), ProcLinks[J].Name);
+      Break;
+    end;
+  end;
 end;
 
 procedure TTD32FileReader.ParseAlignSymbols(const Entry: TTD32DirectoryEntry);
@@ -2036,7 +2097,7 @@ begin
   if Entry.Size < 4 then Exit;
   // Skip 4-byte signature. ALIGN_SYMBOLS belong to a module -> pass the ModIndex
   // so GDATA32/LDATA32 globals get attributed to their owning unit.
-  ParseSymbolStream(Base + 4, Base + Entry.Size, True, Entry.ModIndex);
+  ParseSymbolStream(Base, Base + 4, Base + Entry.Size, True, Entry.ModIndex);
 end;
 
 procedure TTD32FileReader.ParseGlobalSymbols(const Entry: TTD32DirectoryEntry);
@@ -2046,7 +2107,7 @@ begin
   // GLOBAL_SYMBOLS has a 32-byte header (Borland TD32 variant -- larger
   // than the Microsoft sstGlobalSym SymHash header). Records start after.
   if Entry.Size <= 32 then Exit;
-  ParseSymbolStream(Base + 32, Base + Entry.Size, True);
+  ParseSymbolStream(Base, Base + 32, Base + Entry.Size, True);
 end;
 
 procedure TTD32FileReader.ParseAllAlignSymbols;
@@ -2238,21 +2299,37 @@ begin
   Result := FInnerToParent.TryGetValue(AnsiLowerCase(Inner), Parent);
 end;
 
+// Both answer from CodeView's `pParent` back-pointer, resolved during the
+// symbol-stream parse.
+//
+// These used to return False unconditionally, under a comment saying TD32 knows
+// nesting by short name only and that RVA-keyed lookups belong to whoever parses
+// `_ZZ` mangled symbols. That was wrong, and it mattered: `_ZZ` is a dcc64
+// spelling, so on a 32-bit target NOTHING knew that `Inner` is nested inside
+// `ComputeNested`, and the whole enclosing scope was missing from the locals of
+// every nested procedure.
 function TTD32FileReader.GetEnclosingProcedureByRva(InnerRva: UInt64;
   out Parent: string): Boolean;
 begin
-  // TD32 NAMES stores nested procs by short name only -- no RVA index.
-  // Leave RVA-keyed lookups to providers that actually parse `_ZZ`
-  // mangled symbols (MapFileReader).
-  Result := False;
   Parent := '';
+  var ParentRva: UInt64;
+  if not FRvaToParentRva.TryGetValue(InnerRva, ParentRva) then
+    Exit(False);
+  // Name resolved through the normal lookup rather than from the proc record's
+  // own spelling: that keeps ONE source for how a routine is named, and the
+  // record's spelling is not it. Taking the record's name directly made the
+  // locals prefix read `computenested.Ext1` where every other path says
+  // `ComputeNested.Ext1` -- on x64 too, since this provider now answers first.
+  Result := RvaToFunctionName(ParentRva, Parent);
+  if not Result then
+    Result := FRvaToParentName.TryGetValue(InnerRva, Parent);
 end;
 
 function TTD32FileReader.GetEnclosingProcedureRvaByRva(InnerRva: UInt64;
   out ParentRva: UInt64): Boolean;
 begin
-  Result := False;
   ParentRva := 0;
+  Result := FRvaToParentRva.TryGetValue(InnerRva, ParentRva);
 end;
 
 function TTD32FileReader.GetGlobals: TArray<TGlobalSymbol>;

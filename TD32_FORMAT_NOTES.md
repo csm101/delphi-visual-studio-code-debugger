@@ -430,6 +430,39 @@ Confirmed by comparing the same recursive stack on both bitnesses name for name
 (`Win32_StackFrameNames_MatchWin64`, which caught the missing
 `initialization` case on its first run).
 
+### Nested procedures: `pParent` is the only record dcc32 emits — confirmed
+
+A proc record (`$0204` LPROC32 / `$0205` GPROC32) carries CodeView's `pParent`
+back-pointer at **payload+0**, and it is a byte offset from the **subsection
+base** — not from the first record, which starts at +4 (sstAlignSym) or +32.
+Measured with `DevTools\Td32ProcNesting.exe` on a 32-bit build: 196 of 196
+resolve against the subsection base and 0 of 196 against the first record.
+
+This is load-bearing on Win32 and nowhere else, because dcc32 records nesting
+in no other way:
+
+| Source | dcc64 | dcc32 |
+|---|---|---|
+| symbol-stream lexical nesting (scope stack) | present | **none** — every proc at top level |
+| MAP | `$pdata$_ZZ...` mangled, parent recoverable | flat `Unit.Inner` |
+| TD32 `pParent` | present | **present** |
+
+The `_ZZ` correlation in `MapFileReader` is an Itanium (dcc64) spelling, so
+before `pParent` was read, nothing on a 32-bit target knew that `Inner` is
+nested inside `ComputeNested`. The visible effect was that a nested procedure's
+locals showed only its OWN variables, while the identical source built for
+Win64 also showed the enclosing routine's — measured at `INNER_BODY`:
+
+    x64:  S, ComputeNested.X, ComputeNested.D1, ComputeNested.Ext1, ...
+    x86:  S
+
+Resolution happens after the whole subsection is walked, because a parent may
+appear AFTER its child in the stream. The parent's NAME is then taken from the
+ordinary name lookup rather than from the proc record's own spelling: using the
+record's spelling made the locals prefix read `computenested.Ext1` where every
+other path says `ComputeNested.Ext1`, on x64 too, since this provider answers
+first.
+
 #### Constructors and destructors carry NO declared name — confirmed
 
 A third shape exists that the demangler **cannot** decode, because the name is

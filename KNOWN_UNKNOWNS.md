@@ -696,7 +696,14 @@ No cheap containment exists: the wrong names are structurally indistinguishable
 from right ones, so "refuse when unreliable" needs the same decoding the fix
 needs.
 
-### Win32: a nested procedure cannot see its parent's variables
+### FIXED: Win32 nested procedures now see the parent scope
+
+Kept for the measurements, which took several wrong turns to get right. The fix
+was NOT where the investigation started (the frame pointer) but two levels up:
+nothing knew the routines were related at all. `pParent` supplied it; see
+`TD32_FORMAT_NOTES.md`.
+
+### (historical) Win32: a nested procedure cannot see its parent's variables
 
 Standing at `INNER_BODY` inside `ComputeNested.Inner`, the locals view differs
 completely by bitness:

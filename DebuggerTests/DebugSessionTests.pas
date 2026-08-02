@@ -224,6 +224,12 @@ type
     // symbol and got read as data -- a number about an object that has no such
     // member.
     [Test] procedure MemberLookup_DoesNotFallBackToAGlobalOnBothBitnesses;
+    // Delphi's LEXICAL scoping: standing in a nested procedure, the enclosing
+    // routine's variables are reachable by bare name. On Win32 the entire
+    // parent scope was missing -- the locals list showed only the nested
+    // routine's own `S`. Distinct from FrameScopedEvaluation_..., which selects
+    // the parent FRAME explicitly and worked on both bitnesses all along.
+    [Test] procedure NestedProc_SeesTheParentScopeOnBothBitnesses;
     // TD32 stores globals mangled, and dcc32 mangles Borland-style where dcc64
     // mangles Itanium-style; only the latter was decoded, so NO unit global
     // resolved on a 32-bit target.
@@ -4083,6 +4089,65 @@ begin
   Assert.AreEqual('', Failures,
     'the stack must reach the caller across sourceless RTL frames, at the ' +
     'right line, on both bitnesses -- ' + Failures);
+end;
+
+procedure TWin32RunControlTests.NestedProc_SeesTheParentScopeOnBothBitnesses;
+type
+  TExprCheck = record Expr, Expect: string end;
+const
+  SOURCE = 'TestTargetCore.pas';
+  MARKER = 'INNER_BODY';
+  // `Inner` is nested in `ComputeNested` and declares only `S`. Everything else
+  // below belongs to the enclosing routine, so each one is reachable ONLY
+  // through the lexical scope. `Ext1` doubles as a decoder check: 10 bytes of
+  // x87 on Win32, an alias of Double on Win64.
+  CHECKS: array[0..3] of TExprCheck = (
+    (Expr: 'Ext1'; Expect: '2.75'),
+    (Expr: 'R48';  Expect: '3.5'),
+    (Expr: 'X';    Expect: '11'),
+    (Expr: 'S';    Expect: ''));   // the nested routine's OWN local still works
+
+  function EvalAt(const Exe, Map, Rsm, Expr: string; Line: Integer): string;
+  begin
+    var Session := OpenSessionAtMarker(Exe, Map, Rsm, TargetDir, SOURCE, Line);
+    try
+      if Session.State <> dsStopped then
+        Exit('<did not stop>');
+      var R := Session.Evaluate(Expr);
+      if not R.Success then
+        Exit('<' + R.ErrorText + '>');
+      Result := R.Value;
+    finally
+      Session.Free;
+    end;
+  end;
+
+  function Wrong(const Got, Expect: string): Boolean;
+  begin
+    if Expect = '' then
+      Result := Got.StartsWith('<')   // must resolve; its value is not the point
+    else
+      Result := not Got.Contains(Expect);
+  end;
+
+begin
+  var Line := MarkerLineInFile(TargetDir + SOURCE, MARKER);
+  Assert.IsTrue(Line > 0, 'marker ' + MARKER + ' not found');
+  Assert.IsTrue(FileExists(Win64Exe), '64-bit control target missing');
+
+  var Failures := '';
+  for var Check in CHECKS do begin
+    var Got64 := EvalAt(Win64Exe, Win64Map, Win64Rsm, Check.Expr, Line);
+    if Wrong(Got64, Check.Expect) then
+      Failures := Failures + Format('x64 %s -> %s; ', [Check.Expr, Got64]);
+    var Got32 := EvalAt(Win32Exe, Win32Map, Win32Rsm, Check.Expr, Line);
+    if Wrong(Got32, Check.Expect) then
+      Failures := Failures + Format('x86 %s -> %s; ', [Check.Expr, Got32]);
+  end;
+
+  Assert.AreEqual('', Failures,
+    'a nested procedure must see its enclosing routine''s variables on both ' +
+    'bitnesses -- ' + Failures);
 end;
 
 procedure TWin32RunControlTests.MemberLookup_DoesNotFallBackToAGlobalOnBothBitnesses;
