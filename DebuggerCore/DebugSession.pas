@@ -1521,9 +1521,14 @@ begin
     NewValue := ErrMsg;
     Exit;
   end;
-  // Build a refreshed display from a fresh 8-byte read at the field address.
+  // Build a refreshed display from a fresh read at the field address, at the
+  // FIELD's own width. Eight bytes folds the neighbouring field into the high
+  // half on a 32-bit target, which for a pointer-shaped field (a string, an
+  // object) yields an address outside the process and a read failure where the
+  // write in fact succeeded.
   var FreshRaw: UInt64 := 0;
-  if FDebugger.ReadProcessMemoryAt(FieldAddr, @FreshRaw, 8) then begin
+  if FDebugger.ReadProcessMemoryAt(FieldAddr, @FreshRaw,
+       LocalReadSize(FieldType, FDebugger.TargetLayout.PointerSize)) then begin
     var Lv := Default(TLocalValue);
     Lv.Name       := Name;
     Lv.TypeHint   := FieldType;
@@ -1997,7 +2002,13 @@ begin
     if Val.IsValid and (Val.RawValue >= 65536) and (FRtti <> nil) then begin
       var Probe: UInt64 := Val.RawValue;
       var IsInst := FRtti.IsClassInstance(Probe);
-      if (not IsInst) and FDebugger.ReadProcessMemoryAt(Val.RawValue, @Probe, 8) and
+      // The extra dereference reads a POINTER, so read one pointer. At eight
+      // bytes the high half is the neighbouring word on a 32-bit target, which
+      // makes the probe fail there every time -- so this recovery has simply
+      // never worked on x86.
+      Probe := 0;
+      if (not IsInst) and FDebugger.ReadProcessMemoryAt(Val.RawValue, @Probe,
+             FDebugger.TargetLayout.PointerSize) and
          (Probe >= 65536) and FRtti.IsClassInstance(Probe) then begin
         Val.RawValue := Probe;
         IsInst := True;

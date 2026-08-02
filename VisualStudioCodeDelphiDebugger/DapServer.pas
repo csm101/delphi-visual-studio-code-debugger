@@ -3116,6 +3116,10 @@ begin
     on E: Exception do begin
       DapLog(Format('EXCEPTION in handler "%s": %s: %s',
         [Cmd, E.ClassName, E.Message]));
+      // The class and message alone do not say WHERE, and an adapter-internal
+      // failure is exactly the case where that matters most.
+      if E.StackTrace <> '' then
+        DapLog('  raised at:'#13#10 + E.StackTrace);
       FIO.SendErrorResponse(Seq, Cmd,
         Format('Internal adapter error: %s', [E.Message]));
     end;

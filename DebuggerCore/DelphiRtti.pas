@@ -172,6 +172,15 @@ type
     // True if the value ObjAddr (stored in a class variable) points to what
     // looks like a valid Delphi object (VMT self-pointer check).
     function IsClassInstance(ObjAddr: UInt64): Boolean;
+    // True when this object's class, or an ancestor, declares an implemented
+    // interface whose hidden field sits exactly Offset bytes in. The exact test
+    // for whether an interface reference at Obj+Offset belongs to Obj.
+    function DeclaresInterfaceAtOffset(ObjAddr: UInt64; Offset: Cardinal): Boolean;
+    // Recovers the object an interface reference points into, and its concrete
+    // class. THE single mechanism for this question -- see the implementation
+    // for why the alternatives were dropped.
+    function TryRecoverObjectFromInterface(IntfPtr: UInt64; out Obj: UInt64;
+      out ConcreteClass: string): Boolean;
 
     // Reads the (un-decorated) class name from the VMT of the instance at
     // ObjAddr. Returns '' on read failure.
@@ -513,6 +522,139 @@ begin
     FI.IsExpandable := TypeKindIsExpandable(FieldKind);
     SetLength(Fields, Length(Fields) + 1);
     Fields[High(Fields)] := FI;
+  end;
+end;
+
+function TDelphiRtti.DeclaresInterfaceAtOffset(ObjAddr: UInt64;
+  Offset: Cardinal): Boolean;
+// True when the object's class (or an ancestor) declares an implemented
+// interface whose hidden field sits exactly Offset bytes into the instance.
+//
+// This is the exact test for "does this interface reference belong to that
+// object": Delphi records, per implemented interface, the byte offset of the
+// field holding its method-table pointer, so a reference at Obj+Offset is that
+// object's if and only if some entry says Offset. No inspection of what the
+// memory looks like is involved.
+//
+// TInterfaceTable, measured by DevTools\IntfTableProbe on both bitnesses:
+//   EntryCount : Integer, then padding to pointer alignment
+//   entries    : IID(TGUID,16) + VTable(pointer) + IOffset(Integer) + ...
+//   stride       40 bytes on x64, 28 on x86
+const
+  MAX_ENTRIES  = 256;   // a class implementing more than this is not real code
+  MAX_ANCESTORS = 32;
+begin
+  Result := False;
+  var VmtAddr: UInt64;
+  if not ReadVmtSlot(ObjAddr, 0, VmtAddr) then Exit;
+  if not IsValidVmt(VmtAddr) then Exit;
+
+  var PtrSize   := UInt64(FLayout.PointerSize);
+  var HeaderLen := PtrSize;                       // Integer count, then aligned
+  var Stride    := 16 + PtrSize + 4;              // IID + VTable + IOffset
+  if (Stride mod PtrSize) <> 0 then               // ... then ImplGetter, aligned
+    Stride := Stride + (PtrSize - (Stride mod PtrSize));
+  Stride := Stride + PtrSize;
+  var IOffsetAt := 16 + PtrSize;
+
+  // An interface can be introduced by an ancestor, so every class in the chain
+  // is consulted. The chain is walked through TypeInfo, the same way
+  // ExpandClass collects ancestor VMTs -- there is no measured vmtParent
+  // constant, and inventing one is exactly what this codebase avoids.
+  var Vmts: TArray<UInt64> := [VmtAddr];
+  var TypeInfoAddr: UInt64;
+  if ReadVmtSlot(VmtAddr, FLayout.VmtTypeInfo, TypeInfoAddr) and (TypeInfoAddr <> 0) then begin
+    var CurTypeInfo := TypeInfoAddr;
+    for var Depth := 1 to MAX_ANCESTORS do begin
+      if CurTypeInfo = 0 then Break;
+      var Kind: Byte;
+      var TypeName: string;
+      var TypeDataAddr: UInt64;
+      if not ReadTypeInfoKindName(CurTypeInfo, Kind, TypeName, TypeDataAddr) then Break;
+      if Kind <> TK_CLASS then Break;
+      var AncVmt: UInt64;
+      if ReadTargetPointer(TypeDataAddr, AncVmt) and (AncVmt <> 0) then
+        Vmts := Vmts + [AncVmt];
+      var PParent: UInt64;
+      if not TryReadParentTypeInfo(TypeDataAddr, PParent) then Break;
+      CurTypeInfo := PParent;
+    end;
+  end;
+
+  for var Vmt in Vmts do begin
+    var TablePtr: UInt64;
+    if not ReadVmtSlot(Vmt, FLayout.VmtIntfTable, TablePtr) then Continue;
+    if TablePtr < 65536 then Continue;
+    var Count: Cardinal;
+    if not ReadU32(TablePtr, Count) then Continue;
+    if (Count = 0) or (Count > MAX_ENTRIES) then Continue;
+    for var I := 0 to Integer(Count) - 1 do begin
+      var EntryAt := TablePtr + HeaderLen + UInt64(I) * Stride;
+      var Candidate: Cardinal;
+      if ReadU32(EntryAt + IOffsetAt, Candidate) and (Candidate = Offset) then
+        Exit(True);
+    end;
+  end;
+end;
+
+function TDelphiRtti.TryRecoverObjectFromInterface(IntfPtr: UInt64;
+  out Obj: UInt64; out ConcreteClass: string): Boolean;
+// An interface reference addresses a hidden field INSIDE the implementing
+// object, so it is not itself a class instance. Walk back a pointer at a time
+// and accept a candidate only when its class declares an implemented interface
+// at exactly this offset -- an exact structural match, from the class's own
+// interface table.
+//
+// This replaces two earlier mechanisms:
+//   * decoding the IMT adjustor thunk's machine code (`add rcx, imm`), which
+//     only ever matched x64 encodings, so a 32-bit target never resolved the
+//     concrete class at all;
+//   * accepting any candidate with a valid VMT whose instance size merely
+//     reached the pointer, which is a far weaker claim than the class saying
+//     an interface lives there.
+// One mechanism, no instruction decoding, same answer on both bitnesses.
+const
+  // Backstop only. The real bound is the allocation, below.
+  MAX_SEARCH_BYTES = 4096;
+begin
+  Obj           := 0;
+  ConcreteClass := '';
+  Result        := False;
+  if IntfPtr < 65536 then Exit;
+
+  // Bound the walk by the ALLOCATION the reference points into. An object never
+  // spans two allocations, so anything below that base cannot be the object --
+  // and walking on regardless is not merely wasted work: with a fixed 4096-byte
+  // window the search ran off the end of the heap block and into a loaded
+  // module's data, where a stretch of bytes passed the VMT identity check and
+  // the RTTI readers then raised EIntOverflow on it (measured: offset 4048,
+  // candidate $7FFF154D8A60). The allocation base is a fact from the OS, which
+  // a byte count never was.
+  var LowestCandidate: UInt64 := 0;
+  if FProcess <> 0 then begin
+    var Mbi: TMemoryBasicInformation;
+    if VirtualQueryEx(FProcess, Pointer(IntfPtr), Mbi, SizeOf(Mbi)) = SizeOf(Mbi) then
+      LowestCandidate := UInt64(Mbi.AllocationBase);
+  end;
+
+  var Step := UInt64(FLayout.PointerSize);
+  var Offset: UInt64 := 0;
+  while Offset <= MAX_SEARCH_BYTES do begin
+    var Candidate := IntfPtr - Offset;
+    if (LowestCandidate <> 0) and (Candidate < LowestCandidate) then
+      Break;
+    if IsClassInstance(Candidate) then begin
+      var InstSize := GetInstanceSize(Candidate);
+      if (InstSize > 0) and (Offset + Step <= UInt64(InstSize)) and
+         DeclaresInterfaceAtOffset(Candidate, Cardinal(Offset)) then begin
+        ConcreteClass := GetInstanceClassName(Candidate);
+        if ConcreteClass <> '' then begin
+          Obj := Candidate;
+          Exit(True);
+        end;
+      end;
+    end;
+    Inc(Offset, Step);
   end;
 end;
 

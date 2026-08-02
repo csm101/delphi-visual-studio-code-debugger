@@ -630,40 +630,28 @@ end;
 // cannot be resolved against the interface. It can be resolved against the
 // implementing CLASS, which is why finding the object is the whole problem.
 //
-// Walk backwards a pointer at a time and accept the first candidate that both
-// carries a valid VMT and whose declared instance size REACHES the interface
-// pointer. That second condition is what makes this exact rather than a guess:
-// requiring the candidate's storage to cover the address means only the object
-// that actually contains the field can qualify -- a neighbouring heap block
-// would have to overlap it, which distinct live objects never do.
+// Walk backwards a pointer at a time; accept a candidate only when its CLASS
+// declares an implemented interface at exactly this offset.
+//
+// The acceptance test is the whole point. Delphi records, per implemented
+// interface, the byte offset of the hidden field holding its method-table
+// pointer, so a reference at Candidate+Offset belongs to Candidate if and only
+// if the class says an interface lives there -- an exact structural match, not
+// an opinion about what the memory looks like. An earlier version accepted any
+// candidate with a valid VMT whose instance size merely REACHED the pointer,
+// which is a much weaker claim.
+//
+// The backward walk remains because the class is only reachable through the
+// object, so there is nothing to look the answer up in until a candidate
+// exists. The walk is bounded by the candidate's own declared instance size:
+// an interface field cannot lie outside the object that contains it.
 function TExprEvaluator.TryObjectBehindInterface(IntfPtr: UInt64;
   out Obj: UInt64; out ClassName: string): Boolean;
-const
-  // An interface field beyond this depth into an object would be extraordinary;
-  // the bound just keeps a bad pointer from walking the whole address space.
-  MAX_FIELD_OFFSET = 4096;
 begin
   Obj       := 0;
   ClassName := '';
-  Result    := False;
-  if (FRtti = nil) or (IntfPtr < 65536) then
-    Exit;
-  var Step := UInt64(FDebugger.TargetLayout.PointerSize);
-  var Offset: UInt64 := 0;
-  while Offset <= MAX_FIELD_OFFSET do begin
-    var Candidate := IntfPtr - Offset;
-    if FRtti.IsClassInstance(Candidate) then begin
-      var InstSize := FRtti.GetInstanceSize(Candidate);
-      if (InstSize > 0) and (Offset + Step <= UInt64(InstSize)) then begin
-        ClassName := FRtti.GetInstanceClassName(Candidate);
-        if ClassName <> '' then begin
-          Obj := Candidate;
-          Exit(True);
-        end;
-      end;
-    end;
-    Inc(Offset, Step);
-  end;
+  Result    := (FRtti <> nil) and
+               FRtti.TryRecoverObjectFromInterface(IntfPtr, Obj, ClassName);
 end;
 
 // True when a value of this type is stored BY VALUE rather than as a
@@ -1920,7 +1908,13 @@ begin
     // and indexing it must be bound-checked from the type, not from whatever
     // precedes the data pointer.
     Result.ValueKind   := RetPointeeKind;
-    if not FDebugger.ReadProcessMemoryAt(Slot, @Result.RawValue, 8) then
+    // The slot holds a POINTER -- to string data, to a dynamic array, to an
+    // interface -- so read exactly one pointer. Reading eight bytes folds the
+    // next scratch word into the high half on a 32-bit target; that has been
+    // harmless only because the scratch happens to be zeroed there.
+    Result.RawValue := 0;
+    if not FDebugger.ReadProcessMemoryAt(Slot, @Result.RawValue,
+             FDebugger.TargetLayout.PointerSize) then
       Exit(InvalidValue('<string result deref failed>'));
   end else begin
     if SmallRecInRax then
@@ -2119,7 +2113,11 @@ function TExprEvaluator.ApplyDot(const Base: TExprValue; const Field: string): T
       // string / dyn-array formatters keep working unchanged.
       case P.PropTypeKind of
         TK_LSTRING, TK_USTRING, TK_WSTRING, TK_DYNARRAY: begin
-          if not FDebugger.ReadProcessMemoryAt(Slot, @Result.RawValue, 8) then
+          // One POINTER, at the target's width -- see the sibling read in
+          // ApplyMethodCall.
+          Result.RawValue := 0;
+          if not FDebugger.ReadProcessMemoryAt(Slot, @Result.RawValue,
+                   FDebugger.TargetLayout.PointerSize) then
             Exit(InvalidValue('<getter result deref failed>'));
         end;
         TK_RECORD, TK_MRECORD: begin

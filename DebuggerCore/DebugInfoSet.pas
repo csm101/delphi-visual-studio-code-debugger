@@ -1014,6 +1014,13 @@ begin
             // GetLocalsForFunction for why the offset sign cannot substitute.
             if A.ParamStatus <> spsUnknown then
               Locals[Idx].ParamStatus := A.ParamStatus;
+            // Being a BY-REFERENCE parameter is likewise a source fact only one
+            // provider records: RSM tags it, TD32 calls every symbol a local.
+            // Without merging it, whichever provider happened to be the base
+            // decided -- and it differs by bitness, so `var AResult: Integer`
+            // was dereferenced on x64 and displayed as its POINTER on x86.
+            if A.Kind = lkVarParam then
+              Locals[Idx].Kind := lkVarParam;
             var Cur := Locals[Idx].TypeHint;
             var DupCount: Integer;
             DupNames.TryGetValue(AnsiLowerCase(A.Name), DupCount);

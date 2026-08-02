@@ -143,6 +143,12 @@ type
     // is the only source that knows a `TList<Integer>`'s element type, because
     // dcc32 emits the generic un-instantiated.
     [Test] procedure RttiFieldTable_ReadsRealFieldsOnBothBitnesses;
+    // A `var` parameter's slot holds a POINTER to the caller's storage. Only
+    // RSM records that a parameter is by-reference; TD32 calls every symbol a
+    // local. Whichever provider happened to be the base therefore decided, and
+    // it differs by bitness -- so x86 displayed the pointer (a stack address)
+    // where x64 displayed the value.
+    [Test] procedure VarParameters_ShowTheValueOnBothBitnesses;
     // TD32 stores globals mangled, and dcc32 mangles Borland-style where dcc64
     // mangles Itanium-style; only the latter was decoded, so NO unit global
     // resolved on a 32-bit target.
@@ -2936,6 +2942,14 @@ begin
       Failures := Failures + Format('x86 %s -> %s; ', [Check.Expr, Got32]);
   end;
 
+  // NOTE: deliberately no assertion that the locals view LABELS the interface
+  // with its concrete class. Doing that needs the object, and the recovery that
+  // finds it walks into memory the RTTI readers cannot survive when the value
+  // comes from an arbitrary formatted slot -- it fails the whole `variables`
+  // request with an integer overflow. Recorded in KNOWN_UNKNOWNS; the label is
+  // off until that is understood. Member ACCESS through the interface, asserted
+  // above, does not go through that path.
+
   Assert.AreEqual('', Failures,
     'fields, properties and methods must be reachable through an interface ' +
     'reference on both bitnesses -- ' + Failures);
@@ -3553,6 +3567,57 @@ begin
   Assert.AreEqual('', Failures,
     'runtime RTTI must report a generic''s real, instantiated fields on both ' +
     'bitnesses -- ' + Failures);
+end;
+
+procedure TWin32RunControlTests.VarParameters_ShowTheValueOnBothBitnesses;
+const
+  SOURCE = 'TestTargetCore.pas';
+  MARKER = 'COMPUTE_BODY';
+
+  // `TWidget.Compute(var AResult: Integer)` stops on `AResult := Factor + 10`
+  // with Factor = 84. Stepping over that line makes the caller's variable 94,
+  // so reading 94 back proves the debugger followed the pointer to the CALLER's
+  // storage -- not that it printed something plausible. Printing the pointer
+  // instead yields a stack address in the millions, which no assertion on a
+  // small number can accept by accident.
+  function ValueAfterAssignment(const Exe, Map, Rsm: string; Line: Integer): string;
+  begin
+    var Session := OpenSessionAtMarker(Exe, Map, Rsm, TargetDir, SOURCE, Line);
+    try
+      if Session.State <> dsStopped then
+        Exit('<did not stop>');
+      Session.StepOver;
+      var Deadline := GetTickCount64 + 20000;
+      while (Session.State <> dsStopped) and (not Session.HasExited) and
+            (GetTickCount64 < Deadline) do
+        Session.Pump;
+      if Session.State <> dsStopped then
+        Exit('<did not stop after step>');
+      var R := Session.Evaluate('AResult');
+      if not R.Success then
+        Exit('<' + R.ErrorText + '>');
+      Result := R.Value;
+    finally
+      Session.Free;
+    end;
+  end;
+
+begin
+  var Line := MarkerLineInFile(TargetDir + SOURCE, MARKER);
+  Assert.IsTrue(Line > 0, 'marker ' + MARKER + ' not found');
+  Assert.IsTrue(FileExists(Win64Exe), '64-bit control target missing');
+
+  var Failures := '';
+  var Got64 := ValueAfterAssignment(Win64Exe, Win64Map, Win64Rsm, Line);
+  if not Got64.StartsWith('94') then
+    Failures := Failures + 'x64: ' + Got64 + '; ';
+  var Got32 := ValueAfterAssignment(Win32Exe, Win32Map, Win32Rsm, Line);
+  if not Got32.StartsWith('94') then
+    Failures := Failures + 'x86: ' + Got32 + '; ';
+
+  Assert.AreEqual('', Failures,
+    'a var parameter must show the caller''s VALUE, not the pointer to it, ' +
+    'on both bitnesses -- ' + Failures);
 end;
 
 procedure TWin32RunControlTests.BreakpointOnBeginLine_ReportsPassedParameters;

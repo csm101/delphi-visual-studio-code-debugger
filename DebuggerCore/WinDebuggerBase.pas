@@ -4570,8 +4570,19 @@ begin
          end,
          V.Address, Sym.TypeHint, TargetLayout.PointerSize, V.RawValue) then begin
       V.ValueValid := True;
+      // A var parameter's slot holds a pointer to the caller's storage, so this
+      // reads the POINTEE -- at the POINTEE's width, which is not the pointer's.
+      // Debug info types such a parameter `^Integer`, so sizing the read by that
+      // name would read eight bytes for a four-byte Integer and fold the
+      // neighbouring word into the high half, which is how `AResult` displayed
+      // as -865266791511752704.
+      var PointeeType := Sym.TypeHint;
+      if (Length(PointeeType) >= 2) and (PointeeType[1] = '^') then
+        PointeeType := Copy(PointeeType, 2, MaxInt);
+      V.DerefValue := 0;
       if (V.Kind = lkVarParam) and (V.RawValue <> 0) and
-         ReadProcessMemoryAt(V.RawValue, @V.DerefValue, 8) then
+         ReadProcessMemoryAt(V.RawValue, @V.DerefValue,
+           LocalReadSize(PointeeType, TargetLayout.PointerSize)) then
         V.DerefValid := True;
     end;
     // Innermost-wins dedup: with nested blocks both containing the PC, a

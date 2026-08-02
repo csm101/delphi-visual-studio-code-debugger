@@ -64,6 +64,10 @@ type
     // actually emits. Each slot is one pointer wide, so a slot read uses
     // PointerSize, not a fixed 8.
     VmtSelfPtr:    Integer;
+    // Slot holding PInterfaceTable. Measured by DevTools\IntfTableProbe against
+    // TMyClass.GetInterfaceTable, and worth measuring: on x64 it sits BEFORE
+    // SelfPtr (-192 vs -176), the opposite of the documented slot order.
+    VmtIntfTable:  Integer;
     VmtTypeInfo:   Integer;
     VmtFieldTable: Integer;
     VmtClassName:  Integer;
@@ -131,6 +135,7 @@ begin
   Result.DynArrayRefCountOffset := -12;
   Result.PushSlotSize           := 8;
   Result.VmtSelfPtr             := -176;
+  Result.VmtIntfTable           := -192;
   Result.VmtTypeInfo            := -168;
   Result.VmtFieldTable          := -160;
   Result.VmtClassName           := -112;
@@ -150,6 +155,7 @@ begin
   Result.DynArrayRefCountOffset := -8;
   Result.PushSlotSize           := 4;
   Result.VmtSelfPtr             := -88;
+  Result.VmtIntfTable           := -84;
   Result.VmtTypeInfo            := -72;
   Result.VmtFieldTable          := -68;
   Result.VmtClassName           := -56;

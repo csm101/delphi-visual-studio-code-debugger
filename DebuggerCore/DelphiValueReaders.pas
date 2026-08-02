@@ -617,6 +617,17 @@ end;
 {$R-}
 
 function TDelphiValueReader.RecoverObjectFromInterface(IfacePtr: UInt64): UInt64;
+// Recovers the object behind an interface reference by decoding the IMT
+// adjustor thunk. Bounded and cheap: three reads at addresses the reference
+// itself supplies, no search.
+//
+// The x64 instruction encodings are the only ones matched, so this answers
+// nothing on a 32-bit target -- an interface there keeps showing its raw
+// pointer. Replacing it with the bitness-independent interface-table search
+// was tried and REVERTED: reached from an arbitrary formatted value, that
+// search walks into module data where the RTTI readers raise EIntOverflow and
+// fail the whole `variables` request. A missing label beats a failed request.
+// See KNOWN_UNKNOWNS.
 var
   Imt:   UInt64;          // interface method table (value stored at IfacePtr)
   M0:    UInt64;          // address of the first IMT method (adjustor thunk)
@@ -626,12 +637,12 @@ var
 begin
   Result := 0;
   if (Debugger = nil) or (Rtti = nil) or (IfacePtr < 65536) then Exit;
+  var PtrSize := Debugger.TargetLayout.PointerSize;
   // IfacePtr -> IMT pointer -> first method (adjustor thunk).
-  if not Debugger.ReadProcessMemoryAt(IfacePtr, @Imt, 8) or (Imt < 65536) then Exit;
-  if not Debugger.ReadProcessMemoryAt(Imt, @M0, 8) or (M0 < 65536) then Exit;
+  if not Debugger.ReadProcessMemoryAt(IfacePtr, @Imt, PtrSize) or (Imt < 65536) then Exit;
+  if not Debugger.ReadProcessMemoryAt(Imt, @M0, PtrSize) or (M0 < 65536) then Exit;
   if not Debugger.ReadProcessMemoryAt(M0, @Code[0], 8) then Exit;
 
-  // Win64 Delphi adjustor thunk converts the interface ptr back to Self:
   //   48 83 C1 ib        add rcx, imm8     (small IOffset)
   //   48 81 C1 id        add rcx, imm32    (large IOffset)
   //   48 8D 49 ib        lea rcx,[rcx+ib]
@@ -654,6 +665,7 @@ begin
   if Rtti.IsClassInstance(Obj) then
     Result := Obj;
 end;
+
 
 function TDelphiValueReader.DecodeSetMembers(RawValue, Address: UInt64;
   ByteWidth: Integer; const Names: TArray<string>; MinValue: Integer): string;
@@ -1065,6 +1077,14 @@ function TDelphiValueReader.FormatLocalValue(const V: TLocalValue): string;
     Kind := 0;
     if (TypeName <> '') and (DebugInfo <> nil) then
       Kind := DebugInfo.LookupTypeKind(TypeName);
+    // The name lookup cannot answer for every type. An INTERFACE in particular
+    // is emitted with no entry in the type tables at all -- `ICounter` appears
+    // in neither TD32's class table nor the RSM type table -- so it resolves to
+    // nothing, and gating anything on the name alone silently never fires. The
+    // symbol carries the kind ITS OWN provider resolved from the type id, which
+    // is the authority whenever the name is silent.
+    if (Kind = 0) and SameText(TypeName, V.TypeHint) then
+      Kind := V.TypeKind;
 
     // TD32 sometimes surfaces a class-typed local as `^TFoo` (raw pointer
     // to the class instance) instead of `TFoo` directly. Unwrap so the
@@ -1093,8 +1113,14 @@ function TDelphiValueReader.FormatLocalValue(const V: TLocalValue): string;
       Exit('nil');
 
     // Interface reference: the slot points INTO the implementing object
+    // (Obj + IOffset), so IsClassInstance(Raw) is False. Recover the object
+    // from the class's interface table and label the slot with its CONCRETE
+    // class.
+    //
+    // Interface reference: the slot points INTO the implementing object
     // (Obj + IOffset), so IsClassInstance(Raw) is False. Recover the object via
-    // the IMT adjustor thunk and label the slot with its CONCRETE class.
+    // the IMT adjustor thunk -- bounded, x64-only -- and label the slot with
+    // its CONCRETE class.
     if (Raw >= 65536) and (Rtti <> nil) and not Rtti.IsClassInstance(Raw) and
        ((Kind = TK_INTERFACE) or
         ((Length(TypeName) >= 2) and (TypeName[1] = 'I') and
@@ -1285,7 +1311,7 @@ function TDelphiValueReader.FormatLocalValue(const V: TLocalValue): string;
       Kind := DebugInfo.LookupTypeKind(TypeName);
 
     case Kind of
-      TK_USTRING: begin
+      TK_USTRING: begin   // (string-by-pointer dispatch; see FormatTyped)
         if ReadDelphiUnicodeString(Ptr, Decoded) then
           Exit(Format('''%s''  (@0x%x)', [Decoded, Ptr]));
         Exit(Format('@0x%x (string read failed)', [Ptr]));

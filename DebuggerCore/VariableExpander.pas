@@ -88,6 +88,10 @@ type
                 out ObjBase: UInt64; out ClassName: string): Boolean;
     function  SyntheticLocal(const Name, TypeName: string; Addr: UInt64): TLocalValue;
     function  FormatExprValue(const E: TExprValue): string;
+    // Element type for any spelling of a dynamic array (`^E`, `TArray<E>`,
+    // `array of E`), so all of them reach the array expansion.
+    function  TryDynArrayElementType(const TypeName: string;
+                out ElemType: string): Boolean;
     function  TryClassifyChild(const TypeName, EvalName: string;
                 FieldAddr, PtrVal: UInt64; out Exp: TSessionExpansion): Boolean;
     function  FormatMemberValue(const TypeName: string; TypeKind: Byte;
@@ -279,6 +283,34 @@ end;
 // 8 bytes there read as PtrVal) is itself expandable, and if so returns the child
 // expansion. A class/interface field holds a POINTER to the object -> deref +
 // validate; a record field is expanded IN PLACE at FieldAddr.
+// Recognises the spellings a dynamic array arrives under and yields its element
+// type: `^Element` (TD32's fallback when it has no name), `TArray<Element>` and
+// `array of Element` (the real names, which runtime RTTI and richer providers
+// do supply). Any of them means the value is a data pointer with a length
+// header, so they must all reach the same expansion.
+function TVariableExpander.TryDynArrayElementType(const TypeName: string;
+  out ElemType: string): Boolean;
+begin
+  ElemType := '';
+  if TypeName = '' then
+    Exit(False);
+  if TypeName[1] = '^' then begin
+    ElemType := Copy(TypeName, 2, MaxInt);
+    Exit(ElemType <> '');
+  end;
+  if TypeName.StartsWith('TArray<', True) and TypeName.EndsWith('>') then begin
+    ElemType := TypeName.Substring(7, TypeName.Length - 8);
+    if ElemType.StartsWith('System.', True) then
+      ElemType := ElemType.Substring(7);
+    Exit(ElemType <> '');
+  end;
+  if TypeName.StartsWith('array of ', True) then begin
+    ElemType := Trim(TypeName.Substring(9));
+    Exit(ElemType <> '');
+  end;
+  Result := False;
+end;
+
 function TVariableExpander.TryClassifyChild(const TypeName, EvalName: string;
   FieldAddr, PtrVal: UInt64; out Exp: TSessionExpansion): Boolean;
 begin
@@ -286,8 +318,15 @@ begin
   if TypeName = '' then
     Exit;
 
-  if TypeName.StartsWith('^') then begin
-    if TryMakeDynArray(PtrVal, Copy(TypeName, 2, MaxInt), EvalName, Exp) then
+  // A dynamic array, in any of the spellings debug info uses for one. Keying
+  // this on the `^` prefix alone was a trap: TD32 writes `^Element` only when
+  // it has no better name, and once runtime RTTI started supplying the real
+  // instantiated name -- `TArray<System.Integer>` -- the field stopped being
+  // recognised as an array and fell through to the class path below, which
+  // expanded it into ITSELF. The DAP request then recursed until it failed.
+  var ElemType: string;
+  if TryDynArrayElementType(TypeName, ElemType) then begin
+    if TryMakeDynArray(PtrVal, ElemType, EvalName, Exp) then
       Result := True;
     Exit;
   end;
@@ -385,11 +424,13 @@ begin
     end;
   end;
 
-  // Dynamic array local: TD32 renders a dyn-array type as `^Element`. The slot
-  // holds the array data pointer; a valid dyn-array header makes it expandable.
-  if LV.ValueValid and (LV.TypeHint <> '') and LV.TypeHint.StartsWith('^') then begin
+  // Dynamic array local. TD32 renders one as `^Element`, but a provider with a
+  // real name gives `TArray<Element>` -- both mean the slot holds the array's
+  // data pointer, so both must reach here (see TryDynArrayElementType).
+  var LocalElemType: string;
+  if LV.ValueValid and TryDynArrayElementType(LV.TypeHint, LocalElemType) then begin
     var Exp: TSessionExpansion;
-    if TryMakeDynArray(EffVal, Copy(LV.TypeHint, 2, MaxInt), LV.Name, Exp) then begin
+    if TryMakeDynArray(EffVal, LocalElemType, LV.Name, Exp) then begin
       V.Kind := vkArray; V.Expandable := True; V.Handle := MintHandle(Exp);
     end;
     Exit;
