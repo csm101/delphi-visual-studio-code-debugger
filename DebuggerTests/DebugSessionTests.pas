@@ -149,6 +149,11 @@ type
     // it differs by bitness -- so x86 displayed the pointer (a stack address)
     // where x64 displayed the value.
     [Test] procedure VarParameters_ShowTheValueOnBothBitnesses;
+    // Evaluating in a CALLER frame, which every "click a stack frame and look
+    // at its locals" interaction depends on. Uncovered on either bitness until
+    // now; no defect found, but the x86 stack walk is a different
+    // implementation from the x64 one, so the coverage is not redundant.
+    [Test] procedure FrameScopedEvaluation_SeesTheRightLocalsOnBothBitnesses;
     // TD32 stores globals mangled, and dcc32 mangles Borland-style where dcc64
     // mangles Itanium-style; only the latter was decoded, so NO unit global
     // resolved on a 32-bit target.
@@ -3618,6 +3623,60 @@ begin
   Assert.AreEqual('', Failures,
     'a var parameter must show the caller''s VALUE, not the pointer to it, ' +
     'on both bitnesses -- ' + Failures);
+end;
+
+procedure TWin32RunControlTests.FrameScopedEvaluation_SeesTheRightLocalsOnBothBitnesses;
+const
+  SOURCE = 'TestTargetTypes.pas';
+  MARKER = 'DEEP_NEST_INNER_BODY';
+
+  // Three nested routines, each with its own local: Inner has InnerTag = 3.14,
+  // Mid has MidTag = 'mid-value', Outer has OuterTag = 777. Selecting a frame
+  // must show that frame's locals -- and NOT the callee's, which is the half
+  // that catches an evaluation quietly staying on the top frame.
+  function EvalInFrame(const Exe, Map, Rsm, Expr: string;
+    FrameIndex, Line: Integer): string;
+  begin
+    var Session := OpenSessionAtMarker(Exe, Map, Rsm, TargetDir, SOURCE, Line);
+    try
+      if Session.State <> dsStopped then
+        Exit('<did not stop>');
+      var R := Session.EvaluateForFrame(Expr, FrameIndex);
+      if not R.Success then
+        Exit('<' + R.ErrorText + '>');
+      Result := R.Value;
+    finally
+      Session.Free;
+    end;
+  end;
+
+  function Check(const Expr: string; FrameIndex: Integer;
+    const Expected: string; Line: Integer): string;
+  begin
+    Result := '';
+    var Got64 := EvalInFrame(Win64Exe, Win64Map, Win64Rsm, Expr, FrameIndex, Line);
+    if not Got64.Contains(Expected) then
+      Result := Result + Format('x64 frame%d %s -> %s; ', [FrameIndex, Expr, Got64]);
+    var Got32 := EvalInFrame(Win32Exe, Win32Map, Win32Rsm, Expr, FrameIndex, Line);
+    if not Got32.Contains(Expected) then
+      Result := Result + Format('x86 frame%d %s -> %s; ', [FrameIndex, Expr, Got32]);
+  end;
+
+begin
+  var Line := MarkerLineInFile(TargetDir + SOURCE, MARKER);
+  Assert.IsTrue(Line > 0, 'marker ' + MARKER + ' not found');
+  Assert.IsTrue(FileExists(Win64Exe), '64-bit control target missing');
+
+  var Failures := '';
+  Failures := Failures + Check('InnerTag', 0, '3.14',        Line);
+  Failures := Failures + Check('MidTag',   1, 'mid-value',   Line);
+  Failures := Failures + Check('OuterTag', 2, '777',         Line);
+  // Scope must also EXCLUDE: the callee's local is not visible from its caller.
+  Failures := Failures + Check('InnerTag', 1, 'not found',   Line);
+
+  Assert.AreEqual('', Failures,
+    'selecting a stack frame must scope evaluation to that frame, on both ' +
+    'bitnesses -- ' + Failures);
 end;
 
 procedure TWin32RunControlTests.BreakpointOnBeginLine_ReportsPassedParameters;

@@ -1950,7 +1950,14 @@ begin
 
   // SelectFrame reads the trimmed frame cache; at an exception stop it needs it
   // populated so frame 0 retargets off the RTL raise-plumbing to the user frame (F11).
-  if FStoppedOnException and (Length(FLastFrames) = 0) then
+  // Selecting a frame indexes the cache the last GetCallStack filled, and an
+  // index into an EMPTY cache is silently unselectable -- evaluation then falls
+  // back to the stopped top frame and answers with the WRONG frame's locals
+  // rather than saying anything. A caller that asks for frame N without having
+  // fetched the stack (an MCP evaluate, a watch issued before the stack panel
+  // is opened) hit exactly that. Fill the cache first, through GetCallStack, so
+  // the indexing matches what a client would have seen.
+  if (Length(FLastFrames) = 0) and (FStoppedOnException or (FrameIndex > 0)) then
     GetCallStack;
   SelectFrame(FrameIndex, ThreadId);
   try
