@@ -24,6 +24,8 @@ program LiveSessionProbe;
 uses
   System.SysUtils, System.Classes, System.StrUtils, System.Generics.Collections,
   Winapi.Windows,
+  DebugTarget,                       // FrameOriginName for the stack print
+  DapProtocol,                       // SetDapLogEnabled: engine-side diagnostics
   DebugSessionTypes, DebugSession;
 
 type
@@ -325,12 +327,18 @@ begin
     // nearest preceding symbol and the line from the nearest preceding line
     // record, so a bogus frame reads exactly like a real one. entry=0 says the
     // resolver could not place the address in any routine, which is the tell.
-    Writeln(Format('    #%-2d %-44s %s:%d  [%s]  ip=%s entry=%s',
+    //
+    // origin= names the mechanism that emitted the frame. A stack is assembled
+    // by several independent ones (EBP chain, prologue probe, frameless
+    // recovery, dbghelp tail) and they produce identical-looking records, so
+    // without it a frame that turns out to be bogus gives no clue as to which
+    // one to go and read.
+    Writeln(Format('    #%-2d %-44s %s:%d  [%s]  ip=%s entry=%s origin=%s',
       [F.Index,
        IfThen(F.FunctionName <> '', F.FunctionName, '<no name>'),
        IfThen(F.SourceFile <> '', ExtractFileName(F.SourceFile), '-'),
        F.SourceLine, F.ModuleName, IntToHex(F.IP, 8),
-       IntToHex(F.FuncEntryVA, 8)]));
+       IntToHex(F.FuncEntryVA, 8), FrameOriginName(F.Origin)]));
   Writeln(Format('    (%d frames)', [Length(Frames)]));
 
   Writeln('  locals:');
@@ -462,6 +470,10 @@ begin
 end;
 
 begin
+  // The engine's own log carries what the printed frames cannot: WHY a stack
+  // stopped where it did. A probe exists to be diagnosed from, so this is on
+  // unconditionally rather than behind a switch nobody remembers to pass.
+  SetDapLogEnabled(True);
   GExitWatch := TExitWatch.Create;
   try
     if ParamCount < 3 then begin

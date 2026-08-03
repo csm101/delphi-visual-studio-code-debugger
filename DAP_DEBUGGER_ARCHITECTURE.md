@@ -1141,9 +1141,25 @@ Every x86 link is validated, never trusted: the return address must be
 executable code inside a known module, and the next frame pointer must be
 4-byte aligned, strictly ABOVE the current one (the stack grows down) and within
 1 MB of it. The chain genuinely does end — system DLLs are routinely built with
-the frame pointer omitted — so when it dies at depth ≤ 1 the walk defers to the
-inherited StackWalk64, which on a stack that is mostly frameless system code may
-still do better.
+the frame pointer omitted — so when it dies at depth ≤ 1 the walk asks the
+inherited StackWalk64 and appends what it offers.
+
+"Inside a known module" means the debugger's OWN module table, built from the
+`CREATE_PROCESS` / `LOAD_DLL` debug events, not dbghelp's. On a WOW64 target
+dbghelp claims no module for the 32-bit `kernel32`/`ntdll`, so asking it refused
+every OS return address and truncated the stack at the last framed Delphi
+routine. That behaviour was recorded for a while as an inherent i386 limitation.
+It was not: measured on Hydra2, the EBP chain walks straight through the OS
+frames once the module test stops lying.
+
+Both consumers of dbghelp output — the tail splice below a verified join, and
+the "chain produced nothing, take dbghelp's answer" path — go through one
+routine that applies the same validation. They did not: the second copied
+dbghelp's array verbatim, checked by nothing, which is where the fabricated
+frame below the OS tail was coming from. Frame provenance is carried on every
+frame (`TFrameOrigin`, printed by `LiveSessionProbe` as `origin=`) precisely so
+that question is answerable by measurement rather than by inference; three
+earlier fixes were aimed at the wrong producer.
 
 ### Proving a stack word is a return address (x86)
 
@@ -1161,8 +1177,19 @@ code address lying on the stack, and the test for that is exact:
   and reports whether a boundary lands on the candidate with a `call` ending
   there. x86 is not self-synchronising, so reading backwards cannot answer this.
 - The boundary comes from the line table (every line record starts an
-  instruction), restricted to the candidate's own routine; the routine entry is
-  the fallback when the module has symbols but no lines.
+  instruction), restricted to the routine that contains the byte **before** the
+  candidate — which is where the instruction ENDING at the candidate lives. The
+  routine entry is the fallback when the module has symbols but no lines.
+- That `-1` is load-bearing. Anchoring on the routine containing the candidate
+  itself has no answer when the candidate IS a function entry: no boundary
+  exists before it inside its own routine, so the verdict came back
+  `csaUndecidable` and the frame was kept unproven. Measured on Hydra2, the
+  impossible frame below the OS tail was exactly that case — the entry of the
+  program's main block, whose preceding byte is a `ret`.
+- Only addresses inside the MAIN image are judged at all. RVAs are relative to
+  it, so an address in any other module would become a meaningless offset that
+  can land on an unrelated routine of the executable; refusing outright is what
+  keeps the OS frames undecidable, and therefore kept.
 - Three outcomes, and only `csaYes` accepts. `csaUndecidable` is deliberately
   distinct from `csaNo`: an opcode the decoder does not know, or a span it
   cannot resolve, must never be read as "not a call".

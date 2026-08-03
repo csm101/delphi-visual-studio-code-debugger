@@ -50,6 +50,27 @@ type
     // unwind broke both in the field, returning a stack address as the caller's
     // PC and losing the real caller with it.
     [Test] procedure Win32_CallStack_FramesAreCodeAndFramePointersAscend;
+    // The two halves of the Delphi/OS boundary on a WOW64 stack, which failed in
+    // opposite directions and hid each other.
+    //
+    // The tail was TRUNCATED: a frame was only accepted if dbghelp claimed a
+    // module for its address, and for the 32-bit kernel32/ntdll of a WOW64
+    // target dbghelp claims none -- so every stack stopped at the last framed
+    // Delphi routine and the OS frames were dropped. That was recorded as an
+    // inherent i386 limitation; it was this test being absent.
+    //
+    // And the tail was FABRICATED: below the OS frames dbghelp offered one more
+    // address inside the target, which application code cannot be the caller of
+    // the OS thread starter. It survived because the proof that rejects it needs
+    // to decode the instruction ending at that address, and the address was a
+    // function ENTRY -- no boundary exists before it inside its own routine.
+    //
+    // Coverage is honest about its limits: the truncation half FAILS on this
+    // fixture without its fix (measured), the fabrication half does NOT -- it
+    // needs a stale stack word that lands exactly on a function entry, which no
+    // fixture can be made to produce on demand. That half is measured against a
+    // real BPL-loading application and is guarded here only against regression.
+    [Test] procedure Win32_CallStack_ReachesTheOsFramesAndEndsThere;
     // A breakpoint placed on a routine's `begin` line resolves to the routine's
     // ENTRY, where the prologue has not spilled Self or the by-register
     // parameters yet, so every local reads the CALLER's frame. Both bitnesses
@@ -4574,6 +4595,43 @@ begin
                  [I, Frames[I].FrameRBP, Prev]));
       Prev := Frames[I].FrameRBP;
     end;
+  finally
+    Session.Free;
+  end;
+end;
+
+procedure TWin32RunControlTests.Win32_CallStack_ReachesTheOsFramesAndEndsThere;
+begin
+  var Line := MarkerLine(W32_SOURCE, W32_MARKER);
+  Assert.IsTrue(Line > 0, 'marker not found: ' + W32_MARKER);
+  var Session := OpenSessionAtMarker(Win32Exe, Win32Map, Win32Rsm, TargetDir,
+    W32_SOURCE, Line);
+  try
+    Assert.AreEqual(Ord(dsStopped), Ord(Session.State), 'did not stop');
+    var Frames := Session.GetCallStack;
+    var TargetModule := LowerCase(ExtractFileName(Win32Exe));
+
+    // Half one: the walk must cross into the OS. The main block is reached from
+    // the CRT/OS startup, so a stack that stops before it is truncated.
+    var FirstOsFrame := -1;
+    for var I := 0 to High(Frames) do
+      if (Frames[I].ModuleName <> '') and
+         not SameText(Frames[I].ModuleName, TargetModule) then begin
+        FirstOsFrame := I;
+        Break;
+      end;
+    Assert.IsTrue(FirstOsFrame >= 0,
+      Format('the stack never left %s -- %d frame(s), so the OS tail was ' +
+             'refused rather than walked', [TargetModule, Length(Frames)]));
+
+    // Half two: and it must not come BACK. Nothing in the target can be the
+    // caller of the operating system's thread starter.
+    for var I := FirstOsFrame + 1 to High(Frames) do
+      Assert.IsFalse(SameText(Frames[I].ModuleName, TargetModule),
+        Format('frame %d is back inside %s ($%x, %s) below the OS frame at ' +
+               'frame %d -- the tail was fabricated',
+               [I, TargetModule, Frames[I].IP, Frames[I].FunctionName,
+                FirstOsFrame]));
   finally
     Session.Free;
   end;

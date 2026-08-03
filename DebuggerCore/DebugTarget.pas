@@ -124,6 +124,22 @@ type
                              // ReadProcessMemoryAt(Address).
   end;
 
+  // WHICH mechanism produced a frame. Diagnostic only -- nothing branches on it
+  // -- but a stack is assembled by several independent mechanisms and a frame
+  // that turns out to be wrong reads exactly like a correct one, so without this
+  // the first question after "this frame is bogus" ("who emitted it?") can only
+  // be answered by guessing. It has been answered wrongly three times.
+  TFrameOrigin = (
+    foUnknown,          // not tagged (a producer that has not been instrumented)
+    foSeed,             // frame 0, straight from the thread context
+    foEbpChain,         // followed a saved-EBP link that validated
+    foPrologueProbe,    // return address found near ESP, frame not yet established
+    foFramelessRecover, // inserted for a framed caller a frameless routine hid
+    foDbgHelpTail,      // spliced from dbghelp below a verified join
+    foDbgHelpWhole,     // dbghelp's entire walk, taken because ours had nothing
+    foSynthesizedSeed   // walker produced nothing; frame 0 rebuilt from context
+  );
+
   TStackFrame = record
     IP:           UInt64;
     FunctionName: string;
@@ -131,6 +147,7 @@ type
     SourceLine:   Integer;
     FrameRBP:     UInt64;   // this frame's RBP (StackWalk64 AddrFrame)
     FuncEntryVA:  UInt64;   // VA of the frame's function entry (for prolog)
+    Origin:       TFrameOrigin;
   end;
 
   TBreakpointRec = record
@@ -336,7 +353,18 @@ type
     property OnBpHit:       TOnBpHit       read GetOnBpHit       write SetOnBpHit;
   end;
 
+function FrameOriginName(Origin: TFrameOrigin): string;
+
 implementation
+
+function FrameOriginName(Origin: TFrameOrigin): string;
+const
+  Names: array[TFrameOrigin] of string = (
+    'unknown', 'seed', 'ebp-chain', 'prologue-probe', 'frameless-recover',
+    'dbghelp-tail', 'dbghelp-whole', 'synth-seed');
+begin
+  Result := Names[Origin];
+end;
 
 function TRegisterSnapshot.Pc: UInt64;
 begin

@@ -1229,6 +1229,7 @@ begin
   Result.IP           := F.IP;
   Result.FrameRBP     := F.FrameRBP;
   Result.FuncEntryVA  := F.FuncEntryVA;
+  Result.Origin       := F.Origin;
   // Owning module + symbol state. A frame the providers could not name arrives
   // here with FunctionName = '' and no explanation; this is the only place that
   // still knows WHICH module the address belongs to and whether that module has

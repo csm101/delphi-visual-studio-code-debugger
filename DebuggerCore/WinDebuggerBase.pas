@@ -25,6 +25,7 @@ type
   TRawStackFrame = record
     PC:       UInt64;
     FramePtr: UInt64;
+    Origin:   TFrameOrigin;   // which mechanism produced it (diagnostic)
   end;
 
   TWinDebugger = class(TInterfacedObject, IDebugTarget)
@@ -40,6 +41,7 @@ type
     FThreadNames:  TDictionary<DWORD, string>;  // id -> announced name
     FStoppedTid:   DWORD;
     FImageBase:    UInt64;
+    FImageSize:    UInt64;   // SizeOfImage of the main image, read at CreateProcess
     FPreferredBase: UInt64;
     FDebugInfo:    TDebugInfoSet;
     FBreakpoints:  TList<TBreakpointRec>;
@@ -268,6 +270,8 @@ type
   private
     procedure EnsureSymInitialized;
     procedure RegisterModuleWithDbgHelp(const Path: string; Base, ImageSize: UInt64);
+    function  ReadImageSizeOf(Base: UInt64): UInt64;
+    function  AddressInLoadedModule(VA: UInt64): Boolean;
     procedure PlantStepBp(VA: UInt64);
     procedure ClearStepBps;
     procedure PlantInFuncStepBps;
@@ -728,17 +732,38 @@ function TWinDebugger.NearestInstructionBoundaryBefore(VA: UInt64;
   out BoundaryVA: UInt64): Boolean;
 begin
   BoundaryVA := 0;
-  if (FDebugInfo = nil) or (VA <= FImageBase) then
+  if FDebugInfo = nil then
+    Exit(False);
+  // RVAs here are relative to the MAIN image, so an address in any other module
+  // would be turned into a meaningless offset that can land on an unrelated
+  // routine of the executable. Refusing outright is what keeps OS frames
+  // undecidable -- and therefore kept -- rather than judged against the wrong
+  // code.
+  if (VA <= FImageBase) or
+     ((FImageSize <> 0) and (VA >= FImageBase + FImageSize)) then
     Exit(False);
   var TargetRva := VAToRva(VA);
-  // A boundary is only usable if it belongs to the same routine: decoding
-  // forward from an unrelated address could otherwise land on the target by
-  // coincidence and manufacture an answer out of nothing. The routine's own
-  // entry is therefore both the containment test and the last-resort boundary.
-  var FuncStart: UInt64;
-  if not FDebugInfo.RvaToFunctionStart(TargetRva, FuncStart) then
+  if TargetRva = 0 then
     Exit(False);
-  if FuncStart >= TargetRva then
+
+  // A boundary is only usable if it belongs to the routine the instruction
+  // ENDING at the target lives in: decoding forward from an unrelated address
+  // could otherwise land on the target by coincidence and manufacture an answer
+  // out of nothing. That routine is the one containing the byte BEFORE the
+  // target, which is what makes the -1 here load-bearing rather than cosmetic.
+  //
+  // Anchoring on the routine containing the target ITSELF (what this did) has
+  // no answer when the target IS a function entry: no boundary exists before it
+  // inside its own routine, so every such address came back csaUndecidable and
+  // was kept unproven. Measured on Hydra2: $45CCB0 is the entry of the main
+  // block, and that is precisely the impossible frame the tail kept offering.
+  // With this anchor the decode runs through the PRECEDING routine and lands on
+  // the target, where the previous instruction is a `ret`.
+  //
+  // For an ordinary mid-routine return address nothing changes: the byte before
+  // it belongs to the same routine.
+  var FuncStart: UInt64;
+  if not FDebugInfo.RvaToFunctionStart(TargetRva - 1, FuncStart) then
     Exit(False);
 
   // Prefer the closest line record: the shorter the span, the less chance of
@@ -1354,12 +1379,62 @@ begin
       [Path, Base, GetLastError]));
 end;
 
+// SizeOfImage out of the PE header of an image already mapped in the debuggee.
+// 0 when it cannot be read, which callers must treat as "extent unknown" rather
+// than "empty".
+function TWinDebugger.ReadImageSizeOf(Base: UInt64): UInt64;
+var
+  R: NativeUInt;
+begin
+  Result := 0;
+  if (FProcess = 0) or (Base = 0) then
+    Exit;
+  var E_lfanew: DWORD := 0;
+  if not (ReadProcessMemory(FProcess, Pointer(Base + $3C), @E_lfanew, 4, R) and (R = 4)) then
+    Exit;
+  var SizeOfImage: DWORD := 0;
+  if ReadProcessMemory(FProcess, Pointer(Base + E_lfanew + $50), @SizeOfImage, 4, R) and (R = 4) then
+    Result := SizeOfImage;
+end;
+
+// Does VA fall inside a module the OS actually told us about?
+//
+// This used to ask dbghelp (SymGetModuleBase64), and on a WOW64 target that is
+// wrong: measured on Hydra2, the kernel32 return address $75925D49 -- a real
+// frame, in a module the debugger itself had logged as loaded -- got module
+// base 0 from dbghelp and was refused, which truncated the stack at the last
+// Delphi frame. dbghelp's module list is whatever its invade sweep and our
+// SymLoadModuleEx calls managed to register; OURS is built directly from the
+// CREATE_PROCESS / LOAD_DLL debug events, so it is complete by construction.
+//
+// dbghelp is still consulted last, for the case where a module IS ours but its
+// SizeOfImage could not be read, so nothing is lost relative to the old test.
+function TWinDebugger.AddressInLoadedModule(VA: UInt64): Boolean;
+
+  function InRange(Base, Size: UInt64): Boolean;
+  begin
+    Result := (Base <> 0) and (Size <> 0) and (VA >= Base) and (VA < Base + Size);
+  end;
+
+begin
+  if VA = 0 then
+    Exit(False);
+  if InRange(FImageBase, FImageSize) then
+    Exit(True);
+  for var KV in FDllBases do begin
+    var Size: UInt64 := 0;
+    if FDllSizes.TryGetValue(KV.Key, Size) and InRange(KV.Value, Size) then
+      Exit(True);
+  end;
+  EnsureSymInitialized;
+  Result := SymGetModuleBase64(FProcess, VA) <> 0;
+end;
+
 function TWinDebugger.IsPlausibleReturnAddress(VA: UInt64): Boolean;
 begin
   if VA = 0 then
     Exit(False);
-  EnsureSymInitialized;
-  if SymGetModuleBase64(FProcess, VA) = 0 then
+  if not AddressInLoadedModule(VA) then
     Exit(False);
   Result := AddressIsExecutable(VA);
 end;
@@ -1881,6 +1956,7 @@ begin
   FProcessId := Ev.dwProcessId;
   FMainTid   := Ev.dwThreadId;  // primary thread -- retargeted-to on pause (F1)
   FImageBase := UInt64(Ev.CreateProcessInfo.lpBaseOfImage);
+  FImageSize := ReadImageSizeOf(FImageBase);
   FThreads.AddOrSetValue(Ev.dwThreadId, Ev.CreateProcessInfo.hThread);
   FRunning := True;
   // Per the debug-event contract the receiver owns hFile and must close it
@@ -2001,12 +2077,8 @@ var
   Name, Path: string;
   Buf: array[0..MAX_PATH - 1] of Char;
   PathLen: DWORD;
-  E_lfanew: UInt32;
-  SizeOfImage: UInt32;
-  R: SIZE_T;
 begin
   Base      := UInt64(Ev.LoadDll.lpBaseOfDll);
-  ImageSize := 0;
   Name      := '';
   Path      := '';
 
@@ -2021,15 +2093,7 @@ begin
     CloseHandle(Ev.LoadDll.hFile);
   end;
 
-  // Read SizeOfImage from the PE header in the mapped image
-  E_lfanew := 0;
-  if (Base > 0) and
-     ReadProcessMemory(FProcess, Pointer(Base + $3C), @E_lfanew, 4, R) and (R = 4) then begin
-    SizeOfImage := 0;
-    if ReadProcessMemory(FProcess, Pointer(Base + E_lfanew + $50), @SizeOfImage, 4, R) and
-       (R = 4) then
-      ImageSize := SizeOfImage;
-  end;
+  ImageSize := ReadImageSizeOf(Base);
 
   // dbghelp must learn about this module too, not just our own MAP/RSM/TD32
   // loader: StackWalk64 reads its unwind info through dbghelp's module list.
@@ -2856,6 +2920,7 @@ begin
     if SF.AddrPC.Offset = 0 then
       Break;
     var Raw: TRawStackFrame;
+    Raw.Origin := foDbgHelpWhole;
     Raw.PC := SF.AddrPC.Offset;
     // StackWalk64 updates Ctx to the unwound register state for THIS frame;
     // Ctx.Rbp is the frame's actual RBP, which the BPREL local / param offset
@@ -2950,6 +3015,7 @@ begin
     if (not TargetLayout.Is64Bit) and (Frame.IP > $FFFFFFFF) then
       Break;
     Frame.FrameRBP := Raw.FramePtr;
+    Frame.Origin   := Raw.Origin;
     // Frame.IP, not the walker's raw PC: frame 0 was just re-anchored to the
     // thread's live PC above, and symbolication has to follow the corrected
     // address or it resolves the walker's bad one.
@@ -2990,6 +3056,7 @@ begin
     Frame := Default(TStackFrame);
     Frame.IP       := SeedRip;
     Frame.FrameRBP := SeedRbp;
+    Frame.Origin   := foSynthesizedSeed;
     var Rva0 := VAToRva(SeedRip);
     if FDebugInfo.RvaToSourceLine(Rva0, Loc) then begin
       Frame.SourceFile := Loc.SourceFile;

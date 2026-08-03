@@ -83,6 +83,10 @@ type
 
 implementation
 
+uses
+  System.SysUtils,
+  DapProtocol;   // DapLog: why a candidate frame was refused
+
 { ------------------------------------------------------------ architecture -- }
 
 function TWin32Debugger.TargetLayout: TTargetLayout;
@@ -374,6 +378,7 @@ const
       end;
 
       var Raw: TRawStackFrame;
+      Raw.Origin := foFramelessRecover;
       Raw.PC := Found;
       // The missing routine IS framed -- it is its callee that was not -- and
       // the frame pointer the chain attributed to the frameless entry is in
@@ -381,6 +386,73 @@ const
       Raw.FramePtr := Here.FramePtr;
       System.Insert([Raw], Result, I + 1);
       Inc(I, 2);
+    end;
+  end;
+
+  // Appends dbghelp frames Src[FromIndex..], stopping at the first one that
+  // fails validation.
+  //
+  // BOTH places that consume dbghelp go through here, and that is the point.
+  // The checks used to live only in the tail splice, so the OTHER consumer --
+  // the "chain produced nothing, take dbghelp's whole answer" path below --
+  // copied its output verbatim, unvalidated. Measured on Hydra2 with the frame
+  // origin instrumented: the impossible `frmLogModificheVegaU.pas:148` frame
+  // came out of that path (`origin=dbghelp-whole`), which is why three fixes
+  // aimed at the chain walk and at the tail splice all changed nothing. A rule
+  // that only one of two callers obeys is not a rule.
+  procedure AppendDbgHelpFrames(const Src: TArray<TRawStackFrame>;
+    FromIndex: Integer; Origin: TFrameOrigin);
+
+    // A stack that stops early looks exactly like a stack that ended, so say
+    // WHICH test refused the next frame. Without this the two are
+    // indistinguishable from the outside, and the last three attempts at this
+    // walker were spent guessing between them.
+    procedure Refuse(PC: UInt64; const Test: string);
+    begin
+      DapLog(Format('WalkRawFrames(x86): dbghelp frame $%x refused by %s; ' +
+        'stack ends at %d frames', [PC, Test, Length(Result)]));
+    end;
+
+  begin
+    for var I := FromIndex to High(Src) do begin
+      if Length(Result) >= MaxFrames then
+        Break;
+      var Cand := Src[I];
+      if (Cand.PC = 0) or (Cand.PC > $FFFFFFFF) then begin
+        Refuse(Cand.PC, 'address width');
+        Break;
+      end;
+      if not IsPlausibleReturnAddress(Cand.PC) then begin
+        Refuse(Cand.PC, 'not executable code in a known module');
+        Break;
+      end;
+      // "Executable code in a known module" is not the same claim as "a return
+      // address", and dbghelp's i386 unwind supplies the difference. Measured
+      // on a real BPL-loading application: below three kernel32/ntdll frames it
+      // offered `frmLogModificheVegaU.pas:148`, which is impossible --
+      // application code cannot call the OS thread starter. Decoding says why:
+      // that address is a function ENTRY, and the byte before it is `C3`, a
+      // `ret`.
+      //
+      // Only a PROVEN negative stops the walk. The OS frames themselves carry
+      // no line table, so no boundary is available to decode from and the
+      // verdict is undecidable -- those are kept, which is what preserves the
+      // legitimate kernel32/ntdll tail.
+      case CallSiteVerdict(Cand.PC) of
+        csaNo: begin
+          Refuse(Cand.PC, 'proven not preceded by a call');
+          Break;
+        end;
+        csaUndecidable:
+          // Kept, but say so: this is the only class of frame in the tail that
+          // rests on an absence of evidence rather than on evidence.
+          DapLog(Format('WalkRawFrames(x86): dbghelp frame $%x kept UNPROVEN ' +
+            '(no instruction boundary to decode from)', [Cand.PC]));
+      end;
+      if (Cand.FramePtr > $FFFFFFFF) or ((Cand.FramePtr and 3) <> 0) then
+        Cand.FramePtr := 0;   // unknown, which the locals decode already handles
+      Cand.Origin := Origin;
+      Result := Result + [Cand];
     end;
   end;
 
@@ -404,6 +476,7 @@ const
       if not IsPlausibleNextFramePtr(Fp, NextFp) then
         Break;
       var Raw: TRawStackFrame;
+      Raw.Origin   := foEbpChain;
       Raw.PC       := Ret;
       Raw.FramePtr := NextFp;
       Result := Result + [Raw];
@@ -417,6 +490,7 @@ begin
     Exit;
 
   var Frame0: TRawStackFrame;
+  Frame0.Origin   := foSeed;
   Frame0.PC       := SeedPc;
   Frame0.FramePtr := SeedFp;
   Result := [Frame0];
@@ -446,6 +520,7 @@ begin
       if not IsPlausibleReturnAddress(Ret) or not IsAfterCallSite(Ret) then
         Continue;
       var Raw: TRawStackFrame;
+      Raw.Origin   := foPrologueProbe;
       Raw.PC       := Ret;
       Raw.FramePtr := SeedFp;
       Result := Result + [Raw];
@@ -463,12 +538,16 @@ begin
   // the chain already vouched for.
   RecoverFramelessCallers;
 
-  // Still nothing to chain from: frame 0 is in frameless code. dbghelp may have
-  // something; take its answer when it is richer.
+  // Still nothing to chain from: frame 0 is in frameless code, or its caller is
+  // -- which is the normal shape for a stop in a program's main block, whose
+  // caller is the RTL/OS startup. dbghelp may have something; append it to the
+  // seed frame we already hold, through the same validation the tail splice
+  // uses. Replacing Result wholesale with dbghelp's array (what this did) let
+  // its unwind emit whatever it liked, checked by nothing.
   if Length(Result) < 2 then begin
-    var ViaDbgHelp := inherited WalkRawFrames(TH, SeedPc, SeedSp, SeedFp, MaxFrames);
-    if Length(ViaDbgHelp) > Length(Result) then
-      Result := ViaDbgHelp;
+    AppendDbgHelpFrames(
+      inherited WalkRawFrames(TH, SeedPc, SeedSp, SeedFp, MaxFrames),
+      1, foDbgHelpWhole);
     Exit;
   end;
 
@@ -507,31 +586,7 @@ begin
     end;
   if JoinAt < 0 then
     Exit;   // no verified join: leave the stack short rather than guess a tail
-  for var I := JoinAt + 1 to High(Full) do begin
-    var Cand := Full[I];
-    if (Cand.PC = 0) or (Cand.PC > $FFFFFFFF) then
-      Break;
-    if not IsPlausibleReturnAddress(Cand.PC) then
-      Break;
-    // "Executable code in a known module" is not the same claim as "a return
-    // address", and dbghelp's i386 tail supplies the difference. Measured on a
-    // real BPL-loading application: below three kernel32/ntdll frames it offered
-    // `frmLogModificheVegaU.pas:148`, which is impossible -- application code
-    // cannot call the OS thread starter. Decoding says why: that address is a
-    // function ENTRY, and the byte before it is `C3`, a `ret`.
-    //
-    // Only a PROVEN negative stops the tail. The OS frames themselves carry no
-    // line table, so no boundary is available to decode from and the verdict is
-    // undecidable -- those are kept, which is what preserves the legitimate
-    // kernel32/ntdll tail.
-    if IsProvenNotAfterCallSite(Cand.PC) then
-      Break;
-    if (Cand.FramePtr > $FFFFFFFF) or ((Cand.FramePtr and 3) <> 0) then
-      Cand.FramePtr := 0;   // unknown, which the locals decode already handles
-    Result := Result + [Cand];
-    if Length(Result) >= MaxFrames then
-      Break;
-  end;
+  AppendDbgHelpFrames(Full, JoinAt + 1, foDbgHelpTail);
 end;
 
 // Declines, deliberately.

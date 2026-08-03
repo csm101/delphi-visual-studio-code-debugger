@@ -103,10 +103,6 @@ begin
   FOut := GetStdHandle(STD_OUTPUT_HANDLE);
   InitializeCriticalSection(FOutLock);
   FSeq := 0;
-  GLogPath := GetEnvironmentVariable('TEMP') + '\dap_adapter.log';
-  // Env-var override: DAP_LOG=1 forces logging on regardless of launch.json.
-  if SameText(GetEnvironmentVariable('DAP_LOG'), '1') then
-    GLogEnabled := True;
   DapLog('=== VisualStudioCodeDelphiDebugger started ===');
 end;
 
@@ -250,6 +246,16 @@ end;
 
 initialization
   InitializeCriticalSection(GLogLock);
+  // Where the log goes, and whether it is on, belong to the UNIT, not to
+  // TDapIO. They used to be set in that constructor, which meant every
+  // consumer of the engine that is not the DAP server -- the DevTools probes,
+  // the test runner, the MCP server -- had GLogPath = '', so DapLog silently
+  // wrote nowhere even when explicitly enabled. Diagnostics that vanish
+  // depending on which frontend is running are worse than none.
+  GLogPath := GetEnvironmentVariable('TEMP') + '\dap_adapter.log';
+  // Env-var override: DAP_LOG=1 forces logging on regardless of launch.json.
+  if SameText(GetEnvironmentVariable('DAP_LOG'), '1') then
+    GLogEnabled := True;
 
 finalization
   if GLogHandle <> INVALID_HANDLE_VALUE then

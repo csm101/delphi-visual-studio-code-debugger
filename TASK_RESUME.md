@@ -214,6 +214,42 @@ number. Assume any remaining one is currently invisible.
 
 ### CURRENT CURSOR
 
+**2026-08-03 -- the x86 Delphi/OS stack boundary, both halves. Suite 1022 /
+1018 passed / 0 failed / 4 ignored.**
+
+Started by instrumenting frame PROVENANCE (`TFrameOrigin` on every frame,
+printed by `LiveSessionProbe` as `origin=`) instead of adding a fourth rule to a
+model that had been wrong three times. One Hydra2 run then named the producer
+immediately: `origin=dbghelp-whole`.
+
+What that exposed, in order:
+
+1. The "chain produced nothing, take dbghelp's answer" path replaced the frame
+   array WHOLESALE, unvalidated. The validation lived only in the tail splice.
+   Both now go through `AppendDbgHelpFrames`.
+2. With that closed the stack lost its OS tail entirely, and the refusal log
+   said why: `IsPlausibleReturnAddress` asked dbghelp for the module of
+   `$75925D49` (32-bit kernel32) and dbghelp claims none on a WOW64 target. It
+   now asks the debugger's own module table, built from the debug events. This
+   is what the file used to call an inherent i386 limitation -- see the
+   correction further down.
+3. The fabricated frame then came back via the tail splice, `kept UNPROVEN`.
+   `NearestInstructionBoundaryBefore` anchored on the routine containing the
+   candidate, which has no boundary before it when the candidate IS an entry.
+   Anchored on the routine containing the byte BEFORE it, the decode lands on
+   the target and proves `ret`, not `call`.
+
+Final Hydra2 stack: main block <- kernel32 <- ntdll <- ntdll, and it stops.
+
+Test: `Win32_CallStack_ReachesTheOsFramesAndEndsThere`. Verified by temporarily
+reverting each fix -- the truncation half FAILS the fixture without its fix; the
+fabrication half does NOT reproduce there (it needs a stale stack word landing
+exactly on a function entry) and is guarded, not proven, by the suite.
+
+Also fixed on the way: `GLogPath` was set in `TDapIO.Create`, so `DapLog` wrote
+nowhere for every non-DAP consumer of the engine (probes, tests, MCP) even with
+`DAP_LOG=1`. Moved to unit initialization.
+
 Unattended bug-hunting run (2026-08-01), driving both bitnesses through
 `DevTools\LiveSessionProbe` against TestTarget and comparing x64 vs x86 answer
 by answer. Six defects found, each measured before it was touched, each closed
@@ -2942,15 +2978,24 @@ and may connect to a production database; that is not a side effect to cause
 unattended. The 497 MB `Hydra2SingleEXE.exe` is used for STATIC validation
 instead, which is safe and is what surfaced the AVX gap.
 
-### Known limitation confirmed, not a defect
+### A "known limitation" that was a defect -- CORRECTED 2026-08-03
 
-On x86 a stack truncates at the last FRAMED Delphi routine when the caller chain
-runs into VCL/RTL code built without frame pointers -- measured:
-`LeggiCollegamentoVegaRest <- TfrmMain.Create` and nothing above. There is no
-unwind data on i386, and scanning for return addresses cannot distinguish a LIVE
-one from a stale one left on the stack; the exact call-site test proves "this IS
-a return address", not "this is on the current chain". Stopping is the correct
-answer, and inventing the tail is the one thing that must not happen.
+Recorded here earlier: "on x86 a stack truncates at the last FRAMED Delphi
+routine when the caller chain runs into VCL/RTL code built without frame
+pointers", with the reasoning that i386 has no unwind data and stopping is the
+correct answer.
+
+The reasoning was sound and the conclusion was wrong. The stack stopped there
+because `IsPlausibleReturnAddress` asked **dbghelp** whether the address belonged
+to a module, and on a WOW64 target dbghelp claims no module for the 32-bit
+`kernel32`/`ntdll`. Every OS return address was refused, so the walk ended at the
+Delphi/OS boundary and the truncation looked structural. Asking the debugger's
+own module table -- built from the debug events, complete by construction -- the
+EBP chain walks through the OS frames unaided.
+
+Lesson worth keeping: an explanation that fits the evidence is not the same as a
+measurement. This one survived because nothing ever asked WHY a specific frame
+was refused, which is why the walker now logs the refusing test by name.
 ### Earlier this session
 
 `X86Decode.pas` — a 32-bit instruction-length decoder — plus `X86DecodeProbe`

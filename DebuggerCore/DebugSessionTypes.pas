@@ -13,9 +13,10 @@ unit DebugSessionTypes;
 // Handles are opaque (TVarHandle): a frontend passes them back verbatim to
 // expand a variable; it must never treat one as a raw address or a DAP int.
 //
-// The only real type reused here is TStopReason (from DebugTarget) so a stop
-// event carries the same reason enum the engine already produces. DebugTarget
-// does not depend on this unit, so no cycle is introduced.
+// The only real types reused here are TStopReason and TFrameOrigin (from
+// DebugTarget), so a stop event carries the same reason enum the engine already
+// produces and a frame keeps the engine's own record of which unwind mechanism
+// built it. DebugTarget does not depend on this unit, so no cycle is introduced.
 
 interface
 
@@ -84,6 +85,10 @@ type
     // locals/evaluate on this frame via TDebugSession.SelectFrame(Index).
     FrameRBP:     UInt64;   // this frame's RBP (for BPREL local/param decode)
     FuncEntryVA:  UInt64;   // VA of the frame's function entry (prolog read)
+    // Which unwind mechanism produced this frame. Diagnostic: a stack is
+    // assembled by several of them and a wrong frame is indistinguishable from a
+    // right one, so this is what makes "who emitted it?" answerable.
+    Origin:       TFrameOrigin;
   end;
 
   TSessionVariable = record

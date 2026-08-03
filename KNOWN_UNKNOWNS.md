@@ -677,53 +677,6 @@ channel; `TDebugSession.OnConsole` would be the sink).
 - **`%TEMP%\dap_adapter.log` opt-in** — currently always-on. No
   configuration knob in the launch schema yet.
 
-## A fabricated frame at the end of an x86 stack — OPEN, well measured
-
-Seen on every Hydra2 run (real BPL-loading application, 32-bit). Below the OS
-frames the stack carries one more:
-
-    #3  Hydra2                  Hydra2.dpr:164   [hydra2.exe]  ip=0045CEA5 entry=0045CCB0
-    #4  <no name>                                [kernel32.dll]
-    #5  <no name>                                [ntdll.dll]
-    #6  <no name>                                [ntdll.dll]
-    #7  frmLogModificheVegaU    ...:148          [hydra2.exe]  ip=0045CCB0 entry=0045CC98
-
-Application code cannot be the caller of the OS thread starter, so #7 is not
-real. What it actually is, from the bytes:
-
-    0005CCA9  E8 F6 56 FA FF   call ...
-    0005CCAE  5D               pop ebp
-    0005CCAF  C3               ret
-    0005CCB0  55 8B EC ...     push ebp      <- the address offered
-
-`$5CCB0` is the ENTRY of the program's main block, preceded by a `ret`.
-
-MEASURED FACTS, each of which killed a plausible fix:
-
-  * The same address gets TWO different owners. Frame #3, whose IP is deeper
-    inside the main block, reports `entry=0045CCB0`; frame #7, whose IP IS
-    `$45CCB0`, reports `entry=0045CC98` -- the PRECEDING routine. So every check
-    of the form "is this address a function entry" fails exactly at an entry.
-  * TD32 does know the routine: `Td32ProcNesting` lists `LPROC32 rva=$5CCB0
-    name=@Hydra2`. So the `$5CC98` answer comes from a different provider (there
-    is no `Hydra2.map`; the providers are TD32 and RSM), and which one answers
-    decides the result.
-  * Clamping TD32 proc ranges to the next routine's start -- two routines cannot
-    overlap -- changed nothing, consistent with the answer not coming from TD32.
-    Reverted.
-  * Requiring a PROVEN "not after a call" in the chain walk, and rejecting a PC
-    equal to its own function entry, both changed nothing either. Reverted.
-
-That last point is the important one: those rules SHOULD have fired for this
-address, and did not. So the frame is produced by a path that has not been
-identified -- not the chain walk, not the dbghelp tail splice as currently
-understood. INSTRUMENT THAT FIRST next time, instead of adding another rule on
-top of a model that has now been wrong three times.
-
-NOTE on `47ee202`: that commit added the proven-negative check to the dbghelp
-tail and cited this frame as its motivation. The check is sound on its own terms
-but it does NOT remove this frame, and the commit message overstates it.
-
 ## Win32 targets — what is still open
 
 32-bit targets are implemented (launch, breakpoints, stepping, stack, locals,
