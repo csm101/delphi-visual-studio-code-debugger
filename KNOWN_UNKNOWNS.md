@@ -1361,6 +1361,39 @@ bytes→expected type dumper, per-unit import dumps for a single unit and for al
 units (the latter with no-truncation resync), a `$08` TypeInfo enumeration, and a
 stall finder that locates the import-parse stall offset + bytes.
 
+## Live MCP findings — triage 2026-08-03
+
+`MCP_LIVE_FINDINGS_TODO.md` is a LOCAL working file (`.gitignore:71`), so its
+checkboxes never reach the repository. Conclusions that outlive the
+investigation belong here instead.
+
+- **F22, `list_breakpoints` reporting `verified:false` for planted, firing
+  breakpoints — ALREADY FIXED.** `NotifyBreakpointFlips` writes the recomputed
+  state back through `StoreVerifiedState` into the records `ListBreakpoints`
+  returns, in both directions, so a module unload cannot leave a client
+  believing a breakpoint is still live. Guarded by
+  `Bpl_ListBreakpoints_ReportsVerified_AfterPackageLoads`. Only the local
+  checkbox was stale.
+
+- **F16, `get_locals` disagreeing with `evaluate` on an `on E:` local — DOES NOT
+  REPRODUCE.** Re-measured on the clean repro the note asked for
+  (`--run-exception-handler`, stopped INSIDE the handler at `{BP:EXC_HANDLER}`),
+  both bitnesses: the two paths agree exactly — same address, same type,
+  expandable. The original observation was taken at the FIRST-CHANCE stop, which
+  is on the `raise` line where `E` is not yet assigned, so both paths were
+  reading an unassigned slot and disagreeing about garbage.
+
+  Checked while there, because that uninitialised read declared a string of
+  15 144 541 characters: `TDelphiValueReader` caps the read at `MAX_LEN = 4096`
+  and appends `…(N chars total)`. A bogus length is not trusted. Correct as
+  designed, recorded because a garbage length is precisely where an unbounded
+  read would bite.
+
+Still open there, unchanged and all low: F5 (opaque pointer fields show an empty
+type, deferred), F21 (`detach_debugger` on a LAUNCHED session terminates instead
+of refusing), F23 (after ATTACH, already-mapped modules are not symbolicated
+until something forces a load — visibility fixed, root cause deliberately not).
+
 ## A one-off suite failure that would not reproduce — OPEN, and deliberately not closed
 
 `TDebuggerTestsBpl.Test_RtlStringGetter_VarOutFromPropertyType` failed once,
