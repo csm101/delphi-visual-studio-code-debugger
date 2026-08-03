@@ -478,6 +478,12 @@ type
     property  OnBpHit:        TOnBpHit       read GetOnBpHit       write SetOnBpHit;
   end;
 
+// Removes locals that share a frame address with another local, because two
+// distinct STACK locals in one frame cannot. Register-allocated locals are
+// exempt. Exposed so the rule is testable without a live process.
+function DropAddressCollisions(const Values: TArray<TLocalValue>;
+  out Dropped: Integer): TArray<TLocalValue>;
+
 implementation
 
 { DbgHelp bindings for StackWalk64 }
@@ -4888,6 +4894,45 @@ end;
 //   FuncEntryVA - VA of the procedure's first instruction (to read the prolog)
 //   FuncName    - simple name used to look up locals in debug info
 //   NamePrefix  - optional string prepended to each local's name (e.g. parent.)
+// Two distinct STACK locals in one frame cannot share an address. When they do,
+// the location data is not real and every one of them reads the same bytes --
+// so the values are not merely imprecise, they are fabricated, and they arrive
+// with plausible names and types and nothing marking them wrong.
+//
+// Measured on a 505 MB single-exe build of a real application: stopped in the
+// program's MAIN BLOCK, TD32 had no entry for it and RSM's by-name lookup
+// answered with 23 locals belonging to an unrelated JSON/RTTI routine, 22 of
+// them carrying neither a frame offset nor a register. All 22 rendered the
+// saved frame pointer as their value.
+//
+// Colliding entries are dropped rather than the whole set: an entry with a
+// unique address may well be genuine -- the 23rd, at offset -4, was. Which
+// member of a colliding group is the real one is not knowable, so none of them
+// is kept. REGISTER-allocated locals are exempt: their value is not on the
+// frame at all, so sharing a frame address says nothing about them.
+//
+// A free function so the rule can be tested on its own, without a live process.
+function DropAddressCollisions(const Values: TArray<TLocalValue>;
+  out Dropped: Integer): TArray<TLocalValue>;
+begin
+  Result  := nil;
+  Dropped := 0;
+  for var I := 0 to High(Values) do begin
+    var Collides := False;
+    if Values[I].RegId = 0 then
+      for var J := 0 to High(Values) do
+        if (J <> I) and (Values[J].RegId = 0) and
+           (Values[J].Address = Values[I].Address) then begin
+          Collides := True;
+          Break;
+        end;
+    if Collides then
+      Inc(Dropped)
+    else
+      Result := Result + [Values[I]];
+  end;
+end;
+
 function TWinDebugger.CollectLocalsForFrame(FrameRBP: UInt64;
   FuncEntryVA: UInt64; const FuncName, NamePrefix: string;
   FramePcRva: UInt64): TArray<TLocalValue>;
@@ -5110,6 +5155,30 @@ begin
       Result := Result + [V];
       Widths := Widths + [W];
     end;
+  end;
+
+  // Two distinct stack locals in ONE frame cannot share an address. When they
+  // do, the location data is not real and every one of them reads the same
+  // bytes -- so the values are not merely imprecise, they are fabricated.
+  //
+  // Measured on a 505 MB single-exe: stopped in the program's MAIN BLOCK, TD32
+  // had no entry for it and RSM's by-name lookup returned 23 locals belonging
+  // to an unrelated JSON/RTTI routine, 22 of them with neither a frame offset
+  // nor a register. All 22 rendered the saved frame pointer as their value,
+  // with plausible names and types and nothing marking them wrong.
+  //
+  // Colliding entries are dropped rather than the whole set: an entry with a
+  // unique address may well be genuine (the 23rd, at offset -4, was). Which
+  // member of a colliding group is the real one is not knowable, so none is
+  // kept. Register-allocated locals are exempt -- their value is not on the
+  // frame, so sharing offset 0 says nothing about them.
+  var Dropped := 0;
+  var Kept := DropAddressCollisions(Result, Dropped);
+  if Dropped > 0 then begin
+    DapLog(Format('CollectLocalsForFrame("%s"): dropped %d of %d local(s) sharing ' +
+      'a frame address -- the debug info gave them no distinct location',
+      [FuncName, Dropped, Length(Result)]));
+    Result := Kept;
   end;
 end;
 

@@ -18,6 +18,10 @@ type
     // (e.g. TBorderWidth = 0..MaxInt) is read as 8 bytes, so the high dword holds
     // the ADJACENT field's bytes. The formatter must mask it down to its storage
     // width instead of printing the corrupted 64-bit value.
+    // Locals that share a frame address are fabricated: two distinct stack
+    // locals cannot occupy one address, and in the field 22 of them rendered
+    // the saved frame pointer as their value with plausible names and types.
+    [Test] procedure CollidingLocals_AreDropped_UniqueAndRegisterOnesKept;
     [Test] procedure UnknownOrdinalSubrange_MasksHighDword;
     // Guard: a genuine 64-bit type (matched by name) must still show all 8 bytes.
     [Test] procedure Int64ByName_KeepsAllEightBytes;
@@ -69,7 +73,7 @@ implementation
 uses
   System.SysUtils, Winapi.Windows,
   DebugInfoTypes, DebugTarget, DebugInfoSet, DelphiValueReaders, ExceptionRules,
-  ValueEncoders, TargetLayout;
+  ValueEncoders, TargetLayout, WinDebuggerBase;
 
 type
   // Minimal IDebugTarget fake: only ReadProcessMemoryAt is live, serving a fixed
@@ -257,6 +261,51 @@ function  TFakeMemTarget.GetOnDllUnloaded: TOnDllUnloaded; begin Result := FOnDl
 procedure TFakeMemTarget.SetOnDllUnloaded(const Value: TOnDllUnloaded); begin FOnDllUnloaded := Value; end;
 function  TFakeMemTarget.GetOnBpHit: TOnBpHit; begin Result := FOnBpHit; end;
 procedure TFakeMemTarget.SetOnBpHit(const Value: TOnBpHit); begin FOnBpHit := Value; end;
+
+procedure TValueReaderTests.CollidingLocals_AreDropped_UniqueAndRegisterOnesKept;
+
+  function MakeLocal(const Name: string; Addr: UInt64; Reg: Word): TLocalValue;
+  begin
+    Result         := Default(TLocalValue);
+    Result.Name    := Name;
+    Result.Address := Addr;
+    Result.RegId   := Reg;
+  end;
+
+begin
+  // The measured shape: a set of stack locals all landing on one address
+  // (the debug info gave them no location at all), one genuine local at its
+  // own address, and a register-allocated local which legitimately carries no
+  // frame address and must survive.
+  var Input: TArray<TLocalValue> := [
+    MakeLocal('bogusA',  $1F6FF8B0, 0),
+    MakeLocal('bogusB',  $1F6FF8B0, 0),
+    MakeLocal('bogusC',  $1F6FF8B0, 0),
+    MakeLocal('genuine', $1F6FF8AC, 0),
+    MakeLocal('inEax',   0,         1),
+    MakeLocal('inEdx',   0,         2)];
+
+  var Dropped := -1;
+  var Kept := DropAddressCollisions(Input, Dropped);
+
+  Assert.AreEqual(3, Dropped, 'the three colliding stack locals must be dropped');
+  Assert.AreEqual(3, Integer(Length(Kept)),
+    'genuine + the two register locals must remain');
+
+  var Names := '';
+  for var K in Kept do
+    Names := Names + K.Name + ' ';
+  Assert.IsTrue(Names.Contains('genuine'),
+    'a local with its own address is not a collision: ' + Names);
+  // Register locals share address 0 with each other, which says nothing about
+  // them -- their value is not on the frame. Dropping them would delete every
+  // register-allocated variable in an optimised build.
+  Assert.IsTrue(Names.Contains('inEax') and Names.Contains('inEdx'),
+    'register-allocated locals must be exempt from the address test: ' + Names);
+  Assert.IsFalse(Names.Contains('bogus'),
+    'no member of a colliding group may be kept -- which one is real is not ' +
+    'knowable: ' + Names);
+end;
 
 procedure TValueReaderTests.UnknownOrdinalSubrange_MasksHighDword;
 begin
