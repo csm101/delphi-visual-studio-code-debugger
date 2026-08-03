@@ -245,6 +245,10 @@ type
     // symbol and got read as data -- a number about an object that has no such
     // member.
     [Test] procedure MemberLookup_DoesNotFallBackToAGlobalOnBothBitnesses;
+    // The locals reader labels an object with the class its VMT says it IS; the
+    // evaluate path labelled it with the DECLARED type. Same object, two
+    // answers, and nothing on screen to say which one to believe.
+    [Test] procedure EvaluateNamesTheClassTheObjectIsOnBothBitnesses;
     // Delphi's LEXICAL scoping: standing in a nested procedure, the enclosing
     // routine's variables are reachable by bare name. On Win32 the entire
     // parent scope was missing -- the locals list showed only the nested
@@ -4240,6 +4244,52 @@ begin
   Assert.AreEqual('', Failures,
     'a nested procedure must see its enclosing routine''s variables on both ' +
     'bitnesses -- ' + Failures);
+end;
+
+procedure TWin32RunControlTests.EvaluateNamesTheClassTheObjectIsOnBothBitnesses;
+const
+  SOURCE = 'TestTargetTypes.pas';
+  MARKER = 'COLLECTIONS_BODY';
+  // `ArrObj` is declared `TArray<TBase>` and holds `TDerivedA` instances, so the
+  // declared type and the runtime class differ -- which is the whole point.
+
+  function EvaluateLabelAt(const Exe, Map, Rsm: string; Line: Integer): string;
+  begin
+    var Session := OpenSessionAtMarker(Exe, Map, Rsm, TargetDir, SOURCE, Line);
+    try
+      if Session.State <> dsStopped then
+        Exit('<did not stop>');
+      var R := Session.Evaluate('ArrObj[0]');
+      if not R.Success then
+        Exit('<' + R.ErrorText + '>');
+      Result := R.Value;
+    finally
+      Session.Free;
+    end;
+  end;
+
+begin
+  var Line := MarkerLineInFile(TargetDir + SOURCE, MARKER);
+  Assert.IsTrue(Line > 0, 'marker ' + MARKER + ' not found');
+  Assert.IsTrue(FileExists(Win64Exe), '64-bit control target missing');
+
+  // An object must be labelled with the class its VMT says it IS. Showing the
+  // DECLARED type instead is not a smaller answer, it is a wrong one: it states
+  // that the object is a TBase.
+  var Failures := '';
+  var Got64 := EvaluateLabelAt(Win64Exe, Win64Map, Win64Rsm, Line);
+  if not Got64.Contains('TDerivedA') then
+    Failures := Failures + Format('x64 -> %s; ', [Got64]);
+  var Got32 := EvaluateLabelAt(Win32Exe, Win32Map, Win32Rsm, Line);
+  if not Got32.Contains('TDerivedA') then
+    Failures := Failures + Format('x86 -> %s; ', [Got32]);
+
+  // Measured on Hydra2 before the fix: `AOwner`, declared TComponent and holding
+  // the TApplication, read `(TApplication)` in the locals pane and
+  // `(TComponent)` from evaluate -- the same object, two answers, and nothing on
+  // screen to say which one to believe.
+  Assert.AreEqual('', Failures,
+    'evaluate must name the runtime class, not the declared one -- ' + Failures);
 end;
 
 procedure TWin32RunControlTests.MemberLookup_DoesNotFallBackToAGlobalOnBothBitnesses;

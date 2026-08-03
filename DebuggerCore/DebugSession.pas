@@ -2066,10 +2066,28 @@ begin
           DisplayAddr := Val.RawValue
         else
           DisplayAddr := Val.Address;
+        // Which class to NAME. The locals reader labels an object with the class
+        // its VMT says it IS (FormatTyped prefers the runtime name over the
+        // declared one), and this path labelled it with the DECLARED type, so
+        // the same object read differently depending on which pane asked.
+        // Measured on Hydra2: `AOwner`, declared TComponent and holding the
+        // TApplication, was `(TApplication)` in locals and `(TComponent)` from
+        // evaluate.
+        //
+        // Only the LABEL changes. Result.TypeName keeps the declared type and
+        // the expansion is still minted from it, so member resolution cannot
+        // start depending on whether a runtime class happens to be covered by
+        // the loaded debug info.
+        var DisplayType := Val.TypeHint;
+        if IsClassInst then begin
+          var RuntimeClass := FRtti.GetInstanceClassName(Val.RawValue);
+          if RuntimeClass <> '' then
+            DisplayType := RuntimeClass;
+        end;
         if (Kind = TK_CLASS) and (Val.RawValue = 0) then
-          Display := Format('nil (%s)', [Val.TypeHint])
+          Display := Format('nil (%s)', [DisplayType])
         else
-          Display := Format('$%x (%s)', [DisplayAddr, Val.TypeHint]);
+          Display := Format('$%x (%s)', [DisplayAddr, DisplayType]);
         if (DisplayAddr >= 65536) and (HasMembers or IsClassInst) then
           ExpHandle := FExpander.MakeClassExpansion(DisplayAddr, Val.TypeHint, Expr);
       end;
