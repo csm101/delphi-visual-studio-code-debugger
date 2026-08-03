@@ -212,6 +212,53 @@ The corollary that matters more than the count: **a wrong pointer width rarely
 fails loudly.** Three of the four degraded into a fallback or a plausible
 number. Assume any remaining one is currently invisible.
 
+### PENDING DELIVERABLE (requested 2026-08-03, AFTER the development work)
+
+A comparison document for anyone trying the debugger: **what works against a
+monolithic exe built entirely with debug info, versus an application that loads
+runtime packages, some of which carry none.** The maintainer's point is that
+this is the first thing a new user needs, because the second shape is the one
+that degrades and today nothing states how.
+
+Do NOT hand-write it from memory. The material is already measured:
+
+- the suite runs three scenarios -- mono, BPL, and NO_RSM -- so per-feature
+  support is derivable from which tests are un-gated in each (`TEST_CATALOG.md`,
+  and the `SkipIfBpl` / `SkipIfNoRsm` gates);
+- the live Hydra2 runs cover the multi-package shape with real packages that
+  have no debug info (vcl290.bpl), including what degrades: unresolvable
+  globals, `<not found>` for VCL symbols, mangled constructor names without a
+  MAP;
+- `get_loaded_modules` reports per-module symbol state and formats, which is
+  exactly the axis the document is organised around.
+
+Structure it as a capability matrix (breakpoints, stepping, call stack, locals,
+object expansion, evaluate, synthetic calls, raw stack scan) x (mono / packages
+with debug info / packages without), each cell backed by a test name or a
+measured run rather than an assertion.
+
+THIRD AXIS, requested 2026-08-03: **32-bit vs 64-bit**, and it is not a cosmetic
+column — the axes interact, and the differences are already measured:
+
+- raw stack scan: every hit is `proven:false` on x64, because the call-site
+  proof needs an instruction-length decoder the engine has only for x86. Same
+  feature, different guarantee;
+- stack walk: x64 unwinds from `.pdata`, x86 has no unwind data at all and
+  chains EBP -- so the two degrade differently, not just at different rates;
+- names: dcc32 qualifies every type name with its unit and dcc64 does not, and
+  dcc64 did not emit the class-nested type into the fixture's table at all;
+- x86-only display wart: a generic renders as `%TList__1` rather than
+  `TList<System.Integer>` (type and expansion are correct);
+- `-$O+` locals on 32-bit: never measured.
+
+Much of this is derivable rather than re-measured: `TWin32RunControlTests`
+already compares x86 against x64 answer-by-answer on the same markers.
+
+RULE FOR THE DOCUMENT: a cell that has not been measured is left EXPLICITLY
+blank ("not verified"), never filled in by symmetry with its neighbour. The
+reader is deciding whether to trust the tool; an invented cell costs more than a
+missing one.
+
 ### CURRENT CURSOR
 
 **2026-08-03 -- the nested-enum wrong answer is CLOSED. Suite 1032 / 1028

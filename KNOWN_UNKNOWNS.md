@@ -1361,6 +1361,30 @@ bytes→expected type dumper, per-unit import dumps for a single unit and for al
 units (the latter with no-truncation resync), a `$08` TypeInfo enumeration, and a
 stall finder that locates the import-parse stall offset + bytes.
 
+## A one-off suite failure that would not reproduce — OPEN, and deliberately not closed
+
+`TDebuggerTestsBpl.Test_RtlStringGetter_VarOutFromPropertyType` failed once,
+during an ordinary full-suite run, with:
+
+    SL.Text ... got: <TStrings.GetTextStr not found>
+
+Hunted 2026-08-03 and NOT reproduced: 10 consecutive runs of that test in
+isolation, then 3 consecutive full-suite runs, all clean (13 attempts).
+
+Isolation passing is itself informative — it says the trigger is not in the
+test but in the surrounding load. The message points at symbol INDEXING rather
+than at the var-out ABI the test is about: an RTL symbol was absent at the
+moment `evaluate` asked for it, in the BPL scenario, on the request right after
+a stop. That is the same signature that got the background prefetcher shipped
+disabled (see "PARTIAL: background symbol PREFETCH" in `TASK_RESUME.md`), and
+`GetStackFrames` already refuses to cache a walk taken while
+`AnyBackgroundIndexingPending` — the evaluate path has no equivalent guard.
+
+Left open on purpose. A flake that cannot be reproduced is not a flake that has
+been fixed, and writing it off as noise is how it comes back as a field report.
+Next step when it recurs: capture `%TEMP%\dap_adapter.log` from the failing run
+-- the indexing state at that moment is logged -- rather than re-running.
+
 ## Large-project scale (SampleApp / 780 MB RSM)
 
 - **Cold-start scan duration** — MAP and RSM sidecar index files (`.map.idx`,
@@ -1375,6 +1399,17 @@ stall finder that locates the import-parse stall offset + bytes.
 
 ## Process / repo
 
-- **VS Code extension publishing** — currently a manual local copy
-  to `%USERPROFILE%\.vscode\extensions\local.delphi-win64-debug\`.
-  Marketplace publishing path is undecided.
+- **VS Code extension publishing — DECIDED 2026-08-03: stays as it is.**
+  `install\Install.exe` packages a `.vsix` and installs it into every detected
+  editor of the VS Code family (VS Code, Insiders, Cursor, Windsurf, VSCodium,
+  Trae) through that editor's own CLI, falling back to a folder copy when the
+  editor is present but its CLI is not on PATH.
+
+  The Microsoft marketplace would REDUCE reach here, not extend it: Cursor,
+  Windsurf and VSCodium do not pull from it (Open VSX is their registry), and
+  multi-editor support is a requirement rather than a nicety. So this was
+  previously mis-filed as an open production blocker; it is a deliberate choice.
+
+  What it does not provide, and nobody has asked for: automatic updates (users
+  re-run the installer) and hosted distribution of the installer itself
+  (`build_setup_zip.bat` / `make_release.bat` package it).

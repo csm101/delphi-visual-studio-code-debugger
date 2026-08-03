@@ -254,6 +254,12 @@ type
     // the stack -- while marking every result as a raw hit and offering no
     // frame pointer, because a raw hit is a POSITION and not a live frame.
     [Test] procedure RawStackScan_FindsTheChainAndSaysItIsRaw;
+    // `evaluate` must report a local's DECLARED type. RSM mis-resolves type ids
+    // past its import table and once answered `ICounter` with
+    // `TClassHelperBaseClass` (x64) / `TContainedObject` (x86); the variables
+    // view was moved onto TD32 for that reason, but the evaluator was never
+    // measured. It is now, and this pins the result.
+    [Test] procedure EvaluateReportsDeclaredTypesOnBothBitnesses;
     // Delphi's LEXICAL scoping: standing in a nested procedure, the enclosing
     // routine's variables are reachable by bare name. On Win32 the entire
     // parent scope was missing -- the locals list showed only the nested
@@ -4249,6 +4255,68 @@ begin
   Assert.AreEqual('', Failures,
     'a nested procedure must see its enclosing routine''s variables on both ' +
     'bitnesses -- ' + Failures);
+end;
+
+procedure TWin32RunControlTests.EvaluateReportsDeclaredTypesOnBothBitnesses;
+type
+  TTypeCheck = record Expr, Declared: string end;
+const
+  SOURCE = 'TestTargetTypes.pas';
+  MARKER = 'TYPES_BODY';
+  // One per shape the RSM typeId defect was measured to corrupt: interfaces,
+  // method/anon pointers, class references, generics, typed pointers, records
+  // and the RTL value types. `Declared` is the source declaration, matched as a
+  // SUBSTRING so an instantiated generic name (`TList<System.Integer>`) still
+  // counts.
+  CHECKS: array[0..12] of TTypeCheck = (
+    (Expr: 'Cnt';     Declared: 'ICounter'),
+    (Expr: 'NilCnt';  Declared: 'ICounter'),
+    (Expr: 'AP';      Declared: 'TAnonProc'),
+    (Expr: 'ClsRef';  Declared: 'TBase'),
+    (Expr: 'GenList'; Declared: 'TList'),
+    (Expr: 'PI';      Declared: 'Integer'),
+    (Expr: 'RecP';    Declared: 'TPackedRec'),
+    (Expr: 'PCh';     Declared: 'Char'),
+    (Expr: 'PRec';    Declared: 'TPackedRec'),
+    (Expr: 'MRec';    Declared: 'TManagedRec'),
+    (Expr: 'Pt';      Declared: 'TPoint2D'),
+    (Expr: 'G1';      Declared: 'TGUID'),
+    (Expr: 'SS1';     Declared: 'ShortString'));
+
+  function TypesAt(const Exe, Map, Rsm: string; Line: Integer): string;
+  begin
+    Result := '';
+    var Session := OpenSessionAtMarker(Exe, Map, Rsm, TargetDir, SOURCE, Line);
+    try
+      if Session.State <> dsStopped then
+        Exit('did not stop; ');
+      for var Check in CHECKS do begin
+        var R := Session.Evaluate(Check.Expr);
+        if not R.Success then
+          Result := Result + Format('%s -> <%s>; ', [Check.Expr, R.ErrorText])
+        else if not R.TypeName.Contains(Check.Declared) then
+          Result := Result + Format('%s declared %s but reported "%s"; ',
+            [Check.Expr, Check.Declared, R.TypeName]);
+      end;
+    finally
+      Session.Free;
+    end;
+  end;
+
+begin
+  var Line := MarkerLineInFile(TargetDir + SOURCE, MARKER);
+  Assert.IsTrue(Line > 0, 'marker ' + MARKER + ' not found');
+  Assert.IsTrue(FileExists(Win64Exe), '64-bit control target missing');
+
+  var Failures := TypesAt(Win64Exe, Win64Map, Win64Rsm, Line);
+  if Failures <> '' then
+    Failures := 'x64: ' + Failures;
+  var F32 := TypesAt(Win32Exe, Win32Map, Win32Rsm, Line);
+  if F32 <> '' then
+    Failures := Failures + 'x86: ' + F32;
+
+  Assert.AreEqual('', Failures,
+    'evaluate must report the declared type -- ' + Failures);
 end;
 
 procedure TWin32RunControlTests.RawStackScan_FindsTheChainAndSaysItIsRaw;
