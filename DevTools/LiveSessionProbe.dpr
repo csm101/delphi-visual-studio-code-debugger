@@ -176,6 +176,12 @@ begin
            F.SourceLine, F.ModuleName]));
     end
     else if SameText(Cmd, 'locals') then begin
+      // Honour the frame the script selected. This used to read frame 0
+      // unconditionally, so `frame 2` followed by `locals` printed the TOP
+      // frame's variables under the caller's name -- which reads as the
+      // debugger reporting the wrong locals rather than as a probe that never
+      // asked for the right ones.
+      Session.SelectFrame(FrameIdx);
       var L := Session.GetLocals;
       for var V in L do
         ShowVar('    ', V);

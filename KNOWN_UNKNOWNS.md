@@ -904,6 +904,40 @@ Fix direction, in order of preference:
     already does for constants. Weaker here, because a `.dpr` transitively uses
     almost everything.
 
+NARROWED FURTHER on Hydra2 (2026-08-03), which pins down every part of it:
+
+  * The owning module is `cxLibraryRS29.bpl` — found by scanning the runtime
+    BPLs for the string `TPopupMenuKind`; it is in no other module, and not in
+    `Hydra2.exe` or `Hydra2.rsm`.
+  * The declaration is `strict protected type TPopupMenuKind = (External, VCL,
+    Application)` inside `class TdxPopupMenuController` (`dxPopupMenus.pas`), so
+    the member is not reachable by ANY spelling from outside that class.
+  * The frame's unit (`frmTABPuntiVenditaU`) does not use `dxPopupMenus` at all
+    — zero occurrences in the source.
+  * It answers only because the real `Application` cannot be resolved: it lives
+    in `vcl290.bpl`, an Embarcadero binary with no debug info in this
+    deployment. `ExprEval` step 4 (global) misses, step 5 (const/enum) then
+    answers from a strictly worse source instead of reporting "not found".
+  * The scan that answers is `TTD32FileReader.TryResolveEnumLiteral`: every
+    `tkEnum` type in the module, every member, FIRST MATCH WINS. Requiring the
+    match to be UNIQUE would not help — `Application` is unique among enum
+    members.
+
+And the uses-scope fallback is now known to be UNAVAILABLE for this shape, not
+merely weaker: `GetUnitUses` is implemented ONLY by `TRsmFile`. The units
+involved live in BPLs that carry TD32 and no `.rsm`, so `FrameUses` is empty and
+`TryResolveConstScoped` reaches its flat any-unit path by construction. Applying
+uses scope here would require teaching TD32 to report uses, which it does not
+record.
+
+So the remaining fix is the first one: the provider must say that an enum type
+is class-nested, and `TryResolveEnumLiteral` must skip those. The earlier
+`LF_NESTTYPE` attempt failed because it was applied to the wrong module's
+reader; the type tables that answer belong to a DIFFERENT loaded module, and
+that module was never the one being parsed. Re-attempting it means verifying
+first that `cxLibraryRS29.bpl`'s TD32 actually carries the `LF_NESTTYPE` entry
+for this type — which has NOT been measured.
+
 ## Class-member field typeId encoding on large type spaces (BLOCKS #2)
 
 On SampleApp the type NAME shown for a class field/property is wrong whenever the
