@@ -175,7 +175,8 @@ type
     function  LookupEnumInfo(const TypeName: string; out Info: TRsmEnumInfo): Boolean;
     function  LookupTypeKind(const TypeName: string): Byte;
     function  TryResolveEnumLiteral(const Name: string;
-                out Ordinal: Integer; out EnumTypeName: string): Boolean;
+                out Ordinal: Integer; out EnumTypeName: string;
+                const ScopeClass: string = ''): Boolean;
     function  GetClassMembers(const ClassName: string;
                 out Members: TArray<TClassMember>; PreferInstanceSize: Integer = 0): Boolean;
     // Declared parameters of a class method (first provider that resolves the
@@ -1509,10 +1510,11 @@ begin
 end;
 
 function TDebugInfoSet.TryResolveEnumLiteral(const Name: string;
-  out Ordinal: Integer; out EnumTypeName: string): Boolean;
+  out Ordinal: Integer; out EnumTypeName: string;
+  const ScopeClass: string): Boolean;
 begin
   for var P in FEnumProviders do
-    if P.TryResolveEnumLiteral(Name, Ordinal, EnumTypeName) then
+    if P.TryResolveEnumLiteral(Name, Ordinal, EnumTypeName, ScopeClass) then
       Exit(True);
   Result := False;
 end;

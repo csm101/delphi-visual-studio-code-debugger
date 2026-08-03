@@ -407,6 +407,7 @@ type
     // iteration. Thread-safe; a no-op when no call is running.
     procedure RequestAbortRemoteCall;
     function  TryResolveClassRef(const ClassName: string; out VA: UInt64): Boolean;
+    function  CurrentScopeClassName: string;
     function  TryResolveConstValue(const Name: string;
                 out Value: Int64; out TypeHint: string): Boolean;
     // Returns the VA of a reusable, zeroed scratch slot in the debuggee
@@ -687,6 +688,28 @@ begin
     VA := RvaToVA(Rva);
     Result := True;
   end;
+end;
+
+function TWinDebugger.CurrentScopeClassName: string;
+begin
+  Result := '';
+  var FnName := FActiveFrameName;
+  if FnName = '' then begin
+    // No frame explicitly selected: the scope is the stopped location's.
+    var PC := FActiveFramePC;
+    if PC = 0 then
+      PC := CurrentRIP(FStoppedTid);
+    if (PC = 0) or (FDebugInfo = nil) then
+      Exit;
+    if not FDebugInfo.RvaToFunctionName(VAToRva(PC), FnName) then
+      Exit;
+  end;
+  // 'TNestedHost.Describe' -> 'TNestedHost'; 'Unit.TClass.Method' -> 'TClass'.
+  // A plain routine has no dot and yields '', which is correct: it is in no
+  // class's scope.
+  var Parts := FnName.Split(['.']);
+  if Length(Parts) >= 2 then
+    Result := Parts[High(Parts) - 1];
 end;
 
 function TWinDebugger.TryResolveConstValue(const Name: string;

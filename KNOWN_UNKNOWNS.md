@@ -882,10 +882,19 @@ re-measured. Do not treat it as a known defect without doing so.
 Kept because how it was fixed matters more than that it was: the FIRST TWO
 rules that looked right were wrong, and the fixture caught both.
 
-The fix: `TTD32FileReader.TryResolveEnumLiteral` skips an enum whose type is
-declared inside a class or record, because its members are not reachable by a
-bare name from ANYWHERE — not even inside the owning class, which must write
-`TOwner.TEnum.Member`.
+The fix: `TTD32FileReader.TryResolveEnumLiteral` skips an enum declared inside a
+class **unless the frame is executing a method of that class**.
+
+That qualifier was missing at first, and the claim behind it was wrong. With the
+default `{$SCOPEDENUMS OFF}` an enum's members land in the scope that ENCLOSES
+the declaration, which for a class-nested enum is the CLASS — so a bare
+`ikAlsoHidden` IS legal inside the owning class's methods. The fixture proves
+it: `TNestedHost.Describe` compiles `var K: TInnerKind := ikAlsoHidden`. The
+first version refused it everywhere, which replaced a wrong answer with a wrong
+refusal. The scope class now travels with the query
+(`IDebugTarget.CurrentScopeClassName` → `IEnumInfoProvider.TryResolveEnumLiteral`'s
+`ScopeClass`); an empty scope refuses nested members, which is the safe answer
+when the scope is unknown.
 
 Nesting is recovered from the RAW type name. LF_NESTTYPE ($0409) is NOT the
 answer and that is measured, not assumed: `DevTools\Td32NestTypeProbe` finds
@@ -902,7 +911,9 @@ Measured name forms (same probe):
 | `@Unit@Proc$qqrv@TRoutineKind` (dcc32) | routine-local |
 | `@Unit@TNestedHost@TInnerKind` (dcc32) | class-nested |
 
-Two rules were tried and REJECTED by measurement before the third stood up:
+THREE rules were tried and rejected before the fourth stood up. The third was
+caught by the maintainer reading the justification, not by a test — which is
+why the scope case now has one:
 
   1. **"the raw name contains '@'"** — dcc32 qualifies EVERY type name with its
      unit, so this refused every enum literal on a 32-bit target. It looked
@@ -911,6 +922,9 @@ Two rules were tried and REJECTED by measurement before the third stood up:
   2. **"skip the leading empty segment and the unit segment"** — a DOTTED unit
      name occupies two segments, so `@System@Uitypes@TColorRec` read as owner
      "Uitypes" and every RTL type in a dotted unit became nested.
+  3. **"a class-nested member is never bare-visible"** — false. Its members are
+     in the owning CLASS's scope, so they are bare-visible inside that class's
+     methods. Refusing them there is a wrong refusal.
 
 What holds: split on '@'; if any segment before the type name carries a Borland
 signature marker ('$') the type is ROUTINE-scoped and stays visible (a mangled

@@ -3009,7 +3009,13 @@ function TExprEvaluator.TryResolveEnumLiteral(const Name: string;
 begin
   Result := False;
   if FDebugInfo = nil then Exit;
-  Result := FDebugInfo.TryResolveEnumLiteral(Name, Ordinal, EnumTypeName);
+  // The frame's class goes with the query: an enum declared inside a class puts
+  // its members in that CLASS's scope, so `ikHidden` is legal inside the
+  // owning class's methods and nowhere else.
+  var ScopeClass := '';
+  if FDebugger <> nil then
+    ScopeClass := FDebugger.CurrentScopeClassName;
+  Result := FDebugInfo.TryResolveEnumLiteral(Name, Ordinal, EnumTypeName, ScopeClass);
 end;
 
 // Peek at the current `[` to decide whether what follows is a set

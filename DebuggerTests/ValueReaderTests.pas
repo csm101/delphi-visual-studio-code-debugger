@@ -115,6 +115,7 @@ type
     function  GetStackFrames(TID: DWORD): TArray<TStackFrame>; overload;
     function  GetRawStackFrames(TID: DWORD; MaxItems: Integer = 0): TArray<TStackFrame>;
     function  ResymbolicateFrames(const Frames: TArray<TStackFrame>): TArray<TStackFrame>;
+    function  CurrentScopeClassName: string;
     function  GetLocalValues: TArray<TLocalValue>;
     procedure SetActiveFrame(FrameRBP, FuncEntryVA: UInt64; const FuncName: string; FramePC: UInt64 = 0);
     procedure ClearActiveFrame;
@@ -203,6 +204,7 @@ function  TFakeMemTarget.GetStackFrames: TArray<TStackFrame>; begin Result := ni
 function  TFakeMemTarget.GetStackFrames(TID: DWORD): TArray<TStackFrame>; begin Result := nil; end;
 function  TFakeMemTarget.GetRawStackFrames(TID: DWORD; MaxItems: Integer): TArray<TStackFrame>; begin Result := nil; end;
 function  TFakeMemTarget.ResymbolicateFrames(const Frames: TArray<TStackFrame>): TArray<TStackFrame>; begin Result := Frames; end;
+function  TFakeMemTarget.CurrentScopeClassName: string; begin Result := ''; end;
 function  TFakeMemTarget.GetLocalValues: TArray<TLocalValue>; begin Result := nil; end;
 procedure TFakeMemTarget.SetActiveFrame(FrameRBP, FuncEntryVA: UInt64; const FuncName: string; FramePC: UInt64 = 0); begin end;
 procedure TFakeMemTarget.ClearActiveFrame; begin end;
@@ -469,7 +471,8 @@ type
     constructor Create(const ATypeName: string; const AInfo: TRsmEnumInfo; ASize: Integer);
     function LookupEnumInfo(const TypeName: string; out Info: TRsmEnumInfo): Boolean;
     function TryResolveEnumLiteral(const Name: string;
-      out Ordinal: Integer; out EnumTypeName: string): Boolean;
+      out Ordinal: Integer; out EnumTypeName: string;
+      const ScopeClass: string = ''): Boolean;
     function LookupTypeKind(const TypeName: string): Byte;
     function GetTypeSize(const TypeName: string; out Size: Integer): Boolean;
   end;
@@ -492,7 +495,8 @@ begin
 end;
 
 function TFakeEnumSizeProvider.TryResolveEnumLiteral(const Name: string;
-  out Ordinal: Integer; out EnumTypeName: string): Boolean;
+  out Ordinal: Integer; out EnumTypeName: string;
+  const ScopeClass: string): Boolean;
 begin
   Ordinal := 0; EnumTypeName := ''; Result := False;
 end;

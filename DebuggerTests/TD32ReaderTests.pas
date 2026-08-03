@@ -1158,11 +1158,18 @@ begin
     '..\..\TestTarget\' + Bitness + '\Debug\NestedEnumSample.exe';
 end;
 
-// A bare identifier must never resolve to a member of a CLASS-NESTED enum:
-// `TNestedHost.TInnerKind.ikHidden` is the only legal spelling, so a bare
-// `ikHidden` means nothing, even inside TNestedHost. Meanwhile a unit-level
-// enum and a ROUTINE-LOCAL one must keep resolving -- the latter is exactly
-// what an over-broad rule breaks.
+// A bare identifier must not resolve to a member of a CLASS-NESTED enum FROM
+// OUTSIDE the owning class -- and MUST resolve from inside it.
+//
+// With the default {$SCOPEDENUMS OFF} an enum's members land in the scope that
+// ENCLOSES the declaration, which for a class-nested enum is the CLASS. So a
+// bare `ikAlsoHidden` is legal inside TNestedHost's own methods; the fixture
+// itself proves it, since `TNestedHost.Describe` compiles exactly that. An
+// earlier version of this rule refused it everywhere, which turned a wrong
+// answer into a wrong refusal.
+//
+// A unit-level enum and a ROUTINE-LOCAL one must keep resolving in any scope --
+// the latter is what an over-broad rule breaks first.
 //
 // Only x86 is asserted for the nested case. Measured: dcc64 does not emit the
 // nested `TInnerKind` into this fixture's type table at all, so on x64 there is
@@ -1178,10 +1185,23 @@ begin
     var Ord_: Integer;
     var EnumType: string;
 
+    // No scope: outside any class, so the nested members are not visible.
     Assert.IsFalse(R.TryResolveEnumLiteral('ikHidden', Ord_, EnumType),
-      'ikHidden is a member of a CLASS-NESTED enum and must not resolve by bare name');
+      'ikHidden must not resolve by bare name outside the owning class');
     Assert.IsFalse(R.TryResolveEnumLiteral('ikAlsoHidden', Ord_, EnumType),
-      'ikAlsoHidden is a member of a CLASS-NESTED enum and must not resolve by bare name');
+      'ikAlsoHidden must not resolve by bare name outside the owning class');
+    // A DIFFERENT class is still outside.
+    Assert.IsFalse(R.TryResolveEnumLiteral('ikHidden', Ord_, EnumType, 'TSomethingElse'),
+      'ikHidden must not resolve inside an unrelated class');
+
+    // Inside the owning class it IS in scope, and the compiler agrees: the
+    // fixture's own TNestedHost.Describe uses `ikAlsoHidden` bare.
+    Assert.IsTrue(R.TryResolveEnumLiteral('ikAlsoHidden', Ord_, EnumType, 'TNestedHost'),
+      'ikAlsoHidden must resolve inside TNestedHost, where the compiler accepts it');
+    Assert.AreEqual(1, Ord_, 'ikAlsoHidden ordinal');
+    Assert.IsTrue(R.TryResolveEnumLiteral('ikHidden', Ord_, EnumType, 'tnestedhost'),
+      'the owning-class match must not be case sensitive');
+    Assert.AreEqual(0, Ord_, 'ikHidden ordinal');
 
     // The other two scopes must be untouched, or the guard is just a blanket
     // refusal wearing a rule's clothes.

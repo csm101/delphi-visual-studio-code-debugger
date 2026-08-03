@@ -273,8 +273,16 @@ type
     // Reverse lookup: given an enum-value identifier (e.g. `wmPaused`), find
     // any enum type that contains it and return the ordinal + the enum type
     // name. Used by the expression evaluator for unqualified enum literals.
+    //
+    // ScopeClass is the class whose method the frame is executing, or '' when
+    // that is unknown. It matters because an enum declared INSIDE a class puts
+    // its members in the CLASS's scope (with the default {$SCOPEDENUMS OFF}),
+    // so a bare `ikHidden` is legal inside that class's own methods and
+    // meaningless everywhere else. Passing '' therefore refuses class-nested
+    // members, which is the safe answer when the scope is not known.
     function TryResolveEnumLiteral(const Name: string;
-      out Ordinal: Integer; out EnumTypeName: string): Boolean;
+      out Ordinal: Integer; out EnumTypeName: string;
+      const ScopeClass: string = ''): Boolean;
     // Delphi TTypeKind byte for any type that appears in a TTypeInfo
     // record (0 = no TypeInfo). Drives the variables-view decision
     // between primitive formatting and class/record decoration.

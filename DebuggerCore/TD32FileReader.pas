@@ -323,6 +323,8 @@ type
     // True when a RAW type name says the type is declared inside a class or
     // record. Consults the type table, not just the shape of the name.
     function  RawTypeNameIsNested(const RawName: string): Boolean;
+    // The class/record a raw type name is declared inside, '' when none.
+    function  NestingOwnerOf(const RawName: string): string;
     procedure EnsureOwnerTypeNames;
     procedure ParseAllSourceModules;
     procedure ParseSourceModule(const Entry: TTD32DirectoryEntry);
@@ -484,7 +486,8 @@ type
     function    EnumValueToOrdinal(const TypeName, ValueName: string;
                   out Ordinal: Integer; out EnumTypeName: string): Boolean;
     function    TryResolveEnumLiteral(const Name: string;
-                  out Ordinal: Integer; out EnumTypeName: string): Boolean;
+                  out Ordinal: Integer; out EnumTypeName: string;
+                  const ScopeClass: string = ''): Boolean;
     function    LookupTypeKind(const TypeName: string): Byte;
 
     // Lower bound of an LF_ARRAY index ($0031 subrange); 0 when unknown.
@@ -4007,7 +4010,16 @@ end;
 // it.
 function TTD32FileReader.RawTypeNameIsNested(const RawName: string): Boolean;
 begin
-  Result := False;
+  Result := NestingOwnerOf(RawName) <> '';
+end;
+
+// The class or record this type is declared inside, or '' when it is not
+// nested in one. Same analysis as RawTypeNameIsNested, but it returns the owner
+// because visibility depends on WHICH class: a class-nested enum's members are
+// in scope inside that class's own methods.
+function TTD32FileReader.NestingOwnerOf(const RawName: string): string;
+begin
+  Result := '';
   if RawName = '' then
     Exit;
   var Parts := RawName.Split(['@']);
@@ -4025,7 +4037,8 @@ begin
   if Owner = '' then
     Exit;
   EnsureOwnerTypeNames;
-  Result := FOwnerTypeNames.ContainsKey(LowerCase(Owner));
+  if FOwnerTypeNames.ContainsKey(LowerCase(Owner)) then
+    Result := Owner;
 end;
 
 // Names of every class / record / structure in the table, for the nesting test
@@ -4055,7 +4068,8 @@ begin
 end;
 
 function TTD32FileReader.TryResolveEnumLiteral(const Name: string;
-  out Ordinal: Integer; out EnumTypeName: string): Boolean;
+  out Ordinal: Integer; out EnumTypeName: string;
+  const ScopeClass: string): Boolean;
 begin
   Result := False;
   Ordinal := 0;
@@ -4064,10 +4078,18 @@ begin
   // LF_ENUMERATE members; first match wins (mirrors the RSM provider). The
   // member Offset is the ordinal value, the member Name the literal.
   //
-  // A CLASS-NESTED enum is skipped, because its members are not reachable by a
-  // bare name from ANYWHERE in the language -- not even inside the owning
-  // class, which must write `TOwner.TEnum.Member`. Without this the scan
-  // answered a bare identifier with a member of a type it could never mean.
+  // A CLASS-NESTED enum is skipped UNLESS the frame is executing a method of
+  // the owning class.
+  //
+  // The scope rule, corrected after getting it wrong: with the default
+  // {$SCOPEDENUMS OFF} an enum's members land in the scope that ENCLOSES the
+  // enum declaration. For a class-nested enum that scope is the CLASS, so a
+  // bare `ikHidden` is legal inside that class's own methods -- the fixture
+  // proves it, `TNestedHost.Describe` compiles `var K: TInnerKind :=
+  // ikAlsoHidden`. It is meaningless everywhere else. An earlier version of
+  // this comment claimed such members were unreachable by bare name from
+  // anywhere; that was simply false, and it made the guard refuse a legal
+  // expression.
   //
   // Measured on two real applications: `Application` resolved to the member of
   // DevExpress's `TdxPopupMenuController.TPopupMenuKind = (External, VCL,
@@ -4079,9 +4101,12 @@ begin
   // "not found" is the correct answer when the real symbol is unreachable.
   for var I := 0 to High(FTypes) do
     if FTypes[I].Kind = tkEnum then begin
-      if (FTypes[I].NameIdx <> 0) and
-         RawTypeNameIsNested(ResolveNameByIndex(FTypes[I].NameIdx)) then
-        Continue;
+      if FTypes[I].NameIdx <> 0 then begin
+        var Owner := NestingOwnerOf(ResolveNameByIndex(FTypes[I].NameIdx));
+        // Nested, and the frame is not inside the owning class: not in scope.
+        if (Owner <> '') and not SameText(Owner, ScopeClass) then
+          Continue;
+      end;
       for var M in FTypes[I].Members do
         if SameText(M.Name, Name) then begin
           Ordinal      := Integer(M.Offset);

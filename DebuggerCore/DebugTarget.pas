@@ -266,6 +266,11 @@ type
     // of a multi-megabyte stack just to see the names.
     function  ResymbolicateFrames(
                 const Frames: TArray<TStackFrame>): TArray<TStackFrame>;
+    // The class whose method the SELECTED frame is executing, or '' outside a
+    // method. Names the Pascal scope an unqualified identifier is resolved in,
+    // which is what makes a class-nested enum's members visible: with the
+    // default {$SCOPEDENUMS OFF} they live in the CLASS's scope.
+    function  CurrentScopeClassName: string;
     function  GetLocalValues: TArray<TLocalValue>;
     // Select / clear the active call-stack frame (DAP frameId). When a
     // non-top frame is active, GetLocalValues and the evaluator read that

@@ -309,7 +309,8 @@ type
     // adapter treats as "expandable structured value".
     function    LookupTypeKind(const TypeName: string): Byte;
     function    TryResolveEnumLiteral(const Name: string;
-                  out Ordinal: Integer; out EnumTypeName: string): Boolean;
+                  out Ordinal: Integer; out EnumTypeName: string;
+                  const ScopeClass: string = ''): Boolean;
     function    GetClassMembers(const ClassName: string;
                   out Members: TArray<TClassMember>; PreferInstanceSize: Integer = 0): Boolean;
     function    AllProcedureNames: TArray<string>;
@@ -3504,8 +3505,13 @@ begin
   end;
 end;
 
+// ScopeClass is accepted and ignored: RSM records no nesting for a type, so
+// this provider has nothing to scope BY. It never had the defect the parameter
+// exists for either -- the class-nested enum that started it came from a TD32
+// type table.
 function TRsmFile.TryResolveEnumLiteral(const Name: string;
-  out Ordinal: Integer; out EnumTypeName: string): Boolean;
+  out Ordinal: Integer; out EnumTypeName: string;
+  const ScopeClass: string): Boolean;
 begin
   WaitForIndex;
   FLock.Acquire;
