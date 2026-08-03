@@ -878,6 +878,23 @@ applies no scoping at all.
 
 Contrast `Screen`, which honestly answers "not found" in the same session.
 
+CONFIRMED ON A SECOND REAL APPLICATION (Hydra2, 2026-08-03), so it is not a
+quirk of one binary.
+
+AND NARROWED, by an attempt that FAILED and was reverted. Reading CodeView's
+`LF_NESTTYPE` ($0409) — which the field-list parser recognises and skips — to
+build the set of class-nested type names, then refusing enum literals from
+those, changed NOTHING. The reason is worth more than the attempt: searching
+both of `AppContainer.exe` and `AppContainer.rsm` for the string
+`PopupMenuKind` finds it in NEITHER. The enum is not in the application's own
+debug info at all — it comes from the type tables of ANOTHER LOADED MODULE.
+
+So this is not a TD32 field-list gap. A bare identifier is resolved against
+every loaded module's types, and the fix has to be about WHICH MODULE AND SCOPE
+may answer, not about one reader's parse. Enums nested in a ROUTINE must keep
+working either way: those ARE bare-visible inside that routine, and the test
+target depends on it (`TColor = (Red, Green, Blue)` in RunTypeSampler).
+
 Fix direction, in order of preference:
   * Do not let an enum member satisfy a bare identifier when its enum type is
     NESTED. That is a language fact, not a preference. Needs the provider to
