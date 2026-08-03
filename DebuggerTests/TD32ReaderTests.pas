@@ -1203,6 +1203,26 @@ begin
       'the owning-class match must not be case sensitive');
     Assert.AreEqual(0, Ord_, 'ikHidden ordinal');
 
+    // And in a DESCENDANT: a protected nested type is inherited like any other
+    // member, so TDerivedHost.DescribeDerived reaches `ikHidden` unqualified --
+    // the fixture compiles exactly that. Comparing owner to scope class
+    // EXACTLY refused it, and inheritance is the normal case in VCL code.
+    Assert.IsTrue(R.TryResolveEnumLiteral('ikHidden', Ord_, EnumType, 'TDerivedHost'),
+      'ikHidden must resolve inside a DESCENDANT of the owning class');
+    Assert.AreEqual(0, Ord_, 'ikHidden ordinal from the descendant');
+
+    // KNOWN LIMIT, pinned so it is not mistaken for correctness: a
+    // {$SCOPEDENUMS ON} enum requires `TScopedMode.seSecond` in source, and the
+    // bare form does not compile -- yet it resolves here. Measured why: the
+    // directive leaves NO trace in TD32. The enum record and its field list are
+    // byte-identical to an unscoped one apart from the name indices (see
+    // KNOWN_UNKNOWNS), so a bare-name lookup cannot honour it. The failure mode
+    // is permissiveness, never a wrong value.
+    Assert.IsTrue(R.TryResolveEnumLiteral('seSecond', Ord_, EnumType),
+      'scoped-enum members are indistinguishable in TD32 and still resolve; ' +
+      'if this ever fails, the directive became visible and the rule can honour it');
+    Assert.AreEqual(1, Ord_, 'seSecond ordinal');
+
     // The other two scopes must be untouched, or the guard is just a blanket
     // refusal wearing a rule's clothes.
     Assert.IsTrue(R.TryResolveEnumLiteral('vmSecond', Ord_, EnumType),

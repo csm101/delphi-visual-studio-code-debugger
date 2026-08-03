@@ -26,21 +26,57 @@ type
   // uses this one. Must keep resolving.
   TVisibleMode = (vmFirst, vmSecond, vmThird);
 
-  // Class-nested: `TNestedHost.TInnerKind.ikHidden` is the ONLY legal spelling.
-  // A bare `ikHidden` means nothing, even inside TNestedHost.
+  // Class-nested. With the default {$SCOPEDENUMS OFF} the members land in the
+  // CLASS's scope, so a bare `ikHidden` is legal inside TNestedHost's own
+  // methods -- and inside a DESCENDANT's methods -- and nowhere else.
   TNestedHost = class
-  strict protected type
+  protected type
     TInnerKind = (ikHidden, ikAlsoHidden);
   public
     Mode: TVisibleMode;
     function Describe: string;
   end;
 
+  // Inheritance: a protected nested type is visible in a descendant's methods
+  // too, so the bare member must resolve while stopped here as well.
+  TDerivedHost = class(TNestedHost)
+  public
+    function DescribeDerived: string;
+  end;
+
 function TNestedHost.Describe: string;
 begin
-  // Referenced so the compiler keeps the nested type in the debug info.
+  // Referenced so the compiler keeps the nested type in the debug info. That
+  // this line COMPILES is itself the evidence that a class-nested enum member
+  // is bare-visible inside the owning class.
   var K: TInnerKind := ikAlsoHidden;
   Result := Format('%d/%d', [Ord(Mode), Ord(K)]);
+end;
+
+function TDerivedHost.DescribeDerived: string;
+begin
+  // And bare-visible in a DESCENDANT: this compiles without naming TNestedHost.
+  var K: TInnerKind := ikHidden;
+  Result := Format('derived %d', [Ord(K)]);
+end;
+
+// SCOPED enums: with the directive ON the members are NOT injected into the
+// enclosing scope, so `seSecond` is illegal bare -- `TScopedMode.seSecond` is
+// the only spelling, even in this same unit. Present so the debug info of a
+// scoped enum can be compared against an unscoped one: if nothing distinguishes
+// them, a bare-name lookup CANNOT honour the directive and that is a stated
+// limit rather than a silent one.
+{$SCOPEDENUMS ON}
+type
+  TScopedMode = (seFirst, seSecond, seThird);
+{$SCOPEDENUMS OFF}
+
+procedure UseScopedEnum;
+var
+  S: TScopedMode;
+begin
+  S := TScopedMode.seSecond;   // qualified -- the bare form would not compile
+  Writeln(Ord(S));
 end;
 
 procedure UseRoutineLocalEnum;
@@ -62,7 +98,14 @@ begin
     H.Mode := vmSecond;
     Writeln(H.Describe);
     UseRoutineLocalEnum;
+    UseScopedEnum;
   finally
     H.Free;
+  end;
+  var D := TDerivedHost.Create;
+  try
+    Writeln(D.DescribeDerived);
+  finally
+    D.Free;
   end;
 end.

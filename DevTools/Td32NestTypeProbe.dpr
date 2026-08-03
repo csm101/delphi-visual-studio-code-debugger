@@ -66,6 +66,33 @@ begin
           [Rec.NameIdx, Reader.DiagResolveName(Rec.NameIdx)]));
         for var M in Rec.Members do
           Writeln(Format('           member "%s" = %d', [M.Name, M.Offset]));
+        // Raw record bytes. Used to ask whether {$SCOPEDENUMS ON} leaves any
+        // trace at all: if a scoped and an unscoped enum are byte-identical
+        // apart from names, a bare-name lookup cannot honour the directive and
+        // that has to be stated as a limit rather than guessed at.
+        var Payload: PByte;
+        var PayLen: Integer;
+        if Reader.GetTypeRecordPayload(Rec.Index, Payload, PayLen) then begin
+          var Hex := '';
+          for var I := 0 to PayLen - 1 do
+            Hex := Hex + IntToHex((Payload + I)^, 2) + ' ';
+          Writeln(Format('control: payload (%d bytes) = %s', [PayLen, Hex.Trim]));
+          // ...and the FIELDLIST it points at (payload+2), where the per-member
+          // attribute lives. If the directive is recorded anywhere, it is here
+          // or nowhere.
+          if Rec.FieldListId >= $1000 then begin
+            var FieldListId := Rec.FieldListId;
+            var FlPayload: PByte;
+            var FlLen: Integer;
+            if Reader.GetTypeRecordPayload(FieldListId, FlPayload, FlLen) then begin
+              var FlHex := '';
+              for var I := 0 to FlLen - 1 do
+                FlHex := FlHex + IntToHex((FlPayload + I)^, 2) + ' ';
+              Writeln(Format('control: fieldlist $%x (%d bytes) = %s',
+                [FieldListId, FlLen, FlHex.Trim]));
+            end;
+          end;
+        end;
       end
       else
         Writeln(Format('control: type "%s" is NOT in the type table', [Filter]));

@@ -325,6 +325,9 @@ type
     function  RawTypeNameIsNested(const RawName: string): Boolean;
     // The class/record a raw type name is declared inside, '' when none.
     function  NestingOwnerOf(const RawName: string): string;
+    // Does code in ScopeClass see a type nested in Owner unqualified? True for
+    // the owner itself and for any descendant of it.
+    function  ScopeSeesNestedOwner(const ScopeClass, Owner: string): Boolean;
     procedure EnsureOwnerTypeNames;
     procedure ParseAllSourceModules;
     procedure ParseSourceModule(const Entry: TTD32DirectoryEntry);
@@ -4013,6 +4016,37 @@ begin
   Result := NestingOwnerOf(RawName) <> '';
 end;
 
+// Can code executing in ScopeClass see a type nested in Owner by its bare name?
+//
+// Yes when they are the same class, and yes when ScopeClass DESCENDS from Owner:
+// a nested type declared `protected` (or looser) is inherited like any other
+// member, so a descendant's methods reach it unqualified. Missing that was the
+// second wrong version of this rule -- it compared the owner to the scope class
+// exactly, and refused a legal expression the moment the frame was in a
+// subclass. Inheritance is the normal case in VCL code, not an edge one.
+//
+// NOT modelled: `strict private` nesting, which a descendant may NOT see. The
+// visibility attribute is not recorded for a nested type, so this errs toward
+// resolving -- the same direction the language takes for everything else here.
+function TTD32FileReader.ScopeSeesNestedOwner(const ScopeClass,
+  Owner: string): Boolean;
+const
+  MAX_DEPTH = 32;   // cycle guard; a Delphi hierarchy is never near this
+begin
+  Result := False;
+  if (ScopeClass = '') or (Owner = '') then
+    Exit;
+  var Current := ScopeClass;
+  for var Depth := 1 to MAX_DEPTH do begin
+    if SameText(Current, Owner) then
+      Exit(True);
+    var Parent: string;
+    if not GetParentClassName(Current, Parent) then
+      Exit;
+    Current := Parent;
+  end;
+end;
+
 // The class or record this type is declared inside, or '' when it is not
 // nested in one. Same analysis as RawTypeNameIsNested, but it returns the owner
 // because visibility depends on WHICH class: a class-nested enum's members are
@@ -4103,8 +4137,9 @@ begin
     if FTypes[I].Kind = tkEnum then begin
       if FTypes[I].NameIdx <> 0 then begin
         var Owner := NestingOwnerOf(ResolveNameByIndex(FTypes[I].NameIdx));
-        // Nested, and the frame is not inside the owning class: not in scope.
-        if (Owner <> '') and not SameText(Owner, ScopeClass) then
+        // Nested, and the frame is not inside the owning class or one of its
+        // descendants: not in scope.
+        if (Owner <> '') and not ScopeSeesNestedOwner(ScopeClass, Owner) then
           Continue;
       end;
       for var M in FTypes[I].Members do

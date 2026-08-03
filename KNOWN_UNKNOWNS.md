@@ -925,6 +925,15 @@ why the scope case now has one:
   3. **"a class-nested member is never bare-visible"** — false. Its members are
      in the owning CLASS's scope, so they are bare-visible inside that class's
      methods. Refusing them there is a wrong refusal.
+  4. **"visible only in the owning class itself"** — too narrow. A `protected`
+     nested type is inherited, so a DESCENDANT's methods see it unqualified.
+
+Remaining known permissiveness, deliberately not fixed because each errs toward
+answering rather than refusing, and none is measured to occur: two classes of
+the same name in different units are not told apart (the owner check is by
+name); a class declared inside a routine makes its nested types visible
+anywhere in that routine; and the RSM provider ignores `ScopeClass` entirely
+because RSM records no nesting at all.
 
 What holds: split on '@'; if any segment before the type name carries a Borland
 signature marker ('$') the type is ROUTINE-scoped and stays visible (a mangled
@@ -943,9 +952,41 @@ and has broken unrelated tests before); tests
 `NestedEnumMember_IsNotBareVisible` and
 `NestedTypeDetection_SeparatesUnitRoutineAndClass`.
 
+Inheritance is honoured: a nested type declared `protected` is inherited like
+any other member, so a DESCENDANT's methods reach it unqualified. The scope
+check walks the class hierarchy rather than comparing names exactly — comparing
+exactly was the FOURTH wrong version, and inheritance is the normal case in VCL
+code, not an edge one. NOT modelled: `strict private` nesting, which a
+descendant may not see; the visibility attribute is not recorded for a nested
+type, so this errs toward resolving.
+
 STILL TRUE, and not a defect: the VCL's real `Application` remains unresolvable
 in a deployment whose `vcl290.bpl` carries no debug info. "Not found" is the
 correct answer there.
+
+#### `{$SCOPEDENUMS ON}` cannot be honoured — MEASURED, stated limit
+
+With the directive on, `TScopedMode.seSecond` is the only legal spelling and a
+bare `seSecond` does not compile. The debugger resolves it anyway, and it cannot
+do otherwise: **the directive leaves no trace in TD32**.
+
+Measured on `NestedEnumSample` (dcc32), a scoped and an unscoped enum declared
+side by side in the same unit:
+
+    TVisibleMode  payload   2A 00 1C 27 00 00 00 00
+    TScopedMode   payload   2A 00 29 27 00 00 00 00
+
+    TVisibleMode  fieldlist 03 04 00 00 AC 3E 00 00 00 00 00 00 00 00 F2 F1  ...
+    TScopedMode   fieldlist 03 04 00 00 B0 3E 00 00 00 00 00 00 00 00 F2 F1  ...
+
+Byte-identical apart from the NAMES indices and the record ids; the per-member
+attribute is `00 00` in both. There is nothing to branch on.
+
+The failure mode is PERMISSIVENESS, never a wrong value: the debugger answers an
+identifier the compiler would have rejected, with that identifier's correct
+ordinal. Pinned by an assertion in `NestedEnumMember_IsNotBareVisible` so the
+behaviour is recorded as a limit rather than mistaken for correctness — if that
+assertion ever fails, the directive became visible and the rule can honour it.
 
 ### (historical) A bare identifier can resolve to an enum member of a NESTED type
 
