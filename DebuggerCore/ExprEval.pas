@@ -2228,6 +2228,11 @@ function TExprEvaluator.ApplyDot(const Base: TExprValue; const Field: string): T
       Result.TypeHint := M.TypeName
     else
       Result.TypeHint := 'Pointer';
+    // The member's resolved kind travels with the value. It is what separates a
+    // flattened dynamic array from a genuine typed pointer -- both spelled `^T`
+    // -- and dropping it made `MRec.Tags` evaluate to a bare address while
+    // EXPANDING the same field rendered `[4, 5, 6]`.
+    Result.ValueKind := M.TypeKind;
     Size := PrimTypeSize(Result.TypeHint);
     if Size = 0 then Size := 8;
     Result.Address := ObjAddr + UInt64(M.FieldOffset);

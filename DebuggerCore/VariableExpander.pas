@@ -86,8 +86,19 @@ type
     // and $ActRec has no runtime field table.
     function  TryRecoverClosureObject(InterfaceRef: UInt64;
                 out ObjBase: UInt64; out ClassName: string): Boolean;
-    function  SyntheticLocal(const Name, TypeName: string; Addr: UInt64): TLocalValue;
+    // TypeKind is passed when the CALLER already knows it -- notably that a
+    // flattened `^T` member is really a dynamic array. Without it the reader has
+    // only the ambiguous spelling and must guess from memory shape.
+    function  SyntheticLocal(const Name, TypeName: string; Addr: UInt64;
+                TypeKind: Byte = 0): TLocalValue;
+  public
+    // Renders an evaluated expression. PUBLIC and shared: TDebugSession had its
+    // own byte-identical copy, and the two drifted -- the copy here learned to
+    // carry ValueKind while the other did not, so EXPANDING `MRec.Tags` showed
+    // `[4, 5, 6]` and EVALUATING it showed a bare address. One conversion, so
+    // they cannot disagree again.
     function  FormatExprValue(const E: TExprValue): string;
+  private
     // Element type for any spelling of a dynamic array (`^E`, `TArray<E>`,
     // `array of E`), so all of them reach the array expansion.
     function  TryDynArrayElementType(const TypeName: string;
@@ -263,11 +274,12 @@ begin
 end;
 
 function TVariableExpander.SyntheticLocal(const Name, TypeName: string;
-  Addr: UInt64): TLocalValue;
+  Addr: UInt64; TypeKind: Byte): TLocalValue;
 begin
   Result            := Default(TLocalValue);
   Result.Name       := Name;
   Result.TypeHint   := TypeName;
+  Result.TypeKind   := TypeKind;
   Result.Address    := Addr;
   Result.Kind       := lkLocal;
   if Debugger = nil then
@@ -295,6 +307,17 @@ var
 begin
   LV            := Default(TLocalValue);
   LV.TypeHint   := E.TypeHint;
+  // ONLY the dynamic-array fact is carried, deliberately not the kind wholesale.
+  // It is what separates a flattened dynamic array from a genuine typed
+  // pointer, both of which read `^T`; without it `MRec.Tags` evaluated to a bare
+  // address while EXPANDING the same field showed `[4, 5, 6]`.
+  //
+  // Copying the kind wholesale is wrong here and was measured wrong: a `var`
+  // parameter's kind describes its DECLARED type (`^Integer`) while RawValue
+  // already holds the value the caller passed, so the formatter rendered the
+  // correct number in pointer style -- `0x5E` instead of `94`.
+  if E.ValueKind = TK_DYNARRAY then
+    LV.TypeKind := TK_DYNARRAY;
   LV.Address    := E.Address;
   LV.RawValue   := E.RawValue;
   LV.ValueValid := E.IsValid;
@@ -496,11 +519,19 @@ begin
       if ArrPtr = 0 then
         Result := '(empty)'
       else begin
-        var LenVal: UInt64 := 0;
-        var Layout := Debugger.TargetLayout;
-        Debugger.ReadProcessMemoryAt(Layout.DynArrayLengthAddr(ArrPtr),
-          @LenVal, Layout.DynArrayLengthSize);
-        Result := Format('%s[%d]', [TypeName, Integer(LenVal)]);
+        // Prefer the element preview. The kind is CARRIED here, so the reader
+        // renders the array because it was told it is one -- not because the
+        // pointed-to bytes resembled a header, which is the guess a genuine
+        // `^T2` aimed at a live `array of T1` also passes.
+        Result := Readers.FormatLocalValue(
+          SyntheticLocal('', TypeName, FieldAddr, TK_DYNARRAY));
+        if Result = '' then begin
+          var LenVal: UInt64 := 0;
+          var Layout := Debugger.TargetLayout;
+          Debugger.ReadProcessMemoryAt(Layout.DynArrayLengthAddr(ArrPtr),
+            @LenVal, Layout.DynArrayLengthSize);
+          Result := Format('%s[%d]', [TypeName, Integer(LenVal)]);
+        end;
       end;
     end;
   else
@@ -512,8 +543,14 @@ function TVariableExpander.MemberFieldToSession(const Exp: TSessionExpansion;
   const M: TClassMember; const ParentRttiFields: TArray<TRttiFieldInfo>): TSessionVariable;
 begin
   var FieldAddr := Exp.BaseAddr + UInt64(M.FieldOffset);
-  var TypeKind: Byte := TK_UNKNOWN;
-  if (DebugInfo <> nil) and (M.TypeName <> '') then
+  // The member's OWN resolved kind wins over a lookup by type NAME. The name is
+  // the ambiguous thing: TD32 flattens a dynamic-array member to `^T`, spelled
+  // exactly like a genuine typed pointer, so `LookupTypeKind('^Integer')` throws
+  // away an answer the member already carries. Measured with
+  // `Td32AliasProbe -class TManagedRec`: `Tags` arrives with kind=17
+  // (tkDynArray) on both bitnesses, and asking by name turned that into nothing.
+  var TypeKind: Byte := M.TypeKind;
+  if (TypeKind = TK_UNKNOWN) and (DebugInfo <> nil) and (M.TypeName <> '') then
     TypeKind := DebugInfo.LookupTypeKind(M.TypeName);
 
   Result := Default(TSessionVariable);

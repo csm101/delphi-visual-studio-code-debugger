@@ -1907,16 +1907,14 @@ begin
 end;
 
 function TDebugSession.FormatExprValue(const E: TExprValue): string;
-var
-  LV: TLocalValue;
 begin
-  LV            := Default(TLocalValue);
-  LV.TypeHint   := E.TypeHint;
-  LV.Address    := E.Address;
-  LV.RawValue   := E.RawValue;
-  LV.ValueValid := E.IsValid;
-  LV.Kind       := lkLocal;
-  Result := Readers.FormatLocalValue(LV);
+  // Delegated rather than duplicated. This used to be a byte-identical copy of
+  // the expander's, and the two drifted: the expander's learned to carry
+  // ValueKind -- the only thing that tells a flattened dynamic array from a
+  // genuine typed pointer, both spelled `^T` -- while this one kept dropping
+  // it, so expanding `MRec.Tags` rendered `[4, 5, 6]` and evaluating the same
+  // field rendered a bare address.
+  Result := FExpander.FormatExprValue(E);
 end;
 
 function TDebugSession.Evaluate(const Expr: string): TSessionEvalResult;

@@ -427,7 +427,59 @@ in `ValueReaderTests.pas` for deterministic memory-pattern unit tests):
   closure-type rendering pinned down first, without regressing the shipped increment-A
   expansion (`Test_Closure_ExpandsCapturedFields`).
 
-- **DEFERRED (low): dyn-array `^T` header heuristic can alias a real header**
+- **FIXED (2026-08-03): dyn-array `^T` header heuristic** — a `^T` now renders as
+  an array only when the provider that owns the type table SAYS it is one. The
+  entry below is kept because the investigation took three wrong turns and the
+  measurements are worth having.
+
+  The signal was there all along. `Td32AliasProbe -class TManagedRec` shows the
+  member `Tags` arriving with `kind=17` (tkDynArray) on both bitnesses, and
+  `MemberFieldToSession` threw it away one line before use by re-deriving the
+  kind from the type NAME — `LookupTypeKind('^Integer')` — which is precisely
+  the ambiguous spelling the kind existed to disambiguate.
+
+  Removing the heuristic then exposed the kind being dropped at two more points
+  on the evaluate path. The last was the instructive one: `TDebugSession.
+  FormatExprValue` was a byte-identical COPY of the expander's, and the two had
+  drifted, so expanding `MRec.Tags` rendered `[4, 5, 6]` while evaluating the
+  same field rendered a bare address. The copies are now one method.
+
+  One narrowing was needed: carrying the kind WHOLESALE broke `var` parameters,
+  whose kind describes the declared type (`^Integer`) while RawValue already
+  holds the dereferenced value — the formatter printed the right number in
+  pointer style, `0x5E` instead of `94`. Only the dynamic-array fact travels.
+
+  Pinned by `DynArrayRendering_NeedsAStatedKindOnBothBitnesses`: `PI`, a genuine
+  `^Integer`, is aimed at the DATA of the live `MRec.Tags` array, so the bytes
+  behind it are an authentic dynamic-array header — the case a byte-shape test
+  cannot refuse. Without the gate it renders `[4, 5, 6]` as if it were the
+  array; with it, a pointer.
+
+  A SHARPER fixture was attempted three times and abandoned, which is worth
+  knowing on its own. A `^Word` aimed at an `array of Integer` demonstrates the
+  corruption outright: `[1000, 2000, 3000]` read Word-strided came out as
+  `[1000, 0, 2000]`, on both bitnesses. It cannot be kept as a fixture:
+
+    * declaring the two locals it needs SHIFTS the RSM per-unit import indices,
+      and `ClassTypedField_ResolvesViaClassHashCandidates` then resolves
+      `Exception.FInnerException` to
+      `{System.Generics.Collections}TList<System.Integer>.UpdateNotify.:2<...>`;
+    * declaring ONE local of an already-present type (`^Integer`) shifts them
+      too;
+    * reusing an existing local breaks the three tests that assert `PI^ = 2`.
+
+  So TWO ORDINARY VARIABLES are enough to silently re-resolve an unrelated class
+  field elsewhere in the binary. That is the class-member typeId weakness below,
+  and this is a sharper measure of it than anything recorded there: it is not a
+  large-type-space-only problem, it is reachable by editing a test target.
+
+  Tried and reverted while chasing that: scoping the class-hash candidate choice
+  by the referencing unit instead of taking `Candidates[0]`. The reasoning is
+  sound (position is a guess, scope is a fact) but it made no difference to the
+  failure, because the wrong name arrives from the import-index step BEFORE the
+  hash fallback is reached. Unverified and inert, so not shipped.
+
+- **(historical) DEFERRED (low): dyn-array `^T` header heuristic can alias a real header**
   (`DelphiValueReaders.FormatDynArrayLocal` / `VariableExpander.TryMakeDynArray`). The
   common vectors are refuted (non-optimised codegen finalises a managed `array of T`
   local to nil at scope exit, so a later `^T` reading the same slot shows `[]`). The

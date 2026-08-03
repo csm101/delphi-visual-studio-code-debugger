@@ -104,9 +104,14 @@ begin
     Exit;
   end;
   Writeln('== members of ' + ClassName + ' ==');
+  // `pointee` is the decoded answer to the one question the type NAME cannot
+  // settle: TD32 flattens a dynamic-array member to `^T`, which is spelled
+  // exactly like a genuine typed pointer. TTypeKind 17 = tkDynArray.
   for var M in Members do
-    Writeln(Format('  %-24s off=%-5d TypeId=$%.4x  TypeName=%-20s resolved=%-20s chain=%s',
-      [M.Name, M.FieldOffset, M.TypeId, M.TypeName, Reader.GetTypeName(Cardinal(M.TypeId)),
+    Writeln(Format('  %-24s off=%-5d TypeId=$%.4x  TypeName=%-20s kind=%-3d pointee=%-3d resolved=%-20s chain=%s',
+      [M.Name, M.FieldOffset, M.TypeId, M.TypeName,
+       M.TypeKind, Reader.PointeeKindById(Cardinal(M.TypeId)),
+       Reader.GetTypeName(Cardinal(M.TypeId)),
        Reader.DescribeTypeChain(Cardinal(M.TypeId))]));
 end;
 

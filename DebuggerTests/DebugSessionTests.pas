@@ -230,6 +230,13 @@ type
     // routine's own `S`. Distinct from FrameScopedEvaluation_..., which selects
     // the parent FRAME explicitly and worked on both bitnesses all along.
     [Test] procedure NestedProc_SeesTheParentScopeOnBothBitnesses;
+    // TD32 flattens a dynamic array to `^T`, which is exactly how a genuine
+    // typed pointer reads, so the renderer used to decide by looking at whether
+    // the pointed-to bytes resembled an array header. A real pointer aimed at a
+    // live array's data passes that -- it IS a real header -- and the value came
+    // out with the wrong element type and a stride past the buffer. The kind now
+    // has to be stated by the provider that owns the type table.
+    [Test] procedure DynArrayRendering_NeedsAStatedKindOnBothBitnesses;
     // TD32 stores globals mangled, and dcc32 mangles Borland-style where dcc64
     // mangles Itanium-style; only the latter was decoded, so NO unit global
     // resolved on a 32-bit target.
@@ -4089,6 +4096,70 @@ begin
   Assert.AreEqual('', Failures,
     'the stack must reach the caller across sourceless RTL frames, at the ' +
     'right line, on both bitnesses -- ' + Failures);
+end;
+
+procedure TWin32RunControlTests.DynArrayRendering_NeedsAStatedKindOnBothBitnesses;
+type
+  TExprCheck = record Expr, Expect, Reject: string end;
+const
+  SOURCE = 'TestTargetTypes.pas';
+  MARKER = 'TYPES_BODY';
+  // `MRec.Tags` is a real `TArray<Integer>` that TD32 spells `^Integer`, so it
+  // is the case the gate must NOT refuse: it has to keep rendering elements.
+  // `PI` is a genuine `^Integer`, and must render as a pointer.
+  //
+  // The sharper case -- a real pointer aimed at a LIVE array's data, where the
+  // header behind it is authentic -- has no fixture on purpose. Three attempts
+  // showed that adding any local to this routine shifts the RSM per-unit import
+  // indices and silently re-resolves unrelated types (`Exception.FInnerException`
+  // started answering `{System.Generics.Collections}TList<...>`), and reusing an
+  // existing local breaks the three tests that assert `PI^ = 2`. The behaviour
+  // was measured directly instead and is recorded in KNOWN_UNKNOWNS: without the
+  // gate, a `^Word` over `[1000, 2000, 3000]` rendered `[1000, 0, 2000]`.
+  CHECKS: array[0..1] of TExprCheck = (
+    (Expr: 'MRec.Tags'; Expect: '[4, 5, 6]'; Reject: ''),
+    (Expr: 'PI';        Expect: '0x';        Reject: '['));
+
+  function EvalAt(const Exe, Map, Rsm, Expr: string; Line: Integer): string;
+  begin
+    var Session := OpenSessionAtMarker(Exe, Map, Rsm, TargetDir, SOURCE, Line);
+    try
+      if Session.State <> dsStopped then
+        Exit('<did not stop>');
+      var R := Session.Evaluate(Expr);
+      if not R.Success then
+        Exit('<' + R.ErrorText + '>');
+      Result := R.Value;
+    finally
+      Session.Free;
+    end;
+  end;
+
+  function Wrong(const Got: string; const C: TExprCheck): Boolean;
+  begin
+    Result := not Got.Contains(C.Expect);
+    if (not Result) and (C.Reject <> '') then
+      Result := Got.Contains(C.Reject);
+  end;
+
+begin
+  var Line := MarkerLineInFile(TargetDir + SOURCE, MARKER);
+  Assert.IsTrue(Line > 0, 'marker ' + MARKER + ' not found');
+  Assert.IsTrue(FileExists(Win64Exe), '64-bit control target missing');
+
+  var Failures := '';
+  for var Check in CHECKS do begin
+    var Got64 := EvalAt(Win64Exe, Win64Map, Win64Rsm, Check.Expr, Line);
+    if Wrong(Got64, Check) then
+      Failures := Failures + Format('x64 %s -> %s; ', [Check.Expr, Got64]);
+    var Got32 := EvalAt(Win32Exe, Win32Map, Win32Rsm, Check.Expr, Line);
+    if Wrong(Got32, Check) then
+      Failures := Failures + Format('x86 %s -> %s; ', [Check.Expr, Got32]);
+  end;
+
+  Assert.AreEqual('', Failures,
+    'a `^T` renders as an array only when the debug info SAYS it is one, on ' +
+    'both bitnesses -- ' + Failures);
 end;
 
 procedure TWin32RunControlTests.NestedProc_SeesTheParentScopeOnBothBitnesses;

@@ -1593,6 +1593,17 @@ begin
   // to body locals (lkLocal): var/out `^T` parameters were handled above.
   if V.Kind = lkLocal then begin
     var ElemType := DynArrayElemType(V.TypeHint);
+    // `TArray<E>` and `array of E` say what they are. `^E` does NOT -- TD32
+    // flattens a dynamic array to exactly the spelling of a genuine typed
+    // pointer -- so it is accepted only when the provider that owns the type
+    // table SAYS so. Without that, the decision came from whether the
+    // pointed-to bytes resembled an array header, and a real `^T2` aimed at a
+    // live `array of T1` passes that: it IS a real header, and the result is a
+    // wrong length and a stride past the end of the buffer, with nothing
+    // marking it as a guess.
+    if (ElemType <> '') and (Length(V.TypeHint) >= 2) and (V.TypeHint[1] = '^') and
+       (V.TypeKind <> TK_DYNARRAY) then
+      ElemType := '';
     if ElemType <> '' then begin
       var DynStr := FormatDynArrayLocal(V.RawValue, ElemType);
       if DynStr <> '' then
