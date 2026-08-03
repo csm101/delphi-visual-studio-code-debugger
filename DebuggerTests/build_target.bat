@@ -24,6 +24,14 @@ set MAPONLY64_ERR=%errorlevel%
 if not exist Win32\Debug md Win32\Debug
 dcc32 -$O- -GD -E.\Win32\Debug -NU.\Win32\Debug MapOnlyGlobals.dpr 2>&1
 set MAPONLY32_ERR=%errorlevel%
+rem Nested-enum fixture: embedded TD32 (-V) so the tests can read how the
+rem compiler records a class-nested type versus a unit-level or routine-local
+rem one. Separate target on purpose -- adding declarations to TestTarget shifts
+rem the RSM per-unit import indices and has broken unrelated tests before.
+dcc64 -$O- -V -VN -E.\Win64\Debug -NU.\Win64\Debug NestedEnumSample.dpr 2>&1
+set NESTED64_ERR=%errorlevel%
+dcc32 -$O- -V -VN -E.\Win32\Debug -NU.\Win32\Debug NestedEnumSample.dpr 2>&1
+set NESTED32_ERR=%errorlevel%
 rem External-TDS target (-VT): debug info in a standalone .tds, no embedded .debug.
 dcc64 -$O- -VT -VN -E.\Win64\Debug -NU.\Win64\Debug TdsSample.dpr 2>&1
 set TDS_ERR=%errorlevel%
@@ -42,4 +50,6 @@ if not "%EXE_ERR%"=="0" exit /b %EXE_ERR%
 if not "%TDS_ERR%"=="0" exit /b %TDS_ERR%
 if not "%MAPONLY64_ERR%"=="0" exit /b %MAPONLY64_ERR%
 if not "%MAPONLY32_ERR%"=="0" exit /b %MAPONLY32_ERR%
+if not "%NESTED64_ERR%"=="0" exit /b %NESTED64_ERR%
+if not "%NESTED32_ERR%"=="0" exit /b %NESTED32_ERR%
 exit /b %TT32_ERR%

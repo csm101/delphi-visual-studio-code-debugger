@@ -877,7 +877,63 @@ STILL UNVERIFIED after that fix: `Self.Handle` itself. It is an RTTI property,
 so it takes the property path rather than the leaf fallback, and it has not been
 re-measured. Do not treat it as a known defect without doing so.
 
-### A bare identifier can resolve to an enum member of a NESTED type
+### A bare identifier could resolve to an enum member of a NESTED type — FIXED 2026-08-03
+
+Kept because how it was fixed matters more than that it was: the FIRST TWO
+rules that looked right were wrong, and the fixture caught both.
+
+The fix: `TTD32FileReader.TryResolveEnumLiteral` skips an enum whose type is
+declared inside a class or record, because its members are not reachable by a
+bare name from ANYWHERE — not even inside the owning class, which must write
+`TOwner.TEnum.Member`.
+
+Nesting is recovered from the RAW type name. LF_NESTTYPE ($0409) is NOT the
+answer and that is measured, not assumed: `DevTools\Td32NestTypeProbe` finds
+ZERO of those records in binaries that demonstrably contain nested types. The
+earlier attempt that "changed nothing" failed for this reason.
+
+Measured name forms (same probe):
+
+| form | meaning |
+|---|---|
+| `TVisibleMode` (dcc64) | unit-level |
+| `TdxPopupMenuController@TPopupMenuKind` (dcc64) | class-nested |
+| `@Unit@TVisibleMode` (dcc32) | unit-level |
+| `@Unit@Proc$qqrv@TRoutineKind` (dcc32) | routine-local |
+| `@Unit@TNestedHost@TInnerKind` (dcc32) | class-nested |
+
+Two rules were tried and REJECTED by measurement before the third stood up:
+
+  1. **"the raw name contains '@'"** — dcc32 qualifies EVERY type name with its
+     unit, so this refused every enum literal on a 32-bit target. It looked
+     like a fix on Hydra2 only because the one expression being checked was the
+     one that should be refused.
+  2. **"skip the leading empty segment and the unit segment"** — a DOTTED unit
+     name occupies two segments, so `@System@Uitypes@TColorRec` read as owner
+     "Uitypes" and every RTL type in a dotted unit became nested.
+
+What holds: split on '@'; if any segment before the type name carries a Borland
+signature marker ('$') the type is ROUTINE-scoped and stays visible (a mangled
+signature can itself contain '@', which is how a real type name lands in the
+owner slot of a routine-scoped name); otherwise the segment before the type
+name is a nesting owner only if a class or record of that name EXISTS in the
+type table. That last check is what separates an owner from a unit-name
+fragment, and it consults data rather than a naming convention.
+
+Verified on the real application: `Application` now answers `<not found>` — the
+same honest answer `Screen` already gave — while `frReadWrite`, a unit-level
+enum member in a runtime package, still resolves, and a local of that type still
+reads. Fixture `DebuggerTests\TestTarget\NestedEnumSample.dpr` (separate target,
+because adding declarations to TestTarget shifts the RSM per-unit import indices
+and has broken unrelated tests before); tests
+`NestedEnumMember_IsNotBareVisible` and
+`NestedTypeDetection_SeparatesUnitRoutineAndClass`.
+
+STILL TRUE, and not a defect: the VCL's real `Application` remains unresolvable
+in a deployment whose `vcl290.bpl` carries no debug info. "Not found" is the
+correct answer there.
+
+### (historical) A bare identifier can resolve to an enum member of a NESTED type
 
 Found by running the debugger against a real 32-bit VCL application
 (`hydra_2\ExtApps\AppContainer`), which is the only way it would have surfaced:

@@ -214,6 +214,38 @@ number. Assume any remaining one is currently invisible.
 
 ### CURRENT CURSOR
 
+**2026-08-03 -- the nested-enum wrong answer is CLOSED. Suite 1032 / 1028
+passed / 0 failed / 4 ignored.**
+
+This was the one item classed as blocking for production: a bare `Application`
+answered with a member of a class-nested DevExpress enum, with nothing marking
+it wrong. Now refused; `<Application: not found>` on Hydra2, same as `Screen`.
+
+The route matters more than the result. LF_NESTTYPE is NOT emitted (measured:
+zero records in binaries that demonstrably contain nested types), which is why
+the earlier attempt "changed nothing". Nesting is in the RAW type name instead
+-- and the first two readings of that name were WRONG and were caught by the
+new fixture, not by reasoning:
+
+  1. "contains '@'" -- dcc32 qualifies every type name with its unit, so it
+     refused EVERY enum on 32-bit. It looked correct on Hydra2 because the one
+     expression under test was the one that should be refused.
+  2. "skip the empty + unit segment" -- a DOTTED unit name takes two segments,
+     so `@System@Uitypes@TColorRec` read owner "Uitypes" and every RTL type in a
+     dotted unit became nested.
+
+Standing rule: routine-scoped ('$' in any segment before the type name) stays
+visible; otherwise the owner segment must NAME A CLASS OR RECORD THAT EXISTS in
+the type table. Full write-up in KNOWN_UNKNOWNS.
+
+New: `DevTools\Td32NestTypeProbe.dpr` (the probe that settled every question
+above) and `DebuggerTests\TestTarget\NestedEnumSample.dpr` (separate target --
+adding declarations to TestTarget shifts RSM import indices).
+
+Next on the production list: measure the residual RSM typeId exposure in
+`evaluate`, then cold-start/scale numbers.
+
+
 **2026-08-03 (later) -- raw stack scan, at the user's request.**
 
 The user asked for the JCL "brutal" mode: when the walk runs out in code with no

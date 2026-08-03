@@ -299,6 +299,9 @@ type
     // Type table built from SST_TYPES / SST_GLOBAL_TYPES.
     FTypes:           TArray<TTD32TypeRecord>; // indexed by record index
     FTypeIdToRecord:  TDictionary<Cardinal, Integer>; // GDATA32/BPREL32 TypeIdx
+    // Lowercased names of every class / record, for the nested-type test.
+    // Built lazily by EnsureOwnerTypeNames; nil until first asked.
+    FOwnerTypeNames:  TDictionary<string, Byte>;
                                                       // -> index in FTypes
     FNameToTypeIdx:   TDictionary<string, Integer>;   // lowercase demangled
                                                       // class/struct/enum name
@@ -317,6 +320,10 @@ type
     procedure LocateNamesSection;
     procedure BuildNamesIndex;
     function  ResolveNameByIndex(Idx: Cardinal): string;
+    // True when a RAW type name says the type is declared inside a class or
+    // record. Consults the type table, not just the shape of the name.
+    function  RawTypeNameIsNested(const RawName: string): Boolean;
+    procedure EnsureOwnerTypeNames;
     procedure ParseAllSourceModules;
     procedure ParseSourceModule(const Entry: TTD32DirectoryEntry);
     procedure ParseAllAlignSymbols;
@@ -516,6 +523,14 @@ type
     // main exe's TD32 covers only ~33 units (GlobalsU is not one; its `Globals`
     // lives in libSharedFormsD29.bpl, where the same scan finds it at RVA $6F198).
     function    DiagFindSymbolRecords(const NameFilter: string): TArray<string>;
+    // Diagnostic: every type whose RAW name is owner-qualified, i.e. declared
+    // inside a class or record. Exists because that is how nesting had to be
+    // recovered -- LF_NESTTYPE is not emitted (measured) -- and a rule that
+    // decides visibility must be checkable against a real binary.
+    function    DiagNestedTypes(const NameFilter: string): TArray<string>;
+    // Is this type declared INSIDE a class or record? Its members are then not
+    // reachable by a bare name from anywhere in the language.
+    function    IsNestedTypeName(const TypeName: string): Boolean;
   end;
 
 implementation
@@ -618,6 +633,7 @@ begin
   FProcLocalChains.Free;
   FRvaLocalChains.Free;
   FTypeIdToRecord.Free;
+  FOwnerTypeNames.Free;
   FNameToTypeIdx.Free;
   FModIndexUnit.Free;
   FUnitGlobals.Free;
@@ -2929,7 +2945,13 @@ begin
       $0407: begin // LF_STMEMBER
         Inc(Pos, 12);
       end;
-      $0409: begin // LF_NESTTYPE
+      $0409: begin // LF_NESTTYPE -- recognised, skipped
+        // Deliberately NOT used to detect nesting, and this is measured rather
+        // than assumed: `DevTools\Td32NestTypeProbe` finds ZERO of these in
+        // binaries that demonstrably contain class-nested types (0 relations in
+        // cxLibraryRS29.bpl, whose table does carry
+        // `TdxPopupMenuController@TPopupMenuKind`). Nesting is recoverable from
+        // the type's RAW NAME instead -- see IsNestedTypeName.
         Inc(Pos, 12);
       end;
       $0403: begin // LF_ENUMERATE -- enum value
@@ -3937,6 +3959,101 @@ begin
     end;
 end;
 
+function TTD32FileReader.DiagNestedTypes(const NameFilter: string): TArray<string>;
+begin
+  Result := [];
+  for var I := 0 to High(FTypes) do begin
+    if FTypes[I].NameIdx = 0 then
+      Continue;
+    var Raw := ResolveNameByIndex(FTypes[I].NameIdx);
+    if not RawTypeNameIsNested(Raw) then
+      Continue;
+    var Line := Format('%s   (typeId=$%x, kind=%d)',
+      [Raw, FTypes[I].Index, Ord(FTypes[I].Kind)]);
+    if (NameFilter = '') or Line.ToLower.Contains(NameFilter.ToLower) then
+      Result := Result + [Line];
+  end;
+end;
+
+// Is this raw type name a type declared INSIDE a class or record?
+//
+// The answer is in the OWNER SEGMENT, not in the presence of qualification --
+// and getting that wrong is not academic. "Contains '@'" was tried first and is
+// WRONG: dcc32 qualifies every type name with its unit, so that rule refused
+// every enum literal on a 32-bit target while looking like a fix, because the
+// one expression being checked happened to be the one that should be refused.
+//
+// Measured forms (DevTools\Td32NestTypeProbe):
+//   dcc64  TVisibleMode                                     unit-level
+//   dcc64  TRoutineKind                                     routine-local
+//   dcc64  TdxPopupMenuController@TPopupMenuKind            class-nested
+//   dcc32  @Nestedenumsample@TVisibleMode                   unit-level
+//   dcc32  @Nestedenumsample@UseRoutineLocalEnum$qqrv@TRoutineKind  routine-local
+//   dcc32  @Nestedenumsample@TNestedHost@TInnerKind         class-nested
+//
+// So: split on '@' and look at the segment immediately before the type name.
+// It is a nesting owner only when it is REALLY A TYPE, and that is checked
+// against the type table rather than against the shape of the name.
+//
+// Counting unit segments instead was tried and is WRONG: a dotted unit name
+// occupies two segments, so `@System@Uitypes@TColorRec` (unit System.UITypes)
+// read as owner "Uitypes" and every RTL type in a dotted unit was declared
+// nested. Asking whether a type of that name exists separates the two cases
+// exactly -- `TNestedHost` is a class in the table, `Uitypes` is not.
+//
+// A routine owner is excluded before that, by its Borland signature marker
+// ('$qqrv'): routine-local types must keep resolving, since their members ARE
+// reachable by a bare name inside that routine and the test target depends on
+// it.
+function TTD32FileReader.RawTypeNameIsNested(const RawName: string): Boolean;
+begin
+  Result := False;
+  if RawName = '' then
+    Exit;
+  var Parts := RawName.Split(['@']);
+  if Length(Parts) < 2 then
+    Exit;
+  // Any '$' before the type name means a ROUTINE is in the scope chain, and a
+  // type declared inside a routine is reachable by a bare name there. Checking
+  // only the immediately-preceding segment is not enough: a mangled signature
+  // can itself contain '@' (`...ScanForMemoryLeaks$qqrv@...@TSmallBlockPoolHeader@StrRec`),
+  // which puts a real type name in the owner slot of a routine-scoped name.
+  for var I := 0 to High(Parts) - 1 do
+    if Parts[I].Contains('$') then
+      Exit;
+  var Owner := Parts[High(Parts) - 1];
+  if Owner = '' then
+    Exit;
+  EnsureOwnerTypeNames;
+  Result := FOwnerTypeNames.ContainsKey(LowerCase(Owner));
+end;
+
+// Names of every class / record / structure in the table, for the nesting test
+// above. Built once from FTypes rather than searched per query: the enum scan
+// asks for it per enum type, and a linear search there would make a bare
+// identifier O(types squared) on a binary with hundreds of thousands of them.
+procedure TTD32FileReader.EnsureOwnerTypeNames;
+begin
+  if FOwnerTypeNames <> nil then
+    Exit;
+  FOwnerTypeNames := TDictionary<string, Byte>.Create;
+  for var I := 0 to High(FTypes) do
+    if FTypes[I].Kind in [tkClass, tkStructure] then
+      if FTypes[I].Name <> '' then
+        FOwnerTypeNames.AddOrSetValue(LowerCase(FTypes[I].Name), 0);
+end;
+
+function TTD32FileReader.IsNestedTypeName(const TypeName: string): Boolean;
+begin
+  Result := False;
+  if TypeName = '' then
+    Exit;
+  for var I := 0 to High(FTypes) do
+    if SameText(FTypes[I].Name, TypeName) and (FTypes[I].NameIdx <> 0) then
+      if RawTypeNameIsNested(ResolveNameByIndex(FTypes[I].NameIdx)) then
+        Exit(True);
+end;
+
 function TTD32FileReader.TryResolveEnumLiteral(const Name: string;
   out Ordinal: Integer; out EnumTypeName: string): Boolean;
 begin
@@ -3946,14 +4063,32 @@ begin
   // Unqualified enum literal (e.g. `wmRunning`): scan every enum type's
   // LF_ENUMERATE members; first match wins (mirrors the RSM provider). The
   // member Offset is the ordinal value, the member Name the literal.
+  //
+  // A CLASS-NESTED enum is skipped, because its members are not reachable by a
+  // bare name from ANYWHERE in the language -- not even inside the owning
+  // class, which must write `TOwner.TEnum.Member`. Without this the scan
+  // answered a bare identifier with a member of a type it could never mean.
+  //
+  // Measured on two real applications: `Application` resolved to the member of
+  // DevExpress's `TdxPopupMenuController.TPopupMenuKind = (External, VCL,
+  // Application)` -- strict protected, inside a class, in a unit the frame does
+  // not even use. It won only because the VCL's real `Application` lives in
+  // vcl290.bpl, which ships no debug info, so the global lookup missed and this
+  // scan answered from a strictly worse source. A wrong value with nothing
+  // marking it wrong is the one outcome a debugger may not produce; saying
+  // "not found" is the correct answer when the real symbol is unreachable.
   for var I := 0 to High(FTypes) do
-    if FTypes[I].Kind = tkEnum then
+    if FTypes[I].Kind = tkEnum then begin
+      if (FTypes[I].NameIdx <> 0) and
+         RawTypeNameIsNested(ResolveNameByIndex(FTypes[I].NameIdx)) then
+        Continue;
       for var M in FTypes[I].Members do
         if SameText(M.Name, Name) then begin
           Ordinal      := Integer(M.Offset);
           EnumTypeName := FTypes[I].Name;
           Exit(True);
         end;
+    end;
 end;
 
 // System.TypInfo.TTypeKind ordinal for a built-in scalar type, or 0 if the name

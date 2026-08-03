@@ -24,6 +24,10 @@ type
     function BplPath: string;
   public
     // --- Demangler (pure) ---
+    // A bare identifier must not resolve to a member of a class-nested enum,
+    // while unit-level and routine-local enums keep working.
+    [Test] procedure NestedEnumMember_IsNotBareVisible;
+    [Test] procedure NestedTypeDetection_SeparatesUnitRoutineAndClass;
     [Test] procedure Demangle_TopLevelProc_DropsUnit;
     [Test] procedure Demangle_ClassMethod_KeepsClassDotMethod;
     [Test] procedure Demangle_Constructor_C3_BecomesCreate;
@@ -1144,6 +1148,92 @@ begin
     Assert.AreEqual(LocExact.Line, LocFallback.Line,
       'fallback must surface the same line number');
   finally R.Free; end;
+end;
+
+// --- Nested types and bare-identifier visibility ---
+
+function NestedEnumSampleExe(const Bitness: string): string;
+begin
+  Result := ExtractFilePath(ParamStr(0)) +
+    '..\..\TestTarget\' + Bitness + '\Debug\NestedEnumSample.exe';
+end;
+
+// A bare identifier must never resolve to a member of a CLASS-NESTED enum:
+// `TNestedHost.TInnerKind.ikHidden` is the only legal spelling, so a bare
+// `ikHidden` means nothing, even inside TNestedHost. Meanwhile a unit-level
+// enum and a ROUTINE-LOCAL one must keep resolving -- the latter is exactly
+// what an over-broad rule breaks.
+//
+// Only x86 is asserted for the nested case. Measured: dcc64 does not emit the
+// nested `TInnerKind` into this fixture's type table at all, so on x64 there is
+// nothing to refuse and asserting a refusal would be asserting an accident.
+procedure TTD32ReaderTests.NestedEnumMember_IsNotBareVisible;
+begin
+  var Exe := NestedEnumSampleExe('Win32');
+  if not TFile.Exists(Exe) then
+    Assert.Fail('NestedEnumSample.exe (Win32) not found -- run build_target.bat first');
+  var R := TTD32FileReader.Create;
+  try
+    R.LoadFromFile(Exe);
+    var Ord_: Integer;
+    var EnumType: string;
+
+    Assert.IsFalse(R.TryResolveEnumLiteral('ikHidden', Ord_, EnumType),
+      'ikHidden is a member of a CLASS-NESTED enum and must not resolve by bare name');
+    Assert.IsFalse(R.TryResolveEnumLiteral('ikAlsoHidden', Ord_, EnumType),
+      'ikAlsoHidden is a member of a CLASS-NESTED enum and must not resolve by bare name');
+
+    // The other two scopes must be untouched, or the guard is just a blanket
+    // refusal wearing a rule's clothes.
+    Assert.IsTrue(R.TryResolveEnumLiteral('vmSecond', Ord_, EnumType),
+      'vmSecond is a UNIT-LEVEL enum member and must still resolve');
+    Assert.AreEqual(1, Ord_, 'vmSecond ordinal');
+    Assert.IsTrue(R.TryResolveEnumLiteral('rkBeta', Ord_, EnumType),
+      'rkBeta is a ROUTINE-LOCAL enum member and must still resolve');
+    Assert.AreEqual(1, Ord_, 'rkBeta ordinal');
+  finally
+    R.Free;
+  end;
+end;
+
+// The rule that decides the above, checked directly on the raw names, because
+// every wrong version of it was wrong in a way the enum test alone would not
+// have localised.
+procedure TTD32ReaderTests.NestedTypeDetection_SeparatesUnitRoutineAndClass;
+begin
+  for var Bitness in ['Win32', 'Win64'] do begin
+    var Exe := NestedEnumSampleExe(Bitness);
+    if not TFile.Exists(Exe) then
+      Assert.Fail('NestedEnumSample.exe (' + Bitness + ') not found -- run build_target.bat first');
+    var R := TTD32FileReader.Create;
+    try
+      R.LoadFromFile(Exe);
+      var Nested := R.DiagNestedTypes('');
+      for var Line in Nested do begin
+        // A dotted unit name occupies two segments, so an early version read
+        // `@System@Uitypes@TColorRec` as owner "Uitypes" and called every RTL
+        // type in a dotted unit nested.
+        Assert.IsFalse(Line.Contains('@Uitypes@TColorRec'),
+          Bitness + ': a type in a dotted-name UNIT was reported as class-nested: ' + Line);
+        // A mangled signature can itself contain '@', which put a real type
+        // name in the owner slot of a routine-scoped name.
+        Assert.IsFalse(Line.Contains('$qqr'),
+          Bitness + ': a ROUTINE-scoped type was reported as class-nested: ' + Line);
+      end;
+      // And the fixture's own nested type is found where it exists. dcc64 does
+      // not emit it, so this is asserted only where it is actually present.
+      if Bitness = 'Win32' then begin
+        var Found := False;
+        for var Line in Nested do
+          if Line.Contains('TNestedHost@TInnerKind') then
+            Found := True;
+        Assert.IsTrue(Found,
+          'the class-nested TInnerKind was not detected: ' + string.Join(' | ', Nested));
+      end;
+    finally
+      R.Free;
+    end;
+  end;
 end;
 
 // --- External .tds ---
