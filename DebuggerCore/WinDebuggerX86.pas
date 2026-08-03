@@ -246,17 +246,31 @@ const
   // routine while pointing at its `finally` block. Decoding forward from a
   // known instruction boundary is the only exact method; the line table
   // supplies the boundary, since every line record starts an instruction.
-  function IsAfterCallSite(VA: UInt64): Boolean;
+  function CallSiteVerdict(VA: UInt64): TCallSiteAnswer;
   begin
     var StartVA: UInt64;
     if not NearestInstructionBoundaryBefore(VA, StartVA) then
-      Exit(False);
+      Exit(csaUndecidable);
     Result := CallSiteEndsAt(
       function(At: UInt64; Buf: Pointer; Size: Integer): Boolean
       begin
         Result := ReadProcessMemoryAt(At, Buf, Size);
       end,
-      StartVA, VA) = csaYes;
+      StartVA, VA);
+  end;
+
+  function IsAfterCallSite(VA: UInt64): Boolean;
+  begin
+    Result := CallSiteVerdict(VA) = csaYes;
+  end;
+
+  // Only a PROVEN negative. Used where a frame is already on offer and the
+  // question is whether to keep it, rather than whether to invent one: an
+  // address the decoder cannot judge is left alone, an address it can prove is
+  // not preceded by a call is refused.
+  function IsProvenNotAfterCallSite(VA: UInt64): Boolean;
+  begin
+    Result := CallSiteVerdict(VA) = csaNo;
   end;
 
   // A FRAMELESS routine between two framed ones is invisible to the chain: it
@@ -498,6 +512,19 @@ begin
     if (Cand.PC = 0) or (Cand.PC > $FFFFFFFF) then
       Break;
     if not IsPlausibleReturnAddress(Cand.PC) then
+      Break;
+    // "Executable code in a known module" is not the same claim as "a return
+    // address", and dbghelp's i386 tail supplies the difference. Measured on a
+    // real BPL-loading application: below three kernel32/ntdll frames it offered
+    // `frmLogModificheVegaU.pas:148`, which is impossible -- application code
+    // cannot call the OS thread starter. Decoding says why: that address is a
+    // function ENTRY, and the byte before it is `C3`, a `ret`.
+    //
+    // Only a PROVEN negative stops the tail. The OS frames themselves carry no
+    // line table, so no boundary is available to decode from and the verdict is
+    // undecidable -- those are kept, which is what preserves the legitimate
+    // kernel32/ntdll tail.
+    if IsProvenNotAfterCallSite(Cand.PC) then
       Break;
     if (Cand.FramePtr > $FFFFFFFF) or ((Cand.FramePtr and 3) <> 0) then
       Cand.FramePtr := 0;   // unknown, which the locals decode already handles

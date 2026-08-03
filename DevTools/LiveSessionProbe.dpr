@@ -32,6 +32,39 @@ type
     Line:       Integer;
   end;
 
+  // Captures the debuggee's exit code. `OnSessionExited` is `of object`, so it
+  // needs an instance to hang off; this is that instance and nothing more.
+  TExitWatch = class
+    Code: Integer;
+    procedure Note(ExitCode: Integer);
+  end;
+
+var
+  GExitWatch: TExitWatch;
+
+procedure TExitWatch.Note(ExitCode: Integer);
+begin
+  Code := ExitCode;
+end;
+
+function GExitCode: Integer;
+begin
+  Result := GExitWatch.Code;
+end;
+
+// A plain-language reading, because the number alone invites the wrong
+// conclusion. 0 means the program decided to stop; anything else means it was
+// stopped, and under a debugger that is worth investigating rather than
+// assuming the user clicked the X.
+function ExitCodeMeaning(Code: Integer): string;
+begin
+  if Code = 0 then
+    Exit('normal termination -- e.g. the window was closed');
+  if Cardinal(Code) >= $C0000000 then
+    Exit('NTSTATUS exception -- the process was killed by a fault');
+  Result := 'non-zero: the program terminated itself deliberately';
+end;
+
 function ParseBpSpec(const S: string; out Req: TBpRequest): Boolean;
 begin
   Result := False;
@@ -316,6 +349,7 @@ procedure Run(const ExePath, SourceRoot: string; const Bps: TArray<TBpRequest>;
   const Evals, Script: TArray<string>; Seconds: Integer; const TargetArgs: string);
 begin
   var Session := TDebugSession.Create;
+  Session.OnSessionExited := GExitWatch.Note;
   try
     var Opts := Default(TLaunchOptions);
     Opts.ExePath     := ExePath;
@@ -406,7 +440,11 @@ begin
     end;
 
     if Session.HasExited then
-      Writeln('target exited')
+      // The CODE matters, not just the fact. "The target exited" reads the same
+      // whether a human closed the window or the process died under the
+      // debugger, and those call for opposite conclusions. 0 is a normal close.
+      Writeln(Format('target exited, exit code %d (%s)',
+        [GExitCode, ExitCodeMeaning(GExitCode)]))
     else begin
       Writeln(Format('time is up after %d stop(s); detaching and leaving the ' +
                      'target running', [StopIndex]));
@@ -418,6 +456,7 @@ begin
 end;
 
 begin
+  GExitWatch := TExitWatch.Create;
   try
     if ParamCount < 3 then begin
       Writeln('usage: LiveSessionProbe <exe> <sourceRoot> <file:line>[,<file:line>...]');
