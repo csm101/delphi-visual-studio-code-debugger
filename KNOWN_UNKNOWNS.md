@@ -680,12 +680,12 @@ channel; `TDebugSession.OnConsole` would be the sink).
   `supportsReadMemoryRequest`). The maintainer's call, 2026-08-03: not useful
   enough to a HUMAN on its own, and it belongs with the disassembly view — a
   memory pane without a disassembler is half a tool. Do the two together.
-- **`modules` / `loadedSources` requests** — never implemented on either
-  frontend, though the engine tracks every loaded module and its symbol state
-  (`TSymbolAvailability`, already surfaced per frame). Maintainer's call: may be
-  worth it for the MCP server, where an agent has no other way to ask "which
-  packages are loaded and which have symbols"; not for DAP for now, where the
-  same information already rides on each frame.
+- **`modules` / `loadedSources` requests — DONE for MCP, deliberately not for
+  DAP.** `get_loaded_modules` exposes every mapped image with its base, size,
+  symbol state and the debug-info formats that actually registered. The DAP
+  `modules` request stays unimplemented by the maintainer's call: the same
+  information already rides on every frame there, while an agent had no other
+  way to ask it.
 - **`setExpression`** — unimplemented and not advertised, so assigning from the
   WATCH panel does nothing while assigning in the Variables panel works
   (`setVariable`). The engine primitives exist (`SetLocalVariable`,

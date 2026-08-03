@@ -29,6 +29,7 @@ function VarListToJson(const Vars: TArray<TSessionVariable>): TJSONArray;
 function EvalResultToJson(const R: TSessionEvalResult): TJSONObject;
 function ExceptionToJson(const E: TSessionExceptionInfo): TJSONObject;
 function SnapshotToJson(const S: TCompactSnapshot): TJSONObject;
+function ModuleListToJson(const Modules: TArray<TSessionModule>): TJSONArray;
 function StringListToJson(const Items: TArray<string>): TJSONArray;
 
 implementation
@@ -268,6 +269,30 @@ begin
     Result.AddPair('locals', VarListToJson(S.Locals));
     if S.HasException then
       Result.AddPair('exception', ExceptionToJson(S.Exception_));
+  end;
+end;
+
+function ModuleListToJson(const Modules: TArray<TSessionModule>): TJSONArray;
+begin
+  Result := TJSONArray.Create;
+  for var M in Modules do begin
+    var O := TJSONObject.Create;
+    O.AddPair('name', M.Name);
+    if M.Path <> '' then
+      O.AddPair('path', M.Path);
+    O.AddPair('isMain', TJSONBool.Create(M.IsMain));
+    if M.Base <> 0 then
+      O.AddPair('base', '0x' + IntToHex(M.Base, 1));
+    if M.Size <> 0 then
+      O.AddPair('size', TJSONNumber.Create(Int64(M.Size)));
+    // Same vocabulary the frames use, so "why is this frame nameless" and "what
+    // does this module have" are answered in one language.
+    O.AddPair('symbols', SymbolAvailabilityName(M.Symbols));
+    // Which formats actually LOADED. `symbols:"loaded"` with an empty list
+    // cannot happen; `noSymbols` with an empty list is the ordinary case of a
+    // module built without debug info.
+    O.AddPair('formats', StringListToJson(M.Formats));
+    Result.Add(O);
   end;
 end;
 

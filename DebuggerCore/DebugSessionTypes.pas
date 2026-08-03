@@ -192,6 +192,23 @@ type
   // exactly. ExceptionFiltersSet must be True for ExceptionFilters/
   // DelphiClassFilter to be applied; an empty ExceptionRules array is not
   // pushed to the engine. A caller that passes nothing (MCP) changes nothing.
+  // One image mapped in the debuggee, and what the debugger can say about it.
+  //
+  // `Formats` is the point: "has symbols" is not one fact but several, and a
+  // module answering from a `.map` alone cannot do what one with TD32 can.
+  // Listing the formats that actually REGISTERED (not the ones that were
+  // looked for) is what lets a caller tell "built without debug info" from
+  // "sidecar missing next to the binary".
+  TSessionModule = record
+    Name:     string;    // lowercase file name, e.g. 'libtabanagd29.bpl'
+    Path:     string;    // full path when the OS reported one
+    Base:     UInt64;    // actual load base (may differ from the preferred one)
+    Size:     UInt64;    // SizeOfImage, 0 when it could not be read
+    IsMain:   Boolean;   // the executable itself, not a runtime-loaded module
+    Symbols:  TSymbolAvailability;
+    Formats:  TArray<string>;  // 'td32' | 'tds' | 'map' | 'rsm' | 'dcp' | 'jdbg'
+  end;
+
   TLaunchOptions = record
     ExePath:          string;
     MapPath:          string;

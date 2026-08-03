@@ -112,6 +112,15 @@ To attach to processes owned by another user or elevated targets, run the client
   `get_exception_details`,
   `get_debuggee_output` (program stdout), `get_debugger_output` (logpoint
   messages and debugger notices).
+- `get_loaded_modules` — every image mapped in the debuggee (executable first,
+  then each DLL / runtime package) with `base`, `size`, `symbols` and
+  `formats`. `symbols` uses the same vocabulary as the frames (`loaded`,
+  `noSymbols`, `indexing`); `formats` lists what actually REGISTERED (`td32`,
+  `map`, `rsm`, `dcp`, `jdbg`, `tds`), not what was looked for — so an empty
+  list beside `noSymbols` means the binary carries none, rather than a sidecar
+  merely being absent. Answers the two questions a nameless frame raises, and
+  tells whether a breakpoint that has not bound is waiting for a package that
+  is not loaded yet. Valid while running, not only while stopped.
 - `get_raw_stack_scan` (`threadId`, `maxItems`) — **last resort, and not a call
   stack.** Brute-force sweep of the thread's stack for words that could be
   return addresses, for when `get_call_stack` stops short: a 32-bit target

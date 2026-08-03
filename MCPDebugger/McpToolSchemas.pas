@@ -193,6 +193,18 @@ begin
     [Prop('threadId', 'integer',
       'OS thread id to walk (from get_threads). Omit for the current stopped thread.', False)]));
 
+  Result.Add(MakeTool('get_loaded_modules',
+    'List every image mapped in the debuggee (the executable first, then each DLL / runtime ' +
+    'package), with its load base, size, symbol state and the debug-info formats that actually ' +
+    'loaded for it. Answers the two questions a nameless frame raises: is the owning module even ' +
+    'loaded, and does it carry debug info. `symbols` is the same vocabulary the frames use -- ' +
+    '"loaded", "noSymbols" (built without debug info), "indexing" (retry shortly). `formats` ' +
+    'lists what REGISTERED ("td32", "map", "rsm", "dcp", "jdbg", "tds"), not what was looked ' +
+    'for, so an empty list next to "noSymbols" means the binary has none rather than that a ' +
+    'sidecar is merely missing. Also the way to tell whether a breakpoint that has not bound is ' +
+    'waiting for a package that is not loaded YET. Valid while running as well as while stopped.',
+    []));
+
   Result.Add(MakeTool('get_raw_stack_scan',
     'LAST RESORT, and NOT a call stack. Brute-force sweep of the thread''s stack for words ' +
     'that could be return addresses, ordered from the top of the stack down. Use it only when ' +

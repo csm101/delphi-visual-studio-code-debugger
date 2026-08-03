@@ -238,6 +238,10 @@ type
     // GetCallStack on purpose: the results are positions, not a chain.
     function  GetRawStackScan(ThreadId: Cardinal = 0;
                 MaxItems: Integer = 0): TArray<TSessionFrame>;
+    // Every image mapped in the debuggee, main module first, with its symbol
+    // state and the debug-info formats that actually loaded for it. Valid
+    // whenever a process exists -- it describes the address space, not a stop.
+    function  GetModules: TArray<TSessionModule>;
     function  GetCurrentLocation(out FnName, SrcFile: string;
                 out Line: Integer): Boolean;
     function  GetLocals: TArray<TSessionVariable>;
@@ -1267,6 +1271,49 @@ begin
   SetLength(Result, Length(Frames));
   for var I := 0 to High(Frames) do
     Result[I] := FrameToSession(Frames[I], I);
+end;
+
+function TDebugSession.GetModules: TArray<TSessionModule>;
+
+  // The formats a runtime module actually registered, read off the provider
+  // references themselves. A `*Tried` flag would say only that a format was
+  // looked for.
+  function FormatsOf(M: TModuleSymbols): TArray<string>;
+  begin
+    Result := [];
+    if M.Td32Iface <> nil then Result := Result + ['td32'];
+    if M.TdsIface  <> nil then Result := Result + ['tds'];
+    if M.MapIface  <> nil then Result := Result + ['map'];
+    if M.RsmIface  <> nil then Result := Result + ['rsm'];
+    if M.DcpIface  <> nil then Result := Result + ['dcp'];
+    if M.JclIface  <> nil then Result := Result + ['jdbg'];
+  end;
+
+begin
+  Result := nil;
+  if (FDebugger = nil) or (FLoader = nil) then
+    Exit;
+
+  var Main := Default(TSessionModule);
+  Main.IsMain  := True;
+  Main.Path    := FExePath;
+  Main.Name    := LowerCase(ExtractFileName(FExePath));
+  Main.Base    := FDebugger.ImageBase;
+  Main.Size    := FLoader.MainImageSize;
+  Main.Symbols := FLoader.MainSymbolAvailability;
+  Main.Formats := FLoader.MainSymbolFormats;
+  Result := [Main];
+
+  for var M in FLoader.Modules do begin
+    var Rec := Default(TSessionModule);
+    Rec.Name    := M.Name;
+    Rec.Path    := M.FullPath;
+    Rec.Base    := M.Base;
+    Rec.Size    := M.ImageSize;
+    Rec.Symbols := M.SymbolAvailability;
+    Rec.Formats := FormatsOf(M);
+    Result := Result + [Rec];
+  end;
 end;
 
 // Opt-in raw sweep of the stopped thread's stack. Never called by GetCallStack

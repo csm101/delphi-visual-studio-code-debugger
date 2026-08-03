@@ -40,6 +40,11 @@ type
     // because an agent that mistakes one for a call chain will report a routine
     // as "called this" when it merely ran earlier.
     [Test] procedure RawStackScan_HitsAreMarkedAsPositions;
+    // The module list must describe the EXE on the same terms as every runtime
+    // module, and must say which formats actually loaded -- an agent asking
+    // "why is this frame nameless" needs "the module has no debug info" to be
+    // distinguishable from "the module is not loaded".
+    [Test] procedure LoadedModules_DescribeMainAndPackages;
   end;
 
 implementation
@@ -387,6 +392,75 @@ begin
       Assert.IsTrue(O.GetValue<string>('value', '').Contains('42'), 'W.FValue mismatch: ' + O.ToJSON);
     finally
       R.Free;
+    end;
+
+    C.CallTool('terminate_debuggee', nil).Free;
+  finally
+    C.Free;
+  end;
+end;
+
+procedure TMcpE2ETests.LoadedModules_DescribeMainAndPackages;
+begin
+  var Line := MarkerLine(EVAL_SOURCE, EVAL_MARKER);
+  var C := TMcpTestClient.Start(McpExe);
+  try
+    C.Call('initialize', nil).Free;
+
+    var LaunchArgs := TJSONObject.Create;
+    LaunchArgs.AddPair('program', TargetExe);
+    LaunchArgs.AddPair('sourceRoot', TargetDir);
+    C.CallTool('launch_debuggee', LaunchArgs).Free;
+
+    var BpArgs := TJSONObject.Create;
+    BpArgs.AddPair('sourceFile', EVAL_SOURCE);
+    BpArgs.AddPair('line', TJSONNumber.Create(Line));
+    C.CallTool('set_breakpoint', BpArgs).Free;
+    C.CallTool('continue_and_wait', nil).Free;
+
+    var Mods := C.CallTool('get_loaded_modules', nil);
+    try
+      var Arr := Mods as TJSONArray;
+      // The registry is fed by the LOAD_DLL debug events, so it is not just the
+      // modules the debugger happened to load symbols for: every Windows
+      // process maps ntdll, and a list of length 1 would mean the runtime
+      // modules never reach it.
+      Assert.IsTrue(Arr.Count >= 2,
+        'only the main image was listed -- runtime modules are missing: ' + Arr.ToJSON);
+
+      var MainCount := 0;
+      var MainFormats := 0;
+      for var I := 0 to Arr.Count - 1 do begin
+        var O := Arr.Items[I] as TJSONObject;
+        Assert.IsTrue(O.GetValue<string>('name', '') <> '',
+          'a module has no name: ' + O.ToJSON);
+        // Every entry must state its symbol position, main image included --
+        // the exe being the one row with no answer was the defect this guards.
+        Assert.IsTrue(O.GetValue<string>('symbols', '') <> '',
+          'module ' + O.GetValue<string>('name', '') + ' has no symbol state: ' + O.ToJSON);
+        var Formats := O.GetValue<TJSONArray>('formats');
+        Assert.IsNotNull(Formats,
+          'module ' + O.GetValue<string>('name', '') + ' has no formats list: ' + O.ToJSON);
+        // "loaded" without a single registered format would be self-
+        // contradictory: something must have supplied the symbols.
+        if O.GetValue<string>('symbols', '') = 'loaded' then
+          Assert.IsTrue(Formats.Count > 0,
+            'module ' + O.GetValue<string>('name', '') +
+            ' claims loaded symbols but lists no format: ' + O.ToJSON);
+        if O.GetValue<Boolean>('isMain', False) then begin
+          Inc(MainCount);
+          MainFormats := Formats.Count;
+          Assert.IsTrue(SameText(ExtractFileName(TargetExe), O.GetValue<string>('name', '')),
+            'the main module is not the launched exe: ' + O.ToJSON);
+        end;
+      end;
+      Assert.AreEqual(1, MainCount, 'exactly one module must be the main image: ' + Arr.ToJSON);
+      // The fixture is built with debug info, so the exe must report at least
+      // one provider; zero would mean the format list is never populated.
+      Assert.IsTrue(MainFormats > 0,
+        'the main image reports no debug-info format: ' + Arr.ToJSON);
+    finally
+      Mods.Free;
     end;
 
     C.CallTool('terminate_debuggee', nil).Free;

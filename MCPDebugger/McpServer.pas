@@ -626,6 +626,18 @@ begin
         SendToolJson(IdJson, McpJson.FrameListToJson(FSession.GetCallStack));
       Exit;
     end;
+    if Name = 'get_loaded_modules' then begin
+      // Deliberately NOT gated on being stopped: which images are mapped is a
+      // property of the process, and the question is most useful exactly when a
+      // breakpoint has not bound yet and the agent needs to know whether the
+      // owning package is even loaded.
+      var Mods := FSession.GetModules;
+      if Length(Mods) = 0 then
+        SendToolError(IdJson, 'No active debuggee. Launch or attach first.')
+      else
+        SendToolJson(IdJson, McpJson.ModuleListToJson(Mods));
+      Exit;
+    end;
     if Name = 'get_raw_stack_scan' then begin
       if not Stopped then begin
         SendToolError(IdJson, 'Cannot sweep the stack while the debuggee is running. Pause or wait for a stop first.');

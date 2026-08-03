@@ -228,6 +228,9 @@ type
     // Count of main-module providers actually registered (TD32 / RSM / MAP / JCL),
     // so LoadMainModule can warn when the exe has NO usable debug info at all.
     FMainProviderCount: Integer;
+    // Format names of the main-module providers that were actually registered,
+    // in registration order (see AddMainProvider).
+    FMainFormats:       TArray<string>;
     // Main-module extent, so an address in the exe can be attributed to it. The
     // exe is deliberately NOT in the runtime registry (it must never be probed
     // for DLL sidecars), so it needs its own range check.
@@ -259,11 +262,18 @@ type
     function  PrefetchBlocks(Module: TModuleSymbols): Boolean;
     function  ShouldRetry(const AName: string): Boolean;
     function  RequiresOf(Module: TModuleSymbols): TArray<string>;
-    procedure AddMainProvider(const Provider: IInterface; Primary: Boolean = False);
+    procedure AddMainProvider(const Provider: IInterface; const Format: string;
+                Primary: Boolean = False);
     function  GetMainTD32: TTD32FileReader;
     function  MainModuleContainsPC(PC: UInt64): Boolean;
-    function  MainSymbolAvailability: TSymbolAvailability;
   public
+    // Symbol state of the MAIN image, and which formats actually supplied it.
+    // Public because a frontend listing modules has to describe the exe on the
+    // same terms as every DLL/BPL; without it the main module would be the one
+    // entry with no answer.
+    function  MainSymbolAvailability: TSymbolAvailability;
+    function  MainSymbolFormats: TArray<string>;
+    property  MainImageSize: UInt64 read FMainImageSize;
     constructor Create;
     destructor  Destroy; override;
 
@@ -803,7 +813,7 @@ begin
 end;
 
 procedure TModuleSymbolLoader.AddMainProvider(const Provider: IInterface;
-  Primary: Boolean = False);
+  const Format: string; Primary: Boolean = False);
 begin
   var ImageSize := ReadPEImageSize(FExePath);
   if ImageSize > 0 then
@@ -811,6 +821,16 @@ begin
   else
     FDebugInfo.AddProvider(Provider, Primary);
   Inc(FMainProviderCount);
+  // Recorded HERE, where the registration actually happens, rather than
+  // inferred afterwards from the various *Loaded flags: those say an attempt
+  // was made, not that a provider was accepted.
+  if Format <> '' then
+    FMainFormats := FMainFormats + [Format];
+end;
+
+function TModuleSymbolLoader.MainSymbolFormats: TArray<string>;
+begin
+  Result := FMainFormats;
 end;
 
 { Main module }
@@ -836,7 +856,7 @@ begin
   end;
   Console('Loading RSM type info: ' + FRsmPath);
   FMainRsm.LoadFromFile(FRsmPath);
-  AddMainProvider(FMainRsm);
+  AddMainProvider(FMainRsm, 'rsm');
   Console('RSM loaded');
 end;
 
@@ -848,7 +868,7 @@ begin
     // Expose locals so DebugInfoSet.GetLocalsForFunction can merge TD32's better
     // TypeHints (managed types via $003x leaves) on top of RSM's locals.
     FMainTD32.ExposeLocals := True;
-    AddMainProvider(FMainTD32 as IInterface, {Primary=}True);
+    AddMainProvider(FMainTD32 as IInterface, 'td32', {Primary=}True);
     Result := True;
     Console('TD32 loaded');
   except
@@ -884,7 +904,7 @@ begin
   try
     FMainTds.LoadFromTdsFile(TdsPath, FExePath);
     FMainTds.ExposeLocals := True;
-    AddMainProvider(FMainTds as IInterface, {Primary=}True);
+    AddMainProvider(FMainTds as IInterface, 'tds', {Primary=}True);
     Result := True;
     Console('TDS (external -VT debug info) loaded: ' + TdsPath);
   except
@@ -917,7 +937,7 @@ begin
   if not CreateJclDebugProvider(FExePath, 0, ReadPEImageSize(FExePath), Prov) then
     Exit;
   FMainJcl := Prov;
-  AddMainProvider(Prov);
+  AddMainProvider(Prov, 'jdbg');
   if Linked then
     Console('JCL debug info loaded (linked JCLDEBUG section): ' + FExePath)
   else
@@ -930,7 +950,7 @@ begin
     Exit;
   Console('Loading MAP: ' + FMapPath);
   FMainMap.LoadFromFile(FMapPath, ReadPEPreferredBase(FExePath));
-  AddMainProvider(FMainMap);
+  AddMainProvider(FMainMap, 'map');
   FMainMapRegistered := True;
   Console('MAP loaded');
 end;
