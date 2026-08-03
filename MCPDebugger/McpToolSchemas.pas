@@ -193,6 +193,22 @@ begin
     [Prop('threadId', 'integer',
       'OS thread id to walk (from get_threads). Omit for the current stopped thread.', False)]));
 
+  Result.Add(MakeTool('get_raw_stack_scan',
+    'LAST RESORT, and NOT a call stack. Brute-force sweep of the thread''s stack for words ' +
+    'that could be return addresses, ordered from the top of the stack down. Use it only when ' +
+    'get_call_stack STOPS short -- 32-bit targets carry no unwind data, so the walk ends at the ' +
+    'first routine built without a frame pointer -- and the question is which of the user''s own ' +
+    'routines is somewhere underneath. Each hit is marked kind="rawStackHit"; proven=true means ' +
+    'the instruction ending at that address was DECODED and is a call, proven=false means there ' +
+    'was no line table to decode from. NEITHER means the routine is still on the current chain: ' +
+    'a call that has already returned leaves its return address behind, and no sweep can tell the ' +
+    'difference. Report these as places the program HAS BEEN, never as callers, and never merge ' +
+    'them into a call stack.',
+    [Prop('threadId', 'integer',
+       'OS thread id to sweep (from get_threads). Omit for the current stopped thread.', False),
+     Prop('maxItems', 'integer',
+       'Stop after this many hits. Omit for all of them.', False)]));
+
   Result.Add(MakeTool('get_threads',
     'List the debuggee''s threads at the current stop (id, name, isStopped, isCurrent). ' +
     'isCurrent marks the thread the debugger reports for this stop -- after a pause that is ' +

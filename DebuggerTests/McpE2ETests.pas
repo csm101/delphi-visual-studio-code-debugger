@@ -35,6 +35,11 @@ type
     [Test] procedure Relaunch_AfterTerminate_Succeeds;
     [Test] procedure Evaluate_Object_IsExpandable;
     [Test] procedure Locals_FrameIndex_ReadsCallerFrame;
+    // The raw sweep as an AGENT sees it. What matters is not that it finds
+    // things -- it is that every hit says it is a position and not a caller,
+    // because an agent that mistakes one for a call chain will report a routine
+    // as "called this" when it merely ran earlier.
+    [Test] procedure RawStackScan_HitsAreMarkedAsPositions;
   end;
 
 implementation
@@ -382,6 +387,67 @@ begin
       Assert.IsTrue(O.GetValue<string>('value', '').Contains('42'), 'W.FValue mismatch: ' + O.ToJSON);
     finally
       R.Free;
+    end;
+
+    C.CallTool('terminate_debuggee', nil).Free;
+  finally
+    C.Free;
+  end;
+end;
+
+procedure TMcpE2ETests.RawStackScan_HitsAreMarkedAsPositions;
+begin
+  var Line := MarkerLine(EVAL_SOURCE, EVAL_MARKER);
+  var C := TMcpTestClient.Start(McpExe);
+  try
+    C.Call('initialize', nil).Free;
+
+    var LaunchArgs := TJSONObject.Create;
+    LaunchArgs.AddPair('program', TargetExe);
+    LaunchArgs.AddPair('sourceRoot', TargetDir);
+    C.CallTool('launch_debuggee', LaunchArgs).Free;
+
+    var BpArgs := TJSONObject.Create;
+    BpArgs.AddPair('sourceFile', EVAL_SOURCE);
+    BpArgs.AddPair('line', TJSONNumber.Create(Line));
+    C.CallTool('set_breakpoint', BpArgs).Free;
+    C.CallTool('continue_and_wait', nil).Free;
+
+    // The walked stack must stay clean: no tool other than the sweep may ever
+    // hand an agent a rawStackHit.
+    var Walked := C.CallTool('get_call_stack', nil);
+    try
+      var WArr := Walked as TJSONArray;
+      for var I := 0 to WArr.Count - 1 do
+        Assert.AreEqual('', (WArr.Items[I] as TJSONObject).GetValue<string>('kind', ''),
+          'get_call_stack returned a marked hit: ' + WArr.ToJSON);
+    finally
+      Walked.Free;
+    end;
+
+    var Raw := C.CallTool('get_raw_stack_scan', nil);
+    try
+      var Arr := Raw as TJSONArray;
+      Assert.IsTrue(Arr.Count > 0, 'raw sweep found nothing: ' + Arr.ToJSON);
+      for var I := 0 to Arr.Count - 1 do begin
+        var O := Arr.Items[I] as TJSONObject;
+        // Both fields, on EVERY hit. `kind` alone would leave `proven` to be
+        // inferred from its absence, and an agent reading a missing field as
+        // false is exactly the failure this is guarding against.
+        Assert.AreEqual('rawStackHit', O.GetValue<string>('kind', ''),
+          'a sweep hit is not marked as one: ' + O.ToJSON);
+        Assert.IsNotNull(O.FindValue('proven'),
+          'a sweep hit does not say whether it was proven: ' + O.ToJSON);
+      end;
+      // Deliberately NOT asserted here: that some hit came back proven=true.
+      // This fixture is x64, and the call-site proof needs an instruction-length
+      // decoder the engine only has for x86 -- so on a 64-bit target every hit
+      // is honestly proven=false. Measured, not assumed: the first version of
+      // this test demanded a proven hit and failed for exactly that reason.
+      // The proof itself is covered on x86 by
+      // RawStackScan_FindsTheChainAndSaysItIsRaw.
+    finally
+      Raw.Free;
     end;
 
     C.CallTool('terminate_debuggee', nil).Free;

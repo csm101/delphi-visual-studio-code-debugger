@@ -171,6 +171,16 @@ begin
     // 'unknownModule' (nothing mapped there), 'loaded' (symbols present -- this
     // particular address just is not covered by them).
     O.AddPair('symbols', SymbolAvailabilityName(F.Symbols));
+    // A raw-sweep hit must not read like a walked frame to an agent either. It
+    // is a POSITION on the stack: `proven` says the instruction ending at that
+    // address was decoded and is a call, and NEITHER value says the routine is
+    // still on the current chain -- a call that has already returned leaves its
+    // return address behind. Walked frames carry no `kind`, so existing
+    // consumers see no change.
+    if F.Origin in [foRawProven, foRawUnproven] then begin
+      O.AddPair('kind',   'rawStackHit');
+      O.AddPair('proven', TJSONBool.Create(F.Origin = foRawProven));
+    end;
     Result.Add(O);
   end;
 end;

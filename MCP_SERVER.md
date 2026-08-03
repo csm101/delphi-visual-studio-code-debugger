@@ -112,6 +112,17 @@ To attach to processes owned by another user or elevated targets, run the client
   `get_exception_details`,
   `get_debuggee_output` (program stdout), `get_debugger_output` (logpoint
   messages and debugger notices).
+- `get_raw_stack_scan` (`threadId`, `maxItems`) — **last resort, and not a call
+  stack.** Brute-force sweep of the thread's stack for words that could be
+  return addresses, for when `get_call_stack` stops short: a 32-bit target
+  carries no unwind data, so the walk ends at the first routine built without a
+  frame pointer. Every hit is marked `kind:"rawStackHit"` plus `proven` —
+  `true` means the instruction ending there was decoded and is a `call`, `false`
+  means there was no line table to decode from. Neither value says the routine
+  is still on the current chain: a call that has already returned leaves its
+  return address behind. Report these as places the program *has been*, never as
+  callers. (On x64 every hit is `proven:false` — the call-site decoder is x86
+  only.)
 - `expand_variable` (`handle`) — read the child fields of a class instance or
   record. `get_locals` / `get_compact_debug_snapshot` mark an expandable value
   with `expandable:true` and a `handle`; pass that handle here. Nested

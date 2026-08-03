@@ -242,6 +242,14 @@ Measured on Hydra2: `QBFCreateForm` (qbfd29.bpl), four cxLibraryRS29 routines,
 `CheckSize` and `CMVisibleChanged` (hydra2.exe) -- user code the walk did not
 show. Test: `RawStackScan_FindsTheChainAndSaysItIsRaw`, both bitnesses.
 
+MCP surface DONE too (`get_raw_stack_scan`). Every hit carries
+`kind:"rawStackHit"` + `proven`, and the tool description tells the agent in as
+many words never to merge them into a call stack. Test
+`RawStackScan_HitsAreMarkedAsPositions` also asserts the converse: `get_call_stack`
+must never return a marked hit. NOTE, measured: that fixture is x64, where every
+hit is honestly `proven:false` because the call-site decoder is x86 only -- the
+first version of the test demanded a proven hit and failed for that reason.
+
 DAP surface DONE (the user asked for it directly; deferring it had been my call,
 not theirs): `"rawStackScan": true` in launch.json appends the sweep below the
 walked frames, each marked `[raw]` / `[raw?]` in the name AND

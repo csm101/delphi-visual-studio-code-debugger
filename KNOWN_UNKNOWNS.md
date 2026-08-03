@@ -673,6 +673,23 @@ channel; `TDebugSession.OnConsole` would be the sink).
 - **Disassembly view** — `disassemble` request is unimplemented; need
   a disassembler we can ship (zydis? capstone?) or a hand-rolled
   Delphi-prologue-aware one.
+- **`readMemory` / `writeMemory` on DAP — DEFERRED, not missed.** The engine
+  has both (`ReadProcessMemoryAt` / `WriteMemoryAt`) and the MCP server exposes
+  them as `read_memory` / `write_memory`; only the DAP side is absent, so
+  VS Code's hex viewer never lights up (it keys off
+  `supportsReadMemoryRequest`). The maintainer's call, 2026-08-03: not useful
+  enough to a HUMAN on its own, and it belongs with the disassembly view — a
+  memory pane without a disassembler is half a tool. Do the two together.
+- **`modules` / `loadedSources` requests** — never implemented on either
+  frontend, though the engine tracks every loaded module and its symbol state
+  (`TSymbolAvailability`, already surfaced per frame). Maintainer's call: may be
+  worth it for the MCP server, where an agent has no other way to ask "which
+  packages are loaded and which have symbols"; not for DAP for now, where the
+  same information already rides on each frame.
+- **`setExpression`** — unimplemented and not advertised, so assigning from the
+  WATCH panel does nothing while assigning in the Variables panel works
+  (`setVariable`). The engine primitives exist (`SetLocalVariable`,
+  `SetFieldVariable`); this is plumbing, not capability.
 - **Child process tracking** — debug API can follow children; we don't.
 - **`%TEMP%\dap_adapter.log` opt-in** — currently always-on. No
   configuration knob in the launch schema yet.

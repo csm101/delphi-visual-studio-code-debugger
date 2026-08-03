@@ -626,6 +626,16 @@ begin
         SendToolJson(IdJson, McpJson.FrameListToJson(FSession.GetCallStack));
       Exit;
     end;
+    if Name = 'get_raw_stack_scan' then begin
+      if not Stopped then begin
+        SendToolError(IdJson, 'Cannot sweep the stack while the debuggee is running. Pause or wait for a stop first.');
+        Exit;
+      end;
+      SendToolJson(IdJson, McpJson.FrameListToJson(
+        FSession.GetRawStackScan(Cardinal(ArgInt('threadId', 0)),
+                                 ArgInt('maxItems', 0))));
+      Exit;
+    end;
     if Name = 'get_threads' then begin
       if not Stopped then begin
         SendToolError(IdJson, 'Cannot list threads while the debuggee is running. Pause or wait for a stop first.');
