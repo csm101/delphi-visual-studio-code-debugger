@@ -2906,6 +2906,28 @@ and, where noted, reproduced BEFORE the fix.
   scope. The cause was two levels above where the investigation started: nothing
   knew the routines were related.
 
+### Multi-BPL against Hydra2 (2026-08-03) -- the core use case, first exercised
+
+The user authorised launching the real ERP client. What it established:
+
+- **Deferred breakpoint binding works.** Three breakpoints inside
+  `libStdFormsD29.bpl` all went `verified=False` -> `verified=True` when the
+  package loaded. Three for three, across separate runs.
+- **The host runs normally under the debugger** -- main window up, 634 MB
+  working set, GUI responsive.
+- **One defect found and fixed** (`47ee202`): the dbghelp tail offered a frame
+  that was not a return address. No fixture would have produced it; it needs a
+  binary where a stale stack word lands exactly on a function entry.
+- **`Application` resolves to a nested enum member on Hydra2 too**, so that
+  defect is not specific to one application.
+
+Still NOT exercised: stopping inside BPL code. The breakpoints bind, but the
+app kept exiting at logon (`exit code 0` -- `if not EseguiLogon then Exit`, not
+a debugger fault; the probe now reports the exit code precisely so this is not
+guesswork). The user supplied the auto-logon command line
+`u=dev p=dev d=lxoracle`, passed via `-targetargs`; that is the way to reach it
+unattended.
+
 ### What the real-application runs proved (and cost)
 
 Running against `hydra_2\ExtApps\AppContainer` (a real 32-bit VCL app) found two

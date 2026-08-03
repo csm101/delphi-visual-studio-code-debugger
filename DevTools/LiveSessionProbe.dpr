@@ -320,11 +320,17 @@ begin
   Writeln('  call stack:');
   var Frames := Session.GetCallStack;
   for var F in Frames do
-    Writeln(Format('    #%-2d %-44s %s:%d  [%s]  ip=%s',
+    // entry= is printed because a NAME and a LINE can both be present for an
+    // address the debugger has no FUNCTION for -- the name comes from the
+    // nearest preceding symbol and the line from the nearest preceding line
+    // record, so a bogus frame reads exactly like a real one. entry=0 says the
+    // resolver could not place the address in any routine, which is the tell.
+    Writeln(Format('    #%-2d %-44s %s:%d  [%s]  ip=%s entry=%s',
       [F.Index,
        IfThen(F.FunctionName <> '', F.FunctionName, '<no name>'),
        IfThen(F.SourceFile <> '', ExtractFileName(F.SourceFile), '-'),
-       F.SourceLine, F.ModuleName, IntToHex(F.IP, 8)]));
+       F.SourceLine, F.ModuleName, IntToHex(F.IP, 8),
+       IntToHex(F.FuncEntryVA, 8)]));
   Writeln(Format('    (%d frames)', [Length(Frames)]));
 
   Writeln('  locals:');
