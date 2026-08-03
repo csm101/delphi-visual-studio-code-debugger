@@ -98,8 +98,22 @@ end;
 
 function CollectInputs(const Opt: TOptions): TArray<string>;
 begin
-  if TFile.Exists(Opt.Root) then
+  if TFile.Exists(Opt.Root) then begin
+    // An explicit file bypasses the extension filter below, and everything
+    // downstream feeds it to TRsmFile. Handing it a `.map` therefore scanned
+    // 137 MB for 60 seconds and reported "unparsable" -- blaming a file that
+    // parses perfectly well, with the RIGHT reader. MAP sidecars are built by
+    // the adapter at run time; this tool does not cover them, and saying so at
+    // once beats failing slowly.
+    var Ext := LowerCase(TPath.GetExtension(Opt.Root));
+    if (Ext <> '.rsm') and (Ext <> '.dcp') then begin
+      Writeln(Format('%s: this tool builds sidecars for .rsm and .dcp only ' +
+        '(got "%s"). A .map index is built by the adapter itself on first use.',
+        [TPath.GetFileName(Opt.Root), Ext]));
+      Exit(nil);
+    end;
     Exit(TArray<string>.Create(Opt.Root));
+  end;
   if not TDirectory.Exists(Opt.Root) then begin
     Writeln('not found: ', Opt.Root);
     Exit(nil);

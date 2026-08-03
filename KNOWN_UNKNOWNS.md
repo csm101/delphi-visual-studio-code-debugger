@@ -1387,15 +1387,37 @@ Next step when it recurs: capture `%TEMP%\dap_adapter.log` from the failing run
 
 ## Large-project scale (SampleApp / 780 MB RSM)
 
-- **Cold-start scan duration** — MAP and RSM sidecar index files (`.map.idx`,
-  `.rsm.idx`) are written on the first run and loaded in milliseconds on
-  subsequent runs. The one-time cold-start sequential scan of 780 MB RSM
-  duration under SampleApp has not been measured. Does it noticeably delay the
-  first debug session?
-- **Memory footprint** — with hundreds of modules lazily cached, total
-  resident set of the adapter under real use on SampleApp is unknown.
-- **Symbol lookup latency** — at 780 MB, even a binary search over the
-  module index may be slow if the index itself is large. Not yet measured.
+- **Cold-start scan duration — MEASURED 2026-08-03.** On
+  `Hydra2SingleEXE.rsm`, a **523 MB** RSM from a real single-exe build of the
+  ERP client:
+
+  | | time | peak working set | sidecar |
+  |---|---|---|---|
+  | cold (no `.idx`) | **7.7 s** | **692 MB** | 36 MB |
+  | warm (`.idx` present) | **0.06 s** | — | reused |
+
+  So the one-time cost is seconds, not minutes, and every later session pays a
+  freshness check only. The peak working set during the build is the number to
+  watch: it is ~1.3x the file, so a machine indexing several large containers
+  at once (PrebuildIdx defaults to 2 workers) needs headroom.
+
+  Measured with `PrebuildIdx`, which builds the sidecar through the same
+  `TRsmFile` path the adapter uses, so this is the adapter's cost and not a
+  tool-specific one.
+
+- **Memory footprint under a live session** — STILL UNMEASURED. The number
+  above is the INDEX BUILD, not an adapter that has been stepping through a
+  many-package application for an hour. Not the same question.
+- **Symbol lookup latency** — STILL UNMEASURED. Nothing times an individual
+  resolution at a stop; the raw stack sweep is the only operation that reports
+  its own duration.
+
+- **`.map` is not covered by PrebuildIdx, and it used to lie about why.** The
+  tool indexes `.rsm` and `.dcp`; a MAP sidecar is built by the adapter itself
+  on first use. An explicit `.map` argument bypassed the extension filter and
+  was fed to `TRsmFile`, which scanned 137 MB for **60 seconds** and reported
+  "unparsable or not writable" -- blaming a file that parses perfectly with the
+  right reader. It now refuses in 0.02 s and says which extensions it covers.
 
 ## Process / repo
 
