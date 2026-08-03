@@ -36,6 +36,7 @@ type
   private
     FClient: TDapClient;
     FBpSourceFile: string;       // populated by Bp() — actual source for SetBreakpoints
+    FRawStackScan: Boolean;      // set before StartSession to launch with rawStackScan
 
     // Paths computed at runtime relative to RunTests.exe location.
     // RunTests.exe is at <repo>\DebuggerTests\Win64\Debug\RunTests.exe.
@@ -311,6 +312,12 @@ type
     //     type. Regression for SampleApp TApplication.ExeName / CurrentHelpFile. ---
     [Test]
     procedure Test_RtlStringGetter_VarOutFromPropertyType;
+
+    // --- Raw stack sweep: off by default, appended and marked when asked ---
+    [Test]
+    procedure Test_RawStackScan_NotOfferedUnlessAsked;
+    [Test]
+    procedure Test_RawStackScan_AppendedAndMarkedWhenAsked;
 
     // --- var parameter (reference param) ---
     [Test]
@@ -1155,6 +1162,8 @@ end;
 procedure TDebuggerTests.TearDown;
 begin
   EndSession;
+  // Opt-in flags must not survive into the next test in the fixture.
+  FRawStackScan := False;
 end;
 
 procedure TDebuggerTests.EndSession;
@@ -1224,6 +1233,9 @@ begin
   BpLine  := Bp(BpMarker);
 
   FClient := TDapClient.Create;
+  // Carried from the test onto the fresh client: the launch request is built
+  // inside here, so a test cannot set the option on the client itself.
+  FClient.RawStackScan := FRawStackScan;
   FClient.Start(AdapterExe);
 
   FClient.Initialize.Free;
@@ -4313,6 +4325,70 @@ end;
 // writes its managed Result to RDX=0, and the call faults ("method invocation
 // failed"). This is the exact shape of real VCL getters like
 // TApplication.ExeName / CurrentHelpFile that previously failed.
+// The raw stack sweep as the DAP renders it. Two properties, and the second
+// matters more than the first: a user who did NOT ask for the sweep must never
+// see a raw hit sitting next to real frames, because a raw hit is a POSITION on
+// the stack and may be a return address left by a call that already returned.
+procedure TDebuggerTests.Test_RawStackScan_NotOfferedUnlessAsked;
+var
+  FrameId, LocalsRef: Integer;
+begin
+  StartSession('COMPUTE_BODY', FrameId, LocalsRef);
+  var Resp := FClient.StackTrace;
+  try
+    var Arr := Resp.GetValue<TJSONArray>('stackFrames');
+    Assert.IsNotNull(Arr, 'no stackFrames');
+    for var I := 0 to Arr.Count - 1 do begin
+      var Name := (Arr.Items[I] as TJSONObject).GetValue<string>('name', '');
+      Assert.IsFalse(Name.StartsWith('[raw'),
+        'raw sweep leaked into a stack that did not ask for it: ' + Name);
+    end;
+  finally
+    Resp.Free;
+  end;
+end;
+
+procedure TDebuggerTests.Test_RawStackScan_AppendedAndMarkedWhenAsked;
+var
+  FrameId, LocalsRef: Integer;
+begin
+  FRawStackScan := True;
+  StartSession('COMPUTE_BODY', FrameId, LocalsRef);
+  var Resp := FClient.StackTrace;
+  try
+    var Arr := Resp.GetValue<TJSONArray>('stackFrames');
+    Assert.IsNotNull(Arr, 'no stackFrames');
+
+    var RawSeen  := 0;
+    var FirstRaw := -1;
+    var LastWalked := -1;
+    for var I := 0 to Arr.Count - 1 do begin
+      var FO   := Arr.Items[I] as TJSONObject;
+      var Name := FO.GetValue<string>('name', '');
+      if Name.StartsWith('[raw') then begin
+        Inc(RawSeen);
+        if FirstRaw < 0 then
+          FirstRaw := I;
+        // Marked twice on purpose: the name survives a copy-paste into a bug
+        // report, the hint greys the row in the Call Stack view.
+        Assert.AreEqual('subtle', FO.GetValue<string>('presentationHint', ''),
+          'raw frame ' + Name + ' is not rendered subtle');
+      end else
+        LastWalked := I;
+    end;
+
+    Assert.IsTrue(RawSeen > 0,
+      'rawStackScan was on but no raw frame was appended');
+    // Appended, never interleaved: every walked frame comes first, so the real
+    // call stack still reads top-to-bottom without raw rows cutting through it.
+    Assert.IsTrue(LastWalked < FirstRaw,
+      Format('a walked frame (index %d) appears BELOW the first raw one (%d)',
+        [LastWalked, FirstRaw]));
+  finally
+    Resp.Free;
+  end;
+end;
+
 procedure TDebuggerTests.Test_RtlStringGetter_VarOutFromPropertyType;
 var
   FrameId, LocalsRef: Integer;

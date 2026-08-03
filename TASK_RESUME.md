@@ -214,6 +214,42 @@ number. Assume any remaining one is currently invisible.
 
 ### CURRENT CURSOR
 
+**2026-08-03 (later) -- raw stack scan, at the user's request.**
+
+The user asked for the JCL "brutal" mode: when the walk runs out in code with no
+debug info, sweep the stack for anything that could be a return address, because
+what matters to them is finding THEIR code at the bottom of a deep chain, not a
+100% clean stack.
+
+Built as `IDebugTarget.GetRawStackFrames` / `TDebugSession.GetRawStackScan`,
+opt-in, never merged into `GetCallStack`. Better than the JCL version in one
+specific way: JCL accepts a word that points at executable memory; here each
+candidate goes through the exact decoder, and `foRawProven` means the
+instruction ending there was DECODED as a `call`. Liveness remains unknowable
+and is stated rather than hidden -- the fixture sweep returns the live chain
+plus `InitUnits`/`@StartExe` from unit initialisation, which had finished.
+
+Probe: `rawstack` (proven only) / `rawstack all`.
+
+Uncovered on the way: `NearestInstructionBoundaryBefore` had been bounded to the
+main image (added earlier the same day). RVAs are one space anchored there and
+every module registers inside it, so the bound made runtime-package code
+permanently undecidable -- and the user's own code mostly lives in packages.
+Removed; OS frames stay undecidable because no provider covers them, which was
+already true before the bound existed.
+
+Measured on Hydra2: `QBFCreateForm` (qbfd29.bpl), four cxLibraryRS29 routines,
+`CheckSize` and `CMVisibleChanged` (hydra2.exe) -- user code the walk did not
+show. Test: `RawStackScan_FindsTheChainAndSaysItIsRaw`, both bitnesses.
+
+DAP surface DONE (the user asked for it directly; deferring it had been my call,
+not theirs): `"rawStackScan": true` in launch.json appends the sweep below the
+walked frames, each marked `[raw]` / `[raw?]` in the name AND
+`presentationHint: subtle`. Default off. Tests
+`Test_RawStackScan_NotOfferedUnlessAsked` (the important one -- no leakage into
+a stack that did not ask) and `Test_RawStackScan_AppendedAndMarkedWhenAsked`,
+both scenarios.
+
 **2026-08-03 -- the x86 Delphi/OS stack boundary, both halves. Suite 1022 /
 1018 passed / 0 failed / 4 ignored.**
 

@@ -42,8 +42,15 @@ type
     // Returns the full response message (no `success` check, no raise except
     // on timeout). Caller owns the result.
     function  WaitRespRaw(Seq: Integer; TimeoutMs: Integer = 30000): TJSONObject;
+    // Emits `rawStackScan` into a launch/attach request when the test asked for
+    // it. Applied by EVERY launch variant on purpose: an option that only some
+    // of them honour is a trap for whoever writes the next test.
+    procedure MaybeAddRawStackScan(Req: TJSONObject);
 
   public
+    // Set before Launch to exercise the adapter's raw stack sweep.
+    RawStackScan: Boolean;
+
     constructor Create;
     destructor  Destroy; override;
 
@@ -508,6 +515,12 @@ begin
   Result := WaitResp(Seq);
 end;
 
+procedure TDapClient.MaybeAddRawStackScan(Req: TJSONObject);
+begin
+  if RawStackScan then
+    Req.AddPair('rawStackScan', TJSONBool.Create(True));
+end;
+
 function TDapClient.LaunchWithRules(const TargetExe, MapFile, RsmFile, SourceRoot: string;
   const Args: TArray<string>; const RulesJson: string;
   const Modules: TArray<TArray<string>>): TJSONObject;
@@ -523,6 +536,7 @@ begin
   Req.AddPair('sourceRoot',   SourceRoot);
   Req.AddPair('stopAtEntry',  TJSONBool.Create(False));
   Req.AddPair('noDebug',      TJSONBool.Create(False));
+  MaybeAddRawStackScan(Req);
   Req.AddPair('useGlobalExceptionRules', TJSONBool.Create(False)); // test isolation: ignore the machine-wide rules file
   if Length(Args) > 0 then begin
     ArgArr := TJSONArray.Create;
@@ -563,6 +577,7 @@ begin
   Req.AddPair('sourceRoot',   SourceRoot);
   Req.AddPair('stopAtEntry',  TJSONBool.Create(False));
   Req.AddPair('noDebug',      TJSONBool.Create(False));
+  MaybeAddRawStackScan(Req);
   Req.AddPair('useGlobalExceptionRules',   TJSONBool.Create(True));
   Req.AddPair('globalExceptionRulesPath',  GlobalRulesPath);
   if Length(Args) > 0 then begin
@@ -600,6 +615,7 @@ begin
   Req.AddPair('sourceRoot',   SourceRoot);
   Req.AddPair('stopAtEntry',  TJSONBool.Create(StopAtEntry));
   Req.AddPair('noDebug',      TJSONBool.Create(False));
+  MaybeAddRawStackScan(Req);
   Req.AddPair('useGlobalExceptionRules', TJSONBool.Create(False)); // test isolation: ignore the machine-wide rules file
   if Length(Args) > 0 then begin
     ArgArr := TJSONArray.Create;
@@ -626,6 +642,7 @@ begin
   Req.AddPair('sourceRoot',   SourceRoot);
   Req.AddPair('stopAtEntry',  TJSONBool.Create(StopAtEntry));
   Req.AddPair('noDebug',      TJSONBool.Create(False));
+  MaybeAddRawStackScan(Req);
   Req.AddPair('useGlobalExceptionRules', TJSONBool.Create(False)); // test isolation: ignore the machine-wide rules file
   if Length(Args) > 0 then begin
     ArgArr := TJSONArray.Create;

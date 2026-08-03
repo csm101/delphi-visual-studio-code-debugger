@@ -175,6 +175,26 @@ begin
            IfThen(F.SourceFile <> '', ExtractFileName(F.SourceFile), '-'),
            F.SourceLine, F.ModuleName]));
     end
+    else if SameText(Cmd, 'rawstack') then begin
+      // Only the frames the sweep could PROVE are printed by default, because
+      // the unproven ones are the bulk and are mostly foreign code; `rawstack
+      // all` shows everything.
+      var ShowAll := SameText(Arg, 'all');
+      var Shown := 0;
+      for var F in Session.GetRawStackScan do begin
+        if (not ShowAll) and (F.Origin <> foRawProven) then
+          Continue;
+        Inc(Shown);
+        Writeln(Format('    %-44s %s:%d  [%s]  ip=%s %s',
+          [IfThen(F.FunctionName <> '', F.FunctionName, '<no name>'),
+           IfThen(F.SourceFile <> '', ExtractFileName(F.SourceFile), '-'),
+           F.SourceLine, F.ModuleName, IntToHex(F.IP, 8),
+           FrameOriginName(F.Origin)]));
+      end;
+      Writeln(Format('    (%d shown -- POSITIONS on the stack, not a chain: a ' +
+        'hit may be a return address left by a call that already returned)',
+        [Shown]));
+    end
     else if SameText(Cmd, 'locals') then begin
       // Honour the frame the script selected. This used to read frame 0
       // unconditionally, so `frame 2` followed by `locals` printed the TOP

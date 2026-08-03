@@ -137,7 +137,12 @@ type
     foFramelessRecover, // inserted for a framed caller a frameless routine hid
     foDbgHelpTail,      // spliced from dbghelp below a verified join
     foDbgHelpWhole,     // dbghelp's entire walk, taken because ours had nothing
-    foSynthesizedSeed   // walker produced nothing; frame 0 rebuilt from context
+    foSynthesizedSeed,  // walker produced nothing; frame 0 rebuilt from context
+    // Raw stack scan (opt-in, see IDebugTarget.RawStackCandidates). NEVER
+    // produced by the ordinary walk, and never mixed into it: these say where a
+    // return address IS, not that it is still live.
+    foRawProven,        // decoded: the instruction ending here IS a call
+    foRawUnproven       // in executable code, but no boundary to decode from
   );
 
   TStackFrame = record
@@ -148,6 +153,19 @@ type
     FrameRBP:     UInt64;   // this frame's RBP (StackWalk64 AddrFrame)
     FuncEntryVA:  UInt64;   // VA of the frame's function entry (for prolog)
     Origin:       TFrameOrigin;
+  end;
+
+  // One word of the thread's stack that could be a return address.
+  //
+  // "Could": position is established, LIVENESS IS NOT. A return address left by
+  // a call that has already returned is still sitting there and still decodes
+  // as call-adjacent, and nothing on the stack distinguishes it from a live one
+  // without a frame chain -- which is precisely what is missing when this is
+  // used. Callers must present these apart from walked frames, never merged.
+  TRawStackCandidate = record
+    StackAddr: UInt64;   // where the word was found (orders the results)
+    PC:        UInt64;   // the code address the word holds
+    Proven:    Boolean;  // the instruction ending at PC was DECODED as a call
   end;
 
   TBreakpointRec = record
@@ -230,6 +248,24 @@ type
     function  GetRegisters: TRegisterSnapshot;
     function  GetStackFrames: TArray<TStackFrame>; overload;
     function  GetStackFrames(TID: DWORD): TArray<TStackFrame>; overload;
+    // Brute-force sweep of the thread's stack for words that could be return
+    // addresses, symbolicated like ordinary frames but carrying foRawProven /
+    // foRawUnproven. Opt-in and deliberately separate from GetStackFrames: it
+    // is for the case where the walk STOPS -- inside code with no unwind data
+    // and no frame pointer -- and the question is no longer "what is the call
+    // stack" but "which of MY routines is somewhere underneath this".
+    //
+    // Ordered by stack address, nearest the top of the stack first. FrameRBP is
+    // 0 throughout: these are addresses, not frames, so no locals can be read
+    // from them.
+    function  GetRawStackFrames(TID: DWORD;
+                MaxItems: Integer = 0): TArray<TStackFrame>;
+    // Re-resolve source/function/entry for frames already found, without
+    // walking or sweeping again. Exists because a caller that loads a module's
+    // symbols in response to a nameless frame must not pay for a second sweep
+    // of a multi-megabyte stack just to see the names.
+    function  ResymbolicateFrames(
+                const Frames: TArray<TStackFrame>): TArray<TStackFrame>;
     function  GetLocalValues: TArray<TLocalValue>;
     // Select / clear the active call-stack frame (DAP frameId). When a
     // non-top frame is active, GetLocalValues and the evaluator read that
@@ -361,7 +397,7 @@ function FrameOriginName(Origin: TFrameOrigin): string;
 const
   Names: array[TFrameOrigin] of string = (
     'unknown', 'seed', 'ebp-chain', 'prologue-probe', 'frameless-recover',
-    'dbghelp-tail', 'dbghelp-whole', 'synth-seed');
+    'dbghelp-tail', 'dbghelp-whole', 'synth-seed', 'raw-proven', 'raw-unproven');
 begin
   Result := Names[Origin];
 end;

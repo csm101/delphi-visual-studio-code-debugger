@@ -249,6 +249,11 @@ type
     // evaluate path labelled it with the DECLARED type. Same object, two
     // answers, and nothing on screen to say which one to believe.
     [Test] procedure EvaluateNamesTheClassTheObjectIsOnBothBitnesses;
+    // The opt-in raw stack sweep. It must find the routines the exact walk
+    // found -- that is the floor, since those return addresses really are on
+    // the stack -- while marking every result as a raw hit and offering no
+    // frame pointer, because a raw hit is a POSITION and not a live frame.
+    [Test] procedure RawStackScan_FindsTheChainAndSaysItIsRaw;
     // Delphi's LEXICAL scoping: standing in a nested procedure, the enclosing
     // routine's variables are reachable by bare name. On Win32 the entire
     // parent scope was missing -- the locals list showed only the nested
@@ -4244,6 +4249,79 @@ begin
   Assert.AreEqual('', Failures,
     'a nested procedure must see its enclosing routine''s variables on both ' +
     'bitnesses -- ' + Failures);
+end;
+
+procedure TWin32RunControlTests.RawStackScan_FindsTheChainAndSaysItIsRaw;
+
+  function CheckAt(const Exe, Map, Rsm: string; Line: Integer): string;
+  begin
+    var Session := OpenSessionAtMarker(Exe, Map, Rsm, TargetDir, W32_SOURCE, Line);
+    try
+      if Session.State <> dsStopped then
+        Exit('did not stop; ');
+      // Every routine the exact walk names must also be found by the sweep:
+      // its return address is demonstrably on the stack, so a sweep that
+      // misses it is filtering something it should not.
+      var Walked := Session.GetCallStack;
+      var Raw    := Session.GetRawStackScan;
+      if Length(Raw) = 0 then
+        Exit('raw scan found nothing; ');
+
+      Result := '';
+      for var W in Walked do begin
+        // Frame 0 is the LIVE program counter, not a return address: nothing
+        // pushed it, so no stack word holds it and the sweep cannot see it.
+        // That is correct, and it is why the raw scan complements the walk
+        // instead of replacing it.
+        if W.Index = 0 then
+          Continue;
+        if (W.FunctionName = '') or not SameText(W.ModuleName,
+             ExtractFileName(Exe)) then
+          Continue;   // OS frames carry no name and no line table to prove from
+        var Seen := False;
+        for var R in Raw do
+          if R.IP = W.IP then begin
+            Seen := True;
+            Break;
+          end;
+        if not Seen then
+          Result := Result + Format('walked %s ($%x) missing from raw scan; ',
+            [W.FunctionName, W.IP]);
+      end;
+
+      // And every raw hit must declare itself. A raw frame that reached a
+      // frontend labelled like a walked one would be the one outcome worse
+      // than not having the feature.
+      for var R in Raw do begin
+        if not (R.Origin in [foRawProven, foRawUnproven]) then
+          Result := Result + Format('raw hit $%x has origin %s; ',
+            [R.IP, FrameOriginName(R.Origin)]);
+        if R.FrameRBP <> 0 then
+          Result := Result + Format('raw hit $%x offers a frame pointer $%x; ',
+            [R.IP, R.FrameRBP]);
+      end;
+    finally
+      Session.Free;
+    end;
+  end;
+
+begin
+  var Line := MarkerLine(W32_SOURCE, W32_MARKER);
+  Assert.IsTrue(Line > 0, 'marker not found: ' + W32_MARKER);
+  Assert.IsTrue(FileExists(Win64Exe), '64-bit control target missing');
+
+  // x86 is where the feature earns its keep (no unwind data at all), but the
+  // sweep is architecture-neutral and must work on x64 too -- there the
+  // call-site proof is unavailable, so hits come back foRawUnproven, which the
+  // assertions above accept and the caller can still see.
+  var Failures := CheckAt(Win32Exe, Win32Map, Win32Rsm, Line);
+  if Failures <> '' then
+    Failures := 'x86: ' + Failures;
+  var Failures64 := CheckAt(Win64Exe, Win64Map, Win64Rsm, Line);
+  if Failures64 <> '' then
+    Failures := Failures + 'x64: ' + Failures64;
+
+  Assert.AreEqual('', Failures, 'raw stack scan -- ' + Failures);
 end;
 
 procedure TWin32RunControlTests.EvaluateNamesTheClassTheObjectIsOnBothBitnesses;

@@ -232,6 +232,12 @@ type
     // Per-thread call stack (read-only). Delegates to the engine's TID-scoped
     // stack walk; does NOT disturb the stopped thread's cached FLastFrames.
     function  GetCallStack(ThreadId: Cardinal): TArray<TSessionFrame>; overload;
+    // Opt-in brute-force sweep of the thread's stack for return addresses, for
+    // when the exact walk STOPS in code with no unwind data and the question
+    // becomes "which of my routines is underneath this". Separate from
+    // GetCallStack on purpose: the results are positions, not a chain.
+    function  GetRawStackScan(ThreadId: Cardinal = 0;
+                MaxItems: Integer = 0): TArray<TSessionFrame>;
     function  GetCurrentLocation(out FnName, SrcFile: string;
                 out Line: Integer): Boolean;
     function  GetLocals: TArray<TSessionVariable>;
@@ -1258,6 +1264,43 @@ begin
   Frames := FResolver.TrimRaisePlumbing(Frames, FStoppedOnException);
   FLastFrames    := Frames;
   FLastFramesTid := FStopTid;
+  SetLength(Result, Length(Frames));
+  for var I := 0 to High(Frames) do
+    Result[I] := FrameToSession(Frames[I], I);
+end;
+
+// Opt-in raw sweep of the stopped thread's stack. Never called by GetCallStack
+// and never merged into it: a raw hit says a return address to that routine is
+// PRESENT on the stack, not that the routine is on the current chain. The
+// distinction is carried per frame in Origin (foRawProven / foRawUnproven) so a
+// frontend cannot lose it by accident.
+//
+// Modules are warmed the same way the walk warms them, or every frame in a
+// runtime package would come back nameless -- which for this feature is the
+// whole answer, since its point is naming the user's own code underneath
+// foreign frames.
+function TDebugSession.GetRawStackScan(ThreadId: Cardinal;
+  MaxItems: Integer): TArray<TSessionFrame>;
+begin
+  var Guard := InteractiveWait;
+  Result := nil;
+  if (FState <> dsStopped) or (FDebugger = nil) then
+    Exit;
+  var Tid := ThreadId;
+  if Tid = 0 then
+    Tid := FStopTid;
+  var Frames := FDebugger.GetRawStackFrames(Tid, MaxItems);
+  var NeedRefresh := False;
+  for var F in Frames do
+    if (F.SourceFile = '') or (F.FunctionName = '') then begin
+      FLoader.EnsureModuleForPC(F.IP);
+      NeedRefresh := True;
+    end;
+  // Re-resolve, do NOT sweep again: the sweep reads the whole stack and a
+  // second pass over several megabytes to pick up names just loaded would
+  // double the cost of the feature for nothing.
+  if NeedRefresh then
+    Frames := FDebugger.ResymbolicateFrames(Frames);
   SetLength(Result, Length(Frames));
   for var I := 0 to High(Frames) do
     Result[I] := FrameToSession(Frames[I], I);

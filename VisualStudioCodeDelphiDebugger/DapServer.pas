@@ -242,6 +242,11 @@ type
     // meaningful only together with its thread -- scopes/evaluate carry no
     // threadId, and without this the index was paired with the stopped thread.
     FLastStackTid: Cardinal;
+    // `rawStackScan` in launch.json: append the brute-force sweep of the
+    // thread's stack below the walked frames. Off by default -- the results are
+    // POSITIONS on the stack, not a chain, and a user who has not asked for
+    // them must never be shown them next to real frames.
+    FRawStackScan: Boolean;
                                          // (neutral session frames carry FrameRBP /
                                          // FuncEntryVA / IP for frame selection)
     // Placeholder documents for frames with no source file. Without a `source`
@@ -349,6 +354,11 @@ type
 
     // `progressLocation` from the launch/attach config -> FProgressAsCustomEvent.
     procedure ParseProgressLocation(Args: TJSONObject);
+    // `rawStackScan` from the launch/attach config -> FRawStackScan.
+    procedure ParseRawStackScan(Args: TJSONObject);
+    // Marks a raw-sweep frame's displayed name; returns a walked frame's name
+    // unchanged.
+    function  RawStackLabel(const F: TSessionFrame; const Name: string): string;
     // THE single fan-out point for every progress moment of both channels
     // ('startup' and 'op'). AState is 'start', 'update' or 'end'. It picks the
     // wire format from FProgressAsCustomEvent; no caller ever emits an event
@@ -847,6 +857,30 @@ begin
     DapLog('progressLocation = statusBar (delphiProgress custom events)')
   else
     DapLog('progressLocation = notification (standard DAP progress events)');
+end;
+
+// Prefixes the displayed name of a raw-sweep frame, and leaves a walked frame
+// untouched. `[raw]` means the instruction ending at that address was DECODED
+// as a call; `[raw?]` means there was no line table to decode from, so the hit
+// rests on the address being executable code and nothing more. Neither says the
+// frame is LIVE -- a call that has already returned leaves its return address
+// behind, and no sweep can tell the difference.
+function TDapServer.RawStackLabel(const F: TSessionFrame;
+  const Name: string): string;
+begin
+  case F.Origin of
+    foRawProven:   Result := '[raw] '  + Name;
+    foRawUnproven: Result := '[raw?] ' + Name;
+  else
+    Result := Name;
+  end;
+end;
+
+procedure TDapServer.ParseRawStackScan(Args: TJSONObject);
+begin
+  FRawStackScan := (Args <> nil) and Args.GetValue<Boolean>('rawStackScan', False);
+  if FRawStackScan then
+    DapLog('rawStackScan = ON (raw sweep appended below the walked frames)');
 end;
 
 // Every progress moment of every channel goes through here. The busy/debounce
@@ -1802,6 +1836,7 @@ begin
   end;
 
   KillOnDetach := Args.GetValue<Boolean>('killOnDetach', False);
+  ParseRawStackScan(Args);
 
   ParseSourceAndModules(Args, ProgramPath);
   DapLog(Format('Attach: pid=%d exe=%s map=%s rsm=%s killOnDetach=%s',
@@ -1853,6 +1888,7 @@ begin
   // zombie session when the launch failed.
   ProgramPath  := Args.GetValue<string>('program', '');
   FStopAtEntry := Args.GetValue<Boolean>('stopAtEntry', False);
+  ParseRawStackScan(Args);
 
   // Diagnostic log opt-in: writes %TEMP%\dap_adapter.log when launch.json
   // sets `"diagnosticLog": true` (or env var DAP_LOG=1, set at adapter startup).
@@ -2339,6 +2375,24 @@ begin
   // plumbing for the stopped thread, and caches the stopped thread's frames so
   // SelectFrame/evaluate can re-root. A non-current thread id is a read-only walk.
   var Frames := FSession.GetCallStack(ReqTid);
+  // Opt-in raw sweep, APPENDED below the walked frames and never interleaved
+  // with them. It answers a different question -- "which of my routines has a
+  // return address somewhere on this stack" -- for the case where the walk ends
+  // in code with no unwind data. Each appended frame is marked in its name and
+  // rendered subtle, because a raw hit may be a return address left by a call
+  // that has already returned.
+  //
+  // They go into FLastFrames too, so a frameId still indexes one array and
+  // selecting a raw frame is harmless: its FrameRBP is 0, so locals come back
+  // empty rather than decoded from an unrelated frame.
+  if FRawStackScan then begin
+    var RawFrames := FSession.GetRawStackScan(ReqTid);
+    for var R in RawFrames do begin
+      var Appended := R;
+      Appended.Index := Length(Frames);
+      Frames := Frames + [Appended];
+    end;
+  end;
   FLastFrames   := Frames;   // cache so scopes/evaluate can map frameId -> frame
   FLastStackTid := ReqTid;   // ...and remember WHICH thread those indices belong to
   Body     := TJSONObject.Create;
@@ -2348,6 +2402,12 @@ begin
       var F  := Frames[I];
       var FO := TJSONObject.Create;
       FO.AddPair('id', TJSONNumber.Create(I));
+      // A raw hit must not be able to pass for a walked frame. Two independent
+      // markers, because either one alone can be lost: the name carries it into
+      // any log or copy-paste, and `subtle` greys it in the Call Stack view.
+      var IsRaw := F.Origin in [foRawProven, foRawUnproven];
+      if IsRaw then
+        FO.AddPair('presentationHint', 'subtle');
       // DAP StackFrame.moduleId: the owning binary. Emitted whenever a module is
       // known -- including for frames that could not be named -- so the client can
       // always say WHERE the frame is, not just at which address.
@@ -2363,11 +2423,12 @@ begin
         FO.AddPair('line',   TJSONNumber.Create(F.SourceLine));
         FO.AddPair('column', TJSONNumber.Create(1));
         if F.FunctionName <> '' then
-          FO.AddPair('name', F.FunctionName)
+          FO.AddPair('name', RawStackLabel(F, F.FunctionName))
         else
-          FO.AddPair('name', Format('%s:%d', [ExtractFileName(F.SourceFile), F.SourceLine]));
+          FO.AddPair('name', RawStackLabel(F,
+            Format('%s:%d', [ExtractFileName(F.SourceFile), F.SourceLine])));
       end else if F.FunctionName <> '' then begin
-        FO.AddPair('name', F.FunctionName);
+        FO.AddPair('name', RawStackLabel(F, F.FunctionName));
         // No source line for this frame (publics-only module). If the unit
         // resolves to a file, attach a synthetic source so VS Code can select
         // the frame and open the Variables view (Locals / $exception / watches).
@@ -2384,7 +2445,7 @@ begin
           AttachPlaceholderSource(FO, F, F.FunctionName);
       end else begin
         var Nameless := NamelessFrameLabel(F);
-        FO.AddPair('name', Nameless);
+        FO.AddPair('name', RawStackLabel(F, Nameless));
         AttachPlaceholderSource(FO, F, Nameless);
       end;
       FrameArr.AddElement(FO);

@@ -1200,6 +1200,67 @@ the recovered frame named the right routine while pointing at its `finally`
 block — a wrong frame is worse than a missing one, because every frame on
 screen looks equally real.
 
+### Raw stack scan (opt-in)
+
+`IDebugTarget.GetRawStackFrames` / `TDebugSession.GetRawStackScan` sweep a
+thread's whole stack for words that could be return addresses. Nothing calls
+them from the ordinary walk, and their results are never merged into it.
+
+Why, given that the walk is exact: **the exact walk stops**. On i386 there is no
+unwind data, so when the chain reaches a routine built without a frame pointer
+there is nothing left to follow. Truncating is the right answer to "what is the
+call stack"; it is the wrong answer to "which of my routines is underneath
+this", which is the question a bug report actually asks.
+
+How it differs from the JCL/madExcept equivalent: those accept a word if it
+points at executable memory, which any function pointer, VMT slot or dead frame
+satisfies. Here every candidate goes to `CallSiteVerdictAt`, and `foRawProven`
+means the instruction ending at that address was **decoded** and is a `call`.
+The boundary to decode from comes from the line table, so the modules the user
+builds — including their BPLs — get proven answers. Foreign code with no line
+table comes back `foRawUnproven` and is reported rather than dropped, because
+dropping it loses the shape of the chain.
+
+What stays unknowable is **liveness**. A return address left by a call that has
+already returned still sits in the popped frame and still decodes as
+call-adjacent; nothing distinguishes it from a live one without the frame chain
+that is missing by assumption. Measured on the recursion fixture, the sweep
+returns the live chain *and* `InitUnits` / `@StartExe` / `TObject.Create` from
+unit initialisation, which finished long before. So the sweep reports where
+return addresses ARE, `FrameRBP` is 0 throughout (no locals can be read off a
+position), and `TFrameOrigin` carries the distinction to the frontend so it
+cannot be lost by accident.
+
+Cost is bounded: the stack extent comes from the target's memory map (one
+allocation, walked upward while the allocation base holds — no TEB needed),
+reads are 64 KB at a time, module containment is a binary search over a sorted
+snapshot, page protection is cached per region, and the sweep caps at 4 MB and
+logs when it does. Each sweep logs its size, hit count and duration.
+
+Measured on Hydra2 (real 32-bit multi-BPL ERP client), the sweep surfaced
+`QBFCreateForm` in `qbfd29.bpl`, four DevExpress routines in `cxlibraryrs29.bpl`
+and `CheckSize` / `CMVisibleChanged` in the executable — user code the walked
+stack did not show.
+
+**DAP surface.** `"rawStackScan": true` in the launch/attach config appends the
+sweep BELOW the walked frames — appended, never interleaved, so the real call
+stack still reads top-to-bottom. Each appended frame is marked twice, because
+either marker alone can be lost: the name is prefixed `[raw]` (decoded as a
+call) or `[raw?]` (no line table to decode from), which survives a copy-paste
+into a bug report, and `presentationHint: "subtle"` greys the row. Default off:
+a user who has not asked for the sweep must never see a position sitting next
+to a real frame. Raw frames go into the same `FLastFrames` array so a `frameId`
+still indexes one list; selecting one is harmless because its `FrameRBP` is 0,
+so locals come back empty rather than decoded off an unrelated frame.
+
+One trap this uncovered: `NearestInstructionBoundaryBefore` had been bounded to
+the main image. RVAs are a single space anchored at the main image and every
+module's provider registers inside it, so that bound made code in a runtime
+package permanently undecidable — and the user's own code mostly lives in
+packages. Containment is decided by whether a provider owns the address; an
+address none covers (kernel32, ntdll) still fails `RvaToFunctionStart` and stays
+undecidable, which is what preserves the OS tail.
+
 ### Recovering a caller the chain stepped over (x86)
 
 A FRAMELESS routine between two framed ones is invisible to the chain: it never

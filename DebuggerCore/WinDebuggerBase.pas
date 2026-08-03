@@ -15,7 +15,8 @@ uses
   System.SysUtils, System.Classes, System.Generics.Collections,
   Winapi.Windows,
   DapProtocol, DebugInfoTypes, DebugInfoSet, DebugTarget, ExceptionRules,
-  TargetLayout, DelphiValueReaders;
+  TargetLayout, DelphiValueReaders,
+  X86Decode;   // TCallSiteAnswer: the call-site verdict seam (x86 supplies it)
 
 type
   // One unwound frame before symbolication: where the code is and where its
@@ -244,6 +245,13 @@ type
     // the frame pointer and both bases are zero.
     function  LocalsOffsetBase(SubRspN, ExtraPushBytes: UInt32): Integer; virtual;
     function  ParamsOffsetBase(SubRspN, ExtraPushBytes: UInt32): Integer; virtual;
+    // Is the instruction that ENDS at VA a call? The only exact way to tell a
+    // return address from any other code address lying on the stack.
+    //
+    // The base declines for everything: amd64 needs a length decoder this
+    // engine does not have on that architecture, and answering `csaNo` without
+    // decoding would be a guess dressed as a proof. x86 overrides it.
+    function  CallSiteVerdictAt(VA: UInt64): TCallSiteAnswer; virtual;
   private
     procedure SetTrapFlag(TID: DWORD; Enable: Boolean);
     procedure SetRIP(TID: DWORD; NewRIP: UInt64);
@@ -336,6 +344,14 @@ type
     // Called from debug thread after stop
     function  GetStackFrames: TArray<TStackFrame>; overload;
     function  GetStackFrames(TID: DWORD): TArray<TStackFrame>; overload;
+    function  RawStackCandidates(TID: DWORD;
+                MaxItems: Integer = 0): TArray<TRawStackCandidate>;
+    function  GetRawStackFrames(TID: DWORD;
+                MaxItems: Integer = 0): TArray<TStackFrame>;
+    function  ResymbolicateFrames(
+                const Frames: TArray<TStackFrame>): TArray<TStackFrame>;
+    procedure SymbolicateAddress(VA: UInt64; AtReturnAddress: Boolean;
+                var Frame: TStackFrame);
     function  GetSourceLocation(out SourceFile: string; out Line: Integer): Boolean;
     function  GetLocalValues: TArray<TLocalValue>;
     function  GetLocalValuesForFrame(FrameRBP, FuncEntryVA: UInt64;
@@ -734,13 +750,17 @@ begin
   BoundaryVA := 0;
   if FDebugInfo = nil then
     Exit(False);
-  // RVAs here are relative to the MAIN image, so an address in any other module
-  // would be turned into a meaningless offset that can land on an unrelated
-  // routine of the executable. Refusing outright is what keeps OS frames
-  // undecidable -- and therefore kept -- rather than judged against the wrong
-  // code.
-  if (VA <= FImageBase) or
-     ((FImageSize <> 0) and (VA >= FImageBase + FImageSize)) then
+  // RVAs are one space anchored at the main image, and every module's provider
+  // registers inside it -- which is what lets a BPL frame symbolicate at all.
+  // So containment is decided by whether a provider OWNS the address, below,
+  // and not by a range test here.
+  //
+  // Bounding this to the main image was tried and is wrong: it made code in a
+  // runtime package permanently undecidable, and the user's own code mostly
+  // LIVES in packages. An address no provider covers -- kernel32, ntdll --
+  // still fails at RvaToFunctionStart and stays undecidable, which is what
+  // preserves the OS tail; that was already true before the range test existed.
+  if VA <= FImageBase then
     Exit(False);
   var TargetRva := VAToRva(VA);
   if TargetRva = 0 then
@@ -1428,6 +1448,291 @@ begin
   end;
   EnsureSymInitialized;
   Result := SymGetModuleBase64(FProcess, VA) <> 0;
+end;
+
+function TWinDebugger.CallSiteVerdictAt(VA: UInt64): TCallSiteAnswer;
+begin
+  Result := csaUndecidable;
+end;
+
+// Fills the source/function/entry fields for a code address. Shared by the
+// walked stack and the raw sweep so the two cannot drift into disagreeing about
+// what an address is called.
+//
+// AtReturnAddress shifts the lookup back one byte. A RETURN address is the
+// instruction AFTER the call, so looking it up directly reports the line
+// FOLLOWING the call site -- an `Assert` call reads as the next statement. The
+// live PC of frame 0 is not a return address and must not be shifted.
+procedure TWinDebugger.SymbolicateAddress(VA: UInt64; AtReturnAddress: Boolean;
+  var Frame: TStackFrame);
+var
+  Loc: TSourceLocation;
+begin
+  Frame.IP          := VA;
+  Frame.SourceFile  := '';
+  Frame.SourceLine  := 0;
+  Frame.FunctionName := '';
+  Frame.FuncEntryVA := 0;
+  if FDebugInfo = nil then
+    Exit;
+  var LookupRva := VAToRva(VA);
+  if AtReturnAddress and (LookupRva > 0) then
+    Dec(LookupRva);
+  if FDebugInfo.RvaToSourceLine(LookupRva, Loc) then begin
+    Frame.SourceFile := Loc.SourceFile;
+    Frame.SourceLine := Loc.Line;
+  end;
+  if not FDebugInfo.RvaToFunctionName(LookupRva, Frame.FunctionName) then
+    Frame.FunctionName := '';
+  var FuncRva: UInt64 := 0;
+  if FDebugInfo.RvaToFunctionStart(LookupRva, FuncRva) then
+    Frame.FuncEntryVA := RvaToVA(FuncRva);
+end;
+
+function TWinDebugger.ResymbolicateFrames(
+  const Frames: TArray<TStackFrame>): TArray<TStackFrame>;
+begin
+  SetLength(Result, Length(Frames));
+  for var I := 0 to High(Frames) do begin
+    Result[I] := Frames[I];
+    // Frame 0 of a WALKED stack is the live PC; every other frame, and every
+    // raw hit including the first, is a return address. Origin says which.
+    SymbolicateAddress(Frames[I].IP,
+      {AtReturnAddress=}(I > 0) or (Frames[I].Origin in [foRawProven, foRawUnproven]),
+      Result[I]);
+  end;
+end;
+
+function TWinDebugger.GetRawStackFrames(TID: DWORD;
+  MaxItems: Integer): TArray<TStackFrame>;
+begin
+  SetLength(Result, 0);
+  EnsureSymInitialized;
+  for var Cand in RawStackCandidates(TID, MaxItems) do begin
+    var Frame := Default(TStackFrame);
+    // Every candidate IS a return address by construction -- that is what the
+    // sweep looked for -- so the call-site shift always applies here.
+    SymbolicateAddress(Cand.PC, {AtReturnAddress=}True, Frame);
+    // No frame pointer: these are addresses, not frames. Leaving it 0 is what
+    // stops anything downstream from trying to read locals off them.
+    Frame.FrameRBP := 0;
+    if Cand.Proven then
+      Frame.Origin := foRawProven
+    else
+      Frame.Origin := foRawUnproven;
+    Result := Result + [Frame];
+  end;
+end;
+
+// Brute-force sweep of a thread's stack for words that could be return
+// addresses -- the "raw" mode a Delphi user knows from JCL / madExcept.
+//
+// WHY it exists, given that the walker is exact: the exact walk STOPS. On i386
+// there is no unwind data, so when the chain runs into a routine built without
+// a frame pointer there is nothing left to follow, and the frames BELOW that
+// point -- which is where the user's own code usually is -- are simply not
+// reported. Truncating is the right answer for a call stack. It is the wrong
+// answer to the question "which of my routines is underneath this".
+//
+// WHAT is different from the JCL version: JCL accepts a word if it points at
+// executable memory, which any function pointer, VMT slot or dead frame
+// satisfies. Here every candidate is put to the DECODER: `Proven` means the
+// instruction ending at that address was decoded and IS a call. For the user's
+// own modules a line table supplies the boundary to decode from, so their code
+// -- the part they care about -- gets proven answers rather than guesses.
+// Foreign code with no line table stays undecidable and is reported as such
+// rather than dropped, because dropping it loses the shape of the chain.
+//
+// WHAT REMAINS UNKNOWABLE: liveness. A return address left behind by a call
+// that has already returned still sits in the frame that has been popped, and
+// still decodes as call-adjacent. Nothing distinguishes it from a live one
+// without the frame chain that is missing by assumption. So this reports where
+// return addresses ARE, and callers must present that as a different kind of
+// claim from a walked frame.
+function TWinDebugger.RawStackCandidates(TID: DWORD;
+  MaxItems: Integer): TArray<TRawStackCandidate>;
+const
+  // A thread stack is 1 MB by default and can be larger; beyond this the sweep
+  // stops rather than spend unbounded time. Reported through DapLog when hit,
+  // because a silently shortened sweep looks exactly like an exhaustive one.
+  MAX_SCAN_BYTES = 4 * 1024 * 1024;
+  CHUNK_BYTES    = 64 * 1024;
+type
+  TModuleRange = record Base, Limit: UInt64; end;
+var
+  // Module ranges, snapshotted once and kept SORTED. The per-word test runs
+  // millions of times over a deep stack, so it must not walk a dictionary: the
+  // binary search below is what keeps the sweep from being the slowest thing
+  // the debugger does.
+  Ranges: TArray<TModuleRange>;
+  // Page protection costs a syscall per query, so remember the region that
+  // last answered: code sections are large, and consecutive candidates land in
+  // the same one almost every time.
+  CacheBase, CacheLimit: UInt64;
+  CacheExec: Boolean;
+
+  // Insertion keeps Ranges ordered without pulling in a sorter; a process has
+  // tens of modules, and this runs once per sweep.
+  procedure AddRange(Base, Size: UInt64);
+  begin
+    if (Base = 0) or (Size = 0) then
+      Exit;
+    var R: TModuleRange;
+    R.Base  := Base;
+    R.Limit := Base + Size;
+    var At := Length(Ranges);
+    SetLength(Ranges, At + 1);
+    while (At > 0) and (Ranges[At - 1].Base > R.Base) do begin
+      Ranges[At] := Ranges[At - 1];
+      Dec(At);
+    end;
+    Ranges[At] := R;
+  end;
+
+  function InAnyModule(VA: UInt64): Boolean;
+  begin
+    var Lo := 0;
+    var Hi := High(Ranges);
+    while Lo <= Hi do begin
+      var Mid := (Lo + Hi) div 2;
+      if VA < Ranges[Mid].Base then
+        Hi := Mid - 1
+      else if VA >= Ranges[Mid].Limit then
+        Lo := Mid + 1
+      else
+        Exit(True);
+    end;
+    Result := False;
+  end;
+
+  function IsExecutable(VA: UInt64): Boolean;
+  begin
+    if (CacheLimit > CacheBase) and (VA >= CacheBase) and (VA < CacheLimit) then
+      Exit(CacheExec);
+    var M := Default(MEMORY_BASIC_INFORMATION);
+    if VirtualQueryEx(FProcess, Pointer(VA), M, SizeOf(M)) <> SizeOf(M) then
+      Exit(False);
+    CacheBase  := UInt64(M.BaseAddress);
+    CacheLimit := CacheBase + M.RegionSize;
+    var Prot := M.Protect and not (PAGE_GUARD or PAGE_NOCACHE);
+    CacheExec  := (M.State = MEM_COMMIT) and
+                  ((Prot = PAGE_EXECUTE) or (Prot = PAGE_EXECUTE_READ) or
+                   (Prot = PAGE_EXECUTE_READWRITE) or (Prot = PAGE_EXECUTE_WRITECOPY));
+    Result := CacheExec;
+  end;
+
+  // The stack's extent, taken from the target's own memory map rather than
+  // assumed: one reserved allocation, of which the committed part is the live
+  // stack. Walking regions upward while the allocation base holds finds the top
+  // exactly, and needs no TEB -- whose 32-bit copy is awkward to reach from a
+  // 64-bit debugger.
+  function StackExtent(SP, PtrSize: UInt64; out Lo, Hi: UInt64): Boolean;
+  begin
+    Lo := SP - (SP mod PtrSize);
+    Hi := 0;
+    var Mbi := Default(MEMORY_BASIC_INFORMATION);
+    if VirtualQueryEx(FProcess, Pointer(Lo), Mbi, SizeOf(Mbi)) <> SizeOf(Mbi) then
+      Exit(False);
+    var StackAlloc := UInt64(Mbi.AllocationBase);
+    Hi := UInt64(Mbi.BaseAddress) + Mbi.RegionSize;
+    for var Step := 1 to 4096 do begin
+      if VirtualQueryEx(FProcess, Pointer(Hi), Mbi, SizeOf(Mbi)) <> SizeOf(Mbi) then
+        Break;
+      if UInt64(Mbi.AllocationBase) <> StackAlloc then
+        Break;
+      Hi := UInt64(Mbi.BaseAddress) + Mbi.RegionSize;
+    end;
+    Result := Hi > Lo;
+  end;
+
+begin
+  SetLength(Result, 0);
+  SetLength(Ranges, 0);
+  CacheBase  := 0;
+  CacheLimit := 0;
+  CacheExec  := False;
+  if FProcess = 0 then
+    Exit;
+  var TH := ThreadHandle(TID);
+  if TH = 0 then
+    Exit;
+  var Ctx: TContext;
+  var SeedPc, SeedSp, SeedFp: UInt64;
+  if not FillStackWalkContext(TH, Ctx, SeedPc, SeedSp, SeedFp) then
+    Exit;
+  if SeedSp = 0 then
+    Exit;
+
+  var PtrSize := UInt64(TargetLayout.PointerSize);
+  var ScanLo, ScanHi: UInt64;
+  if not StackExtent(SeedSp, PtrSize, ScanLo, ScanHi) then
+    Exit;
+  if ScanHi - ScanLo > MAX_SCAN_BYTES then begin
+    DapLog(Format('RawStackCandidates(TID=%d): stack $%x..$%x is %d bytes; ' +
+      'sweeping the first %d only',
+      [TID, ScanLo, ScanHi, ScanHi - ScanLo, MAX_SCAN_BYTES]));
+    ScanHi := ScanLo + MAX_SCAN_BYTES;
+  end;
+
+  AddRange(FImageBase, FImageSize);
+  for var KV in FDllBases do begin
+    var Size: UInt64 := 0;
+    if FDllSizes.TryGetValue(KV.Key, Size) then
+      AddRange(KV.Value, Size);
+  end;
+  if Length(Ranges) = 0 then
+    Exit;
+
+  // A sweep reads megabytes and decodes thousands of candidates. Saying how
+  // long it took and how much it looked at is what turns "the UI paused" into a
+  // number, and this is the one operation in the engine whose cost scales with
+  // the debuggee's stack rather than with anything the user did.
+  var StartedAt := GetTickCount64;
+  var Buf: TBytes;
+  SetLength(Buf, CHUNK_BYTES);
+  var At := ScanLo;
+  while At < ScanHi do begin
+    var Want := ScanHi - At;
+    if Want > CHUNK_BYTES then
+      Want := CHUNK_BYTES;
+    // A read that fails is a hole in the committed stack, not the end of it:
+    // skip the chunk and carry on rather than truncate the sweep.
+    if not ReadProcessMemoryAt(At, @Buf[0], Want) then begin
+      Inc(At, CHUNK_BYTES);
+      Continue;
+    end;
+    var Slot: UInt64 := 0;
+    while Slot + PtrSize <= Want do begin
+      var VA: UInt64;
+      if PtrSize = 4 then
+        VA := PUInt32(@Buf[Slot])^
+      else
+        VA := PUInt64(@Buf[Slot])^;
+      if (VA >= 65536) and InAnyModule(VA) and IsExecutable(VA) then begin
+        var Verdict := CallSiteVerdictAt(VA);
+        // csaNo is the only rejection. csaUndecidable is kept and reported as
+        // unproven: dropping it would lose every frame in code with no line
+        // table, which is most of the chain this mode exists to see through.
+        if Verdict <> csaNo then begin
+          var Cand: TRawStackCandidate;
+          Cand.StackAddr := At + Slot;
+          Cand.PC        := VA;
+          Cand.Proven    := Verdict = csaYes;
+          Result := Result + [Cand];
+          if (MaxItems > 0) and (Length(Result) >= MaxItems) then begin
+            DapLog(Format('RawStackCandidates(TID=%d): stopped at the %d-item ' +
+              'cap after %d ms', [TID, MaxItems, GetTickCount64 - StartedAt]));
+            Exit;
+          end;
+        end;
+      end;
+      Inc(Slot, PtrSize);
+    end;
+    Inc(At, Want);
+  end;
+  DapLog(Format('RawStackCandidates(TID=%d): swept $%x..$%x (%d KB), %d hit(s), %d ms',
+    [TID, ScanLo, ScanHi, (ScanHi - ScanLo) div 1024, Length(Result),
+     GetTickCount64 - StartedAt]));
 end;
 
 function TWinDebugger.IsPlausibleReturnAddress(VA: UInt64): Boolean;
@@ -3019,29 +3324,7 @@ begin
     // Frame.IP, not the walker's raw PC: frame 0 was just re-anchored to the
     // thread's live PC above, and symbolication has to follow the corrected
     // address or it resolves the walker's bad one.
-    var FrameRva := VAToRva(Frame.IP);
-    // Frame 0 is the live RIP; every caller frame carries a RETURN address,
-    // i.e. the instruction AFTER the call. Looking that up maps to the line
-    // following the call site (e.g. an Assert call reports the next line).
-    // Symbolicate return addresses at RVA-1 so the reported line / function
-    // is the call site itself.
-    var LookupRva := FrameRva;
-    if (Length(Result) > 0) and (FrameRva > 0) then
-      LookupRva := FrameRva - 1;
-    if FDebugInfo.RvaToSourceLine(LookupRva, Loc) then begin
-      Frame.SourceFile := Loc.SourceFile;
-      Frame.SourceLine := Loc.Line;
-    end else begin
-      Frame.SourceFile := '';
-      Frame.SourceLine := 0;
-    end;
-    if not FDebugInfo.RvaToFunctionName(LookupRva, Frame.FunctionName) then
-      Frame.FunctionName := '';
-    var FuncRva: UInt64 := 0;
-    if FDebugInfo.RvaToFunctionStart(LookupRva, FuncRva) then
-      Frame.FuncEntryVA := RvaToVA(FuncRva)
-    else
-      Frame.FuncEntryVA := 0;
+    SymbolicateAddress(Frame.IP, {AtReturnAddress=}Length(Result) > 0, Frame);
     Result := Result + [Frame];
     if Length(Result) >= MAX_FRAMES then
       Break;

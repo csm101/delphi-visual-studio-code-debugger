@@ -56,6 +56,7 @@ type
                 out SeedPc, SeedSp, SeedFp: UInt64): Boolean; override;
     function  WalkRawFrames(TH: THandle; SeedPc, SeedSp, SeedFp: UInt64;
                 MaxFrames: Integer): TArray<TRawStackFrame>; override;
+    function  CallSiteVerdictAt(VA: UInt64): TCallSiteAnswer; override;
 
     function  ReadPrologInfo(EntryVA: UInt64; out ExtraPushBytes: UInt32;
                 out Recognised: Boolean): UInt32; override;
@@ -214,6 +215,29 @@ end;
 // some ancestor's frame or at nothing at all. When a link fails the walk stops
 // and, if it produced almost nothing, defers to the inherited StackWalk64 --
 // which for a stack that is mostly system code may still do better.
+// Decode forward from a known instruction boundary and report whether one lands
+// on VA with a `call` ending there. x86 is not self-synchronising, so reading
+// BACKWARDS cannot answer this: the earlier version scanned a few bytes back
+// for something call-shaped and accepted the address Delphi pushes with
+// `push offset @@finallyHandler`, producing a frame that named the right
+// routine while pointing at its `finally` block.
+//
+// A method rather than a closure inside the walker because the raw stack sweep
+// needs the same proof, and two copies of a rule that has already been got
+// wrong once is one too many.
+function TWin32Debugger.CallSiteVerdictAt(VA: UInt64): TCallSiteAnswer;
+begin
+  var StartVA: UInt64;
+  if not NearestInstructionBoundaryBefore(VA, StartVA) then
+    Exit(csaUndecidable);
+  Result := CallSiteEndsAt(
+    function(At: UInt64; Buf: Pointer; Size: Integer): Boolean
+    begin
+      Result := ReadProcessMemoryAt(At, Buf, Size);
+    end,
+    StartVA, VA);
+end;
+
 function TWin32Debugger.WalkRawFrames(TH: THandle; SeedPc, SeedSp, SeedFp: UInt64;
   MaxFrames: Integer): TArray<TRawStackFrame>;
 const
@@ -252,15 +276,7 @@ const
   // supplies the boundary, since every line record starts an instruction.
   function CallSiteVerdict(VA: UInt64): TCallSiteAnswer;
   begin
-    var StartVA: UInt64;
-    if not NearestInstructionBoundaryBefore(VA, StartVA) then
-      Exit(csaUndecidable);
-    Result := CallSiteEndsAt(
-      function(At: UInt64; Buf: Pointer; Size: Integer): Boolean
-      begin
-        Result := ReadProcessMemoryAt(At, Buf, Size);
-      end,
-      StartVA, VA);
+    Result := CallSiteVerdictAt(VA);
   end;
 
   function IsAfterCallSite(VA: UInt64): Boolean;

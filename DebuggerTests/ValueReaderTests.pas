@@ -113,6 +113,8 @@ type
     function  GetRegisters: TRegisterSnapshot;
     function  GetStackFrames: TArray<TStackFrame>; overload;
     function  GetStackFrames(TID: DWORD): TArray<TStackFrame>; overload;
+    function  GetRawStackFrames(TID: DWORD; MaxItems: Integer = 0): TArray<TStackFrame>;
+    function  ResymbolicateFrames(const Frames: TArray<TStackFrame>): TArray<TStackFrame>;
     function  GetLocalValues: TArray<TLocalValue>;
     procedure SetActiveFrame(FrameRBP, FuncEntryVA: UInt64; const FuncName: string; FramePC: UInt64 = 0);
     procedure ClearActiveFrame;
@@ -199,6 +201,8 @@ function  TFakeMemTarget.GetStoppedThreadId: DWORD; begin Result := 0; end;
 function  TFakeMemTarget.GetRegisters: TRegisterSnapshot; begin Result := Default(TRegisterSnapshot); end;
 function  TFakeMemTarget.GetStackFrames: TArray<TStackFrame>; begin Result := nil; end;
 function  TFakeMemTarget.GetStackFrames(TID: DWORD): TArray<TStackFrame>; begin Result := nil; end;
+function  TFakeMemTarget.GetRawStackFrames(TID: DWORD; MaxItems: Integer): TArray<TStackFrame>; begin Result := nil; end;
+function  TFakeMemTarget.ResymbolicateFrames(const Frames: TArray<TStackFrame>): TArray<TStackFrame>; begin Result := Frames; end;
 function  TFakeMemTarget.GetLocalValues: TArray<TLocalValue>; begin Result := nil; end;
 procedure TFakeMemTarget.SetActiveFrame(FrameRBP, FuncEntryVA: UInt64; const FuncName: string; FramePC: UInt64 = 0); begin end;
 procedure TFakeMemTarget.ClearActiveFrame; begin end;
