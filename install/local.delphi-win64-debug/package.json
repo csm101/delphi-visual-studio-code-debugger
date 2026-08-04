@@ -42,6 +42,12 @@
         "icon": "$(list-ordered)"
       },
       {
+        "command": "delphi-win64.toggleRawStackScan",
+        "title": "Toggle Raw Stack Scan",
+        "category": "Delphi Win64",
+        "icon": "$(search-fuzzy)"
+      },
+      {
         "command": "delphi-win64.createRuleForException",
         "title": "Create a Rule for This Exception...",
         "category": "Delphi Win64",
@@ -65,6 +71,10 @@
         {
           "command": "delphi-win64.pickProcess",
           "when": "false"
+        },
+        {
+          "command": "delphi-win64.toggleRawStackScan",
+          "when": "debugType == 'delphi-win64'"
         }
       ],
       "view/title": [
@@ -77,6 +87,11 @@
           "command": "delphi-win64.editExceptionRules",
           "when": "view == workbench.debug.callStackView",
           "group": "navigation@99"
+        },
+        {
+          "command": "delphi-win64.toggleRawStackScan",
+          "when": "view == workbench.debug.callStackView && debugType == 'delphi-win64'",
+          "group": "navigation@98"
         }
       ],
       "debug/toolBar": [

@@ -511,6 +511,11 @@ begin
   Args.AddPair('columnsStartAt1',      TJSONBool.Create(True));
   Args.AddPair('pathFormat',           'path');
   Args.AddPair('supportsVariableType', TJSONBool.Create(True));
+  // Declared because VS Code declares it: the adapter is only allowed to emit
+  // `invalidated` to a client that asked for it, and the raw-stack toggle relies
+  // on that event to redraw the Call Stack. A test client that stayed silent
+  // would leave that path unexercised.
+  Args.AddPair('supportsInvalidatedEvent', TJSONBool.Create(True));
   Seq    := SendCmd('initialize', Args);
   Result := WaitResp(Seq);
 end;

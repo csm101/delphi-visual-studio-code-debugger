@@ -41,6 +41,11 @@ type
     // never cache a name at CREATE_THREAD time.
     FThreadNames:  TDictionary<DWORD, string>;  // id -> announced name
     FStoppedTid:   DWORD;
+    // Why the last synthetic call failed, in the debuggee's own words: the
+    // exception class and message when it raised, or the fault. Set at the
+    // abort site, where the exception record is in hand; read by the evaluator
+    // so a failed watch says what went wrong instead of only that it did.
+    FLastSyntheticCallError: string;
     FImageBase:    UInt64;
     FImageSize:    UInt64;   // SizeOfImage of the main image, read at CreateProcess
     FPreferredBase: UInt64;
@@ -428,6 +433,7 @@ type
                 const ArgValues: array of UInt64;
                 const ArgKinds:  array of TSyntheticArgKind;
                 out IntResult, FloatResultLow: UInt64): Boolean;
+    function  LastSyntheticCallError: string;
     // Invokes a function in the debuggee, capturing the return value (RAX).
     // Public surface for the expression evaluator's method-backed property
     // getters. Arguments are positional; trailing ones may be 0 for unary
@@ -702,6 +708,11 @@ begin
     VA := RvaToVA(Rva);
     Result := True;
   end;
+end;
+
+function TWinDebugger.LastSyntheticCallError: string;
+begin
+  Result := FLastSyntheticCallError;
 end;
 
 function TWinDebugger.CurrentScopeClassName: string;
@@ -4003,6 +4014,10 @@ begin
   Result    := False;
   IntResult      := 0;
   FloatResultLow := 0;
+  // Cleared per call so a caller can never attribute an OLD failure's reason to
+  // a new one -- a stale "EAccessViolation" on an unrelated expression would be
+  // worse than no reason at all.
+  FLastSyntheticCallError := '';
   if Length(ArgValues) <> Length(ArgKinds) then Exit;
   TH := ThreadHandle(FStoppedTid);
   if (TH = 0) or (FProcess = 0) or (FuncVA = 0) then Exit;
@@ -4169,6 +4184,37 @@ begin
            SecondChance then begin
           DapLog(Format('RunMethodCall: ABORT fault=0x%.8x secondChance=%s -> fail',
             [FaultCode, BoolToStr(SecondChance, True)]));
+          // WHY it failed, captured HERE because this is the only moment it is
+          // knowable: the exception record is in hand and the debuggee is still
+          // frozen at the fault. A caller that sees only False can say
+          // "invocation failed", which tells the user nothing they did not
+          // already see.
+          FLastSyntheticCallError := '';
+          if FaultCode = $0EEDFADE then begin
+            var ObjAddr: UInt64 := 0;
+            var ExcClass := '';
+            if Ev.Exception.ExceptionRecord.NumberParameters >= 2 then begin
+              ObjAddr  := Ev.Exception.ExceptionRecord.ExceptionInformation[1];
+              ExcClass := ReadDelphiExceptionClass(ObjAddr);
+            end;
+            if (ExcClass = '') and (Ev.Exception.ExceptionRecord.NumberParameters >= 1) then begin
+              ObjAddr  := Ev.Exception.ExceptionRecord.ExceptionInformation[0];
+              ExcClass := ReadDelphiExceptionClass(ObjAddr);
+            end;
+            if ExcClass <> '' then begin
+              FLastSyntheticCallError := ExcClass;
+              var ExcMsg := ReadDelphiExceptionMessage(ObjAddr);
+              if ExcMsg <> '' then
+                FLastSyntheticCallError := ExcClass + ': ' + ExcMsg;
+            end
+            else
+              FLastSyntheticCallError := 'a Delphi exception was raised';
+          end
+          else if FaultCode = EXCEPTION_ACCESS_VIOLATION then
+            FLastSyntheticCallError := 'access violation'
+          else
+            FLastSyntheticCallError :=
+              Format('unhandled exception 0x%.8x', [FaultCode]);
           SetThreadContext(TH, SavedCtx);
           Result := False;
           Exit;

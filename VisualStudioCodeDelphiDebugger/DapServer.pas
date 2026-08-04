@@ -247,6 +247,10 @@ type
     // POSITIONS on the stack, not a chain, and a user who has not asked for
     // them must never be shown them next to real frames.
     FRawStackScan: Boolean;
+    // True when the client declared `supportsInvalidatedEvent` in `initialize`.
+    // The raw-stack toggle uses it to make the Call Stack redraw immediately; a
+    // client without it still gets the toggle, its effect showing at the next stop.
+    FClientSupportsInvalidated: Boolean;
     // Where the DEBUGGER's own diagnostics go. True (default) sends them as
     // `delphiLog` custom events for the extension's "Delphi Debug" output
     // channel; False keeps the old behaviour and prints them in the Debug
@@ -362,6 +366,8 @@ type
     procedure ParseProgressLocation(Args: TJSONObject);
     // `rawStackScan` from the launch/attach config -> FRawStackScan.
     procedure ParseRawStackScan(Args: TJSONObject);
+    // Custom request: flips the raw stack sweep mid-session (Call Stack toggle).
+    procedure HandleSetRawStackScan(Seq: Integer; Args: TJSONObject);
     // `diagnosticsLocation` -> FDiagnosticsToOutputChannel.
     procedure ParseDiagnosticsLocation(Args: TJSONObject);
     // Emits one diagnostic line to wherever diagnostics currently go.
@@ -898,6 +904,49 @@ begin
   FRawStackScan := (Args <> nil) and Args.GetValue<Boolean>('rawStackScan', False);
   if FRawStackScan then
     DapLog('rawStackScan = ON (raw sweep appended below the walked frames)');
+end;
+
+// Flips the raw stack sweep mid-session, for the Call Stack title-bar toggle.
+// The launch flag alone meant editing launch.json and restarting -- backwards
+// for something reached for exactly when a stack has just come up short.
+//
+// The reply carries the resulting state so the button can label itself from
+// what the adapter actually did rather than from what the client assumed, and
+// an `invalidated` event follows: VS Code caches the call stack and will not
+// re-request it because a setting changed, so without this the toggle appears
+// to do nothing until the next step.
+procedure TDapServer.HandleSetRawStackScan(Seq: Integer; Args: TJSONObject);
+begin
+  var Enabled := FRawStackScan;
+  if Args <> nil then begin
+    if Args.GetValue('enabled') <> nil then
+      Enabled := Args.GetValue<Boolean>('enabled', Enabled)
+    else
+      Enabled := not FRawStackScan;   // no argument = toggle
+  end
+  else
+    Enabled := not FRawStackScan;
+  FRawStackScan := Enabled;
+  DapLog(Format('delphiSetRawStackScan -> %s', [BoolToStr(FRawStackScan, True)]));
+
+  var Body := TJSONObject.Create;
+  try
+    Body.AddPair('enabled', TJSONBool.Create(FRawStackScan));
+    FIO.SendResponse(Seq, 'delphiSetRawStackScan', True, Body);
+  finally
+    Body.Free;
+  end;
+
+  // Only meaningful while stopped; a running target has no stack to redraw.
+  if FClientSupportsInvalidated and (FSession.State = dsStopped) then begin
+    var Inv := TJSONObject.Create;
+    try
+      Inv.AddPair('areas', TJSONArray.Create(TJSONString.Create('stacks')));
+      FIO.SendEvent('invalidated', Inv);
+    finally
+      Inv.Free;
+    end;
+  end;
 end;
 
 procedure TDapServer.ParseDiagnosticsLocation(Args: TJSONObject);
@@ -1657,6 +1706,13 @@ procedure TDapServer.HandleInitialize(Seq: Integer; Args: TJSONObject);
 var
   Caps: TJSONObject;
 begin
+  // The `invalidated` event may only be sent to a client that asked for it.
+  // Recorded here rather than assumed: the raw-stack toggle needs it to make the
+  // Call Stack redraw, and a client without it must get the toggle anyway (its
+  // effect simply shows at the next stop).
+  if Args <> nil then
+    FClientSupportsInvalidated := Args.GetValue<Boolean>('supportsInvalidatedEvent', False);
+
   Caps := TJSONObject.Create;
   try
     Caps.AddPair('supportsConfigurationDoneRequest', TJSONBool.Create(True));
@@ -3242,6 +3298,7 @@ begin
     else if Cmd = 'gotoTargets'       then HandleGotoTargets(Seq, Args)
     else if Cmd = 'goto'              then HandleGoto(Seq, Args)
     else if Cmd = 'disconnect'        then HandleDisconnect(Seq)
+    else if Cmd = 'delphiSetRawStackScan' then HandleSetRawStackScan(Seq, Args)
     else
       // Unknown command: send empty success response to avoid VS Code hanging
       FIO.SendResponse(Seq, Cmd, True);

@@ -490,6 +490,37 @@ function activate(context) {
   // reason -- an update check that reports its own troubles is a nuisance.
   checkForUpdate(context).catch(() => {});
 
+  // Raw stack sweep, from the Call Stack title bar. It used to be a launch-time
+  // flag only, which meant editing launch.json and restarting for something you
+  // reach for exactly when a stack has just come up short.
+  //
+  // The message deliberately restates what the results ARE, every time it is
+  // switched on: a raw hit is a POSITION on the stack, and one of them may be a
+  // return address left behind by a call that already returned. A toggle that
+  // quietly added plausible-looking frames to a call stack would undo the care
+  // taken to mark them.
+  context.subscriptions.push(
+    vscode.commands.registerCommand('delphi-win64.toggleRawStackScan', async () => {
+      const session = vscode.debug.activeDebugSession;
+      if (!session || session.type !== DEBUG_TYPE) {
+        vscode.window.showInformationMessage(
+          'Raw stack scan applies to a running Delphi Win64 debug session.');
+        return;
+      }
+      try {
+        const reply = await session.customRequest('delphiSetRawStackScan', {});
+        const on = !!(reply && reply.enabled);
+        vscode.window.setStatusBarMessage(
+          on ? 'Delphi: raw stack scan ON — extra entries are POSITIONS on the stack, not callers'
+             : 'Delphi: raw stack scan OFF',
+          6000);
+      } catch (err) {
+        vscode.window.showWarningMessage(
+          'Could not toggle the raw stack scan: ' + (err && err.message ? err.message : String(err)));
+      }
+    })
+  );
+
   // Same language ids the breakpoint contribution uses.
   context.subscriptions.push(
     vscode.languages.registerEvaluatableExpressionProvider(

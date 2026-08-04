@@ -29,7 +29,7 @@ type
 
   TMapFile = class(TInterfacedObject,
     ISourceLineProvider, IFunctionNameProvider, IBackgroundIndexProvider,
-    IThreadLocalNameProvider, ISymbolExtentProvider)
+    IThreadLocalNameProvider, ISymbolExtentProvider, ISourceFileListProvider)
   private
     // Memory-mapped file
     FFileHandle:     THandle;
@@ -176,6 +176,8 @@ type
     // IBackgroundIndexProvider: True while the background publics parse is still
     // running, so a name miss may yet resolve once it completes.
     function    BackgroundIndexingPending: Boolean;
+    // ISourceFileListProvider
+    function    SourceFileList(out Complete: Boolean): TArray<TSourceFileEntry>;
   end;
 
 function ReadPEPreferredBase(const ExePath: string): UInt64;
@@ -1131,6 +1133,30 @@ begin
     end;
     if GetTickCount64 > Deadline then Exit;
     Sleep(1);
+  end;
+end;
+
+// ISourceFileListProvider. The unit-section index is exactly the "Line numbers
+// for <unit>" headers, which is the same set a breakpoint can bind in.
+//
+// `Complete` mirrors FIndexReady rather than the publics flag: the unit sections
+// are what is being listed here, and they finish first.
+function TMapFile.SourceFileList(out Complete: Boolean): TArray<TSourceFileEntry>;
+begin
+  Result := [];
+  FLock.Acquire;
+  try
+    Complete := FIndexReady;
+    for var KV in FUnitSections do begin
+      var Entry := Default(TSourceFileEntry);
+      // The key is the UPPER file name; report the same lowercase spelling every
+      // other surface uses, and keep the recorded path separately.
+      Entry.Name     := AnsiLowerCase(KV.Key);
+      Entry.FullPath := KV.Value.FullPath;
+      Result := Result + [Entry];
+    end;
+  finally
+    FLock.Release;
   end;
 end;
 

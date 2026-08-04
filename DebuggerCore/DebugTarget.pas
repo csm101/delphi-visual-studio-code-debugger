@@ -328,6 +328,11 @@ type
                 const ArgValues: array of UInt64;
                 const ArgKinds:  array of TSyntheticArgKind;
                 out IntResult, FloatResultLow: UInt64): Boolean;
+    // Why the last RunMethodCall failed, in the debuggee's own words -- the
+    // raised exception's class and message, or the fault. '' when the last call
+    // succeeded or failed before reaching the target. Only meaningful
+    // immediately after a False return.
+    function  LastSyntheticCallError: string;
     // Arguments are POSITIONAL, not register-named: which physical register (or
     // stack slot) each one lands in is the implementation's business, and the
     // answer differs per architecture. Delphi's 32-bit `register` convention

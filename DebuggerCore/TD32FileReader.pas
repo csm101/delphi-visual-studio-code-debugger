@@ -172,7 +172,7 @@ type
                           IClassMemberProvider, IEnumInfoProvider,
                           ITypeSizeProvider, IClassHierarchyProvider,
                           ITypePointeeKindProvider,
-                          IMethodSignatureProvider)
+                          IMethodSignatureProvider, ISourceFileListProvider)
   private
     FFileHandle:    THandle;
     FMappingHandle: THandle;
@@ -511,6 +511,8 @@ type
     // breakpoint resolution can route to TD32 even when no MAP file is
     // available alongside the package.
     function    GetSourceFiles: TArray<string>;
+    // ISourceFileListProvider
+    function    SourceFileList(out Complete: Boolean): TArray<TSourceFileEntry>;
     // Diagnostic: returns the raw bytes (payload only, after cb+leaf) of
     // a type record. Used by probes when reverse-engineering new leaf
     // kinds. Returns nil + Len=0 if TypeId is out of range or below the
@@ -2639,6 +2641,22 @@ end;
 function TTD32FileReader.SortedRvas: TArray<UInt64>;
 begin
   Result := FSortedRvas;
+end;
+
+// ISourceFileListProvider. Always complete: the CodeView line table is parsed
+// in full at load, so there is no half-built state to warn about.
+//
+// TD32 records the file name only -- the module list carries the module's own
+// path, and inventing a directory for the source here would be a guess.
+function TTD32FileReader.SourceFileList(out Complete: Boolean): TArray<TSourceFileEntry>;
+begin
+  Complete := True;
+  Result := [];
+  for var Name in GetSourceFiles do begin
+    var Entry := Default(TSourceFileEntry);
+    Entry.Name := Name;
+    Result := Result + [Entry];
+  end;
 end;
 
 function TTD32FileReader.GetSourceFiles: TArray<string>;

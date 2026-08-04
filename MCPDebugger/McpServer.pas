@@ -638,6 +638,36 @@ begin
         SendToolJson(IdJson, McpJson.ModuleListToJson(Mods));
       Exit;
     end;
+    if Name = 'get_source_files' then begin
+      // Not gated on being stopped, for the same reason as get_loaded_modules:
+      // the answer is a property of what has been loaded, and it is most useful
+      // BEFORE running, when a breakpoint file name is being chosen.
+      var Groups := FSession.GetModuleSources;
+      if Length(Groups) = 0 then begin
+        SendToolError(IdJson, 'No active debuggee. Launch or attach first.');
+        Exit;
+      end;
+      var Wanted := Trim(ArgStr('module'));
+      if Wanted <> '' then begin
+        var Kept: TArray<TSessionModuleSources> := [];
+        for var G in Groups do
+          if SameText(G.Module, Wanted) then
+            Kept := Kept + [G];
+        if Length(Kept) = 0 then begin
+          SendToolError(IdJson, Format(
+            'No module named "%s" is loaded. Use get_loaded_modules to see the exact names.',
+            [Wanted]));
+          Exit;
+        end;
+        Groups := Kept;
+      end;
+      if ArgBool('nameOnly') then
+        for var I := 0 to High(Groups) do
+          for var J := 0 to High(Groups[I].Files) do
+            Groups[I].Files[J].FullPath := '';
+      SendToolJson(IdJson, McpJson.ModuleSourcesToJson(Groups));
+      Exit;
+    end;
     if Name = 'get_raw_stack_scan' then begin
       if not Stopped then begin
         SendToolError(IdJson, 'Cannot sweep the stack while the debuggee is running. Pause or wait for a stop first.');

@@ -121,6 +121,18 @@ To attach to processes owned by another user or elevated targets, run the client
   merely being absent. Answers the two questions a nameless frame raises, and
   tells whether a breakpoint that has not bound is waiting for a package that
   is not loaded yet. Valid while running, not only while stopped.
+- `get_source_files` (`module`, `nameOnly`) — the source files the loaded debug
+  info can name, grouped by owning module. This is the file spelling
+  `set_breakpoint` expects, so it replaces guessing a name from a unit or a
+  path. Each group carries `listedBy` (the format that produced the list:
+  `td32`, `tds` or `map`), `complete` (`false` while an index is still filling —
+  the list is partial, re-ask shortly) and `fileCount`. `listedBy: null` means
+  the module's loaded formats **cannot enumerate** — `.rsm`, `.dcp` and `.jdbg`
+  map addresses but hold no file index — which is *unknown*, not "this module
+  has no source files"; a breakpoint there may still bind. Only formats already
+  loaded are consulted, so enumerating never triggers a parse and a module whose
+  sidecars have not been probed yet can be absent; `get_loaded_modules` says
+  which those are. Valid while running, not only while stopped.
 - `get_raw_stack_scan` (`threadId`, `maxItems`) — **last resort, and not a call
   stack.** Brute-force sweep of the thread's stack for words that could be
   return addresses, for when `get_call_stack` stops short: a 32-bit target

@@ -215,6 +215,23 @@ type
     Formats:  TArray<string>;  // 'td32' | 'tds' | 'map' | 'rsm' | 'dcp' | 'jdbg'
   end;
 
+  // The source files one module's debug info can name -- DAP's `loadedSources`,
+  // grouped by module because "which file" is only half the question: the other
+  // half is which image would own a breakpoint set in it.
+  //
+  // `ListedBy` names the format that produced `Files`. It is '' when none of the
+  // module's loaded formats can enumerate (`.rsm`, `.dcp` and `.jdbg` map
+  // addresses but hold no file index), which is a different fact from a module
+  // having no source files at all -- without it the two are indistinguishable.
+  TSessionModuleSources = record
+    Module:   string;              // lowercase module file name
+    IsMain:   Boolean;
+    Formats:  TArray<string>;      // every format registered for the module
+    ListedBy: string;              // 'td32' | 'tds' | 'map' | '' (cannot list)
+    Complete: Boolean;             // False while the listing index is still filling
+    Files:    TArray<TSourceFileEntry>;
+  end;
+
   TLaunchOptions = record
     ExePath:          string;
     MapPath:          string;

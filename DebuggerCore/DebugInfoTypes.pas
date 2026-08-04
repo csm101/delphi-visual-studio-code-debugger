@@ -132,6 +132,34 @@ type
       out ParentRva: UInt64): Boolean;
   end;
 
+  // One source file a provider can map to code.
+  //
+  // `FullPath` is whatever the debug info recorded at compile time -- a compile
+  // machine's path, not necessarily one that exists here. It is reported as-is
+  // rather than resolved, because the caller's source root is the frontend's
+  // business and a silently-rewritten path hides a missing-source problem.
+  TSourceFileEntry = record
+    Name:     string;   // lowercase file name, e.g. 'unit1.pas'
+    FullPath: string;   // path as recorded, '' when only the name is known
+  end;
+
+  // Optional: a provider that can enumerate the source files it covers -- the
+  // set of files in which a breakpoint can actually bind for its module.
+  //
+  // `Complete` is False while an index is still filling, which matters because
+  // a partial list is indistinguishable from a short one: without the flag, a
+  // caller cannot tell "this module has three units" from "three so far".
+  ISourceFileListProvider = interface
+    // NEXT FREE SUFFIX IS 0014. Reusing one is silent and catastrophic: this
+    // interface first shipped with 0011, already held by IThreadLocalNameProvider,
+    // and `Supports` handed out that vtable instead -- so every evaluation that
+    // asked whether a name was thread-local called SourceFileList and wrote its
+    // array result through the Boolean's address. Thirteen tests died with
+    // "Write of address 0". ProviderInterfaceGuids_AreUnique now pins it.
+    ['{2F5A6C01-1111-4A42-8C3D-53ABAABB0013}']
+    function SourceFileList(out Complete: Boolean): TArray<TSourceFileEntry>;
+  end;
+
   // Optional: a provider that builds its name/symbol index on a background
   // thread (e.g. TMapFile parses the large Publics section asynchronously).
   // Returns True while that build is still in progress, so callers can wait

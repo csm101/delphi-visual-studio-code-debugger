@@ -59,6 +59,19 @@ type
     [Test] procedure DynArrayHeader_Win32ImageReadAsWin64_IsWrong;
   end;
 
+  // The debug-info provider interfaces are looked up by GUID with `Supports`,
+  // which does not care whether two of them share one. Duplicating a GUID hands
+  // out the WRONG vtable, so a call lands on whichever method occupies that slot
+  // and arguments are reinterpreted as its own -- a corruption with no exception
+  // at the call site. It has happened once: ISourceFileListProvider shipped with
+  // IThreadLocalNameProvider's GUID and thirteen tests died writing an array
+  // result through a Boolean's address.
+  [TestFixture]
+  TProviderInterfaceTests = class
+  public
+    [Test] procedure ProviderInterfaceGuids_AreUnique;
+  end;
+
   // Pure unit tests for the setVariable byte encoders.
   [TestFixture]
   TValueEncoderTests = class
@@ -75,7 +88,7 @@ type
 implementation
 
 uses
-  System.SysUtils, Winapi.Windows,
+  System.SysUtils, System.TypInfo, Winapi.Windows,
   DebugInfoTypes, DebugTarget, DebugInfoSet, DelphiValueReaders, ExceptionRules,
   ValueEncoders, TargetLayout, WinDebuggerBase;
 
@@ -124,6 +137,7 @@ type
     function  GetRawStackFrames(TID: DWORD; MaxItems: Integer = 0): TArray<TStackFrame>;
     function  ResymbolicateFrames(const Frames: TArray<TStackFrame>): TArray<TStackFrame>;
     function  CurrentScopeClassName: string;
+    function  LastSyntheticCallError: string;
     function  GetLocalValues: TArray<TLocalValue>;
     procedure SetActiveFrame(FrameRBP, FuncEntryVA: UInt64; const FuncName: string; FramePC: UInt64 = 0);
     procedure ClearActiveFrame;
@@ -213,6 +227,7 @@ function  TFakeMemTarget.GetStackFrames(TID: DWORD): TArray<TStackFrame>; begin 
 function  TFakeMemTarget.GetRawStackFrames(TID: DWORD; MaxItems: Integer): TArray<TStackFrame>; begin Result := nil; end;
 function  TFakeMemTarget.ResymbolicateFrames(const Frames: TArray<TStackFrame>): TArray<TStackFrame>; begin Result := Frames; end;
 function  TFakeMemTarget.CurrentScopeClassName: string; begin Result := ''; end;
+function  TFakeMemTarget.LastSyntheticCallError: string; begin Result := ''; end;
 function  TFakeMemTarget.GetLocalValues: TArray<TLocalValue>; begin Result := nil; end;
 procedure TFakeMemTarget.SetActiveFrame(FrameRBP, FuncEntryVA: UInt64; const FuncName: string; FramePC: UInt64 = 0); begin end;
 procedure TFakeMemTarget.ClearActiveFrame; begin end;
@@ -755,8 +770,60 @@ begin
   Assert.AreEqual(2, Integer(Buf[0]));
 end;
 
+// Every provider interface listed here must carry its own GUID. The list is
+// maintained by hand because Delphi offers no way to enumerate the interfaces
+// declared in a unit; a forgotten entry weakens the check but can never make it
+// fail spuriously, which is the right way round for a guard like this.
+procedure TProviderInterfaceTests.ProviderInterfaceGuids_AreUnique;
+type
+  TNamedGuid = record
+    Name: string;
+    Guid: TGUID;
+  end;
+
+  function Entry(const Name: string; Info: PTypeInfo): TNamedGuid;
+  begin
+    Result.Name := Name;
+    Result.Guid := GetTypeData(Info)^.Guid;
+  end;
+
+begin
+  var All: TArray<TNamedGuid> := [
+    Entry('ISourceLineProvider',       TypeInfo(ISourceLineProvider)),
+    Entry('IFunctionNameProvider',     TypeInfo(IFunctionNameProvider)),
+    Entry('ISourceFileListProvider',   TypeInfo(ISourceFileListProvider)),
+    Entry('IBackgroundIndexProvider',  TypeInfo(IBackgroundIndexProvider)),
+    Entry('ILocalSymbolProvider',      TypeInfo(ILocalSymbolProvider)),
+    Entry('IUnitScopedLocalProvider',  TypeInfo(IUnitScopedLocalProvider)),
+    Entry('IGlobalSymbolProvider',     TypeInfo(IGlobalSymbolProvider)),
+    Entry('ISymbolExtentProvider',     TypeInfo(ISymbolExtentProvider)),
+    Entry('IThreadLocalNameProvider',  TypeInfo(IThreadLocalNameProvider)),
+    Entry('IUnitScopedGlobalProvider', TypeInfo(IUnitScopedGlobalProvider)),
+    Entry('IUnitUsesProvider',         TypeInfo(IUnitUsesProvider)),
+    Entry('IUnitScopedFuncProvider',   TypeInfo(IUnitScopedFuncProvider)),
+    Entry('IUnitScopedConstProvider',  TypeInfo(IUnitScopedConstProvider)),
+    Entry('IEnumInfoProvider',         TypeInfo(IEnumInfoProvider)),
+    Entry('IClassMemberProvider',      TypeInfo(IClassMemberProvider)),
+    Entry('IClassHierarchyProvider',   TypeInfo(IClassHierarchyProvider)),
+    Entry('ITypePointeeKindProvider',  TypeInfo(ITypePointeeKindProvider)),
+    Entry('ITypeSizeProvider',         TypeInfo(ITypeSizeProvider)),
+    Entry('IMethodSignatureProvider',  TypeInfo(IMethodSignatureProvider))
+  ];
+
+  for var I := 0 to High(All) do begin
+    Assert.AreNotEqual(GUIDToString(TGUID.Empty), GUIDToString(All[I].Guid),
+      All[I].Name + ' has no GUID -- Supports() cannot find it at all');
+    for var J := I + 1 to High(All) do
+      Assert.AreNotEqual(GUIDToString(All[I].Guid), GUIDToString(All[J].Guid),
+        Format('%s and %s share a GUID: Supports() will hand out the wrong ' +
+               'vtable and calls will land on the other interface''s methods',
+          [All[I].Name, All[J].Name]));
+  end;
+end;
+
 initialization
   TDUnitX.RegisterTestFixture(TValueReaderTests);
+  TDUnitX.RegisterTestFixture(TProviderInterfaceTests);
   TDUnitX.RegisterTestFixture(TValueEncoderTests);
 
 end.

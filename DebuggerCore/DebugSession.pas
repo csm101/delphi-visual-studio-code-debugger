@@ -242,6 +242,7 @@ type
     // state and the debug-info formats that actually loaded for it. Valid
     // whenever a process exists -- it describes the address space, not a stop.
     function  GetModules: TArray<TSessionModule>;
+    function  GetModuleSources: TArray<TSessionModuleSources>;
     function  GetCurrentLocation(out FnName, SrcFile: string;
                 out Line: Integer): Boolean;
     function  GetLocals: TArray<TSessionVariable>;
@@ -1282,22 +1283,21 @@ begin
     Result[I] := FrameToSession(Frames[I], I);
 end;
 
+// The formats a runtime module actually registered, read off the provider
+// references themselves. A `*Tried` flag would say only that a format was
+// looked for.
+function FormatsOf(M: TModuleSymbols): TArray<string>;
+begin
+  Result := [];
+  if M.Td32Iface <> nil then Result := Result + ['td32'];
+  if M.TdsIface  <> nil then Result := Result + ['tds'];
+  if M.MapIface  <> nil then Result := Result + ['map'];
+  if M.RsmIface  <> nil then Result := Result + ['rsm'];
+  if M.DcpIface  <> nil then Result := Result + ['dcp'];
+  if M.JclIface  <> nil then Result := Result + ['jdbg'];
+end;
+
 function TDebugSession.GetModules: TArray<TSessionModule>;
-
-  // The formats a runtime module actually registered, read off the provider
-  // references themselves. A `*Tried` flag would say only that a format was
-  // looked for.
-  function FormatsOf(M: TModuleSymbols): TArray<string>;
-  begin
-    Result := [];
-    if M.Td32Iface <> nil then Result := Result + ['td32'];
-    if M.TdsIface  <> nil then Result := Result + ['tds'];
-    if M.MapIface  <> nil then Result := Result + ['map'];
-    if M.RsmIface  <> nil then Result := Result + ['rsm'];
-    if M.DcpIface  <> nil then Result := Result + ['dcp'];
-    if M.JclIface  <> nil then Result := Result + ['jdbg'];
-  end;
-
 begin
   Result := nil;
   if (FDebugger = nil) or (FLoader = nil) then
@@ -1321,6 +1321,38 @@ begin
     Rec.Size    := M.ImageSize;
     Rec.Symbols := M.SymbolAvailability;
     Rec.Formats := FormatsOf(M);
+    Result := Result + [Rec];
+  end;
+end;
+
+// Every source file the loaded debug info can name, grouped by owning module.
+//
+// Like GetModules, deliberately NOT gated on being stopped: which files are
+// covered is a property of what has been loaded, and the question is most
+// useful before running -- it is how a caller learns the file spelling that
+// set_breakpoint expects instead of guessing at it.
+//
+// Only formats that already loaded are asked. A module whose sidecars have not
+// been probed yet reports what it has so far rather than triggering a parse:
+// enumerating sources must not be the thing that stalls a session for seconds.
+function TDebugSession.GetModuleSources: TArray<TSessionModuleSources>;
+begin
+  Result := nil;
+  if (FDebugger = nil) or (FLoader = nil) then
+    Exit;
+
+  var Main := Default(TSessionModuleSources);
+  Main.Module  := LowerCase(ExtractFileName(FExePath));
+  Main.IsMain  := True;
+  Main.Formats := FLoader.MainSymbolFormats;
+  Main.Files   := FLoader.MainSourceFileList(Main.ListedBy, Main.Complete);
+  Result := [Main];
+
+  for var M in FLoader.Modules do begin
+    var Rec := Default(TSessionModuleSources);
+    Rec.Module  := M.Name;
+    Rec.Formats := FormatsOf(M);
+    Rec.Files   := M.SourceFileList(Rec.ListedBy, Rec.Complete);
     Result := Result + [Rec];
   end;
 end;

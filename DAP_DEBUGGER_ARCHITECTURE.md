@@ -1253,6 +1253,18 @@ to a real frame. Raw frames go into the same `FLastFrames` array so a `frameId`
 still indexes one list; selecting one is harmless because its `FrameRBP` is 0,
 so locals come back empty rather than decoded off an unrelated frame.
 
+**Toggling it mid-session.** The flag used to be read once, at launch, so
+reaching for the sweep meant editing `launch.json` and restarting — losing the
+very stop that motivated it. The custom request `delphiSetRawStackScan`
+(`{"enabled": bool}`, or no argument to toggle) flips it in place and echoes the
+resulting state in its response body, so a client labels its button from what
+the adapter did rather than from what it assumed. VS Code caches the call stack
+and will not re-request it because a setting changed, so an `invalidated` event
+(`areas: ["stacks"]`) follows — sent only to a client that declared
+`supportsInvalidatedEvent`, and only while stopped. The extension binds this to
+a Call Stack title-bar button whose confirmation restates, every single time,
+that raw entries are POSITIONS on the stack rather than callers.
+
 One trap this uncovered: `NearestInstructionBoundaryBefore` had been bounded to
 the main image. RVAs are a single space anchored at the main image and every
 module's provider registers inside it, so that bound made code in a runtime

@@ -205,6 +205,24 @@ begin
     'waiting for a package that is not loaded YET. Valid while running as well as while stopped.',
     []));
 
+  Result.Add(MakeTool('get_source_files',
+    'List the source files the loaded debug info can name, grouped by owning module. ' +
+    'This is the file spelling set_breakpoint expects -- use it instead of guessing a name ' +
+    'from a unit or a path. Each group carries `listedBy` (the format that produced the list: ' +
+    '"td32", "tds" or "map"), `complete` (false while an index is still filling -- re-ask ' +
+    'shortly, the list is partial), and `fileCount`. `listedBy` is null when the module''s ' +
+    'loaded formats CANNOT enumerate files (".rsm", ".dcp" and ".jdbg" map addresses but hold ' +
+    'no file index): that means "unknown", NOT "this module has no source files", and a ' +
+    'breakpoint there may still bind. Only formats already loaded are consulted, so a module ' +
+    'whose sidecars have not been probed yet can be missing from the answer; get_loaded_modules ' +
+    'says which those are. Valid while running as well as while stopped. ' +
+    'Pass `module` to restrict the answer to one image (matched on the file name, ' +
+    'case-insensitive), or `nameOnly` to drop the compile-time paths.',
+    [Prop('module', 'string',
+       'Restrict to this module file name, e.g. "myapp.exe" or "libfoo.bpl". Omit for all.', False),
+     Prop('nameOnly', 'boolean',
+       'Omit the recorded compile-time path of each file and return names only (default false).', False)]));
+
   Result.Add(MakeTool('get_raw_stack_scan',
     'LAST RESORT, and NOT a call stack. Brute-force sweep of the thread''s stack for words ' +
     'that could be return addresses, ordered from the top of the stack down. Use it only when ' +

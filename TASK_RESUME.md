@@ -3214,3 +3214,86 @@ PushImmediate_IsNotACallSite` pins exactly that.
   mid-run edit fakes a large regression.
 - `for var x in ['a','b']` is fine in a for-in, but `Exit(['a'])` is parsed as a
   set ("Ordinal type required"); use `TArray<string>.Create(...)`.
+
+## Current substep (2026-08-04): three frontend gaps the user asked for
+
+Requested as "fai 2,3 e 4 (solo lato mcp)" -- items from the list produced after
+the Hydra2 dogfooding round. All three are written and building; the full suite
+is running.
+
+### 2. Raw stack sweep, togglable from the Call Stack title bar
+
+The flag existed but was read ONCE at launch, so using it meant editing
+`launch.json` and restarting -- precisely when the stack that motivated it is on
+screen and worth keeping.
+
+- `DapServer.pas`: custom request `delphiSetRawStackScan`. `{"enabled":bool}`
+  sets, an absent argument toggles. The reply body echoes the resulting state so
+  the button labels itself from what the adapter did.
+- The Call Stack does not re-issue `stackTrace` because a setting changed, so an
+  `invalidated` event (`areas:["stacks"]`) follows -- but only when the client
+  declared `supportsInvalidatedEvent` (new field `FClientSupportsInvalidated`,
+  read in `HandleInitialize`) and only while stopped. `DapClient.Initialize` now
+  declares it too, or the event path would never be exercised by a test.
+- Extension: command `delphi-win64.toggleRawStackScan`, `view/title` on
+  `workbench.debug.callStackView`, gated on `debugType == 'delphi-win64'`. The
+  status-bar confirmation restates every time that raw hits are POSITIONS, not
+  callers.
+- Test: `Test_RawStackScan_TogglesMidSession` -- off at start, on mid-stop
+  produces raw frames, off again removes them.
+
+### 3. A failed synthetic call now names the exception
+
+`<method invocation failed>` said nothing about WHY. `RunMethodCall` already
+aborts on a Delphi raise / AV; it now records what it aborted on.
+
+- `WinDebuggerBase.pas`: `FLastSyntheticCallError`, cleared at entry, set at the
+  abort site (Delphi raise -> class + message via `ReadDelphiExceptionClass` /
+  `ReadDelphiExceptionMessage`; AV -> "access violation"; otherwise the fault
+  code). Exposed on `IDebugTarget` as `LastSyntheticCallError`.
+- `ExprEval.pas` renders `<MethodName raised EClass: message>`.
+
+### 4. Source-file enumeration, MCP side only (as instructed)
+
+New tool `get_source_files`: the file spelling `set_breakpoint` expects, grouped
+by owning module, instead of guessing a name from a unit.
+
+- New `ISourceFileListProvider` (`DebugInfoTypes.pas`) + `TSourceFileEntry`.
+  Implemented by `TTD32FileReader` (always complete) and `TMapFile` (`Complete`
+  mirrors `FIndexReady`; the unit-section index IS the "Line numbers for" set).
+- `.rsm` / `.dcp` / `.jdbg` map addresses but hold NO file index, so they cannot
+  answer. That is reported as `listedBy: null`, which means UNKNOWN -- never
+  "this module has no source files". Getting that distinction wrong is the whole
+  trap here: an empty list next to a loaded module reads as authoritative.
+- `TModuleSymbols.SourceFileList` / `TModuleSymbolLoader.MainSourceFileList`
+  (the exe is deliberately outside the runtime registry, so it needs its own).
+  `TDebugSession.GetModuleSources` -> `TSessionModuleSources`.
+- Only ALREADY-LOADED formats are asked: enumerating sources must never be the
+  thing that stalls a session parsing a 500 MB sidecar.
+- Test: `SourceFiles_ListTheFileSetBreakpointExpects` asserts the fixture's own
+  breakpoint file is present, lowercase, with `fileCount` agreeing.
+
+### Trap found by the first suite run: a DUPLICATED provider-interface GUID
+
+`ISourceFileListProvider` shipped with `...53ABAABB0011`, already held by
+`IThreadLocalNameProvider`. `Supports` matches on GUID alone and happily handed
+out the wrong vtable, so every evaluation asking whether a name was thread-local
+called `SourceFileList` instead and wrote its `TArray` result through the
+address of a `Boolean`. Thirteen tests errored with "Write of address
+0000000000000000" across three binaries; nothing failed at the call site, and
+the symptom pointed nowhere near the new code.
+
+Fixed by moving to `...0013`. **Next free suffix is 0014** — the comment at the
+declaration says so. New test `TProviderInterfaceTests.
+ProviderInterfaceGuids_AreUnique` (`ValueReaderTests.pas`) reads each interface's
+GUID via `GetTypeData(TypeInfo(I))^.Guid` and asserts pairwise distinctness, so
+a reused GUID now fails loudly instead of corrupting an unrelated call path. The
+list is hand-maintained: a forgotten entry weakens the check but cannot make it
+fail spuriously.
+
+### Exact next step
+
+Read the suite result. Then commit (NOT push). After that, the deliverable still
+outstanding is the comparison document: monolithic-with-full-debug-info vs
+package-loading-with-some-packages-bare, crossed with x86/x64 -- with unmeasured
+cells left explicitly blank rather than inferred.

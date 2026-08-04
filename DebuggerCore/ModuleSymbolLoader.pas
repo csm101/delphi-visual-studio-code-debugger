@@ -173,6 +173,12 @@ type
     // TDllModule) overrides with a cheap authoritative check (PACKAGEINFO for BPLs,
     // MAP source index otherwise) so a many-module host does not repost-storm.
     function ContainsSourceFile(const FileName: string): Boolean; virtual;
+    // The source files this module's loaded providers can name, and which
+    // provider produced the list. Only formats that can actually enumerate
+    // (TD32/TDS, MAP) answer; `ListedBy` is '' when none of the loaded formats
+    // can, which is a different fact from "this module has no source files".
+    function SourceFileList(out ListedBy: string;
+      out Complete: Boolean): TArray<TSourceFileEntry>;
   end;
   TModuleSymbolsClass = class of TModuleSymbols;
 
@@ -273,6 +279,11 @@ type
     // entry with no answer.
     function  MainSymbolAvailability: TSymbolAvailability;
     function  MainSymbolFormats: TArray<string>;
+    // Source files the MAIN image's providers can name. Same contract as
+    // TModuleSymbols.SourceFileList -- the exe needs its own accessor because it
+    // is deliberately absent from the runtime module registry.
+    function  MainSourceFileList(out ListedBy: string;
+                out Complete: Boolean): TArray<TSourceFileEntry>;
     property  MainImageSize: UInt64 read FMainImageSize;
     constructor Create;
     destructor  Destroy; override;
@@ -706,6 +717,30 @@ begin
             (DcpIface <> nil) or (JclIface <> nil);
 end;
 
+// Preference order matches the one the rest of the loader uses: the embedded
+// TD32 first (always in sync with the binary), the external `.tds` next, the
+// `.map` last. A `.rsm` cannot enumerate its files, so a module carrying only
+// RSM comes back with ListedBy = '' rather than an empty-looking answer.
+function TModuleSymbols.SourceFileList(out ListedBy: string;
+  out Complete: Boolean): TArray<TSourceFileEntry>;
+begin
+  ListedBy := '';
+  Complete := False;
+  Result := [];
+  for var Candidate in [TPair<string, IInterface>.Create('td32', Td32Iface),
+                        TPair<string, IInterface>.Create('tds',  TdsIface),
+                        TPair<string, IInterface>.Create('map',  MapIface)] do begin
+    if Candidate.Value = nil then
+      Continue;
+    var Lister: ISourceFileListProvider;
+    if not Supports(Candidate.Value, ISourceFileListProvider, Lister) then
+      Continue;
+    Result   := Lister.SourceFileList(Complete);
+    ListedBy := Candidate.Key;
+    Exit;
+  end;
+end;
+
 function TModuleSymbols.HasUnprobedSymbolFormats: Boolean;
 begin
   Result := not (MapTried and RsmTried and Td32Tried and DcpTried and
@@ -831,6 +866,46 @@ end;
 function TModuleSymbolLoader.MainSymbolFormats: TArray<string>;
 begin
   Result := FMainFormats;
+end;
+
+function TModuleSymbolLoader.MainSourceFileList(out ListedBy: string;
+  out Complete: Boolean): TArray<TSourceFileEntry>;
+var
+  Files: TArray<TSourceFileEntry>;
+  Done:  Boolean;
+  From:  string;
+
+  // A reader object exists from construction; only `Loaded` says it actually
+  // parsed anything. Asking an unloaded one would report an empty list as
+  // authoritative and stop the search before the format that does have the
+  // files -- the exact shape of a -VT-only build, where the embedded reader is
+  // present and empty and the `.tds` carries everything.
+  function ListFrom(Reader: TTD32FileReader; const Format: string): Boolean;
+  begin
+    Result := False;
+    if (Reader = nil) or not Reader.Loaded then
+      Exit;
+    Files  := Reader.SourceFileList(Done);
+    From   := Format;
+    Result := True;
+  end;
+
+begin
+  Files := [];
+  Done  := False;
+  From  := '';
+  // The MAP is only askable once it is a registered provider; before that its
+  // index does not exist and the call would report an empty list as if the exe
+  // had no units.
+  if not ListFrom(FMainTD32, 'td32') then
+    if not ListFrom(FMainTds, 'tds') then
+      if FMainMapRegistered then begin
+        Files := FMainMap.SourceFileList(Done);
+        From  := 'map';
+      end;
+  ListedBy := From;
+  Complete := Done;
+  Result   := Files;
 end;
 
 { Main module }

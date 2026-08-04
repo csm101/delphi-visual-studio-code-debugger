@@ -1894,8 +1894,17 @@ begin
     Kinds := Kinds + [sakOrdinal];
   end;
 
-  if not FDebugger.RunMethodCall(FuncVA, Vals, Kinds, Rax, Xmm0) then
+  if not FDebugger.RunMethodCall(FuncVA, Vals, Kinds, Rax, Xmm0) then begin
+    // Name the exception when the debuggee raised one. `<method invocation
+    // failed>` on its own tells the user only what they can already see -- that
+    // the watch went red -- while the interesting part (an EAccessViolation, a
+    // "Cannot open database" from a getter) was known at the abort site and
+    // thrown away.
+    var Why := FDebugger.LastSyntheticCallError;
+    if Why <> '' then
+      Exit(InvalidValue(Format('<%s raised %s>', [MethodName, Why])));
     Exit(InvalidValue('<method invocation failed>'));
+  end;
 
   // Build the return TExprValue. When we have a bound-property return type,
   // use it verbatim; otherwise fall back to the legacy heuristic shape.

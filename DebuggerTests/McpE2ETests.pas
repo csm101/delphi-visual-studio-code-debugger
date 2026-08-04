@@ -45,6 +45,7 @@ type
     // "why is this frame nameless" needs "the module has no debug info" to be
     // distinguishable from "the module is not loaded".
     [Test] procedure LoadedModules_DescribeMainAndPackages;
+    [Test] procedure SourceFiles_ListTheFileSetBreakpointExpects;
   end;
 
 implementation
@@ -461,6 +462,69 @@ begin
         'the main image reports no debug-info format: ' + Arr.ToJSON);
     finally
       Mods.Free;
+    end;
+
+    C.CallTool('terminate_debuggee', nil).Free;
+  finally
+    C.Free;
+  end;
+end;
+
+// The point of the tool is that the names it returns are the ones
+// set_breakpoint accepts. A list that omitted the very unit the fixture breaks
+// in would still look plausible, so the assertion is specifically that the file
+// used elsewhere in this suite is present -- and that it is reported in the
+// lowercase spelling the rest of the surface uses.
+procedure TMcpE2ETests.SourceFiles_ListTheFileSetBreakpointExpects;
+begin
+  var C := TMcpTestClient.Start(McpExe);
+  try
+    C.Call('initialize', nil).Free;
+
+    var LaunchArgs := TJSONObject.Create;
+    LaunchArgs.AddPair('program', TargetExe);
+    LaunchArgs.AddPair('sourceRoot', TargetDir);
+    C.CallTool('launch_debuggee', LaunchArgs).Free;
+
+    var Groups := C.CallTool('get_source_files', nil);
+    try
+      var Arr := Groups as TJSONArray;
+      Assert.IsTrue(Arr.Count >= 1, 'no module groups were returned: ' + Arr.ToJSON);
+
+      var MainSeen := False;
+      var FoundEvalSource := False;
+      for var I := 0 to Arr.Count - 1 do begin
+        var G := Arr.Items[I] as TJSONObject;
+        Assert.IsTrue(G.GetValue<string>('module', '') <> '',
+          'a group has no module name: ' + G.ToJSON);
+        var Files := G.GetValue<TJSONArray>('files');
+        Assert.IsNotNull(Files, 'group has no files array: ' + G.ToJSON);
+        // A group that lists files must say which format listed them; the pair
+        // is what lets a caller tell "none" from "cannot enumerate".
+        if Files.Count > 0 then
+          Assert.IsTrue(G.GetValue<string>('listedBy', '') <> '',
+            'files were listed with no listedBy: ' + G.ToJSON);
+        Assert.AreEqual(Files.Count, G.GetValue<Integer>('fileCount', -1),
+          'fileCount disagrees with the files array: ' + G.ToJSON);
+
+        if not G.GetValue<Boolean>('isMain', False) then
+          Continue;
+        MainSeen := True;
+        for var J := 0 to Files.Count - 1 do begin
+          var Name := (Files.Items[J] as TJSONObject).GetValue<string>('name', '');
+          Assert.AreEqual(LowerCase(Name), Name,
+            'source file names must be lowercase like every other surface: ' + Name);
+          if SameText(Name, EVAL_SOURCE) then
+            FoundEvalSource := True;
+        end;
+      end;
+
+      Assert.IsTrue(MainSeen, 'the main image has no source group: ' + Arr.ToJSON);
+      Assert.IsTrue(FoundEvalSource,
+        Format('%s is missing from the main image source list, yet breakpoints bind in it: %s',
+          [EVAL_SOURCE, Arr.ToJSON]));
+    finally
+      Groups.Free;
     end;
 
     C.CallTool('terminate_debuggee', nil).Free;

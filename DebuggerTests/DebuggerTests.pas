@@ -318,6 +318,8 @@ type
     procedure Test_RawStackScan_NotOfferedUnlessAsked;
     [Test]
     procedure Test_RawStackScan_AppendedAndMarkedWhenAsked;
+    [Test]
+    procedure Test_RawStackScan_TogglesMidSession;
 
     // --- var parameter (reference param) ---
     [Test]
@@ -4387,6 +4389,58 @@ begin
   finally
     Resp.Free;
   end;
+end;
+
+// The sweep used to be readable only once, at launch, which meant reaching for
+// it required editing launch.json and restarting -- exactly when a stack has
+// just come up short and the state that produced it is what you want to keep.
+// The Call Stack toggle sends this custom request instead, so it has to take
+// effect on the NEXT stackTrace of the SAME stop, and be reversible.
+procedure TDebuggerTests.Test_RawStackScan_TogglesMidSession;
+var
+  FrameId, LocalsRef: Integer;
+
+  function RawFrameCount: Integer;
+  begin
+    Result := 0;
+    var Resp := FClient.StackTrace;
+    try
+      var Arr := Resp.GetValue<TJSONArray>('stackFrames');
+      Assert.IsNotNull(Arr, 'no stackFrames');
+      for var I := 0 to Arr.Count - 1 do
+        if (Arr.Items[I] as TJSONObject).GetValue<string>('name', '').StartsWith('[raw') then
+          Inc(Result);
+    finally
+      Resp.Free;
+    end;
+  end;
+
+  function SetScan(Enabled: Boolean): Boolean;
+  begin
+    var Seq := FClient.SendRequest('delphiSetRawStackScan',
+      Format('{"enabled":%s}', [LowerCase(BoolToStr(Enabled, True))]));
+    var Resp := FClient.WaitRawResponse(Seq, 10000);
+    try
+      var Body := Resp.GetValue<TJSONObject>('body');
+      Assert.IsNotNull(Body, 'delphiSetRawStackScan returned no body');
+      // The reply states the resulting state so the button labels itself from
+      // what the adapter did, not from what the client assumed.
+      Result := Body.GetValue<Boolean>('enabled', not Enabled);
+    finally
+      Resp.Free;
+    end;
+  end;
+
+begin
+  StartSession('COMPUTE_BODY', FrameId, LocalsRef);
+  Assert.AreEqual(0, RawFrameCount, 'the session started with the sweep already on');
+
+  Assert.IsTrue(SetScan(True), 'the adapter did not report the sweep as enabled');
+  Assert.IsTrue(RawFrameCount > 0,
+    'the sweep was switched on mid-session but no raw frame was appended');
+
+  Assert.IsFalse(SetScan(False), 'the adapter did not report the sweep as disabled');
+  Assert.AreEqual(0, RawFrameCount, 'raw frames survived switching the sweep off');
 end;
 
 procedure TDebuggerTests.Test_RtlStringGetter_VarOutFromPropertyType;

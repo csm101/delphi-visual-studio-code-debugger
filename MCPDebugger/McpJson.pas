@@ -30,6 +30,7 @@ function EvalResultToJson(const R: TSessionEvalResult): TJSONObject;
 function ExceptionToJson(const E: TSessionExceptionInfo): TJSONObject;
 function SnapshotToJson(const S: TCompactSnapshot): TJSONObject;
 function ModuleListToJson(const Modules: TArray<TSessionModule>): TJSONArray;
+function ModuleSourcesToJson(const Groups: TArray<TSessionModuleSources>): TJSONArray;
 function StringListToJson(const Items: TArray<string>): TJSONArray;
 
 implementation
@@ -301,6 +302,36 @@ begin
   Result := TJSONArray.Create;
   for var S in Items do
     Result.Add(S);
+end;
+
+function ModuleSourcesToJson(
+  const Groups: TArray<TSessionModuleSources>): TJSONArray;
+begin
+  Result := TJSONArray.Create;
+  for var G in Groups do begin
+    var O := TJSONObject.Create;
+    O.AddPair('module', G.Module);
+    O.AddPair('isMain', TJSONBool.Create(G.IsMain));
+    O.AddPair('formats', StringListToJson(G.Formats));
+    // '' means no loaded format can enumerate -- reported as an explicit null so
+    // it cannot be misread as an empty file set.
+    if G.ListedBy <> '' then
+      O.AddPair('listedBy', G.ListedBy)
+    else
+      O.AddPair('listedBy', TJSONNull.Create);
+    O.AddPair('complete', TJSONBool.Create(G.Complete));
+    O.AddPair('fileCount', TJSONNumber.Create(Length(G.Files)));
+    var Arr := TJSONArray.Create;
+    for var F in G.Files do begin
+      var FO := TJSONObject.Create;
+      FO.AddPair('name', F.Name);
+      if F.FullPath <> '' then
+        FO.AddPair('path', F.FullPath);
+      Arr.Add(FO);
+    end;
+    O.AddPair('files', Arr);
+    Result.Add(O);
+  end;
 end;
 
 end.
