@@ -77,12 +77,29 @@ begin
   try
     try
       Td.LoadFromFile(Path);
+      // Without this the reader withholds locals by design (RSM is the default
+      // provider), and the probe would measure its own silence -- which is
+      // exactly what happened on the first run of this tool.
+      Td.ExposeLocals := True;
       var L: TArray<TLocalSymbol>;
       Report('by name', Td.GetLocalsForFunction(Name, L), L);
-      if Rva <> 0 then begin
-        var L2: TArray<TLocalSymbol>;
-        Report('by rva', Td.GetLocalsForFunctionByRva(Rva, L2), L2);
+      // The session tries the RVA-keyed lookup FIRST, so a by-name miss says
+      // nothing on its own. Resolve the address from the name when the caller
+      // did not supply one, and ask that way too.
+      var UseRva := Rva;
+      if UseRva = 0 then begin
+        var R: UInt64;
+        if Td.NameToRva(Name, R) then begin
+          UseRva := R;
+          Writeln(Format('  (resolved "%s" -> rva $%x via TD32)', [Name, R]));
+        end;
       end;
+      if UseRva <> 0 then begin
+        var L2: TArray<TLocalSymbol>;
+        Report('by rva', Td.GetLocalsForFunctionByRva(UseRva, L2), L2);
+      end
+      else
+        Writeln('  (no rva: TD32 could not resolve the name to an address)');
     except
       on E: Exception do Writeln('  load failed: ', E.Message);
     end;

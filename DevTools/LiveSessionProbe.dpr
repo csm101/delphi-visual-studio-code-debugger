@@ -26,6 +26,7 @@ uses
   Winapi.Windows,
   DebugTarget,                       // FrameOriginName for the stack print
   DapProtocol,                       // SetDapLogEnabled: engine-side diagnostics
+  ExceptionRules,                    // TExceptionFilters for the launch options
   DebugSessionTypes, DebugSession;
 
 type
@@ -398,6 +399,12 @@ begin
     // Several TestTarget scenarios only run behind a command-line switch, so a
     // breakpoint in them verifies and then never hits without this.
     Opts.Args        := TargetArgs;
+    // Break only on UNHANDLED exceptions. A real application raises plenty of
+    // first-chance ones during startup -- a logon that probes for an optional
+    // record, a parse that falls back -- and stopping on each of them buries
+    // the breakpoint the probe was pointed at under dozens of unrelated stops.
+    Opts.ExceptionFilters    := [efUnhandled];
+    Opts.ExceptionFiltersSet := True;
 
     if not Session.Launch(Opts) then begin
       Writeln('LAUNCH FAILED: ' + ExePath);

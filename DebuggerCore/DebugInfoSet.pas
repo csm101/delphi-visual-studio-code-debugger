@@ -77,6 +77,8 @@ type
     FHierProviders:   TList<IClassHierarchyProvider>;
     FBgIndexProviders: TList<IBackgroundIndexProvider>;
     function IsSuspectMisTag(const T: string): Boolean;
+    // The class-ancestor subset of the above: only a class may refine a class.
+    function IsClassAncestorMisTag(const T: string): Boolean;
     function IsBetterHint(const NewH, CurH: string): Boolean;
     // Source unit (basename, no path/ext) that owns Rva, or '' if unknown.
     function UnitNameForRva(Rva: UInt64): string;
@@ -230,6 +232,11 @@ implementation
 uses
   Winapi.Windows,   // GetTickCount64 / Sleep for the indexing-retry bound
   DapProtocol;
+
+const
+  // System.TypInfo.tkClass. Spelled out here rather than pulled in, so this
+  // unit keeps its no-RTTI-dependency shape.
+  TK_CLASS_KIND = 7;
 
 constructor TDebugInfoSet.Create;
 begin
@@ -904,6 +911,18 @@ begin
   Result := False;
 end;
 
+// The CLASS-ancestor half of the suspect list. Kept separate because the two
+// halves license different refinements: a small-int placeholder may become an
+// enum, a set or a wider ordinal, whereas a generic class ancestor may only
+// become a DESCENDANT CLASS. Merging them let a class be replaced by a
+// one-byte boolean.
+function TDebugInfoSet.IsClassAncestorMisTag(const T: string): Boolean;
+begin
+  Result := SameText(T, 'TObject')           or SameText(T, 'TPersistent') or
+            SameText(T, 'TNoRefCountObject') or SameText(T, 'TInterfacedObject') or
+            SameText(T, 'TComponent');
+end;
+
 function TDebugInfoSet.IsSuspectMisTag(const T: string): Boolean;
 begin
   // Small-int primitive aliases -- often a placeholder for the real type
@@ -1202,6 +1221,22 @@ begin
               // this only fires on a wrong-scope augment leak (SampleApp /
               // RunTypeSampler). Reject.
               DapLog(Format('  merge KEEP "%s": "%s" (rejected TArray augment "%s" from #%d)',
+                [Locals[Idx].Name, Cur, A.TypeHint, I]));
+            end else if IsSuspectMisTag(Cur) and IsClassAncestorMisTag(Cur) and
+                        (LookupTypeKind(A.TypeHint) <> TK_CLASS_KIND) then begin
+              // A suspect CLASS ancestor may only be refined by another CLASS.
+              // The suspect list exists because TD32 sometimes names a generic
+              // ancestor (TComponent) where the declared type is a descendant,
+              // and RSM has the leaf -- but "not suspect" is not the same as
+              // "plausible for this slot". Measured on a 797 MB RSM: TD32 had
+              // `AOwner: TComponent` (correct) and RSM's mis-resolved typeId
+              // said `ByteBool`, so this rule replaced a class reference with a
+              // one-byte boolean and a constructor's owner rendered as `True`.
+              // Kind comes from the type system, not from the shape of the
+              // name; when it cannot be confirmed to be a class the override is
+              // refused, because keeping a correct ancestor costs a little
+              // precision while accepting a wrong type costs the truth.
+              DapLog(Format('  merge KEEP "%s": "%s" (augment "%s" is not a class, provider #%d)',
                 [Locals[Idx].Name, Cur, A.TypeHint, I]));
             end else if IsSuspectMisTag(Cur) and not IsSuspectMisTag(A.TypeHint) then begin
               DapLog(Format('  merge override "%s": "%s" -> "%s" (Cur suspect, provider #%d)',

@@ -22,6 +22,10 @@ type
     // locals cannot occupy one address, and in the field 22 of them rendered
     // the saved frame pointer as their value with plausible names and types.
     [Test] procedure CollidingLocals_AreDropped_UniqueAndRegisterOnesKept;
+    // A generic class ancestor may be refined by a DESCENDANT CLASS and by
+    // nothing else. Letting "any non-suspect type" win turned a constructor's
+    // `AOwner: TComponent` into `ByteBool` on a real 797 MB binary.
+    [Test] procedure ClassAncestorHint_IsNotOverriddenByANonClass;
     [Test] procedure UnknownOrdinalSubrange_MasksHighDword;
     // Guard: a genuine 64-bit type (matched by name) must still show all 8 bytes.
     [Test] procedure Int64ByName_KeepsAllEightBytes;
@@ -511,6 +515,23 @@ type
   // Serves one named enum/set type: its TRsmEnumInfo and (optionally) an exact
   // provider size. Size = 0 means "no provider size", forcing the encoder's
   // derived-width path.
+  // One routine's locals, answering by RVA, by name, or both -- enough to stand
+  // in for TD32 (RVA-keyed, authoritative types) or RSM (name-keyed) in a merge.
+  TFakeLocalProvider = class(TInterfacedObject, ILocalSymbolProvider)
+  private
+    FLocals:    TArray<TLocalSymbol>;
+    FAnswerRva: Boolean;
+    FAnswerName: Boolean;
+  public
+    constructor Create(const ALocals: TArray<TLocalSymbol>;
+      AnswerRva, AnswerName: Boolean);
+    function GetLocalsForFunction(const FunctionName: string;
+      out Locals: TArray<TLocalSymbol>): Boolean;
+    function GetLocalsForFunctionByRva(InnerRva: UInt64;
+      out Locals: TArray<TLocalSymbol>): Boolean;
+    function AllProcedureNames: TArray<string>;
+  end;
+
   TFakeEnumSizeProvider = class(TInterfacedObject, IEnumInfoProvider, ITypeSizeProvider)
   private
     FTypeName: string;
@@ -525,6 +546,74 @@ type
     function LookupTypeKind(const TypeName: string): Byte;
     function GetTypeSize(const TypeName: string; out Size: Integer): Boolean;
   end;
+
+constructor TFakeLocalProvider.Create(const ALocals: TArray<TLocalSymbol>;
+  AnswerRva, AnswerName: Boolean);
+begin
+  inherited Create;
+  FLocals     := ALocals;
+  FAnswerRva  := AnswerRva;
+  FAnswerName := AnswerName;
+end;
+
+function TFakeLocalProvider.GetLocalsForFunction(const FunctionName: string;
+  out Locals: TArray<TLocalSymbol>): Boolean;
+begin
+  Locals := FLocals;
+  Result := FAnswerName and (Length(FLocals) > 0);
+end;
+
+function TFakeLocalProvider.GetLocalsForFunctionByRva(InnerRva: UInt64;
+  out Locals: TArray<TLocalSymbol>): Boolean;
+begin
+  Locals := FLocals;
+  Result := FAnswerRva and (Length(FLocals) > 0);
+end;
+
+function TFakeLocalProvider.AllProcedureNames: TArray<string>;
+begin
+  Result := nil;
+end;
+
+procedure TValueReaderTests.ClassAncestorHint_IsNotOverriddenByANonClass;
+
+  function Local(const Name, Hint: string; Off: Integer): TLocalSymbol;
+  begin
+    Result           := Default(TLocalSymbol);
+    Result.Name      := Name;
+    Result.TypeHint  := Hint;
+    Result.RbpOffset := Off;
+  end;
+
+begin
+  // The measured shape. TD32 answers by RVA and is right; RSM answers by name
+  // with a mis-resolved typeId. `TComponent` is on the suspect list because
+  // TD32 does sometimes name a generic ancestor where the source declares a
+  // descendant -- but "not suspect" is not "plausible for this slot", and a
+  // one-byte boolean can never refine a class reference.
+  var Info := TDebugInfoSet.Create;
+  try
+    Info.AddProvider(TFakeLocalProvider.Create(
+      [Local('Self', 'TfrmSomething', 16), Local('AOwner', 'TComponent', 32)],
+      {AnswerRva=}True, {AnswerName=}False) as IInterface, {Primary=}True);
+    Info.AddProvider(TFakeLocalProvider.Create(
+      [Local('Self', 'TfrmSomething', 16), Local('AOwner', 'ByteBool', 32)],
+      {AnswerRva=}False, {AnswerName=}True) as IInterface);
+
+    var Locals: TArray<TLocalSymbol>;
+    Assert.IsTrue(Info.GetLocalsForFunctionByRva($1000, 'TfrmSomething.Create', Locals),
+      'the RVA-keyed provider must answer');
+
+    var Hint := '';
+    for var L in Locals do
+      if SameText(L.Name, 'AOwner') then
+        Hint := L.TypeHint;
+    Assert.AreEqual('TComponent', Hint,
+      'a class-ancestor hint must survive a non-class augment; got "' + Hint + '"');
+  finally
+    Info.Free;
+  end;
+end;
 
 constructor TFakeEnumSizeProvider.Create(const ATypeName: string;
   const AInfo: TRsmEnumInfo; ASize: Integer);
