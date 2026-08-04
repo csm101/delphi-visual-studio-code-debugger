@@ -525,6 +525,13 @@ type
 constructor TDapServer.Create;
 begin
   inherited;
+  // The default belongs HERE, not in the launch parse. Diagnostics start before
+  // any launch arrives -- `initialize done` is the first line the adapter ever
+  // writes -- and a field left at its zero value routed those early lines to
+  // the Debug Console, which is exactly where they were not wanted. The launch
+  // config can still turn it off; it can no longer be the thing that turns it
+  // ON.
+  FDiagnosticsToOutputChannel := True;
   FIO         := TDapIO.Create;
   // The session owns the engine + all symbol/expansion machinery. Configure its
   // loader with the DAP-side enriched module class + PACKAGEINFO hooks + log sinks

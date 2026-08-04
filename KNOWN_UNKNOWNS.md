@@ -690,6 +690,31 @@ channel; `TDebugSession.OnConsole` would be the sink).
   WATCH panel does nothing while assigning in the Variables panel works
   (`setVariable`). The engine primitives exist (`SetLocalVariable`,
   `SetFieldVariable`); this is plumbing, not capability.
+- **An adapter killed while ATTACHED leaves INT3 bytes in the target** —
+  observed 2026-08-04, and unavoidable rather than unfixed.
+
+  Seen on a real application: `External exception 80000003` in the app's own
+  error dialog. $80000003 is STATUS_BREAKPOINT -- the program executed a
+  planted INT3 with no debugger left to claim it.
+
+  Cause, and it was self-inflicted: the adapter process was force-killed
+  (`Stop-Process`) to unblock a rebuild while it was attached. CLEAN detach is
+  already handled carefully -- `Detach` restores every planted byte, clears the
+  trap flag and releases a held event before `DebugActiveProcessStop`, with
+  comments explaining that skipping any of it produces exactly this dialog.
+  Abnormal death has no such chance: the bytes live in the TARGET's memory and
+  only the debugger could put them back.
+
+  So this is a property of debugging, not a defect to fix: nothing running
+  inside a dead process can undo it. What follows from it is discipline --
+  never force-kill the adapter while a session is attached; detach first. Worth
+  stating in user-facing docs, because "the app I attached to now shows
+  External exception 80000003" reads like a debugger bug and is really a
+  debugger that was not allowed to leave.
+
+  Only ATTACH is exposed. A LAUNCHED target dies with the adapter, so there is
+  nothing left to trip over the bytes.
+
 - **Update check against GitHub releases — REQUIRED BEFORE THE NEXT RELEASE**
   (requested 2026-08-04, the maintainer's words: "vorrei che ci fosse
   assolutamente prima della prossima release").
