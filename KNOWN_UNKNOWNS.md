@@ -690,6 +690,39 @@ channel; `TDebugSession.OnConsole` would be the sink).
   WATCH panel does nothing while assigning in the Variables panel works
   (`setVariable`). The engine primitives exist (`SetLocalVariable`,
   `SetFieldVariable`); this is plumbing, not capability.
+- **A name that is not a local can be answered by an unrelated global** — found
+  2026-08-04 stepping into the optimised RTL, NOT previously known.
+
+  Stopped in `TStringList.Find` (`System.Classes.pas`), the local `L` evaluated
+  to an object of type `TErrorCorrectionLevel` -- a type from an unrelated
+  barcode unit. Wrong value, wrong type, no marker.
+
+  TWO separate facts, and only the second is a defect:
+
+  1. The RTL is compiled OPTIMISED, and its body locals are simply not in the
+     debug info. Measured with `DevTools\LocalsLookupProbe` against the 582 MB
+     Win64 build: TD32 reports exactly two symbols for `TStringList.Find` --
+     `Self` (off -16) and `S` (off -8) -- and RSM has no answer at all. `L`,
+     `H`, `I`, `C` and `Index` are register-allocated and undescribed. Nothing
+     can read them; "not found" is the only honest answer. This was already
+     recorded as the `-$O+` limitation but ONLY for 32-bit targets; it applies
+     to the shipped x64 RTL of any build.
+
+  2. Instead of saying that, the evaluator fell through to the GLOBAL lookup,
+     which after its exact scoped match has a TAIL-NAME fallback across mixed
+     providers (`TryResolveFromGlobalProviders` / `TailName` in
+     `WinDebuggerBase.EvaluateGlobalName`). In a 500 MB binary a one-letter
+     name matches something every time.
+
+  FIX SHAPE for (2): the tail-name fallback is a guess whose collision
+  probability rises as the name gets shorter, and for a 1-2 character
+  identifier it is effectively certain to hit something unrelated. Refusing
+  short names there -- or requiring the tail match to be UNIQUE, as the
+  frameless-caller recovery already requires of its candidates -- turns this
+  into "not found", which is correct. Same family as the nested-enum defect
+  fixed on 2026-08-03: a lookup that answers from a strictly worse source
+  rather than admitting the symbol is unreachable.
+
 - **An INDEXED property evaluated WITHOUT an index answers instead of refusing**
   — found 2026-08-04 on a real application, NOT previously known.
 
