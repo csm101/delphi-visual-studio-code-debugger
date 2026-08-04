@@ -690,6 +690,46 @@ channel; `TDebugSession.OnConsole` would be the sink).
   WATCH panel does nothing while assigning in the Variables panel works
   (`setVariable`). The engine primitives exist (`SetLocalVariable`,
   `SetFieldVariable`); this is plumbing, not capability.
+- **HOVER can execute code in the debuggee, and nothing stops it** — found
+  2026-08-04, and the more serious of the two hover findings.
+
+  `TDapServer.HandleEvaluate` never reads the DAP `context` field, so `hover`,
+  `watch` and `repl` are the same request. The evaluator calls property getters
+  and parameterless functions by design (in Pascal a bare `Now` IS a call), so
+  RESTING THE MOUSE on an identifier can run that code in the target -- with
+  whatever side effects it has, and with the crash risk of any synthetic call.
+
+  The maintainer asked directly whether a guard exists. It does not.
+
+  What other debuggers do, for reference rather than as a plan: Visual Studio
+  makes implicit function evaluation a setting and suppresses it in tooltips
+  when a call would be needed; gdb refuses side-effecting calls unless asked.
+  Options here, cheapest first: honour `context` and refuse synthetic calls when
+  it is `hover`; make it a launch-config switch; or render a "click to
+  evaluate" affordance instead of calling. Any of them needs the ability to
+  distinguish "this expression needs a call" from "this is a plain read", which
+  the evaluator already knows at the point where it decides to invoke.
+
+- **Hover picks the WORD under the cursor, not the selection** — found
+  2026-08-04. Selecting `IsModuleEnabled('INTEGRAZIONE_DA_RIFORNIMENTO')` and
+  hovering it evaluates only `IsModuleEnabled`; hovering the literal sends a
+  fragment of it and the parser answers `<unterminated string>`.
+
+  This is VS Code behaviour, not a defect of ours: its debug hover uses an
+  `EvaluatableExpressionProvider` when a language extension supplies one, and
+  otherwise a word-range heuristic. It does NOT evaluate the selection, unlike
+  the Delphi IDE. (An earlier answer in the session claimed it did -- wrong.)
+  The working equivalents today are the selection's context menu: "Evaluate in
+  Debug Console" and "Add to Watch".
+
+  What WE can do: contribute an `EvaluatableExpressionProvider` for Pascal from
+  `local.delphi-win64-debug`, so hover expands to a real Pascal expression --
+  qualified names, indexers, calls -- instead of a bare word. That also answers
+  the separate question of how to hover `DictModules.Enabled[ModuleName]`
+  without adding a watch. Interacts with the hover-safety item above: a provider
+  that makes hover MORE capable makes an unguarded hover MORE dangerous, so the
+  two should land together.
+
 - **A name that is not a local can be answered by an unrelated global** — found
   2026-08-04 stepping into the optimised RTL, NOT previously known.
 
