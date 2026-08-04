@@ -1,6 +1,6 @@
 program Install;
 
-// Interactive installer for the Delphi Win64 Debugger VS Code extension.
+// Interactive installer for the Delphi Debugger (Win32/Win64) VS Code extension.
 // Resolves the repository root from its own location, ensures the DAP adapter
 // executable is built, stages it next to the extension manifest, then packages
 // the extension into a .vsix and installs it into every detected VS Code-family
@@ -516,7 +516,7 @@ end;
 
 begin
   try
-    Writeln('Delphi Win64 Debugger - installer');
+    Writeln('Delphi Debugger (Win32/Win64) - installer');
     if IsPortable then begin
       Writeln('Mode: portable (bundled adapter)');
     end

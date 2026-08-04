@@ -412,7 +412,10 @@ const pascalEvaluatableExpressionProvider = {
 // tracker can OBSERVE output events but cannot suppress them, so filtering
 // here would have shown every line twice.
 const DIAGNOSTIC_EVENT = 'delphiLog';
-const DIAGNOSTIC_CHANNEL_NAME = 'Delphi Debug';
+// Matches the command category and the settings title. The name is what a user
+// scans the Output dropdown for, so having three spellings of the same product
+// in three menus is a way to look absent while being present.
+const DIAGNOSTIC_CHANNEL_NAME = 'Delphi Debugger';
 
 const UPDATE_LAST_CHECK_KEY = 'delphiWin64.updateCheck.lastCheck';
 const UPDATE_SKIPPED_KEY    = 'delphiWin64.updateCheck.skippedVersion';

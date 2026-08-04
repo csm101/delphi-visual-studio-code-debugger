@@ -1,6 +1,11 @@
-Debug Delphi Win64 applications from VS Code, or from an AI agent over MCP.
-No Delphi toolchain and no build step needed to install: the adapter, the MCP
-server and the VS Code extension are all compiled and bundled.
+Debug Delphi Win32 and Win64 applications from VS Code, or from an AI agent over
+MCP. No Delphi toolchain and no build step needed to install: the adapter, the
+MCP server and the VS Code extension are all compiled and bundled.
+
+The adapter is always a 64-bit process, whichever target it debugs — a 32-bit
+application is debugged across the WOW64 boundary, so the debugger does not work
+inside a 32-bit address space, which is where a large project's symbol data
+would otherwise run out of room.
 
 {{HIGHLIGHTS}}
 
@@ -26,7 +31,8 @@ which is otherwise a few hundred search paths to write by hand.
 - Windows x64, VS Code 1.80 or later.
 - **The program you want to debug must be compiled with full debug information**,
   or most of this will not work — a debugger can only show what the compiler
-  emitted. In the Delphi project options, for the Win64 Debug configuration:
+  emitted. In the Delphi project options, for the Debug configuration of the
+  platform you are building (Win32 or Win64):
   - *Compiling* -> **Optimization off**, **Debug information** on, **Local symbols** on
   - *Linking* -> **Debug information** on, **Include remote debug symbols** on
     (this is the `.rsm`), **Map file: Detailed**

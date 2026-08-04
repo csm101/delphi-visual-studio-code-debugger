@@ -353,6 +353,15 @@ begin
   end;
 end;
 
+// The gate is NOT "same architecture as the debugger". An x64 debugger debugs a
+// WOW64 x86 target across the boundary -- that is the whole Win32 story, and
+// requiring equality here refused every 32-bit process at the picker while the
+// engine underneath attached to them perfectly well.
+//
+// What is genuinely impossible is the other direction: a 32-bit debugger cannot
+// drive a 64-bit target, because it cannot express the addresses. ARM64 is
+// refused because nothing about it has been MEASURED, which is a different
+// statement from "it cannot work" and is worded as such.
 function CanDebug(const Info: TProcessInfo; out Reason: string): Boolean;
 begin
   Reason := '';
@@ -360,7 +369,18 @@ begin
     Reason := 'cannot determine target architecture';
     Exit(False);
   end;
+
   var Host := HostDebuggerArch;
+  if Host = paX64 then begin
+    if Info.Arch in [paX64, paX86] then
+      Exit(True);
+    Reason := Format('target is %s; this debugger has only been verified against x64 and x86 (WOW64) targets',
+      [ArchToStr(Info.Arch)]);
+    Exit(False);
+  end;
+
+  // A non-x64 host: only an exact match is defensible. In practice the adapter
+  // is built x64, so this is the branch that should never run in the field.
   if Info.Arch <> Host then begin
     Reason := Format('target is %s; this debugger is %s and cannot debug a different architecture',
       [ArchToStr(Info.Arch), ArchToStr(Host)]);

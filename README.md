@@ -1,7 +1,20 @@
-# Delphi Win64 Debugger
+# Delphi Debugger for VS Code (Win32 and Win64)
 
-Debug Delphi Win64 applications outside the Embarcadero IDE — a real debugger
-built on the Windows Debug API, written in Delphi.
+Debug Delphi **32-bit and 64-bit** applications outside the Embarcadero IDE — a
+real debugger built on the Windows Debug API, written in Delphi.
+
+> **The debugger itself is always a 64-bit process, whichever target it
+> debugs.** A 32-bit application is debugged by a 64-bit adapter across the
+> WOW64 boundary, so the debugger is not competing with the debuggee for a
+> 32-bit address space and does not inherit the ceiling a 32-bit debugger works
+> under. That matters on large projects, where the symbol data is the memory
+> hog: indexing a 523 MB `.rsm` from a real single-exe build peaks at 692 MB of
+> working set — comfortable at 64-bit, and not something to attempt inside a
+> 2 GB user-mode address space.
+>
+> Only one binary is shipped. The target's PE header decides the machine model
+> before the process starts; there is nothing to choose and no second adapter to
+> install.
 
 The repository contains **three programs** that share one debugger engine:
 
@@ -9,7 +22,7 @@ The repository contains **three programs** that share one debugger engine:
 |---|---|---|
 | **Debug adapter** | A **Debug Adapter Protocol (DAP)** server. This is the debugger itself: breakpoints, stepping, call stacks, variables, expression evaluation. Any DAP client can drive it. | `VisualStudioCodeDelphiDebugger\` |
 | **VS Code extension** | The client that makes it usable in the editor: the `delphi-win64` debug type, the process picker for attaching, status-bar progress, and an editor for the exception rules. | `install\local.delphi-win64-debug\` |
-| **MCP server** | The same engine exposed to an **AI agent** over the Model Context Protocol — 33 tools (`set_breakpoint`, `step_into`, `get_locals`, `evaluate_expression`, `get_call_stack`, `read_memory`, …). It lets an agent run a program, stop it, and read its actual state instead of guessing from the source. | `MCPDebugger\` |
+| **MCP server** | The same engine exposed to an **AI agent** over the Model Context Protocol — 36 tools (`set_breakpoint`, `step_into`, `get_locals`, `evaluate_expression`, `get_call_stack`, `read_memory`, …). It lets an agent run a program, stop it, and read its actual state instead of guessing from the source. | `MCPDebugger\` |
 
 The engine is shared: `DebuggerCore\` holds the Windows Debug API loop, the
 symbol readers (`.rsm`, TD32, `.map`, `.dcp`, JCL) and the expression evaluator.
@@ -25,7 +38,8 @@ The three front ends are thin.
 
 > ⚠️ **Compile the program you want to debug with full debug information, or
 > most of this will not work.** A debugger can only show what the compiler
-> emitted. In the Delphi project options, for the **Win64 Debug** configuration:
+> emitted. In the Delphi project options, for the **Debug** configuration of the
+> platform you are building (Win32 or Win64):
 >
 > - *Compiling* → **Optimization off**, **Debug information** on, **Local symbols** on;
 > - *Linking* → **Debug information** on, **Include remote debug symbols** on
@@ -642,7 +656,7 @@ hot-reloaded.)
 VS Code's native exception UI offers only on/off checkboxes for the four
 filters, so the extension ships a dedicated editor for the rule table:
 
-**Command Palette (`Ctrl+Shift+P`) → `Delphi Win64: Edit Exception Rules...`**
+**Command Palette (`Ctrl+Shift+P`) → `Delphi Debugger: Edit Exception Rules...`**
 
 This is the route that always works: it is contributed unconditionally, so it is
 there with no debug session, no open Delphi file and no launch configuration.
@@ -655,7 +669,7 @@ home: VS Code removes the Call Stack section when no session is running and no
 launch configuration is selected, whereas Breakpoints stays as soon as one
 breakpoint exists or the workspace has been debugged once.
 
-While stopped on an exception, `Delphi Win64: Create a Rule for This
+While stopped on an exception, `Delphi Debugger: Create a Rule for This
 Exception...` also appears as a button in the floating debug toolbar, pre-filled
 from the exception in front of you.
 
@@ -784,10 +798,13 @@ At runtime the adapter compares the debuggee's actual `ImageBase` (from `CREATE_
 - [x] Current source line highlighted in editor
 - [x] Multi-module debugging: DLLs and runtime-loaded BPLs (lazy per-module symbol loading)
 - [x] All threads enumerated (with names); the whole process stops together (`allThreadsStopped`)
+- [x] Update notice: the extension checks GitHub once a day for a newer release and shows a link, since an installer-delivered extension has nothing else to announce one (`delphi-win64.checkForUpdates` turns it off; it downloads nothing and sends nothing)
+- [x] The debugger's own diagnostics go to a **Delphi Debugger** channel in the Output panel, leaving the Debug Console to the debuggee
 - [x] Per-thread inspection: selecting any thread shows that thread's own call stack, and its frames' locals/watches are inspectable (read-only)
 - [x] RVA/address resolution from Delphi `.map` files (segment-relative offsets handled correctly)
 - [x] ASLR: actual ImageBase vs. preferred base handled at runtime
 - [x] Call stack with function names (frame unwinding beyond the current frame)
+- [x] **Raw stack scan** — when the unwinder cannot get through code built without debug information or without frame pointers, an opt-in sweep of the thread's stack finds your own routines underneath it, resolved against every loaded module and marked `[raw]` / `[raw?]` so they are never mistaken for callers. Toggled live from the **Call Stack** title bar
 - [x] Local variable inspection from reverse-engineered Delphi `.rsm` files
 - [x] Parent-procedure locals visible from inside nested procedures
 - [x] Anonymous-method parameters and closure-captured variables inspectable (the captured `$ActRec` fields expand like a normal object)

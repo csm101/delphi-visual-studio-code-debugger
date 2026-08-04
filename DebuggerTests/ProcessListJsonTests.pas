@@ -21,6 +21,7 @@ type
     [Test] procedure Json_IsASingleLineArray;
     [Test] procedure Json_CarriesEveryFieldThePickerReads;
     [Test] procedure Json_ArchMismatch_ReportsCanDebugFalseWithReason;
+    [Test] procedure Json_Wow64Target_IsAttachableFromAnX64Debugger;
     [Test] procedure Json_EscapesQuotesAndControlCharacters;
     [Test] procedure Json_EmptyListIsAnEmptyArray;
     [Test] procedure Json_WindowTitleIsCarriedAndEmptyForAWindowlessProcess;
@@ -120,18 +121,45 @@ end;
 procedure TProcessListJsonTests.Json_ArchMismatch_ReportsCanDebugFalseWithReason;
 begin
   var Info := SampleProcess;
-  if HostDebuggerArch = paX86 then
-    Info.Arch := paX64
-  else
-    Info.Arch := paX86;
+  // ARM64, not x86: an x64 debugger DOES debug a WOW64 x86 target, and this
+  // test used to assert the opposite by picking "any architecture that is not
+  // the host". That is how a stale refusal survives a green suite.
+  Info.Arch := paArm64;
 
   var Item := ParseSingleObject(BuildProcessListJson([Info]));
   try
     Assert.IsFalse(Item.GetValue<Boolean>('canDebug'));
     // The picker shows this text verbatim, so it must be a sentence a user can
     // act on rather than an empty string or a code.
-    Assert.IsTrue(Item.GetValue<string>('reason').Contains('architecture'),
+    Assert.IsTrue(Item.GetValue<string>('reason').Contains('x64 and x86'),
       'the reason must explain the refusal: ' + Item.GetValue<string>('reason'));
+  finally
+    Item.Free;
+  end;
+end;
+
+// The defect this pins shipped: `CanDebug` demanded the target match the
+// debugger's own architecture, so every 32-bit process was listed as not
+// attachable and the picker refused it -- while `Attach_ToRunningTarget_
+// StopsWithLocalsOnBothBitnesses` proved the engine attaches to one just fine.
+// A gate that contradicts the engine is worse than no gate: it makes a working
+// feature look unimplemented.
+procedure TProcessListJsonTests.Json_Wow64Target_IsAttachableFromAnX64Debugger;
+begin
+  if HostDebuggerArch <> paX64 then begin
+    Assert.Pass('this assertion is about an x64 debugger; the host is not one');
+    Exit;
+  end;
+
+  var Info := SampleProcess;
+  Info.Arch := paX86;
+
+  var Item := ParseSingleObject(BuildProcessListJson([Info]));
+  try
+    Assert.IsTrue(Item.GetValue<Boolean>('canDebug'),
+      'a 32-bit process must be offered for attach: ' + Item.GetValue<string>('reason'));
+    Assert.AreEqual('', Item.GetValue<string>('reason'),
+      'an attachable process must carry no refusal reason');
   finally
     Item.Free;
   end;

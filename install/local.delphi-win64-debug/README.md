@@ -1,13 +1,22 @@
-# Delphi Win64 Debugger
+# Delphi Debugger (Win32 and Win64)
 
-Debug **Delphi Win64** applications directly in VS Code — no Embarcadero IDE
-required.
+Debug **Delphi 32-bit and 64-bit** applications directly in VS Code — no
+Embarcadero IDE required.
 
 This extension registers the `delphi-win64` debug type and ships a Debug Adapter
 Protocol (DAP) server that drives the Windows Debug API. It reads the debug
 information the Delphi compiler already emits (`.map`, `.rsm`, the TD32 `.debug`
 PE section, `.dcp` for packages), so breakpoints, call stacks, watches and
 variable inspection work against ordinary Delphi builds.
+
+**The adapter is always a 64-bit process, whichever target it debugs.** A 32-bit
+application is debugged across the WOW64 boundary, so the debugger neither
+shares nor inherits a 32-bit address space — which is where a large project's
+symbol data would otherwise run out of room. One binary handles both; the
+target's PE header decides, and there is nothing to configure.
+
+The debug type is still called `delphi-win64` because renaming it would break
+every existing `launch.json`. It debugs both platforms.
 
 ---
 
@@ -38,6 +47,7 @@ variable inspection work against ordinary Delphi builds.
 - All threads listed with their names; the process stops as a whole
 - Selecting any thread shows that thread's own stack, and its frames' locals and
   watches are inspectable
+- **Raw stack scan** — see past code the unwinder cannot get through (see below)
 
 **Variables**
 
@@ -93,6 +103,69 @@ Console** (REPL) and breakpoint conditions:
 - Symbols are loaded lazily, per module, as each one is touched
 - Debug-info files can be pre-bound per module with the `modules` property when
   they do not sit next to the binary
+
+**Housekeeping**
+
+- Tells you when a newer release exists on GitHub, once a day at most, with a
+  link — because an installer-delivered extension has nothing else to announce
+  it (see [Staying up to date](#staying-up-to-date); switch it off with
+  `delphi-win64.checkForUpdates`)
+- The debugger's own diagnostics go to a **Delphi Debugger** channel in the
+  Output panel, leaving the Debug Console for your program's output (see
+  [Where the debugger's own logging goes](#where-the-debuggers-own-logging-goes))
+
+---
+
+## Raw stack scan: seeing past code you have no debug information for
+
+You stop deep inside something you did not compile — an exception in the VCL, a
+callback out of a third-party control suite, an access violation under the RTL —
+and the call stack shows a couple of frames and stops. Everything below was
+built without debug information, or without a frame pointer, so there is nothing
+to unwind through. And the one thing worth knowing is exactly what is hidden:
+**which of your own routines is underneath all that?**
+
+This is the ordinary case on 32-bit targets, which carry no unwind data at all,
+so the walk ends at the first routine compiled without a frame pointer. It also
+happens on 64-bit in any application assembled largely from packages that were
+not built with debug information.
+
+**Press `Toggle Raw Stack Scan`** in the **Call Stack** title bar (the magnifier
+icon; also `Delphi Debugger: Toggle Raw Stack Scan` in the Command Palette). The
+debugger sweeps the thread's stack word by word for values that could be return
+addresses, resolves each against every module it knows — the executable and
+every loaded runtime package — and appends what it finds below the real frames.
+Your own routines come back with names and source lines even though nothing
+could unwind to them.
+
+It takes effect on the stop you are already looking at. No restart, no editing
+`launch.json`. (`"rawStackScan": true` in the launch configuration turns it on
+from the start, if you would rather not press anything.)
+
+### How much to trust a hit
+
+Every appended entry is marked twice, because either marker on its own can be
+lost — the prefix survives a copy-paste into a bug report, the grey row is what
+you see at a glance:
+
+| | meaning |
+|---|---|
+| `[raw]` | the instruction ending at that address was decoded and **is a call** |
+| `[raw?]` | there was no line table to decode from, so the hit rests on the address being executable code and nothing more |
+
+**Neither of them means the routine is still on the current chain.** A call that
+has already returned leaves its return address behind on the stack, and no sweep
+can tell that apart from a live one. Read these as places the program *has
+been* — which is usually enough to answer "how did execution get here" — and
+never as callers.
+
+That is also why they are **appended below** the real stack instead of being
+mixed into it, and why the feature is **off by default**: a stack you did not
+ask to have swept must never show a position sitting next to a real frame.
+
+On 64-bit every hit is `[raw?]`: the call-site decoder that proves a hit is
+x86-only. It is also needed far less there, since 64-bit code unwinds properly
+from `.pdata`.
 
 ---
 
@@ -329,10 +402,11 @@ the same Win32 process APIs the debugger itself uses, so the picker needs no
 native VS Code module and no extra tooling — and no elevation to list, although
 attaching still has the usual requirements below.
 
-That also means the picker knows each process's **architecture**. A 32-bit
-process is still listed, but marked as not attachable with the adapter's own
-reason instead of being offered as a candidate that fails on selection — this
-debugger is Win64 only. Choosing one reports the reason and aborts.
+That also means the picker knows each process's **architecture**, and shows it.
+Both 32-bit and 64-bit processes are attachable — the adapter is 64-bit and
+debugs a 32-bit target across the WOW64 boundary. A process the adapter has not
+been verified against (ARM64) is still listed, but marked with the adapter's own
+reason rather than offered as a candidate that fails on selection.
 
 If the adapter cannot be found or fails, the picker says so and the session is
 aborted. It never falls back to a second source.
@@ -447,7 +521,7 @@ traffic and the adapter consumes it before the rules run.
 
 Editing rule tables by hand in JSON gets old quickly, and order is semantic. Use:
 
-**Command Palette (`Ctrl+Shift+P`) → `Delphi Win64: Edit Exception Rules...`**
+**Command Palette (`Ctrl+Shift+P`) → `Delphi Debugger: Edit Exception Rules...`**
 
 That route always works — no session, no open Delphi file, nothing else
 required. It is the one to reach for if you cannot find the button.
@@ -489,7 +563,7 @@ untrusted workspace the editor is read-only and offers **Copy JSON** instead.
 
 While the debugger is stopped **on an exception**, a scales-of-justice button
 appears in the floating debug toolbar, next to continue/step, and the command
-`Delphi Win64: Create a Rule for This Exception...` becomes available in the
+`Delphi Debugger: Create a Rule for This Exception...` becomes available in the
 Command Palette. Both disappear as soon as you resume or stop somewhere else —
 the rule is about the exception you are looking at, so it is offered only while
 you are looking at one.
@@ -599,7 +673,15 @@ milliseconds instead.
 
 ## Limitations
 
-- **Win64 only.** 32-bit targets are not supported.
+- **32-bit locals need an unoptimised build.** Win32 locals and parameters are
+  supported for `-$O-` builds; `-$O+` omits the frame pointer routinely. This is
+  the usual Debug configuration, but it is a real constraint on an optimised
+  build. (64-bit targets are not affected: they unwind from `.pdata`.)
+- **32-bit call stacks can stop short.** 32-bit code carries no unwind data, so
+  the stack is walked by the saved-EBP chain, and a routine built without a
+  frame pointer sitting between two framed ones still hides its caller. The
+  **Toggle Raw Stack Scan** button in the Call Stack title bar is the fallback —
+  it reports positions on the stack, not callers.
 - **Single process.** The debuggee is launched with `DEBUG_ONLY_THIS_PROCESS`;
   child processes it spawns are not tracked.
 - **No disassembly view.**
@@ -607,6 +689,59 @@ milliseconds instead.
   breakpoints, stepping and a named call stack, but limited variable data.
 - If the stepped thread blocks on a lock held by another thread, the step cannot
   complete — the same constraint VS Code has with other debuggers.
+
+---
+
+## Where the debugger's own logging goes
+
+The **Debug Console** is for your program. Everything the debugger says about
+itself — symbol loading, module events, breakpoint binding, timings — goes to a
+separate channel instead:
+
+> **Output** panel (`Ctrl+Shift+U`) → the dropdown on the right → **Delphi Debugger**
+
+It used to be interleaved with the debuggee's own output, which made a
+`Writeln` from your program hard to find among the debugger's chatter and vice
+versa. They are now two panels and neither drowns the other.
+
+The channel appears once a Delphi debug session has started — VS Code lists an
+Output channel only after something has created it, so an empty dropdown before
+the first session is expected rather than a fault.
+
+For a much more verbose record, set `"diagnosticLog": true` in the launch
+configuration; that writes every DAP request, response and debug event to
+`%TEMP%\dap_adapter.log`. Leave it off for normal use.
+
+---
+
+## Staying up to date
+
+This extension is installed by an installer, not from a marketplace, so nothing
+in VS Code would otherwise tell you a new version exists — and in practice that
+means people run an old one for months without knowing.
+
+So it checks. Once a day at most, the extension asks GitHub for the latest
+release of this project and, if it is newer than what you have, shows one
+notification with a link to the download page.
+
+What it does **not** do, deliberately:
+
+- it never downloads or installs anything — the link opens the release page and
+  you decide;
+- it does not send anything about you, your code or your projects. The request
+  is an anonymous read of a public releases endpoint;
+- it stays silent when the check fails, when GitHub is unreachable, or when the
+  answer is not newer. A version check that reports its own troubles is a
+  nuisance;
+- it does not nag: **Skip this version** is remembered, and the check is rate
+  limited to once a day whatever happens.
+
+Turn it off entirely with the setting **`delphi-win64.checkForUpdates`**
+(*Settings → Extensions → Delphi Debugger*), or in `settings.json`:
+
+```jsonc
+"delphi-win64.checkForUpdates": false
+```
 
 ---
 

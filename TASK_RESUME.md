@@ -3291,6 +3291,49 @@ a reused GUID now fails loudly instead of corrupting an unrelated call path. The
 list is hand-maintained: a forgotten entry weakens the check but cannot make it
 fail spuriously.
 
+### Release 0.3.0 preparation (2026-08-04)
+
+`public-main` fast-forwarded onto the Win32 branch (127 commits; the two are one
+lineage — `main` is the unrelated PRIVATE archive whose last commit sanitised the
+tree that became the public root, and it must never be merged). Version bumped to
+`0.3.0` in the extension manifest, the single place the release script reads.
+
+Two defects found by preparing the release rather than by the suite:
+
+* **The pre-attach gate refused every 32-bit process.** `ProcessEnum.CanDebug`
+  demanded the target match the DEBUGGER's architecture, so the picker and
+  `list_debuggable_processes` reported 32-bit processes as not attachable while
+  the engine attached to them perfectly well — `Attach_ToRunningTarget_
+  StopsWithLocalsOnBothBitnesses` proves it every run. A gate contradicting the
+  engine makes a working feature look unimplemented. Worse, the test that should
+  have caught it CEMENTED it: it picked "any architecture that is not the host",
+  i.e. x86, and asserted the refusal. Now: an x64 host accepts x64 and x86
+  (WOW64); ARM64 is refused as UNVERIFIED, which is a different claim from
+  impossible. The old test uses ARM64; `Json_Wow64Target_IsAttachableFromAnX64
+  Debugger` pins the positive case.
+* **The extension test suite was red and nobody was running it.** The hover
+  provider registration was unguarded, so an editor of the VS Code family
+  lacking `registerEvaluatableExpressionProvider` would have thrown out of
+  `activate()` and lost the DEBUG TYPE with it. Guarded. The JS tests under
+  `install/local.delphi-win64-debug/test/` were never invoked by anything; they
+  are now in `install/extension-tests/run.bat`, which is the runner the release
+  procedure calls.
+
+User-facing text swept for "Win64 only" claims (README, extension README,
+release-notes template, installer banner, manifest displayName/description/
+category/labels, launch snippets — a Win32 launch snippet added). The debug type
+`delphi-win64` and every command id are DELIBERATELY unchanged: renaming them
+breaks every existing `launch.json`. The diagnostics output channel was renamed
+`Delphi Debug` -> `Delphi Debugger` to match the command category and the
+settings title.
+
+Suite after all of it: **1040 found / 1036 passed / 0 failed / 0 errored / 4
+ignored**. Extension suite: 152 passed / 0 failed.
+
+Next: the draft release notes are with the user for review (working copy in the
+job scratchpad). NOT pushed and no GitHub release created — the push is the
+outward-facing step and waits on the notes being approved.
+
 ### Exact next step
 
 Read the suite result. Then commit (NOT push). After that, the deliverable still

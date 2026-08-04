@@ -1,8 +1,8 @@
 {
   "name": "delphi-win64-debug",
-  "displayName": "Delphi Win64 Debugger",
-  "description": "Debug Delphi Win64 applications in VS Code - breakpoints, stepping, call stacks, watches and exception rules, without the Embarcadero IDE.",
-  "version": "0.2.4",
+  "displayName": "Delphi Debugger (Win32 and Win64)",
+  "description": "Debug Delphi Win32 and Win64 applications in VS Code - breakpoints, stepping, call stacks, watches and exception rules, without the Embarcadero IDE. The debug adapter is always a 64-bit process, so a 32-bit target is debugged without the address-space ceiling a 32-bit debugger works under.",
+  "version": "0.3.0",
   "publisher": "local",
   "license": "MIT",
   "author": "Carlo Sirna",
@@ -26,6 +26,9 @@
     "pascal",
     "debugger",
     "win64",
+    "win32",
+    "32-bit",
+    "64-bit",
     "dap"
   ],
   "main": "./extension.js",
@@ -38,25 +41,25 @@
       {
         "command": "delphi-win64.editExceptionRules",
         "title": "Edit Exception Rules...",
-        "category": "Delphi Win64",
+        "category": "Delphi Debugger",
         "icon": "$(list-ordered)"
       },
       {
         "command": "delphi-win64.toggleRawStackScan",
         "title": "Toggle Raw Stack Scan",
-        "category": "Delphi Win64",
+        "category": "Delphi Debugger",
         "icon": "$(search-fuzzy)"
       },
       {
         "command": "delphi-win64.createRuleForException",
         "title": "Create a Rule for This Exception...",
-        "category": "Delphi Win64",
+        "category": "Delphi Debugger",
         "icon": "$(law)"
       },
       {
         "command": "delphi-win64.pickProcess",
         "title": "Pick a Process to Attach To",
-        "category": "Delphi Win64"
+        "category": "Delphi Debugger"
       }
     ],
     "menus": {
@@ -103,7 +106,7 @@
       ]
     },
     "configuration": {
-      "title": "Delphi Win64 Debugger",
+      "title": "Delphi Debugger",
       "properties": {
         "delphi-win64.checkForUpdates": {
           "type": "boolean",
@@ -126,7 +129,7 @@
     "debuggers": [
       {
         "type": "delphi-win64",
-        "label": "Delphi Win64",
+        "label": "Delphi (Win32/Win64)",
         "program": "./VisualStudioCodeDelphiDebugger.exe",
         "languages": [
           "objectpascal",
@@ -539,8 +542,8 @@
         ],
         "configurationSnippets": [
           {
-            "label": "Delphi Win64: Launch",
-            "description": "Launch a Delphi Win64 executable under the debugger",
+            "label": "Delphi: Launch (Win64)",
+            "description": "Launch a 64-bit Delphi executable under the debugger",
             "body": {
               "type": "delphi-win64",
               "request": "launch",
@@ -550,18 +553,29 @@
             }
           },
           {
-            "label": "Delphi Win64: Attach (pick a process)",
-            "description": "Attach to a running Delphi Win64 process, choosing it from a list at start",
+            "label": "Delphi: Launch (Win32)",
+            "description": "Launch a 32-bit Delphi executable under the debugger. The adapter stays 64-bit and debugs the target across the WOW64 boundary; build with optimisation off, or locals will be unavailable",
+            "body": {
+              "type": "delphi-win64",
+              "request": "launch",
+              "name": "Debug Delphi Win32",
+              "program": "^\"\\${workspaceFolder}/Win32/Debug/\\${workspaceFolderBasename}.exe\"",
+              "stopAtEntry": false
+            }
+          },
+          {
+            "label": "Delphi: Attach (pick a process)",
+            "description": "Attach to a running Delphi process, 32-bit or 64-bit, choosing it from a list at start",
             "body": {
               "type": "delphi-win64",
               "request": "attach",
-              "name": "Attach to a Delphi Win64 process",
+              "name": "Attach to a Delphi process",
               "processId": "^\"\\${command:delphi-win64.pickProcess}\"",
               "sourceRoot": "^\"\\${workspaceFolder}\""
             }
           },
           {
-            "label": "Delphi Win64: Attach (pick an instance of one executable)",
+            "label": "Delphi: Attach (pick an instance of one executable)",
             "description": "Attach to a named executable; when several instances are running, choose between them by command line",
             "body": {
               "type": "delphi-win64",
