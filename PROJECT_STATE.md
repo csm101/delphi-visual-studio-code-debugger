@@ -170,6 +170,14 @@ IDE integration:
   [{name, map}]` and uses the configured host application as `program`.
   `sourceSearchPaths` always starts with `${env:BDS}/source`.
 
+## What works in which configuration
+
+`WHAT_WORKS_WHERE.md` is the per-configuration matrix: monolithic exe vs.
+package host, crossed with x64 vs. x86, with every cell either measured or
+explicitly left blank. Read it before answering "does the debugger support X" —
+the answer usually depends on the configuration, and more often on whether the
+module you are standing in carries debug information at all.
+
 ## Implemented features
 
 Target architecture:
