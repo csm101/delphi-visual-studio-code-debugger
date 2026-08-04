@@ -414,6 +414,53 @@ const pascalEvaluatableExpressionProvider = {
 const DIAGNOSTIC_EVENT = 'delphiLog';
 const DIAGNOSTIC_CHANNEL_NAME = 'Delphi Debug';
 
+const UPDATE_LAST_CHECK_KEY = 'delphiWin64.updateCheck.lastCheck';
+const UPDATE_SKIPPED_KEY    = 'delphiWin64.updateCheck.skippedVersion';
+
+// Asks GitHub, at most once a day, whether a newer release exists -- because
+// this extension is installed by an installer rather than from a marketplace,
+// so nothing else would ever tell the user.
+//
+// Everything here is written to stay out of the way: it never blocks
+// activation, it says nothing at all when the check fails, and "Skip this
+// version" is remembered so the same release is announced once and not every
+// day until it is installed.
+async function checkForUpdate(context, deps) {
+  const d = deps || {};
+  const vs = d.vscode || vscode;
+  const updates = d.updateCheck || require('./updateCheck');
+  const now = d.now === undefined ? Date.now() : d.now;
+
+  const config = vs.workspace.getConfiguration('delphi-win64');
+  if (!config.get('checkForUpdates', true)) return;
+
+  const state = context.globalState;
+  if (!updates.shouldCheck(state.get(UPDATE_LAST_CHECK_KEY), now)) return;
+  // Stamp BEFORE the request, not after: a GitHub that is slow or unreachable
+  // must not turn every activation into another attempt.
+  await state.update(UPDATE_LAST_CHECK_KEY, now);
+
+  const pkg = context.extension && context.extension.packageJSON;
+  if (!pkg || !pkg.version) return;
+  const repoUrl = pkg.repository && pkg.repository.url;
+
+  const latest = await updates.fetchLatestRelease(repoUrl, d.httpGet);
+  if (!latest) return;                                    // silent by design
+  if (updates.compareVersions(latest.version, pkg.version) <= 0) return;
+  if (state.get(UPDATE_SKIPPED_KEY) === latest.version) return;
+
+  const download = 'Download';
+  const skip = 'Skip this version';
+  const choice = await vs.window.showInformationMessage(
+    'Delphi Win64 Debugger ' + latest.version + ' is available (you have ' +
+      pkg.version + ').',
+    download, skip);
+  if (choice === download && latest.url)
+    vs.env.openExternal(vs.Uri.parse(latest.url));
+  else if (choice === skip)
+    await state.update(UPDATE_SKIPPED_KEY, latest.version);
+}
+
 function activate(context) {
   const progress = new ProgressStatusBar();
   context.subscriptions.push(progress);
@@ -437,6 +484,11 @@ function activate(context) {
       appendDiagnostic(event.body && event.body.text);
     })
   );
+
+  // Deliberately not awaited: activation must not wait on the network, and a
+  // failure here is not the user's problem. Any error is swallowed for the same
+  // reason -- an update check that reports its own troubles is a nuisance.
+  checkForUpdate(context).catch(() => {});
 
   // Same language ids the breakpoint contribution uses.
   context.subscriptions.push(
@@ -524,5 +576,6 @@ module.exports = {
   EXCEPTION_CONTEXT_KEY: EXCEPTION_CONTEXT_KEY,
   RESUME_REQUESTS: RESUME_REQUESTS,
   // Exported for tests: the hover-expression rule is plain text in, span out.
-  pascalExpressionSpan: pascalExpressionSpan
+  pascalExpressionSpan: pascalExpressionSpan,
+  checkForUpdate: checkForUpdate
 };

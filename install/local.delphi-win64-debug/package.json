@@ -87,6 +87,16 @@
         }
       ]
     },
+    "configuration": {
+      "title": "Delphi Win64 Debugger",
+      "properties": {
+        "delphi-win64.checkForUpdates": {
+          "type": "boolean",
+          "default": true,
+          "description": "Check GitHub once a day for a newer release and show a notification with a download link. This extension is installed by an installer rather than from a marketplace, so nothing else would tell you a new version exists. The check fails silently when GitHub is unreachable, and 'Skip this version' is remembered."
+        }
+      }
+    },
     "breakpoints": [
       {
         "language": "objectpascal"
