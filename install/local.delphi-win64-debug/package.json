@@ -163,6 +163,19 @@
                 "default": false,
                 "description": "Write a detailed adapter log to %TEMP%\\dap_adapter.log. Verbose: every DAP request/response, every debug event (LoadDll, Exception, Output, Breakpoint), every command queued and processed. Use only for diagnosing adapter behavior issues; off by default."
               },
+              "diagnosticsLocation": {
+                "type": "string",
+                "enum": [
+                  "outputChannel",
+                  "debugConsole"
+                ],
+                "enumDescriptions": [
+                  "Send the debugger's own messages to the \"Delphi Debug\" channel in the Output panel, keeping the Debug Console for your program's output and your logpoint messages.",
+                  "Print the debugger's own messages in the Debug Console, mixed in with the program's output (the behaviour before this setting existed)."
+                ],
+                "default": "outputChannel",
+                "description": "Where the DEBUGGER's own messages go — symbol loading, modules without debug info, warnings. Your program's output and your logpoint messages always go to the Debug Console, whichever you choose. A multi-package application emits hundreds of \"no debug info\" lines before it prints anything of its own, which is why they are separated by default."
+              },
               "args": {
                 "type": "array",
                 "items": {

@@ -247,6 +247,12 @@ type
     // POSITIONS on the stack, not a chain, and a user who has not asked for
     // them must never be shown them next to real frames.
     FRawStackScan: Boolean;
+    // Where the DEBUGGER's own diagnostics go. True (default) sends them as
+    // `delphiLog` custom events for the extension's "Delphi Debug" output
+    // channel; False keeps the old behaviour and prints them in the Debug
+    // Console. The program's output and logpoint messages are unaffected
+    // either way -- they always go to the Debug Console.
+    FDiagnosticsToOutputChannel: Boolean;
                                          // (neutral session frames carry FrameRBP /
                                          // FuncEntryVA / IP for frame selection)
     // Placeholder documents for frames with no source file. Without a `source`
@@ -356,6 +362,10 @@ type
     procedure ParseProgressLocation(Args: TJSONObject);
     // `rawStackScan` from the launch/attach config -> FRawStackScan.
     procedure ParseRawStackScan(Args: TJSONObject);
+    // `diagnosticsLocation` -> FDiagnosticsToOutputChannel.
+    procedure ParseDiagnosticsLocation(Args: TJSONObject);
+    // Emits one diagnostic line to wherever diagnostics currently go.
+    procedure SendDiagnosticEvent(const Text: string);
     // Marks a raw-sweep frame's displayed name; returns a walked frame's name
     // unchanged.
     function  RawStackLabel(const F: TSessionFrame; const Name: string): string;
@@ -881,6 +891,21 @@ begin
   FRawStackScan := (Args <> nil) and Args.GetValue<Boolean>('rawStackScan', False);
   if FRawStackScan then
     DapLog('rawStackScan = ON (raw sweep appended below the walked frames)');
+end;
+
+procedure TDapServer.ParseDiagnosticsLocation(Args: TJSONObject);
+begin
+  // Default: the output channel. The extension is always loaded when this debug
+  // type runs (it is the manifest's `main`), so the custom event always has a
+  // listener. `debugConsole` is the escape hatch for a bare DAP client.
+  var Loc := '';
+  if Args <> nil then
+    Loc := Trim(Args.GetValue<string>('diagnosticsLocation', ''));
+  FDiagnosticsToOutputChannel := not SameText(Loc, 'debugConsole');
+  if FDiagnosticsToOutputChannel then
+    DapLog('diagnosticsLocation = outputChannel ("Delphi Debug" via delphiLog events)')
+  else
+    DapLog('diagnosticsLocation = debugConsole');
 end;
 
 // Every progress moment of every channel goes through here. The busy/debounce
@@ -1578,12 +1603,47 @@ end;
 // (okDebugger), which is how the session's HandleBpHit surfaces logpoint messages,
 // -> `output` category console, matching the old OnBpHit console emission (with the
 // trailing line break the logpoint path used to append).
+// Three destinations, because the three kinds are not the same thing to a user.
+//
+// The program's stdout and a logpoint the user WROTE both belong in the Debug
+// Console -- that panel is about the program. The debugger's own diagnostics
+// (symbol loading, modules without debug info, warnings) are about the
+// DEBUGGER, and mixing them in buries the first two: a multi-package app emits
+// hundreds of "no debug info for X" lines before the program prints anything.
+//
+// Diagnostics leave as a CUSTOM event rather than an `output` one. A debug
+// adapter tracker can observe `output` events but cannot suppress them, so
+// filtering in the extension would show every line twice. The same reasoning
+// already produced the `delphiProgress` custom event.
 procedure TDapServer.OnSessionOutput(Kind: TOutputKind; const Text: string);
 begin
-  if Kind = okDebuggee then
-    SendOutputEvent(Text, 'stdout')
+  case Kind of
+    okDebuggee:
+      SendOutputEvent(Text, 'stdout');
+    okLogPoint:
+      SendOutputEvent(Text + sLineBreak, 'console');
   else
+    SendDiagnosticEvent(Text);
+  end;
+end;
+
+// Diagnostics for the extension's "Delphi Debug" output channel. Falls back to
+// the Debug Console when no client is listening for the custom event, so a
+// plain DAP client (or a VS Code without our extension) still sees them rather
+// than losing them silently.
+procedure TDapServer.SendDiagnosticEvent(const Text: string);
+begin
+  if not FDiagnosticsToOutputChannel then begin
     SendOutputEvent(Text + sLineBreak, 'console');
+    Exit;
+  end;
+  var Body := TJSONObject.Create;
+  try
+    Body.AddPair('text', Text);
+    FIO.SendEvent('delphiLog', Body);
+  finally
+    Body.Free;
+  end;
 end;
 
 procedure TDapServer.HandleInitialize(Seq: Integer; Args: TJSONObject);
@@ -1837,6 +1897,7 @@ begin
 
   KillOnDetach := Args.GetValue<Boolean>('killOnDetach', False);
   ParseRawStackScan(Args);
+  ParseDiagnosticsLocation(Args);
 
   ParseSourceAndModules(Args, ProgramPath);
   DapLog(Format('Attach: pid=%d exe=%s map=%s rsm=%s killOnDetach=%s',
@@ -1889,6 +1950,7 @@ begin
   ProgramPath  := Args.GetValue<string>('program', '');
   FStopAtEntry := Args.GetValue<Boolean>('stopAtEntry', False);
   ParseRawStackScan(Args);
+  ParseDiagnosticsLocation(Args);
 
   // Diagnostic log opt-in: writes %TEMP%\dap_adapter.log when launch.json
   // sets `"diagnosticLog": true` (or env var DAP_LOG=1, set at adapter startup).

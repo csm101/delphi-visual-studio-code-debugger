@@ -402,9 +402,41 @@ const pascalEvaluatableExpressionProvider = {
   }
 };
 
+// The debugger's own diagnostics -- symbol loading, modules without debug
+// info, warnings -- arrive as `delphiLog` custom events and go to a dedicated
+// Output channel, which is why they no longer bury the program's output in the
+// Debug Console. A multi-package application emits hundreds of "no debug info
+// for X" lines before it prints anything of its own.
+//
+// A custom event rather than an `output` event on purpose: a debug adapter
+// tracker can OBSERVE output events but cannot suppress them, so filtering
+// here would have shown every line twice.
+const DIAGNOSTIC_EVENT = 'delphiLog';
+const DIAGNOSTIC_CHANNEL_NAME = 'Delphi Debug';
+
 function activate(context) {
   const progress = new ProgressStatusBar();
   context.subscriptions.push(progress);
+
+  // Created lazily on the first diagnostic: an empty channel in the dropdown
+  // for a session that never logged anything is clutter.
+  let diagnostics;
+  const appendDiagnostic = (text) => {
+    if (!text) return;
+    if (!diagnostics) {
+      diagnostics = vscode.window.createOutputChannel(DIAGNOSTIC_CHANNEL_NAME);
+      context.subscriptions.push(diagnostics);
+    }
+    diagnostics.appendLine(String(text).replace(/\r?\n$/, ''));
+  };
+
+  context.subscriptions.push(
+    vscode.debug.onDidReceiveDebugSessionCustomEvent((event) => {
+      if (event.event !== DIAGNOSTIC_EVENT) return;
+      if (!event.session || event.session.type !== DEBUG_TYPE) return;
+      appendDiagnostic(event.body && event.body.text);
+    })
+  );
 
   // Same language ids the breakpoint contribution uses.
   context.subscriptions.push(

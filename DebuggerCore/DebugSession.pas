@@ -1019,8 +1019,12 @@ begin
       Result := True;
     bpLog: begin
       FDebuggerOutput.Add(LogText);
+      // A logpoint message is the USER's, not the debugger's: it goes where the
+      // program's own output goes, not into the diagnostics channel. It stays
+      // in FDebuggerOutput as well, because the MCP `get_debugger_output` tool
+      // is documented as returning logpoint messages AND debugger notices.
       if Assigned(FOnOutput) then
-        FOnOutput(okDebugger, LogText);
+        FOnOutput(okLogPoint, LogText);
       Result := False;
     end;
   else
