@@ -690,6 +690,28 @@ channel; `TDebugSession.OnConsole` would be the sink).
   WATCH panel does nothing while assigning in the Variables panel works
   (`setVariable`). The engine primitives exist (`SetLocalVariable`,
   `SetFieldVariable`); this is plumbing, not capability.
+- **A failed evaluation should say WHICH exception was raised** — requested
+  2026-08-04, deliberately not implemented yet.
+
+  Today a synthetic call that raises reports `<method invocation failed>`
+  (`ExprEval.pas:1867`) and nothing more, so a watch or a locals row that goes
+  red tells the user THAT it failed and never WHY. The ask: carry the raised
+  exception's class and message into that text, so hovering the failing watch
+  or local shows e.g. `<EAccessViolation: Access violation at address ...>`.
+
+  What makes it look tractable, and what to verify before believing that: the
+  engine already aborts a synthetic call on a raise, and already surfaces the
+  live exception elsewhere (`LastExceptionClass` / `LastExceptionMessage`,
+  `GetExceptionDetails`, the `$exception` pseudo-local). So the information
+  probably exists at the moment of failure and this is about plumbing it into
+  the error string rather than about capturing anything new. NOT verified --
+  in particular, whether the abort path preserves the exception object long
+  enough to read its `Message`, and whether reading it needs a second synthetic
+  call (which would itself be a call inside a failed call).
+
+  Applies to both frontends: the DAP hover/watch and the MCP
+  `evaluate_expression` error field come from the same string.
+
 - **Child process tracking** — debug API can follow children; we don't.
 - **`%TEMP%\dap_adapter.log` opt-in** — currently always-on. No
   configuration knob in the launch schema yet.
