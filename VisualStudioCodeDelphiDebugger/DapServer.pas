@@ -1034,18 +1034,18 @@ begin
   UpdateBusyTitle('Delphi debugger: loading symbols: ' + ADisplayName);
 end;
 
+// Every adapter-authored line -- symbol loading, `launch:`, `setBreakpoints
+// #N`, `configurationDone`, the loader's module notices -- goes through here,
+// and all of it is DIAGNOSTICS. So it routes with the rest of the diagnostics
+// rather than straight to the Debug Console.
+//
+// This was the path the first attempt at the split MISSED. `OnSessionOutput`
+// was changed and the job declared done, but that function is not the only
+// emitter: these fourteen call sites wrote `output`/`console` directly, which
+// is why the console still looked exactly the same afterwards.
 procedure TDapServer.SendConsoleLog(const AMsg: string);
-var
-  Body: TJSONObject;
 begin
-  Body := TJSONObject.Create;
-  try
-    Body.AddPair('category', 'console');
-    Body.AddPair('output',   AMsg + #13#10);
-    FIO.SendEvent('output', Body);
-  finally
-    Body.Free;
-  end;
+  SendDiagnosticEvent(AMsg);
 end;
 
 // Latched + idempotent: delegates to the shared loader (which retains the main
