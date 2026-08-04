@@ -690,6 +690,29 @@ channel; `TDebugSession.OnConsole` would be the sink).
   WATCH panel does nothing while assigning in the Variables panel works
   (`setVariable`). The engine primitives exist (`SetLocalVariable`,
   `SetFieldVariable`); this is plumbing, not capability.
+- **An INDEXED property evaluated WITHOUT an index answers instead of refusing**
+  — found 2026-08-04 on a real application, NOT previously known.
+
+  `DictModules.Enabled` (`QBFDictionary.pas`) returned `false`. `Enabled` is an
+  indexed property — `Enabled[ModuleName]` — so it has no value without an
+  index, and `false` is not a smaller answer, it is an invented one.
+
+  CAUSE, located: `ExprEval` already knows the rule and even states it --
+  "evaluating `.Ident` with no arguments would fire the getter with the index
+  registers holding garbage" -- but it only consults `IsKnownIndexedProperty`
+  in the branch taken when a `[` FOLLOWS the name. A bare `.Ident` never
+  reaches that check, so the getter is called with whatever the index registers
+  happen to hold and its return value is rendered as the property's value.
+
+  FIX SHAPE: consult the same predicate on the no-bracket path and refuse with
+  a message that names the reason (an indexed property needs an index) rather
+  than calling. The predicate already handles the case where TD32 loses
+  `IsIndexed` and only the getter's parameter count reveals it.
+
+  Note the variables view was already protected -- TD32 marks indexed
+  properties so the pane does not auto-call their getters -- so this is the
+  EVALUATE path only (watch, hover, MCP `evaluate_expression`).
+
 - **A failed evaluation should say WHICH exception was raised** — requested
   2026-08-04, deliberately not implemented yet.
 
