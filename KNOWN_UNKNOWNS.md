@@ -712,6 +712,33 @@ channel; `TDebugSession.OnConsole` would be the sink).
   Applies to both frontends: the DAP hover/watch and the MCP
   `evaluate_expression` error field come from the same string.
 
+- **A Call Stack title-bar toggle for the raw stack scan** — requested
+  2026-08-04, deliberately not implemented yet.
+
+  `rawStackScan` is a launch-config flag today, so turning it on means editing
+  `launch.json` and restarting the session — which is backwards for something
+  you reach for exactly when a stack has just come up short. The ask: a button
+  in the Call Stack view title, beside the existing "Edit Exception Rules...",
+  with a tooltip that states plainly what it does.
+
+  The contribution point is already proven: `local.delphi-win64-debug/package.json`
+  puts `delphi-win64.editExceptionRules` in `view/title` under
+  `view == workbench.debug.callStackView`, so a second command sits next to it
+  with a `$(...)` icon and a toggle title.
+
+  What is NOT already there, and is the actual work: the flag is read ONCE, in
+  `TDapServer.ParseRawStackScan` at launch/attach. A button makes it live
+  state, so it needs a custom request (or a `setDebugSessionOption`-style
+  command) that flips `FRawStackScan` mid-session, and the Call Stack view then
+  has to be re-fetched — VS Code will not re-issue `stackTrace` on its own
+  just because a setting changed. Whether the adapter can force that (an
+  `invalidated` event) or the extension has to nudge the session is unverified.
+
+  The tooltip has to carry the caveat, not just the name: raw hits are
+  POSITIONS on the stack, not callers, and one may be a return address left by
+  a call that already returned. A button that quietly adds plausible-looking
+  frames to a call stack would undo the care taken to mark them.
+
 - **Child process tracking** — debug API can follow children; we don't.
 - **`%TEMP%\dap_adapter.log` opt-in** — currently always-on. No
   configuration knob in the launch schema yet.
