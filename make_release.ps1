@@ -147,7 +147,7 @@ if ($DryRun) {
 Write-Host ''
 Write-Host "=== Creating DRAFT release $tag ==="
 gh release create $tag --draft --target main `
-    --title "$tag - Delphi Win64 Debugger" `
+    --title "$tag - Delphi Debugger for VS Code (Win32 and Win64)" `
     --notes-file $notesPath `
     $zip
 if ($LASTEXITCODE -ne 0) { Fail "gh release create failed." }
