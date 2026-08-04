@@ -257,8 +257,13 @@ type
     // No warm-up and no miss-cache live here -- those stay in the frontend, which
     // re-invokes this on a miss after warming the relevant module providers.
     // ThreadId qualifies FrameIndex (see SelectFrame); 0 = the cached thread.
+    // AllowCalls=False forbids running anything in the debuggee: no methods, no
+    // property getters, no speculative parameterless invocation. Pass False for
+    // a HOVER, where the user rested the mouse and did not ask for an effect.
+    // Plain reads still resolve.
     function  EvaluateForFrame(const Expr: string; FrameIndex: Integer;
-                ThreadId: Cardinal = 0): TSessionEvalResult;
+                ThreadId: Cardinal = 0;
+                AllowCalls: Boolean = True): TSessionEvalResult;
     function  GetExceptionDetails: TSessionExceptionInfo;
     function  Snapshot: TCompactSnapshot;
 
@@ -2022,7 +2027,8 @@ end;
 // results. Warm-up + miss-cache stay in the frontend, which re-invokes this on a
 // miss (IsValid=False) after warming module providers.
 function TDebugSession.EvaluateForFrame(const Expr: string;
-  FrameIndex: Integer; ThreadId: Cardinal = 0): TSessionEvalResult;
+  FrameIndex: Integer; ThreadId: Cardinal = 0;
+  AllowCalls: Boolean = True): TSessionEvalResult;
 begin
   var Guard := InteractiveWait;   // bound symbol-index waits (F14)
   Result := Default(TSessionEvalResult);
@@ -2052,7 +2058,7 @@ begin
   try
     var Val: TExprValue := Default(TExprValue);
     var Display: string;
-    var Eval := TExprEvaluator.Create(FDebugger, FRtti, FDebugInfo);
+    var Eval := TExprEvaluator.Create(FDebugger, FRtti, FDebugInfo, AllowCalls);
     try
       if Eval.Evaluate(Expr, Val) then
         Display := FormatExprValue(Val)

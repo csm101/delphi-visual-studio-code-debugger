@@ -2169,6 +2169,13 @@ begin
     // index is the raw value shr 1. Mirrors GetClassMembers.
     if (Result = '') and ((ATypeId and 1) = 1) then
       Result := ResolveTypeNameForUnit(UnitName, ATypeId shr 1, UnitImports, nil);
+    // Same reasoning as ResolveTypeNameForUnit: when the unit HAS an import
+    // list and the id resolved to nothing in it, the id is out of that list's
+    // range, and the by-id global map is a different table indexed the same
+    // way. Falling through to it is how a wrong-but-plausible type name is
+    // produced. Say nothing instead, and let TD32 answer.
+    if (Result = '') and (Length(UnitImports) > 0) then
+      Exit;
   end;
   if Result = '' then
     Result := LookupTypeName(ATypeId);

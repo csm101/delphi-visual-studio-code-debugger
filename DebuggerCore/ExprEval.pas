@@ -69,6 +69,12 @@ type
     FDebugger:  IDebugTarget;
     FRtti:      TDelphiRtti;     // optional -- when nil, runtime VMT introspection disabled
     FDebugInfo: TDebugInfoSet;   // optional -- when present, RSM-driven member resolution
+    // False forbids RUNNING anything in the debuggee: no method calls, no
+    // property getters, no speculative parameterless invocation. Set for a
+    // HOVER, where the user only rested the mouse and never asked for an
+    // effect. Reads of memory are unaffected -- a field, a local, a global and
+    // a field-backed property all still resolve.
+    FAllowCalls: Boolean;
     FExpr:      string;
     FPos:       Integer;
     // Guards the interface-to-object fallback in ApplyDot against re-entering
@@ -251,7 +257,8 @@ type
 
   public
     constructor Create(const Debugger: IDebugTarget; Rtti: TDelphiRtti = nil;
-                       DebugInfo: TDebugInfoSet = nil);
+                       DebugInfo: TDebugInfoSet = nil;
+                       AllowCalls: Boolean = True);
     function Evaluate(const Expr: string; out Val: TExprValue): Boolean;
   end;
 
@@ -264,12 +271,13 @@ uses
 { TExprEvaluator }
 
 constructor TExprEvaluator.Create(const Debugger: IDebugTarget; Rtti: TDelphiRtti;
-  DebugInfo: TDebugInfoSet);
+  DebugInfo: TDebugInfoSet; AllowCalls: Boolean);
 begin
   inherited Create;
-  FDebugger  := Debugger;
-  FRtti      := Rtti;
-  FDebugInfo := DebugInfo;
+  FDebugger   := Debugger;
+  FRtti       := Rtti;
+  FDebugInfo  := DebugInfo;
+  FAllowCalls := AllowCalls;
 end;
 
 { Tokenizer }
@@ -1525,6 +1533,29 @@ var
   IsFreeProc: Boolean;
 begin
   Result := Default(TExprValue);
+  // THE choke point for running debuggee code: every method, class method,
+  // free routine and property getter reaches the target through here. One
+  // refusal covers them all.
+  //
+  // A HOVER is not a request to execute anything -- the user rested the mouse.
+  // Until this existed, hovering an identifier could fire a getter that opens a
+  // connection, writes a log or raises, and a synthetic call carries the crash
+  // risk of any call. Speculative invocation is silent about it: a bare
+  // identifier is TRIED as a parameterless call before the global lookup, so
+  // the mouse alone was enough.
+  //
+  // Reads are untouched: fields, locals, globals and field-backed properties
+  // all still resolve, which is the great majority of what a hover wants.
+  if not FAllowCalls then begin
+    if Speculative then
+      // The caller is probing whether this name happens to be a routine; it
+      // has a non-call path to fall through to, so stay quiet.
+      Exit(InvalidValue(''))
+    else
+      Exit(InvalidValue(Format(
+        '<%s: evaluating this would CALL it; hover does not run code -- use the ' +
+        'Debug Console or a watch>', [MethodName])));
+  end;
   // Three call modes: instance method (Base is a class instance), class method
   // (ForceClassMethod -- Self is the class VMT in ClassRefSelf, not an instance),
   // and free procedure (Base is the synthetic "no-receiver" sentinel passed by
@@ -2820,8 +2851,26 @@ begin
               Result := ApplyMethodCall(Result, Field, Args);
             end;
           end;
-        end else
+        end else begin
+          // `.Ident` with NOTHING after it. If the debug info says Ident is an
+          // INDEXED property, it has no value without an index and must not be
+          // evaluated: the reasoning in the bracket branch above -- firing the
+          // getter with the index registers holding garbage -- applies here
+          // too, and here nothing was stopping it.
+          //
+          // Measured on a real application: `DictModules.Enabled` answered
+          // `false`, plausibly and with no marker, for a property whose only
+          // legal spelling is `Enabled[ModuleName]`.
+          var BarePropType: string;
+          var BarePropKind: Byte;
+          var BarePropSize: Integer;
+          if IsKnownIndexedProperty(Result, Field, BarePropType,
+               BarePropKind, BarePropSize) then
+            Exit(InvalidValue(Format(
+              '<%s is an INDEXED property -- it has no value without an index ' +
+              '(write %s[...])>', [Field, Field])));
           Result := ApplyDot(Result, Field);
+        end;
       end;
       '^': begin
         // Pointer dereference: `P^` reads the value at the pointer.

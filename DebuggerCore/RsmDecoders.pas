@@ -256,6 +256,22 @@ begin
   var Idx: Integer := (TypeId div 2) - 1;
   if (Idx >= 0) and (Idx < Length(UnitImports)) and (UnitImports[Idx] <> '') then
     Exit(UnitImports[Idx]);
+  // The index is meaningful ONLY inside the unit's own import list. Once it
+  // runs past the end of that list, indexing ANOTHER table with the same
+  // number yields an unrelated name -- and the reader has no way to notice,
+  // because a name came back.
+  //
+  // This is the measured "past the import table everything is wrong" failure.
+  // On a 797 MB RSM it produced `AOwner: ByteBool` for a `TComponent`
+  // parameter and `iPostIt: IEnumerator<...>` for an interface, both plausible
+  // and both fabricated. Returning '' lets a better provider answer, or lets
+  // the caller say it does not know.
+  //
+  // The global table is still consulted when the unit HAS NO import list at
+  // all: there the index was never a per-unit index, so there is nothing to
+  // run past, and this is the pre-existing behaviour rather than the defect.
+  if Length(UnitImports) > 0 then
+    Exit;
   if (Idx >= 0) and (Idx < Length(FallbackGlobal)) and (FallbackGlobal[Idx] <> '') then
     Result := FallbackGlobal[Idx];
 end;

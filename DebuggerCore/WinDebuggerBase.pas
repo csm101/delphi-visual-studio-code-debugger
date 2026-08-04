@@ -486,6 +486,14 @@ function DropAddressCollisions(const Values: TArray<TLocalValue>;
 
 implementation
 
+const
+  // Shortest identifier that may be TAIL-MATCHED against unit-qualified global
+  // names. Below this the match is a coincidence: a one- or two-character name
+  // finds something in any large binary, and the found symbol is unrelated.
+  // Three is the shortest length at which a Delphi global name carries enough
+  // signal to be worth the risk; anything shorter must be written qualified.
+  MIN_TAILMATCH_NAME_LEN = 3;
+
 { DbgHelp bindings for StackWalk64 }
 
 type
@@ -3478,8 +3486,28 @@ var
     if Pos('.', Query) > 0 then
       Exit(False);
 
+    // A SHORT name must not be tail-matched at all. The match is a guess whose
+    // collision probability rises as the name shortens, and at one or two
+    // characters it is certain to hit something in a large binary.
+    //
+    // Measured: stopped in the optimised RTL's `TStringList.Find`, whose body
+    // locals are register-allocated and absent from the debug info, the local
+    // `L` fell through to here and came back as an unrelated global typed
+    // `TErrorCorrectionLevel` -- a barcode enum. The correct answer was "not
+    // found": nothing can read a register-allocated local.
+    //
+    // The cost of refusing is that a genuinely short global must be written
+    // qualified (`Unit.L`), which the exact path above already handles.
+    if Length(Query) < MIN_TAILMATCH_NAME_LEN then begin
+      DapLog(Format('EvaluateGlobalName "%s": too short to tail-match a qualified ' +
+        'global (min %d) -- refusing rather than guessing',
+        [Query, MIN_TAILMATCH_NAME_LEN]));
+      Exit(False);
+    end;
+
     var Globals := FDebugInfo.GetGlobalsForRva(ScopeRva);
     var BestIdx := -1;
+    var Matches := 0;
     for var I := 0 to High(Globals) do begin
       if Globals[I].RVA = 0 then
         Continue;
@@ -3487,9 +3515,21 @@ var
         Continue;
       if LooksLikeCodeSymbol(Globals[I].Name) then
         Continue;
-      // Prefer the shortest qualified name as the least ambiguous match.
+      // Distinct ADDRESSES, not distinct names: the same global reported by
+      // two providers is one symbol, and must not read as an ambiguity.
+      if (BestIdx < 0) or (Globals[I].RVA <> Globals[BestIdx].RVA) then
+        Inc(Matches);
       if (BestIdx < 0) or (Length(Globals[I].Name) < Length(Globals[BestIdx].Name)) then
         BestIdx := I;
+    end;
+
+    // Two different globals whose names end the same way: which one the user
+    // meant is not knowable, and picking the shortest qualified name was a
+    // tie-break dressed as an answer.
+    if Matches > 1 then begin
+      DapLog(Format('EvaluateGlobalName "%s": %d distinct globals tail-match -- ' +
+        'ambiguous, refusing', [Query, Matches]));
+      Exit(False);
     end;
 
     if BestIdx >= 0 then begin

@@ -265,9 +265,153 @@ class ExceptionStopTracker {
   }
 }
 
+// --- What a debug hover evaluates -------------------------------------------
+//
+// Without a provider, VS Code hovers whatever its word heuristic finds, which
+// for Pascal is one identifier. Hovering `IsModuleEnabled('X')` evaluated
+// `IsModuleEnabled` alone; hovering the string literal sent a fragment of it
+// and the evaluator answered `<unterminated string>`. Neither is what the user
+// pointed at.
+//
+// Two rules, in order:
+//   1. If there IS a selection and the mouse is inside it, that selection is
+//      the expression -- the Delphi IDE behaviour the maintainer expected, and
+//      the only way to hover something the heuristic could never guess.
+//   2. Otherwise grow the identifier under the cursor into a whole Pascal
+//      expression: qualified names, indexers, calls, dereferences.
+//
+// Growing across `(` is deliberate even though a hover will not RUN a call:
+// the adapter refuses with "evaluating this would CALL it", which tells the
+// truth, whereas evaluating half the text produces a parse error about a
+// string that is not really unterminated.
+
+const IDENT_CHAR = /[A-Za-z0-9_]/;
+
+// Scans from `from` in `text` over a balanced (...) or [...] group, skipping
+// Pascal string literals so a bracket inside 'a[b]' cannot unbalance it.
+// Returns the index just past the closing bracket, or -1 if it never closes.
+function scanBalanced(text, from) {
+  const open = text[from];
+  const close = open === '(' ? ')' : ']';
+  let depth = 0;
+  let i = from;
+  while (i < text.length) {
+    const ch = text[i];
+    if (ch === "'") {
+      i++;
+      while (i < text.length) {
+        if (text[i] === "'") {
+          // '' inside a literal is an escaped quote, not the end.
+          if (text[i + 1] === "'") { i += 2; continue; }
+          break;
+        }
+        i++;
+      }
+      if (i >= text.length) return -1;
+      i++;
+      continue;
+    }
+    if (ch === open) depth++;
+    else if (ch === close) {
+      depth--;
+      if (depth === 0) return i + 1;
+    }
+    i++;
+  }
+  return -1;
+}
+
+// Start of the qualified chain ending at `end` (exclusive): walks back over
+// `Ident`, `.`, and balanced groups, so `A.B[0].C` starts at `A`.
+function chainStart(text, end) {
+  let i = end;
+  for (;;) {
+    while (i > 0 && IDENT_CHAR.test(text[i - 1])) i--;
+    if (i > 0 && (text[i - 1] === ']' || text[i - 1] === ')')) {
+      // Walk back over the group by scanning forward from each candidate
+      // opener -- cheaper to find than to reverse-parse.
+      const closeAt = i - 1;
+      const opener = text[closeAt] === ']' ? '[' : '(';
+      let j = closeAt - 1;
+      let found = -1;
+      while (j >= 0) {
+        if (text[j] === opener && scanBalanced(text, j) === closeAt + 1) { found = j; break; }
+        j--;
+      }
+      if (found < 0) break;
+      i = found;
+      continue;
+    }
+    // A `.` may follow an identifier OR a closing bracket -- `Self.FList[i].Name`
+    // walks back through `]` on its way to `Self`. Requiring an identifier here
+    // stopped the chain dead at the last dot.
+    if (i > 1 && text[i - 1] === '.' &&
+        (IDENT_CHAR.test(text[i - 2]) || text[i - 2] === ']' || text[i - 2] === ')')) {
+      i--;
+      continue;
+    }
+    break;
+  }
+  return i;
+}
+
+// The whole rule, on plain text, so it can be tested without VS Code.
+// `wordStart`/`wordEnd` bound the identifier the cursor is on.
+function pascalExpressionSpan(line, wordStart, wordEnd) {
+  let start = chainStart(line, wordStart);
+  let end = wordEnd;
+
+  // Grow right over `.Ident`, `[...]`, `(...)` and `^`.
+  for (;;) {
+    if (end < line.length && (line[end] === '[' || line[end] === '(')) {
+      const past = scanBalanced(line, end);
+      if (past < 0) break;
+      end = past;
+      continue;
+    }
+    if (end < line.length && line[end] === '^') { end++; continue; }
+    if (end + 1 < line.length && line[end] === '.' && IDENT_CHAR.test(line[end + 1])) {
+      end++;
+      while (end < line.length && IDENT_CHAR.test(line[end])) end++;
+      continue;
+    }
+    break;
+  }
+  return { start: start, end: end };
+}
+
+function pascalExpressionRange(document, position) {
+  const line = document.lineAt(position.line).text;
+  const wordRange = document.getWordRangeAtPosition(position, /[A-Za-z_][A-Za-z0-9_]*/);
+  if (!wordRange) return undefined;
+  const span = pascalExpressionSpan(line, wordRange.start.character, wordRange.end.character);
+  return new vscode.Range(position.line, span.start, position.line, span.end);
+}
+
+const pascalEvaluatableExpressionProvider = {
+  provideEvaluatableExpression(document, position) {
+    const editor = vscode.window.activeTextEditor;
+    if (editor && editor.document === document) {
+      const sel = editor.selection;
+      if (!sel.isEmpty && sel.contains(position))
+        return new vscode.EvaluatableExpression(sel, document.getText(sel).trim());
+    }
+    const range = pascalExpressionRange(document, position);
+    if (!range) return undefined;
+    return new vscode.EvaluatableExpression(range);
+  }
+};
+
 function activate(context) {
   const progress = new ProgressStatusBar();
   context.subscriptions.push(progress);
+
+  // Same language ids the breakpoint contribution uses.
+  context.subscriptions.push(
+    vscode.languages.registerEvaluatableExpressionProvider(
+      [{ language: 'objectpascal' }, { language: 'pascal' }, { language: 'delphi' }],
+      pascalEvaluatableExpressionProvider)
+  );
 
   const exceptionStops = new ExceptionStopTracker((value) =>
     vscode.commands.executeCommand('setContext', EXCEPTION_CONTEXT_KEY, value));
@@ -346,5 +490,7 @@ module.exports = {
   resolveAttachTarget: resolveAttachTarget,
   hasExplicitProcessId: hasExplicitProcessId,
   EXCEPTION_CONTEXT_KEY: EXCEPTION_CONTEXT_KEY,
-  RESUME_REQUESTS: RESUME_REQUESTS
+  RESUME_REQUESTS: RESUME_REQUESTS,
+  // Exported for tests: the hover-expression rule is plain text in, span out.
+  pascalExpressionSpan: pascalExpressionSpan
 };

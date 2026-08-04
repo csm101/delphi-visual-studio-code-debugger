@@ -2891,7 +2891,14 @@ begin
     // frame's requires-closure first, and on a miss warm its uses-scope (or fall
     // back to the un-scoped provider sweep) and retry the evaluate ONCE -- exactly
     // the ordering the inline code used, so watch latency on BPL is preserved.
-    var R := FSession.EvaluateForFrame(Expr, Fid, FLastStackTid);
+    // A HOVER is not a request to execute anything: the user rested the mouse.
+    // Property getters and parameterless routines are CALLED by the evaluator
+    // by design (in Pascal a bare `Now` IS a call), so without this the mouse
+    // alone could open a connection, write a log, or crash the target. The
+    // Debug Console and the Watch panel keep the full behaviour, because there
+    // the user asked.
+    var AllowCalls := not SameText(Args.GetValue<string>('context', ''), 'hover');
+    var R := FSession.EvaluateForFrame(Expr, Fid, FLastStackTid, AllowCalls);
     if (not R.IsValid) and (LeadingIdentifier(Expr) <> '') then begin
       // Bounded, scope-correct warm-up: load ONLY the frame's uses-scope (its unit
       // + its direct uses). A still-missing identifier there is genuinely out of
@@ -2902,9 +2909,9 @@ begin
       var FrameRva: UInt64 := WarmPC - FDebugger.ImageBase;
       {$Q+}
       if (WarmPC <> 0) and WarmupUsesScopeForFrame(FrameRva) then
-        R := FSession.EvaluateForFrame(Expr, Fid, FLastStackTid)
+        R := FSession.EvaluateForFrame(Expr, Fid, FLastStackTid, AllowCalls)
       else if WarmupSymbolProvidersForEvaluate > 0 then
-        R := FSession.EvaluateForFrame(Expr, Fid, FLastStackTid);
+        R := FSession.EvaluateForFrame(Expr, Fid, FLastStackTid, AllowCalls);
     end;
 
     // Record a confirmed miss so the next identical watch is an O(1) lookup.

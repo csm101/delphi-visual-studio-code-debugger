@@ -690,6 +690,38 @@ channel; `TDebugSession.OnConsole` would be the sink).
   WATCH panel does nothing while assigning in the Variables panel works
   (`setVariable`). The engine primitives exist (`SetLocalVariable`,
   `SetFieldVariable`); this is plumbing, not capability.
+- **Update check against GitHub releases — REQUIRED BEFORE THE NEXT RELEASE**
+  (requested 2026-08-04, the maintainer's words: "vorrei che ci fosse
+  assolutamente prima della prossima release").
+
+  Distribution is by installer rather than by an extension marketplace (a
+  deliberate choice -- it reaches Cursor, Windsurf, VSCodium and Trae, which the
+  Microsoft marketplace does not). The cost of that choice is that nothing tells
+  an existing user a new version exists. So the extension should ask GitHub for
+  the latest release and, when it is newer than the installed version, show a
+  notification with a link to the downloads page.
+
+  The pieces already exist, which is why this is small:
+  * `local.delphi-win64-debug/package.json` already declares `main:
+    ./extension.js` and activates on `onDebugResolve:delphi-win64`, so there is
+    a place to run and a natural moment (first debug session of the day).
+  * It already carries `repository.url`
+    (`github.com/csm101/delphi-visual-studio-code-debugger`) and its own
+    `version`, so both sides of the comparison are on hand --
+    `/repos/{owner}/{repo}/releases/latest` returns `tag_name` and `html_url`.
+
+  Decisions to make rather than assume, and each one can make this annoying
+  instead of useful:
+  * how often to check (once per day, persisted in `globalState`, not once per
+    activation);
+  * how to fail — a network error, a rate-limited response or a private repo
+    must be SILENT: an update check that nags when GitHub is unreachable is
+    worse than none;
+  * whether it is opt-out (a setting), which it should be for anyone on a
+    locked-down network;
+  * comparing versions as semver rather than as strings, so `0.10.0` is not
+    judged older than `0.9.0`.
+
 - **HOVER can execute code in the debuggee, and nothing stops it** — found
   2026-08-04, and the more serious of the two hover findings.
 
