@@ -238,12 +238,12 @@ Stepping / control:
   support and is now only meaningful as an assertion that the live process
   agrees with the class chosen from the on-disk PE header — the debugger class
   itself is selected earlier, in `TDebugSession.BuildAndWireDebugger`, because
-  `IsWow64Process2` cannot answer until the process exists. **Stale:** the
-  advisory `[FATAL]` text it prints
-  (`WarnIfUnsupportedTargetArchitecture` in `WinDebuggerBase.pas`) still says a
-  32-bit target is unsupported and its stacks will not resolve, which is no
-  longer true. Nothing depends on the message; it should be rewritten or
-  dropped.
+  `IsWow64Process2` cannot answer until the process exists. The advisory
+  `[FATAL]` text (`WarnIfUnsupportedTargetArchitecture` in
+  `WinDebuggerBase.pas`) was rewritten with the Win32 work and is accurate: it
+  fires only when the live process DISAGREES with the on-disk PE header the
+  class was chosen from, and says so — which means the launched image is not the
+  one that was inspected. Agreement is the normal case and prints nothing.
 - Source-line breakpoints from VS Code gutter, accurate verification state.
 - Step over (F10), step into (F11, walks until next source line),
   step out (Shift+F11, uses `StackWalk64` for caller resume RIP).

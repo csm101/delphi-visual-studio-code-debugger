@@ -110,6 +110,24 @@ test('the rules editor is on the Breakpoints view title, and on Call Stack too',
     'anything but a navigation group hides the command in the "..." overflow menu'));
 });
 
+/*
+ * The raw stack sweep is reached from the Call Stack title bar, and where it
+ * sits IS the feature: it is wanted at the moment a stack has just come up
+ * short, so anywhere else is a button nobody finds in time. Unlike the rules
+ * editor it is meaningless without a session, hence the debugType gate -- and
+ * without that gate it would also appear during other extensions' debug
+ * sessions, where the custom request it sends does not exist.
+ */
+test('the raw stack scan toggle is on the Call Stack view, gated on our debug type', () => {
+  const entry = (contributes.menus['view/title'] || [])
+    .find((item) => item.command === 'delphi-win64.toggleRawStackScan');
+  assert.ok(entry, 'missing view/title entry for the raw stack scan toggle');
+  assert.match(entry.when, /view == workbench\.debug\.callStackView/);
+  assert.match(entry.when, /debugType == 'delphi-win64'/);
+  assert.match(entry.group || '', /^navigation/,
+    'anything but a navigation group hides the command in the "..." overflow menu');
+});
+
 test('the rule wizard is on the debug toolbar, gated on our type and on an exception stop', () => {
   const entry = (contributes.menus['debug/toolBar'] || [])
     .find((item) => item.command === 'delphi-win64.createRuleForException');

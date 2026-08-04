@@ -522,11 +522,20 @@ function activate(context) {
   );
 
   // Same language ids the breakpoint contribution uses.
-  context.subscriptions.push(
-    vscode.languages.registerEvaluatableExpressionProvider(
-      [{ language: 'objectpascal' }, { language: 'pascal' }, { language: 'delphi' }],
-      pascalEvaluatableExpressionProvider)
-  );
+  //
+  // Guarded, and not out of superstition: this extension is installed into every
+  // editor of the VS Code family (Cursor, Windsurf, VSCodium, Trae), and if one
+  // of them lacks this API an unguarded call throws out of activate() and takes
+  // the DEBUG TYPE REGISTRATION down with it -- trading richer hovers for an
+  // extension that cannot start a session at all. Losing the hover is the
+  // proportionate failure.
+  if (vscode.languages && vscode.languages.registerEvaluatableExpressionProvider) {
+    context.subscriptions.push(
+      vscode.languages.registerEvaluatableExpressionProvider(
+        [{ language: 'objectpascal' }, { language: 'pascal' }, { language: 'delphi' }],
+        pascalEvaluatableExpressionProvider)
+    );
+  }
 
   const exceptionStops = new ExceptionStopTracker((value) =>
     vscode.commands.executeCommand('setContext', EXCEPTION_CONTEXT_KEY, value));

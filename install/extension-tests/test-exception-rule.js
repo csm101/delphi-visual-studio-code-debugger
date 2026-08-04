@@ -138,6 +138,8 @@ const vscodeStub = {
       return Promise.resolve();
     }
   },
+  // Present so activate() takes its REAL path -- see the note in test-progress.js.
+  languages: { registerEvaluatableExpressionProvider() { return { dispose() {} }; } },
   workspace: {
     workspaceFolders: [],
     workspaceFile: undefined,

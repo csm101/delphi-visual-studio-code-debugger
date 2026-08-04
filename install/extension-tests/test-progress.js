@@ -71,6 +71,11 @@ const vscodeStub = {
     },
     executeCommand: async () => undefined
   },
+  // Present so activate() takes its REAL path. The extension guards this call
+  // (an editor without the API must still get a working debug type), and a
+  // double that omitted it would make every test here exercise the guard
+  // instead of the code.
+  languages: { registerEvaluatableExpressionProvider() { return { dispose() {} }; } },
   workspace: { workspaceFolders: [], isTrusted: true, openTextDocument: async () => { throw new Error('none'); } },
   Uri: { joinPath: (...parts) => ({ path: parts.join('/') }), file: (fsPath) => ({ path: fsPath, fsPath: fsPath }) },
   Range: function Range() {},
