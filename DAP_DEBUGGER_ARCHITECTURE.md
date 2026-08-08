@@ -170,6 +170,7 @@ nothing else:
 | `ReadThreadRegisters` | `Wow64GetThreadContext` |
 | `SetThreadPc` | `Wow64SetThreadContext` |
 | `SetThreadTrapFlag` | `Wow64SetThreadContext`, EFLAGS bit `$100` |
+| `ReadDebugRegisters` / `WriteDebugRegisters` | `Wow64Get/SetThreadContext` with `WOW64_CONTEXT_DEBUG_REGISTERS`; the registers are 32 bits wide, so the widening is the whole difference |
 | `FillStackWalkContext` | seeds `StackWalk64` from a WOW64 context |
 | `ReadPrologInfo` | x86 byte-pattern decoder (x86 has no `.pdata`) |
 | `LocalsOffsetBase` / `ParamsOffsetBase` | 0 — see "x86 frame model" |
@@ -1857,6 +1858,44 @@ in place and execute the original instruction. Sequence:
 When the user requested `stepInto` while a reactivation is pending,
 the rearm consumes the trap step, so we re-enable TF before resuming
 so the actual step still fires.
+
+## Hardware watchpoints and the single-step branch
+
+A hardware data breakpoint hit is delivered as a SINGLE-STEP exception —
+`$80000004`, or `$4000001E` under WOW64 — which is the same event the whole
+sequence above consumes. The exception code cannot separate them; `DR6` can, and
+nothing else can:
+
+- `B0..B3` name the slot(s) that fired;
+- `BS` (bit 14) says the trap flag caused this trap;
+- both are set when one instruction did both.
+
+`TWinDebugger.TakeDebugTrapCause` is the FIRST thing the branch does, before the
+trap flag is cleared and before any other state is touched — on WOW64 the slot
+bits do not survive an intervening `Wow64SetThreadContext`. It reads `DR6`, masks
+it (the reserved bits read back as ones), and writes zero back, because the CPU
+never clears `DR6` itself.
+
+The branch then behaves as follows:
+
+- no slot bit → exactly the pre-existing path, and while no slot is armed the
+  register file is never opened at all, so stepping costs what it always did;
+- a slot bit without `BS` → a watchpoint fired while the target was running free.
+  It is recorded (`HardwareWatchpointHitCount` / `LastHardwareWatchpointHit`) and
+  resumed; the stepping engine never sees the event, and any in-flight step is
+  left to its own resume breakpoint;
+- a slot bit with `BS` → one instruction both completed our step and tripped the
+  watchpoint. The hit is recorded and the step is allowed to complete.
+
+Arming is `ArmHardwareWatchpoint(TID, Slot, Address, SizeBytes, WriteOnly)`,
+which REFUSES a bad slot, an unsupported size, an 8-byte watch on a 32-bit
+target or a misaligned address rather than rounding it — the hardware ignores the
+low address bits, so a rounded request would silently watch a neighbouring cell
+and report success. The DR7 bit maths is architecture-neutral and lives once in
+`TWinDebugger`; only the register access is behind the funnel.
+
+Not yet built (see `DATA_BREAKPOINTS_PLAN.md`): the slot allocator, replication
+onto every thread, clear-on-detach, a stop reason, and the MCP/DAP surfaces.
 
 ## Exception handling
 

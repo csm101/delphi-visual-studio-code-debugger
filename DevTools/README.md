@@ -799,7 +799,7 @@ so the auto-discovery must keep its `%~xF` extension guard.
 ## `DataBpProbe` — hardware watchpoint feasibility (2026-08-08)
 
 ```
-DataBpProbe.exe <exe> [-maxhits <n>]
+DataBpProbe.exe <exe> [-maxhits <n>] [-tfstep] [-tfwalk <n>]
 ```
 
 Launches the target, arms `DR0` for write on a known global, and reports each
@@ -815,3 +815,18 @@ context funnel.
 fires, on EITHER bitness — the initial thread has not run user code yet. Arm
 after the process's own initial system breakpoint (`$80000003` native,
 `$4000001F` for the WOW64 target's own, which follows the native one).
+
+`-tfstep` and `-tfwalk` answer the question increment 2 turned on: a watchpoint
+hit and a completed single step arrive as the SAME exception, so can the pump
+separate them from `DR6` alone?
+
+- `-tfstep` sets the trap flag once after arming and reports the `DR6` of the
+  step it produces. Measured on both bitnesses: `BS` (bit 14) set, slot bits
+  clear.
+- `-tfwalk <n>` keeps stepping with the trap flag armed until one stepped
+  instruction also writes the watched cell — the combined case. Measured on both
+  bitnesses: `DR6` carries `BS` **and** the slot bit (`$FFFF4FF1`).
+
+So the disambiguation needs no state of its own. Note that `DR6` reads back with
+its reserved bits SET (`$FFFF4FF0` for a plain step), so it must be masked field
+by field rather than compared or tested for zero.

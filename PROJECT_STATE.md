@@ -513,17 +513,25 @@ Debugger features:
   external `.tds`. Full plan + decisions in `DEBUG_INFO_FORMATS_TODO.md`.
 - PE import-table reader so MAP can be dropped entirely.
 - Child process tracking.
-- **Data breakpoints / watchpoints ("stop when this address is written") —
-  DESIGNED, not built (2026-08-08).** Nothing exists today: no debug-register
-  handling in the engine, no DAP capability, no MCP tool. Full plan in
-  `DATA_BREAKPOINTS_PLAN.md`. Key points: hardware `DR0..DR3`, so four slots and
-  explicit refusal when exhausted; **debug registers are PER-THREAD**, so a
-  watchpoint must be replicated onto every thread including ones created later,
-  and cleared on detach; a hit arrives as a SINGLE-STEP exception, so `DR6` must
-  disambiguate it from the stepping engine's own steps — a change to the event
-  pump's most delicate path; x86 has no read-only watchpoint, so DAP `read` maps
-  to read-or-write and must say so. Ranked above disassembly in diagnostic value:
-  "who writes this variable" has no other answer.
+- **Data breakpoints / watchpoints ("stop when this address is written") — IN
+  PROGRESS, increments 1-2 of 6 done (2026-08-08).** Full plan, measurements and
+  increment list in `DATA_BREAKPOINTS_PLAN.md`.
+  * **Built:** debug registers as a fourth role behind the thread-context funnel
+    (`ReadDebugRegisters` / `WriteDebugRegisters`, with the `Wow64` variant in
+    `WinDebuggerX86`); `ArmHardwareWatchpoint` / `DisarmHardwareWatchpoint` on
+    `IDebugTarget`, refusing a bad slot, size or alignment rather than rounding;
+    and the `DR6` disambiguation in the event pump, because a hit arrives as a
+    SINGLE-STEP exception — the same event the stepping engine consumes. `DR6` is
+    sampled BEFORE anything else touches the thread context (on WOW64 the slot
+    bits do not survive an intervening context write) and cleared afterwards.
+    Tested on both bitnesses, three scenarios each, with both negative controls
+    run.
+  * **Not built:** the four-slot allocator with explicit exhaustion, replication
+    onto every thread (including ones created later) and clear-on-detach, the
+    stop reason with old→new capture, and the MCP / DAP surfaces. x86 has no
+    read-only watchpoint, so DAP `read` maps to read-or-write and must say so.
+  Ranked above disassembly in diagnostic value: "who writes this variable" has no
+  other answer.
 - **Disassembly + address breakpoints — DESIGNED, not built (2026-08-08).** Full
   plan, decisions and increments in `DISASSEMBLY_PLAN.md`. In short: complete ISA
   coverage is a requirement (target code is not only Delphi-compiled), so the

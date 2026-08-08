@@ -27,23 +27,27 @@ longer true, delete it.
 
 ## Current task (2026-08-08)
 
-**Data breakpoints (watchpoints), increment 1 — DONE.** Plan:
-`DATA_BREAKPOINTS_PLAN.md`. Probe `DevTools\DataBpProbe.dpr` confirmed WOW64
-debug registers (`Wow64Get/SetThreadContext` + `WOW64_CONTEXT_DEBUG_REGISTERS`)
-work identically to native x64: `DR6` bit `B0` set, write already visible at
-trap, `DR7` survives scheduling, both bitnesses sustained 3 consecutive hits.
-Plan NOT invalidated. One trap found and recorded in the plan doc: arming at
-`CREATE_PROCESS_DEBUG_EVENT` never fires (initial thread hasn't run user code
-yet); must arm after the process's own initial system breakpoint
-(`$80000003` native, `$4000001F` for the WOW64 target's own bp, which fires
-after the native one).
+**Data breakpoints (watchpoints), increments 1 and 2 — DONE.** Plan and every
+measurement: `DATA_BREAKPOINTS_PLAN.md`. Increment 2 landed the debug registers
+as a fourth role behind the thread-context funnel, `ArmHardwareWatchpoint` /
+`DisarmHardwareWatchpoint` on `IDebugTarget`, and the `DR6` disambiguation in the
+single-step branch of `HandleException`. Six tests (`*DataBp_*` in
+`DebugSessionTests.pas`, three scenarios × both bitnesses) over the new
+`RunDataBpStepFixture` fixture; both negative controls run and recorded in the
+plan doc. No session API, no MCP, no DAP — those are increments 3-6.
+
+The one that cost the session, now in `TRAPS.md`: `DR6` must be sampled BEFORE
+anything else touches the thread context. On WOW64 the slot bits were already
+gone once the pump had cleared the trap flag through `Wow64SetThreadContext`;
+native x64 survived it, so the feature recorded no hits on one bitness only.
 
 ### Next action
 
-Increment 2: `DR6` disambiguation in the exception handler
-(`WinDebuggerBase.pas:2823`), plus tests that a normal step still completes
-with a watchpoint armed and vice versa. No production wiring beyond that yet
-(no session API, no MCP/DAP surfaces — those are increments 3-6).
+Increment 3: per-thread replication — arm-on-create (`HandleCreateThread`),
+arm-on-attach, clear-on-detach, plus the four-slot allocator with explicit
+exhaustion. `FWatchArmedSlots` / `FWatchAddr` in `TWinDebugger` are process-wide
+bookkeeping today and are only correct because a watchpoint currently lives on a
+single thread; increment 3 owns replacing them.
 
 ### Chosen sequencing
 
@@ -64,7 +68,7 @@ written here.
 - `public-main`, clean. Release **0.3.0 is committed but NOT tagged and NOT
   pushed**; no GitHub release exists. The push is the outward-facing step and
   waits on the maintainer.
-- Last full suite: **1040 found / 1036 passed / 0 failed / 0 errored / 4 ignored.**
+- Last full suite: **1046 found / 1042 passed / 0 failed / 0 errored / 4 ignored.**
   Extension suite: 152 passed / 0 failed.
 - Win32 support is functionally complete for `-$O-` targets. Debug-info format
   coverage (TD32, RSM, MAP, JCL, DCP, `.tds`) is closed; DCU is WON'T DO.

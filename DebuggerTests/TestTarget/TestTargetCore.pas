@@ -451,6 +451,11 @@ var
   GStepIsoStop: Boolean;
   GStepIsoB:    Int64;
   GStepIsoC:    Int64;
+  // Hardware-watchpoint fixture (see RunDataBpStepFixture). Integer, so the
+  // cell is 4 bytes and naturally 4-aligned -- the alignment a debug register
+  // requires, and the reason not to make it a Boolean or an Int64.
+  GDataBpWatched: Integer;
+  GDataBpOther:   Integer;
 
 procedure ComputeNested(var X: Integer);
 procedure RunAllScenarios;
@@ -1834,6 +1839,46 @@ begin
   CloseHandle(HC);
 end;
 
+// --- Hardware-watchpoint / DR6 disambiguation fixture ----------------------
+// A watchpoint hit and a completed single step arrive as the SAME exception, so
+// the event pump can only separate them by reading DR6. Two directions have to
+// be provable, and this fixture supplies one call site for each:
+//
+//   * a step still completes while a watchpoint is armed -- step over
+//     DataBpQuietStep, which never touches the watched cell;
+//   * a hit that happens inside a stepped-over call is NOT reported as that
+//     step completing -- step over DataBpWriteWatched, which writes it.
+//
+// The write sits in a CALLEE deliberately. During a step-over the target runs
+// free to a planted return breakpoint with the trap flag off, so the trap the
+// watchpoint produces is unambiguously not the step's own -- which is exactly
+// the event the pump used to misread as a completed step.
+
+procedure DataBpQuietStep;
+begin
+  Inc(GDataBpOther);                                          // {BP:DATABP_QUIET_BODY}
+end;
+
+// The write is deliberately NOT the first statement: a breakpoint on a routine's
+// first statement is subject to entry/body adjustment, and the combined-case test
+// needs the breakpoint to sit exactly BEFORE the writing instruction.
+procedure DataBpWriteWatched;
+begin
+  GDataBpOther := GDataBpOther + 1;                           // {BP:DATABP_WRITE_PRE}
+  Inc(GDataBpWatched);                                        // {BP:DATABP_WRITE_BODY}
+  GDataBpOther := GDataBpOther + 2;                           // {BP:DATABP_WRITE_AFTER}
+end;
+
+procedure RunDataBpStepFixture;
+begin
+  GDataBpWatched := 0;
+  GDataBpOther   := 0;
+  GSink.Use(['databp ready ', GDataBpWatched]);               // {BP:DATABP_READY}
+  DataBpQuietStep;                                            // {BP:DATABP_QUIET_CALL}
+  DataBpWriteWatched;                                         // {BP:DATABP_WRITE_CALL}
+  GSink.Use(['databp done ', GDataBpWatched, GDataBpOther]);  // {BP:DATABP_DONE}
+end;
+
 procedure RunBpTests;
 var
   I, Acc: Integer;
@@ -1926,6 +1971,9 @@ begin
 
   if FindCmdLineSwitch('run-per-thread-step') or FindCmdLineSwitch('-run-per-thread-step') then
     RunPerThreadStepFixture;
+
+  if FindCmdLineSwitch('run-databp-step') or FindCmdLineSwitch('-run-databp-step') then
+    RunDataBpStepFixture;
 
   if FindCmdLineSwitch('run-av') or FindCmdLineSwitch('-run-av') then
     RunAccessViolation;

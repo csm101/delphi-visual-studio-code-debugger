@@ -232,6 +232,23 @@ real implementation. Run summary shows the live count
 - [x] Terminate / run-to-completion clean shutdown
       (`Test_Lifecycle_RunToTermination`)
 
+Hardware watchpoints share the single-step exception with the stepping engine,
+so they are covered here rather than under their own heading. Both bitnesses,
+`DebugSessionTests.pas`:
+
+- [x] A step still completes with a watchpoint armed
+      (`DataBp_StepCompletesWithWatchpointArmed` / `Win32_...`)
+- [x] A hit inside a stepped-over call is not reported as the step completing
+      (`DataBp_HitDuringStep_IsNotReportedAsStepCompletion` / `Win32_...`)
+- [x] A hit on the stepped instruction itself (`DR6` = `BS` + slot bit) still
+      completes the step
+      (`DataBp_HitOnTheSteppedInstruction_StillCompletesTheStep` / `Win32_...`)
+- [ ] Slot exhaustion refuses the fifth watchpoint (increment 3)
+- [ ] A watchpoint replicated onto a thread created after it was set
+      (increment 3)
+- [ ] Detach leaves the target unarmed (increment 3)
+- [ ] The stop names the WRITING thread, and old -> new (increment 4)
+
 ---
 
 ## F. Exception handling

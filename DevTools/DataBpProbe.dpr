@@ -30,10 +30,26 @@ program DataBpProbe;
   clears DR6, re-reads DR7 to confirm it was not reset by the emulation
   layer, and continues.
 
+  Second question, added for increment 2 (DR6 disambiguation in the event
+  pump): a watchpoint hit and a completed single step arrive as the SAME
+  exception, so the pump must tell them apart from DR6 alone. B0..B3 name the
+  slot that fired; BS (bit 14) says the trap flag caused this trap. Whether the
+  WOW64 emulation layer reports BS at all is not documented anywhere we trust,
+  and the answer decides whether the pump can be stateless. `-tfstep` sets the
+  trap flag once after arming and reports the DR6 of the resulting step, so the
+  two cases can be compared side by side on both bitnesses.
+
   Usage:
-    DataBpProbe <exe> [-maxhits <n>]
+    DataBpProbe <exe> [-maxhits <n>] [-tfstep]
 
     -maxhits  how many DR6 hits to observe before terminating (default 3)
+    -tfstep   also set the trap flag once after arming, and report the DR6 of
+              the single step it produces (measures whether BS is reported)
+    -tfwalk n keep the trap flag armed for up to n consecutive single steps and
+              report the DR6 of each. This is the COMBINED case: sooner or later
+              one stepped instruction also writes the watched cell, and the
+              question is whether DR6 then reports BS *and* the slot bit, or
+              only BS -- i.e. whether a watchpoint hit can hide inside a step.
 }
 
 {$APPTYPE CONSOLE}
@@ -50,6 +66,8 @@ const
   DR7_L0                  = DWORD($00000001);
   DR7_RW0_WRITE           = DWORD($00010000); // bits 16-17 = 01
   DR7_LEN0_4BYTE          = DWORD($000C0000); // bits 18-19 = 11
+  DR6_BS                  = DWORD($00004000); // single step caused this #DB
+  TRAP_FLAG               = DWORD($00000100);
 
 function IsSingleStepException(Code: DWORD): Boolean;
 begin
@@ -75,6 +93,11 @@ var
   GProcess:    THandle = 0;
   GIsWow64:    Boolean = False;
   GMaxHits:    Integer = 3;
+  GTfStep:     Boolean = False;
+  GTfWalk:     Integer = 0;
+  // Walking with the trap flag armed produces one event per instruction, so the
+  // per-event report is silenced while it runs and replaced by a summary.
+  GVerbose:    Boolean = True;
 
 function ClassifyWow64(hProcess: THandle): Boolean;
 begin
@@ -101,8 +124,37 @@ begin
   if (Dr6 and $2) <> 0 then Result := Result + 'B1 ';
   if (Dr6 and $4) <> 0 then Result := Result + 'B2 ';
   if (Dr6 and $8) <> 0 then Result := Result + 'B3 ';
+  if (Dr6 and DR6_BS) <> 0 then Result := Result + 'BS ';
   if Result = '' then
     Result := '(none)';
+end;
+
+// Sets the trap flag on the target's main thread, whichever bitness it is.
+// Returns False and says why on failure, so a missing measurement is never
+// mistaken for a measured absence.
+function SetTrapFlagOnMain(hThread: THandle): Boolean;
+begin
+  if GIsWow64 then begin
+    var Ctx := Default(TWow64Context);
+    Ctx.ContextFlags := WOW64_CONTEXT_CONTROL;
+    if not Wow64GetThreadContext(hThread, Ctx) then begin
+      Say(Format('  Wow64GetThreadContext (TF) FAILED err=%d', [GetLastError]));
+      Exit(False);
+    end;
+    Ctx.EFlags := Ctx.EFlags or TRAP_FLAG;
+    Result := Wow64SetThreadContext(hThread, Ctx);
+  end else begin
+    var Ctx := Default(TContext);
+    Ctx.ContextFlags := CONTEXT_CONTROL;
+    if not GetThreadContext(hThread, Ctx) then begin
+      Say(Format('  GetThreadContext (TF) FAILED err=%d', [GetLastError]));
+      Exit(False);
+    end;
+    Ctx.EFlags := Ctx.EFlags or TRAP_FLAG;
+    Result := SetThreadContext(hThread, Ctx);
+  end;
+  if not Result then
+    Say(Format('  SetThreadContext (TF) FAILED err=%d', [GetLastError]));
 end;
 
 { ---------------------------------------------------------- native (x64) -- }
@@ -144,7 +196,8 @@ begin
   Dr6Out := DWORD(Ctx.Dr6);
   AfterVal := 0;
   ReadProcessMemory(GProcess, Pointer(WatchAddr), @AfterVal, 4, Read);
-  Say(Format('  DR6=%s bits=[%s]  DR7=%s (expected %s, %s)  watched dword before=%s after=%s (%s)',
+  if GVerbose then
+    Say(Format('  DR6=%s bits=[%s]  DR7=%s (expected %s, %s)  watched dword before=%s after=%s (%s)',
     [Hex(Dr6Out), ReportDr6Bits(Dr6Out), Hex(Ctx.Dr7), Hex(ExpectDr7),
      IfThen(UInt64(Ctx.Dr7) = ExpectDr7, 'UNCHANGED', 'CHANGED!'),
      Hex(BeforeVal), Hex(AfterVal), IfThen(BeforeVal <> AfterVal, 'write visible', 'write NOT visible')]));
@@ -191,7 +244,8 @@ begin
   Dr6Out := Ctx.Dr6;
   AfterVal := 0;
   ReadProcessMemory(GProcess, Pointer(WatchAddr), @AfterVal, 4, Read);
-  Say(Format('  DR6=%s bits=[%s]  DR7=%s (expected %s, %s)  watched dword before=%s after=%s (%s)',
+  if GVerbose then
+    Say(Format('  DR6=%s bits=[%s]  DR7=%s (expected %s, %s)  watched dword before=%s after=%s (%s)',
     [Hex(Dr6Out), ReportDr6Bits(Dr6Out), Hex(Ctx.Dr7), Hex(ExpectDr7),
      IfThen(Ctx.Dr7 = ExpectDr7, 'UNCHANGED', 'CHANGED!'),
      Hex(BeforeVal), Hex(AfterVal), IfThen(BeforeVal <> AfterVal, 'write visible', 'write NOT visible')]));
@@ -218,6 +272,8 @@ var
   StepSeenNoBits: Integer;
   Done:        Boolean;
   SeenInitialBp: Boolean;
+  TfStepPending: Boolean;
+  WalkSteps:     Integer;
 
   // Arming at CREATE_PROCESS_DEBUG_EVENT does not work reliably: the initial
   // thread has not run any user code yet, and a watchpoint set that early
@@ -286,6 +342,8 @@ begin
   StepSeenNoBits := 0;
   Done := False;
   SeenInitialBp := False;
+  TfStepPending := False;
+  WalkSteps     := 0;
 
   while (not Done) and WaitForDebugEvent(Ev, 20000) do begin
     var ContinueStatus: DWORD := DBG_CONTINUE;
@@ -307,7 +365,8 @@ begin
       EXCEPTION_DEBUG_EVENT:
         begin
           var Code := Ev.Exception.ExceptionRecord.ExceptionCode;
-          Say(Format('  exception code=%s firstChance=%d tid=%d', [Hex(Code), Ev.Exception.dwFirstChance, Ev.dwThreadId]));
+          if GVerbose then
+            Say(Format('  exception code=%s firstChance=%d tid=%d', [Hex(Code), Ev.Exception.dwFirstChance, Ev.dwThreadId]));
 
           // For a WOW64 target the native ntdll breakpoint ($80000003) fires
           // BEFORE the thread switches into 32-bit execution; arm on the
@@ -319,6 +378,11 @@ begin
             SeenInitialBp := True;
             Say('  initial system breakpoint (own bitness) reached -- arming watchpoint now');
             ArmNow;
+            if Armed and (GTfStep or (GTfWalk > 0)) then begin
+              TfStepPending := SetTrapFlagOnMain(MainThread);
+              if TfStepPending then
+                Say('  trap flag set -- the next single step should be a TF step, not a watchpoint hit');
+            end;
           end;
 
           if Armed and IsSingleStepException(Code) then begin
@@ -328,7 +392,42 @@ begin
               Ok := HandleHitWow64(MainThread, WatchAddr, ExpectDr7Wow, BeforeVal, Dr6)
             else
               Ok := HandleHitNative(MainThread, WatchAddr, ExpectDr7Native, BeforeVal, Dr6);
+            var WasTfStep := TfStepPending;
+            // Trap-flag WALK: keep stepping and classify every step. The result
+            // that matters is the first step whose own instruction writes the
+            // watched cell -- does DR6 then carry BS *and* the slot bit?
+            if Ok and (GTfWalk > 0) then begin
+              Inc(WalkSteps);
+              if (Dr6 and $F) <> 0 then begin
+                GVerbose := True;
+                Say(Format('=== COMBINED === after %d trap-flag steps: DR6=%s bits=[%s] -- ' +
+                  'the stepped instruction wrote the watched cell and DR6 reports %s',
+                  [WalkSteps, Hex(Dr6), ReportDr6Bits(Dr6),
+                   IfThen(Dr6 and DR6_BS <> 0, 'BOTH BS and the slot bit',
+                     'ONLY the slot bit (BS absent)')]));
+                GTfWalk := 0;
+              end else if WalkSteps >= GTfWalk then begin
+                GVerbose := True;
+                Say(Format('=== WALK ENDED === %d trap-flag steps, none of them wrote the ' +
+                  'watched cell (BS-only every time) -- the combined case did not occur',
+                  [WalkSteps]));
+                GTfWalk := 0;
+              end else begin
+                GVerbose := False;
+                TfStepPending := SetTrapFlagOnMain(MainThread);
+                ContinueDebugEvent(Ev.dwProcessId, Ev.dwThreadId, DBG_CONTINUE);
+                Continue;
+              end;
+            end;
             if Ok then begin
+              if TfStepPending then begin
+                TfStepPending := False;
+                Say(Format('=== TF STEP === DR6=%s bits=[%s]  slot bits %s, BS %s',
+                  [Hex(Dr6), ReportDr6Bits(Dr6),
+                   IfThen(Dr6 and $F <> 0, 'SET (a step would look like a hit!)', 'clear (as required)'),
+                   IfThen(Dr6 and DR6_BS <> 0, 'SET (stateless disambiguation possible)',
+                                               'NOT reported (pump needs its own trap-flag record)')]));
+              end;
               if Dr6 and $F <> 0 then begin
                 Inc(HitCount);
                 Say(Format('=== HIT %d/%d ===', [HitCount, GMaxHits]));
@@ -340,7 +439,7 @@ begin
                   TerminateProcess(GProcess, 0);
                   Done := True;
                 end;
-              end else begin
+              end else if not WasTfStep then begin
                 Inc(StepSeenNoBits);
                 Say('  single-step with NO DR6 bits set (unexpected -- not a watchpoint hit)');
               end;
@@ -375,13 +474,18 @@ begin
     if SameText(Arg, '-maxhits') and (I < ParamCount) then begin
       Inc(I);
       GMaxHits := StrToIntDef(ParamStr(I), 3);
-    end else if ExePath = '' then
+    end else if SameText(Arg, '-tfwalk') and (I < ParamCount) then begin
+      Inc(I);
+      GTfWalk := StrToIntDef(ParamStr(I), 200);
+    end else if SameText(Arg, '-tfstep') then
+      GTfStep := True
+    else if ExePath = '' then
       ExePath := Arg;
     Inc(I);
   end;
   Result := (ExePath <> '') and FileExists(ExePath);
   if not Result then
-    Say('usage: DataBpProbe <exe> [-maxhits <n>]');
+    Say('usage: DataBpProbe <exe> [-maxhits <n>] [-tfstep]');
 end;
 
 var

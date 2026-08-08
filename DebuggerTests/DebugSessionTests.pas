@@ -361,6 +361,11 @@ type
     // host width splices the argument into its high half and the run-to-return
     // breakpoint is planted nowhere, so the step never completes.
     [Test] procedure Win32_StepOverCallWithStackArgument_LandsOnTheNextLine;
+    // The DR6 disambiguation, on a WOW64 target: same three scenarios as the
+    // x64 fixture, reaching the debug registers through Wow64Get/SetThreadContext.
+    [Test] procedure Win32_DataBp_StepCompletesWithWatchpointArmed;
+    [Test] procedure Win32_DataBp_HitDuringStep_IsNotReportedAsStepCompletion;
+    [Test] procedure Win32_DataBp_HitOnTheSteppedInstruction_StillCompletesTheStep;
     // An application split across runtime packages is this project's core use
     // case and the shape where debugger bugs have historically surfaced, so it
     // has to hold on both bitnesses rather than only x64. The breakpoint is
@@ -415,6 +420,12 @@ type
     // Step-0 superset additions (frontend-neutral core superset of the DAP needs).
     [Test] procedure Threads_StoppedThreadIsCurrent;
     [Test] procedure PerThreadStep_StepsOnlySelectedThread;
+    // Hardware watchpoints share the single-step exception with the stepping
+    // engine; these pin both directions of telling them apart. See the shared
+    // scenario helpers for what each one exercises.
+    [Test] procedure DataBp_StepCompletesWithWatchpointArmed;
+    [Test] procedure DataBp_HitDuringStep_IsNotReportedAsStepCompletion;
+    [Test] procedure DataBp_HitOnTheSteppedInstruction_StillCompletesTheStep;
     // F19: a step-into used to report at the callee's ENTRY address, before the
     // prologue had spilled the register arguments into their home slots, so Self
     // and every by-register parameter read as the CALLER's leftover frame bytes
@@ -531,7 +542,9 @@ begin
   Result := RepoRoot + 'DebuggerTests\TestPackage\TestPkgUnit.pas';
 end;
 
-function TDebugSessionTests.MarkerLineInFile(const SourcePath, Marker: string): Integer;
+// 1-based line carrying `{BP:<Marker>}`, or 0. Both fixtures and the shared
+// scenario helpers resolve markers through this one scan.
+function MarkerLineIn(const SourcePath, Marker: string): Integer;
 var
   Lines: TStringList;
 begin
@@ -542,10 +555,15 @@ begin
     var Tag := '{BP:' + Marker + '}';
     for var I := 0 to Lines.Count - 1 do
       if Lines[I].Contains(Tag) then
-        Exit(I + 1);  // 1-based
+        Exit(I + 1);
   finally
     Lines.Free;
   end;
+end;
+
+function TDebugSessionTests.MarkerLineInFile(const SourcePath, Marker: string): Integer;
+begin
+  Result := MarkerLineIn(SourcePath, Marker);
 end;
 
 function TDebugSessionTests.MarkerLine(const SourceBaseName, Marker: string): Integer;
@@ -584,6 +602,210 @@ begin
   while (Result.State <> dsStopped) and (not Result.HasExited) and
         (GetTickCount64 < Deadline) do
     Result.Pump;
+end;
+
+procedure PumpUntilStop(Session: TDebugSession; TimeoutMs: Cardinal);
+begin
+  var Deadline := GetTickCount64 + TimeoutMs;
+  while (Session.State <> dsStopped) and (not Session.HasExited) and
+        (GetTickCount64 < Deadline) do
+    Session.Pump;
+end;
+
+{ ------------------------------------------- hardware watchpoints (DR6) ---- }
+
+// A hardware watchpoint hit is delivered as a SINGLE-STEP exception -- the same
+// event the stepping engine consumes -- so only DR6 can separate them. These
+// three scenarios pin both directions of that, and they are shared verbatim
+// between the x64 and the WOW64 fixture because the disambiguation is supposed
+// to be bitness-independent: the register file is reached differently, the
+// meaning of the bits is not.
+//
+// Increment 2 of DATA_BREAKPOINTS_PLAN.md has no stop reason for a watchpoint
+// yet, so a hit that completes no step of ours is recorded and resumed. What is
+// under test is that the stepping engine never sees it.
+
+const
+  DATABP_SOURCE = 'TestTargetCore.pas';
+  DATABP_ARGS   = '-run-databp-step';
+
+// Address of a unit global in the debuggee, through the same resolution the
+// evaluator uses. Asserted here so a moved fixture fails talking about the
+// SYMBOL rather than about a watchpoint that would not arm.
+function WatchedGlobalAddress(Session: TDebugSession; const Name: string): UInt64;
+var
+  V: TLocalValue;
+begin
+  Assert.IsTrue(Session.Debugger.EvaluateGlobalName(Name, V),
+    'global not resolvable in the debuggee: ' + Name);
+  Assert.IsTrue(V.Address <> 0, 'global resolved to address 0: ' + Name);
+  Result := V.Address;
+end;
+
+procedure ArmWatchOnGDataBpWatched(Session: TDebugSession; out Addr: UInt64);
+begin
+  Addr := WatchedGlobalAddress(Session, 'GDataBpWatched');
+  Assert.IsTrue(Session.Debugger.ArmHardwareWatchpoint(
+      Session.GetStoppedThreadId, 0, Addr, 4, True),
+    Format('arming a 4-byte write watchpoint on GDataBpWatched at $%x was refused',
+      [Addr]));
+end;
+
+function StopLineOf(Session: TDebugSession; const Context: string): Integer;
+var
+  FnName, SrcFile: string;
+begin
+  Assert.IsTrue(Session.GetCurrentLocation(FnName, SrcFile, Result),
+    'no current location ' + Context);
+end;
+
+// Direction 1: an ordinary step still completes while a watchpoint is armed.
+// Nothing writes the watched cell here, so DR6 carries no slot bit and the
+// stepping engine must behave exactly as it did before watchpoints existed --
+// the regression this increment could most easily cause.
+procedure RunStepCompletesWithWatchpointArmed(const ExePath, MapPath, RsmPath,
+  SourceDir: string);
+begin
+  var ReadyLine := MarkerLineIn(SourceDir + DATABP_SOURCE, 'DATABP_READY');
+  var QuietLine := MarkerLineIn(SourceDir + DATABP_SOURCE, 'DATABP_QUIET_CALL');
+  var WriteLine := MarkerLineIn(SourceDir + DATABP_SOURCE, 'DATABP_WRITE_CALL');
+  Assert.IsTrue((ReadyLine > 0) and (QuietLine > 0) and (WriteLine > 0),
+    'DATABP_READY / DATABP_QUIET_CALL / DATABP_WRITE_CALL markers not found');
+
+  var Session := OpenSessionAtMarker(ExePath, MapPath, RsmPath, SourceDir,
+    DATABP_SOURCE, ReadyLine, DATABP_ARGS);
+  try
+    Assert.AreEqual(Ord(dsStopped), Ord(Session.State),
+      'did not stop at DATABP_READY');
+    var Addr: UInt64;
+    ArmWatchOnGDataBpWatched(Session, Addr);
+
+    Session.StepOver;
+    PumpUntilStop(Session, 30000);
+    Assert.AreEqual(Ord(dsStopped), Ord(Session.State),
+      'the first step never completed with a watchpoint armed');
+    Assert.AreEqual(QuietLine, StopLineOf(Session, 'after the first step'),
+      'the first step landed on the wrong line');
+
+    // ... and over a CALL as well, which is where the step machinery runs the
+    // target free and is at its most exposed to a stray single-step event.
+    Session.StepOver;
+    PumpUntilStop(Session, 30000);
+    Assert.AreEqual(Ord(dsStopped), Ord(Session.State),
+      'the step over a call never completed with a watchpoint armed');
+    Assert.AreEqual(WriteLine, StopLineOf(Session, 'after the second step'),
+      'the step over a call landed on the wrong line');
+
+    Assert.AreEqual(0, Session.Debugger.HardwareWatchpointHitCount,
+      'nothing wrote the watched cell, so no hit may have been recorded');
+  finally
+    Session.Terminate;
+    Session.Free;
+  end;
+end;
+
+// Direction 2, trap flag OFF: the watched cell is written inside a stepped-over
+// CALL, while the target runs free towards the step's own resume breakpoint. The
+// resulting single-step exception completes no step of ours, and reporting it as
+// one stops the user inside the callee, at the write.
+procedure RunWatchpointHitDuringStepIsNotAStepCompletion(const ExePath, MapPath,
+  RsmPath, SourceDir: string);
+begin
+  var CallLine := MarkerLineIn(SourceDir + DATABP_SOURCE, 'DATABP_WRITE_CALL');
+  var BodyLine := MarkerLineIn(SourceDir + DATABP_SOURCE, 'DATABP_WRITE_BODY');
+  var DoneLine := MarkerLineIn(SourceDir + DATABP_SOURCE, 'DATABP_DONE');
+  Assert.IsTrue((CallLine > 0) and (BodyLine > 0) and (DoneLine > 0),
+    'DATABP_WRITE_CALL / DATABP_WRITE_BODY / DATABP_DONE markers not found');
+
+  var Session := OpenSessionAtMarker(ExePath, MapPath, RsmPath, SourceDir,
+    DATABP_SOURCE, CallLine, DATABP_ARGS);
+  try
+    Assert.AreEqual(Ord(dsStopped), Ord(Session.State),
+      'did not stop at DATABP_WRITE_CALL');
+    var Addr: UInt64;
+    ArmWatchOnGDataBpWatched(Session, Addr);
+    var Before: UInt32 := 0;
+    Session.Debugger.ReadProcessMemoryAt(Addr, @Before, SizeOf(Before));
+
+    Session.StepOver;
+    PumpUntilStop(Session, 30000);
+    Assert.AreEqual(Ord(dsStopped), Ord(Session.State),
+      'the step over the writing call never produced a stop');
+
+    // Separates the two ways this can fail: the address we watched was never
+    // written (a symbol-resolution problem) versus it was written and the
+    // hardware never reported it (a debug-register problem).
+    var After: UInt32 := 0;
+    Session.Debugger.ReadProcessMemoryAt(Addr, @After, SizeOf(After));
+    Assert.IsTrue(After <> Before,
+      Format('the watched address $%x did not change across the call that ' +
+             'writes GDataBpWatched (%d -> %d) -- the watchpoint was armed on ' +
+             'the wrong cell', [Addr, Before, After]));
+
+    // The behaviour under test first, so a regression reports the symptom the
+    // user would see rather than the bookkeeping.
+    var Landed := StopLineOf(Session, 'after the step over the writing call');
+    Assert.AreNotEqual(BodyLine, Landed,
+      'the watchpoint hit was reported as the step completing, inside the callee');
+    Assert.AreEqual(DoneLine, Landed,
+      'the step over the writing call landed on the wrong line');
+
+    // ...then the guard that keeps this from passing vacuously on a debugger
+    // where the watchpoint simply never fired.
+    Assert.IsTrue(Session.Debugger.HardwareWatchpointHitCount > 0,
+      'the watched cell was written but no watchpoint hit was recorded');
+    var Hit := Session.Debugger.LastHardwareWatchpointHit;
+    Assert.AreEqual(0, Hit.Slot, 'the hit named the wrong debug register');
+    Assert.IsTrue(Hit.Address = Addr,
+      Format('the hit named address $%x, expected $%x', [Hit.Address, Addr]));
+  finally
+    Session.Terminate;
+    Session.Free;
+  end;
+end;
+
+// Direction 2, trap flag ON: one instruction both completes our single step and
+// trips the watchpoint, so DR6 carries BS *and* a slot bit. Swallowing every
+// slot-bit trap would strand the step -- the target resumes with no trap flag
+// and runs to exit -- so `did it stop at all` is the assertion that matters.
+procedure RunWatchpointHitOnTheSteppedInstructionStillCompletesTheStep(
+  const ExePath, MapPath, RsmPath, SourceDir: string);
+begin
+  var BodyLine  := MarkerLineIn(SourceDir + DATABP_SOURCE, 'DATABP_WRITE_BODY');
+  var AfterLine := MarkerLineIn(SourceDir + DATABP_SOURCE, 'DATABP_WRITE_AFTER');
+  Assert.IsTrue((BodyLine > 0) and (AfterLine > 0),
+    'DATABP_WRITE_BODY / DATABP_WRITE_AFTER markers not found');
+
+  var Session := OpenSessionAtMarker(ExePath, MapPath, RsmPath, SourceDir,
+    DATABP_SOURCE, BodyLine, DATABP_ARGS);
+  try
+    Assert.AreEqual(Ord(dsStopped), Ord(Session.State),
+      'did not stop at DATABP_WRITE_BODY');
+    var Addr: UInt64;
+    ArmWatchOnGDataBpWatched(Session, Addr);
+    var Before: UInt32 := 0;
+    Session.Debugger.ReadProcessMemoryAt(Addr, @Before, SizeOf(Before));
+
+    // The write is on THIS line, inside the function being stepped, so it is
+    // reached by a trap-flag single step rather than by a free run.
+    Session.StepOver;
+    PumpUntilStop(Session, 30000);
+    Assert.AreEqual(Ord(dsStopped), Ord(Session.State),
+      'the step whose own instruction tripped the watchpoint never completed');
+
+    var After: UInt32 := 0;
+    Session.Debugger.ReadProcessMemoryAt(Addr, @After, SizeOf(After));
+    Assert.IsTrue(After <> Before,
+      Format('the step did not write the watched address $%x (%d -> %d), so the ' +
+             'combined case was never produced', [Addr, Before, After]));
+    Assert.IsTrue(Session.Debugger.HardwareWatchpointHitCount > 0,
+      'the stepped instruction wrote the watched cell but no hit was recorded');
+    Assert.AreEqual(AfterLine, StopLineOf(Session, 'after the stepped write'),
+      'the step landed on the wrong line');
+  finally
+    Session.Terminate;
+    Session.Free;
+  end;
 end;
 
 procedure TDebugSessionTests.Launch_StopsAtBreakpoint;
@@ -1703,6 +1925,23 @@ end;
 // thread stops at STEPISO_MAIN with both live. Stepping the NON-stopped spinner
 // must advance ONLY it -- the other spinner's counter must not move at all (proof
 // every non-stepped thread was frozen) -- and run control must then target it.
+procedure TDebugSessionTests.DataBp_StepCompletesWithWatchpointArmed;
+begin
+  RunStepCompletesWithWatchpointArmed(TargetExe, TargetMap, TargetRsm, TargetDir);
+end;
+
+procedure TDebugSessionTests.DataBp_HitDuringStep_IsNotReportedAsStepCompletion;
+begin
+  RunWatchpointHitDuringStepIsNotAStepCompletion(TargetExe, TargetMap, TargetRsm,
+    TargetDir);
+end;
+
+procedure TDebugSessionTests.DataBp_HitOnTheSteppedInstruction_StillCompletesTheStep;
+begin
+  RunWatchpointHitOnTheSteppedInstructionStillCompletesTheStep(TargetExe,
+    TargetMap, TargetRsm, TargetDir);
+end;
+
 procedure TDebugSessionTests.PerThreadStep_StepsOnlySelectedThread;
 
   procedure PumpUntilStopped(Session: TDebugSession; TimeoutMs: Cardinal);
@@ -2509,20 +2748,8 @@ end;
 
 function TWin32RunControlTests.MarkerLineInFile(const SourcePath,
   Marker: string): Integer;
-var
-  Lines: TStringList;
 begin
-  Result := 0;
-  Lines := TStringList.Create;
-  try
-    Lines.LoadFromFile(SourcePath);
-    var Tag := '{BP:' + Marker + '}';
-    for var I := 0 to Lines.Count - 1 do
-      if Lines[I].Contains(Tag) then
-        Exit(I + 1);
-  finally
-    Lines.Free;
-  end;
+  Result := MarkerLineIn(SourcePath, Marker);
 end;
 
 const
@@ -5362,14 +5589,6 @@ begin
     'x86 published no $exception object -- the class read must have failed');
 end;
 
-procedure PumpUntilStop(Session: TDebugSession; TimeoutMs: Cardinal);
-begin
-  var Deadline := GetTickCount64 + TimeoutMs;
-  while (Session.State <> dsStopped) and (not Session.HasExited) and
-        (GetTickCount64 < Deadline) do
-    Session.Pump;
-end;
-
 procedure TWin32RunControlTests.Win32_StepInto_LandsInTheCallee;
 const
   STEP_SOURCE = 'TestTargetCore.pas';
@@ -5461,6 +5680,23 @@ begin
   finally
     Session.Free;
   end;
+end;
+
+procedure TWin32RunControlTests.Win32_DataBp_StepCompletesWithWatchpointArmed;
+begin
+  RunStepCompletesWithWatchpointArmed(Win32Exe, Win32Map, Win32Rsm, TargetDir);
+end;
+
+procedure TWin32RunControlTests.Win32_DataBp_HitDuringStep_IsNotReportedAsStepCompletion;
+begin
+  RunWatchpointHitDuringStepIsNotAStepCompletion(Win32Exe, Win32Map, Win32Rsm,
+    TargetDir);
+end;
+
+procedure TWin32RunControlTests.Win32_DataBp_HitOnTheSteppedInstruction_StillCompletesTheStep;
+begin
+  RunWatchpointHitOnTheSteppedInstructionStillCompletesTheStep(Win32Exe,
+    Win32Map, Win32Rsm, TargetDir);
 end;
 
 procedure TWin32RunControlTests.Win32_Bpl_BreakpointInPackage_FiresWithLocals;

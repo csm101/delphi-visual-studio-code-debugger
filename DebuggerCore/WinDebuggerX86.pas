@@ -52,6 +52,8 @@ type
     function  ReadThreadRegisters(TID: DWORD; out Regs: TRegisterSnapshot): Boolean; override;
     function  SetThreadPc(TID: DWORD; VA: UInt64): Boolean; override;
     function  SetThreadTrapFlag(TID: DWORD; Enable: Boolean): Boolean; override;
+    function  ReadDebugRegisters(TID: DWORD; out Regs: TDebugRegisters): Boolean; override;
+    function  WriteDebugRegisters(TID: DWORD; const Regs: TDebugRegisters): Boolean; override;
     function  FillStackWalkContext(TH: THandle; var Buf: TContext;
                 out SeedPc, SeedSp, SeedFp: UInt64): Boolean; override;
     function  WalkRawFrames(TH: THandle; SeedPc, SeedSp, SeedFp: UInt64;
@@ -172,6 +174,69 @@ begin
     Ctx.EFlags := Ctx.EFlags or TRAP_FLAG
   else
     Ctx.EFlags := Ctx.EFlags and (not TRAP_FLAG);
+  Result := Wow64SetThreadContext(TH, Ctx);
+end;
+
+// Debug registers of a WOW64 target. Measured (DevTools\DataBpProbe, both
+// bitnesses) to behave exactly like the native path: DR7 survives real
+// scheduling, DR6 names the slot that fired, and BS is reported for a trap-flag
+// step. The WOW64 registers are 32 bits wide, so the widening is the whole
+// difference -- which is precisely why this belongs behind the funnel and not
+// in the caller.
+function TWin32Debugger.ReadDebugRegisters(TID: DWORD;
+  out Regs: TDebugRegisters): Boolean;
+var
+  Ctx: TWow64Context;
+  TH:  THandle;
+begin
+  Regs := Default(TDebugRegisters);
+  Result := False;
+  TH := ThreadHandle(TID);
+  if TH = 0 then
+    Exit;
+  Ctx := Default(TWow64Context);
+  Ctx.ContextFlags := WOW64_CONTEXT_DEBUG_REGISTERS;
+  if not Wow64GetThreadContext(TH, Ctx) then
+    Exit;
+  Regs.Dr[0] := Ctx.Dr0;
+  Regs.Dr[1] := Ctx.Dr1;
+  Regs.Dr[2] := Ctx.Dr2;
+  Regs.Dr[3] := Ctx.Dr3;
+  Regs.Dr6   := Ctx.Dr6;
+  Regs.Dr7   := Ctx.Dr7;
+  Result := True;
+end;
+
+function TWin32Debugger.WriteDebugRegisters(TID: DWORD;
+  const Regs: TDebugRegisters): Boolean;
+
+  // The WOW64 debug registers ARE 32 bits wide, so narrowing is their real
+  // width rather than a lossy cast -- and masking rather than casting keeps it
+  // that way under the adapter's range checking. An address that would not fit
+  // was already refused by ArmHardwareWatchpoint.
+  function Low32(V: UInt64): DWORD;
+  begin
+    Result := DWORD(V and $FFFFFFFF);
+  end;
+
+var
+  Ctx: TWow64Context;
+  TH:  THandle;
+begin
+  Result := False;
+  TH := ThreadHandle(TID);
+  if TH = 0 then
+    Exit;
+  Ctx := Default(TWow64Context);
+  Ctx.ContextFlags := WOW64_CONTEXT_DEBUG_REGISTERS;
+  if not Wow64GetThreadContext(TH, Ctx) then
+    Exit;
+  Ctx.Dr0 := Low32(Regs.Dr[0]);
+  Ctx.Dr1 := Low32(Regs.Dr[1]);
+  Ctx.Dr2 := Low32(Regs.Dr[2]);
+  Ctx.Dr3 := Low32(Regs.Dr[3]);
+  Ctx.Dr6 := Low32(Regs.Dr6);
+  Ctx.Dr7 := Low32(Regs.Dr7);
   Result := Wow64SetThreadContext(TH, Ctx);
 end;
 

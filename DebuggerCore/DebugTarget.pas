@@ -84,6 +84,27 @@ type
     function FramePtr: UInt64;  // RBP / EBP
   end;
 
+  // The debug-register file, expressed as a ROLE rather than a layout: DR0..DR3
+  // hold the watched addresses, DR6 reports what fired, DR7 controls arming.
+  // Both bitnesses share this 64-bit shape; a 32-bit target simply never fills
+  // the high halves, exactly as TRegisterSnapshot works.
+  TDebugRegisters = record
+    Dr:  array[0..3] of UInt64;
+    Dr6: UInt64;
+    Dr7: UInt64;
+  end;
+
+  // A hardware watchpoint hit, as the event pump saw it. The firing THREAD is
+  // part of the answer, not decoration: "who wrote this" is the question a
+  // watchpoint exists to answer.
+  TWatchpointHit = record
+    ThreadId:   DWORD;
+    Slot:       Integer;  // lowest DR that fired, -1 when none
+    FiredSlots: Byte;     // bitmask: two slots can trip on one instruction
+    Address:    UInt64;   // what that DR was armed on
+    Pc:         UInt64;   // where the target was when the trap arrived
+  end;
+
   TLocalValue = record
     Name:       string;
     TypeHint:   string;
@@ -291,6 +312,23 @@ type
     // local -> Self.<name> -> global resolution priority.
     function  EvaluateLocalName(const Name: string; out Value: TLocalValue): Boolean;
     function  EvaluateGlobalName(const Name: string; out Value: TLocalValue): Boolean;
+
+    // --- Hardware watchpoints (debug registers) ------------------------------
+    // The raw per-thread primitive and what the event pump saw. Increment 2 of
+    // DATA_BREAKPOINTS_PLAN.md stops deliberately here: no slot allocator, no
+    // replication onto other threads, no stop reason. What the increment buys
+    // is that the stepping engine no longer mistakes a watchpoint hit for its
+    // own completed step -- both arrive as the same single-step exception.
+    //
+    // Arming refuses rather than rounds: Slot must be 0..3, SizeBytes one of
+    // 1/2/4/8 (8 only on a 64-bit target), and Address must be aligned to
+    // SizeBytes -- the hardware ignores the low address bits, so a misaligned
+    // request would silently watch a neighbouring cell.
+    function  ArmHardwareWatchpoint(TID: DWORD; Slot: Integer; Address: UInt64;
+                SizeBytes: Integer; WriteOnly: Boolean): Boolean;
+    function  DisarmHardwareWatchpoint(TID: DWORD; Slot: Integer): Boolean;
+    function  HardwareWatchpointHitCount: Integer;
+    function  LastHardwareWatchpointHit: TWatchpointHit;
 
     // Mutators (used by `setVariable` and the synthetic remote-call path).
     function  SetRegisterByName(const Name: string; Value: UInt64): Boolean;

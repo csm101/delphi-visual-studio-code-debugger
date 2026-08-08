@@ -147,6 +147,11 @@ type
     function  EvaluateGlobalName(const Name: string; out Value: TLocalValue): Boolean;
     function  SetRegisterByName(const Name: string; Value: UInt64): Boolean;
     function  SetInstructionPointer(VA: UInt64): Boolean;
+    function  ArmHardwareWatchpoint(TID: DWORD; Slot: Integer; Address: UInt64;
+                SizeBytes: Integer; WriteOnly: Boolean): Boolean;
+    function  DisarmHardwareWatchpoint(TID: DWORD; Slot: Integer): Boolean;
+    function  HardwareWatchpointHitCount: Integer;
+    function  LastHardwareWatchpointHit: TWatchpointHit;
     function  AllocateRemoteString(const Text, TypeHint: string; out NewPtr: UInt64): Boolean;
     function  SetStringVariable(TargetAddr: UInt64; const Text, TypeHint: string): Boolean;
     function  TryResolveSymbolVA(const Name: string; out VA: UInt64): Boolean;
@@ -237,6 +242,12 @@ function  TFakeMemTarget.EvaluateLocalName(const Name: string; out Value: TLocal
 function  TFakeMemTarget.EvaluateGlobalName(const Name: string; out Value: TLocalValue): Boolean; begin Value := Default(TLocalValue); Result := False; end;
 function  TFakeMemTarget.SetRegisterByName(const Name: string; Value: UInt64): Boolean; begin Result := False; end;
 function  TFakeMemTarget.SetInstructionPointer(VA: UInt64): Boolean; begin Result := False; end;
+// This fake has no live process and therefore no debug registers: arming must
+// FAIL rather than silently claim a watchpoint nothing can deliver.
+function  TFakeMemTarget.ArmHardwareWatchpoint(TID: DWORD; Slot: Integer; Address: UInt64; SizeBytes: Integer; WriteOnly: Boolean): Boolean; begin Result := False; end;
+function  TFakeMemTarget.DisarmHardwareWatchpoint(TID: DWORD; Slot: Integer): Boolean; begin Result := False; end;
+function  TFakeMemTarget.HardwareWatchpointHitCount: Integer; begin Result := 0; end;
+function  TFakeMemTarget.LastHardwareWatchpointHit: TWatchpointHit; begin Result := Default(TWatchpointHit); Result.Slot := -1; end;
 function  TFakeMemTarget.AllocateRemoteString(const Text, TypeHint: string; out NewPtr: UInt64): Boolean; begin NewPtr := 0; Result := False; end;
 function  TFakeMemTarget.SetStringVariable(TargetAddr: UInt64; const Text, TypeHint: string): Boolean; begin Result := False; end;
 function  TFakeMemTarget.TryResolveSymbolVA(const Name: string; out VA: UInt64): Boolean; begin VA := 0; Result := False; end;

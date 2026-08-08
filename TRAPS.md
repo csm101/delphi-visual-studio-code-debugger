@@ -138,6 +138,13 @@ absurdly.
   first-hit order that `Test_Bug16` depends on.
 - **A local nothing ever reads gets its store ELIDED even under `-$O-`.** Make the
   variable live before chasing a zero read-back.
+- **A fixture that needs a breakpoint exactly BEFORE a given instruction must not
+  put that instruction in the routine's FIRST statement.** A breakpoint on the
+  first statement is subject to entry/body adjustment, and on the 32-bit build it
+  landed AFTER the write it was supposed to precede — the x64 build did not, so
+  the test failed on one bitness only and looked like a WOW64 hardware
+  divergence. `DataBpWriteWatched` keeps a throwaway statement ahead of the
+  watched write for exactly this reason.
 - **`Win32_ExceptionStop_NamesClassAndMessage` needs `-run-exception-test`**;
   without the argument the target exits without raising and the test passes
   vacuously.
@@ -207,6 +214,17 @@ absurdly.
 
 ## Engine and language gotchas
 
+- **Sample `DR6` BEFORE anything else touches the thread context.** On a WOW64
+  target the slot bits were already gone by the time the pump had cleared the trap
+  flag through `Wow64SetThreadContext`; on native x64 they survived, so the whole
+  data-breakpoint feature looked like "the target never wrote the cell" on one
+  bitness only. Read the cause of a trap first, mutate the thread afterwards.
+- **`DR6` reads back with its RESERVED bits SET** — measured `$FFFF4FF0` for a
+  plain single step and `$FFFF0FF1` for a slot-0 hit, on BOTH bitnesses. Mask the
+  fields you want (`$F` for `B0..B3`, `$4000` for `BS`); never compare `DR6` whole
+  and never test it for "non-zero".
+- **The CPU never clears `DR6`.** Leave it and the next trap on that thread carries
+  the same bits, so every later step looks like a watchpoint hit.
 - **Never name a Delphi method `Continue`** — it shadows the loop keyword. Use
   `ContinueExecution`.
 - `for var x in ['a','b']` is fine, but `Exit(['a'])` parses as a set ("Ordinal

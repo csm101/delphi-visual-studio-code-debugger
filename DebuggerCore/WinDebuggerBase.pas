@@ -29,6 +29,22 @@ type
     Origin:   TFrameOrigin;   // which mechanism produced it (diagnostic)
   end;
 
+  // Why a single-step exception ($80000004, or $4000001E under WOW64) arrived.
+  // The exception code is the same for a completed single step and a hardware
+  // watchpoint hit, so only DR6 can separate them:
+  //
+  //   B0..B3 (bits 0..3) name the slot(s) that fired;
+  //   BS     (bit 14)    says the trap flag caused this trap.
+  //
+  // Both can be set at once -- one instruction can complete our step AND write
+  // a watched cell. Measured identical on native x64 and on WOW64
+  // (DevTools\DataBpProbe, `-tfstep`), which is why the pump needs no state of
+  // its own to tell the two apart.
+  TDebugTrapCause = record
+    FiredSlots:   Byte;     // bitmask of B0..B3
+    TrapFlagStep: Boolean;  // BS
+  end;
+
   TWinDebugger = class(TInterfacedObject, IDebugTarget)
   private
     FProcess:      THandle;
@@ -140,6 +156,16 @@ type
     // Allocated lazily; zeroed on each use. One page (4 KB) is enough for
     // every supported return type.
     FRemoteScratch:   UInt64;
+    // Hardware watchpoints. FWatchArmedSlots is the bitmask of DR slots this
+    // debugger has armed on ANY thread; while it is zero the event pump never
+    // opens a debug-register context at all, so ordinary stepping costs exactly
+    // what it did before this feature existed. It is also what makes the
+    // gating honest rather than a heuristic: a slot we never armed cannot have
+    // set the B bit that names it.
+    FWatchArmedSlots: Byte;
+    FWatchAddr:       array[0..3] of UInt64;
+    FWatchHitCount:   Integer;
+    FLastWatchHit:    TWatchpointHit;
     FCommandQueue: TQueue<TCommand>;
     FQueueLock:    TRTLCriticalSection;
     FOnStopped:          TOnStopped;
@@ -222,6 +248,12 @@ type
     function  ReadThreadRegisters(TID: DWORD; out Regs: TRegisterSnapshot): Boolean; virtual;
     function  SetThreadPc(TID: DWORD; VA: UInt64): Boolean; virtual;
     function  SetThreadTrapFlag(TID: DWORD; Enable: Boolean): Boolean; virtual;
+    // The debug registers are a FOURTH role behind the same funnel, for the same
+    // reason as the other three: a caller that wants "arm slot 2 for a 4-byte
+    // write" must not have to know that a 32-bit target needs
+    // Wow64Get/SetThreadContext and WOW64_CONTEXT_DEBUG_REGISTERS.
+    function  ReadDebugRegisters(TID: DWORD; out Regs: TDebugRegisters): Boolean; virtual;
+    function  WriteDebugRegisters(TID: DWORD; const Regs: TDebugRegisters): Boolean; virtual;
     // Machine type handed to StackWalk64. dbghelp already unwinds i386 as well
     // as amd64, so a 32-bit target changes this value rather than needing a
     // hand-rolled walker.
@@ -258,6 +290,11 @@ type
     // decoding would be a guess dressed as a proof. x86 overrides it.
     function  CallSiteVerdictAt(VA: UInt64): TCallSiteAnswer; virtual;
   private
+    // Reads DR6 for TID, clears it, and reports WHY this #DB arrived. Cheap
+    // no-op (FiredSlots = 0, TrapFlagStep = True) while no slot is armed, so
+    // the pump's fall-through behaviour is unchanged when the feature is unused.
+    function  TakeDebugTrapCause(TID: DWORD): TDebugTrapCause;
+    procedure RecordWatchpointHit(TID: DWORD; FiredSlots: Byte; Pc: UInt64);
     procedure SetTrapFlag(TID: DWORD; Enable: Boolean);
     procedure SetRIP(TID: DWORD; NewRIP: UInt64);
     function  CurrentRIP(TID: DWORD): UInt64;
@@ -401,6 +438,13 @@ type
     function  TargetLayout: TTargetLayout; virtual;
     // Sets RIP of the currently stopped thread. Returns False if not stopped.
     function  SetInstructionPointer(VA: UInt64): Boolean;
+    // Hardware watchpoints. See IDebugTarget for what this increment does and
+    // does not cover.
+    function  ArmHardwareWatchpoint(TID: DWORD; Slot: Integer; Address: UInt64;
+                SizeBytes: Integer; WriteOnly: Boolean): Boolean;
+    function  DisarmHardwareWatchpoint(TID: DWORD; Slot: Integer): Boolean;
+    function  HardwareWatchpointHitCount: Integer;
+    function  LastHardwareWatchpointHit: TWatchpointHit;
     // Resolves a fully-qualified symbol name (e.g. `TWidget.GetScore`) to its
     // run-time VA via the loaded MAP/RSM data. Returns False when no match.
     function  TryResolveSymbolVA(const Name: string; out VA: UInt64): Boolean;
@@ -622,6 +666,10 @@ begin
   FIsStopped              := False;
   FExceptionFilters       := DEFAULT_EXCEPTION_FILTERS;
   FPauseRequested         := False;
+  FWatchArmedSlots        := 0;
+  FWatchHitCount          := 0;
+  FLastWatchHit           := Default(TWatchpointHit);
+  FLastWatchHit.Slot      := -1;   // "no hit yet" -- 0 is a real slot number
 end;
 
 destructor TWinDebugger.Destroy;
@@ -1170,6 +1218,53 @@ begin
   Result := SetThreadContext(TH, Ctx);
 end;
 
+function TWinDebugger.ReadDebugRegisters(TID: DWORD;
+  out Regs: TDebugRegisters): Boolean;
+var
+  Ctx: TContext;
+  TH:  THandle;
+begin
+  Regs := Default(TDebugRegisters);
+  Result := False;
+  TH := ThreadHandle(TID);
+  if TH = 0 then
+    Exit;
+  Ctx := Default(TContext);
+  Ctx.ContextFlags := CONTEXT_DEBUG_REGISTERS;
+  if not GetThreadContext(TH, Ctx) then
+    Exit;
+  Regs.Dr[0] := Ctx.Dr0;
+  Regs.Dr[1] := Ctx.Dr1;
+  Regs.Dr[2] := Ctx.Dr2;
+  Regs.Dr[3] := Ctx.Dr3;
+  Regs.Dr6   := Ctx.Dr6;
+  Regs.Dr7   := Ctx.Dr7;
+  Result := True;
+end;
+
+function TWinDebugger.WriteDebugRegisters(TID: DWORD;
+  const Regs: TDebugRegisters): Boolean;
+var
+  Ctx: TContext;
+  TH:  THandle;
+begin
+  Result := False;
+  TH := ThreadHandle(TID);
+  if TH = 0 then
+    Exit;
+  Ctx := Default(TContext);
+  Ctx.ContextFlags := CONTEXT_DEBUG_REGISTERS;
+  if not GetThreadContext(TH, Ctx) then
+    Exit;
+  Ctx.Dr0 := Regs.Dr[0];
+  Ctx.Dr1 := Regs.Dr[1];
+  Ctx.Dr2 := Regs.Dr[2];
+  Ctx.Dr3 := Regs.Dr[3];
+  Ctx.Dr6 := Regs.Dr6;
+  Ctx.Dr7 := Regs.Dr7;
+  Result := SetThreadContext(TH, Ctx);
+end;
+
 function TWinDebugger.StackWalkMachineType: DWORD;
 begin
   Result := IMAGE_FILE_MACHINE_AMD64;
@@ -1240,6 +1335,177 @@ end;
 procedure TWinDebugger.SetRIP(TID: DWORD; NewRIP: UInt64);
 begin
   SetThreadPc(TID, NewRIP);
+end;
+
+{ ---------------------------------------------------------------------------
+  Hardware watchpoints.
+
+  DR7 lays every slot out the same way: a local-enable bit at 2*Slot, a 2-bit
+  access type at 16 + 4*Slot, and a 2-bit length right above it. The bit maths
+  is therefore architecture-neutral and lives here once; only the reading and
+  writing of the register file differ per bitness, and that is already behind
+  the thread-context funnel.
+  --------------------------------------------------------------------------- }
+
+function TWinDebugger.ArmHardwareWatchpoint(TID: DWORD; Slot: Integer;
+  Address: UInt64; SizeBytes: Integer; WriteOnly: Boolean): Boolean;
+
+  // Refusals, never roundings. The hardware ignores the low bits of DRn, so a
+  // misaligned or odd-sized request would quietly watch a NEIGHBOURING cell and
+  // report success -- the one failure mode a watchpoint must not have.
+  function Refuse(const Reason: string): Boolean;
+  begin
+    DapLog(Format('ArmHardwareWatchpoint REFUSED tid=%d slot=%d addr=$%x size=%d: %s',
+      [TID, Slot, Address, SizeBytes, Reason]));
+    Result := False;
+  end;
+
+  function TryLengthEncoding(out Bits: UInt64): Boolean;
+  begin
+    Result := True;
+    case SizeBytes of
+      1: Bits := 0;
+      2: Bits := 1;
+      4: Bits := 3;
+      8: Bits := 2;
+    else
+      Bits := 0;
+      Result := False;
+    end;
+  end;
+
+begin
+  if (Slot < 0) or (Slot > 3) then
+    Exit(Refuse('slot must be 0..3 -- the hardware has exactly four'));
+  var LenBits: UInt64;
+  if not TryLengthEncoding(LenBits) then
+    Exit(Refuse('size must be 1, 2, 4 or 8 bytes'));
+  if TargetLayout.PointerSize < 8 then begin
+    if SizeBytes = 8 then
+      Exit(Refuse('an 8-byte watchpoint exists only in 64-bit mode'));
+    if Address > $FFFFFFFF then
+      Exit(Refuse('a 32-bit target has no such address'));
+  end;
+  if (Address = 0) or ((Address mod UInt64(SizeBytes)) <> 0) then
+    Exit(Refuse('address must be non-zero and aligned to the watched size'));
+
+  var Regs: TDebugRegisters;
+  if not ReadDebugRegisters(TID, Regs) then
+    Exit(Refuse(Format('the debug registers of thread %d are unreadable', [TID])));
+
+  var RwBits: UInt64 := 1;    // 01 = break on write
+  if not WriteOnly then
+    RwBits := 3;              // 11 = break on read or write. There is no
+                              // read-ONLY encoding on x86; saying so is the
+                              // surface's job, not this one's.
+  var FieldShift := 16 + 4 * Slot;
+  Regs.Dr[Slot] := Address;
+  Regs.Dr7 := Regs.Dr7 and not (UInt64($F) shl FieldShift);
+  Regs.Dr7 := Regs.Dr7 or (RwBits shl FieldShift) or (LenBits shl (FieldShift + 2));
+  Regs.Dr7 := Regs.Dr7 or (UInt64(1) shl (2 * Slot));
+  Regs.Dr6 := 0;              // a stale B bit would name this slot at the very
+                              // next trap, before the watchpoint ever fired
+
+  if not WriteDebugRegisters(TID, Regs) then
+    Exit(Refuse('the thread context rejected the debug registers'));
+
+  FWatchAddr[Slot]  := Address;
+  FWatchArmedSlots  := FWatchArmedSlots or Byte(1 shl Slot);
+  var AccessName := 'read/write';
+  if WriteOnly then
+    AccessName := 'write';
+  // Read back rather than trust the write: SetThreadContext can report success
+  // and still leave a debug register untouched, and a watchpoint that was never
+  // really armed looks exactly like a target that never wrote the cell.
+  var Verify: TDebugRegisters;
+  if ReadDebugRegisters(TID, Verify) then
+    DapLog(Format('ArmHardwareWatchpoint OK tid=%d slot=%d addr=$%x size=%d access=%s ' +
+      '(readback DR%d=$%x DR7=$%x)',
+      [TID, Slot, Address, SizeBytes, AccessName, Slot, Verify.Dr[Slot], Verify.Dr7]))
+  else
+    DapLog(Format('ArmHardwareWatchpoint OK tid=%d slot=%d addr=$%x size=%d access=%s ' +
+      '(readback unavailable)', [TID, Slot, Address, SizeBytes, AccessName]));
+  Result := True;
+end;
+
+// Clears one slot on ONE thread. The armed-slot bookkeeping is process-wide and
+// therefore approximate while a watchpoint can live on several threads at once;
+// increment 3 (per-thread replication) is what owns that, and until it exists a
+// watchpoint is only ever armed on a single thread.
+function TWinDebugger.DisarmHardwareWatchpoint(TID: DWORD; Slot: Integer): Boolean;
+begin
+  Result := False;
+  if (Slot < 0) or (Slot > 3) then
+    Exit;
+  var Regs: TDebugRegisters;
+  if not ReadDebugRegisters(TID, Regs) then
+    Exit;
+  Regs.Dr[Slot] := 0;
+  Regs.Dr7 := Regs.Dr7 and not (UInt64(3) shl (2 * Slot));        // local + global enable
+  Regs.Dr7 := Regs.Dr7 and not (UInt64($F) shl (16 + 4 * Slot));  // access + length
+  Regs.Dr6 := 0;
+  Result := WriteDebugRegisters(TID, Regs);
+  if not Result then
+    Exit;
+  FWatchAddr[Slot] := 0;
+  FWatchArmedSlots := FWatchArmedSlots and not Byte(1 shl Slot);
+  DapLog(Format('DisarmHardwareWatchpoint OK tid=%d slot=%d', [TID, Slot]));
+end;
+
+function TWinDebugger.HardwareWatchpointHitCount: Integer;
+begin
+  Result := FWatchHitCount;
+end;
+
+function TWinDebugger.LastHardwareWatchpointHit: TWatchpointHit;
+begin
+  Result := FLastWatchHit;
+end;
+
+function TWinDebugger.TakeDebugTrapCause(TID: DWORD): TDebugTrapCause;
+const
+  DR6_SLOT_MASK = UInt64($F);      // B0..B3: which slot fired
+  DR6_BS        = UInt64($4000);   // the trap flag caused this #DB
+begin
+  // Nothing armed: no slot of OURS can have fired, so leave the pump on exactly
+  // the path it walked before watchpoints existed, and pay no context switch
+  // for a feature that is not in use. Stepping is single-step-heavy.
+  Result.FiredSlots   := 0;
+  Result.TrapFlagStep := True;
+  if FWatchArmedSlots = 0 then
+    Exit;
+
+  var Regs: TDebugRegisters;
+  if not ReadDebugRegisters(TID, Regs) then
+    Exit;
+
+  // DR6 reads back with its reserved bits SET ($FFFF4FF0 for a step, $FFFF0FF1
+  // for a slot-0 hit, measured on both bitnesses), so it must be masked field by
+  // field -- never compared whole, never tested for "non-zero".
+  Result.FiredSlots   := Byte(Regs.Dr6 and DR6_SLOT_MASK) and FWatchArmedSlots;
+  Result.TrapFlagStep := (Regs.Dr6 and DR6_BS) <> 0;
+
+  // Clearing is not optional. The CPU never clears DR6 by itself, so leaving it
+  // would make the NEXT trap on this thread carry these bits, and every step
+  // after this one would look like a watchpoint hit.
+  Regs.Dr6 := 0;
+  WriteDebugRegisters(TID, Regs);
+end;
+
+procedure TWinDebugger.RecordWatchpointHit(TID: DWORD; FiredSlots: Byte;
+  Pc: UInt64);
+begin
+  var Lowest := 0;
+  while (Lowest < 3) and ((FiredSlots and Byte(1 shl Lowest)) = 0) do
+    Inc(Lowest);
+  Inc(FWatchHitCount);
+  FLastWatchHit.ThreadId   := TID;
+  FLastWatchHit.Slot       := Lowest;
+  FLastWatchHit.FiredSlots := FiredSlots;
+  FLastWatchHit.Address    := FWatchAddr[Lowest];
+  FLastWatchHit.Pc         := Pc;
+  DapLog(Format('watchpoint HIT tid=%d slot=%d slots=$%x addr=$%x pc=$%x (hit %d)',
+    [TID, Lowest, FiredSlots, FWatchAddr[Lowest], Pc, FWatchHitCount]));
 end;
 
 function TWinDebugger.SetInstructionPointer(VA: UInt64): Boolean;
@@ -2653,7 +2919,6 @@ begin
   ContinueStatus := DBG_CONTINUE;
   Code    := Ev.Exception.ExceptionRecord.ExceptionCode;
   ExcAddr := UInt64(Ev.Exception.ExceptionRecord.ExceptionAddress);
-
   case Code of
     EXCEPTION_BREAKPOINT, STATUS_WX86_BREAKPOINT:
     begin
@@ -2823,6 +3088,33 @@ begin
     EXCEPTION_SINGLE_STEP, STATUS_WX86_SINGLE_STEP:
     begin
       FStoppedTid := Ev.dwThreadId;
+
+      // A hardware watchpoint hit is delivered as a SINGLE-STEP exception -- the
+      // very event everything below consumes -- and the exception code does not
+      // distinguish the two. DR6 does, and nothing else can: B0..B3 name the
+      // slot that fired, BS says the trap flag caused this trap. Reading it
+      // also CLEARS it; leaving stale bits would make every later step look
+      // like a watchpoint hit.
+      var Trap := TakeDebugTrapCause(Ev.dwThreadId);
+      if Trap.FiredSlots <> 0 then begin
+        RecordWatchpointHit(Ev.dwThreadId, Trap.FiredSlots, ExcAddr);
+        if not Trap.TrapFlagStep then begin
+          // A watched cell was written while the target was running free: no
+          // step of ours completed here, and the machinery below would read
+          // this event as one and report a stop at the wrong place. Increment 2
+          // has no stop reason for a watchpoint yet (that is increment 4), so
+          // the honest thing is to resume and leave every in-flight step
+          // exactly as it was -- its own resume breakpoint still owns it.
+          //
+          // The trap flag is deliberately NOT touched on the way out: BS was
+          // clear, so it was already off, and writing the thread context here
+          // would be a needless round-trip on a thread that is running free.
+          ContinueDebugEvent(Ev.dwProcessId, Ev.dwThreadId, DBG_CONTINUE);
+          Exit;
+        end;
+        // BS as well: one instruction both completed our step and tripped the
+        // watchpoint. Fall through so the step still finishes normally.
+      end;
       SetTrapFlag(Ev.dwThreadId, False);
 
       if (FPendingReactivateVA <> 0) and (Ev.dwThreadId = FReactivateTid) then begin

@@ -58,13 +58,40 @@ event the stepping engine already consumes at `WinDebuggerBase.pas:2823`
 that Phase 0 of the Win32 work measured).
 
 Telling the two apart is not optional and cannot be done from the exception code:
-**read `DR6`.** Bits `B0..B3` name the slot that fired; a step completion has none
-of them set. `DR6` must then be CLEARED, or the next event carries stale bits and
-every step afterwards looks like a watchpoint hit.
+**read `DR6`.** Bits `B0..B3` name the slot that fired; `BS` (bit 14) says the trap
+flag caused this trap. `DR6` must then be CLEARED, or the next event carries stale
+bits and every step afterwards looks like a watchpoint hit.
 
 This is a change to the event pump's most delicate path — the one that took three
 measurement rounds to get right for Win32 — so it lands with its own tests before
 anything user-facing is wired.
+
+**BUILT (increment 2).** `TWinDebugger.TakeDebugTrapCause` reads and clears `DR6`
+at the top of the `EXCEPTION_SINGLE_STEP` / `STATUS_WX86_SINGLE_STEP` branch. What
+was measured, and what it forced:
+
+- `BS` **is** reported on both bitnesses, so the pump needs no state of its own:
+  `B0..B3` alone mean "a watchpoint fired and no step of ours completed" and the
+  event is recorded and resumed without the stepping engine ever seeing it;
+  `BS` together with a slot bit means one instruction did both, and the step is
+  allowed to complete normally. `DevTools\DataBpProbe -tfstep` measures the first,
+  `-tfwalk <n>` the combined case (native x64 and WOW64 both report `BS|B0`).
+- `DR6` reads back with every RESERVED bit set — `$FFFF4FF0` for a plain step,
+  `$FFFF0FF1` for a slot-0 hit, identical on both bitnesses. It must be masked
+  field by field and never tested for "non-zero".
+- **`DR6` must be sampled BEFORE anything else touches the thread context.** On
+  WOW64 the slot bits were gone by the time the pump had cleared the trap flag
+  through `Wow64SetThreadContext`; on native x64 they survived. Reading the cause
+  of a trap before mutating the thread is right in either case, but only the
+  32-bit target made the ordering observable — the whole feature silently
+  recorded no hits at all.
+- The read is skipped entirely while no slot is armed, so ordinary stepping —
+  which is single-step heavy — costs exactly what it did before.
+
+Increment 2 has no stop reason yet, so a hit that completes no step of ours is
+counted, logged (slot, address, thread, PC) and resumed. Tests:
+`DataBp_*` / `Win32_DataBp_*` in `DebuggerTests\DebugSessionTests.pas`, three
+scenarios per bitness over the `RunDataBpStepFixture` fixture.
 
 Second interaction: a synthetic call runs real code in the debuggee. A watchpoint
 can fire inside it. The existing abort-on-raise machinery
@@ -172,11 +199,16 @@ menu appears once the capabilities are declared):
 
 ## Increments (each gated on a green suite)
 
-1. Debug-register access behind the thread-context funnel + the x86/WOW64 variant.
-   A DevTools probe arms a slot by hand and proves a hit is delivered, on BOTH
-   bitnesses, before any of it is wired to a feature.
-2. `DR6` disambiguation in the exception handler, with tests that a normal step
-   still completes with a watchpoint armed, and vice versa.
+1. **DONE.** Debug-register access behind the thread-context funnel + the x86/WOW64
+   variant. A DevTools probe arms a slot by hand and proves a hit is delivered, on
+   BOTH bitnesses, before any of it is wired to a feature.
+2. **DONE.** `DR6` disambiguation in the exception handler, with tests that a normal
+   step still completes with a watchpoint armed, and vice versa. The engine
+   primitive is `IDebugTarget.ArmHardwareWatchpoint` / `DisarmHardwareWatchpoint`
+   plus `HardwareWatchpointHitCount` / `LastHardwareWatchpointHit`; arming refuses
+   a bad slot, size or alignment rather than rounding it. `ReadDebugRegisters` /
+   `WriteDebugRegisters` are the fourth role behind the thread-context funnel,
+   with the `Wow64Get/SetThreadContext` variant in `WinDebuggerX86`.
 3. Per-thread replication: arm-on-create, arm-on-attach, clear-on-detach, plus the
    slot allocator with explicit exhaustion.
 4. Session API + stop reason + old/new capture.
@@ -192,7 +224,19 @@ menu appears once the capabilities are declared):
 - Slot exhaustion refuses the fifth with a message, and the first four still work.
 - Misaligned or odd-sized request is refused, not rounded.
 - Stepping still works with a watchpoint armed (the `DR6` case), and a watchpoint
-  hit during a step is not reported as a step completion.
+  hit during a step is not reported as a step completion. DONE — and the negative
+  controls are worth recording, because one of them says less than it looks:
+  * removing the `DR6` read entirely fails both hit tests with "no watchpoint hit
+    was recorded", but the step-over still LANDS correctly. The range-based
+    step-over recovers from a stray single-step on its own, so on that path the
+    disambiguation buys RECOGNITION rather than run-control correctness. The paths
+    that are not self-correcting (the pending breakpoint re-arm, and every stop
+    reason increment 4 will add) have no such luck.
+  * ignoring `BS` and swallowing every slot-bit trap strands the step: the target
+    resumes with no trap flag and runs to exit. Both bitnesses, symptom "the step
+    whose own instruction tripped the watchpoint never completed".
+- A watchpoint hit on an instruction that is ALSO a single step (`BS` + slot bit)
+  must still complete the step. DONE, both bitnesses.
 - Detach leaves the target unarmed — verified by continuing it afterwards.
 - A local-scoped watchpoint is reported stale after its frame exits.
 
