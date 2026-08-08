@@ -50,6 +50,21 @@ type
     FQuit:    Boolean;
     FWait:    TPendingWait;
 
+    // Data breakpoints (watchpoints; increment 5 of DATA_BREAKPOINTS_PLAN.md).
+    // TDebugSession.SetDataBreakpoints replaces the WHOLE set on every call
+    // (mirrors DAP's own setDataBreakpoints) and reassigns every entry a FRESH
+    // session-level Id each time, even for specs that did not change -- so an id
+    // handed back after one set_data_breakpoint call is no longer the id of that
+    // same watchpoint after the next one. The MCP tool surface wants to add and
+    // remove ONE watchpoint at a time with a STABLE id, so this layer keeps its
+    // own accumulated spec list (the source of truth SetDataBreakpoints is always
+    // called with in full) plus a parallel array of MCP-owned ids that never
+    // change once issued. Kept in lockstep by construction: every mutation
+    // (add/remove) updates both arrays together, then resends the whole list.
+    FDataBpSpecs:     TArray<TDataBpSpec>;
+    FDataBpOwnIds:    TArray<string>;
+    FNextDataBpOwnId: Integer;
+
     procedure ProcessRpc(Msg: TJSONObject);
     procedure DispatchInitialize(const IdJson: string);
     procedure DispatchToolsList(const IdJson: string);
@@ -247,7 +262,39 @@ begin
     FSession.Free;
     FSession := TDebugSession.Create;
     FWait.Active := False;
+    // A fresh session's own FDataBreakpoints starts empty; this layer's
+    // bookkeeping must follow or list_data_breakpoints would keep reporting
+    // watchpoints from a debuggee that no longer exists.
+    FDataBpSpecs  := nil;
+    FDataBpOwnIds := nil;
   end;
+end;
+
+// "write" -> WriteOnly=True (the only access type with a real hardware
+// equivalent); "readWrite" -> WriteOnly=False (read-or-write -- there is no
+// read-only watchpoint on x86/x64). "read" alone is refused outright rather
+// than silently mapped to readWrite: accepting it would let a caller believe
+// it filtered out writes, which no x86/x64 hardware watchpoint can do.
+function ParseDataBpAccess(const Access: string; out WriteOnly: Boolean;
+  out ErrMsg: string): Boolean;
+begin
+  ErrMsg := '';
+  if SameText(Access, 'write') then begin
+    WriteOnly := True;
+    Exit(True);
+  end;
+  if SameText(Access, 'readWrite') then begin
+    WriteOnly := False;
+    Exit(True);
+  end;
+  WriteOnly := False;
+  if SameText(Access, 'read') then
+    ErrMsg := '"read" has no hardware equivalent on x86/x64 -- there is no read-only ' +
+      'watchpoint. Use "readWrite" to also catch reads (it ALSO fires on writes, it does ' +
+      'not filter them out), or "write" to only catch writes.'
+  else
+    ErrMsg := Format('unknown access "%s" -- use "write" or "readWrite".', [Access]);
+  Result := False;
 end;
 
 procedure TMcpServer.ArmWait(const IdJson: string; TimeoutMs: Integer);
@@ -578,6 +625,74 @@ begin
     if Name = 'remove_all_breakpoints' then begin
       FSession.RemoveAllBreakpoints;
       SendToolJson(IdJson, McpJson.BreakpointListToJson(FSession.ListBreakpoints));
+      Exit;
+    end;
+
+    // ---- data breakpoints (watchpoints) ----
+    // Arming/removal both funnel through FSession.SetDataBreakpoints (never a
+    // direct RemoveAllDataBreakpoints call) so the session's own "only while
+    // stopped" guard always applies -- but gate here too, with a clearer
+    // message: a whole-list refusal from the session would otherwise make
+    // ALREADY-armed watchpoints look newly broken.
+    if Name = 'set_data_breakpoint' then begin
+      if not Stopped then begin
+        SendToolError(IdJson, 'Cannot set a data breakpoint while the debuggee is running. Pause or wait for a stop first.');
+        Exit;
+      end;
+      var Expr := ArgStr('expression');
+      if Expr = '' then begin
+        SendToolError(IdJson, 'Provide "expression" (a literal address like "0x1234"/"1234" or a global/unit variable name).');
+        Exit;
+      end;
+      var WriteOnly: Boolean;
+      var AccessErr: string;
+      if not ParseDataBpAccess(ArgStr('access'), WriteOnly, AccessErr) then begin
+        SendToolError(IdJson, AccessErr);
+        Exit;
+      end;
+      var Spec: TDataBpSpec;
+      Spec             := Default(TDataBpSpec);
+      Spec.Expression  := Expr;
+      Spec.SizeBytes   := ArgInt('size', 0);
+      Spec.WriteOnly   := WriteOnly;
+      Inc(FNextDataBpOwnId);
+      FDataBpSpecs  := FDataBpSpecs  + [Spec];
+      FDataBpOwnIds := FDataBpOwnIds + ['wp' + IntToStr(FNextDataBpOwnId)];
+      var Results := FSession.SetDataBreakpoints(FDataBpSpecs);
+      // Report only the just-added entry (its position is the last one, since
+      // specs are only ever appended) -- mirrors set_breakpoint returning what
+      // was just set, not the whole accumulated list (list_data_breakpoints is
+      // for that).
+      if Length(Results) > 0 then
+        SendToolJson(IdJson, McpJson.DataBreakpointToJson(Results[High(Results)], FDataBpOwnIds[High(FDataBpOwnIds)]))
+      else
+        SendToolError(IdJson, 'internal error: no result for the new data breakpoint');
+      Exit;
+    end;
+    if Name = 'list_data_breakpoints' then begin
+      SendToolJson(IdJson, McpJson.DataBreakpointListToJson(FSession.ListDataBreakpoints, FDataBpOwnIds));
+      Exit;
+    end;
+    if Name = 'remove_data_breakpoint' then begin
+      if not Stopped then begin
+        SendToolError(IdJson, 'Cannot remove a data breakpoint while the debuggee is running. Pause or wait for a stop first.');
+        Exit;
+      end;
+      var TargetId := ArgStr('id');
+      var FoundIdx := -1;
+      for var I := 0 to High(FDataBpOwnIds) do
+        if FDataBpOwnIds[I] = TargetId then begin
+          FoundIdx := I;
+          Break;
+        end;
+      if FoundIdx < 0 then begin
+        SendToolError(IdJson, Format('No data breakpoint with id "%s". Use list_data_breakpoints to see current ids.', [TargetId]));
+        Exit;
+      end;
+      Delete(FDataBpSpecs, FoundIdx, 1);
+      Delete(FDataBpOwnIds, FoundIdx, 1);
+      var Results := FSession.SetDataBreakpoints(FDataBpSpecs);
+      SendToolJson(IdJson, McpJson.DataBreakpointListToJson(Results, FDataBpOwnIds));
       Exit;
     end;
 

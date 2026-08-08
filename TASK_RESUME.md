@@ -25,31 +25,35 @@ longer true, delete it.
 
 ## Current task (2026-08-08)
 
-**Data breakpoints (watchpoints), increment 4 of 6 — DONE and gated.** Session
-API (`SetDataBreakpoints`/`ListDataBreakpoints`/`RemoveAllDataBreakpoints`), the
-new `srDataBreakpoint` stop reason with old->new capture, and the
-synthetic-call abort interaction are all built, tested (mono + Win32) and
-green. Full detail in `DATA_BREAKPOINTS_PLAN.md` (increment 4 section) and
-`PROJECT_STATE.md`'s roadmap entry — both updated in this change set. Full
-suite: 1059 found / 1055 passed / 0 failed / 0 errored / 4 ignored.
+**Data breakpoints (watchpoints), increment 5 of 6 — DONE, not yet committed.**
+MCP tool surface (`set_data_breakpoint` / `list_data_breakpoints` /
+`remove_data_breakpoint` in `MCPDebugger\McpServer.pas` / `McpToolSchemas.pas`,
+JSON shape in `McpJson.pas`) over the increment-4 session API. Also fixed a
+real bug found while wiring it: `McpJson.ReasonName` had no case for
+`srDataBreakpoint`, so a watchpoint stop reported `stopReason:"unknown"` over
+MCP. Full detail (including the granularity mismatch between the session's
+whole-set-replace API and the MCP tools' add/remove-one shape, and how it was
+resolved without touching the session) in `DATA_BREAKPOINTS_PLAN.md`
+(increment 5 section) and `TEST_CATALOG.md`. 6 new tests in
+`DebuggerTests\McpE2ETests.pas` (`DataBreakpoint_*`); two negative controls run
+(revert `ReasonName` case, revert the `access="read"` refusal) — both failed
+exactly as expected, then reverted back and reconfirmed green. Full suite:
+1065 found / 1061 passed / 0 failed / 0 errored / 4 ignored (delta vs the
+increment-4 baseline of 1059/1055 is exactly the 6 new tests).
+
+**Not committed yet** — left in the tree for review, per instruction.
 
 ### Next action
 
-Start **increment 5: MCP tool surface.** Per `DATA_BREAKPOINTS_PLAN.md`
-§"Surfaces": `set_data_breakpoint(address | expression, size, access)` with
-`access` one of `write`/`readWrite` (`read` refused, explained — x86 has no
-read-only watchpoint), `list_data_breakpoints`, `remove_data_breakpoint`; the
-stop payload names the watched address, the firing thread, and old/new. The
-session-level plumbing this needs already exists (`SetDataBreakpoints` etc. in
-`DebugSession.pas`) — this increment is the MCP tool schema + handler wiring
-(`McpServer.pas`, `McpToolSchemas.pas`) plus surfacing `srDataBreakpoint` /
-`DataBreakpointDescription` through `get_compact_debug_snapshot` and whatever
-stop-notification path MCP uses (check how `srException` is surfaced there
-today and mirror it). No code written yet for increment 5 — cold start.
-
-DAP surfaces (increment 6: `supportsDataBreakpoints`, `dataBreakpointInfo`,
-`setDataBreakpoints`, address-form persistence across relaunch) are also not
-started.
+Start **increment 6: DAP capabilities and requests** (not started).
+`supportsDataBreakpoints`, request `dataBreakpointInfo` (variable reference ->
+`dataId` + supported access types, needed for LOCALS which increment 5
+explicitly refused), request `setDataBreakpoints`, the `stopped` event with
+the new reason/description, and address-form persistence across relaunch. See
+`DATA_BREAKPOINTS_PLAN.md` §"Surfaces" (DAP half) and increment 5's own
+section for what the MCP side already proved works (old->new capture, thread
+attribution, the read-only-watchpoint caveat) so increment 6 does not
+re-derive it.
 
 ## Standing constraint from the user
 
@@ -62,11 +66,11 @@ documented.
 - `public-main`, clean. Release **0.3.0 is committed but NOT tagged and NOT
   pushed**; no GitHub release exists. The push is the outward-facing step and
   waits on the maintainer.
-- Last full suite: **1059 found / 1055 passed / 0 failed / 0 errored / 4
+- Last full suite: **1065 found / 1061 passed / 0 failed / 0 errored / 4
   ignored.** One unrelated flake seen during the increment-3 session
   (`Test_RtlStringGetter_VarOutFromPropertyType` in the BPL scenario, failed
   once in a full run, passed 3/3 in isolation) — logged, not chased, not seen
-  again in increment 4's runs.
+  again in increment 4 or 5's runs.
 - Win32 support is functionally complete for `-$O-` targets. Debug-info format
   coverage (TD32, RSM, MAP, JCL, DCP, `.tds`) is closed; DCU is WON'T DO.
 

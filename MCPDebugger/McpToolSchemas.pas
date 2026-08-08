@@ -152,6 +152,45 @@ begin
   Result.Add(MakeTool('remove_all_breakpoints',
     'Remove every breakpoint.', []));
 
+  // ---- Data breakpoints (watchpoints) ----
+  Result.Add(MakeTool('set_data_breakpoint',
+    'Set a hardware watchpoint that stops execution when the watched memory is written ' +
+    '(or read-or-written). Backed by the CPU''s debug registers: only 4 slots exist, shared ' +
+    'by the whole process, and the 5th request is refused by name (what already holds the ' +
+    'slots), never silently dropped. There is NO read-only watchpoint on x86/x64 -- ' +
+    'access="readWrite" is the closest to "stop on read" and it ALSO fires on writes, it does ' +
+    'not filter them out; the response says so. A local variable is refused with a reason -- ' +
+    'its address is only valid for the lifetime of its stack frame -- so watch the containing ' +
+    'global or object field instead, or pass a literal address you already have. Requires the ' +
+    'session to be stopped (arming touches live thread contexts). When it fires, the stop''s ' +
+    'stopReason is "dataBreakpoint" and dataBreakpointDescription names the watched ' +
+    'expression, the old and new values, and the THREAD that wrote it -- frequently the whole ' +
+    'answer to "who did this".',
+    [Prop('expression', 'string',
+       'A literal address ("0x1234", "$1234" or a plain decimal) or a global/unit variable name. ' +
+       'Local variables are refused, not silently accepted as a stale address.', True),
+     Prop('size', 'integer',
+       'Width in bytes: 1, 2, 4 or 8. The address must already be aligned to this width; a ' +
+       'misaligned or other-width request is refused, never rounded.', True),
+     Prop('access', 'string',
+       '"write" to stop only on writes, or "readWrite" to also catch reads -- there is no ' +
+       'read-only hardware watchpoint on x86/x64, so "readWrite" ALSO fires on writes, it does ' +
+       'not filter them out. "read" alone is refused rather than silently treated as "readWrite".',
+       True)]));
+
+  Result.Add(MakeTool('list_data_breakpoints',
+    'List every data breakpoint (watchpoint) currently tracked: id, expression, resolved ' +
+    'address (plus owning module+rva when known), size, access, whether it actually armed ' +
+    '(verified), the hardware slot it holds (0-3, or -1 when refused/not yet armed), and a ' +
+    'message -- the refusal reason when not verified, or the read-or-write caveat when access ' +
+    'is "readWrite".', []));
+
+  Result.Add(MakeTool('remove_data_breakpoint',
+    'Remove one data breakpoint by id (from set_data_breakpoint or list_data_breakpoints) and ' +
+    'free its hardware slot. Returns the remaining data breakpoints. Requires the session to ' +
+    'be stopped.',
+    [Prop('id', 'string', 'The id of the data breakpoint to remove.', True)]));
+
   // ---- Execution control ----
   Result.Add(MakeTool('continue_and_wait',
     'Resume execution and wait until the debuggee next stops (breakpoint, exception, ' +
@@ -296,7 +335,9 @@ begin
 
   Result.Add(MakeTool('get_compact_debug_snapshot',
     'Return, in one call: session state, stop reason, current thread, current location, ' +
-    'top stack frames, top-frame locals, and exception info if any. Minimises round trips.', []));
+    'top stack frames, top-frame locals, and exception info if any. When stopReason is ' +
+    '"dataBreakpoint" (a watchpoint fired), dataBreakpointDescription names the watched ' +
+    'expression, the old and new values, and the firing thread. Minimises round trips.', []));
 
   Result.Add(MakeTool('get_debuggee_output',
     'Return debuggee (program stdout) output produced since the previous call (incremental).', []));

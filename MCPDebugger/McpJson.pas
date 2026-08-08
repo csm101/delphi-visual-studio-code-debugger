@@ -32,6 +32,9 @@ function SnapshotToJson(const S: TCompactSnapshot): TJSONObject;
 function ModuleListToJson(const Modules: TArray<TSessionModule>): TJSONArray;
 function ModuleSourcesToJson(const Groups: TArray<TSessionModuleSources>): TJSONArray;
 function StringListToJson(const Items: TArray<string>): TJSONArray;
+function DataBreakpointToJson(const Bp: TSessionDataBreakpoint; const OwnId: string): TJSONObject;
+function DataBreakpointListToJson(const Bps: TArray<TSessionDataBreakpoint>;
+  const OwnIds: TArray<string>): TJSONArray;
 
 implementation
 
@@ -81,6 +84,10 @@ begin
     srStep:       Result := 'step';
     srException:  Result := 'exception';
     srPause:      Result := 'pause';
+    // A watchpoint stop is not a breakpoint stop -- callers branching on this
+    // string (an agent checking "did I hit MY breakpoint or the watchpoint")
+    // must see a distinct value, not fall through to 'unknown'.
+    srDataBreakpoint: Result := 'dataBreakpoint';
   else
     Result := 'unknown';
   end;
@@ -270,6 +277,12 @@ begin
     Result.AddPair('locals', VarListToJson(S.Locals));
     if S.HasException then
       Result.AddPair('exception', ExceptionToJson(S.Exception_));
+    // "expression: $old -> $new (thread N)" -- the watched name/address, the
+    // firing thread (also in `thread` above, repeated here so it is not
+    // buried) and the old->new values in one string. Only meaningful when
+    // stopReason = "dataBreakpoint".
+    if S.StopReason = srDataBreakpoint then
+      Result.AddPair('dataBreakpointDescription', S.DataBreakpointDescription);
   end;
 end;
 
@@ -331,6 +344,64 @@ begin
     end;
     O.AddPair('files', Arr);
     Result.Add(O);
+  end;
+end;
+
+// WriteOnly=True is the only access type with a real hardware equivalent
+// ("write"); WriteOnly=False means read-or-write ("readWrite" -- there is no
+// read-only watchpoint on x86/x64, see TSessionDataBreakpoint.Message for the
+// caveat text carried alongside it).
+function DataBpAccessName(WriteOnly: Boolean): string;
+begin
+  if WriteOnly then
+    Result := 'write'
+  else
+    Result := 'readWrite';
+end;
+
+function DataBreakpointToJson(const Bp: TSessionDataBreakpoint; const OwnId: string): TJSONObject;
+begin
+  Result := TJSONObject.Create;
+  Result.AddPair('id', OwnId);
+  Result.AddPair('expression', Bp.Expression);
+  Result.AddPair('size', TJSONNumber.Create(Bp.SizeBytes));
+  Result.AddPair('access', DataBpAccessName(Bp.WriteOnly));
+  Result.AddPair('verified', TJSONBool.Create(Bp.Verified));
+  // Address (and module+rva when it falls inside a known module) is filled in
+  // as soon as the expression RESOLVES, even when arming itself was then
+  // refused (e.g. slot exhaustion) -- so a refusal still tells the caller
+  // which address it was about.
+  if Bp.Address <> 0 then
+    Result.AddPair('address', '0x' + IntToHex(Bp.Address, 1));
+  if Bp.ModuleName <> '' then begin
+    Result.AddPair('module', Bp.ModuleName);
+    Result.AddPair('rva', '0x' + IntToHex(Bp.Rva, 1));
+  end;
+  // -1 until armed; a real DR0..DR3 index (four slots, process-wide) once
+  // verified. Informational: it is what "exhausted" refers to.
+  Result.AddPair('slot', TJSONNumber.Create(Bp.Slot));
+  // A refusal reason when Verified=False, OR the no-read-only-watchpoint
+  // caveat when Verified=True and access is "readWrite". Never both, never
+  // silently absent when there is something to say.
+  if Bp.Message <> '' then
+    Result.AddPair('message', Bp.Message);
+end;
+
+function DataBreakpointListToJson(const Bps: TArray<TSessionDataBreakpoint>;
+  const OwnIds: TArray<string>): TJSONArray;
+begin
+  Result := TJSONArray.Create;
+  for var I := 0 to High(Bps) do begin
+    var OwnId: string;
+    // Defensive only: OwnIds is kept in lockstep with Bps by the caller
+    // (McpServer) on every mutation. Fall back to the session-assigned id
+    // (regenerated on every SetDataBreakpoints call) rather than crash if it
+    // is ever out of sync.
+    if I <= High(OwnIds) then
+      OwnId := OwnIds[I]
+    else
+      OwnId := Bps[I].Id;
+    Result.Add(DataBreakpointToJson(Bps[I], OwnId));
   end;
 end;
 

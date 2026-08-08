@@ -98,6 +98,33 @@ To attach to processes owned by another user or elevated targets, run the client
   fields); each listed file's set is replaced, unlisted files untouched.
 - `list_breakpoints`, `remove_all_breakpoints`.
 
+### Data breakpoints (watchpoints)
+Hardware watchpoints (`DR0`-`DR3`): stop when a memory location is written (or
+read-or-written — there is no read-only watchpoint on x86/x64). Only 4 slots
+exist, shared by the whole process; the 5th request is refused by name (what
+already holds the slots), never silently dropped. The session must be
+`stopped` to set or remove one (arming touches live thread contexts).
+- `set_data_breakpoint` — `expression` (a literal address like `"0x1234"` or a
+  global/unit variable name — locals are refused with a reason, their address
+  is only valid for the frame's lifetime), `size` (1/2/4/8, address must
+  already be aligned), `access` (`"write"`, or `"readWrite"` to also catch
+  reads — it ALSO fires on writes, it does not filter them out; `"read"`
+  alone is refused outright, never silently downgraded). Returns the new
+  watchpoint: `id`, `expression`, `size`, `access`, `verified`, `address`
+  (plus `module`/`rva` when resolved inside a known module), `slot` (0-3, or
+  `-1` when refused), and `message` (a refusal reason, or the read-or-write
+  caveat when `access` is `"readWrite"`).
+- `list_data_breakpoints` — every tracked watchpoint in the same shape.
+- `remove_data_breakpoint` — by `id`; frees the hardware slot and returns the
+  remaining list.
+
+A watchpoint stop reports `stopReason: "dataBreakpoint"` (from
+`get_compact_debug_snapshot` / `continue_and_wait` / any wait-class tool) plus
+`dataBreakpointDescription`: `"expression: $old -> $new (thread N)"` — the
+watched expression, the old and new values, and the THREAD that wrote it
+(also in the snapshot's own `thread` field) in one string, since which thread
+did it is frequently the whole answer.
+
 ### Execution (event-driven — the stop is folded into the response, no sleeps)
 - `continue_and_wait` (optional `timeoutMs`), `step_over`, `step_into`,
   `step_out`, `pause_execution`, `wait_until_stopped`. Each returns a compact
@@ -105,7 +132,9 @@ To attach to processes owned by another user or elevated targets, run the client
 
 ### Inspection (valid while stopped)
 - `get_compact_debug_snapshot` — state, stop reason, thread, current location,
-  top frames, top-frame locals, exception info if any (one round trip).
+  top frames, top-frame locals, exception info if any, and
+  `dataBreakpointDescription` when the stop reason is `dataBreakpoint` (one
+  round trip).
 - `get_current_source_location`, `get_call_stack`, `get_locals`,
   `get_variable` (`name` — one named variable, with an expansion handle when it is
   a local class/record/array), `evaluate_expression` (`expression`),

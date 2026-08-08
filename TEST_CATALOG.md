@@ -243,11 +243,48 @@ so they are covered here rather than under their own heading. Both bitnesses,
 - [x] A hit on the stepped instruction itself (`DR6` = `BS` + slot bit) still
       completes the step
       (`DataBp_HitOnTheSteppedInstruction_StillCompletesTheStep` / `Win32_...`)
-- [ ] Slot exhaustion refuses the fifth watchpoint (increment 3)
-- [ ] A watchpoint replicated onto a thread created after it was set
-      (increment 3)
-- [ ] Detach leaves the target unarmed (increment 3)
-- [ ] The stop names the WRITING thread, and old -> new (increment 4)
+- [x] Slot exhaustion refuses the fifth watchpoint
+      (`DataBp_SlotExhaustion_RefusesTheFifth`, x64 only)
+- [x] A watchpoint replicated onto a thread created after it was set
+      (`DataBp_ThreadCreatedAfterArm_StillTrips` / `Win32_...`)
+- [x] Detach leaves the target unarmed
+      (`DataBp_CleanDetach_LeavesTargetUnarmed`, x64 attach-based)
+- [x] The stop names the WRITING thread, and old -> new -- session API
+      (`DataBp_SessionApi_StopsWithOldNewAndThread` / `Win32_...`)
+- [x] A local is refused by name, not treated as a stale address
+      (`DataBp_SessionApi_RejectsLocalWithReason`)
+- [x] Exhaustion reported PER SPEC through the session API, not failing the
+      whole request (`DataBp_SessionApi_SlotExhaustion_PerSpecResults`)
+- [x] `RemoveAllDataBreakpoints` genuinely clears the hardware slot
+      (`DataBp_SessionApi_RemoveAll_StopsWatching`)
+- [x] A watchpoint hit during a synthetic call aborts the call, like a raise
+      (`DataBp_DuringSyntheticCall_AbortsEvaluation` / `Win32_...`)
+
+**MCP tool surface** (increment 5 -- `set_data_breakpoint` / `list_data_breakpoints`
+/ `remove_data_breakpoint` in `MCPDebugger\McpServer.pas`; DUnitX in
+`DebuggerTests\McpE2ETests.pas`; the session/engine correctness above is not
+re-proven here, only the tool wiring on top of it):
+
+- [x] Stop payload names the address, the firing thread and old->new; `stopReason`
+      is `"dataBreakpoint"`, not `"unknown"`
+      (`DataBreakpoint_StopsWithAddressThreadOldNew`)
+- [x] `access="readWrite"` arms and its result carries the no-read-only-watchpoint
+      caveat (`DataBreakpoint_ReadWriteAccessCarriesCaveat`)
+- [x] `access="read"` is refused outright as a tool error, explained, never
+      silently downgraded to `readWrite`
+      (`DataBreakpoint_ReadAccessRefusedExplicitly`)
+- [x] A local is refused with a reason at the MCP surface too
+      (`DataBreakpoint_LocalRefusedWithReason`)
+- [x] Slot exhaustion surfaces the engine's own message (what already holds the
+      slots), not a generic MCP failure
+      (`DataBreakpoint_SlotExhaustion_RefusesFifthWithEngineMessage`)
+- [x] `list_data_breakpoints` / `remove_data_breakpoint` round-trip with a STABLE
+      MCP-owned id (independent of the session's own id, which is reassigned on
+      every `SetDataBreakpoints` call), and removal genuinely frees the hardware
+      slot -- the target runs PAST the watched write afterward
+      (`DataBreakpoint_ListAndRemove_ClearsHardwareSlotForReal`)
+- [ ] DAP surface (`supportsDataBreakpoints`, `dataBreakpointInfo`,
+      `setDataBreakpoints`) -- increment 6, not started
 
 ---
 

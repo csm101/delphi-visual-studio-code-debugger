@@ -1,16 +1,18 @@
 # Data breakpoints (watchpoints) — plan
 
-Status: **in progress** (2026-08-08), increments 1-4 of 6 done and gated on a
+Status: **in progress** (2026-08-08), increments 1-5 of 6 done and gated on a
 green suite. The engine can arm/disarm hardware watchpoints, tell a watchpoint
 hit apart from a completed step, replicate a watchpoint onto every thread
 (present and future), allocate/free the four slots with explicit exhaustion,
-and now a real session-level API (`TDebugSession.SetDataBreakpoints` /
+a real session-level API (`TDebugSession.SetDataBreakpoints` /
 `ListDataBreakpoints` / `RemoveAllDataBreakpoints`) that resolves an
 expression, arms it, and reports a genuine `srDataBreakpoint` stop with
-old->new capture and the firing thread. Still missing: the MCP tool surface
-and `supportsDataBreakpoints` / `dataBreakpointInfo` / `setDataBreakpoints` in
-the DAP layer (increments 5-6). Nothing is user-facing yet -- increment 4 is
-still an internal API, driven by tests, not by MCP or VS Code.
+old->new capture and the firing thread, and now the MCP tool surface
+(`set_data_breakpoint` / `list_data_breakpoints` / `remove_data_breakpoint`)
+that drives it. Still missing: `supportsDataBreakpoints` /
+`dataBreakpointInfo` / `setDataBreakpoints` in the DAP layer (increment 6).
+The feature is user-facing over MCP as of increment 5; VS Code's own "Break on
+Value Change" UI is still increment 6.
 
 "Stop when THIS address is written" is one of the few questions only a debugger
 can answer. Ranked against the other two address-oriented features
@@ -345,7 +347,72 @@ menu appears once the capabilities are declared):
    afterward, and a follow-up read of `GDataBpOther` proves the call really
    stopped at the trap (only the statement BEFORE the watched write ran, not
    the one after).
-5. MCP tools.
+5. **DONE.** MCP tool surface: `set_data_breakpoint(expression, size, access)`,
+   `list_data_breakpoints`, `remove_data_breakpoint(id)` in `MCPDebugger\McpServer.pas`
+   / `McpToolSchemas.pas`, JSON shape in `McpJson.pas`. `expression` accepts
+   either form the session already resolves (a literal address or a
+   global/unit variable name) -- "address | expression" in the plan above is
+   one parameter, not two, matching `TDataBpSpec.Expression`.
+
+   **Granularity mismatch, handled at the MCP layer, not the session.**
+   `TDebugSession.SetDataBreakpoints` is whole-set-replace (increment 4,
+   mirroring DAP's own `setDataBreakpoints`) and reassigns every entry a FRESH
+   `Id` on every call, even to specs that did not change. The MCP tools want
+   to add/remove ONE watchpoint at a time with an id that stays valid across
+   later calls. Resolved by keeping the accumulated spec list and a parallel
+   array of MCP-owned ids (`wp1`, `wp2`, ...) in `TMcpServer`
+   (`FDataBpSpecs`/`FDataBpOwnIds`/`FNextDataBpOwnId`) -- source of truth for
+   what SHOULD be armed. `set_data_breakpoint` appends and resends the whole
+   list; `remove_data_breakpoint` splices by MCP id and resends the reduced
+   list; both read the result back at the same array position, so the
+   session's own regenerated `Id` never needs to be stable. `list_data_breakpoints`
+   does not call `SetDataBreakpoints` (that would re-arm for no reason); it
+   just zips `FSession.ListDataBreakpoints` with the cached own-ids array,
+   which is safe because MCP is the only caller of the session's data-breakpoint
+   API and both arrays are always mutated together. `EnsureFreshSessionForStart`
+   clears both arrays exactly when it recreates `FSession`, so a relaunch
+   starts with an empty tracked set instead of stale entries from a dead
+   debuggee. This is an implementation choice made without changing the
+   session API's shape -- a standard read-modify-write adapter over a
+   replace-all primitive -- not a design decision that needed escalation.
+
+   **Both mutating tools gate on `State = dsStopped` in the MCP handler**,
+   before ever calling into the session, even though `SetDataBreakpoints`
+   already refuses everything when not stopped on its own. Without the
+   earlier gate, a `remove_data_breakpoint` call while running would resend
+   the WHOLE reduced list through `SetDataBreakpoints`, which refuses every
+   entry uniformly with "data breakpoints can only be set while stopped" --
+   making already-armed watchpoints look newly broken instead of reporting
+   the real reason (wrong state) plainly. `list_data_breakpoints` has no gate,
+   matching `list_breakpoints`: it only reads cached state.
+
+   **`access="read"` is refused OUTRIGHT at the MCP layer**, not passed
+   through: `TDataBpSpec.WriteOnly` is a boolean with no "read-only" value to
+   represent it, so there is nothing for the session to accept. The refusal
+   names why (no hardware equivalent) and points at `"readWrite"`, which DOES
+   arm and carries the already-built no-read-only-watchpoint caveat in its
+   `message` (increment 4's `ArmOneDataBreakpoint`) -- surfaced verbatim, not
+   reworded.
+
+   **Bug found and fixed in the same change set**: `McpJson.ReasonName` had no
+   case for `srDataBreakpoint` (added by increment 4's `TStopReason`), so
+   `get_compact_debug_snapshot`/`continue_and_wait` reported `stopReason:
+   "unknown"` for a real watchpoint hit -- silently indistinguishable from an
+   actual unknown reason. Fixed by adding the case; `SnapshotToJson` also
+   gained a `dataBreakpointDescription` field (only present when
+   `stopReason = "dataBreakpoint"`), surfacing the session's own
+   `BuildDataBreakpointDescription` string ("expression: $old -> $new (thread
+   N)") verbatim -- no new session-layer plumbing needed, increment 4 already
+   built the whole thing, increment 5 was purely wiring it into JSON.
+
+   Tests (`DebuggerTests\McpE2ETests.pas`, mono fixture, x64 -- the underlying
+   engine/session correctness is proven per-bitness by the increment 3/4
+   `DataBp_SessionApi_*` tests, not re-proven here): `DataBreakpoint_StopsWithAddressThreadOldNew`
+   (worker-thread scenario; also the negative control for the `ReasonName` fix
+   -- reverting it fails this test's `stopReason` assertion),
+   `DataBreakpoint_ReadWriteAccessCarriesCaveat`, `DataBreakpoint_ReadAccessRefusedExplicitly`,
+   `DataBreakpoint_LocalRefusedWithReason`, `DataBreakpoint_SlotExhaustion_RefusesFifthWithEngineMessage`,
+   `DataBreakpoint_ListAndRemove_ClearsHardwareSlotForReal`.
 6. DAP capabilities and requests.
 
 ## Tests to write (both bitnesses, mono and BPL fixtures)

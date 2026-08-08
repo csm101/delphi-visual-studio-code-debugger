@@ -102,7 +102,7 @@ VS Code  ── DAP (JSON over stdio) ──>  VisualStudioCodeDelphiDebugger.ex
 - `DebuggerTests\`: DUnitX integration test suite. Launches the adapter,
   exercises BPs / locals / step / globals / evaluate.
   Run with `cmd /c "C:\Athens\GitHub\Win64Debugger\DebuggerTests\build_and_run.bat"`.
-  Current status: **1059 found / 1055 pass / 0 fail / 0 leaked / 4 ignored.**
+  Current status: **1065 found / 1061 pass / 0 fail / 0 leaked / 4 ignored.**
   Attach/detach tests self-skip when SeDebugPrivilege
   isn't held; run elevated to exercise them. The count includes the TD32
   + RSM reader unit tests (`TD32ReaderTests`, `RsmReaderTests`), the
@@ -514,7 +514,7 @@ Debugger features:
 - PE import-table reader so MAP can be dropped entirely.
 - Child process tracking.
 - **Data breakpoints / watchpoints ("stop when this address is written") — IN
-  PROGRESS, increments 1-4 of 6 done (2026-08-08).** Full plan, measurements and
+  PROGRESS, increments 1-5 of 6 done (2026-08-08).** Full plan, measurements and
   increment list in `DATA_BREAKPOINTS_PLAN.md`.
   * **Built:** debug registers as a fourth role behind the thread-context funnel
     (`ReadDebugRegisters` / `WriteDebugRegisters`, with the `Wow64` variant in
@@ -545,8 +545,23 @@ Debugger features:
     own resume breakpoint still lands correctly). A watchpoint firing inside a
     synthetic call (`RunMethodCall`) now aborts it like a raise, which also
     fixed a latent DR6-leak bug the old fall-through would have introduced.
-  * **Not built:** the MCP / DAP surfaces (increments 5-6). x86 has no
-    read-only watchpoint, so DAP `read` maps to read-or-write and must say so.
+  * **MCP tool surface (increment 5).** `set_data_breakpoint(expression, size,
+    access)` / `list_data_breakpoints` / `remove_data_breakpoint(id)` in
+    `MCPDebugger\McpServer.pas` / `McpToolSchemas.pas`, JSON in `McpJson.pas`.
+    `access="read"` is refused outright (no hardware equivalent to represent);
+    `"readWrite"` arms and carries the no-read-only-watchpoint caveat in its
+    message. The session's `SetDataBreakpoints` is whole-set-replace
+    (increment 4) but the MCP tools want one-at-a-time add/remove with a
+    STABLE id, so the MCP layer keeps its own accumulated spec list + a
+    parallel MCP-owned id array and resends the whole list on every mutation
+    -- a read-modify-write adapter over the replace-all primitive, no session
+    API change. Also fixed in this pass: `McpJson.ReasonName` had no case for
+    `srDataBreakpoint`, so a watchpoint stop reported `stopReason:"unknown"`
+    over MCP -- a real latent bug, not something increment 5 introduced.
+  * **Not built:** the DAP surface (increment 6). x86 has no read-only
+    watchpoint, so DAP `read` (via `dataBreakpointInfo`'s supported access
+    types) maps to read-or-write and must say so -- already proven at the MCP
+    layer, increment 6 just needs the DAP request shape.
   Ranked above disassembly in diagnostic value: "who writes this variable" has no
   other answer.
 - **Disassembly + address breakpoints — DESIGNED, not built (2026-08-08).** Full

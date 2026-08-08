@@ -46,6 +46,18 @@ type
     // distinguishable from "the module is not loaded".
     [Test] procedure LoadedModules_DescribeMainAndPackages;
     [Test] procedure SourceFiles_ListTheFileSetBreakpointExpects;
+    // Data breakpoints (watchpoints) -- increment 5 of DATA_BREAKPOINTS_PLAN.md.
+    // The session/engine correctness (per-thread replication, DR6
+    // disambiguation, slot allocation) is proven by DataBp_SessionApi_* in
+    // DebugSessionTests.pas; these cover the MCP TOOL surface on top of it --
+    // argument parsing, the access-type refusal, and the JSON shape a caller
+    // actually sees.
+    [Test] procedure DataBreakpoint_StopsWithAddressThreadOldNew;
+    [Test] procedure DataBreakpoint_ReadWriteAccessCarriesCaveat;
+    [Test] procedure DataBreakpoint_ReadAccessRefusedExplicitly;
+    [Test] procedure DataBreakpoint_LocalRefusedWithReason;
+    [Test] procedure DataBreakpoint_SlotExhaustion_RefusesFifthWithEngineMessage;
+    [Test] procedure DataBreakpoint_ListAndRemove_ClearsHardwareSlotForReal;
   end;
 
 implementation
@@ -56,6 +68,10 @@ uses
 const
   EVAL_MARKER = 'EVAL_BODY';
   EVAL_SOURCE = 'TestTargetCore.pas';
+  // Data-breakpoint fixtures (shared with DataBp_SessionApi_* in
+  // DebuggerTests\DebugSessionTests.pas; see DATA_BREAKPOINTS_PLAN.md).
+  DATABP_ARGS       = '-run-databp-step';
+  DATABPTHREAD_ARGS = '-run-databp-thread';
 
 type
   // Minimal JSON-RPC-over-stdio client for the MCP server under test.
@@ -1231,6 +1247,388 @@ begin
         'selected the caller (' + Frame1Desc + '): ' + LeakEval.ToJSON);
     finally
       LeakEval.Free;
+    end;
+
+    C.CallTool('terminate_debuggee', nil).Free;
+  finally
+    C.Free;
+  end;
+end;
+
+// The worker thread scenario: GDataBpThreadWatched is written by a thread that
+// was already alive (spinning) when the watchpoint is armed, proving arm-time
+// per-thread replication reaches the MCP surface. Also the negative control for
+// McpJson.ReasonName: with srDataBreakpoint left unhandled there, stopReason
+// comes back "unknown" instead of "dataBreakpoint" and this test fails on that
+// assertion alone.
+procedure TMcpE2ETests.DataBreakpoint_StopsWithAddressThreadOldNew;
+begin
+  var ReadyLine := MarkerLine(EVAL_SOURCE, 'DATABPTHREAD_READY');
+  Assert.IsTrue(ReadyLine > 0, 'DATABPTHREAD_READY marker not found');
+
+  var C := TMcpTestClient.Start(McpExe);
+  try
+    C.Call('initialize', nil).Free;
+
+    var LaunchArgs := TJSONObject.Create;
+    LaunchArgs.AddPair('program', TargetExe);
+    LaunchArgs.AddPair('sourceRoot', TargetDir);
+    LaunchArgs.AddPair('args', DATABPTHREAD_ARGS);
+    C.CallTool('launch_debuggee', LaunchArgs).Free;
+
+    var BpArgs := TJSONObject.Create;
+    BpArgs.AddPair('sourceFile', EVAL_SOURCE);
+    BpArgs.AddPair('line', TJSONNumber.Create(ReadyLine));
+    C.CallTool('set_breakpoint', BpArgs).Free;
+
+    var MainTid := -1;
+    var Snap1 := C.CallTool('continue_and_wait', nil);
+    try
+      var S1 := TJSONObject(Snap1);
+      Assert.AreEqual('stopped', S1.GetValue<string>('state', ''),
+        'did not stop at DATABPTHREAD_READY: ' + S1.ToJSON);
+      MainTid := S1.GetValue<Integer>('thread', -1);
+    finally
+      Snap1.Free;
+    end;
+
+    var DbpArgs := TJSONObject.Create;
+    DbpArgs.AddPair('expression', 'GDataBpThreadWatched');
+    DbpArgs.AddPair('size', TJSONNumber.Create(4));
+    DbpArgs.AddPair('access', 'write');
+    var Armed := C.CallTool('set_data_breakpoint', DbpArgs);
+    try
+      Assert.IsTrue(Armed is TJSONObject, 'set_data_breakpoint errored: ' + Armed.ToJSON);
+      var A := TJSONObject(Armed);
+      Assert.IsTrue(A.GetValue<Boolean>('verified', False),
+        'watchpoint refused: ' + A.GetValue<string>('message', ''));
+      Assert.IsTrue(A.GetValue<string>('address', '') <> '', 'no resolved address in the result');
+      Assert.IsTrue(A.GetValue<Integer>('slot', -1) >= 0, 'a verified watchpoint must carry a real slot');
+      Assert.AreEqual('write', A.GetValue<string>('access', ''), 'access mismatch');
+    finally
+      Armed.Free;
+    end;
+
+    var Snap2 := C.CallTool('continue_and_wait', nil);
+    try
+      var S2 := TJSONObject(Snap2);
+      Assert.AreEqual('stopped', S2.GetValue<string>('state', ''),
+        'the target never stopped on the watchpoint: ' + S2.ToJSON);
+      Assert.AreEqual('dataBreakpoint', S2.GetValue<string>('stopReason', ''),
+        'stopReason should name the data-breakpoint stop: ' + S2.ToJSON);
+      var FiringTid := S2.GetValue<Integer>('thread', -1);
+      Assert.AreNotEqual(MainTid, FiringTid,
+        'the stop was attributed to the MAIN thread, not the worker that wrote it');
+      var Desc := S2.GetValue<string>('dataBreakpointDescription', '');
+      Assert.IsTrue(Desc.Contains('GDataBpThreadWatched'),
+        'description does not name the watched expression: ' + Desc);
+      Assert.IsTrue(Desc.Contains('-> $1'), 'description does not show the write (-> 1): ' + Desc);
+      Assert.IsTrue(Desc.Contains(IntToStr(FiringTid)),
+        'description does not name the firing thread: ' + Desc);
+    finally
+      Snap2.Free;
+    end;
+
+    C.CallTool('terminate_debuggee', nil).Free;
+  finally
+    C.Free;
+  end;
+end;
+
+// access="readWrite" is the only way to also catch reads, and there is no
+// read-only hardware watchpoint on x86/x64 -- it must arm (this is a real,
+// useful watchpoint) but say plainly that it also fires on writes.
+procedure TMcpE2ETests.DataBreakpoint_ReadWriteAccessCarriesCaveat;
+begin
+  var Line := MarkerLine(EVAL_SOURCE, EVAL_MARKER);
+  var C := TMcpTestClient.Start(McpExe);
+  try
+    C.Call('initialize', nil).Free;
+    var LaunchArgs := TJSONObject.Create;
+    LaunchArgs.AddPair('program', TargetExe);
+    LaunchArgs.AddPair('sourceRoot', TargetDir);
+    C.CallTool('launch_debuggee', LaunchArgs).Free;
+    var BpArgs := TJSONObject.Create;
+    BpArgs.AddPair('sourceFile', EVAL_SOURCE);
+    BpArgs.AddPair('line', TJSONNumber.Create(Line));
+    C.CallTool('set_breakpoint', BpArgs).Free;
+    C.CallTool('continue_and_wait', nil).Free;
+
+    var DbpArgs := TJSONObject.Create;
+    DbpArgs.AddPair('expression', 'GDataBpWatched');
+    DbpArgs.AddPair('size', TJSONNumber.Create(4));
+    DbpArgs.AddPair('access', 'readWrite');
+    var R := C.CallTool('set_data_breakpoint', DbpArgs);
+    try
+      Assert.IsTrue(R is TJSONObject, 'set_data_breakpoint errored: ' + R.ToJSON);
+      var O := TJSONObject(R);
+      Assert.IsTrue(O.GetValue<Boolean>('verified', False),
+        'a readWrite watchpoint on a resolvable global must arm: ' + O.GetValue<string>('message', ''));
+      Assert.AreEqual('readWrite', O.GetValue<string>('access', ''), 'access mismatch');
+      var Msg := O.GetValue<string>('message', '');
+      Assert.IsTrue(Msg.ToLower.Contains('write'),
+        'a readWrite watchpoint must say it ALSO fires on writes: ' + Msg);
+    finally
+      R.Free;
+    end;
+
+    C.CallTool('terminate_debuggee', nil).Free;
+  finally
+    C.Free;
+  end;
+end;
+
+// access="read" has no hardware equivalent and must be refused OUTRIGHT --
+// never silently downgraded to readWrite, which would let a caller believe it
+// asked for (and got) something that filtered out writes.
+procedure TMcpE2ETests.DataBreakpoint_ReadAccessRefusedExplicitly;
+begin
+  var Line := MarkerLine(EVAL_SOURCE, EVAL_MARKER);
+  var C := TMcpTestClient.Start(McpExe);
+  try
+    C.Call('initialize', nil).Free;
+    var LaunchArgs := TJSONObject.Create;
+    LaunchArgs.AddPair('program', TargetExe);
+    LaunchArgs.AddPair('sourceRoot', TargetDir);
+    C.CallTool('launch_debuggee', LaunchArgs).Free;
+    var BpArgs := TJSONObject.Create;
+    BpArgs.AddPair('sourceFile', EVAL_SOURCE);
+    BpArgs.AddPair('line', TJSONNumber.Create(Line));
+    C.CallTool('set_breakpoint', BpArgs).Free;
+    C.CallTool('continue_and_wait', nil).Free;
+
+    var DbpArgs := TJSONObject.Create;
+    DbpArgs.AddPair('expression', 'GDataBpWatched');
+    DbpArgs.AddPair('size', TJSONNumber.Create(4));
+    DbpArgs.AddPair('access', 'read');
+    var R := C.CallTool('set_data_breakpoint', DbpArgs);
+    try
+      Assert.IsTrue(R is TJSONString,
+        'access="read" should be refused as a tool error, never silently accepted: ' + R.ToJSON);
+      var Msg := (R as TJSONString).Value;
+      Assert.IsTrue(Msg.ToLower.Contains('read-only') or Msg.ToLower.Contains('hardware equivalent'),
+        'the refusal does not explain WHY "read" is rejected: ' + Msg);
+    finally
+      R.Free;
+    end;
+
+    // A refused request must not create any tracked entry.
+    var Listed := C.CallTool('list_data_breakpoints', nil);
+    try
+      Assert.AreEqual(0, (Listed as TJSONArray).Count,
+        'a refused access="read" request must not create an entry: ' + Listed.ToJSON);
+    finally
+      Listed.Free;
+    end;
+
+    C.CallTool('terminate_debuggee', nil).Free;
+  finally
+    C.Free;
+  end;
+end;
+
+// A local is a real symbol, but watching its address past the frame's
+// lifetime is nonsense -- refused BY NAME (increment 6's dataBreakpointInfo
+// is what will eventually support it), never treated as a stale address.
+procedure TMcpE2ETests.DataBreakpoint_LocalRefusedWithReason;
+begin
+  var Line := MarkerLine(EVAL_SOURCE, EVAL_MARKER);
+  var C := TMcpTestClient.Start(McpExe);
+  try
+    C.Call('initialize', nil).Free;
+    var LaunchArgs := TJSONObject.Create;
+    LaunchArgs.AddPair('program', TargetExe);
+    LaunchArgs.AddPair('sourceRoot', TargetDir);
+    C.CallTool('launch_debuggee', LaunchArgs).Free;
+    var BpArgs := TJSONObject.Create;
+    BpArgs.AddPair('sourceFile', EVAL_SOURCE);
+    BpArgs.AddPair('line', TJSONNumber.Create(Line));
+    C.CallTool('set_breakpoint', BpArgs).Free;
+    C.CallTool('continue_and_wait', nil).Free;
+
+    var DbpArgs := TJSONObject.Create;
+    DbpArgs.AddPair('expression', 'W');   // the TWidget local at EVAL_BODY
+    DbpArgs.AddPair('size', TJSONNumber.Create(8));
+    DbpArgs.AddPair('access', 'write');
+    var R := C.CallTool('set_data_breakpoint', DbpArgs);
+    try
+      Assert.IsTrue(R is TJSONObject,
+        'a local is a per-item refusal (Verified=False), not a tool-level error: ' + R.ToJSON);
+      var O := TJSONObject(R);
+      Assert.IsFalse(O.GetValue<Boolean>('verified', True), 'a local must be refused, not armed');
+      var Msg := O.GetValue<string>('message', '');
+      Assert.IsTrue(Msg.ToLower.Contains('local'),
+        'refusal reason does not say WHY (local lifetime): ' + Msg);
+      Assert.AreEqual(-1, O.GetValue<Integer>('slot', -99), 'a refused request must not report a real slot');
+    finally
+      R.Free;
+    end;
+
+    C.CallTool('terminate_debuggee', nil).Free;
+  finally
+    C.Free;
+  end;
+end;
+
+// Five distinct 4-byte globals, four hardware slots: exhaustion must be
+// reported for the 5th with a message naming what already holds the slots
+// (the engine's own refusal text, not a generic MCP failure), and the first
+// four must still work.
+procedure TMcpE2ETests.DataBreakpoint_SlotExhaustion_RefusesFifthWithEngineMessage;
+const
+  Globals: array[0..4] of string = (
+    'GDataBpWatched', 'GDataBpOther', 'GCounter', 'GDataBpThreadWatched', 'GDataBpThreadLate');
+begin
+  var Line := MarkerLine(EVAL_SOURCE, EVAL_MARKER);
+  var C := TMcpTestClient.Start(McpExe);
+  try
+    C.Call('initialize', nil).Free;
+    var LaunchArgs := TJSONObject.Create;
+    LaunchArgs.AddPair('program', TargetExe);
+    LaunchArgs.AddPair('sourceRoot', TargetDir);
+    C.CallTool('launch_debuggee', LaunchArgs).Free;
+    var BpArgs := TJSONObject.Create;
+    BpArgs.AddPair('sourceFile', EVAL_SOURCE);
+    BpArgs.AddPair('line', TJSONNumber.Create(Line));
+    C.CallTool('set_breakpoint', BpArgs).Free;
+    C.CallTool('continue_and_wait', nil).Free;
+
+    for var I := 0 to 3 do begin
+      var DbpArgs := TJSONObject.Create;
+      DbpArgs.AddPair('expression', Globals[I]);
+      DbpArgs.AddPair('size', TJSONNumber.Create(4));
+      DbpArgs.AddPair('access', 'write');
+      var R := C.CallTool('set_data_breakpoint', DbpArgs);
+      try
+        Assert.IsTrue(R is TJSONObject, Format('spec %d (%s) errored: %s', [I, Globals[I], R.ToJSON]));
+        Assert.IsTrue(TJSONObject(R).GetValue<Boolean>('verified', False),
+          Format('spec %d (%s) should have armed: %s',
+            [I, Globals[I], TJSONObject(R).GetValue<string>('message', '')]));
+      finally
+        R.Free;
+      end;
+    end;
+
+    var LastArgs := TJSONObject.Create;
+    LastArgs.AddPair('expression', Globals[4]);
+    LastArgs.AddPair('size', TJSONNumber.Create(4));
+    LastArgs.AddPair('access', 'write');
+    var Fifth := C.CallTool('set_data_breakpoint', LastArgs);
+    try
+      Assert.IsTrue(Fifth is TJSONObject, 'the fifth spec should be a per-item refusal, not a tool error: ' + Fifth.ToJSON);
+      var O := TJSONObject(Fifth);
+      Assert.IsFalse(O.GetValue<Boolean>('verified', True), 'the fifth watchpoint should have been refused');
+      var Msg := O.GetValue<string>('message', '');
+      Assert.IsTrue(Msg.ToLower.Contains('slots are in use'),
+        'exhaustion refusal does not name what holds the slots: ' + Msg);
+      Assert.AreEqual(-1, O.GetValue<Integer>('slot', -99), 'a refused request must not report a real slot');
+    finally
+      Fifth.Free;
+    end;
+
+    var Listed := C.CallTool('list_data_breakpoints', nil);
+    try
+      Assert.AreEqual(5, (Listed as TJSONArray).Count,
+        'expected all 5 tracked (4 armed + 1 refused), not silently dropped: ' + Listed.ToJSON);
+    finally
+      Listed.Free;
+    end;
+
+    C.CallTool('terminate_debuggee', nil).Free;
+  finally
+    C.Free;
+  end;
+end;
+
+// remove_data_breakpoint must genuinely clear the hardware slot, not just
+// forget about it: after removal the target must run PAST the write it used
+// to stop on.
+procedure TMcpE2ETests.DataBreakpoint_ListAndRemove_ClearsHardwareSlotForReal;
+begin
+  var ReadyLine := MarkerLine(EVAL_SOURCE, 'DATABP_READY');
+  var DoneLine  := MarkerLine(EVAL_SOURCE, 'DATABP_DONE');
+  Assert.IsTrue((ReadyLine > 0) and (DoneLine > 0),
+    'DATABP_READY / DATABP_DONE markers not found');
+
+  var C := TMcpTestClient.Start(McpExe);
+  try
+    C.Call('initialize', nil).Free;
+    var LaunchArgs := TJSONObject.Create;
+    LaunchArgs.AddPair('program', TargetExe);
+    LaunchArgs.AddPair('sourceRoot', TargetDir);
+    LaunchArgs.AddPair('args', DATABP_ARGS);
+    C.CallTool('launch_debuggee', LaunchArgs).Free;
+
+    var Bps := TJSONArray.Create;
+    var B1 := TJSONObject.Create;
+    B1.AddPair('sourceFile', EVAL_SOURCE); B1.AddPair('line', TJSONNumber.Create(ReadyLine));
+    Bps.Add(B1);
+    var B2 := TJSONObject.Create;
+    B2.AddPair('sourceFile', EVAL_SOURCE); B2.AddPair('line', TJSONNumber.Create(DoneLine));
+    Bps.Add(B2);
+    var BpArgs := TJSONObject.Create;
+    BpArgs.AddPair('breakpoints', Bps);
+    C.CallTool('set_breakpoints', BpArgs).Free;
+
+    var Snap1 := C.CallTool('continue_and_wait', nil);
+    try
+      Assert.AreEqual('stopped', TJSONObject(Snap1).GetValue<string>('state', ''),
+        'did not stop at DATABP_READY: ' + Snap1.ToJSON);
+    finally
+      Snap1.Free;
+    end;
+
+    var DbpArgs := TJSONObject.Create;
+    DbpArgs.AddPair('expression', 'GDataBpWatched');
+    DbpArgs.AddPair('size', TJSONNumber.Create(4));
+    DbpArgs.AddPair('access', 'write');
+    var WpId := '';
+    var Armed := C.CallTool('set_data_breakpoint', DbpArgs);
+    try
+      Assert.IsTrue(TJSONObject(Armed).GetValue<Boolean>('verified', False),
+        'setup: watchpoint should have armed: ' + Armed.ToJSON);
+      WpId := TJSONObject(Armed).GetValue<string>('id', '');
+      Assert.IsTrue(WpId <> '', 'no id returned for the armed watchpoint');
+    finally
+      Armed.Free;
+    end;
+
+    var Listed1 := C.CallTool('list_data_breakpoints', nil);
+    try
+      Assert.AreEqual(1, (Listed1 as TJSONArray).Count, 'expected exactly one tracked watchpoint');
+    finally
+      Listed1.Free;
+    end;
+
+    var RemArgs := TJSONObject.Create;
+    RemArgs.AddPair('id', WpId);
+    var Remaining := C.CallTool('remove_data_breakpoint', RemArgs);
+    try
+      Assert.AreEqual(0, (Remaining as TJSONArray).Count,
+        'remove_data_breakpoint left an entry behind: ' + Remaining.ToJSON);
+    finally
+      Remaining.Free;
+    end;
+
+    var Listed2 := C.CallTool('list_data_breakpoints', nil);
+    try
+      Assert.AreEqual(0, (Listed2 as TJSONArray).Count,
+        'list_data_breakpoints disagrees with the removal: ' + Listed2.ToJSON);
+    finally
+      Listed2.Free;
+    end;
+
+    var Snap2 := C.CallTool('continue_and_wait', nil);
+    try
+      var S2 := TJSONObject(Snap2);
+      Assert.AreEqual('stopped', S2.GetValue<string>('state', ''),
+        'did not reach DATABP_DONE: ' + S2.ToJSON);
+      Assert.AreNotEqual('dataBreakpoint', S2.GetValue<string>('stopReason', ''),
+        'the removed watchpoint still fired -- the hardware slot was left armed: ' + S2.ToJSON);
+      var Loc := S2.GetValue('location') as TJSONObject;
+      Assert.AreEqual(DoneLine, Loc.GetValue<Integer>('line', -1), 'stopped at the wrong line');
+    finally
+      Snap2.Free;
     end;
 
     C.CallTool('terminate_debuggee', nil).Free;
