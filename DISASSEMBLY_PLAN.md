@@ -1,7 +1,8 @@
 # Disassembly and address breakpoints — plan
 
-Status: **decided, not built** (2026-08-08). This document is the agreed design;
-`PROJECT_STATE.md` carries only the one-line roadmap entry pointing here.
+Status: **increment 1 landed, not committed** (2026-08-08). This document is the
+agreed design; `PROJECT_STATE.md` carries only the one-line roadmap entry
+pointing here.
 
 Two features that share one prerequisite and are therefore planned together:
 
@@ -202,8 +203,15 @@ Decisions:
 
 ## Increments (each gated on a green suite before the next)
 
-1. `ThirdParty\Zydis` layout, submodule, committed DLL, `ZydisApi.pas`, dynamic
-   load + version check. No feature yet; a DevTools probe proves it decodes.
+1. **DONE, not committed (2026-08-08).** `ThirdParty\Zydis` layout, submodule
+   pinned to `v4.1.1`, committed DLL, `ZydisApi.pas`, dynamic load + version
+   check. No feature wired in yet — `DevTools\DisasmProbe.exe` proves the
+   pipeline decodes real bytes from a real binary in both machine modes
+   through the one x64 DLL. Full detail (exact build invocation, SHA-256,
+   struct-layout measurement) in `ThirdParty\Zydis\PROVENANCE.md`. Full suite
+   run afterward: 1081 found / 1077 passed / 0 failed / 0 errored / 4 ignored —
+   exact match to baseline, as expected since nothing new is wired into any
+   existing consumer.
 2. `IDisassembler` + Zydis backend + symbolication of the output. `DevTools\Disasm.exe`.
 3. Differential coverage tool vs the oracle, over the fixtures and the real
    binaries. Record the measured numbers in this file.
@@ -227,13 +235,34 @@ Decisions:
 - Do not merge disassembly-derived call targets into the call stack, for the same
   reason raw stack hits are kept separate: they are positions, not frames.
 
+## Verified in increment 1
+
+- **Version and API shape.** Pinned `v4.1.1` (commit `a2278f1d2`).
+  `ZydisDisassembleIntel` exists exactly as assumed
+  (`include/Zydis/Disassembler.h`) and is exported by the built DLL, confirmed
+  with `dumpbin /exports`. One surprise: `ZydisGetVersion()` reports `4.1.0.0`
+  on this exact pinned commit — the `ZYDIS_VERSION` macro was not bumped for
+  the 4.1.1 patch release (verified against `src/Zydis.c`, which returns the
+  macro literally). `ZydisApi.pas`'s load-time check therefore compares
+  major.minor only. Full detail in `ThirdParty\Zydis\PROVENANCE.md`.
+- **Maintained Pascal bindings.** `zyantific/zydis-pascal` exists and is listed
+  as an official binding (MIT), supporting both static and dynamic linkage. Not
+  adopted: it is a full header translation of the whole API surface (the
+  opposite of the decided minimal-import-unit design), and its last commit
+  (2023-11-20) predates the pinned `v4.1.1` tag (2025-02-16) — it was not
+  re-verified against it. `ZydisApi.pas` is hand-written, importing only
+  `ZydisDisassembleIntel` and `ZydisGetVersion`.
+- **One DLL, both machine modes.** Confirmed both by the CMake config (Zydis
+  has no per-machine-mode build option — `ZYDIS_BUILD_SHARED_LIB` builds one
+  DLL) and empirically: `DevTools\DisasmProbe.exe`, unmodified, decoded correct
+  x64 code from the 64-bit `TestTarget.exe` (auto-detected `long64` from its PE
+  header) and correct x86 code from the 32-bit `TestTarget.exe` (auto-detected
+  `legacy32`) through the same built `Zydis.dll`.
+
 ## Open, to verify before writing code
 
-- Current Zydis version and API shape (the convenience `ZydisDisassembleIntel`
-  entry point), and how it builds a 32-bit-capable x64 DLL.
-- Whether maintained Pascal bindings exist (Zydis began life as an Object Pascal
-  project, so they may) — would reduce increment 1 to almost nothing.
-- Whether XED or iced is the more practical oracle to drive from a `.bat`.
+- Whether XED or iced is the more practical oracle to drive from a `.bat`
+  (increment 3, differential coverage tool).
 
 ## Not in scope, deliberately
 

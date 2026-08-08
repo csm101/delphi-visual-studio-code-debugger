@@ -74,3 +74,9 @@ MCP_LIVE_FINDINGS_TODO.md
 # project resource: without it a fresh clone cannot compile Debugme.dpr, whose
 # {$R *.res} refers to it.
 !Debugme.res
+
+# Zydis (disassembler dependency): the built DLL is committed on purpose so
+# build_all.bat / build_dap.bat stay Delphi-only (see ThirdParty/Zydis/PROVENANCE.md).
+# The CMake scratch directory build_zydis.bat regenerates it into stays ignored.
+!ThirdParty/Zydis/bin/x64/*.dll
+ThirdParty/Zydis/build/

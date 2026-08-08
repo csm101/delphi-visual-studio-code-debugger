@@ -407,6 +407,49 @@ DevTools\Win64\Debug\DumpFunc.exe Win64\Debug\Debugme.exe 2CCA0 64
 
 Arguments: `<exe-path> <hex-RVA> <byte-count>`.
 
+#### DisasmProbe
+
+```bat
+DevTools\Win64\Debug\DisasmProbe.exe DebuggerTests\TestTarget\Win64\Debug\TestTarget.exe 167FC0 10
+DevTools\Win64\Debug\DisasmProbe.exe DebuggerTests\TestTarget\Win32\Debug\TestTarget.exe F4E78 10
+```
+
+Proves the Zydis dependency end to end (`DISASSEMBLY_PLAN.md` increment 1):
+loads `ThirdParty\Zydis\bin\x64\Zydis.dll`, reads real bytes out of a real PE
+image at a given RVA, and decodes a run of instructions through
+`DebuggerCore\ZydisApi.pas`. No feature lives here — `IDisassembler` and
+symbolication are increment 2; this only shows the pipeline decodes.
+
+Arguments: `<exe-or-dll> <hex-RVA> [count] [-mode long64|legacy32] [-zydisdll <path>]`.
+`count` defaults to 10 instructions. The machine mode is read from the image's
+own PE header (`IMAGE_FILE_HEADER.Machine`) unless `-mode` overrides it —
+never assumed from the host, matching how the real `IDisassembler` will derive
+it from `IDebugTarget.TargetLayout`. `Zydis.dll` is located via the normal
+Windows search order (next to this exe, then `PATH`); if that fails, the probe
+falls back to the repo-relative `ThirdParty\Zydis\bin\x64\Zydis.dll` so a fresh
+build works without copying anything, unless `-zydisdll` gives an explicit
+path.
+
+Run once against the 64-bit `TestTarget.exe` and once against its 32-bit
+sibling (each auto-detects its own mode) to see the SAME x64 `Zydis.dll`
+decode both machine modes — the case that matters for this project, since the
+adapter is one 64-bit process debugging either bitness. Measured output at the
+two binaries' entry points, both showing the standard Delphi prologue:
+
+```
+$00167FC0  55                        push rbp
+$00167FC1  53                        push rbx
+$00167FC2  48 81 EC 98 00 00 00      sub rsp, 0x98
+$00167FC9  48 8B EC                  mov rbp, rsp
+```
+
+```
+$000F4E78  55                        push ebp
+$000F4E79  8B EC                     mov ebp, esp
+$000F4E7B  83 C4 C8                  add esp, 0xFFFFFFC8
+$000F4E7F  53                        push ebx
+```
+
 #### HexDump
 
 ```bat

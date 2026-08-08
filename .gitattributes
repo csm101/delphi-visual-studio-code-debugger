@@ -2,7 +2,13 @@
 # Every text file is checked out with CRLF, so an editor or a generated file
 # cannot silently introduce LF endings that later show up as whole-file diffs.
 #
-# No binary rules are needed: build output (*.exe, *.dll, *.bpl, *.dcp, *.dcu,
-# *.res, *.rsm, *.map, *.tds, *.jdbg, *.idx) is all covered by .gitignore, and
-# "text=auto" detects binary content on its own for anything that slips through.
+# No binary rules are needed for most of the tree: build output (*.exe, *.dll,
+# *.bpl, *.dcp, *.dcu, *.res, *.rsm, *.map, *.tds, *.jdbg, *.idx) is all covered
+# by .gitignore, and "text=auto" detects binary content on its own for anything
+# that slips through.
 * text=auto eol=crlf
+
+# The Zydis disassembler DLL is a deliberate exception to "build output stays
+# ignored" (ThirdParty/Zydis/PROVENANCE.md) — it is committed so normal builds
+# stay Delphi-only. Mark it explicitly binary so eol=crlf above never touches it.
+*.dll binary

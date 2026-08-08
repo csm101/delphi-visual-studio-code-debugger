@@ -25,47 +25,62 @@ longer true, delete it.
 
 ## Current task (2026-08-08)
 
-**Data breakpoints (watchpoints), increment 6 of 6 — DONE. The plan is now
-COMPLETE. Not committed; left in the tree for review.**
+**`DISASSEMBLY_PLAN.md` increment 1 — Zydis dependency landed. DONE, not
+committed; left in the tree for review.**
 
-Increment 6 is the DAP surface plus the case increments 4 and 5 both refused: a
-watchpoint on a **LOCAL**. Capability `supportsDataBreakpoints`, requests
-`dataBreakpointInfo` / `setDataBreakpoints`, and the `stopped` reason
-`"data breakpoint"` (which was MISSING — a watchpoint stop arrived with no
-`reason` at all, the DAP twin of the `McpJson.ReasonName` gap increment 5 found).
+No feature or engine behaviour changed. Deliverables, all present:
 
-Full detail, including the `dataId` encoding, the frame-lifetime rule and every
-deliberate refusal, is in `DATA_BREAKPOINTS_PLAN.md` (increment 6 section) and
-`DAP_DEBUGGER_ARCHITECTURE.md` ("Data breakpoints: the request flows"). Test
-inventory in `TEST_CATALOG.md`.
+- `ThirdParty\Zydis\zydis.submodule` — submodule on `zyantific/zydis`, pinned
+  to tag `v4.1.1` (commit `a2278f1d2`), nested `dependencies/zycore` at
+  `0b2432ced`.
+- `ThirdParty\Zydis\bin\x64\Zydis.dll` (+ `.sha256`) — built via
+  `build_zydis.bat` (VS2026/MSVC 14.51.36231, CMake `NMake Makefiles`,
+  `ZYDIS_BUILD_SHARED_LIB=ON`). SHA-256
+  `f81ca7d636d4679a0794da84dc32790d270b9c9bf293722844cd3ac4302ea745`.
+- `ThirdParty\Zydis\LICENSE`, `PROVENANCE.md` (exact invocation, struct-layout
+  measurement, the three verification answers).
+- `DebuggerCore\ZydisApi.pas` — dynamic-load import unit (`ZydisDisassembleIntel`
+  + `ZydisGetVersion` only). The output struct has C bitfields/unions that
+  cannot be safely hand-transcribed, so its layout (1232 bytes total, length
+  at offset 16, text at offset 1136/96 bytes) was MEASURED with a throwaway
+  `offsetof`/`sizeof` C probe compiled against the pinned headers (probe was
+  scratch-only, not kept in the repo — the measured constants live as
+  commented facts in `ZydisApi.pas` and `PROVENANCE.md`).
+- `DevTools\DisasmProbe.dpr` — argv-driven, no hardcoded target. Auto-detects
+  machine mode from the target's own PE header (never the host), with a
+  `-mode` override proven to actually change decoding (fed the same x64 bytes
+  as `legacy32`: `push rbp`→`push ebp`, then desyncs at the REX prefix exactly
+  as expected). Ran clean against both `DebuggerTests\TestTarget\Win64\Debug\
+  TestTarget.exe` (`long64`, entry `$167FC0`) and `...\Win32\Debug\TestTarget.exe`
+  (`legacy32`, entry `$F4E78`) — same DLL, both modes, correct Delphi
+  prologues decoded in each.
+- `.gitattributes` (`*.dll binary`) and `.gitignore`
+  (`!ThirdParty/Zydis/bin/x64/*.dll`, `ThirdParty/Zydis/build/` ignored) —
+  verified with `git check-ignore` / `git status` that the DLL is trackable
+  and the CMake scratch dir is not.
+- `DISASSEMBLY_PLAN.md` and `DevTools\README.md` updated in this change set.
 
-Files changed:
-`DebuggerCore\DebugSessionTypes.pas`, `DebuggerCore\DebugSession.pas`,
-`VisualStudioCodeDelphiDebugger\DapServer.pas`,
-`DebuggerTests\TestTarget\TestTargetCore.pas`, `DebuggerTests\DapClient.pas`,
-`DebuggerTests\DebuggerTests.pas`, `DebuggerTests\DebugSessionTests.pas`,
-plus the docs above and `PROJECT_STATE.md` / `README.md`.
+Full suite (`DebuggerTests\build_and_run.bat`, run once via the test-runner
+agent): **1081 found / 1077 passed / 0 failed / 0 errored / 4 ignored** —
+exact match to baseline. Expected: nothing new is referenced by any existing
+consumer.
 
-Full suite: **1081 found / 1077 passed / 0 failed / 0 errored / 4 ignored**
-(delta vs the increment-5 baseline of 1065/1061 is exactly the 16 new tests:
-5 DAP tests × 2 fixtures, 4 session tests, 2 Win32 mirrors).
+### Verification answers (also in `DISASSEMBLY_PLAN.md`)
 
-Negative controls run and reverted, each RED with the intended message:
-removed `stopped` reason case; `read` access accepted instead of refused;
-Registers-scope branch dropped; `PruneStaleDataBreakpoints` disabled;
-arm-time frame-liveness test disabled.
+1. `ZydisDisassembleIntel` exists as assumed. `ZydisGetVersion()` on this
+   pinned commit reports `4.1.0.0` (patch digit stuck at the last macro bump,
+   not the tag) — version check compares major.minor only.
+2. `zyantific/zydis-pascal` exists (official, MIT) but is a full header
+   translation predating this pin (last commit 2023-11-20 vs. tag
+   2025-02-16) and contradicts the decided minimal-surface design. Not used.
+3. One DLL genuinely serves both machine modes — confirmed by CMake (no
+   per-mode build knob) and empirically by the probe.
 
 ### Next action
 
-Nothing pending on data breakpoints. The next roadmap item is the operator's
-choice — `DISASSEMBLY_PLAN.md` (disassembly + address breakpoints, DESIGNED, not
-built) is the ranked successor, and the two smaller gaps this increment left
-open, both written up in `DATA_BREAKPOINTS_PLAN.md` §"Deferred", are:
-
-- a watchpoint on a FIELD of an expanded object/record (needs expansion handles
-  to carry the address of what they expanded, not a heuristic);
-- applying a `setDataBreakpoints` that arrives while the target is RUNNING
-  (needs a pending-set queue plus a corrective `breakpoint` event).
+Nothing pending on increment 1. Increment 2 (`IDisassembler` interface + Zydis
+backend + symbolication, `DevTools\Disasm.exe`) is next, per
+`DISASSEMBLY_PLAN.md` "Increments" and "The seam". Not started.
 
 ## Standing constraint from the user
 
@@ -75,38 +90,22 @@ documented.
 
 ## State of the tree
 
-- `public-main`, with the increment 5 AND increment 6 work uncommitted. Release
-  **0.3.0 is committed but NOT tagged and NOT pushed**; no GitHub release exists.
-  The push is the outward-facing step and waits on the maintainer.
+- `public-main`, with this increment AND the prior data-breakpoints increment
+  (6/6, also DONE) both uncommitted. Release **0.3.0 is committed but NOT
+  tagged and NOT pushed**; no GitHub release exists.
 - Win32 support is functionally complete for `-$O-` targets. Debug-info format
   coverage (TD32, RSM, MAP, JCL, DCP, `.tds`) is closed; DCU is WON'T DO.
 
-## Open, not failing
-
-Two items carried in `KNOWN_UNKNOWNS.md`, both still true:
-
-- x86 loses a framed caller when a FRAMELESS routine sits between two framed ones
-  (`StackAcrossRtlCallback_...`, still `[Ignore]` TODO-RED). The design for the
-  recovery is written down there; the previous attempt failed because the
-  `finally`-handler address from the try/finally exception record sits in the same
-  gap and passed the old byte-scan test. It should now be rejected by
-  `X86Decode.CallSiteEndsAt`, which proves a candidate follows a real `call`.
-- Interface concrete-class label, x86 only: reverted after `EIntOverflow` inside
-  the RTTI readers failed the whole `variables` request. Cause NOT located, and
-  bisection did not converge — do not retry blindly.
-
-The remaining open defects (string arguments to a synthetic call, `Length()`
-returning `Int64`, `^Element` instead of `TArray<T>`, the unresolved-local binding
-to a garbage global, the MCP-vs-DAP warm-up asymmetry) are listed in
-`KNOWN_UNKNOWNS.md` and `MCP_LIVE_FINDINGS_TODO.md`.
-
 ## Traps
 
-`TRAPS.md`. The four that bite most often, repeated here because they cost whole
-sessions:
+`TRAPS.md`. The ones that bit this session:
 
-- Rebuild EVERY consumer of `DebuggerCore` before trusting a measurement —
-  `build_runner.bat` rebuilds neither the adapter nor the probes.
-- Never edit `DebuggerTests\TestTarget\*.pas` while the suite runs.
-- Never run the suite twice at once; a healthy run is ~400 s and is I/O-bound.
-- Prove a fix with a negative control, on both bitnesses and both fixtures.
+- Batch files need CRLF, not LF — an LF-only `.bat` tokenizes as garbage word
+  by word instead of erroring cleanly. `build_zydis.bat` hit this first.
+- A Delphi unit's `finalization` section requires a preceding `initialization`
+  section (even empty) — `finalization` alone is a parse error.
+- `ZydisGetVersion()` under-reports the patch digit of a patch release (see
+  above) — never gate DLL compatibility on an exact version match.
+- Rebuild EVERY consumer of `DebuggerCore` before trusting a measurement.
+- Never edit `DebuggerTests\TestTarget\*.pas` while the suite runs; never run
+  the suite twice at once (~400 s, I/O-bound).
