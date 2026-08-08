@@ -86,10 +86,12 @@ absurdly.
   whole lifetime; later calls are no-ops that return the cached outcome. A test
   that deliberately points it at a missing/bad DLL to prove the "unavailable"
   path therefore poisons every OTHER test in the SAME process that wanted a
-  real decode. Keep negative-DLL tests and positive-decode tests in separate
-  processes (`RunTests.exe` carries only the negative test;
-  `DevTools\Disasm.exe` proves the positive path manually) — never both in one
-  `RunTests` run.
+  real decode. `ZydisApi.ZydisResetForTests` (test-only, added increment 3)
+  clears the latch, so `DisassemblerTests.pas` now calls it as the FIRST
+  statement of every Zydis-touching test — negative-DLL and positive-decode
+  tests share `RunTests.exe` safely, in any order, as long as each test
+  resets before it cares about the outcome. Production code must never call
+  `ZydisResetForTests`.
 
 ## Proving a fix
 
@@ -122,6 +124,25 @@ absurdly.
 - **Validate any instruction-length decoder against a LARGE real binary.** 70 476
   spans showed zero unknown opcodes; 2 354 868 spans surfaced 61, one a real gap
   (AVX in `System.Move`). Trivial targets hide decoding gaps entirely.
+- **A second-decoder oracle can have its OWN scale limit — measure it before
+  blaming the decoder under test.** `DevTools\DisasmCoverage.exe`'s first
+  unsampled full sweep of a 500+ MB binary (2 377 660 spans, a ~100+ MB
+  synthetic image fed to dumpbin) reported 478 083 "boundary" divergences —
+  dumpbin silently produced NO output at many span-start addresses Zydis
+  decoded as ordinary code. A 33% sample of the SAME binary showed ZERO —
+  the sharp threshold (not a rate that scales with sample size) is what
+  proved it was dumpbin's own capacity limit at extreme single-section
+  scale, not a real per-instruction disagreement. Before trusting a
+  divergence count from ANY external tool at large scale, re-run at a
+  smaller sample and check whether the rate is stable.
+- **Capturing a large subprocess's stdout through an in-process pipe has a
+  ceiling; redirect to a FILE instead.** The same full sweep's dumpbin
+  output, captured via `ReadFile` into one Delphi string, failed outright
+  with `EEncodingError: Invalid count (-1158168115)` (an overflowed string
+  length) before the pipe capture was even the bottleneck being measured.
+  Fixed by redirecting the child's `hStdOutput` straight to a file
+  (`CreateProcess`) and parsing it back with a streaming `TStreamReader`,
+  never materialising the whole output as one string.
 
 ## Fixture design
 

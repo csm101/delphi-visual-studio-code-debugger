@@ -505,6 +505,143 @@ whitelist of the actual Zydis control-transfer mnemonics, not a bare
 0x2A` formats identically to a direct branch and would otherwise be
 mislabelled as a resolved call target.
 
+#### DisasmCoverage
+
+```bat
+rem drives the Visual Studio toolset first so dumpbin.exe is found without -dumpbin
+DevTools\run_disasm_coverage.bat <module1> [<module2> ...] [-maxspan N] [-sample N] [-maxdivs N]
+
+rem examples
+DevTools\run_disasm_coverage.bat DebuggerTests\TestTarget\Win64\Debug\TestTarget.exe DebuggerTests\TestTarget\Win32\Debug\TestTarget.exe
+DevTools\run_disasm_coverage.bat "C:\Program Files (x86)\Embarcadero\Studio\23.0\bin\rtl290.bpl"
+DevTools\run_disasm_coverage.bat C:\Athens\hydra_2\Win32\Debug\Hydra2SingleEXE.exe -sample 3
+```
+
+Differential coverage sweep (`DISASSEMBLY_PLAN.md` increment 3): feeds the
+SAME bytes to Zydis (via the real `IDisassembler`/`TZydisDisassembler`
+production backend) and to an INDEPENDENT oracle — dumpbin `/DISASM:BYTES`
+from the Visual Studio 2026 MSVC toolset — over real compiled binaries, and
+reports every case where the two decoders disagree about WHAT AN
+INSTRUCTION IS, not just formatting. This is the tool `X86DecodeProbe`
+already validates instruction LENGTHS against ground truth without any
+second decoder; `DisasmCoverage` is the equivalent check for Zydis's actual
+mnemonic identity, against a genuinely independent implementation.
+
+**Why dumpbin, not XED.** XED (`intelxed/xed`), the plan's other named
+candidate, is not installed on this machine and building it needs a
+Python + `mbuild` toolchain this project does not otherwise depend on.
+dumpbin ships with Visual Studio, is already used elsewhere in this repo
+(`dumpbin /exports`), and is reachable from a `.bat` via `VsDevCmd.bat` —
+`run_disasm_coverage.bat` does exactly that so `dumpbin.exe` is on `PATH`
+before `DisasmCoverage.exe` runs (pass `-dumpbin <path>` to override,
+or invoke `DisasmCoverage.exe` directly if `dumpbin.exe` is already on
+`PATH`).
+
+**Why not a blind whole-image dumpbin run.** `dumpbin /DISASM` disassembles
+an entire section LINEARLY with no notion of instruction boundaries beyond
+its own decode. Delphi binaries embed real DATA directly inside `.text`
+(RTTI/typeinfo string literals, jump tables, exception-handler tables), so a
+blind run walks into that data, decodes garbage, and its address cursor
+desyncs from real code PERMANENTLY — nothing tells it where to resync. The
+tool instead anchors every span it feeds to BOTH decoders at a KNOWN
+instruction boundary:
+
+- **Line-verified spans**, when the module carries embedded TD32 debug
+  info: every line-table RVA is a proven boundary (the compiler emitted a
+  source line for it), so consecutive RVAs within one routine bound a span
+  whose START and END are both real code. Highest confidence — this is the
+  SAME anchor set `X86DecodeProbe` already uses.
+- **Export-anchored spans**, when the module has NO debug info at all (the
+  shipped RTL/VCL runtime packages, `rtl290.bpl`/`vcl290.bpl`): a PE export
+  is a proven function START, but the END is NOT verified — capped at the
+  next export or `-maxspan` bytes (default 256), whichever is smaller, so
+  the window may still run into data before either decoder would stop on
+  its own. Reported as its own row, lower confidence, never conflated with
+  line-verified spans.
+
+Every selected span's bytes are copied verbatim out of the real module and
+concatenated into ONE synthetic in-memory buffer, each span followed by 20
+bytes of `$CC` (`INT3`). `$CC` as the FIRST byte of any decode attempt is
+unconditionally a 1-byte instruction in both engines — there is no
+multi-byte opcode beginning with `$CC` — so a run more than the 15-byte
+legal x86/x64 instruction-length ceiling guarantees both decoders
+resynchronise to the same address by the next span's start, regardless of
+how far either one drifted decoding the span itself. The buffer is wrapped
+in a minimal hand-built PE (DOS header, one `.text` section) so dumpbin has
+something to load; addresses in that file are therefore synthetic — only
+mnemonic identity and instruction LENGTH are ever compared, never the
+resolved operand address.
+
+**Divergence classes**, printed with the real module RVA (not the synthetic
+address) so a hit can be inspected with `DumpFunc.exe`:
+
+| class | meaning |
+|---|---|
+| `boundary` | at a Zydis instruction's own address, dumpbin has no instruction starting there at all — its own walk disagreed with Zydis's on an EARLIER instruction's length within this span |
+| `length` | both start at the same address but disagree on how many bytes the instruction occupies |
+| `refusal` | one decoder produced a mnemonic, the other refused (Zydis `db XX` / dumpbin's bytes-only line with no mnemonic) |
+| `mnemonic` | both decoded the SAME length but named it differently after alias normalisation |
+
+Formatting differences are normalised away BEFORE counting a mnemonic
+divergence — condition-code synonyms (`sete`/`setz`), the string-op family
+(`stosq`/`stos qword ptr [rdi]`), `sal`/`shl` (genuinely the same opcode),
+x87 duplicate-encoding digit suffixes (`fcomp3`/`fcomp5`/`fcomp`), legacy
+8087/80287 no-op opcodes (`feni8087_nop`/`feni`), `int3`/`int 3`,
+`ret far`/`retf`, and a few more — every entry built from a REAL measured
+divergence, documented with that example at its definition in
+`DisasmCoverage.dpr`, never guessed ahead of evidence.
+
+**dumpbin is driven through a FILE, never an in-process pipe capture.** A
+full sweep of a 500+ MB binary makes dumpbin emit gigabytes of text; the
+first implementation captured its stdout through a pipe into one Delphi
+string and failed outright at that scale (`EEncodingError: Invalid count
+(-1158168115)`, an overflowed string length). `RunToFile` redirects
+dumpbin's stdout straight to a temp file via `CreateProcess`, and
+`ParseDumpbinFile` streams it back with `TStreamReader` one line at a time —
+no in-memory ceiling.
+
+Arguments: `-maxspan N` caps an export-anchored span's window (default 256
+bytes). `-sample N` keeps every Nth span (default 1: full sweep — sampling
+is an explicit opt-in, never a silent cap; the summary line always states
+`full sweep: N spans (no sampling)` or `SAMPLED: N of M spans (every Kth
+span, X% of total)`). `-maxdivs N` caps how many divergences of EACH class
+are printed (default 25; the summary counts and percentages are never
+capped, only the listing). `-dumpbin <path>` / `-zydisdll <path>` override
+the normal search order.
+
+**Measured baseline (2026-08-08), full detail and classification of every
+divergence in `DISASSEMBLY_PLAN.md` "Verified in increment 3 — Half B":**
+
+| binary | bitness | methodology | spans | positions compared | clean spans | boundary | length | refusal | mnemonic |
+|---|---|---|---|---|---|---|---|---|---|
+| `TestTarget.exe` | x64 | line-verified, full | 1 303 | 7 812 | 100.00% | 0 | 0 | 0 | 0 |
+| `TestTarget.exe` | x86 | line-verified, full | 1 253 | 8 248 | 99.92% | 0 | 0 | 1 | 0 |
+| `TestSubject.bpl` | x64 | line-verified, full | 1 276 | 7 509 | 99.84% | 0 | 2 | 0 | 0 |
+| `TestSubject.bpl` | x86 | line-verified, full | 1 233 | 8 190 | 100.00% | 0 | 0 | 0 | 0 |
+| `rtl290.bpl` | x86 | export-anchored, full | 49 564 | 1 535 973 | 81.22% | 0 | 8 902 | 396 | 0 |
+| `vcl290.bpl` | x86 | export-anchored, full | 13 922 | 503 753 | 90.18% | 0 | 1 262 | 384 | 0 |
+| `Hydra2SingleEXE.exe` (505 MB) | x86 | line-verified, 33% sample | 792 554 / 2 377 660 | 5 294 297 | 99.98% | 0 | 76 | 101 | 0 |
+| `Hydra2SingleEXE.exe` (582 MB) | x64 | line-verified, 33% sample | 803 805 / 2 411 415 | 5 807 612 | 99.99% | 0 | 66 | 7 | 0 |
+
+**13 173 394 instruction positions compared, zero mnemonic-identity
+divergences**, after normalisation converged. Every `length` divergence
+manually inspected is data in the code stream (an inline exception-handler
+table on the Delphi fixtures; RTTI name-string literals past a short
+exported RTL routine's real end); every `refusal` is Zydis correctly naming
+an undocumented legacy opcode (`$D6` SALC, `$F1` INT1/ICEBP) dumpbin's own
+table does not know at all. A single UNSAMPLED full sweep of
+`Hydra2SingleEXE.exe` x86 (2 377 660 spans) also surfaced 478 083 `boundary`
+divergences that vanish entirely at the 33% sample — traced to dumpbin
+itself silently omitting output beyond an internal capacity threshold on
+the ~100+ MB synthetic image the full sweep produces, not a Zydis defect;
+full write-up in `DISASSEMBLY_PLAN.md`.
+
+**To reproduce or extend this baseline**: rebuild `DevTools` (`build_all.bat`
+already includes `DisasmCoverage`), then re-run the invocations above and
+compare against this table — a change that adds a real Zydis gap should show
+up as a NEW `mnemonic` divergence; a change to the normalisation table
+should be justified by a measured example the same way every entry above is.
+
 #### HexDump
 
 ```bat
@@ -852,12 +989,13 @@ its own.
 
 | File | Purpose |
 |------|---------|
-| `<Tool>.dpr` | One self-contained entry point per tool; there are 31 of them and no shared units other than `RsmReader.pas` |
+| `<Tool>.dpr` | One self-contained entry point per tool; there are 45 of them and no shared units other than `RsmReader.pas` |
 | `RsmReader.pas` | Standalone binary RSM analyzer, used only by `RsmAnalyzer` (separate from `DebuggerCore\RsmFileReader.pas`, which is the parser the adapter actually ships) |
 | `build_all.bat` | Builds every `*.dpr` in this folder |
 | `build_one.bat` | Builds a single tool, optionally into a private output directory |
 | `build_wow64stackprobe.bat` | Builds only `Wow64StackProbe` (64-bit by construction: the probe *is* the 64-bit debugger side) |
 | `run_wow64probe.bat` | Runs `Wow64StackProbe` with its output tee'd to a log file |
+| `run_disasm_coverage.bat` | Runs `DisasmCoverage` with the Visual Studio toolset initialised first, so `dumpbin.exe` is on `PATH` |
 | `devtool.bat` | Runs a built tool from `Win64\Debug` |
 | `..\setpaths.bat` | Resolves the JCL / DUnitX source roots |
 

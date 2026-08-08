@@ -25,76 +25,73 @@ longer true, delete it.
 
 ## Current task (2026-08-08)
 
-**`DISASSEMBLY_PLAN.md` increment 2 — `IDisassembler` seam + Zydis backend +
-symbolication + `DevTools\Disasm.exe`. DONE, not committed; left in the tree
-for review.**
+**`DISASSEMBLY_PLAN.md` increment 3 — measured coverage. DONE, not committed;
+left in the tree for review.** Full detail (exact numbers, methodology,
+classification of every divergence) lives in `DISASSEMBLY_PLAN.md` "Verified
+in increment 3 — Half A / Half B" — this cursor is a pointer, not a repeat.
 
-Deliverables, all present:
+Two halves, both landed:
 
-- `DebuggerCore\Disassembler.pas` — the seam: `IDisassembler`,
-  `TDisasmInstruction`, `TDisasmMachineMode`, `TDisasmByteReader`. No
-  third-party reference.
-- `DebuggerCore\ZydisDisassembler.pas` — `TZydisDisassembler`, the only unit
-  besides `ZydisApi.pas` allowed to reference Zydis.
-- `DebuggerCore\DebugTarget.pas` / `WinDebuggerBase.pas` — new
-  `IDebugTarget.ReadCodeMemoryAt` (restores planted-breakpoint bytes,
-  truncates at the `VirtualQueryEx` region boundary; shared unchanged by
-  `TWin32Debugger`). This is an interface addition beyond what the plan's
-  seam section specified — the plan named the need ("the engine already
-  keeps OrigByte") but not the shape; decided in favour of the smallest
-  addition reusing existing engine state, flagged in the report rather than
-  silently assumed.
-- `DebuggerTests\ValueReaderTests.pas` — `TFakeMemTarget` (the only other
-  `IDebugTarget` implementer) got a trivial `ReadCodeMemoryAt`.
-- `DebuggerTests\DisassemblerTests.pas` — 3 new tests, registered in
-  `RunTests.dpr`. Both negative-controlled RED (breakpoint-restore loop
-  disabled -> `Expected [204] equals actual [204]`; fail-closed guard
-  disabled -> "byte reader must never be invoked..."), then reverted green.
-- `DevTools\Disasm.dpr` — static file+RVA mode AND live-session mode (via
-  `TDebugSession`), argv-driven, no hardcoded target. Symbolication verified
-  on both bitnesses against `TestTarget.exe` with real resolved call
-  targets (`_InitExe`, `RunAllScenarios`, `TWidget.Create`, ...).
-- Docs updated in this change set: `DISASSEMBLY_PLAN.md` ("Verified in
-  increment 2"), `DAP_DEBUGGER_ARCHITECTURE.md` ("Disassembly seam"),
-  `DevTools\README.md` (`Disasm` tool entry), `TEST_CATALOG.md` ("M.
-  Disassembly"), `TRAPS.md` (ZydisApi one-shot-latch trap),
+- **Half A** — `ZydisApi.ZydisResetForTests` (test-only) makes the one-shot
+  DLL-load latch resettable, so `DebuggerTests\DisassemblerTests.pas` gained
+  `TZydisPositiveDecodeTests` (2 tests, real decode, both machine modes) and
+  `TCallTargetWhitelistTests` (1 test, regression guard for the increment-2
+  `push 0x2A` mislabelling bug) — all Zydis-touching fixtures now share
+  `RunTests.exe` safely regardless of execution order. Both negative
+  controls run and reverted (see the plan doc for exact failure text).
+- **Half B** — `DevTools\DisasmCoverage.exe` (+ `run_disasm_coverage.bat`):
+  differential sweep of Zydis vs dumpbin over real binaries. 13 173 394
+  instruction positions compared across `TestTarget.exe`/`TestSubject.bpl`
+  (both bitnesses, full sweep), `rtl290.bpl`/`vcl290.bpl` (full sweep,
+  export-anchored), and `Hydra2SingleEXE.exe` (505/582 MB, both bitnesses,
+  disclosed 33% sample) — **zero mnemonic-identity divergences** after
+  normalisation converged. Every non-mnemonic divergence manually classified
+  (data-in-code-stream, or Zydis correctly naming an undocumented opcode
+  dumpbin doesn't know). One genuine tooling artifact found and documented:
+  dumpbin itself silently drops output beyond an internal capacity threshold
+  on a single UNSAMPLED full sweep of the largest binary (478 083 spurious
+  "boundary" divergences that vanish at 33% sample) — not a Zydis defect.
+
+Full suite (`build_and_run.bat`, run once via the test-runner agent):
+**1087 found / 1083 passed / 0 failed / 0 errored / 4 ignored** — exact +3
+delta over the 1084/1080/0/0/4 baseline, matching the 3 new tests.
+
+### Files changed this session
+
+- `DebuggerCore\ZydisApi.pas` — `ZydisResetForTests` added (test-only).
+- `DebuggerCore\ZydisDisassembler.pas` — touched during a negative control,
+  reverted to byte-identical (`git status` shows no diff for this file).
+- `DebuggerTests\DisassemblerTests.pas` — 3 new tests + shared helpers
+  (`RepoRoot`, `RealZydisDllPath`, `MakeFixedBytesReader`,
+  `TAlwaysSymbolProvider`), registered in the `initialization` section.
+- `DevTools\DisasmCoverage.dpr` (new) + `DevTools\run_disasm_coverage.bat`
+  (new) — the differential sweep tool and its VS-toolset-initialising
+  wrapper.
+- Docs in this change set: `DISASSEMBLY_PLAN.md` (increment 3 status +
+  both "Verified in increment 3" sections + resolved the XED-vs-dumpbin
+  open question), `DevTools\README.md` (`DisasmCoverage` entry + measured
+  baseline table), `TEST_CATALOG.md` ("M. Disassembly" + "what the suite
+  does NOT prove" — the export-anchored methodology's weaker end-boundary
+  guarantee and the dumpbin scale artifact), `TRAPS.md` (Zydis latch trap
+  updated to mention the test-only reset; two new trap entries: oracle
+  scale limits, and pipe-vs-file subprocess capture at scale),
   `PROJECT_STATE.md` (one-line roadmap pointer updated).
 
-Full suite (`DebuggerTests\build_and_run.bat`, run once via the test-runner
-agent): **1084 found / 1080 passed / 0 failed / 0 errored / 4 ignored** —
-exact +3 delta over the 1081/1077/0/0/4 baseline, matching the 3 new tests.
-Both mono and BPL fixtures compiled and ran (parametrized into the single
-count).
+### Not done, not blocking
 
-### Real bug caught during manual verification (not by a test)
-
-First cut of call-target symbolication matched any `[A-Za-z]+ 0x<hex>` in
-Zydis's formatted text. `push 0x2A` (a plain immediate push) has that exact
-shape, and got mislabelled with a fabricated call-target symbol. Caught by
-eyeballing `DevTools\Disasm.exe` output, not by a unit test. Fixed with a
-CLOSED whitelist of the actual Zydis control-transfer mnemonics
-(`call`/`jmp`/every `Jcc`/`loop` family) in `ZydisDisassembler.pas`. No
-automated regression test guards this specific case — noted as a gap in
-`TEST_CATALOG.md` "M. Disassembly".
-
-### What is NOT covered by an automated test (documented gaps)
-
-- Trap 2 (truncate at a page/section boundary) — no fixture; exercised
-  manually only.
-- The positive Zydis decode path (real DLL, correct output) — deliberately
-  excluded from `RunTests.exe` because `ZydisApi.ZydisTryLoad` is a
-  one-shot process-wide latch (see `TRAPS.md`); proven via
-  `DevTools\Disasm.exe` instead.
-- Call-target symbolication / mnemonic-whitelist correctness — no
-  regression test.
+- Increment 3's own two disclosed weaknesses, already stated in the plan
+  doc rather than hidden: the export-anchored methodology (RTL/VCL, no
+  debug info) has an unverified span END, so its `length`-divergence count
+  is dominated by spans running into data, not decoder disagreement; and
+  the `Hydra2SingleEXE.exe` rows are a 33% sample, not a full sweep (the
+  full sweep DOES complete now after the `RunToFile`/streaming fix, in
+  ~5.7 minutes for the x86 binary, but hits the dumpbin scale artifact
+  described above, so the sample is the trustworthy number).
 
 ### Next action
 
-Increment 3 (`DISASSEMBLY_PLAN.md` "Increments"): differential coverage tool
-vs. an independent oracle (XED and/or `dumpbin /DISASM`), over fixtures and
-real binaries — record measured divergence counts in the plan. "Open, to
-verify before writing code" in the plan already flags the XED-vs-iced
-oracle choice as unresolved. Not started.
+Increment 4 (`DISASSEMBLY_PLAN.md` "Increments"): MCP `disassemble`. Not
+started.
 
 ## Standing constraint from the user
 
@@ -104,8 +101,8 @@ documented.
 
 ## State of the tree
 
-- `public-main`, with THIS increment, the prior disassembly increment 1, and
-  the prior data-breakpoints increment (6/6) all uncommitted. Release
+- `public-main`, with THIS increment, the prior disassembly increments 1-2,
+  and the prior data-breakpoints increment (6/6) all uncommitted. Release
   **0.3.0 is committed but NOT tagged and NOT pushed**; no GitHub release
   exists.
 - Win32 support is functionally complete for `-$O-` targets. Debug-info format
@@ -113,12 +110,15 @@ documented.
 
 ## Traps
 
-`TRAPS.md`. The one that bit this session:
+`TRAPS.md` has full detail. The ones that bit this session:
 
-- `ZydisApi.ZydisTryLoad` is a one-shot process-wide latch — a negative-DLL
-  test and a positive-decode test can never safely share a process. Full
-  detail now in `TRAPS.md`.
-- Rebuild EVERY consumer (`build_runner.bat`, `build_dap.bat`,
-  `build_mcp.bat`, `DevTools\build_all.bat`) before trusting a measurement —
-  all four were rebuilt clean in this session after the `IDebugTarget`
-  interface change.
+- `ZydisApi.ZydisTryLoad`'s one-shot latch is now resettable in tests via
+  `ZydisResetForTests` — production code must never call it.
+- A second-decoder oracle (dumpbin here) can have its OWN scale limit;
+  measure at a smaller sample before trusting a large divergence count.
+- Capturing a large subprocess's stdout through an in-process pipe has a
+  ceiling (`EEncodingError` on an overflowed string) — redirect to a file
+  and stream it back instead.
+- Rebuild EVERY consumer (`build_runner.bat`, `DevTools\build_all.bat`)
+  before trusting a measurement — both rebuilt clean this session after the
+  `ZydisApi.pas` change.

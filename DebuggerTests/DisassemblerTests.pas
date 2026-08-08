@@ -1,19 +1,38 @@
 unit DisassemblerTests;
 
-// Tests for the IDisassembler seam (DISASSEMBLY_PLAN.md increment 2).
+// Tests for the IDisassembler seam (DISASSEMBLY_PLAN.md increments 2 and 3).
 //
-// Two independent groups, deliberately kept apart:
+// Increment 2 shipped with the negative (DLL-missing) path proven here and
+// the positive (real decode) path proven only manually, via DevTools\
+// Disasm.exe -- because ZydisApi.ZydisTryLoad is a ONE-SHOT, process-wide
+// latch (see ZydisApi.pas): the first call in the process decided the
+// outcome for the WHOLE process lifetime, so a negative-DLL test and a
+// positive-decode test could never safely share RunTests.exe.
 //
-//   TDisassemblerBackendTests -- the "unavailable" path, which needs NO copy
-//   of Zydis.dll anywhere. This is the path every user without the VC++
-//   runtime hits, and it is the only Zydis-related coverage that belongs in
-//   this suite: ZydisApi.ZydisTryLoad is a ONE-SHOT, process-wide latch (see
-//   ZydisApi.pas) -- the first call in the process decides the outcome for
-//   its whole lifetime. A test that deliberately points it at a missing DLL
-//   would poison every later test in the same process that wanted a REAL
-//   decode, so this suite does not attempt one; DevTools\Disasm.exe is where
-//   the positive (DLL-present) path is exercised, against real binaries, with
-//   real symbolication (see DevTools\README.md).
+// Increment 3 removed that constraint at the root: ZydisApi.ZydisResetForTests
+// (test-only) clears the latch, so every test below that cares about a
+// specific outcome calls it FIRST, regardless of what any earlier test in the
+// same process left behind. That makes the whole file order-independent --
+// proven by running the suite with DUnitX's default (effectively arbitrary)
+// ordering, not by controlling it.
+//
+// Four independent groups:
+//
+//   TDisassemblerBackendTests -- the "unavailable" path: Available=False,
+//   Disassemble returns empty, the byte reader is never invoked at all.
+//
+//   TZydisPositiveDecodeTests -- the REAL decode path, both machine modes,
+//   against the actual Zydis.dll and hand-picked byte sequences whose
+//   correct decode was already measured and documented in increment 1
+//   (DevTools\README.md's DisasmProbe entry) -- known bytes in, known
+//   mnemonics out.
+//
+//   TCallTargetWhitelistTests -- regression guard for the bug increment 2
+//   found by hand: the FIRST call-target annotator matched any
+//   `<word> 0x<hex>` and mislabelled `push 0x2A` (an immediate push, same
+//   text shape as a resolved branch) as a call into whatever symbol sits at
+//   $2A. Fixed with a closed mnemonic whitelist in ZydisDisassembler.pas;
+//   this test is the automated guard that never existed for it before.
 //
 //   TReadCodeMemoryAtTests / TReadCodeMemoryAtWin32Tests -- prove trap 1 at
 //   the ENGINE level (IDebugTarget.ReadCodeMemoryAt), independent of Zydis
@@ -35,8 +54,31 @@ type
     // why, Disassemble must return an EMPTY array (never fabricate a `db`
     // stream by reading memory anyway), and the byte reader must never be
     // invoked at all -- fail closed BEFORE touching memory, not after a
-    // failed attempt.
+    // failed attempt. Calls ZydisResetForTests first so the outcome does not
+    // depend on whether a positive-decode test already ran in this process.
     [Test] procedure Unavailable_WhenDllMissing_DisassembleReturnsEmptyAndNeverReads;
+  end;
+
+  [TestFixture]
+  TZydisPositiveDecodeTests = class
+  public
+    // Real bytes in, expected Zydis mnemonics out -- the path increment 2
+    // proved only by hand (DevTools\Disasm.exe). Calls ZydisResetForTests
+    // first so this passes regardless of whether the negative-DLL test
+    // already ran in this process.
+    [Test] procedure Long64_KnownPrologueBytes_DecodeToExpectedMnemonics;
+    [Test] procedure Legacy32_KnownPrologueBytes_DecodeToExpectedMnemonics;
+  end;
+
+  [TestFixture]
+  TCallTargetWhitelistTests = class
+  public
+    // The exact bug found by hand during increment 2: `push 0x2A` has the
+    // same 'mnemonic 0x<hex>' text shape a resolved call/jmp target does.
+    // With a symbol provider that answers EVERY address, an open
+    // `[A-Za-z]+ 0x<hex>` match would append a fabricated "; <name>"
+    // comment; the closed whitelist must not.
+    [Test] procedure PushImmediate_NeverAnnotatedAsCallTarget;
   end;
 
   [TestFixture]
@@ -72,13 +114,53 @@ implementation
 
 uses
   System.SysUtils, System.Classes, Winapi.Windows,
-  Disassembler, ZydisDisassembler,
+  Disassembler, ZydisDisassembler, ZydisApi,
+  DebugInfoSet, DebugInfoTypes,
   DebugSession, DebugSessionTypes, DebugTarget;
+
+// Shared by every fixture below that needs the real Zydis.dll: RunTests.exe
+// lives at DebuggerTests\Win64\Debug\RunTests.exe, three levels below the
+// repo root -- same convention TReadCodeMemoryAtTests.RepoRoot uses below,
+// pulled out here once because it is bitness-independent (Zydis.dll is a
+// single x64 DLL that decodes both machine modes).
+function RepoRoot: string;
+begin
+  Result := ExpandFileName(ExtractFilePath(ParamStr(0)) + '..\..\..\');
+end;
+
+function RealZydisDllPath: string;
+begin
+  Result := RepoRoot + 'ThirdParty\Zydis\bin\x64\Zydis.dll';
+end;
+
+// Feeds bytes out of a fixed in-memory buffer, VA-addressed from BaseVA --
+// what both TZydisPositiveDecodeTests and TCallTargetWhitelistTests need
+// instead of a live process or a file on disk.
+function MakeFixedBytesReader(BaseVA: UInt64; const Data: TBytes): TDisasmByteReader;
+begin
+  Result :=
+    function(VA: UInt64; Buf: Pointer; Size: Integer): Integer
+    begin
+      var Offset := Int64(VA) - Int64(BaseVA);
+      if (Offset < 0) or (Offset >= Length(Data)) then
+        Exit(0);
+      var Avail := Int64(Length(Data)) - Offset;
+      if Avail > Size then
+        Avail := Size;
+      Move(Data[Offset], Buf^, Avail);
+      Result := Integer(Avail);
+    end;
+end;
 
 { TDisassemblerBackendTests }
 
 procedure TDisassemblerBackendTests.Unavailable_WhenDllMissing_DisassembleReturnsEmptyAndNeverReads;
 begin
+  // Order-independence: a positive-decode test earlier in this process left
+  // the one-shot latch pointed at the REAL DLL. Reset it so this test's
+  // outcome depends only on the bad path it passes below, not on run order.
+  ZydisResetForTests;
+
   var ReaderCalled := False;
   var Reader: TDisasmByteReader :=
     function(VA: UInt64; Buf: Pointer; Size: Integer): Integer
@@ -101,6 +183,151 @@ begin
   Assert.IsFalse(ReaderCalled,
     'the byte reader must never be invoked when the backend is unavailable -- ' +
     'fail closed before touching memory, not fail after an attempt');
+end;
+
+{ TZydisPositiveDecodeTests }
+
+procedure TZydisPositiveDecodeTests.Long64_KnownPrologueBytes_DecodeToExpectedMnemonics;
+begin
+  // Order-independence: reset the latch first so this passes whether or not
+  // the negative-DLL test already ran (and poisoned Available=False) in this
+  // process. Real Zydis.dll from here on.
+  ZydisResetForTests;
+
+  // The standard Delphi x64 prologue, measured byte-for-byte and text-for-text
+  // in increment 1 (DevTools\README.md, DisasmProbe entry, TestTarget.exe
+  // entry point): push rbp / push rbx / sub rsp,0x98 / mov rbp,rsp.
+  const BaseVA = UInt64($140001000);
+  var Bytes: TBytes := [$55, $53, $48, $81, $EC, $98, $00, $00, $00, $48, $8B, $EC];
+  var Reader := MakeFixedBytesReader(BaseVA, Bytes);
+
+  var Disasm: IDisassembler := TZydisDisassembler.Create(dmmLong64, Reader, nil, 0, RealZydisDllPath);
+  Assert.IsTrue(Disasm.Available, 'real Zydis.dll must load: ' + Disasm.StatusText);
+
+  var Insns := Disasm.Disassemble(BaseVA, 4);
+  Assert.AreEqual<Integer>(4, Length(Insns), 'expected exactly 4 instructions from the known prologue bytes');
+  Assert.IsTrue(Insns[0].Decoded, 'push rbp must decode');
+  Assert.AreEqual('push rbp', Insns[0].Text);
+  Assert.IsTrue(Insns[1].Decoded, 'push rbx must decode');
+  Assert.AreEqual('push rbx', Insns[1].Text);
+  Assert.IsTrue(Insns[2].Decoded, 'sub rsp, 0x98 must decode');
+  Assert.AreEqual('sub rsp, 0x98', Insns[2].Text);
+  Assert.IsTrue(Insns[3].Decoded, 'mov rbp, rsp must decode');
+  Assert.AreEqual('mov rbp, rsp', Insns[3].Text);
+end;
+
+procedure TZydisPositiveDecodeTests.Legacy32_KnownPrologueBytes_DecodeToExpectedMnemonics;
+begin
+  ZydisResetForTests;
+
+  // The standard Delphi x86 prologue, measured in increment 1 (same source as
+  // above, TestTarget.exe Win32 entry point): push ebp / mov ebp,esp /
+  // add esp,0xFFFFFFC8 / push ebx.
+  const BaseVA = UInt64($00401000);
+  var Bytes: TBytes := [$55, $8B, $EC, $83, $C4, $C8, $53];
+  var Reader := MakeFixedBytesReader(BaseVA, Bytes);
+
+  var Disasm: IDisassembler := TZydisDisassembler.Create(dmmLegacy32, Reader, nil, 0, RealZydisDllPath);
+  Assert.IsTrue(Disasm.Available, 'real Zydis.dll must load: ' + Disasm.StatusText);
+
+  var Insns := Disasm.Disassemble(BaseVA, 4);
+  Assert.AreEqual<Integer>(4, Length(Insns), 'expected exactly 4 instructions from the known prologue bytes');
+  Assert.IsTrue(Insns[0].Decoded, 'push ebp must decode');
+  Assert.AreEqual('push ebp', Insns[0].Text);
+  Assert.IsTrue(Insns[1].Decoded, 'mov ebp, esp must decode');
+  Assert.AreEqual('mov ebp, esp', Insns[1].Text);
+  Assert.IsTrue(Insns[2].Decoded, 'add esp, 0xFFFFFFC8 must decode');
+  Assert.AreEqual('add esp, 0xFFFFFFC8', Insns[2].Text);
+  Assert.IsTrue(Insns[3].Decoded, 'push ebx must decode');
+  Assert.AreEqual('push ebx', Insns[3].Text);
+end;
+
+{ TCallTargetWhitelistTests }
+
+type
+  // Answers EVERY RVA with a fabricated name, so a whitelist regression
+  // (matching a non-branch mnemonic as a resolved call target) would have
+  // something to wrongly annotate WITH. A provider that only answered real
+  // addresses could pass even with the bug back, if it happened not to know
+  // a name at the specific address under test.
+  TAlwaysSymbolProvider = class(TInterfacedObject, IFunctionNameProvider)
+  public
+    function RvaToFunctionName(Rva: UInt64; out Name: string): Boolean;
+    function RvaToFunctionStart(Rva: UInt64; out FuncRva: UInt64): Boolean;
+    function NameToRva(const Name: string; out Rva: UInt64): Boolean;
+    function GetEnclosingProcedure(const Inner: string; out Parent: string): Boolean;
+    function GetEnclosingProcedureByRva(InnerRva: UInt64; out Parent: string): Boolean;
+    function GetEnclosingProcedureRvaByRva(InnerRva: UInt64; out ParentRva: UInt64): Boolean;
+  end;
+
+function TAlwaysSymbolProvider.RvaToFunctionName(Rva: UInt64; out Name: string): Boolean;
+begin
+  Name := Format('FakeSym_%x', [Rva]);
+  Result := True;
+end;
+
+function TAlwaysSymbolProvider.RvaToFunctionStart(Rva: UInt64; out FuncRva: UInt64): Boolean;
+begin
+  FuncRva := Rva;   // offset 0 -- keeps SymbolAt's output simple to assert against
+  Result := True;
+end;
+
+function TAlwaysSymbolProvider.NameToRva(const Name: string; out Rva: UInt64): Boolean;
+begin
+  Result := False;
+end;
+
+function TAlwaysSymbolProvider.GetEnclosingProcedure(const Inner: string; out Parent: string): Boolean;
+begin
+  Result := False;
+end;
+
+function TAlwaysSymbolProvider.GetEnclosingProcedureByRva(InnerRva: UInt64; out Parent: string): Boolean;
+begin
+  Result := False;
+end;
+
+function TAlwaysSymbolProvider.GetEnclosingProcedureRvaByRva(InnerRva: UInt64; out ParentRva: UInt64): Boolean;
+begin
+  Result := False;
+end;
+
+procedure TCallTargetWhitelistTests.PushImmediate_NeverAnnotatedAsCallTarget;
+begin
+  ZydisResetForTests;
+
+  // PUSH imm8 (0x2A), sign-extended -- Zydis's own formatter prints this as
+  // 'push 0x2a', the EXACT 'mnemonic 0x<hex>' shape a resolved direct
+  // call/jmp/jcc target also has (DISASSEMBLY_PLAN.md "Verified in increment
+  // 2"). ImageBase=0 so the instruction's own VA IS the RVA a symbol lookup
+  // would use, and the fake provider below answers a name for literal
+  // address $2A -- exactly the operand this instruction pushes -- so an open
+  // mnemonic match has something concrete to wrongly annotate with.
+  const BaseVA = UInt64($1000);
+  var Bytes: TBytes := [$6A, $2A];
+  var Reader := MakeFixedBytesReader(BaseVA, Bytes);
+
+  var Symbols := TDebugInfoSet.Create;
+  try
+    var Fake: IFunctionNameProvider := TAlwaysSymbolProvider.Create;
+    Symbols.AddProvider(Fake);
+
+    var Disasm: IDisassembler := TZydisDisassembler.Create(dmmLong64, Reader, Symbols, 0, RealZydisDllPath);
+    Assert.IsTrue(Disasm.Available, 'real Zydis.dll must load: ' + Disasm.StatusText);
+
+    var Insns := Disasm.Disassemble(BaseVA, 1);
+    Assert.AreEqual<Integer>(1, Length(Insns));
+    Assert.IsTrue(Insns[0].Decoded, 'push 0x2A must decode');
+    Assert.IsTrue(Insns[0].Text.StartsWith('push', True),
+      'expected a push mnemonic, got: ' + Insns[0].Text);
+    Assert.IsFalse(Insns[0].Text.Contains(';'),
+      'a plain immediate push must NEVER be annotated as a resolved call/jmp target -- ' +
+      '''push 0x2A'' has the exact ''mnemonic 0x<hex>'' shape a direct branch target does, ' +
+      'and an open [A-Za-z]+ 0x<hex> match mislabelled it during increment 2 development ' +
+      '(fixed with the closed control-transfer whitelist in ZydisDisassembler.pas)');
+  finally
+    Symbols.Free;
+  end;
 end;
 
 { shared marker/path helpers -- duplicated (not shared) deliberately: each
@@ -258,6 +485,8 @@ end;
 
 initialization
   TDUnitX.RegisterTestFixture(TDisassemblerBackendTests);
+  TDUnitX.RegisterTestFixture(TZydisPositiveDecodeTests);
+  TDUnitX.RegisterTestFixture(TCallTargetWhitelistTests);
   TDUnitX.RegisterTestFixture(TReadCodeMemoryAtTests);
   TDUnitX.RegisterTestFixture(TReadCodeMemoryAtWin32Tests);
 

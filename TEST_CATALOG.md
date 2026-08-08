@@ -493,7 +493,7 @@ fixture):
 - [ ] Set clipboard text
 - [ ] Class with > 30 fields -- truncated representation
 
-## M. Disassembly (DISASSEMBLY_PLAN.md increment 2)
+## M. Disassembly (DISASSEMBLY_PLAN.md increments 2-3)
 
 - [x] Backend reports `Available=False` with a non-empty `StatusText` and
       `Disassemble` returns an empty array -- WITHOUT ever invoking the byte
@@ -508,19 +508,43 @@ fixture):
       than fails) -- no automated fixture; exercised manually via
       `DevTools\Disasm.exe` (static mode truncates at file EOF, live mode at
       the `VirtualQueryEx` region boundary in `ReadCodeMemoryAt`)
-- [ ] The positive decode path (real `Zydis.dll`, correct bytes/mnemonics) --
-      deliberately NOT in the automated suite: `ZydisApi.ZydisTryLoad` is a
-      one-shot, process-wide latch, so a negative-DLL test sharing the process
-      with a positive one would poison it (see `DisassemblerTests.pas`
-      header). Proven manually via `DevTools\Disasm.exe` against
-      `TestTarget.exe` on both bitnesses, including a symbolicated call
-      target in each.
-- [ ] Call-target symbolication correctness (mnemonic whitelist, name+offset
-      annotation) -- no automated fixture; verified manually. Caught and fixed
-      a real bug during development: an open `[A-Za-z]+ 0x<hex>` match
-      mislabelled `push 0x2A` as a resolved call target, because a plain
-      immediate operand formats identically to a direct branch target. Fixed
-      with a closed whitelist of the actual Zydis control-transfer mnemonics.
+- [x] The positive decode path (real `Zydis.dll`, correct bytes/mnemonics),
+      both machine modes -- increment 3 made `ZydisApi.ZydisTryLoad`'s
+      one-shot latch resettable (`ZydisResetForTests`, test-only), removing
+      the reason this was excluded before. Known prologue bytes measured in
+      increment 1 decode to the expected mnemonics
+      (`TZydisPositiveDecodeTests.Long64_KnownPrologueBytes_DecodeToExpectedMnemonics`
+      / `.Legacy32_KnownPrologueBytes_DecodeToExpectedMnemonics`). All
+      Zydis-touching fixtures in `DisassemblerTests.pas` (this one, the
+      negative-DLL test, the whitelist regression below, and both
+      `ReadCodeMemoryAt` fixtures) run together in ONE process and pass
+      regardless of DUnitX's own execution order -- proven by running them
+      together, not assumed. `DevTools\Disasm.exe` remains the manual
+      end-to-end demonstration against real binaries with real
+      symbolication.
+- [x] Call-target symbolication correctness (mnemonic whitelist) -- the exact
+      bug found by hand during increment 2 development now has an automated
+      regression guard: `push 0x2A` fed through `TZydisDisassembler` with a
+      fake symbol provider that answers a name for EVERY address must never
+      grow a `"; <name>"` comment
+      (`TCallTargetWhitelistTests.PushImmediate_NeverAnnotatedAsCallTarget`).
+      Negative-controlled: reverting `FBranchTargetRe` to the pre-fix open
+      `[A-Za-z]+ 0x<hex>` pattern fails the test with the exact bug
+      description in the assertion message.
+- [x] Differential coverage of Zydis's actual decode against an independent
+      oracle (dumpbin), over real binaries at real scale -- increment 3,
+      `DevTools\DisasmCoverage.exe`. Not a DUnitX fixture (it is a
+      measurement tool, not a fast repeatable assertion — a full sweep of
+      the largest binary takes minutes), so tracked here as a `[x]` because
+      the measurement itself is done and recorded, not because it runs in
+      `RunTests.exe`. 13 173 394 instruction positions compared across
+      `TestTarget.exe` (both bitnesses), `TestSubject.bpl` (both
+      bitnesses), `rtl290.bpl`, `vcl290.bpl`, and both bitnesses of a
+      500+ MB real production binary (33% sample, disclosed): zero
+      mnemonic-identity divergences. Full numbers, classification of every
+      non-mnemonic divergence, and the dumpbin-scale artifact this sweep
+      surfaced are in `DISASSEMBLY_PLAN.md` "Verified in increment 3 — Half
+      B" and `DevTools\README.md`'s `DisasmCoverage` entry.
 - [ ] MCP `disassemble` / DAP `disassemble` request -- out of scope here,
       increments 4 and 6 of `DISASSEMBLY_PLAN.md`.
 
@@ -556,6 +580,24 @@ never gave. Recovered from `TASK_RESUME.md` when that file was cut back.
 - **`SkipIfNoRsm(reason)` skips ONLY the mono scenario** under `NO_RSM=1`; BPL and
   RSM-on mono still execute, so a green `NO_RSM` run is not proof that those
   capabilities work without RSM.
+- **A green `RunTests.exe` proves the disassembly SEAM, not decoder
+  coverage.** `DisassemblerTests.pas`'s positive-decode tests (increment 3)
+  check four known instructions on each bitness -- real, but tiny. The
+  actual coverage claim ("Zydis agrees with an independent oracle at scale")
+  comes from `DevTools\DisasmCoverage.exe`, a separate measurement tool that
+  is NOT part of `RunTests.exe` and does not run on every suite invocation
+  -- its numbers are only as current as the last time someone re-ran it
+  (`DISASSEMBLY_PLAN.md` "Verified in increment 3 — Half B" records when).
+  Within that tool's own numbers: the export-anchored methodology (used for
+  `rtl290.bpl`/`vcl290.bpl`, which ship with no debug info) has an
+  UNVERIFIED span end, so its `length`-divergence count is dominated by
+  spans running into data past a short routine's real end, not decoder
+  disagreement -- stated in the tool's own output, not silently absorbed
+  into a clean-looking percentage. And a single UNSAMPLED full sweep of the
+  largest binary surfaced a genuine dumpbin-side scale artifact (478 083
+  `boundary` divergences that vanish at a 33% sample of the SAME binary) --
+  a reminder that the oracle itself can have limits worth measuring, not
+  just the thing being checked against it.
 
 ### Fixture-design rules that follow from the above
 

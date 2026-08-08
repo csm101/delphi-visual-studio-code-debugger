@@ -1,6 +1,6 @@
 # Disassembly and address breakpoints — plan
 
-Status: **increment 2 landed, not committed** (2026-08-08). This document is the
+Status: **increment 3 landed, not committed** (2026-08-08). This document is the
 agreed design; `PROJECT_STATE.md` carries only the one-line roadmap entry
 pointing here.
 
@@ -215,8 +215,25 @@ Decisions:
 2. **DONE, not committed (2026-08-08).** `IDisassembler` + Zydis backend +
    symbolication of the output. `DevTools\Disasm.exe`. Full detail in
    "Verified in increment 2" below.
-3. Differential coverage tool vs the oracle, over the fixtures and the real
-   binaries. Record the measured numbers in this file.
+3. **DONE, not committed (2026-08-08).** Two halves, both about honesty of
+   coverage rather than new decoder features:
+   - **Half A** closed the coverage hole increment 2 left: the positive
+     (real-DLL) Zydis decode path and the call-target mnemonic whitelist had
+     no automated regression coverage, because `ZydisApi.ZydisTryLoad`'s
+     one-shot latch made a negative-DLL test and a positive-decode test
+     mutually exclusive within one process. `ZydisApi.ZydisResetForTests`
+     (test-only) removes that constraint. Full detail in "Verified in
+     increment 3 — Half A" below.
+   - **Half B** built `DevTools\DisasmCoverage.exe`, a differential sweep
+     against dumpbin (chosen over XED — see "Open, to verify before writing
+     code" below, now resolved) over real binaries at real scale: both
+     `TestTarget.exe` bitnesses, `TestSubject.bpl` both bitnesses,
+     `rtl290.bpl` + `vcl290.bpl`, and both bitnesses of a 500+ MB real
+     production single-EXE build (Hydra2SingleEXE.exe). Full detail,
+     including the sampling disclosure and a genuine dumpbin-scale artifact
+     it surfaced, in "Verified in increment 3 — Half B" below and
+     `DevTools\README.md`'s `DisasmCoverage` entry.
+   - Full suite after both halves: see "Verified in increment 3 — Half A".
 4. MCP `disassemble`.
 5. Address breakpoints in `DebugSession` (module+RVA identity, deferred bind),
    then the MCP tool, then `setInstructionBreakpoints` over DAP.
@@ -365,10 +382,205 @@ Decisions:
   $00000000000F4EA5  E8 5A 42 FF FF   call 0x000E9104  ; TWidget.Create [Testtarget+0x2D]  ; TestTarget.dpr:29
   ```
 
+## Verified in increment 3 — Half A (coverage hole closed)
+
+- **`ZydisApi.ZydisResetForTests`** (test-only, documented as such in its own
+  comment) frees the loaded module if any and clears `GLoadAttempted` /
+  `GDisassembleIntel` / `GGetVersionFunc` / `GStatusText`, so the ONE-SHOT
+  latch can be re-driven from a clean state. Production code never calls it;
+  `ZydisTryLoad`'s one-shot contract is unchanged for every other caller.
+- **`DebuggerTests\DisassemblerTests.pas`** gained three fixtures, each
+  calling `ZydisResetForTests` as its OWN first statement (not relying on
+  fixture setup/teardown ordering across different classes) so every test's
+  outcome depends only on what IT does, never on what ran before it in the
+  same process:
+  - `TZydisPositiveDecodeTests` — two tests, real `Zydis.dll`, hand-picked
+    byte sequences whose correct decode was already measured in increment 1
+    (`DevTools\README.md`'s `DisasmProbe` entry): the x64 prologue
+    `55 53 48 81 EC 98 00 00 00 48 8B EC` decodes to `push rbp` / `push rbx`
+    / `sub rsp, 0x98` / `mov rbp, rsp`; the x86 prologue
+    `55 8B EC 83 C4 C8 53` decodes to `push ebp` / `mov ebp, esp` /
+    `add esp, 0xFFFFFFC8` / `push ebx`.
+  - `TCallTargetWhitelistTests` — one test, the exact bug increment 2 found
+    by hand: `push 0x2A` ($6A $2A) fed to `TZydisDisassembler` with a fake
+    `IFunctionNameProvider` that answers a name for EVERY RVA (so a
+    regression has something concrete to wrongly annotate with) must never
+    grow a `"; <name>"` comment.
+- **Order-independence, proven, not assumed.** All 6 Zydis-touching fixtures
+  in the file (the pre-existing negative-DLL test, the two new positive-
+  decode tests, the new whitelist test, and the two `ReadCodeMemoryAt`
+  fixtures) run in ONE `RunTests.exe` process via
+  `RUNTESTS_ONLY=DisassemblerTests`: 6 found / 6 passed, regardless of
+  DUnitX's own execution order (not registration order — the negative test
+  did not run first).
+- **Negative-controlled, both fixes.**
+  - `ZydisResetForTests` turned into a no-op (`Exit;` as its first
+    statement): the same 6-test combined run drops to 5 passed / 1 failed —
+    `TDisassemblerBackendTests.Unavailable_WhenDllMissing_DisassembleReturnsEmptyAndNeverReads`
+    fails with `Condition is True when False expected. a missing DLL must
+    report Available=False`, because an earlier positive-decode test in the
+    same process left the latch pointed at the real DLL. This is the exact
+    cross-contamination the fix removes, reproduced by removing the fix.
+  - `ZydisDisassembler.pas`'s `FBranchTargetRe` reverted to the pre-increment-2
+    open pattern `^([A-Za-z]+) 0x([0-9A-Fa-f]+)$`: `TCallTargetWhitelistTests`
+    fails with `Condition is True when False expected. a plain immediate push
+    must NEVER be annotated as a resolved call/jmp target -- 'push 0x2A' has
+    the exact 'mnemonic 0x<hex>' shape a direct branch target does, and an
+    open [A-Za-z]+ 0x<hex> match mislabelled it during increment 2
+    development (fixed with the closed control-transfer whitelist in
+    ZydisDisassembler.pas)`.
+  - Both reverted back afterward; `DevTools\build_all.bat` and
+    `build_runner.bat` rebuilt clean.
+- Full suite (`DebuggerTests\build_and_run.bat`, run once via the
+  test-runner agent): **1087 found / 1083 passed / 0 failed / 0 errored /
+  4 ignored** — exact +3 delta over the increment 2 baseline
+  (1084/1080/0/0/4), matching the three new tests. Both mono and BPL
+  fixtures compiled and ran (parametrized into the single count).
+
+## Verified in increment 3 — Half B (differential coverage sweep)
+
+**Oracle: dumpbin `/DISASM:BYTES`, not XED.** XED (`intelxed/xed`) is not
+installed on this machine and building it needs a Python + `mbuild`
+toolchain this project does not otherwise depend on — a real cost, not a
+preference. dumpbin ships with Visual Studio 2026
+(`C:\Program Files\Microsoft Visual Studio\18\Community\VC\Tools\MSVC\
+14.51.36231\bin\Hostx64\x64\dumpbin.exe`, not on `PATH` by default — reached
+through `VsDevCmd.bat`, see `DevTools\run_disasm_coverage.bat`), is already
+used elsewhere in this repo (`dumpbin /exports`, `PROVENANCE.md`), and is an
+independent x86/x64 decoder built by a different vendor with a different
+opcode table implementation, satisfying the plan's "independent oracle"
+requirement.
+
+**Methodology.** `dumpbin /DISASM` has no "decode this byte range" mode — it
+disassembles an entire PE section LINEARLY with no notion of instruction
+boundaries beyond its own decode, and Delphi binaries embed real DATA
+directly inside `.text` (RTTI/typeinfo string literals, jump tables,
+exception-handler tables), so a blind whole-image run walks into that data,
+decodes garbage, and its address cursor desyncs from real code permanently.
+`DevTools\DisasmCoverage.exe` anchors every span to a KNOWN instruction
+boundary instead — the same idea `X86DecodeProbe` already uses for a
+different purpose, extended to a second, independent decoder:
+
+- **Line-verified spans** (when the module carries embedded TD32 debug
+  info): every line-table RVA is a proven boundary, so consecutive RVAs
+  within one routine bound a span whose START and END are both real code.
+  Highest confidence.
+- **Export-anchored spans** (modules with NO debug info at all — the shipped
+  RTL/VCL packages): a PE export is a proven START, but the END is capped at
+  the next export or a fixed byte budget (default 256), NOT verified, so the
+  window may run into data before either decoder would stop on its own.
+  Lower confidence, reported separately.
+
+Every span's bytes are copied verbatim out of the real module and
+concatenated into ONE synthetic buffer, each span followed by 20 bytes of
+`$CC` (`INT3` — unconditionally a 1-byte decode as the first byte read in
+both engines, so a run more than the 15-byte legal instruction-length
+ceiling guarantees both decoders resynchronise to the same address by the
+next span's start regardless of how far either drifted inside the span
+itself). The buffer is wrapped in a minimal hand-built PE (one `.text`
+section) so dumpbin has something to load; only mnemonic identity and
+instruction length are ever compared, never the resolved (synthetic)
+operand addresses.
+
+**Formatting normalisation, built empirically from real divergences, not
+guessed ahead of evidence** (all documented with the measured example at the
+point of definition in `DisasmCoverage.dpr`): Jcc/SETcc/CMOVcc condition-code
+synonyms (`sete`/`setz`, `jc`/`jb`, ...); `stosq`/`stos qword ptr [rdi]` and
+the rest of the string-op family; `sal`/`shl` (genuinely the same opcode);
+x87 duplicate-encoding digit suffixes (`fcomp3`/`fcomp5`/`fcomp`); legacy
+8087/80287 no-op opcodes (`feni8087_nop`/`feni`, `fsetpm287_nop`/`fsetpm`);
+`int3`/`int 3`; `ret far`/`retf`; `wait`/`fwait`; `aamb`/`aam`,
+`aadb`/`aad`. One measured bug in this normalisation itself is recorded
+below, because it was found by the tool's own first full-scale run, not by
+inspection.
+
+**Measured coverage (2026-08-08), after normalisation converged to zero
+mnemonic divergences everywhere below:**
+
+| binary | bitness | methodology | spans | positions compared | clean spans | boundary | length | refusal | mnemonic |
+|---|---|---|---|---|---|---|---|---|---|
+| `TestTarget.exe` | x64 | line-verified, full sweep | 1 303 | 7 812 | 100.00% | 0 | 0 | 0 | 0 |
+| `TestTarget.exe` | x86 | line-verified, full sweep | 1 253 | 8 248 | 99.92% | 0 | 0 | 1 | 0 |
+| `TestSubject.bpl` | x64 | line-verified, full sweep | 1 276 | 7 509 | 99.84% | 0 | 2 | 0 | 0 |
+| `TestSubject.bpl` | x86 | line-verified, full sweep | 1 233 | 8 190 | 100.00% | 0 | 0 | 0 | 0 |
+| `rtl290.bpl` | x86 | export-anchored, full sweep | 49 564 | 1 535 973 | 81.22% | 0 | 8 902 | 396 | 0 |
+| `vcl290.bpl` | x86 | export-anchored, full sweep | 13 922 | 503 753 | 90.18% | 0 | 1 262 | 384 | 0 |
+| `Hydra2SingleEXE.exe` (505 MB) | x86 | line-verified, **33% sample** (every 3rd span; disclosed) | 792 554 of 2 377 660 | 5 294 297 | 99.98% | 0 | 76 | 101 | 0 |
+| `Hydra2SingleEXE.exe` (582 MB) | x64 | line-verified, **33% sample** (every 3rd span; disclosed) | 803 805 of 2 411 415 | 5 807 612 | 99.99% | 0 | 66 | 7 | 0 |
+
+Grand total across every row: **13 173 394 instruction positions compared,
+zero mnemonic-identity divergences.**
+
+**Every non-mnemonic divergence, classified:**
+
+- **`length` (Delphi test targets and BPL, 2 total)** — manually inspected
+  with `DumpFunc.exe`: both sit inside a Delphi inline exception-handler
+  table (`count DWORD` / `Exception VMT RVA DWORD` / `handler address DWORD`
+  triples emitted after a `jmp @HandleAnyException`) that a line-to-line span
+  can straddle — the EXACT pattern `X86DecodeProbe`'s own README entry
+  documents ("dcc32 emits the exception-handler table inline in the code
+  stream ... That is data, and no linear decode can cross it"). Not a
+  decoder disagreement; both engines are decoding non-code bytes.
+- **`length` (`rtl290.bpl`/`vcl290.bpl`, 10 164 total, 0.50%)** — manually
+  inspected: the first one (`rtl290.bpl` RVA `$116F`) is the literal ASCII
+  bytes `...Extended80...Extended...`, RTTI type-name string data embedded
+  directly in `.text`. This is the DISCLOSED weakness of the export-anchored
+  methodology (unverified span end) doing exactly what its own description
+  says it might: running past a short exported routine into adjacent data.
+  Not attributable to either decoder.
+- **`refusal` (all binaries, 780 in RTL/VCL + 1 in `TestTarget.exe` x86 +
+  108 in the Hydra2SingleEXE.exe samples)** — every single one is Zydis
+  decoding `$D6` (`SALC`) or `$F1` (`INT1`/`ICEBP`), two real, well-known
+  UNDOCUMENTED x86 opcodes, while dumpbin's decoder does not recognise
+  either at all (dumpbin advances one byte and prints nothing). Zydis has
+  broader legacy-opcode coverage than MASM's disassembler — a genuine
+  decoder CAPABILITY difference, not a bug: Zydis is not wrong here, it
+  knows something dumpbin's table does not.
+- **`boundary`, the one tooling artifact this sweep surfaced.** A single
+  UNSAMPLED full sweep of `Hydra2SingleEXE.exe` x86 (all 2 377 660 spans,
+  13 161 805 positions) was also run. It reported 478 083 `boundary`
+  divergences (3.63%) — dumpbin had NO instruction at all at many span-start
+  addresses Zydis decoded as utterly ordinary code (`push ebp`,
+  `xor eax, eax`, `mov edx, [ebp-0x08]`). The SAME binary's 33% sample
+  (5 294 297 positions, the row in the table above) shows ZERO boundary
+  divergences, and a 5% sample (810 480 positions) also shows zero — a sharp
+  scale threshold, not a uniform per-instruction rate, which rules out a
+  real per-instruction Zydis/dumpbin disagreement (that would scale with the
+  sample). Traced to dumpbin.exe itself silently omitting disassembly output
+  somewhere beyond an internal capacity threshold when fed the ~100+ MB
+  single-section synthetic image the full sweep produces — a genuine, newly
+  measured LIMIT OF THE ORACLE at extreme scale, not a Zydis defect. This
+  full-sweep run is reported here as a secondary, informational data point;
+  the 33%-sample row in the table above is the trustworthy measurement for
+  this binary. `RunAndCapture`'s original in-memory pipe capture also failed
+  outright at this scale first (`EEncodingError: Invalid count
+  (-1158168115)`, an overflowed Delphi string length) before being replaced
+  with `RunToFile` + streamed `TStreamReader` parsing — see
+  `DevTools\README.md`.
+- **One normalisation bug, found by the tool's own full-scale run, not by
+  inspection.** An early version of the `int3`/`int 3` alias matched on the
+  operand's literal TEXT (`'3'`), which only fired for dumpbin's decimal
+  spelling and silently missed Zydis's hex spelling of the SAME instruction
+  (`int 0x03`) — invisible on every fixture and sample up to 33%, and only
+  showed up as a nonzero `mnemonic` count on the one 100%-scale run. Fixed
+  by collapsing Zydis's fused `int3` token to plain `int` instead of trying
+  to detect dumpbin's operand value; re-verified at 0 mnemonic divergences
+  across every row in the table above.
+
+**Sampling, stated plainly per the standing "no silent capping" rule:** every
+row above is a FULL, unsampled sweep of the named binary EXCEPT the two
+`Hydra2SingleEXE.exe` rows, which are a disclosed 33% sample (every 3rd
+span) chosen after `RunToFile`'s streaming fix made a full sweep succeed
+technically but take ~5.7 minutes and surface the dumpbin-scale artifact
+above; the 33% sample was independently confirmed clean of that artifact.
+Re-running `DevTools\run_disasm_coverage.bat <exe>` with no `-sample` flag
+performs a full, unsampled sweep of any binary, `Hydra2SingleEXE.exe`
+included — the tool's default is always the full sweep; sampling is an
+explicit, disclosed opt-in via `-sample N`, never a silent cap.
+
 ## Open, to verify before writing code
 
-- Whether XED or iced is the more practical oracle to drive from a `.bat`
-  (increment 3, differential coverage tool).
+(none remaining for increment 3 — resolved above)
 
 ## Not in scope, deliberately
 

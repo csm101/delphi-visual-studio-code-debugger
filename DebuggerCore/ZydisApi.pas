@@ -66,6 +66,16 @@ function ZydisStatusText: string;
 function ZydisDecodeOne(Mode: TZydisMachineMode; RuntimeAddress: UInt64;
   const Bytes; AvailLen: Integer; out Insn: TZydisInstruction): Boolean;
 
+// TEST-ONLY. Resets the one-shot load latch (frees the module if one is
+// loaded, and clears GLoadAttempted) so a single process can exercise BOTH
+// the missing-DLL path and a real decode -- in EITHER order -- instead of
+// the two being permanently exclusive within one process lifetime.
+// Production code must never call this: ZydisTryLoad's one-shot contract
+// ("the first call decides the outcome for the process's whole lifetime")
+// is deliberate everywhere else, and stays in force for every caller except
+// a test that explicitly wants to re-drive the load from a clean state.
+procedure ZydisResetForTests;
+
 implementation
 
 uses
@@ -190,6 +200,18 @@ end;
 function ZydisStatusText: string;
 begin
   Result := GStatusText;
+end;
+
+procedure ZydisResetForTests;
+begin
+  if GModule <> 0 then begin
+    FreeLibrary(GModule);
+    GModule := 0;
+  end;
+  GLoadAttempted := False;
+  GDisassembleIntel := nil;
+  GGetVersionFunc := nil;
+  GStatusText := 'ZydisTryLoad was never called';
 end;
 
 function RawTextToString(const Buf: TRawInstructionBuf): string;
