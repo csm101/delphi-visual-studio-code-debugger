@@ -65,6 +65,14 @@ type
     [Test] procedure Disassemble_Before_ReturnsProvenPrecedingInstructions;
     [Test] procedure Disassemble_Win32_Forward_ReturnsDecodedInstructions;
     [Test] procedure Disassemble_ReportsUnavailable_WhenZydisDllNotFound;
+    // DISASSEMBLY_PLAN.md increment 5: address breakpoints. Uses disassemble's
+    // own echoed address (the documented workflow: feed a frame/instruction
+    // address straight back in) so the tool surface is proven the way an
+    // agent would actually drive it, not with a hand-computed VA.
+    [Test] procedure SetBreakpointAtAddress_UsingDisassembledAddress_StopsAgain;
+    [Test] procedure SetBreakpointAtAddress_Win32_StopsAgain;
+    [Test] procedure SetBreakpointAtAddress_RefusedWhenNotInAnyLoadedModule;
+    [Test] procedure RemoveBreakpointAtAddress_UnplantsAndDoesNotStopAgain;
   end;
 
 implementation
@@ -1932,6 +1940,267 @@ begin
     end;
   finally
     TDirectory.Delete(ScratchDir, True);
+  end;
+end;
+
+// CTOR_BODY (TWidget.Create) is hit more than once per run (see
+// DebuggerTests\DebugSessionTests.pas' own use of the same marker), which is
+// what proves a REPLANT rather than a one-time hit: a source breakpoint stops
+// on the FIRST call, gets removed, an address breakpoint is set at the exact
+// address it stopped at, and continuing must stop there AGAIN on a LATER call.
+procedure TMcpE2ETests.SetBreakpointAtAddress_UsingDisassembledAddress_StopsAgain;
+begin
+  var Line := MarkerLine(EVAL_SOURCE, 'CTOR_BODY');
+  Assert.IsTrue(Line > 0, 'CTOR_BODY marker not found');
+  var C := TMcpTestClient.Start(McpExe);
+  try
+    C.Call('initialize', nil).Free;
+
+    var LaunchArgs := TJSONObject.Create;
+    LaunchArgs.AddPair('program', TargetExe);
+    LaunchArgs.AddPair('sourceRoot', TargetDir);
+    C.CallTool('launch_debuggee', LaunchArgs).Free;
+
+    var BpArgs := TJSONObject.Create;
+    BpArgs.AddPair('sourceFile', EVAL_SOURCE);
+    BpArgs.AddPair('line', TJSONNumber.Create(Line));
+    C.CallTool('set_breakpoint', BpArgs).Free;
+
+    var StopAddr := '';
+    var Snap1 := C.CallTool('continue_and_wait', nil);
+    try
+      var S := TJSONObject(Snap1);
+      Assert.AreEqual('stopped', S.GetValue<string>('state', ''), 'first CTOR hit did not stop: ' + S.ToJSON);
+      var Frames := S.GetValue('frames') as TJSONArray;
+      Assert.IsTrue((Frames <> nil) and (Frames.Count > 0), 'no frames at first stop');
+      StopAddr := (Frames.Items[0] as TJSONObject).GetValue<string>('address', '');
+      Assert.IsTrue(StopAddr <> '', 'top frame carries no address field');
+    finally
+      Snap1.Free;
+    end;
+
+    C.CallTool('remove_all_breakpoints', nil).Free;
+
+    var AddrArgs := TJSONObject.Create;
+    AddrArgs.AddPair('address', StopAddr);
+    var SetResult := C.CallTool('set_breakpoint_at_address', AddrArgs);
+    var NewId := '';
+    try
+      var Arr := SetResult as TJSONArray;
+      Assert.IsTrue((Arr <> nil) and (Arr.Count = 1), 'expected a one-element array: ' + SetResult.ToJSON);
+      var O := Arr.Items[0] as TJSONObject;
+      Assert.AreEqual('address', O.GetValue<string>('kind', ''), 'wrong kind');
+      Assert.IsTrue(O.GetValue<Boolean>('verified', False),
+        'address breakpoint at a live, already-stopped-at address must resolve: ' + O.ToJSON);
+      Assert.AreEqual(StopAddr, O.GetValue<string>('address', ''), 'echoed address mismatch');
+      Assert.IsTrue(O.GetValue<string>('module', '') <> '', 'no owning module reported');
+      NewId := O.GetValue<string>('id', '');
+      Assert.IsTrue(NewId <> '', 'no id returned');
+    finally
+      SetResult.Free;
+    end;
+
+    var Snap2 := C.CallTool('continue_and_wait', nil);
+    try
+      var S := TJSONObject(Snap2);
+      Assert.AreEqual('stopped', S.GetValue<string>('state', ''),
+        'address breakpoint did not stop the target on a later call: ' + S.ToJSON);
+      var Frames := S.GetValue('frames') as TJSONArray;
+      Assert.IsTrue((Frames <> nil) and (Frames.Count > 0), 'no frames at second stop');
+      Assert.AreEqual(StopAddr, (Frames.Items[0] as TJSONObject).GetValue<string>('address', ''),
+        'second stop landed at a different address');
+    finally
+      Snap2.Free;
+    end;
+
+    var ListResult := C.CallTool('list_breakpoints', nil);
+    try
+      var Arr := ListResult as TJSONArray;
+      var Found := False;
+      for var Item in Arr do begin
+        var O := Item as TJSONObject;
+        if O.GetValue<string>('id', '') = NewId then begin
+          Found := True;
+          Assert.AreEqual('address', O.GetValue<string>('kind', ''), 'listed with the wrong kind');
+          Assert.IsTrue(O.GetValue<Boolean>('verified', False), 'listed as unverified after firing');
+        end;
+      end;
+      Assert.IsTrue(Found, 'address breakpoint missing from list_breakpoints');
+    finally
+      ListResult.Free;
+    end;
+
+    C.CallTool('terminate_debuggee', nil).Free;
+  finally
+    C.Free;
+  end;
+end;
+
+// Bitness coverage: the same workflow against the 32-bit build, proving the
+// address round trip (a 32-bit VA echoed back and re-resolved) works under
+// WOW64 too, not just x64.
+procedure TMcpE2ETests.SetBreakpointAtAddress_Win32_StopsAgain;
+begin
+  var Line := MarkerLine(EVAL_SOURCE, 'CTOR_BODY');
+  Assert.IsTrue(Line > 0, 'CTOR_BODY marker not found');
+  var C := TMcpTestClient.Start(McpExe);
+  try
+    C.Call('initialize', nil).Free;
+
+    var LaunchArgs := TJSONObject.Create;
+    LaunchArgs.AddPair('program', TargetExe32);
+    LaunchArgs.AddPair('sourceRoot', TargetDir);
+    C.CallTool('launch_debuggee', LaunchArgs).Free;
+
+    var BpArgs := TJSONObject.Create;
+    BpArgs.AddPair('sourceFile', EVAL_SOURCE);
+    BpArgs.AddPair('line', TJSONNumber.Create(Line));
+    C.CallTool('set_breakpoint', BpArgs).Free;
+
+    var StopAddr := '';
+    var Snap1 := C.CallTool('continue_and_wait', nil);
+    try
+      var S := TJSONObject(Snap1);
+      Assert.AreEqual('stopped', S.GetValue<string>('state', ''), 'first CTOR hit did not stop: ' + S.ToJSON);
+      var Frames := S.GetValue('frames') as TJSONArray;
+      Assert.IsTrue((Frames <> nil) and (Frames.Count > 0), 'no frames at first stop');
+      StopAddr := (Frames.Items[0] as TJSONObject).GetValue<string>('address', '');
+      Assert.IsTrue(StopAddr <> '', 'top frame carries no address field');
+      Assert.IsTrue(StopAddr.Length - 2 <= 8, 'expected a 32-bit VA: ' + StopAddr);
+    finally
+      Snap1.Free;
+    end;
+
+    C.CallTool('remove_all_breakpoints', nil).Free;
+
+    var AddrArgs := TJSONObject.Create;
+    AddrArgs.AddPair('address', StopAddr);
+    var SetResult := C.CallTool('set_breakpoint_at_address', AddrArgs);
+    try
+      var Arr := SetResult as TJSONArray;
+      var O := Arr.Items[0] as TJSONObject;
+      Assert.IsTrue(O.GetValue<Boolean>('verified', False),
+        'address breakpoint should resolve on Win32 too: ' + O.ToJSON);
+    finally
+      SetResult.Free;
+    end;
+
+    var Snap2 := C.CallTool('continue_and_wait', nil);
+    try
+      var S := TJSONObject(Snap2);
+      Assert.AreEqual('stopped', S.GetValue<string>('state', ''),
+        'address breakpoint did not stop the Win32 target on a later call: ' + S.ToJSON);
+    finally
+      Snap2.Free;
+    end;
+
+    C.CallTool('terminate_debuggee', nil).Free;
+  finally
+    C.Free;
+  end;
+end;
+
+procedure TMcpE2ETests.SetBreakpointAtAddress_RefusedWhenNotInAnyLoadedModule;
+begin
+  var C := TMcpTestClient.Start(McpExe);
+  try
+    C.Call('initialize', nil).Free;
+
+    var LaunchArgs := TJSONObject.Create;
+    LaunchArgs.AddPair('program', TargetExe);
+    LaunchArgs.AddPair('sourceRoot', TargetDir);
+    C.CallTool('launch_debuggee', LaunchArgs).Free;
+
+    var AddrArgs := TJSONObject.Create;
+    AddrArgs.AddPair('address', '0x1');
+    var SetResult := C.CallTool('set_breakpoint_at_address', AddrArgs);
+    try
+      var Arr := SetResult as TJSONArray;
+      Assert.IsTrue((Arr <> nil) and (Arr.Count = 1), 'expected a one-element array: ' + SetResult.ToJSON);
+      var O := Arr.Items[0] as TJSONObject;
+      Assert.IsFalse(O.GetValue<Boolean>('verified', True), '0x1 must not resolve to any loaded module');
+      Assert.IsTrue(O.GetValue<string>('message', '') <> '', 'a refusal must name a reason: ' + O.ToJSON);
+    finally
+      SetResult.Free;
+    end;
+
+    var ListResult := C.CallTool('list_breakpoints', nil);
+    try
+      Assert.AreEqual(0, (ListResult as TJSONArray).Count,
+        'a refused address breakpoint must not appear in list_breakpoints');
+    finally
+      ListResult.Free;
+    end;
+
+    C.CallTool('terminate_debuggee', nil).Free;
+  finally
+    C.Free;
+  end;
+end;
+
+procedure TMcpE2ETests.RemoveBreakpointAtAddress_UnplantsAndDoesNotStopAgain;
+begin
+  var Line := MarkerLine(EVAL_SOURCE, 'CTOR_BODY');
+  Assert.IsTrue(Line > 0, 'CTOR_BODY marker not found');
+  var C := TMcpTestClient.Start(McpExe);
+  try
+    C.Call('initialize', nil).Free;
+
+    var LaunchArgs := TJSONObject.Create;
+    LaunchArgs.AddPair('program', TargetExe);
+    LaunchArgs.AddPair('sourceRoot', TargetDir);
+    C.CallTool('launch_debuggee', LaunchArgs).Free;
+
+    var BpArgs := TJSONObject.Create;
+    BpArgs.AddPair('sourceFile', EVAL_SOURCE);
+    BpArgs.AddPair('line', TJSONNumber.Create(Line));
+    C.CallTool('set_breakpoint', BpArgs).Free;
+
+    var StopAddr := '';
+    var Snap1 := C.CallTool('continue_and_wait', nil);
+    try
+      var S := TJSONObject(Snap1);
+      Assert.AreEqual('stopped', S.GetValue<string>('state', ''), 'first CTOR hit did not stop: ' + S.ToJSON);
+      StopAddr := ((S.GetValue('frames') as TJSONArray).Items[0] as TJSONObject).GetValue<string>('address', '');
+    finally
+      Snap1.Free;
+    end;
+
+    C.CallTool('remove_all_breakpoints', nil).Free;
+
+    var AddrArgs := TJSONObject.Create;
+    AddrArgs.AddPair('address', StopAddr);
+    var SetResult := C.CallTool('set_breakpoint_at_address', AddrArgs);
+    var NewId := '';
+    try
+      var O := (SetResult as TJSONArray).Items[0] as TJSONObject;
+      Assert.IsTrue(O.GetValue<Boolean>('verified', False), 'address breakpoint should resolve: ' + O.ToJSON);
+      NewId := O.GetValue<string>('id', '');
+    finally
+      SetResult.Free;
+    end;
+
+    var RemArgs := TJSONObject.Create;
+    RemArgs.AddPair('id', NewId);
+    var RemResult := C.CallTool('remove_breakpoint_at_address', RemArgs);
+    try
+      for var Item in (RemResult as TJSONArray) do
+        Assert.AreNotEqual(NewId, (Item as TJSONObject).GetValue<string>('id', ''),
+          'removed address breakpoint still listed');
+    finally
+      RemResult.Free;
+    end;
+
+    var Snap2 := C.CallTool('continue_and_wait', nil);
+    try
+      var S := TJSONObject(Snap2);
+      Assert.AreEqual('exited', S.GetValue<string>('state', ''),
+        'after removal the target must run to exit (INT3 not cleared): ' + S.ToJSON);
+    finally
+      Snap2.Free;
+    end;
+  finally
+    C.Free;
   end;
 end;
 

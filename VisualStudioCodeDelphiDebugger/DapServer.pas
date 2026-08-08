@@ -354,6 +354,11 @@ type
     FStartupTick:     UInt64;  // GetTickCount64 at launch
     FAdapterStartTick: UInt64; // GetTickCount64 at adapter process start
     FSetBpCount:      Integer; // number of setBreakpoints calls received
+    // Session breakpoint ids planted by the LAST setInstructionBreakpoints
+    // call, so the NEXT call (which replaces the whole set, per the DAP spec)
+    // can remove exactly the ones it is dropping instead of a blind
+    // remove-everything -- mirrors FDataBpOwnIds in the MCP server.
+    FInstrBpIds:      TArray<string>;
     // DebugInfo revision at which the evaluate-fallback symbol warm-up last ran
     // to completion. While it is unchanged no new module could have appeared, so
     // a failed evaluate skips re-iterating every DLL module (was paid on every
@@ -418,6 +423,11 @@ type
     procedure HandleAttach(Seq: Integer; Args: TJSONObject);
     procedure HandleConfigurationDone(Seq: Integer);
     procedure HandleSetBreakpoints(Seq: Integer; Args: TJSONObject);
+    // Address breakpoints (DISASSEMBLY_PLAN.md increment 5) -- VS Code's own
+    // address-breakpoint channel, and the one the Disassembly View gutter
+    // uses. Replaces the WHOLE set on every call, per the DAP spec, using
+    // FInstrBpIds to remove exactly what the previous call planted.
+    procedure HandleSetInstructionBreakpoints(Seq: Integer; Args: TJSONObject);
     procedure HandleSetExceptionBreakpoints(Seq: Integer; Args: TJSONObject);
     procedure HandleExceptionInfo(Seq: Integer; Args: TJSONObject);
     function  BuildExceptionFilterCapability: TJSONArray;
@@ -1795,6 +1805,11 @@ begin
     // whole set. Only `write` and `readWrite` are ever offered -- x86/x64 has no
     // read-only watchpoint (see HandleDataBreakpointInfo).
     Caps.AddPair('supportsDataBreakpoints',          TJSONBool.Create(True));
+    // Address breakpoints (DISASSEMBLY_PLAN.md increment 5): VS Code's own
+    // address-breakpoint channel, and what the Disassembly View gutter uses to
+    // let a click plant one. `setInstructionBreakpoints` behind it replaces the
+    // whole address-breakpoint set on every call, matching the DAP spec.
+    Caps.AddPair('supportsInstructionBreakpoints',   TJSONBool.Create(True));
     // NOTE: `supportsProgressReporting` is a CLIENT capability in the DAP spec
     // (InitializeRequestArguments), not an adapter one. VS Code ignores it in the
     // initialize response, so it does not gate whether progress toasts appear --
@@ -2345,6 +2360,76 @@ begin
     end;
     Body.AddPair('breakpoints', BpList);
     FIO.SendResponse(Seq, 'setBreakpoints', True, Body);
+  finally
+    Body.Free;
+  end;
+end;
+
+// DISASSEMBLY_PLAN.md increment 5: address breakpoints over DAP. Unlike
+// `setBreakpoints` (scoped to one source file, other files untouched),
+// `setInstructionBreakpoints` replaces the WHOLE address-breakpoint set on
+// every call -- there is no file to scope by, an instruction reference is
+// global. FInstrBpIds records exactly which session ids the PREVIOUS call
+// planted, so this one can drop precisely those before (re)adding the new
+// list, rather than a blind remove-everything that would also wipe an
+// address breakpoint some OTHER path might have set.
+procedure TDapServer.HandleSetInstructionBreakpoints(Seq: Integer; Args: TJSONObject);
+type
+  TInstrReq = record
+    RawRef:               string;
+    Addr:                 UInt64;
+    AddrValid:             Boolean;
+    Condition, HitCondition: string;
+  end;
+var
+  Reqs: TArray<TInstrReq>;
+begin
+  var Items: TJSONArray := nil;
+  if Args <> nil then
+    Items := Args.GetValue<TJSONArray>('breakpoints');
+
+  if Items <> nil then
+    for var It in Items do begin
+      var O := It as TJSONObject;
+      var R: TInstrReq;
+      R          := Default(TInstrReq);
+      R.RawRef   := O.GetValue<string>('instructionReference', '');
+      var Offset := O.GetValue<Integer>('offset', 0);
+      var Base: UInt64;
+      R.AddrValid := TryStrToUInt64Lit(Trim(R.RawRef), Base);
+      if R.AddrValid then
+        R.Addr := Base + UInt64(Offset);
+      R.Condition    := O.GetValue<string>('condition',    '');
+      R.HitCondition := O.GetValue<string>('hitCondition', '');
+      Reqs := Reqs + [R];
+    end;
+
+  // Replace: drop every address breakpoint the PREVIOUS call planted before
+  // adding this call's list, so a shrinking set actually shrinks.
+  for var OldId in FInstrBpIds do
+    FSession.RemoveAddressBreakpoint(OldId);
+  SetLength(FInstrBpIds, 0);
+
+  var Body := TJSONObject.Create;
+  try
+    var BpList := TJSONArray.Create;
+    for var R in Reqs do begin
+      var Item := TJSONObject.Create;
+      if not R.AddrValid then begin
+        Item.AddPair('verified', TJSONBool.Create(False));
+        Item.AddPair('message', 'invalid instructionReference: ' + R.RawRef);
+      end else begin
+        var Bp := FSession.SetAddressBreakpoint(R.Addr, R.Condition, R.HitCondition, '');
+        FInstrBpIds := FInstrBpIds + [Bp.Id];
+        Item.AddPair('verified', TJSONBool.Create(Bp.Verified));
+        Item.AddPair('instructionReference', '0x' + IntToHex(Bp.Address, 1));
+        if not Bp.Verified and (Bp.Message <> '') then
+          Item.AddPair('message', Bp.Message);
+      end;
+      BpList.AddElement(Item);
+    end;
+    Body.AddPair('breakpoints', BpList);
+    FIO.SendResponse(Seq, 'setInstructionBreakpoints', True, Body);
   finally
     Body.Free;
   end;
@@ -3692,6 +3777,7 @@ begin
     else if Cmd = 'attach'            then HandleAttach(Seq, Args)
     else if Cmd = 'configurationDone' then HandleConfigurationDone(Seq)
     else if Cmd = 'setBreakpoints'    then HandleSetBreakpoints(Seq, Args)
+    else if Cmd = 'setInstructionBreakpoints' then HandleSetInstructionBreakpoints(Seq, Args)
     else if Cmd = 'setExceptionBreakpoints' then HandleSetExceptionBreakpoints(Seq, Args)
     else if Cmd = 'dataBreakpointInfo'  then HandleDataBreakpointInfo(Seq, Args)
     else if Cmd = 'setDataBreakpoints'  then HandleSetDataBreakpoints(Seq, Args)

@@ -585,6 +585,78 @@ fixture):
       for its negative `instructionOffset`, not re-derive backward
       disassembly.
 
+## N. Address breakpoints (DISASSEMBLY_PLAN.md increment 5)
+
+- [x] Engine plant/refuse: an address inside the (already loaded) main exe
+      resolves to `(module, rva)` and actually stops the target on a LATER
+      call, not merely reports `verified:true`
+      (`DebugSessionTests.AddrBp_MainExe_SetAtKnownAddress_StopsThere`).
+      Negative-controlled: caught a real cross-layer identity bug on its
+      first run (the main-exe module-name sentinel differs between the
+      session and engine layers) -- full detail in `DISASSEMBLY_PLAN.md`
+      "Verified in increment 5".
+- [x] Conditions/hit-counts reuse the SAME per-breakpoint machinery a source
+      breakpoint uses, not a parallel implementation: `hitCondition '>=2'`
+      on an address breakpoint skips the first hit exactly like
+      `Breakpoint_HitCount_SkipsEarlyHits` proves for a source breakpoint
+      (`AddrBp_HitCondition_SkipsEarlyHits`).
+- [x] Refusal: an address not inside any currently loaded module is refused
+      with a reason and never appears in `list_breakpoints` -- never planted
+      at a VA that might belong to something else later
+      (`AddrBp_RefusedWhenAddressNotInAnyLoadedModule`, negative-controlled).
+- [x] `list_breakpoints` carries BOTH kinds in one list, each stating which
+      kind it is (`AddrBp_ListBreakpoints_ReportsBothKinds`, negative-
+      controlled).
+- [x] Remove unplants for real (the INT3 is gone from the target, not just
+      from the session's own list) — mirrors `RemoveAllBreakpoints_
+      ClearsPlantedInt3`'s proof shape (`AddrBp_Remove_
+      UnplantsAndDoesNotStopAgain`, negative-controlled).
+- [x] **The BPL fixture, where module+RVA identity earns its keep.** An
+      address breakpoint set ONCE, while stopped at the first load, survives
+      `TestPackage.bpl` unloading and reloading (`--reload-package`) and
+      fires AGAIN with no second set call -- proven at the session layer
+      (`AddrBp_Bpl_UnloadReload_Rebinds`) and mirrored end to end through
+      both frontends (`TMcpE2ETests` uses the disassembled/echoed address
+      convention on the mono fixture instead, see below; DAP's
+      `Test_SetInstructionBreakpoints_Bpl_UnloadReload_Rebinds` drives the
+      exact same package lifecycle). Negative-controlled: BOTH the load-side
+      and unload-side repost call had to be disabled together to break it
+      (disabling only one is not a sufficient negative control -- the
+      unload-side repost's queued command gets drained by the NEXT load
+      event anyway; see `DISASSEMBLY_PLAN.md` "Traps found in this
+      increment").
+- [x] MCP `set_breakpoint_at_address` / `remove_breakpoint_at_address`, both
+      bitnesses, using the documented "feed a real stop's own echoed address
+      straight back in" workflow
+      (`TMcpE2ETests.SetBreakpointAtAddress_UsingDisassembledAddress_
+      StopsAgain` x64, `.SetBreakpointAtAddress_Win32_StopsAgain` x86,
+      `.SetBreakpointAtAddress_RefusedWhenNotInAnyLoadedModule`,
+      `.RemoveBreakpointAtAddress_UnplantsAndDoesNotStopAgain`).
+- [x] DAP `setInstructionBreakpoints` + `supportsInstructionBreakpoints`,
+      mono (`Test_SetInstructionBreakpoints_Basic_StopsAndVerifies`,
+      reading the exact stop address off the DAP Registers scope since no
+      address-echoing stack-frame field exists yet -- that is increment 6's
+      `instructionPointerReference`) and the BPL reload scenario above.
+      Negative-controlled: commenting out the dispatch wire-up fails with
+      `Value 'breakpoints' not found` (the generic unknown-command
+      fallback), proving the wire-up itself is exercised, not just the
+      session mechanism underneath it.
+- [ ] DAP-layer Win32 coverage for `setInstructionBreakpoints` -- not written
+      this increment (bitness is proven at the MCP layer; DAP is JSON glue
+      over the same already-bitness-proven session code). A scoping choice,
+      not an oversight -- recorded here rather than silently omitted.
+- [ ] No automated fixture proves the module unload transition's `Verified`
+      flip is visible mid-flight (between `UnloadPackage` and the next
+      `LoadPackage`) -- only the eventual outcome (refires after reload) is
+      asserted. The transition would need polling `ListBreakpoints` from
+      inside the pump loop at an unpredictable moment, which is exactly the
+      kind of timing-dependent assertion this project avoids.
+- [ ] No live DAP `breakpoint`-changed event fires when an address
+      breakpoint's `Verified` flips on module unload/reload (unlike a source
+      breakpoint's verified-flip, which fires one via `OnBreakpointChanged`).
+      A follow-up, not a correctness gap: a fresh `list_breakpoints` /
+      `setInstructionBreakpoints` call reports the current truth regardless.
+
 ## What the suite does NOT prove (2026-08-08)
 
 Coverage-honesty notes. Each records a place where a green run is weaker evidence

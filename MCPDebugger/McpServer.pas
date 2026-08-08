@@ -88,6 +88,10 @@ type
     // opaque frameId shape).
     procedure HandleDisassemble(const IdJson, AddrStr: string;
                 FrameIndex: Integer; ThreadId: Cardinal; Count, Before: Integer);
+    // DISASSEMBLY_PLAN.md increment 5. AddrStr is parsed the same way
+    // read_memory/disassemble parse theirs (ParseAddress: "0x..", "$..", decimal).
+    procedure HandleSetBreakpointAtAddress(const IdJson, AddrStr,
+                Condition, HitCondition, LogMessage: string);
 
     // Tool-result envelopes.
     procedure SendToolJson(const IdJson: string; Payload: TJSONValue);
@@ -634,6 +638,20 @@ begin
       SendToolJson(IdJson, McpJson.BreakpointListToJson(FSession.ListBreakpoints));
       Exit;
     end;
+    if Name = 'set_breakpoint_at_address' then begin
+      HandleSetBreakpointAtAddress(IdJson, ArgStr('address'), ArgStr('condition'),
+        ArgStr('hitCondition'), ArgStr('logMessage'));
+      Exit;
+    end;
+    if Name = 'remove_breakpoint_at_address' then begin
+      var TargetId := ArgStr('id');
+      if not FSession.RemoveAddressBreakpoint(TargetId) then begin
+        SendToolError(IdJson, Format('No address breakpoint with id "%s". Use list_breakpoints to see current ids.', [TargetId]));
+        Exit;
+      end;
+      SendToolJson(IdJson, McpJson.BreakpointListToJson(FSession.ListBreakpoints));
+      Exit;
+    end;
 
     // ---- data breakpoints (watchpoints) ----
     // Arming/removal both funnel through FSession.SetDataBreakpoints (never a
@@ -982,6 +1000,19 @@ begin
   Obj.AddPair('address', Format('0x%x', [Addr]));
   Obj.AddPair('written', TJSONNumber.Create(Length(Buf)));
   SendToolJson(IdJson, Obj);
+end;
+
+procedure TMcpServer.HandleSetBreakpointAtAddress(const IdJson, AddrStr,
+  Condition, HitCondition, LogMessage: string);
+var
+  Addr: UInt64;
+begin
+  if not ParseAddress(AddrStr, Addr) then begin
+    SendToolError(IdJson, 'invalid address: ' + AddrStr);
+    Exit;
+  end;
+  var Bp := FSession.SetAddressBreakpoint(Addr, Condition, HitCondition, LogMessage);
+  SendToolJson(IdJson, McpJson.BreakpointListToJson([Bp]));
 end;
 
 // MCPDebugger\Win64\<Config>\DelphiDebuggerMcp.exe is three levels below the

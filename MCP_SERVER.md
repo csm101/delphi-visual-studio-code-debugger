@@ -96,7 +96,27 @@ To attach to processes owned by another user or elevated targets, run the client
   `verified`.
 - `set_breakpoints` — set several at once (`breakpoints` array of the same
   fields); each listed file's set is replaced, unlisted files untouched.
-- `list_breakpoints`, `remove_all_breakpoints`.
+- `list_breakpoints`, `remove_all_breakpoints` — return/clear BOTH source and
+  address breakpoints (see below); each entry carries `kind: "source"` or
+  `"address"`.
+- `set_breakpoint_at_address` — a breakpoint at an ABSOLUTE ADDRESS rather
+  than a source line (`DISASSEMBLY_PLAN.md` increment 5), for a frame with no
+  symbols or an address found by inspection (`disassemble`, `get_call_stack`,
+  `get_raw_stack_scan` all echo an `address` field made exactly for this).
+  Args: `address` (`"0x..."` or decimal, required), `condition`,
+  `hitCondition`, `logMessage` (same semantics as `set_breakpoint`). The
+  address is resolved to `(module, rva)` against the CURRENTLY LOADED modules
+  and stored as that pair, never as the bare address: an address is
+  meaningless across a relaunch or an ASLR-rebased package, so it re-resolves
+  to a fresh address whenever that module (re)loads. An address inside a
+  module that is NOT currently loaded is refused (`verified:false` with a
+  `message`) rather than planted somewhere that may belong to something else
+  once a module maps there. Setting the same address again REPLACES the
+  prior entry (idempotent, keyed by the resolved module+rva), rather than
+  duplicating it. Returns a one-element array, same shape as `set_breakpoint`.
+- `remove_breakpoint_at_address` — remove one address breakpoint by `id`
+  (from `set_breakpoint_at_address` or `list_breakpoints`). Returns the
+  remaining breakpoints (source and address).
 
 ### Data breakpoints (watchpoints)
 Hardware watchpoints (`DR0`-`DR3`): stop when a memory location is written (or

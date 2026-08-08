@@ -591,32 +591,43 @@ Debugger features:
     variable, which is the failure the mechanism exists to prevent.
   Ranked above disassembly in diagnostic value: "who writes this variable" has no
   other answer.
-- **Disassembly + address breakpoints — increment 4/6 landed, not committed
-  (2026-08-09).** `IDisassembler` + Zydis backend + symbolication +
-  `DevTools\Disasm.exe` (increment 2); measured coverage against an
-  independent oracle (`DevTools\DisasmCoverage.exe` vs dumpbin, 13.2M
-  instruction positions compared across the test fixtures, `rtl290.bpl`/
-  `vcl290.bpl`, and a 500+ MB real binary both bitnesses, zero mnemonic
-  divergences — increment 3); MCP `disassemble` shipped, DAP surface not
-  started (increment 6). Full plan, decisions and increments in
-  `DISASSEMBLY_PLAN.md`. In short: complete ISA coverage is a requirement
-  (target code is not only Delphi-compiled), so the backend is **Zydis**
-  (MIT, committed DLL + pinned submodule under `ThirdParty\Zydis`, ONE x64
-  DLL because machine mode is a decoder parameter), behind an
-  `IDisassembler` seam, dynamically loaded and fail-closed — undecodable
-  renders `db XX`, missing DLL reports UNAVAILABLE. `X86Decode.pas` stays
-  for the dependency-free call-site proving path. Coverage is measured
-  against an independent oracle (dumpbin), not claimed. The MCP
-  `disassemble` tool's `before` (instructions preceding an address) is
-  proven-boundary-only by deliberate decision — refuses rather than
-  heuristically scanning backward when no proven boundary lands exactly on
-  the target; see `DISASSEMBLY_PLAN.md` "Decision: backward disassembly is
-  proven-boundary-only", which increment 6's DAP `disassemble` must reuse
-  rather than re-derive. `set_breakpoint_at_address`, DAP `disassemble`,
-  `instructionPointerReference`, `setInstructionBreakpoints` remain
-  increments 5/6. Address breakpoints are stored as module+RVA (a bare VA
-  does not survive relaunch or a rebased package), reusing the existing
-  deferred-bind path.
+- **Disassembly + address breakpoints — increments 1-5 landed, not committed
+  (2026-08-09); increment 6 remaining.** `IDisassembler` + Zydis backend +
+  symbolication + `DevTools\Disasm.exe` (increment 2); measured coverage
+  against an independent oracle (`DevTools\DisasmCoverage.exe` vs dumpbin,
+  13.2M instruction positions compared across the test fixtures,
+  `rtl290.bpl`/`vcl290.bpl`, and a 500+ MB real binary both bitnesses, zero
+  mnemonic divergences — increment 3); MCP `disassemble` shipped (increment
+  4). Full plan, decisions and increments in `DISASSEMBLY_PLAN.md`. In
+  short: complete ISA coverage is a requirement (target code is not only
+  Delphi-compiled), so the backend is **Zydis** (MIT, committed DLL + pinned
+  submodule under `ThirdParty\Zydis`, ONE x64 DLL because machine mode is a
+  decoder parameter), behind an `IDisassembler` seam, dynamically loaded and
+  fail-closed — undecodable renders `db XX`, missing DLL reports
+  UNAVAILABLE. `X86Decode.pas` stays for the dependency-free call-site
+  proving path. Coverage is measured against an independent oracle
+  (dumpbin), not claimed. The MCP `disassemble` tool's `before` (instructions
+  preceding an address) is proven-boundary-only by deliberate decision —
+  refuses rather than heuristically scanning backward when no proven
+  boundary lands exactly on the target; see `DISASSEMBLY_PLAN.md` "Decision:
+  backward disassembly is proven-boundary-only", which increment 6's DAP
+  `disassemble` must reuse rather than re-derive.
+  **Address breakpoints — increment 5, DONE.** Stored as module+RVA (a bare
+  VA does not survive relaunch or a rebased package), resolved from the
+  caller's absolute address against the current module table and refused
+  outright when unattributable; rebind-on-reload reuses the shape of the
+  existing source-breakpoint deferred-bind path (module unload needed no new
+  engine code — the existing VA-range unplant sweep is kind-agnostic).
+  Engine + session (`DebugSession.SetAddressBreakpoint`/
+  `RemoveAddressBreakpoint`), MCP (`set_breakpoint_at_address`/
+  `remove_breakpoint_at_address`), and DAP (`setInstructionBreakpoints` +
+  `supportsInstructionBreakpoints`) all shipped; proven on both bitnesses at
+  the MCP layer and on the BPL fixture (`TestPackage.bpl`'s existing
+  unload/reload lifecycle) at all three layers. Full detail in
+  `DISASSEMBLY_PLAN.md` "Verified in increment 5", including a genuine
+  cross-layer identity bug the tests caught on their first run.
+  **Remaining: increment 6** — DAP `disassemble` request and
+  `instructionPointerReference` on stack frames.
 - Win32 (32-bit) targets — **DONE**. Run control, locals, object expansion,
   evaluation and the multi-BPL case all work on a WOW64 target from the same
   64-bit adapter binary. See "Target architecture" under Implemented features

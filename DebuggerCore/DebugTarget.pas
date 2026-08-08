@@ -211,6 +211,15 @@ type
     Proven:    Boolean;  // the instruction ending at PC was DECODED as a call
   end;
 
+  // Which identity a breakpoint carries. A SOURCE breakpoint is keyed on
+  // (SourceFile, SourceLine); an ADDRESS breakpoint is keyed on
+  // (ModuleName, Rva) instead -- see TAddrBpSpec. Internal one-shot/step
+  // breakpoints (stepping, raise-catch, resume points) are created with the
+  // default bkSource and are never reported through this distinction anyway:
+  // they live only in the engine's own FBreakpoints, never in
+  // TDebugSession's separate user-facing breakpoint list.
+  TBreakpointKind = (bkSource, bkAddress);
+
   TBreakpointRec = record
     VA:           UInt64;
     Rva:          UInt64;
@@ -223,14 +232,34 @@ type
     HitCondition: string;
     LogMessage:   string;
     HitCount:     Integer;
+    Kind:         TBreakpointKind;  // bkSource (default) or bkAddress
+    ModuleName:   string;           // bkAddress only: '' = main exe, else lowercase file name
   end;
 
   TCommandKind = (ckContinue, ckStepInto, ckStepOver, ckStepOut, ckPause,
-    ckSetBreakpoints, ckSetDataBreakpoints);
+    ckSetBreakpoints, ckSetDataBreakpoints, ckSetAddressBreakpoints);
 
   TBpSpec = record
     SourceFile:    string;
     Lines:         TArray<Integer>;
+    Conditions:    TArray<string>;
+    HitConditions: TArray<string>;
+    LogMessages:   TArray<string>;
+  end;
+
+  // Address-breakpoint set for ONE module, identity-keyed the same way TBpSpec
+  // is keyed by SourceFile: a repost REPLACES every address breakpoint
+  // previously registered for ModuleName, never merges. Rvas are offsets from
+  // the module's OWN base, resolved by the CALLER (TDebugSession, which owns
+  // the module table via GetModules) -- the engine only knows how to turn a
+  // currently-loaded module's name into its live base address (FImageBase for
+  // '', FDllBases otherwise) and plant there. A module not currently loaded
+  // means the whole spec is silently dropped: no VA can be computed, so
+  // nothing is planted and nothing lingers half-resolved
+  // (DISASSEMBLY_PLAN.md, "Address breakpoints").
+  TAddrBpSpec = record
+    ModuleName:    string;   // '' = the main exe; lowercase file name otherwise
+    Rvas:          TArray<UInt64>;
     Conditions:    TArray<string>;
     HitConditions: TArray<string>;
     LogMessages:   TArray<string>;
@@ -241,6 +270,7 @@ type
     ThreadId:   DWORD;    // step target for ckStep*: 0 = the currently-stopped thread
     BpSpec:     TBpSpec;
     DataBpSpec: TDataBpArmSpec;
+    AddrBpSpec: TAddrBpSpec;
   end;
 
   TOnStopped     = procedure(Reason: TStopReason; const SourceFile: string;

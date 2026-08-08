@@ -150,7 +150,29 @@ begin
     'List all currently set breakpoints with their verified state.', []));
 
   Result.Add(MakeTool('remove_all_breakpoints',
-    'Remove every breakpoint.', []));
+    'Remove every breakpoint (source and address).', []));
+
+  Result.Add(MakeTool('set_breakpoint_at_address',
+    'Set (or replace) a breakpoint at an ABSOLUTE ADDRESS instead of a source line -- what ' +
+    'makes disassemble() actionable in a frame with no symbols (a runtime package built ' +
+    'without debug info) or at a specific instruction found by inspection. The address is ' +
+    'resolved against the CURRENTLY LOADED modules and stored as (module, offset), never as ' +
+    'the bare address -- an address is meaningless across a relaunch or an ASLR-rebased ' +
+    'package, so it is re-resolved to a fresh address whenever that module (re)loads. An ' +
+    'address inside a module that is NOT currently loaded is refused (verified=false, with a ' +
+    'reason) rather than planted somewhere that may belong to something else once a module ' +
+    'maps there. Setting the same address again replaces the prior entry. Optional condition / ' +
+    'hit-count / logpoint work exactly as they do for a source breakpoint. Appears in ' +
+    'list_breakpoints with kind="address".',
+    [Prop('address', 'string', 'Absolute address, e.g. "0x140012340" (as echoed by disassemble/get_call_stack/get_raw_stack_scan). Decimal is also accepted.', True),
+     Prop('condition', 'string', 'Pascal expression; the breakpoint only stops when it is true / non-zero.'),
+     Prop('hitCondition', 'string', 'Hit-count gate: "5" (5th hit), ">5", ">=5", "%5" (every 5th).'),
+     Prop('logMessage', 'string', 'Logpoint: when set, the breakpoint does NOT stop; it emits this message (with {expr} substituted) to the debugger output instead.')]));
+
+  Result.Add(MakeTool('remove_breakpoint_at_address',
+    'Remove one address breakpoint by id (from set_breakpoint_at_address or list_breakpoints). ' +
+    'Returns the remaining breakpoints (source and address).',
+    [Prop('id', 'string', 'The id of the address breakpoint to remove.', True)]));
 
   // ---- Data breakpoints (watchpoints) ----
   Result.Add(MakeTool('set_data_breakpoint',

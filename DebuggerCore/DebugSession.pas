@@ -225,6 +225,29 @@ type
     // for each line that flipped to verified.
     procedure NotifyBreakpointFlips;
     procedure StoreVerifiedState(const BpId: string; Verified: Boolean);
+    // Address breakpoints (DISASSEMBLY_PLAN.md increment 5). Identity is
+    // (ModuleName, Rva), resolved from the caller's absolute address at SET
+    // time against GetModules -- never a bare VA, which is meaningless across
+    // a relaunch or an ASLR-rebased package.
+    function  ResolveModuleForAddress(Address: UInt64;
+                out ModuleName: string; out ModuleBase: UInt64): Boolean;
+    // Translates a FRIENDLY module name (as stored in TSessionBreakpoint.ModuleName
+    // and reported to a caller -- the exe's own lowercase filename for the main
+    // module) into the identity the ENGINE expects on TAddrBpSpec.ModuleName: ''
+    // for the main exe, matching TWinDebugger's own convention (FDllBases only
+    // ever holds runtime-loaded DLL/BPL entries, never the main exe -- exactly
+    // like FImageBase is consulted separately from FDllBases everywhere else in
+    // the engine). Anything else (a real DLL/BPL name) passes through unchanged.
+    function  EngineModuleNameFor(const FriendlyModuleName: string): string;
+    function  HaveAddressBreakpoints: Boolean;
+    // Re-derives Verified/Address/Message for every stored address breakpoint
+    // against the CURRENT module table, then reposts each affected module's
+    // whole address-breakpoint set to the engine (which drops/replants
+    // depending on whether that module is loaded right now). ExtraModule, when
+    // non-empty, forces an explicit clear command for a module that no longer
+    // owns ANY address breakpoint (a removal can empty a module's set
+    // entirely, in which case it would not otherwise appear in this sweep).
+    procedure RepostAddressBreakpoints(const ExtraModule: string = '');
     procedure ApplyModuleConfig(Module: TModuleSymbols; const AName, APath: string);
     // Registers everything the symbol prefetcher finished, and reposts
     // breakpoints once if anything arrived. No-op unless stopped.
@@ -276,6 +299,27 @@ type
     // DAP background loader registering providers directly) can drive rebind and the
     // single gutter re-colour path without duplicating the flip detection.
     procedure RepostBreakpoints;
+
+    // Breakpoint at an ABSOLUTE ADDRESS rather than a source line
+    // (DISASSEMBLY_PLAN.md increment 5) -- what makes a disassembly view
+    // actionable. The address is resolved to (ModuleName, Rva) against the
+    // CURRENT module table (GetModules) at set time and that pair, not the
+    // bare VA, is the breakpoint's identity: it re-resolves to a fresh VA
+    // whenever the named module (re)loads, exactly like a source breakpoint's
+    // deferred binding. An address inside a module that is NOT currently
+    // loaded cannot be attributed to anything -- refused with Verified=False
+    // and Message set, never planted at a VA that may belong to something
+    // else once a module maps there. Conditions/hit-counts/logpoints reuse
+    // the same per-breakpoint machinery source breakpoints already use.
+    // Idempotent: setting the same (module, rva) again replaces the prior
+    // entry rather than duplicating it. Appears in ListBreakpoints alongside
+    // source breakpoints, Kind=bkAddress.
+    function  SetAddressBreakpoint(Address: UInt64;
+                const Condition, HitCondition, LogMessage: string): TSessionBreakpoint;
+    // Removes one address breakpoint by its Id (as returned by
+    // SetAddressBreakpoint / ListBreakpoints). False when no bkAddress entry
+    // has that Id.
+    function  RemoveAddressBreakpoint(const Id: string): Boolean;
 
     // Data breakpoints (watchpoints; increment 4 of DATA_BREAKPOINTS_PLAN.md).
     // Mirrors the source-breakpoint API's shape, but SetDataBreakpoints
@@ -1533,7 +1577,7 @@ begin
   // Post an empty spec per known source file FIRST so the engine clears the
   // planted INT3s. The old code cleared the lists before iterating them, so it
   // posted nothing and the breakpoints stayed planted in the target.
-  if FDebugger <> nil then
+  if FDebugger <> nil then begin
     for var KV in FBpSpecs do begin
       var Cmd: TCommand;
       Cmd.Kind              := ckSetBreakpoints;
@@ -1541,6 +1585,26 @@ begin
       Cmd.BpSpec.SourceFile := KV.Value.SourceFile;  // empty Lines => clear the file
       FDebugger.PostCommand(Cmd);
     end;
+    // Address breakpoints: one empty-Rvas clear command per module that
+    // currently owns one, same reasoning as the source-file loop above.
+    var AddrModules := TDictionary<string, Byte>.Create;
+    try
+      for var Bp in FBreakpoints do
+        if Bp.Kind = bkAddress then
+          AddrModules.AddOrSetValue(Bp.ModuleName, 0);
+      for var ModName in AddrModules.Keys do begin
+        var Cmd: TCommand;
+        Cmd.Kind                  := ckSetAddressBreakpoints;
+        Cmd.AddrBpSpec            := Default(TAddrBpSpec);
+        // Translate to the engine's own '' sentinel for the main exe -- see
+        // EngineModuleNameFor.
+        Cmd.AddrBpSpec.ModuleName := EngineModuleNameFor(ModName);  // empty Rvas => clears the module
+        FDebugger.PostCommand(Cmd);
+      end;
+    finally
+      AddrModules.Free;
+    end;
+  end;
   FBreakpoints.Clear;
   FPendingBps.Clear;
   FBpSpecs.Clear;
@@ -1718,6 +1782,169 @@ begin
   NotifyBreakpointFlips;
 end;
 
+function TDebugSession.ResolveModuleForAddress(Address: UInt64;
+  out ModuleName: string; out ModuleBase: UInt64): Boolean;
+begin
+  ModuleName := '';
+  ModuleBase := 0;
+  for var M in GetModules do
+    if (M.Base <> 0) and (M.Size > 0) and
+       (Address >= M.Base) and (Address < M.Base + M.Size) then begin
+      ModuleName := M.Name;
+      ModuleBase := M.Base;
+      Exit(True);
+    end;
+  Result := False;
+end;
+
+function TDebugSession.EngineModuleNameFor(const FriendlyModuleName: string): string;
+begin
+  Result := FriendlyModuleName;
+  for var M in GetModules do
+    if M.IsMain and SameText(M.Name, FriendlyModuleName) then
+      Exit('');
+end;
+
+function TDebugSession.HaveAddressBreakpoints: Boolean;
+begin
+  for var Bp in FBreakpoints do
+    if Bp.Kind = bkAddress then
+      Exit(True);
+  Result := False;
+end;
+
+// Re-derives Verified/Address/Message for every stored address breakpoint
+// against the CURRENT module table, then reposts each affected module's
+// whole address-breakpoint set to the engine. Called after a module loads
+// (rebind: the module may now resolve, possibly at a different base than
+// last time) and after one unloads (the engine has already unplanted --
+// HandleUnloadDll removes any breakpoint whose VA falls in the unloaded
+// range regardless of kind -- so this only needs to flip Verified off and
+// leave the identity in place for a later reload).
+procedure TDebugSession.RepostAddressBreakpoints(const ExtraModule: string = '');
+begin
+  if FDebugger = nil then
+    Exit;
+  var Modules := GetModules;
+  var ByModule := TDictionary<string, TList<Integer>>.Create;
+  try
+    for var I := 0 to FBreakpoints.Count - 1 do begin
+      if FBreakpoints[I].Kind <> bkAddress then
+        Continue;
+      var Key := FBreakpoints[I].ModuleName;
+      if not ByModule.ContainsKey(Key) then
+        ByModule.Add(Key, TList<Integer>.Create);
+      ByModule[Key].Add(I);
+    end;
+    // A module whose LAST address breakpoint was just removed no longer has
+    // any FBreakpoints entry to derive it from; seed it explicitly so the
+    // clear command below still reaches the engine.
+    if (ExtraModule <> '') and not ByModule.ContainsKey(ExtraModule) then
+      ByModule.Add(ExtraModule, TList<Integer>.Create);
+
+    for var KV in ByModule do begin
+      var ModBase: UInt64 := 0;
+      var Loaded := False;
+      for var M in Modules do
+        if SameText(M.Name, KV.Key) and (M.Base <> 0) then begin
+          ModBase := M.Base;
+          Loaded  := True;
+          Break;
+        end;
+
+      for var Idx in KV.Value do begin
+        var Bp := FBreakpoints[Idx];
+        Bp.Verified := Loaded;
+        if Loaded then begin
+          Bp.Address := ModBase + Bp.Rva;
+          Bp.Message := '';
+        end else
+          Bp.Message := Format('Module "%s" is not currently loaded.', [Bp.ModuleName]);
+        FBreakpoints[Idx] := Bp;
+      end;
+
+      var Spec: TAddrBpSpec;
+      // The engine's own sentinel for "the main exe" is '' (matching FDllBases,
+      // which never holds an entry for it) -- translate the friendly name
+      // (what FBreakpoints/reporting use) at this one boundary.
+      Spec.ModuleName := EngineModuleNameFor(KV.Key);
+      SetLength(Spec.Rvas,          KV.Value.Count);
+      SetLength(Spec.Conditions,    KV.Value.Count);
+      SetLength(Spec.HitConditions, KV.Value.Count);
+      SetLength(Spec.LogMessages,   KV.Value.Count);
+      for var J := 0 to KV.Value.Count - 1 do begin
+        var Bp := FBreakpoints[KV.Value[J]];
+        Spec.Rvas[J]          := Bp.Rva;
+        Spec.Conditions[J]    := Bp.Condition;
+        Spec.HitConditions[J] := Bp.HitCondition;
+        Spec.LogMessages[J]   := Bp.LogMessage;
+      end;
+      var Cmd: TCommand;
+      Cmd.Kind       := ckSetAddressBreakpoints;
+      Cmd.AddrBpSpec := Spec;
+      FDebugger.PostCommand(Cmd);
+    end;
+  finally
+    for var L in ByModule.Values do
+      L.Free;
+    ByModule.Free;
+  end;
+end;
+
+function TDebugSession.SetAddressBreakpoint(Address: UInt64;
+  const Condition, HitCondition, LogMessage: string): TSessionBreakpoint;
+begin
+  Result := Default(TSessionBreakpoint);
+  Result.Kind         := bkAddress;
+  Result.Address      := Address;
+  Result.Condition    := Condition;
+  Result.HitCondition := HitCondition;
+  Result.LogMessage   := LogMessage;
+
+  if FDebugger = nil then begin
+    Result.Message := 'No active debug session -- launch or attach before setting an address breakpoint.';
+    Exit;
+  end;
+
+  var ModuleName: string;
+  var ModuleBase: UInt64;
+  if not ResolveModuleForAddress(Address, ModuleName, ModuleBase) then begin
+    Result.Message := Format(
+      '0x%x is not inside any currently loaded module -- an address ' +
+      'breakpoint cannot be attributed until the owning module is loaded.',
+      [Address]);
+    Exit;
+  end;
+
+  Result.ModuleName := ModuleName;
+  Result.Rva         := Address - ModuleBase;
+  Result.Id          := 'addr:' + ModuleName + ':' + IntToHex(Result.Rva, 1);
+  Result.Verified    := True;
+
+  // Idempotent: replace any prior entry with the SAME (module, rva) identity.
+  for var I := FBreakpoints.Count - 1 downto 0 do
+    if (FBreakpoints[I].Kind = bkAddress) and (FBreakpoints[I].Id = Result.Id) then
+      FBreakpoints.Delete(I);
+  FBreakpoints.Add(Result);
+
+  RepostAddressBreakpoints;
+end;
+
+function TDebugSession.RemoveAddressBreakpoint(const Id: string): Boolean;
+begin
+  Result := False;
+  var ModuleName := '';
+  for var I := FBreakpoints.Count - 1 downto 0 do
+    if (FBreakpoints[I].Kind = bkAddress) and (FBreakpoints[I].Id = Id) then begin
+      ModuleName := FBreakpoints[I].ModuleName;
+      FBreakpoints.Delete(I);
+      Result := True;
+      Break;   // ids are unique
+    end;
+  if Result then
+    RepostAddressBreakpoints(ModuleName);
+end;
+
 // Writes the new verified state into the stored TSessionBreakpoint record. Records
 // in the list are value types, so the whole record has to be read back, patched and
 // re-assigned by index. Bp.Id uses the same 'lcasefile|line' formula as the flip key.
@@ -1779,6 +2006,15 @@ begin
     FLoader.LoadModuleSymbols(M);
     RepostBreakpoints;
   end;
+
+  // Address breakpoints need no symbols to rebind -- only the module's live
+  // base, which is already known at this point (RegisterModuleRecord just
+  // set it). Re-derive Verified/Address and replant against it, exactly like
+  // the source-breakpoint gate above and for the same reason: this runs
+  // BEFORE the debuggee is resumed, and the module's own init code can run
+  // past an address the instant this event is continued.
+  if HaveAddressBreakpoints then
+    RepostAddressBreakpoints;
 
   if Assigned(FOnDllLoadedHook) then
     FOnDllLoadedHook(Name, Path, Base, ImageSize);
@@ -1871,6 +2107,14 @@ end;
 procedure TDebugSession.HandleDllUnloaded(const Name: string; Base: UInt64);
 begin
   FLoader.RemoveModuleRecord(Name, Base);
+  // The engine has already unplanted any breakpoint (of either kind) whose VA
+  // fell in this module's range (TWinDebugger.HandleUnloadDll, VA-range based,
+  // kind-agnostic). An address breakpoint's IDENTITY survives regardless --
+  // (ModuleName, Rva) still names the same intended instruction -- so this
+  // only needs to flip Verified off; a later HandleDllLoaded for the same
+  // module name rebinds and replants at whatever base it reloads at.
+  if HaveAddressBreakpoints then
+    RepostAddressBreakpoints;
 end;
 
 function TDebugSession.FrameToSession(const F: TStackFrame;

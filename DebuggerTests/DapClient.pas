@@ -101,6 +101,15 @@ type
                   Lines: TArray<Integer>;
                   const Conditions, HitConditions, LogMessages: TArray<string>
                   ): TJSONObject; overload;
+    // Address breakpoints (DISASSEMBLY_PLAN.md increment 5). Addresses are
+    // '0x...' strings (matching what disassemble/stackTrace echo); the whole
+    // set replaces whatever a previous call planted, per the DAP spec.
+    function    SetInstructionBreakpoints(
+                  const Addresses: TArray<string>): TJSONObject; overload;
+    function    SetInstructionBreakpoints(
+                  const Addresses: TArray<string>;
+                  const Conditions, HitConditions: TArray<string>
+                  ): TJSONObject; overload;
     // Capture an `output` event whose `output` field contains `Substring`.
     // Used by the log-point test to assert that the rendered text fired.
     function    WaitForOutputContaining(const Substring: string;
@@ -765,6 +774,39 @@ begin
   Args.AddPair('source',      Src);
   Args.AddPair('breakpoints', BpArr);
   Seq    := SendCmd('setBreakpoints', Args);
+  Result := WaitResp(Seq);
+end;
+
+function TDapClient.SetInstructionBreakpoints(
+  const Addresses: TArray<string>): TJSONObject;
+begin
+  Result := SetInstructionBreakpoints(Addresses, nil, nil);
+end;
+
+function TDapClient.SetInstructionBreakpoints(const Addresses: TArray<string>;
+  const Conditions, HitConditions: TArray<string>): TJSONObject;
+var
+  Args: TJSONObject;
+  BpArr: TJSONArray;
+  Seq:   Integer;
+
+  function NthOrEmpty(const Arr: TArray<string>; Idx: Integer): string;
+  begin
+    if (Idx >= 0) and (Idx < Length(Arr)) then Result := Arr[Idx] else Result := '';
+  end;
+
+begin
+  BpArr := TJSONArray.Create;
+  for var I := 0 to High(Addresses) do begin
+    var BP := TJSONObject.Create;
+    BP.AddPair('instructionReference', Addresses[I]);
+    var C := NthOrEmpty(Conditions,    I); if C <> '' then BP.AddPair('condition',    C);
+    var H := NthOrEmpty(HitConditions, I); if H <> '' then BP.AddPair('hitCondition', H);
+    BpArr.Add(BP);
+  end;
+  Args := TJSONObject.Create;
+  Args.AddPair('breakpoints', BpArr);
+  Seq    := SendCmd('setInstructionBreakpoints', Args);
   Result := WaitResp(Seq);
 end;
 

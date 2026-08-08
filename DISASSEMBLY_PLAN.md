@@ -1,6 +1,6 @@
 # Disassembly and address breakpoints — plan
 
-Status: **increment 4 landed, not committed** (2026-08-09). This document is the
+Status: **increment 5 landed, not committed** (2026-08-09). This document is the
 agreed design; `PROJECT_STATE.md` carries only the one-line roadmap entry
 pointing here.
 
@@ -209,6 +209,196 @@ Decisions:
   is. A source breakpoint that resolved to an address and an address breakpoint
   are different objects with the same plant.
 
+**Resolved, not anticipated by the plan text above — the two points the task
+flagged as likely STOP candidates:**
+
+- **Identity to a client that only knows VAs.** The client-facing input and
+  output are both a plain absolute address string; the module+RVA pair is
+  purely an internal identity, never exposed as a separate parameter a caller
+  must track. `TSessionBreakpoint` carries `ModuleName`/`Rva` for
+  introspection (`list_breakpoints` reports them) and `Address` as the
+  currently-resolved VA, but `set_breakpoint_at_address`/
+  `setInstructionBreakpoints` take and echo only the address.
+- **What happens when the owning module unloads.** Resolved by PRECEDENT, not
+  by invention: `TWinDebugger.HandleUnloadDll` already unplants ANY
+  breakpoint (source or address) whose VA falls in the unloading module's
+  range — kind-agnostic, unchanged by this increment. The session-level
+  identity (`ModuleName`, `Rva`) is NOT dropped on unload, exactly like a
+  source breakpoint's `(SourceFile, Line)` spec survives a module unload in
+  `FBpSpecs` today; `HandleDllUnloaded` only flips `Verified` to `False` and
+  records a reason. A later `HandleDllLoaded` for the SAME module name
+  reposts and replants at whatever base it reloads at — proven in
+  `AddrBp_Bpl_UnloadReload_Rebinds` and the DAP/MCP mirrors of it. No live
+  gutter-recolour DAP event fires on this transition (unlike the source-line
+  verified-flip, which fires `OnBreakpointChanged`) — a follow-up, not a
+  correctness gap: `list_breakpoints`/a fresh `setInstructionBreakpoints`
+  call still report the current truth.
+
+## Verified in increment 5
+
+- **The engine seam.** `DebugTarget.pas`: `TBreakpointKind` (`bkSource` /
+  `bkAddress`), `TBreakpointRec` gained `Kind` + `ModuleName`, `TAddrBpSpec`
+  (mirrors `TBpSpec`: `ModuleName` + parallel `Rvas`/`Conditions`/
+  `HitConditions`/`LogMessages` arrays, replaced as a whole per module on
+  repost), `ckSetAddressBreakpoints` added to `TCommandKind`.
+  `WinDebuggerBase.pas`: `TWinDebugger.DoSetAddressBreakpoints` mirrors
+  `DoSetBreakpoints` — `ClearAddressBreakpointsByModule` first (identity =
+  `Kind=bkAddress AND ModuleName`, so a same-named module never collides with
+  an unrelated source breakpoint that happens to have `ModuleName=''` by
+  default), then resolves the module's CURRENT live base (`FImageBase` for
+  `''`, `FDllBases` otherwise — both already existed for other purposes) and
+  plants at `Base + Rva`, or drops the whole spec silently if the module
+  cannot be resolved right now. Wired into both `ProcessCommandQueue` and
+  `DrainBreakpointCommands` (the latter is what plants BEFORE a freshly
+  loaded module's init code can run past it, same reason source breakpoints
+  need it). `TWinDebugger.HandleUnloadDll` needed NO change — its VA-range
+  unplant sweep was already kind-agnostic.
+- **The session layer.** `DebugSession.pas`: `TDebugSession.SetAddressBreakpoint`
+  resolves the caller's absolute address against `GetModules` (same module
+  table `disassemble`'s `ModuleNameForVA` already uses) to `(ModuleName, Rva)`,
+  refusing outright with a reason when no loaded module owns the address;
+  `RemoveAddressBreakpoint` by id. Both kinds share ONE list
+  (`FBreakpoints: TList<TSessionBreakpoint>`), so `ListBreakpoints` needed no
+  change to include both — `TSessionBreakpoint` gained `Kind`/`ModuleName`/
+  `Rva`/`Address`/`Message`, defaulting to `bkSource` so every pre-existing
+  source-breakpoint code path is unaffected. `RepostAddressBreakpoints`
+  (called from `SetAddressBreakpoint`, `RemoveAddressBreakpoint`,
+  `HandleDllLoaded` and `HandleDllUnloaded`) re-derives `Verified`/`Address`/
+  `Message` against the CURRENT module table and reposts each affected
+  module's whole set — the one mechanism that makes rebind-on-reload work,
+  mirroring `RepostBreakpoints`'s role for source breakpoints exactly.
+- **A real cross-layer identity bug, caught by the FIRST positive test, not
+  designed around in advance.** `TWinDebugger`'s own convention for "the
+  main exe" is the empty string `''` (matching `FDllBases`, which is
+  populated only by `HandleLoadDll` for runtime-loaded DLLs/BPLs and NEVER
+  carries an entry for the main exe — the main exe's base comes from
+  `FImageBase` instead, checked separately everywhere else in the engine).
+  `TDebugSession.GetModules`/`ResolveModuleForAddress`, however, name the
+  main exe by its REAL lowercase filename (`TSessionModule.Name`), for
+  sensible reporting. The first cut of `RepostAddressBreakpoints` sent that
+  friendly name straight through as `TAddrBpSpec.ModuleName`, so
+  `TWinDebugger.DoSetAddressBreakpoints`'s `FDllBases.TryGetValue('testtarget.exe',
+  ...)` failed for every main-exe address breakpoint — silently: `Verified`
+  came back `True` at the SESSION layer (which resolved the address fine
+  against `GetModules`), the command was posted, but the ENGINE dropped it
+  with nothing planted, and the target ran straight to exit.
+  `AddrBp_MainExe_SetAtKnownAddress_StopsThere` failed with
+  `Expected [5] but got [6] address breakpoint did not stop the target (not
+  planted?)` (`5`=`dsStopped`, `6`=`dsExited`) — caught on the FIRST run of
+  a brand-new test, not found later by inspection. Fixed with
+  `TDebugSession.EngineModuleNameFor`, the ONE translation point (used by
+  `RepostAddressBreakpoints` and `RemoveAllBreakpoints`'s address-clear loop)
+  that maps the friendly main-exe name to the engine's `''` sentinel;
+  `TSessionBreakpoint.ModuleName` keeps the friendly name for reporting.
+  Confirms the task's own prediction that address-breakpoint identity was
+  the likely place to hit something unanticipated — the unanticipated part
+  was a naming-convention mismatch BETWEEN two already-existing, independently
+  correct conventions, not a new design question.
+- **Every new test negative-controlled**, fix reverted (or the relevant call
+  site short-circuited) and the SAME test re-run to confirm it fails with the
+  intended message, then reverted back:
+  - `AddrBp_MainExe_SetAtKnownAddress_StopsThere` / `AddrBp_HitCondition_
+    SkipsEarlyHits` — both caught the `EngineModuleNameFor` bug above
+    directly (that bug WAS the negative control); reverting the fix
+    reproduces `Expected [5] but got [6] address breakpoint did not stop the
+    target (not planted?)` for both.
+  - `AddrBp_RefusedWhenAddressNotInAnyLoadedModule` — `ResolveModuleForAddress`
+    forced to always succeed: `Condition is True when False expected.
+    address 0x1 must not resolve to any loaded module`.
+  - `AddrBp_ListBreakpoints_ReportsBothKinds` — `FBreakpoints.Add(Result)`
+    removed from `SetAddressBreakpoint`: `Condition is False when True
+    expected. [the address breakpoint must be listed, Kind=bkAddress]`.
+  - `AddrBp_Remove_UnplantsAndDoesNotStopAgain` — the repost call removed
+    from `RemoveAddressBreakpoint`: `Condition is False when True expected.
+    [after removal the target must run to exit (INT3 not cleared)]`.
+  - `AddrBp_Bpl_UnloadReload_Rebinds` — BOTH `HandleDllLoaded`'s and
+    `HandleDllUnloaded`'s `RepostAddressBreakpoints` calls disabled together
+    (disabling only the load-side one was not enough — see "traps" below):
+    `Expected [5] but got [6] address breakpoint did not re-bind and fire
+    after unload + reload`.
+  - DAP: the `setInstructionBreakpoints` dispatch line commented out —
+    `Value 'breakpoints' not found` (the unknown-command fallback response
+    has no `breakpoints` key), proving the wire-up itself, not just the
+    session mechanism underneath it, is exercised.
+- **The BPL fixture, where module+RVA identity earns its keep.**
+  `AddrBp_Bpl_UnloadReload_Rebinds` (`DebugSessionTests.pas`),
+  `Test_SetInstructionBreakpoints_Bpl_UnloadReload_Rebinds`
+  (`DebuggerTests.pas`, DAP) both drive `TestPackage.bpl`'s existing
+  `--reload-package` lifecycle (load #1 → BP fires, `UnloadPackage`, load #2
+  → BP fires again — the same infrastructure `Test_Bpl_UnloadReload_
+  BpRebinds` already proved for source breakpoints) with ONE
+  `SetAddressBreakpoint`/`setInstructionBreakpoints` call made during the
+  FIRST stop and never repeated: the second stop only happens if the engine
+  actually rebinds, since `HandleUnloadDll`'s VA-range sweep unconditionally
+  removes the plant on unload regardless of kind. Compared against the
+  breakpoint's CURRENTLY resolved address (not the first stop's VA), so the
+  assertion holds whether or not the reload happens to rebase the module.
+- **MCP tool.** `set_breakpoint_at_address` (singular ADD/idempotent-replace
+  semantics, matching the task's own naming suggestion and giving an agent
+  incremental control an all-or-nothing replace would not) and
+  `remove_breakpoint_at_address`, in `McpServer.pas`/`McpToolSchemas.pas`.
+  `McpJson.BreakpointListToJson` gained `kind`, and the address form's
+  `address`/`module`/`rva`/`message` fields (mirroring
+  `DataBreakpointToJson`'s existing module+rva shape). Proven on BOTH
+  bitnesses (`SetBreakpointAtAddress_UsingDisassembledAddress_StopsAgain` x64,
+  `SetBreakpointAtAddress_Win32_StopsAgain` x86) using the documented
+  workflow — feeding a real stop's own echoed `frames[0].address` straight
+  back in, the same convention `disassemble` already established — plus a
+  refusal test and a remove-unplants test. `McpE2ETests.pas`.
+- **DAP `setInstructionBreakpoints` + `supportsInstructionBreakpoints`.**
+  `DapServer.pas`: replaces the WHOLE address-breakpoint set on every call
+  (per the DAP spec — there is no per-file scoping for an instruction
+  reference), tracking the ids the PREVIOUS call planted (`FInstrBpIds`,
+  mirroring `FDataBpOwnIds`'s role in the MCP server) so a shrinking set
+  actually shrinks. `supportsInstructionBreakpoints: true` added to the
+  `initialize` response capabilities — a pure SERVER→CLIENT capability
+  advertisement; checked against the DAP spec and this codebase's own
+  `supportsInvalidatedEvent` precedent, and confirmed there is no
+  CLIENT-declared capability gating this specific request the way
+  `supportsInvalidatedEvent` gates an event the SERVER sends, so the test
+  client (`DapClient.pas`) needed no new capability flag to exercise the
+  path — only a new `SetInstructionBreakpoints` helper method.
+- **No DAP surface exists yet to echo a stop's raw address** (that is
+  increment 6's `instructionPointerReference`), so the DAP tests read the
+  exact stop address off the **Registers scope** (`RIP`/`EIP` via `scopes` +
+  `variables`) instead — proven to need the SAME `"  (<decimal>)"` display-
+  decoration stripping (`ExtractDisplayValue`, already used elsewhere in
+  `DebuggerTests.pas`) that a rendered value carries everywhere else in this
+  codebase; the first attempt (raw register `value` string) failed
+  `setInstructionBreakpoints` with `invalid instructionReference:
+  0x00000000740431B4  (1946431924)` before the fix. A single `NativeUInt(@Func)`
+  evaluate was tried first and rejected empirically: it renders as the bare
+  type name `"Pointer"`, not a hex value, through this codebase's value
+  formatter — recorded here so a future increment does not re-try it.
+- **Full suite**: see `TASK_RESUME.md` for the exact counts from this
+  session's run.
+
+### Traps found in this increment
+
+- **The main-exe module-name sentinel is `''` at the ENGINE layer
+  (`FDllBases` has no entry for it) but the REAL lowercase filename at the
+  SESSION layer (`GetModules`).** Any new code that builds a `TAddrBpSpec`
+  to post to the engine must translate through `TDebugSession.
+  EngineModuleNameFor` first, or a main-exe address breakpoint resolves
+  (`Verified=True`) at the session layer while silently never planting.
+- **Disabling only `HandleDllLoaded`'s address-bp repost is not a sufficient
+  negative control for rebind-on-reload.** `HandleDllUnloaded`'s OWN repost
+  call posts a `ckSetAddressBreakpoints` command that stays QUEUED (there is
+  no `DrainBreakpointCommands` call after `UNLOAD_DLL_DEBUG_EVENT`, unlike
+  after `LOAD_DLL_DEBUG_EVENT`) until the NEXT `LOAD_DLL_DEBUG_EVENT` drains
+  it — by which point `FDllBases` already holds the module's NEW base, so it
+  plants correctly anyway. Both repost call sites had to be disabled
+  together to prove the rebind mechanism is load-bearing at all. This is not
+  a bug — it mirrors how a source breakpoint's repost survives the same
+  unload/reload race — but it means the two call sites are NOT independently
+  redundant only by accident; do not remove one assuming the other alone
+  is enough.
+- **An evaluated function ADDRESS renders as the bare type name `"Pointer"`
+  through this codebase's value formatter**, not a hex string — `@FuncName`
+  and `NativeUInt(@FuncName)` both do this. A register's OWN value (read via
+  the DAP Registers scope) is the reliable way to get a real address out of
+  a stop when no purpose-built address-echoing field exists yet.
+
 ## Increments (each gated on a green suite before the next)
 
 1. **DONE, not committed (2026-08-08).** `ThirdParty\Zydis` layout, submodule
@@ -246,8 +436,12 @@ Decisions:
    including the backward-disassembly decision and what it cost, in
    "Decision: backward disassembly is proven-boundary-only" and "Verified in
    increment 4" below.
-5. Address breakpoints in `DebugSession` (module+RVA identity, deferred bind),
-   then the MCP tool, then `setInstructionBreakpoints` over DAP.
+5. **DONE, not committed (2026-08-09).** Address breakpoints: engine + session
+   (module+RVA identity, deferred bind), the MCP tool
+   (`set_breakpoint_at_address` / `remove_breakpoint_at_address`), and DAP
+   `setInstructionBreakpoints` + `supportsInstructionBreakpoints`. Full detail,
+   including a genuine bug the tests caught (not merely designed around), in
+   "Verified in increment 5" below.
 6. DAP `disassemble` + `instructionPointerReference`.
 7. **Packaging — and it decides whether any of this works on a user's machine.**
    Until it is done, every increment above is a feature that reports UNAVAILABLE

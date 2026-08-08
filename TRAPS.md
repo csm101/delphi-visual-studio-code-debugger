@@ -98,6 +98,14 @@ absurdly.
 - **Run negative controls, do not assume them.** Revert the fix and confirm the new
   test fails with its intended message, in BOTH the mono and the BPL fixture,
   before believing it covers the bug.
+- **Disabling one of several call sites that all post the same repost/rebind
+  command is not automatically a valid negative control.** Address-breakpoint
+  rebind-on-reload has TWO repost call sites (module load, module unload);
+  disabling only the load-side one did not break
+  `AddrBp_Bpl_UnloadReload_Rebinds`, because the unload-side call's queued
+  command gets drained by the very next load event anyway. Disable every
+  call site that could plausibly contribute before trusting a "still green"
+  result as proof the mechanism is unnecessary.
 - **Check every defect on BOTH bitnesses.** That is what separates "Win32
   regression" from "always been wrong".
 - **State which half is proven and which is only guarded.** Some fixes cannot be
@@ -261,6 +269,24 @@ absurdly.
   the same bits, so every later step looks like a watchpoint hit.
 - **Never name a Delphi method `Continue`** — it shadows the loop keyword. Use
   `ContinueExecution`.
+- **The main-exe module-name sentinel differs by layer.** `TWinDebugger`'s own
+  convention for "the main exe" is `''` (`FDllBases` is populated only for
+  runtime-loaded DLLs/BPLs by `HandleLoadDll`, never the main exe, whose base
+  comes from `FImageBase` instead). `TDebugSession.GetModules` names the main
+  exe by its real lowercase filename, for sensible reporting. Any code that
+  builds a `TAddrBpSpec`/similar engine-facing spec must translate through
+  `TDebugSession.EngineModuleNameFor` first, or a main-exe address resolves
+  fine at the session layer (`Verified=True`) while the engine silently drops
+  the plant. Found by `AddrBp_MainExe_SetAtKnownAddress_StopsThere`'s first
+  run (DISASSEMBLY_PLAN.md increment 5), not by inspection.
+- **An evaluated function ADDRESS renders as the bare type name `"Pointer"`**
+  through this codebase's value formatter — `@FuncName` and
+  `NativeUInt(@FuncName)` both do this, in both DAP `evaluate` and (by the
+  same formatter) MCP `evaluate_expression`. Read the DAP Registers scope
+  (`RIP`/`EIP` via `scopes` + `variables`, stripping the same
+  `"  (<decimal>)"` display decoration `ExtractDisplayValue` already strips
+  elsewhere) instead when a test needs a real code address and no
+  purpose-built address-echoing field exists yet.
 - `for var x in ['a','b']` is fine, but `Exit(['a'])` parses as a set ("Ordinal
   type required"). Use `TArray<string>.Create(...)`.
 - **Never use `IsLibrary` or `HInstance` to decide whether code executes inside a

@@ -979,6 +979,65 @@ would restore a breakpoint instruction and leave the target trapping forever at
 an address no breakpoint owns. `PlantInt3` adopts the first planter's original
 byte and skips the write.
 
+### Address breakpoints (DISASSEMBLY_PLAN.md increment 5)
+
+A second breakpoint IDENTITY alongside `(SourceFile, Line)`: `(ModuleName, Rva)`,
+where `ModuleName` is the friendly lowercase file name (`''` reserved at the
+ENGINE layer only, for the main exe — see the trap below) and `Rva` is the
+offset from THAT module's own base, resolved once from the caller's absolute
+address against `TDebugSession.GetModules` (the same table `disassemble`'s
+symbolication already uses).
+
+- `TBreakpointKind` (`bkSource` / `bkAddress`) on both `TBreakpointRec`
+  (engine) and `TSessionBreakpoint` (session), defaulting to `bkSource` so
+  every pre-existing code path is unaffected.
+- **Refuse, never plant unresolved.** An address inside a module that is not
+  currently loaded cannot be attributed to anything and is refused outright
+  (`Verified=False` + a reason) — unlike a source breakpoint, there is no
+  "register now, plant later" pending state for an address breakpoint.
+- **Rebind on reload reuses the source-breakpoint mechanism's SHAPE, not its
+  code.** `TDebugSession.RepostAddressBreakpoints` (called from
+  `SetAddressBreakpoint`, `RemoveAddressBreakpoint`, `HandleDllLoaded` and
+  `HandleDllUnloaded`) re-derives `Verified`/`Address`/`Message` against the
+  CURRENT module table and reposts each affected module's whole address-bp
+  set to the engine (`ckSetAddressBreakpoints` → `TWinDebugger.
+  DoSetAddressBreakpoints`, which mirrors `DoSetBreakpoints`: clear this
+  module's existing address breakpoints first, then resolve the module's
+  LIVE base — `FImageBase` for `''`, `FDllBases` otherwise — and plant, or
+  drop the whole spec silently if the module cannot be resolved right now).
+- **Module unload needed no new engine code.**
+  `TWinDebugger.HandleUnloadDll`'s existing VA-range unplant sweep is
+  kind-agnostic and already removes an address breakpoint's plant when its
+  module unloads; only the SESSION-level `Verified` flag needs updating
+  (`HandleDllUnloaded` → `RepostAddressBreakpoints`), because the identity
+  `(ModuleName, Rva)` survives the unload and rebinds on the next load of
+  the same module name — proven with `TestPackage.bpl`'s existing
+  `--reload-package` load/unload/load lifecycle (`AddrBp_Bpl_UnloadReload_
+  Rebinds` in `DebuggerTests\DebugSessionTests.pas`).
+- **Trap: the main-exe module-name sentinel differs between layers.** The
+  ENGINE's own convention for "the main exe" is `''` (`FDllBases` is
+  populated only for runtime-loaded DLLs/BPLs by `HandleLoadDll`, never for
+  the main exe, whose base comes from `FImageBase` instead — checked
+  separately everywhere else in the engine). The SESSION's `GetModules`
+  names the main exe by its real lowercase filename instead, for sensible
+  reporting. `TDebugSession.EngineModuleNameFor` is the ONE translation
+  point between the two conventions, used wherever a `TAddrBpSpec` is built
+  for the engine. Missing this translation resolves the address FINE at the
+  session layer (`Verified=True`) while the engine silently drops the plant
+  — caught by the first positive test in this increment, not by inspection;
+  full detail in `DISASSEMBLY_PLAN.md` "Verified in increment 5".
+- **DAP**: `setInstructionBreakpoints` replaces the WHOLE address-breakpoint
+  set on every call (per the DAP spec — there is no per-file scoping for an
+  instruction reference), using `FInstrBpIds` to remove exactly what the
+  PREVIOUS call planted before adding the new list (mirrors `FDataBpOwnIds`'s
+  role in the MCP server for data breakpoints). Capability
+  `supportsInstructionBreakpoints: true` is a pure SERVER→CLIENT
+  advertisement with no corresponding CLIENT-declared capability to check
+  (unlike `supportsInvalidatedEvent`), confirmed against the DAP spec.
+- **MCP**: `set_breakpoint_at_address` (singular ADD/idempotent-replace,
+  keyed by the resolved `(module, rva)`) and `remove_breakpoint_at_address`.
+  See `MCP_SERVER.md`.
+
 Hit lifecycle:
 
 1. `EXCEPTION_BREAKPOINT` at `ExceptionAddress = VA`. `RIP` is already

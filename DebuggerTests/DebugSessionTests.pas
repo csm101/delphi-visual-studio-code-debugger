@@ -479,6 +479,19 @@ type
     [Test] procedure Registers_HaveRipAndRsp;
     [Test] procedure ResolveSourcePath_ResolvesCoreUnit;
     [Test] procedure RemoveAllBreakpoints_ClearsPlantedInt3;
+    // Address breakpoints (DISASSEMBLY_PLAN.md increment 5): module+RVA
+    // identity, deferred/rebound binding, refusal for an unattributable
+    // address, and the unified ListBreakpoints surface.
+    [Test] procedure AddrBp_MainExe_SetAtKnownAddress_StopsThere;
+    [Test] procedure AddrBp_HitCondition_SkipsEarlyHits;
+    [Test] procedure AddrBp_RefusedWhenAddressNotInAnyLoadedModule;
+    [Test] procedure AddrBp_ListBreakpoints_ReportsBothKinds;
+    [Test] procedure AddrBp_Remove_UnplantsAndDoesNotStopAgain;
+    // The BPL fixture is where module+RVA identity earns its keep: the SAME
+    // address breakpoint, set once, must survive its owning module
+    // unloading and reloading (a real Delphi package lifecycle), including
+    // firing again with NO second SetAddressBreakpoint call.
+    [Test] procedure AddrBp_Bpl_UnloadReload_Rebinds;
     [Test] procedure EvaluateForFrame_ClassIsExpandable_ScalarIsLeaf;
     // Step-5 write path (setVariable delegated onto the session core).
     [Test] procedure SetLocalVariable_Integer_ReadsBackChanged;
@@ -2949,6 +2962,253 @@ begin
   finally
     if Session.State = dsStopped then
       Session.Terminate;
+    Session.Free;
+  end;
+end;
+
+procedure PumpUntilStoppedOrExited(Session: TDebugSession; TimeoutMs: Cardinal);
+begin
+  var Deadline := GetTickCount64 + TimeoutMs;
+  while (Session.State <> dsStopped) and (not Session.HasExited) and
+        (GetTickCount64 < Deadline) do
+    Session.Pump;
+end;
+
+function LaunchStoppedAtEntry(const ExePath, MapPath, RsmPath, SourceRoot: string;
+  const Args: string = ''): TDebugSession;
+begin
+  Result := TDebugSession.Create;
+  var Opts: TLaunchOptions;
+  Opts             := Default(TLaunchOptions);
+  Opts.ExePath     := ExePath;
+  Opts.MapPath     := MapPath;
+  Opts.RsmPath     := RsmPath;
+  Opts.SourceRoot  := SourceRoot;
+  Opts.StopAtEntry := True;
+  Opts.Args        := Args;
+  Assert.IsTrue(Result.Launch(Opts), 'Launch returned False');
+  PumpUntilStoppedOrExited(Result, 30000);
+  Assert.AreEqual(Ord(dsStopped), Ord(Result.State), 'did not stop at entry');
+end;
+
+// The address is resolved via debug info alone (GetGotoTargetVA), never by
+// stopping at a source breakpoint first -- so no hit is consumed before the
+// address breakpoint is armed, which matters for AddrBp_HitCondition below.
+procedure TDebugSessionTests.AddrBp_MainExe_SetAtKnownAddress_StopsThere;
+begin
+  var Line := MarkerLine(EVAL_SOURCE, 'CTOR_BODY');
+  Assert.IsTrue(Line > 0, 'CTOR_BODY marker not found');
+  var Session := LaunchStoppedAtEntry(TargetExe, TargetMap, TargetRsm, TargetDir);
+  try
+    var VA: UInt64;
+    Assert.IsTrue(Session.GetGotoTargetVA(EVAL_SOURCE, Line, VA),
+      'could not resolve CTOR_BODY to a VA via debug info');
+
+    var Bp := Session.SetAddressBreakpoint(VA, '', '', '');
+    Assert.IsTrue(Bp.Verified,
+      'address breakpoint inside the (already loaded) main exe must resolve: ' + Bp.Message);
+    Assert.AreEqual(LowerCase(ExtractFileName(TargetExe)), LowerCase(Bp.ModuleName),
+      'wrong owning module');
+    Assert.AreEqual(VA - Session.Debugger.ImageBase, Bp.Rva, 'wrong module-relative RVA');
+    Assert.AreEqual(VA, Bp.Address, 'echoed address must match the resolved VA');
+
+    Session.ContinueExecution;
+    PumpUntilStoppedOrExited(Session, 30000);
+    Assert.AreEqual(Ord(dsStopped), Ord(Session.State),
+      'address breakpoint did not stop the target (not planted?)');
+
+    var Frames := Session.GetCallStack;
+    Assert.IsTrue(Length(Frames) > 0, 'no frames at the address-breakpoint stop');
+    Assert.AreEqual(VA, Frames[0].IP, 'stopped at the wrong address');
+  finally
+    if Session.State = dsStopped then Session.Terminate;
+    Session.Free;
+  end;
+end;
+
+// Conditions/hit-counts/logpoints are documented to reuse the SAME
+// per-breakpoint machinery a source breakpoint already uses -- proven here
+// with the exact scenario Breakpoint_HitCount_SkipsEarlyHits proves for a
+// source breakpoint (CTOR_BODY fires more than once; '>=2' must skip the
+// first hit), just armed by address instead of by (file, line).
+procedure TDebugSessionTests.AddrBp_HitCondition_SkipsEarlyHits;
+begin
+  var Line := MarkerLine(EVAL_SOURCE, 'CTOR_BODY');
+  Assert.IsTrue(Line > 0, 'CTOR_BODY marker not found');
+  var Session := LaunchStoppedAtEntry(TargetExe, TargetMap, TargetRsm, TargetDir);
+  try
+    var VA: UInt64;
+    Assert.IsTrue(Session.GetGotoTargetVA(EVAL_SOURCE, Line, VA),
+      'could not resolve CTOR_BODY to a VA via debug info');
+
+    var Bp := Session.SetAddressBreakpoint(VA, '', '>=2', '');
+    Assert.IsTrue(Bp.Verified, 'address breakpoint should resolve: ' + Bp.Message);
+
+    Session.ContinueExecution;
+    PumpUntilStoppedOrExited(Session, 30000);
+    Assert.AreEqual(Ord(dsStopped), Ord(Session.State),
+      'hit-count >=2 should have stopped on a later hit');
+
+    var Frames := Session.GetCallStack;
+    Assert.IsTrue(Length(Frames) > 0, 'no frames at the address-breakpoint stop');
+    Assert.AreEqual(VA, Frames[0].IP, 'stopped at the wrong address');
+  finally
+    if Session.State = dsStopped then Session.Terminate;
+    Session.Free;
+  end;
+end;
+
+// An address in a module that is not currently loaded cannot be attributed
+// to anything -- refused outright rather than planted at a VA that may
+// belong to something else once a module maps there (DISASSEMBLY_PLAN.md).
+procedure TDebugSessionTests.AddrBp_RefusedWhenAddressNotInAnyLoadedModule;
+begin
+  var Session := LaunchStoppedAtEntry(TargetExe, TargetMap, TargetRsm, TargetDir);
+  try
+    var Before := Length(Session.ListBreakpoints);
+    var Bp := Session.SetAddressBreakpoint(1, '', '', '');
+    Assert.IsFalse(Bp.Verified, 'address 0x1 must not resolve to any loaded module');
+    Assert.AreNotEqual('', Bp.Message, 'a refusal must name a reason');
+    Assert.AreEqual(Before, Length(Session.ListBreakpoints),
+      'a refused address breakpoint must not appear in ListBreakpoints (never planted)');
+  finally
+    if Session.State = dsStopped then Session.Terminate;
+    Session.Free;
+  end;
+end;
+
+// list_breakpoints (ListBreakpoints) must carry both kinds in one list, each
+// stating which kind it is -- a source breakpoint that resolved to an
+// address and a genuine address breakpoint are different objects with the
+// same plant.
+procedure TDebugSessionTests.AddrBp_ListBreakpoints_ReportsBothKinds;
+begin
+  var Line := MarkerLine(EVAL_SOURCE, 'CTOR_BODY');
+  Assert.IsTrue(Line > 0, 'CTOR_BODY marker not found');
+  var Session := LaunchStoppedAtEntry(TargetExe, TargetMap, TargetRsm, TargetDir);
+  try
+    var LineSpec  := Default(TBpLineSpec);
+    LineSpec.Line := Line;
+    Session.SetBreakpoints(EVAL_SOURCE, [LineSpec]);
+
+    var VA: UInt64;
+    Assert.IsTrue(Session.GetGotoTargetVA(EVAL_SOURCE, Line, VA), 'could not resolve VA');
+    var AddrBp := Session.SetAddressBreakpoint(VA, '', '', '');
+    Assert.IsTrue(AddrBp.Verified, 'address breakpoint should resolve: ' + AddrBp.Message);
+
+    var FoundSource  := False;
+    var FoundAddress := False;
+    for var Bp in Session.ListBreakpoints do begin
+      if (Bp.Kind = bkSource) and SameText(ExtractFileName(Bp.SourceFile), EVAL_SOURCE) and
+         (Bp.Line = Line) then
+        FoundSource := True;
+      if (Bp.Kind = bkAddress) and (Bp.Id = AddrBp.Id) then begin
+        FoundAddress := True;
+        Assert.AreEqual(AddrBp.ModuleName, Bp.ModuleName, 'module mismatch in listing');
+        Assert.AreEqual(AddrBp.Rva, Bp.Rva, 'rva mismatch in listing');
+      end;
+    end;
+    Assert.IsTrue(FoundSource, 'the source breakpoint must still be listed, Kind=bkSource');
+    Assert.IsTrue(FoundAddress, 'the address breakpoint must be listed, Kind=bkAddress');
+  finally
+    if Session.State = dsStopped then Session.Terminate;
+    Session.Free;
+  end;
+end;
+
+// Mirrors RemoveAllBreakpoints_ClearsPlantedInt3's proof shape for the
+// single-entry address API: after RemoveAddressBreakpoint the INT3 must be
+// gone from the target, not merely from the session's own list.
+procedure TDebugSessionTests.AddrBp_Remove_UnplantsAndDoesNotStopAgain;
+begin
+  var Line := MarkerLine(EVAL_SOURCE, 'CTOR_BODY');
+  Assert.IsTrue(Line > 0, 'CTOR_BODY marker not found');
+  var Session := LaunchStoppedAtEntry(TargetExe, TargetMap, TargetRsm, TargetDir);
+  try
+    var VA: UInt64;
+    Assert.IsTrue(Session.GetGotoTargetVA(EVAL_SOURCE, Line, VA), 'could not resolve VA');
+    var Bp := Session.SetAddressBreakpoint(VA, '', '', '');
+    Assert.IsTrue(Bp.Verified, 'address breakpoint should resolve: ' + Bp.Message);
+
+    Assert.IsTrue(Session.RemoveAddressBreakpoint(Bp.Id), 'RemoveAddressBreakpoint returned False');
+    for var LB in Session.ListBreakpoints do
+      Assert.AreNotEqual(Bp.Id, LB.Id, 'removed address breakpoint still listed');
+
+    Session.ContinueExecution;
+    PumpUntilStoppedOrExited(Session, 30000);
+    Assert.IsTrue(Session.HasExited,
+      'after removal the target must run to exit (INT3 not cleared)');
+  finally
+    if Session.State = dsStopped then Session.Terminate;
+    Session.Free;
+  end;
+end;
+
+// The BPL fixture is where module+RVA identity earns its keep: TestPackage.bpl
+// unloads and reloads ('--reload-package': load #1 -> BP fires, UnloadPackage,
+// load #2 -> BP fires again). ONE SetAddressBreakpoint call, made after the
+// first load, must survive that round trip and fire again on the second --
+// with no second SetAddressBreakpoint call. If the address breakpoint were
+// keyed on the bare VA, or the engine did not rebind on reload, the second
+// load would run straight through: the engine unconditionally unplants any
+// breakpoint (of either kind) whose VA falls in an unloading module's range
+// (TWinDebugger.HandleUnloadDll), so only an active rebind replants it.
+procedure TDebugSessionTests.AddrBp_Bpl_UnloadReload_Rebinds;
+begin
+  var Line := MarkerLineInFile(PackageSrc, 'PKG_BP');
+  Assert.IsTrue(Line > 0, 'PKG_BP marker not found');
+
+  var Session := LaunchStoppedAtEntry(TargetExe, TargetMap, TargetRsm, TargetDir,
+    '--reload-package');
+  try
+    // Learn PKG_BP's address via a SOURCE breakpoint on the FIRST load, then
+    // drop it -- only the address breakpoint is live from here on.
+    var LineSpec  := Default(TBpLineSpec);
+    LineSpec.Line := Line;
+    Session.SetBreakpoints('TestPkgUnit.pas', [LineSpec]);
+    Session.ContinueExecution;
+    PumpUntilStoppedOrExited(Session, 30000);
+    Assert.AreEqual(Ord(dsStopped), Ord(Session.State), 'first load did not hit PKG_BP');
+
+    var Frames := Session.GetCallStack;
+    Assert.IsTrue(Length(Frames) > 0, 'no frames at first PKG_BP stop');
+    var VA := Frames[0].IP;
+
+    Session.SetBreakpoints('TestPkgUnit.pas', []);  // drop the source bp
+
+    var Bp := Session.SetAddressBreakpoint(VA, '', '', '');
+    Assert.IsTrue(Bp.Verified,
+      'address breakpoint at the live PKG_BP address must resolve: ' + Bp.Message);
+    Assert.AreEqual('testpackage.bpl', LowerCase(Bp.ModuleName), 'wrong owning module');
+    Assert.IsTrue(Bp.Rva > 0, 'expected a nonzero module-relative RVA');
+
+    // Continuing now runs UnloadPackage then LoadPackage #2 with NO
+    // intervening user stop.
+    Session.ContinueExecution;
+    PumpUntilStoppedOrExited(Session, 30000);
+    Assert.AreEqual(Ord(dsStopped), Ord(Session.State),
+      'address breakpoint did not re-bind and fire after unload + reload');
+
+    var AfterFrames := Session.GetCallStack;
+    Assert.IsTrue(Length(AfterFrames) > 0, 'no frames at second stop');
+
+    var CurrentAddr: UInt64 := 0;
+    var Found := False;
+    for var LB in Session.ListBreakpoints do
+      if LB.Id = Bp.Id then begin
+        Found       := True;
+        CurrentAddr := LB.Address;
+        Assert.IsTrue(LB.Verified, 'ListBreakpoints must report the rebound breakpoint verified');
+        Break;
+      end;
+    Assert.IsTrue(Found, 'address breakpoint missing from ListBreakpoints after rebind');
+    // Compared against the breakpoint's CURRENTLY resolved address, not the
+    // FIRST stop's VA: a reload is free to rebase the module, and the
+    // identity that survives is (module, rva), not the bare VA.
+    Assert.AreEqual(CurrentAddr, AfterFrames[0].IP,
+      'second stop landed at an address different from the breakpoint''s current resolved address');
+  finally
+    if Session.State = dsStopped then Session.Terminate;
     Session.Free;
   end;
 end;

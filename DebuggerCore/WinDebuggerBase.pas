@@ -406,6 +406,10 @@ type
     procedure ProcessCommandQueue;
     procedure DrainBreakpointCommands;
     procedure DoSetBreakpoints(const Spec: TBpSpec);
+    // Address-breakpoint counterparts of ClearBreakpointsByFile/DoSetBreakpoints.
+    // Identity is (Kind=bkAddress, ModuleName), not SourceFile -- see TAddrBpSpec.
+    procedure ClearAddressBreakpointsByModule(const ModuleName: string);
+    procedure DoSetAddressBreakpoints(const Spec: TAddrBpSpec);
     procedure HandleCreateProcess(const Ev: TDebugEvent);
     procedure WarnIfUnsupportedTargetArchitecture;
     procedure HandleCreateThread(const Ev: TDebugEvent);
@@ -2535,6 +2539,8 @@ begin
       BP.HitCondition := NthOrEmpty(Spec.HitConditions, I);
       BP.LogMessage   := NthOrEmpty(Spec.LogMessages,   I);
       BP.HitCount     := 0;
+      BP.Kind         := bkSource;
+      BP.ModuleName   := '';
       // Before the startup break, ApplyAllBreakpoints will plant it (after
       // FImageBase is set), so we just register the spec here.
       // After startup, FImageBase is known and VA is correct -- plant immediately.
@@ -2542,6 +2548,78 @@ begin
         PlantInt3(BP);
       FBreakpoints.Add(BP);
     end;
+  end;
+end;
+
+procedure TWinDebugger.ClearAddressBreakpointsByModule(const ModuleName: string);
+var
+  I: Integer;
+begin
+  I := 0;
+  while I < FBreakpoints.Count do begin
+    if (FBreakpoints[I].Kind = bkAddress) and
+       SameText(FBreakpoints[I].ModuleName, ModuleName) then begin
+      var BP := FBreakpoints[I];
+      if BP.IsPlanted then
+        RemoveInt3(BP);
+      FBreakpoints.Delete(I);
+    end else
+      Inc(I);
+  end;
+end;
+
+// Counterpart of DoSetBreakpoints for address breakpoints. Identity is
+// (ModuleName), not SourceFile -- a repost REPLACES every address breakpoint
+// previously registered for this module, mirroring ClearBreakpointsByFile.
+//
+// Unlike a source breakpoint, an address breakpoint is NEVER registered
+// unresolved: the caller (TDebugSession.SetAddressBreakpoint) only ever
+// attributes an address to a module that is ALREADY loaded, so by the time a
+// spec reaches here the module's live base is knowable NOW or the spec is
+// stale (the module has since unloaded) -- either way there is no "wait for
+// FImageBase" case like DoSetBreakpoints has for the pre-startup exe. A
+// module that cannot be resolved (unloaded, or never loaded under this
+// name) means the whole spec is dropped after the clear: nothing is
+// planted, and no half-resolved placeholder is kept in FBreakpoints
+// (DISASSEMBLY_PLAN.md, "Address breakpoints" -- "do NOT plant").
+procedure TWinDebugger.DoSetAddressBreakpoints(const Spec: TAddrBpSpec);
+
+  function NthOrEmpty(const Arr: TArray<string>; Idx: Integer): string;
+  begin
+    if (Idx >= 0) and (Idx < Length(Arr)) then Result := Arr[Idx] else Result := '';
+  end;
+
+  function TryResolveModuleBase(out ModBase: UInt64): Boolean;
+  begin
+    if Spec.ModuleName = '' then begin
+      ModBase := FImageBase;
+      Result  := FImageBase <> 0;
+    end else
+      Result := FDllBases.TryGetValue(LowerCase(Spec.ModuleName), ModBase);
+  end;
+
+begin
+  ClearAddressBreakpointsByModule(Spec.ModuleName);
+  var ModBase: UInt64;
+  if not TryResolveModuleBase(ModBase) then
+    Exit;
+  for var I := 0 to High(Spec.Rvas) do begin
+    var BP: TBreakpointRec;
+    BP.Rva          := Spec.Rvas[I];
+    BP.VA           := ModBase + Spec.Rvas[I];
+    BP.OrigByte     := 0;
+    BP.SourceFile   := '';
+    BP.SourceLine   := 0;
+    BP.IsOneShot    := False;
+    BP.IsPlanted    := False;
+    BP.Condition    := NthOrEmpty(Spec.Conditions,    I);
+    BP.HitCondition := NthOrEmpty(Spec.HitConditions, I);
+    BP.LogMessage   := NthOrEmpty(Spec.LogMessages,   I);
+    BP.HitCount     := 0;
+    BP.Kind         := bkAddress;
+    BP.ModuleName   := Spec.ModuleName;
+    PlantInt3(BP);
+    FBreakpoints.Add(BP);
   end;
 end;
 
@@ -2577,6 +2655,8 @@ begin
     for var C in Pending do
       if C.Kind = ckSetBreakpoints then
         DoSetBreakpoints(C.BpSpec)
+      else if C.Kind = ckSetAddressBreakpoints then
+        DoSetAddressBreakpoints(C.AddrBpSpec)
       else
         FCommandQueue.Enqueue(C);
   finally
@@ -2656,6 +2736,8 @@ begin
     case Cmd.Kind of
       ckSetBreakpoints:
         DoSetBreakpoints(Cmd.BpSpec);
+      ckSetAddressBreakpoints:
+        DoSetAddressBreakpoints(Cmd.AddrBpSpec);
       ckSetDataBreakpoints:
         // Reached only if a caller posts without draining immediately
         // (ApplyDataBreakpointCommand always drains in the same call); kept so

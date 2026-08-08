@@ -159,11 +159,26 @@ begin
   for var B in Bps do begin
     var O := TJSONObject.Create;
     O.AddPair('id', B.Id);
-    O.AddPair('sourceFile', B.SourceFile);
-    O.AddPair('line', TJSONNumber.Create(B.Line));
-    O.AddPair('verified', TJSONBool.Create(B.Verified));
+    if B.Kind = bkAddress then begin
+      O.AddPair('kind', 'address');
+      O.AddPair('address', '0x' + IntToHex(B.Address, 1));
+      O.AddPair('module', B.ModuleName);
+      O.AddPair('rva', '0x' + IntToHex(B.Rva, 1));
+      O.AddPair('verified', TJSONBool.Create(B.Verified));
+      if B.Message <> '' then
+        O.AddPair('message', B.Message);
+    end else begin
+      O.AddPair('kind', 'source');
+      O.AddPair('sourceFile', B.SourceFile);
+      O.AddPair('line', TJSONNumber.Create(B.Line));
+      O.AddPair('verified', TJSONBool.Create(B.Verified));
+    end;
     if B.Condition <> '' then
       O.AddPair('condition', B.Condition);
+    if B.HitCondition <> '' then
+      O.AddPair('hitCondition', B.HitCondition);
+    if B.LogMessage <> '' then
+      O.AddPair('logMessage', B.LogMessage);
     Result.Add(O);
   end;
 end;

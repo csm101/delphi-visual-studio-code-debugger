@@ -135,11 +135,27 @@ type
     RawValue:   UInt64;
   end;
 
+  // TBreakpointKind (bkSource / bkAddress) is DebugTarget's, reused verbatim so
+  // there is one definition of "which identity does this breakpoint carry"
+  // shared by the engine's TBreakpointRec and this session-facing record.
   TSessionBreakpoint = record
     Id:           string;
-    SourceFile:   string;
-    Line:         Integer;
+    Kind:         TBreakpointKind;  // bkSource (default) or bkAddress
+    SourceFile:   string;           // bkSource only
+    Line:         Integer;          // bkSource only
+    // bkAddress only, mirroring TSessionDataBreakpoint's ModuleName/Rva/Address
+    // fields for exactly the same reason: a bare VA does not survive a
+    // relaunch or a rebased package, so the module+offset PAIR is the
+    // identity and Address is only the last address it resolved to.
+    ModuleName:   string;
+    Rva:          UInt64;
+    Address:      UInt64;
     Verified:     Boolean;
+    // bkAddress only: refusal reason when Verified=False (address not
+    // currently inside any loaded module, or its module has since unloaded),
+    // '' otherwise. Source breakpoints keep their existing frontend-supplied
+    // "No debug info for this line" text instead of using this field.
+    Message:      string;
     Condition:    string;
     HitCondition: string;
     LogMessage:   string;

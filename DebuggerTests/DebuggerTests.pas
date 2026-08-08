@@ -756,6 +756,11 @@ type
     [Test] procedure Test_Bpl_DefinedClass_ExpandInLocals;
     [Test] procedure Test_Bpl_UnloadReload_BpRebinds;
     [Test] procedure Test_Bpl_TwoModules_EachBpRoutes;
+    // DISASSEMBLY_PLAN.md increment 5: setInstructionBreakpoints. The address
+    // form of Test_Bpl_UnloadReload_BpRebinds above -- module+RVA identity
+    // must survive the SAME unload/reload round trip.
+    [Test] procedure Test_SetInstructionBreakpoints_Bpl_UnloadReload_Rebinds;
+    [Test] procedure Test_SetInstructionBreakpoints_Basic_StopsAndVerifies;
 
     // --- type-sampler battery (TestTargetTypes.pas) ---
     // Tests marked [Ignore('TODO-RED: ...')] are documented BACKLOG: the
@@ -1284,6 +1289,47 @@ begin
     Result := Copy(S, 1, P - 1)
   else
     Result := S;
+end;
+
+// The current instruction pointer of frame FrameId, read through the DAP
+// Registers scope (RIP/EIP) rather than evaluate() -- an evaluated function
+// ADDRESS (e.g. '@PkgAdd') renders as the bare type name "Pointer" through
+// the value formatter, not a hex string; a register's own value is exactly
+// where execution stopped and is already rendered as hex (with the same
+// "  (<decimal>)" display decoration ExtractDisplayValue strips elsewhere).
+// Used by DISASSEMBLY_PLAN.md increment 5's setInstructionBreakpoints tests,
+// which have no other in-protocol way to learn an address
+// (instructionPointerReference on stack frames is increment 6).
+function CurrentRipHex(Client: TDapClient; FrameId: Integer): string;
+var
+  RegRef: Integer;
+begin
+  Result := '';
+  RegRef := 0;
+  var Sc := Client.Scopes(FrameId);
+  try
+    for var S in Sc.GetValue<TJSONArray>('scopes') do
+      if (S as TJSONObject).GetValue<string>('name', '') = 'Registers' then
+        RegRef := (S as TJSONObject).GetValue<Integer>('variablesReference', 0);
+  finally
+    Sc.Free;
+  end;
+  if RegRef = 0 then
+    Exit;
+  var V := Client.Variables(RegRef);
+  try
+    var Vars := V.GetValue<TJSONArray>('variables');
+    if Vars = nil then
+      Exit;
+    for var Item in Vars do begin
+      var O := Item as TJSONObject;
+      var Name := O.GetValue<string>('name', '');
+      if SameText(Name, 'RIP') or SameText(Name, 'EIP') then
+        Exit(ExtractDisplayValue(O.GetValue<string>('value', '')));
+    end;
+  finally
+    V.Free;
+  end;
 end;
 
 { Tests }
@@ -7105,6 +7151,131 @@ begin
       'reload: breakpoint did not re-bind after unload + reload');
   finally
     Stopped2.Free;
+  end;
+end;
+
+procedure TDebuggerTests.Test_SetInstructionBreakpoints_Bpl_UnloadReload_Rebinds;
+// The address form of Test_Bpl_UnloadReload_BpRebinds above: an address
+// breakpoint planted at EXACTLY the PKG_BP address (read off RIP via the DAP
+// Registers scope -- there is no address-echoing stack-frame field yet;
+// that is increment 6's instructionPointerReference) while stopped inside
+// the FIRST load's hit must survive TestPackage.bpl unloading and reloading
+// and fire AGAIN, with no second setInstructionBreakpoints call. This is the
+// scenario module+RVA identity exists for: a bare VA would be meaningless
+// once the package reloads (possibly at a different base).
+var
+  BpLine: Integer;
+  Stopped1, Stopped2: TJSONObject;
+  FrameId: Integer;
+  AddrStr: string;
+begin
+  BpLine := FindBpLine(PackageSrc, 'PKG_BP');
+  Assert.IsTrue(BpLine > 0, 'PKG_BP marker not found');
+
+  FClient := TDapClient.Create;
+  FClient.Start(AdapterExe);
+  FClient.Initialize.Free;
+  Assert.IsTrue(FClient.WaitForInitialized);
+  FClient.SetBreakpoints(PackageSrc, [BpLine]).Free;
+  var Spec := Default(TLaunchSpec);
+  Spec.Args    := ['--reload-package'];
+  Spec.Modules := [['TestPackage.bpl', PackageMap, PackageRsm, PackageDcp]];
+  LaunchTarget(Spec).Free;
+  FClient.ConfigDone.Free;
+
+  Stopped1 := FClient.WaitForStopped(15000);
+  try
+    Assert.AreEqual('breakpoint', Stopped1.GetValue<string>('reason', ''),
+      'reload: first load did not hit PKG_BP');
+  finally
+    Stopped1.Free;
+  end;
+  FrameId := FClient.GetFrameId;
+
+  AddrStr := CurrentRipHex(FClient, FrameId);
+  Assert.IsTrue(AddrStr <> '', 'could not read RIP off the Registers scope');
+
+  FClient.SetBreakpoints(PackageSrc, []).Free;   // drop the source bp
+
+  var SetResp := FClient.SetInstructionBreakpoints([AddrStr]);
+  try
+    var Bps := SetResp.GetValue<TJSONArray>('breakpoints');
+    Assert.IsTrue((Bps <> nil) and (Bps.Count = 1), 'expected one breakpoint result: ' + SetResp.ToJSON);
+    Assert.IsTrue((Bps.Items[0] as TJSONObject).GetValue<Boolean>('verified', False),
+      'address breakpoint at PkgAdd did not verify: ' + SetResp.ToJSON);
+  finally
+    SetResp.Free;
+  end;
+
+  // Continuing now runs UnloadPackage then LoadPackage #2 with no
+  // intervening user stop -- only the address breakpoint remains armed.
+  FClient.Continue_.Free;
+  Stopped2 := FClient.WaitForStopped(15000);
+  try
+    Assert.AreEqual('breakpoint', Stopped2.GetValue<string>('reason', ''),
+      'address breakpoint did not re-bind and fire after unload + reload');
+  finally
+    Stopped2.Free;
+  end;
+end;
+
+procedure TDebuggerTests.Test_SetInstructionBreakpoints_Basic_StopsAndVerifies;
+// Mono coverage: CTOR_BODY (TWidget.Create) is hit more than once per run
+// (DebuggerTests\DebugSessionTests.pas' Breakpoint_HitCount_SkipsEarlyHits
+// proves this for the identical direct-launch shape used here). Stop on the
+// FIRST hit via a source breakpoint, read RIP (the exact stop address) off
+// the DAP Registers scope, drop the source breakpoint, and plant an address
+// breakpoint at that same VA -- it must fire again on a LATER call, with no
+// source breakpoint at that line at all.
+var
+  BpLine: Integer;
+  Stopped: TJSONObject;
+  FrameId: Integer;
+  AddrStr: string;
+begin
+  BpLine := Bp('CTOR_BODY');
+  Assert.IsTrue(BpLine > 0, 'CTOR_BODY marker not found');
+
+  FClient := TDapClient.Create;
+  FClient.Start(AdapterExe);
+  FClient.Initialize.Free;
+  Assert.IsTrue(FClient.WaitForInitialized);
+  FClient.SetBreakpoints(FBpSourceFile, [BpLine]).Free;
+  FClient.SetExceptionBreakpoints([]).Free;
+  LaunchTarget(nil).Free;
+  FClient.ConfigDone.Free;
+
+  Stopped := FClient.WaitForStopped;
+  try
+    Assert.AreEqual('breakpoint', Stopped.GetValue<string>('reason', ''),
+      'did not stop at CTOR_BODY');
+  finally
+    Stopped.Free;
+  end;
+  FrameId := FClient.GetFrameId;
+
+  AddrStr := CurrentRipHex(FClient, FrameId);
+  Assert.IsTrue(AddrStr <> '', 'could not read RIP off the Registers scope');
+
+  FClient.SetBreakpoints(FBpSourceFile, []).Free;   // drop the source bp
+
+  var SetResp := FClient.SetInstructionBreakpoints([AddrStr]);
+  try
+    var Bps := SetResp.GetValue<TJSONArray>('breakpoints');
+    Assert.IsTrue((Bps <> nil) and (Bps.Count = 1), 'expected one breakpoint result: ' + SetResp.ToJSON);
+    Assert.IsTrue((Bps.Items[0] as TJSONObject).GetValue<Boolean>('verified', False),
+      'address breakpoint at TStuff.Create did not verify: ' + SetResp.ToJSON);
+  finally
+    SetResp.Free;
+  end;
+
+  FClient.Continue_.Free;
+  Stopped := FClient.WaitForStopped(15000);
+  try
+    Assert.AreEqual('breakpoint', Stopped.GetValue<string>('reason', ''),
+      'address breakpoint did not stop the target');
+  finally
+    Stopped.Free;
   end;
 end;
 
