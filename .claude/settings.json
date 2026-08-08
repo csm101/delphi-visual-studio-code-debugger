@@ -16,5 +16,24 @@
       "PowerShell(cmd /c \"C:\\Athens\\GitHub\\Win64Debugger\\DebuggerTests\\run_tests.bat\" *)",
       "PowerShell(cmd /c \"C:\\Athens\\GitHub\\Win64Debugger\\install\\extension-tests\\run.bat\" *)"
     ]
+  },
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Write|Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "pwsh",
+            "args": [
+              "-NoProfile",
+              "-File",
+              "C:\\Athens\\GitHub\\Win64Debugger\\.claude\\check_task_resume.ps1"
+            ],
+            "statusMessage": "Checking TASK_RESUME.md size"
+          }
+        ]
+      }
+    ]
   }
 }

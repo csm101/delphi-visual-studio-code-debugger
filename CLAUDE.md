@@ -174,10 +174,10 @@ When starting a new session:
 
 1. Read PROJECT_STATE.md
 2. Read TASK_RESUME.md
-3. Read the living specifications relevant to the next step:
-   - work on symbols / locals / globals / types → the `RSM_*` documents
-   - work on the adapter, debug loop, DAP requests, stepping → `DAP_DEBUGGER_ARCHITECTURE.md`
-   - in every session, regardless of focus → `KNOWN_UNKNOWNS.md` and `TRAPS.md`
+3. Read the living specifications relevant to the next step — pick them from the
+   list under "Living specifications" above, which is the ONLY list of those
+   documents. `KNOWN_UNKNOWNS.md` and `TRAPS.md` are read in every session
+   regardless of focus.
 4. Inspect only referenced files first
 5. Resume exactly from next step
 
