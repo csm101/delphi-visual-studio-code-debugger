@@ -1,6 +1,6 @@
 ---
 name: docs-sync
-description: Updates the living specifications (RSM_*, TD32_FORMAT_NOTES, DAP_DEBUGGER_ARCHITECTURE, KNOWN_UNKNOWNS, PROJECT_STATE, TASK_RESUME) to match a change that was just made. Use after landing a code change, confirming a format fact, or resolving an open question, so the docs move in the same change set as the code.
+description: Updates the living specifications (RSM_*, TD32_FORMAT_NOTES, DAP_DEBUGGER_ARCHITECTURE, KNOWN_UNKNOWNS, TRAPS, PROJECT_STATE, TEST_CATALOG) to match a change that was just made, and keeps TASK_RESUME.md a short cursor rather than a journal. Use after landing a code change, confirming a format fact, or resolving an open question, so the docs move in the same change set as the code.
 tools: Read, Edit, Write, Grep, Glob, Bash
 model: sonnet
 ---
@@ -17,10 +17,15 @@ the experiments actually established. You do not change code — only documents.
 | `RSM_FIELD_OFFSETS.md` | Byte-level layout of each record |
 | `TD32_FORMAT_NOTES.md` | TD32 / CodeView / `.tds` structures |
 | `DAP_DEBUGGER_ARCHITECTURE.md` | Modules, threading model, breakpoint / evaluate / setVariable flows, capability list |
-| `KNOWN_UNKNOWNS.md` | Open questions that block or condition the work |
+| `KNOWN_UNKNOWNS.md` | Open questions that block or condition the work, and refuted attempts worth not repeating |
+| `TRAPS.md` | Operational rules that prevent wasted work — suite, build, proving a fix, fixture design, what the suite cannot prove, provider concurrency, diagnosing a field report, optimisations already rejected |
 | `PROJECT_STATE.md` | Architecture status, implemented features, open milestones, important technical discoveries, stable build/run commands |
-| `TASK_RESUME.md` | The exact current cursor inside the task in progress |
-| `TEST_CATALOG.md` | What the suite covers |
+| `TASK_RESUME.md` | The cursor inside the task in progress — and nothing else. See the rules below |
+| `TEST_CATALOG.md` | What the suite covers, and what a green run does NOT prove |
+| `DISASSEMBLY_PLAN.md`, `DATA_BREAKPOINTS_PLAN.md` | Designed-but-unbuilt features: decisions, increments, traps. Update when a decision changes, not to narrate progress |
+| `WHAT_WORKS_WHERE.md` | The capability matrix: monolithic vs packages with/without debug info, x86 vs x64. A cell that has not been measured stays explicitly blank |
+| `MCP_SERVER.md`, `MCP_LIVE_FINDINGS_TODO.md` | MCP tool surface and its open findings |
+| `DevTools/README.md` | Each probe's invocation, and the expected baselines a probe's output is read against |
 | `README.md` | User-facing feature list, "What works", roadmap |
 
 Put each fact in exactly one place. If two documents would both plausibly own it,
@@ -42,15 +47,35 @@ the more specific one wins and the other gets a pointer, not a copy.
 - Professional technical English, concise but polished. No caveman style in files.
 - CRLF line endings.
 
-## `TASK_RESUME.md` must always contain
+## `TASK_RESUME.md` — the rule that matters most
 
-Current task; current substep; files and symbols in focus; last completed action;
-next action if interrupted right now; files involved; what works; what is failing;
-last test result; exact next step; traps and hypotheses.
+**It is OVERWRITTEN, never appended to, and stays under 150 lines.** A hook
+(`.claude/check_task_resume.ps1`) fails the write when it goes over.
 
-When a long step is still in progress, describe the cursor **inside** that step,
-not just the milestone. Brief but specific enough that a fresh session resumes
-without re-reading broad context.
+This file once reached 3343 lines (~91k tokens) because every session added to the
+bottom. Reading it then cost more than reading the code it described, and its
+"next action" pointed at work finished weeks earlier — a stale cursor is worse
+than no cursor, because it sends the next session in the wrong direction with
+confidence.
+
+It contains: the current task and the cursor inside it; the next action if
+interrupted right now; the files and symbols in focus; last test result; what is
+open; and the traps of THIS task. Nothing else.
+
+Before you add a paragraph, ask where it belongs once the task ends, and put it
+there instead:
+
+- a measured fact about a format → `RSM_*.md`, `TD32_FORMAT_NOTES.md`
+- an architectural decision or mechanism → `DAP_DEBUGGER_ARCHITECTURE.md`
+- an open question or a refuted hypothesis → `KNOWN_UNKNOWNS.md`
+- a rule that prevents wasted work → `TRAPS.md`
+- what is done / what is next at project scale → `PROJECT_STATE.md`
+- what a green suite does not prove → `TEST_CATALOG.md`
+- the narrative of a change that landed → the commit message, not a file
+
+When you finish a task, **delete from `TASK_RESUME.md` everything that is no
+longer true** rather than leaving it as history. That deletion is part of your
+job, not an optional tidy-up.
 
 ## Method
 
