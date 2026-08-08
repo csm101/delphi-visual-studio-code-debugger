@@ -25,39 +25,31 @@ longer true, delete it.
 
 ## Current task (2026-08-08)
 
-**Data breakpoints (watchpoints), increment 3 of 6 — DONE and gated.** Plan,
-what was built, and the negative controls run are all in
-`DATA_BREAKPOINTS_PLAN.md` (increment 3 section) and `PROJECT_STATE.md`'s
-roadmap entry. Full suite green before and after: 1052 found / 1048 passed /
-0 failed / 0 errored / 4 ignored.
+**Data breakpoints (watchpoints), increment 4 of 6 — DONE and gated.** Session
+API (`SetDataBreakpoints`/`ListDataBreakpoints`/`RemoveAllDataBreakpoints`), the
+new `srDataBreakpoint` stop reason with old->new capture, and the
+synthetic-call abort interaction are all built, tested (mono + Win32) and
+green. Full detail in `DATA_BREAKPOINTS_PLAN.md` (increment 4 section) and
+`PROJECT_STATE.md`'s roadmap entry — both updated in this change set. Full
+suite: 1059 found / 1055 passed / 0 failed / 0 errored / 4 ignored.
 
 ### Next action
 
-Start **increment 4: session API + stop reason + old/new capture.**
-`SetDataWatchpoint`/`ClearDataWatchpoint` currently exist only on
-`IDebugTarget` and are called directly by tests/probes — there is no
-session-level entry point and no stop reason yet, so a watchpoint hit today is
-just logged and resumed (`TakeDebugTrapCause` in `WinDebuggerBase.pas`).
+Start **increment 5: MCP tool surface.** Per `DATA_BREAKPOINTS_PLAN.md`
+§"Surfaces": `set_data_breakpoint(address | expression, size, access)` with
+`access` one of `write`/`readWrite` (`read` refused, explained — x86 has no
+read-only watchpoint), `list_data_breakpoints`, `remove_data_breakpoint`; the
+stop payload names the watched address, the firing thread, and old/new. The
+session-level plumbing this needs already exists (`SetDataBreakpoints` etc. in
+`DebugSession.pas`) — this increment is the MCP tool schema + handler wiring
+(`McpServer.pas`, `McpToolSchemas.pas`) plus surfacing `srDataBreakpoint` /
+`DataBreakpointDescription` through `get_compact_debug_snapshot` and whatever
+stop-notification path MCP uses (check how `srException` is surfaced there
+today and mirror it). No code written yet for increment 5 — cold start.
 
-Per `DATA_BREAKPOINTS_PLAN.md` §"Where it plugs into the existing
-architecture":
-- **Command queue** (`DebugTarget.pas:185`, `TCommandKind`): new
-  `ckSetDataBreakpoints` kind with its own spec record, so arming runs on the
-  debug thread like `ckSetBreakpoints`.
-- **Session** (`DebugSession.pas:220`): `SetDataBreakpoints` /
-  `ListDataBreakpoints` / removal, mirroring the source-breakpoint API.
-- **Stop reporting**: a new `TStopReason` value — a watchpoint stop is not a
-  breakpoint stop and must not be reported as one.
-- **Old/new capture**: a write watchpoint traps AFTER the store completes, so
-  "new" reads at the stop; "old" must be captured when the watchpoint is armed
-  and refreshed at every hit.
-- Second interaction to decide deliberately (not default-swallow): a
-  watchpoint firing during a synthetic call — abort the call or suppress the
-  hit? The `RunMethodCall` abort-on-raise machinery
-  (`FLastSyntheticCallError`) is the model to follow or deviate from,
-  consciously.
-
-No code has been written for increment 4 yet — this is a cold start.
+DAP surfaces (increment 6: `supportsDataBreakpoints`, `dataBreakpointInfo`,
+`setDataBreakpoints`, address-form persistence across relaunch) are also not
+started.
 
 ## Standing constraint from the user
 
@@ -70,11 +62,11 @@ documented.
 - `public-main`, clean. Release **0.3.0 is committed but NOT tagged and NOT
   pushed**; no GitHub release exists. The push is the outward-facing step and
   waits on the maintainer.
-- Last full suite: **1052 found / 1048 passed / 0 failed / 0 errored / 4
-  ignored.** Extension suite: 152 passed / 0 failed. One unrelated flake seen
-  during the increment-3 session (`Test_RtlStringGetter_VarOutFromPropertyType`
-  in the BPL scenario, failed once in a full run, passed 3/3 in isolation) —
-  logged, not chased.
+- Last full suite: **1059 found / 1055 passed / 0 failed / 0 errored / 4
+  ignored.** One unrelated flake seen during the increment-3 session
+  (`Test_RtlStringGetter_VarOutFromPropertyType` in the BPL scenario, failed
+  once in a full run, passed 3/3 in isolation) — logged, not chased, not seen
+  again in increment 4's runs.
 - Win32 support is functionally complete for `-$O-` targets. Debug-info format
   coverage (TD32, RSM, MAP, JCL, DCP, `.tds`) is closed; DCU is WON'T DO.
 

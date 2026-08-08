@@ -16,7 +16,8 @@ uses
   System.SysUtils, Winapi.Windows, DebugInfoTypes, ExceptionRules, TargetLayout;
 
 type
-  TStopReason = (srEntry, srBreakpoint, srStep, srException, srPause);
+  TStopReason = (srEntry, srBreakpoint, srStep, srException, srPause,
+    srDataBreakpoint);
 
   // How one synthetic-call argument has to be materialised in the TARGET.
   //
@@ -103,6 +104,27 @@ type
     FiredSlots: Byte;     // bitmask: two slots can trip on one instruction
     Address:    UInt64;   // what that DR was armed on
     Pc:         UInt64;   // where the target was when the trap arrived
+    SizeBytes:  Integer;  // width the slot was armed at, for OldValue/NewValue
+    // A write watchpoint traps AFTER the store completes, so NewValue is read
+    // at the trap; OldValue is whatever NewValue was at the PREVIOUS hit (or at
+    // arm time for the first one) -- captured by the allocator, not decoded
+    // from the trap itself. Zero-extended into the low SizeBytes.
+    OldValue:   UInt64;
+    NewValue:   UInt64;
+    Description: string;  // the allocator's OwnerDescription -- who asked for it
+  end;
+
+  // What one data-breakpoint command asks the engine to do, queued and run on
+  // the debug thread exactly like a source breakpoint spec (arming touches
+  // thread contexts). Clear=True targets an existing Slot instead of arming a
+  // new address.
+  TDataBpArmSpec = record
+    Clear:            Boolean;
+    Slot:             Integer;   // meaningful only when Clear = True
+    Address:          UInt64;
+    SizeBytes:        Integer;
+    WriteOnly:        Boolean;
+    OwnerDescription: string;
   end;
 
   TLocalValue = record
@@ -204,7 +226,7 @@ type
   end;
 
   TCommandKind = (ckContinue, ckStepInto, ckStepOver, ckStepOut, ckPause,
-    ckSetBreakpoints);
+    ckSetBreakpoints, ckSetDataBreakpoints);
 
   TBpSpec = record
     SourceFile:    string;
@@ -215,9 +237,10 @@ type
   end;
 
   TCommand = record
-    Kind:     TCommandKind;
-    ThreadId: DWORD;    // step target for ckStep*: 0 = the currently-stopped thread
-    BpSpec:   TBpSpec;
+    Kind:       TCommandKind;
+    ThreadId:   DWORD;    // step target for ckStep*: 0 = the currently-stopped thread
+    BpSpec:     TBpSpec;
+    DataBpSpec: TDataBpArmSpec;
   end;
 
   TOnStopped     = procedure(Reason: TStopReason; const SourceFile: string;
@@ -344,6 +367,14 @@ type
                 const OwnerDescription: string; out Slot: Integer;
                 out RefusalReason: string): Boolean;
     function  ClearDataWatchpoint(Slot: Integer): Boolean;
+    // Session-facing entry point (increment 4): posts Spec through the command
+    // queue -- arming touches thread contexts, same reason ckSetBreakpoints
+    // does -- then drains and executes it immediately, so the caller gets the
+    // REAL arming outcome (slot exhaustion, misalignment) synchronously rather
+    // than an optimistic prediction. Result mirrors SetDataWatchpoint /
+    // ClearDataWatchpoint's own True/False.
+    function  ApplyDataBreakpointCommand(const Spec: TDataBpArmSpec;
+                out Slot: Integer; out RefusalReason: string): Boolean;
 
     // Mutators (used by `setVariable` and the synthetic remote-call path).
     function  SetRegisterByName(const Name: string; Value: UInt64): Boolean;

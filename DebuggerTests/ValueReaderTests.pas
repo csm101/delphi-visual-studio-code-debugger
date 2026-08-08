@@ -156,6 +156,8 @@ type
                 const OwnerDescription: string; out Slot: Integer;
                 out RefusalReason: string): Boolean;
     function  ClearDataWatchpoint(Slot: Integer): Boolean;
+    function  ApplyDataBreakpointCommand(const Spec: TDataBpArmSpec;
+                out Slot: Integer; out RefusalReason: string): Boolean;
     function  AllocateRemoteString(const Text, TypeHint: string; out NewPtr: UInt64): Boolean;
     function  SetStringVariable(TargetAddr: UInt64; const Text, TypeHint: string): Boolean;
     function  TryResolveSymbolVA(const Name: string; out VA: UInt64): Boolean;
@@ -258,6 +260,13 @@ begin
   Result := False;
 end;
 function  TFakeMemTarget.ClearDataWatchpoint(Slot: Integer): Boolean; begin Result := False; end;
+function  TFakeMemTarget.ApplyDataBreakpointCommand(const Spec: TDataBpArmSpec;
+  out Slot: Integer; out RefusalReason: string): Boolean;
+begin
+  Slot := -1;
+  RefusalReason := 'not implemented in TFakeMemTarget';
+  Result := False;
+end;
 function  TFakeMemTarget.HardwareWatchpointHitCount: Integer; begin Result := 0; end;
 function  TFakeMemTarget.LastHardwareWatchpointHit: TWatchpointHit; begin Result := Default(TWatchpointHit); Result.Slot := -1; end;
 function  TFakeMemTarget.AllocateRemoteString(const Text, TypeHint: string; out NewPtr: UInt64): Boolean; begin NewPtr := 0; Result := False; end;

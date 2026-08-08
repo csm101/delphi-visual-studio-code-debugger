@@ -81,6 +81,12 @@ type
     FBpSpecs:     TDictionary<string, TBpSpec>;   // lcase file -> last spec, for repost on module load
     FBpVerified:  TDictionary<string, Boolean>;   // 'lcasefile|line' -> last-known verified state, for flip detection
 
+    // Data breakpoints (watchpoints; increment 4 of DATA_BREAKPOINTS_PLAN.md).
+    // Unlike source breakpoints there is no per-file grouping -- SetDataBreakpoints
+    // replaces the WHOLE set on every call, mirroring DAP's own setDataBreakpoints.
+    FDataBreakpoints: TList<TSessionDataBreakpoint>;
+    FNextDataBpId:    Integer;
+
     // Launch/attach-configured runtime-module sidecar overrides (empty = today's
     // auto-discovery; applied in HandleDllLoaded).
     FModulesConfig: TArray<TSessionModuleConfig>;
@@ -111,6 +117,24 @@ type
     procedure SetState(NewState: TDebugSessionState);
     function  BuildAndWireDebugger(PreferredBase: UInt64): Boolean;
     procedure ApplyPendingBreakpoints;
+    // Resolves a data-breakpoint expression to a live VA: a literal address
+    // ("$hex" / "0xhex" / a plain decimal), else a global/unit variable via the
+    // same resolution the evaluator uses. Distinguishes "no such symbol" from
+    // "that IS a symbol, but a LOCAL" (RejectReason names which, so the caller
+    // is told WHY rather than just that it failed) -- KnownLocal is set only in
+    // the second case. ModuleName/Rva are populated when Addr falls inside a
+    // module GetModules currently knows about; '' / 0 otherwise.
+    function  ResolveDataBpAddress(const Expression: string; out Addr: UInt64;
+                out ModuleName: string; out Rva: UInt64; out KnownLocal: Boolean;
+                out RejectReason: string): Boolean;
+    // Resolves and arms ONE spec via IDebugTarget.ApplyDataBreakpointCommand,
+    // filling in every field of the returned record including the failure
+    // case (Verified=False, Message=why).
+    function  ArmOneDataBreakpoint(const Spec: TDataBpSpec): TSessionDataBreakpoint;
+    // "expression: old -> new (thread N)" from the engine's last watchpoint
+    // hit. Shared by HandleTargetStopped (the OnStopped event) and Snapshot
+    // (a later poll) so the two never disagree.
+    function  BuildDataBreakpointDescription: string;
     // Free + recreate-empty the symbol infrastructure so its memory-mapped files
     // (target .exe TD32 section, .rsm, BPL .dcp) are released on terminate/detach.
     procedure ReleaseSymbolProviders;
@@ -226,6 +250,19 @@ type
     // DAP background loader registering providers directly) can drive rebind and the
     // single gutter re-colour path without duplicating the flip detection.
     procedure RepostBreakpoints;
+
+    // Data breakpoints (watchpoints; increment 4 of DATA_BREAKPOINTS_PLAN.md).
+    // Mirrors the source-breakpoint API's shape, but SetDataBreakpoints
+    // replaces the WHOLE set on every call (no per-file grouping exists for an
+    // address), matching DAP's own setDataBreakpoints semantics. Only callable
+    // while State = dsStopped: arming reads/writes live thread contexts, which
+    // are only stable at a stop (the same reason DAP's own dataBreakpointInfo /
+    // setDataBreakpoints only make sense there). Each spec is resolved and
+    // armed independently and reports its OWN Verified/Message -- one bad
+    // expression does not fail the others.
+    function  SetDataBreakpoints(const Specs: TArray<TDataBpSpec>): TArray<TSessionDataBreakpoint>;
+    function  ListDataBreakpoints: TArray<TSessionDataBreakpoint>;
+    procedure RemoveAllDataBreakpoints;
 
     // Introspection (valid only when State = dsStopped).
     function  GetCallStack: TArray<TSessionFrame>; overload;
@@ -447,6 +484,7 @@ begin
   FPendingBps  := TList<TBpSpec>.Create;
   FBpSpecs     := TDictionary<string, TBpSpec>.Create;
   FBpVerified  := TDictionary<string, Boolean>.Create;
+  FDataBreakpoints := TList<TSessionDataBreakpoint>.Create;
   FDebuggeeOutput := TList<string>.Create;
   FDebuggerOutput := TList<string>.Create;
   FExpander    := TVariableExpander.Create;
@@ -492,6 +530,7 @@ begin
   FDebuggeeOutput.Free;
   FLoader.Free;          // removes its module providers from FDebugInfo, frees
                          // the registry; main readers released below via ARC
+  FDataBreakpoints.Free;
   FBpVerified.Free;
   FBpSpecs.Free;
   FPendingBps.Free;
@@ -894,9 +933,194 @@ begin
     FPendingBps.Add(Spec);
 end;
 
+function TDebugSession.BuildDataBreakpointDescription: string;
+begin
+  Result := '';
+  if FDebugger = nil then
+    Exit;
+  var Hit := FDebugger.LastHardwareWatchpointHit;
+  var Name := Hit.Description;
+  if Name = '' then
+    Name := Format('$%x', [Hit.Address]);
+  Result := Format('%s: $%x -> $%x (thread %d)',
+    [Name, Hit.OldValue, Hit.NewValue, Hit.ThreadId]);
+end;
+
 function TDebugSession.ListBreakpoints: TArray<TSessionBreakpoint>;
 begin
   Result := FBreakpoints.ToArray;
+end;
+
+function TDebugSession.ResolveDataBpAddress(const Expression: string; out Addr: UInt64;
+  out ModuleName: string; out Rva: UInt64; out KnownLocal: Boolean;
+  out RejectReason: string): Boolean;
+
+  // A literal address: "$hex", "0xhex", or a plain decimal. Anything else
+  // falls through to symbol resolution.
+  function TryParseLiteral(const S: string; out V: UInt64): Boolean;
+  var
+    Norm: string;
+  begin
+    Norm := S;
+    if (Norm <> '') and (Norm[1] = '$') then
+      // already Delphi hex syntax
+    else if (Length(Norm) > 2) and (Norm[1] = '0') and
+            CharInSet(Norm[2], ['x', 'X']) then
+      Norm := '$' + Copy(Norm, 3, MaxInt)
+    else if not ((Norm <> '') and CharInSet(Norm[1], ['0'..'9'])) then
+      Exit(False);
+    Result := TryStrToUInt64(Norm, V);
+  end;
+
+var
+  Expr: string;
+  V:    UInt64;
+  LV:   TLocalValue;
+begin
+  Result       := False;
+  Addr         := 0;
+  ModuleName   := '';
+  Rva          := 0;
+  KnownLocal   := False;
+  RejectReason := '';
+  Expr := Trim(Expression);
+
+  if TryParseLiteral(Expr, V) then begin
+    Addr   := V;
+    Result := True;
+  end else if (FDebugger <> nil) and FDebugger.EvaluateGlobalName(Expr, LV) and
+              (LV.Address <> 0) then begin
+    Addr   := LV.Address;
+    Result := True;
+  end else if (FDebugger <> nil) and FDebugger.EvaluateLocalName(Expr, LV) then begin
+    // A real symbol, but its address only means something for the lifetime of
+    // the frame that owns it -- refuse explicitly rather than arm a watchpoint
+    // that will silently start watching reused stack once the frame is gone.
+    KnownLocal   := True;
+    RejectReason := 'local variables are not supported yet -- their lifetime is ' +
+      'tied to the stack frame (dataBreakpointInfo, increment 6); watch the ' +
+      'containing global, or pass a literal address, instead';
+    Exit(False);
+  end else begin
+    RejectReason := 'unresolved symbol: ' + Expr;
+    Exit(False);
+  end;
+
+  for var M in GetModules do
+    if (M.Size > 0) and (Addr >= M.Base) and (Addr < M.Base + M.Size) then begin
+      ModuleName := M.Name;
+      Rva        := Addr - M.Base;
+      Break;
+    end;
+end;
+
+function TDebugSession.ArmOneDataBreakpoint(const Spec: TDataBpSpec): TSessionDataBreakpoint;
+begin
+  Result := Default(TSessionDataBreakpoint);
+  Inc(FNextDataBpId);
+  Result.Id         := 'databp' + IntToStr(FNextDataBpId);
+  Result.Expression := Spec.Expression;
+  Result.SizeBytes   := Spec.SizeBytes;
+  Result.WriteOnly   := Spec.WriteOnly;
+  Result.Slot        := -1;
+
+  if not (Spec.SizeBytes in [1, 2, 4, 8]) then begin
+    Result.Message := Format('unsupported size %d bytes (must be 1, 2, 4 or 8)',
+      [Spec.SizeBytes]);
+    Exit;
+  end;
+
+  var Addr:       UInt64;
+  var ModName:    string;
+  var Rva:        UInt64;
+  var KnownLocal: Boolean;
+  var Reason:     string;
+  if not ResolveDataBpAddress(Spec.Expression, Addr, ModName, Rva, KnownLocal, Reason) then begin
+    Result.Message := Reason;
+    Exit;
+  end;
+
+  if (Addr mod UInt64(Spec.SizeBytes)) <> 0 then begin
+    Result.Message := Format('address $%x is not aligned to %d bytes',
+      [Addr, Spec.SizeBytes]);
+    Exit;
+  end;
+
+  Result.ModuleName := ModName;
+  Result.Rva        := Rva;
+  Result.Address     := Addr;
+
+  if FDebugger = nil then begin
+    Result.Message := 'no active debug session';
+    Exit;
+  end;
+
+  var ArmSpec: TDataBpArmSpec;
+  ArmSpec := Default(TDataBpArmSpec);
+  ArmSpec.Address          := Addr;
+  ArmSpec.SizeBytes        := Spec.SizeBytes;
+  ArmSpec.WriteOnly        := Spec.WriteOnly;
+  ArmSpec.OwnerDescription := Spec.Expression;
+
+  var Slot: Integer;
+  var RefusalReason: string;
+  if FDebugger.ApplyDataBreakpointCommand(ArmSpec, Slot, RefusalReason) then begin
+    Result.Slot     := Slot;
+    Result.Verified := True;
+    // x86 has no read-only hardware watchpoint: a caller that asked for
+    // read-or-write did not filter anything, and the honest thing is to say
+    // so rather than let a surprise write-hit look like a bug.
+    if not Spec.WriteOnly then
+      Result.Message := 'no read-only watchpoint on this CPU -- also fires on writes';
+  end else
+    Result.Message := RefusalReason;
+end;
+
+function TDebugSession.SetDataBreakpoints(
+  const Specs: TArray<TDataBpSpec>): TArray<TSessionDataBreakpoint>;
+begin
+  SetLength(Result, Length(Specs));
+  if (FDebugger = nil) or (FState <> dsStopped) then begin
+    for var I := 0 to High(Specs) do begin
+      Result[I] := Default(TSessionDataBreakpoint);
+      Result[I].Expression := Specs[I].Expression;
+      Result[I].SizeBytes  := Specs[I].SizeBytes;
+      Result[I].WriteOnly  := Specs[I].WriteOnly;
+      Result[I].Slot       := -1;
+      Result[I].Message    := 'data breakpoints can only be set while stopped';
+    end;
+    Exit;
+  end;
+
+  // Whole-set replace, mirroring DAP's own setDataBreakpoints -- there is no
+  // per-file grouping for an address the way there is for a source line.
+  RemoveAllDataBreakpoints;
+  for var I := 0 to High(Specs) do begin
+    var Bp := ArmOneDataBreakpoint(Specs[I]);
+    FDataBreakpoints.Add(Bp);
+    Result[I] := Bp;
+  end;
+end;
+
+function TDebugSession.ListDataBreakpoints: TArray<TSessionDataBreakpoint>;
+begin
+  Result := FDataBreakpoints.ToArray;
+end;
+
+procedure TDebugSession.RemoveAllDataBreakpoints;
+begin
+  if FDebugger <> nil then
+    for var Bp in FDataBreakpoints do
+      if Bp.Slot >= 0 then begin
+        var ClearSpec: TDataBpArmSpec;
+        ClearSpec := Default(TDataBpArmSpec);
+        ClearSpec.Clear := True;
+        ClearSpec.Slot  := Bp.Slot;
+        var Slot: Integer;
+        var Reason: string;
+        FDebugger.ApplyDataBreakpointCommand(ClearSpec, Slot, Reason);
+      end;
+  FDataBreakpoints.Clear;
 end;
 
 procedure TDebugSession.RemoveAllBreakpoints;
@@ -980,6 +1204,8 @@ begin
     Info.OsThreadId  := FStopTid;
     if (Reason = srException) and (FDebugger <> nil) then
       Info.ExceptionDescription := FDebugger.LastExceptionDesc;
+    if Reason = srDataBreakpoint then
+      Info.DataBreakpointDescription := BuildDataBreakpointDescription;
     FOnStopped(Info);
   end;
 end;
@@ -2289,6 +2515,8 @@ begin
     Result.HasException := True;
     Result.Exception_   := GetExceptionDetails;
   end;
+  if FStopReason = srDataBreakpoint then
+    Result.DataBreakpointDescription := BuildDataBreakpointDescription;
 end;
 
 function TDebugSession.DrainDebuggeeOutput: TArray<string>;

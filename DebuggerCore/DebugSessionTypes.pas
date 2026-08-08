@@ -146,6 +146,41 @@ type
     HitCount:     Integer;
   end;
 
+  // Session-facing data-breakpoint spec (increment 4 of DATA_BREAKPOINTS_PLAN.md).
+  // Expression is a literal address ("$1234" / "0x1234" / a plain decimal) or a
+  // global/unit variable name resolved the same way the evaluator resolves one.
+  // Locals are explicitly out of scope here -- their lifetime is tied to a
+  // stack frame, which needs dataBreakpointInfo (increment 6); SetDataBreakpoints
+  // refuses them by name rather than silently accepting a stale address.
+  TDataBpSpec = record
+    Expression: string;
+    SizeBytes:  Integer;   // must be 1, 2, 4 or 8; anything else is refused
+    // False = read-or-write. There is no read-only hardware watchpoint on
+    // x86/x64 -- WriteOnly=False does not FILTER to reads, it also fires on
+    // writes, and the caller is told so via Message rather than left to find
+    // out from a surprise hit.
+    WriteOnly:  Boolean;
+  end;
+
+  TSessionDataBreakpoint = record
+    Id:         string;
+    Expression: string;
+    // Resolved module+RVA when Address falls inside a known module -- a bare
+    // VA does not survive a relaunch or a rebased package (see address
+    // breakpoints in DISASSEMBLY_PLAN.md for the same reasoning). ModuleName
+    // is '' when Address falls outside every known module.
+    ModuleName: string;
+    Rva:        UInt64;
+    Address:    UInt64;
+    SizeBytes:  Integer;
+    WriteOnly:  Boolean;
+    Slot:       Integer;    // hardware DR index actually holding this, -1 until armed
+    Verified:   Boolean;
+    // Refusal reason when Verified=False, or an informational note (e.g. the
+    // read-or-write caveat above) when Verified=True.
+    Message:    string;
+  end;
+
   TSessionExceptionInfo = record
     ExceptionClass: string;
     Message:        string;
@@ -165,6 +200,11 @@ type
     // description, so a frontend's stopped event carries it without an extra
     // GetExceptionDetails round trip.
     ExceptionDescription: string;
+    // Populated only when Reason = srDataBreakpoint: "expression: old -> new
+    // (thread N)". The thread that fired is also OsThreadId above -- naming
+    // WHICH thread wrote the cell is frequently the whole answer, so it is not
+    // buried inside this string alone.
+    DataBreakpointDescription: string;
   end;
 
   TCompactSnapshot = record
@@ -178,6 +218,8 @@ type
     Locals:          TArray<TSessionVariable>;
     HasException:    Boolean;
     Exception_:      TSessionExceptionInfo;
+    // Populated only when StopReason = srDataBreakpoint; see TStopInfo.
+    DataBreakpointDescription: string;
   end;
 
   // Per runtime-module (DLL/BPL) sidecar overrides from a frontend's launch

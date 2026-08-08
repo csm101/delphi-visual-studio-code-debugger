@@ -102,7 +102,7 @@ VS Code  ── DAP (JSON over stdio) ──>  VisualStudioCodeDelphiDebugger.ex
 - `DebuggerTests\`: DUnitX integration test suite. Launches the adapter,
   exercises BPs / locals / step / globals / evaluate.
   Run with `cmd /c "C:\Athens\GitHub\Win64Debugger\DebuggerTests\build_and_run.bat"`.
-  Current status: **1052 found / 1048 pass / 0 fail / 0 leaked / 4 ignored.**
+  Current status: **1059 found / 1055 pass / 0 fail / 0 leaked / 4 ignored.**
   Attach/detach tests self-skip when SeDebugPrivilege
   isn't held; run elevated to exercise them. The count includes the TD32
   + RSM reader unit tests (`TD32ReaderTests`, `RsmReaderTests`), the
@@ -514,7 +514,7 @@ Debugger features:
 - PE import-table reader so MAP can be dropped entirely.
 - Child process tracking.
 - **Data breakpoints / watchpoints ("stop when this address is written") — IN
-  PROGRESS, increments 1-3 of 6 done (2026-08-08).** Full plan, measurements and
+  PROGRESS, increments 1-4 of 6 done (2026-08-08).** Full plan, measurements and
   increment list in `DATA_BREAKPOINTS_PLAN.md`.
   * **Built:** debug registers as a fourth role behind the thread-context funnel
     (`ReadDebugRegisters` / `WriteDebugRegisters`, with the `Wow64` variant in
@@ -533,9 +533,20 @@ Debugger features:
     the attach path (slot exhaustion, clean detach), with negative controls run
     and reverted for the replication loop, the exhaustion refusal and the
     detach-clears-watchpoints step.
-  * **Not built:** the session API, the stop reason with old→new capture, and
-    the MCP / DAP surfaces. x86 has no read-only watchpoint, so DAP `read` maps
-    to read-or-write and must say so.
+  * **Session API + real stop reason (increment 4).** `TDebugSession.SetDataBreakpoints`
+    / `ListDataBreakpoints` / `RemoveAllDataBreakpoints` (whole-set replace,
+    mirroring DAP's own `setDataBreakpoints`; only works while `dsStopped`).
+    Resolves a literal address or a global/unit name, refuses a local BY NAME
+    (lifetime tied to a frame; needs `dataBreakpointInfo`, increment 6). A new
+    `srDataBreakpoint` stop reason fires for a genuine free-run hit, with
+    old->new capture and the firing thread in `DataBreakpointDescription` --
+    but only when no step owns the thread; a hit during an in-flight step
+    keeps the increment-2/3 behaviour (recorded, not reported, so the step's
+    own resume breakpoint still lands correctly). A watchpoint firing inside a
+    synthetic call (`RunMethodCall`) now aborts it like a raise, which also
+    fixed a latent DR6-leak bug the old fall-through would have introduced.
+  * **Not built:** the MCP / DAP surfaces (increments 5-6). x86 has no
+    read-only watchpoint, so DAP `read` maps to read-or-write and must say so.
   Ranked above disassembly in diagnostic value: "who writes this variable" has no
   other answer.
 - **Disassembly + address breakpoints — DESIGNED, not built (2026-08-08).** Full

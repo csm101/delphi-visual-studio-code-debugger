@@ -1,15 +1,16 @@
 # Data breakpoints (watchpoints) — plan
 
-Status: **in progress** (2026-08-08), increments 1-3 of 6 done and gated on a
+Status: **in progress** (2026-08-08), increments 1-4 of 6 done and gated on a
 green suite. The engine can arm/disarm hardware watchpoints, tell a watchpoint
 hit apart from a completed step, replicate a watchpoint onto every thread
-(present and future), and allocate/free the four slots with explicit
-exhaustion — all at the `IDebugTarget` level only. Still missing: the session
-API, stop reason with old/new capture, the MCP tool surface, and
-`supportsDataBreakpoints` / `dataBreakpointInfo` / `setDataBreakpoints` in the
-DAP layer (increments 4-6). Every breakpoint the debugger plants today is still
-either a software `INT3` on code or a raw watchpoint driven directly by tests
-and probes — nothing is user-facing yet.
+(present and future), allocate/free the four slots with explicit exhaustion,
+and now a real session-level API (`TDebugSession.SetDataBreakpoints` /
+`ListDataBreakpoints` / `RemoveAllDataBreakpoints`) that resolves an
+expression, arms it, and reports a genuine `srDataBreakpoint` stop with
+old->new capture and the firing thread. Still missing: the MCP tool surface
+and `supportsDataBreakpoints` / `dataBreakpointInfo` / `setDataBreakpoints` in
+the DAP layer (increments 5-6). Nothing is user-facing yet -- increment 4 is
+still an internal API, driven by tests, not by MCP or VS Code.
 
 "Stop when THIS address is written" is one of the few questions only a debugger
 can answer. Ranked against the other two address-oriented features
@@ -263,7 +264,87 @@ menu appears once the capabilities are declared):
    writing separate globals (`DataBpThreadWorkerA`, created before the READY
    stop; `DataBpThreadWorkerB`, created after resume) so each test arms only
    the global it cares about.
-4. Session API + stop reason + old/new capture.
+4. **DONE.** Session API + stop reason + old/new capture. `TStopReason` gained
+   `srDataBreakpoint`. `TWatchpointHit` gained `SizeBytes`/`OldValue`/`NewValue`/
+   `Description`; `OldValue` is captured at arm time in `SetDataWatchpoint` and
+   refreshed at every hit in `RecordWatchpointHit` (which now also reads
+   `NewValue` and stamps `Description` from the slot's `OwnerDescription`).
+
+   **Command queue.** `TCommandKind` gained `ckSetDataBreakpoints` with its own
+   spec record (`TDataBpArmSpec`: Address/SizeBytes/WriteOnly/OwnerDescription,
+   or Clear+Slot to disarm). `IDebugTarget.ApplyDataBreakpointCommand` posts the
+   command and drains it in the same call (`TWinDebugger.DrainDataBreakpointCommand`
+   mirrors the existing `DrainBreakpointCommands` dequeue-execute-reenqueue
+   shape), so the caller gets the REAL arming outcome synchronously -- slot
+   exhaustion and misalignment are refused with a reason at the call site, not
+   discovered later. The adapter's main loop is single-threaded (Pump and
+   request handling interleave on one thread -- see `DebugSession.pas`'s own
+   threading note), so this is not a race fix today; it is the same shape
+   `ckSetBreakpoints` uses and keeps arming correct if that ever changes.
+
+   **Session** (`DebugSession.pas`): `SetDataBreakpoints` / `ListDataBreakpoints`
+   / `RemoveAllDataBreakpoints`. Unlike source breakpoints there is no per-file
+   grouping for an address, so `SetDataBreakpoints` replaces the WHOLE set on
+   every call, matching DAP's own `setDataBreakpoints` semantics, and only
+   works while `State = dsStopped` (thread contexts are only stable there --
+   the same reason DAP's own `dataBreakpointInfo`/`setDataBreakpoints` only
+   make sense at a stop). `ResolveDataBpAddress` accepts a literal address
+   (`$hex` / `0xhex` / decimal) or a global/unit variable name through the
+   same resolution the evaluator uses, and tells "no such symbol" apart from
+   "that IS a symbol, but a LOCAL" -- locals are refused explicitly, naming
+   why (their lifetime is tied to a stack frame; needs `dataBreakpointInfo`,
+   increment 6), never silently accepted as a stale address. `ArmOneDataBreakpoint`
+   validates size (1/2/4/8) and alignment, resolves module+RVA when the address
+   falls inside a known module (via `GetModules`), and notes the
+   no-read-only-watchpoint caveat in the result `Message` when `WriteOnly=False`
+   rather than letting a surprise write-hit look like a bug.
+
+   **Stop reporting.** The main event pump's free-run watchpoint branch (the
+   `not Trap.TrapFlagStep` case) now reports a real stop, `ReportStopped(srDataBreakpoint,
+   ExcAddr)`, but ONLY when `FStepMode = smNone` -- i.e. only for a genuine
+   `ContinueExecution`, never for an in-flight step. This was a load-bearing
+   constraint discovered while implementing, not originally written down here:
+   the already-committed increment 2/3 test
+   `RunWatchpointHitDuringStepIsNotAStepCompletion` asserts a watchpoint hit
+   inside a stepped-over CALL must NOT redirect the step into the callee --
+   the step's own resume breakpoint still owns that thread and must be allowed
+   to finish normally. Increment 4's new stop only fires in the complementary
+   case: nothing of the debugger's own is in flight on that thread.
+   `HandleTargetStopped` and `Snapshot` both format "expr: old -> new (thread
+   N)" through one shared helper, `BuildDataBreakpointDescription`, reading
+   `IDebugTarget.LastHardwareWatchpointHit`, so a polled snapshot and the
+   original stop event never disagree.
+
+   **Synthetic-call interaction, decided:** a watchpoint hit during a
+   `RunMethodCall` aborts the call, exactly like a raise -- the model the
+   function already follows for a Delphi exception or an AV. This was
+   necessary, not optional: `RunMethodCall` runs its OWN private event-pump
+   loop (separate from the main pump), and before this change a watchpoint
+   trap reaching that loop fell through to a bare `DBG_CONTINUE` with DR6
+   never read -- a latent bug increment 4 would otherwise have INTRODUCED,
+   because the CPU never clears DR6 on its own (TRAPS.md) and the next
+   ordinary step after ANY synthetic call would then misread as a watchpoint
+   hit. The loop now samples/clears DR6 on every single-step exception and, if
+   a slot fired, restores the pre-call context, sets
+   `FLastSyntheticCallError` to a message naming the firing thread and the
+   watchpoint's description, and fails the call.
+
+   Tests (mono + Win32 where noted): `DataBp_SessionApi_StopsWithOldNewAndThread`
+   (+ Win32 mirror) -- arms via the session API, continues, asserts a REAL stop
+   with `srDataBreakpoint`, the correct firing thread, and an old->new
+   description naming the watchpoint. `DataBp_SessionApi_RejectsLocalWithReason`
+   -- a local (`W` at the eval fixture) is refused with a reason mentioning
+   "local", not armed. `DataBp_SessionApi_SlotExhaustion_PerSpecResults` -- five
+   specs through one `SetDataBreakpoints` call, per-spec Verified/Message (four
+   armed, the fifth refused), matching `ListDataBreakpoints`.
+   `DataBp_SessionApi_RemoveAll_StopsWatching` -- after `RemoveAllDataBreakpoints`
+   the target runs PAST the write it used to stop on, proving the hardware slot
+   was genuinely cleared, not just forgotten by the session. `DataBp_DuringSyntheticCall_AbortsEvaluation`
+   (+ Win32 mirror) -- `Evaluate('DataBpWriteWatched()')` is aborted mid-call;
+   the error text names the data breakpoint, the session stays usable
+   afterward, and a follow-up read of `GDataBpOther` proves the call really
+   stopped at the trap (only the statement BEFORE the watched write ran, not
+   the one after).
 5. MCP tools.
 6. DAP capabilities and requests.
 

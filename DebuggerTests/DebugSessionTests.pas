@@ -370,6 +370,11 @@ type
     // Wow64Get/SetThreadContext must hold exactly as it does natively.
     [Test] procedure Win32_DataBp_WorkerThreadWrite_NamesTheWorkerThread;
     [Test] procedure Win32_DataBp_ThreadCreatedAfterArm_StillTrips;
+    // Increment 4, WOW64: the session API's own address resolution + stop
+    // routing must hold when debug registers are reached through
+    // Wow64Get/SetThreadContext, not just the raw per-thread primitive.
+    [Test] procedure Win32_DataBp_SessionApi_StopsWithOldNewAndThread;
+    [Test] procedure Win32_DataBp_DuringSyntheticCall_AbortsEvaluation;
     // An application split across runtime packages is this project's core use
     // case and the shape where debugger bugs have historically surfaced, so it
     // has to hold on both bitnesses rather than only x64. The breakpoint is
@@ -437,6 +442,14 @@ type
     [Test] procedure DataBp_ThreadCreatedAfterArm_StillTrips;
     [Test] procedure DataBp_SlotExhaustion_RefusesTheFifth;
     [Test] procedure DataBp_CleanDetach_LeavesTargetUnarmed;
+    // Increment 4 (DATA_BREAKPOINTS_PLAN.md): the session API itself --
+    // resolving an expression, arming through ApplyDataBreakpointCommand, the
+    // NEW srDataBreakpoint stop reason, and old->new capture.
+    [Test] procedure DataBp_SessionApi_StopsWithOldNewAndThread;
+    [Test] procedure DataBp_SessionApi_RejectsLocalWithReason;
+    [Test] procedure DataBp_SessionApi_SlotExhaustion_PerSpecResults;
+    [Test] procedure DataBp_SessionApi_RemoveAll_StopsWatching;
+    [Test] procedure DataBp_DuringSyntheticCall_AbortsEvaluation;
     // F19: a step-into used to report at the callee's ENTRY address, before the
     // prologue had spilled the register arguments into their home slots, so Self
     // and every by-register parameter read as the CALLER's leftover frame bytes
@@ -919,6 +932,244 @@ begin
     Session.Terminate;
     Session.Free;
   end;
+end;
+
+{ ------------------------------- increment 4: the session API itself ------ }
+// SetDataBreakpoints resolves an expression, arms through
+// ApplyDataBreakpointCommand, and a free-running hit now produces a REAL stop
+// (srDataBreakpoint) instead of being swallowed -- with old->new and the
+// firing thread in the description. This is the same free-run direction
+// increment 2/3 deliberately left unreported; increment 4 is what reports it.
+
+procedure RunDataBpSessionApiStopsWithOldNewAndThread(const ExePath, MapPath,
+  RsmPath, SourceDir: string);
+begin
+  var ReadyLine := MarkerLineIn(SourceDir + DATABP_SOURCE, 'DATABPTHREAD_READY');
+  Assert.IsTrue(ReadyLine > 0, 'DATABPTHREAD_READY marker not found');
+
+  var Session := OpenSessionAtMarker(ExePath, MapPath, RsmPath, SourceDir,
+    DATABP_SOURCE, ReadyLine, DATABPTHREAD_ARGS);
+  try
+    Assert.AreEqual(Ord(dsStopped), Ord(Session.State),
+      'did not stop at DATABPTHREAD_READY');
+    var MainTid := Session.GetStoppedThreadId;
+
+    var Spec: TDataBpSpec;
+    Spec           := Default(TDataBpSpec);
+    Spec.Expression := 'GDataBpThreadWatched';
+    Spec.SizeBytes   := 4;
+    Spec.WriteOnly   := True;
+    var Bps := Session.SetDataBreakpoints([Spec]);
+    Assert.AreEqual<Integer>(1, Length(Bps), 'expected one result');
+    Assert.IsTrue(Bps[0].Verified,
+      'SetDataBreakpoints refused GDataBpThreadWatched: ' + Bps[0].Message);
+    Assert.IsTrue(Bps[0].Slot >= 0, 'a verified breakpoint must carry a real slot');
+    Assert.AreEqual('', Bps[0].Message,
+      'a write-only watchpoint should carry no caveat: ' + Bps[0].Message);
+
+    Session.ContinueExecution;
+    PumpUntilStop(Session, 30000);
+    Assert.AreEqual(Ord(dsStopped), Ord(Session.State), 'the target never stopped');
+
+    var Snap := Session.Snapshot;
+    Assert.AreEqual(Ord(srDataBreakpoint), Ord(Snap.StopReason),
+      'expected a data-breakpoint stop, got a different reason');
+    Assert.AreNotEqual(MainTid, Snap.OsThreadId,
+      'the stop was attributed to the MAIN thread, not the worker that wrote it');
+
+    var Desc := Snap.DataBreakpointDescription;
+    Assert.IsTrue(Desc.Contains('GDataBpThreadWatched'),
+      'description does not name the watchpoint: ' + Desc);
+    Assert.IsTrue(Desc.Contains('$0 -> $1') or Desc.Contains('-> $1'),
+      'description does not show the write (0 -> 1): ' + Desc);
+    Assert.IsTrue(Desc.Contains(IntToStr(Snap.OsThreadId)),
+      'description does not name the firing thread: ' + Desc);
+  finally
+    Session.Terminate;
+    Session.Free;
+  end;
+end;
+
+procedure TDebugSessionTests.DataBp_SessionApi_StopsWithOldNewAndThread;
+begin
+  RunDataBpSessionApiStopsWithOldNewAndThread(TargetExe, TargetMap, TargetRsm, TargetDir);
+end;
+
+procedure TWin32RunControlTests.Win32_DataBp_SessionApi_StopsWithOldNewAndThread;
+begin
+  RunDataBpSessionApiStopsWithOldNewAndThread(Win32Exe, Win32Map, Win32Rsm, TargetDir);
+end;
+
+// A local is a real symbol, but watching its address past the frame's
+// lifetime is nonsense -- it must be refused BY NAME, not "unresolved symbol".
+procedure TDebugSessionTests.DataBp_SessionApi_RejectsLocalWithReason;
+begin
+  var Line := MarkerLine(EVAL_SOURCE, EVAL_MARKER);
+  var Session := OpenSessionAtMarker(TargetExe, TargetMap, TargetRsm, TargetDir,
+    EVAL_SOURCE, Line);
+  try
+    Assert.AreEqual(Ord(dsStopped), Ord(Session.State), 'did not stop');
+
+    var Spec: TDataBpSpec;
+    Spec             := Default(TDataBpSpec);
+    Spec.Expression   := 'W';
+    Spec.SizeBytes     := 8;
+    Spec.WriteOnly     := True;
+    var Bps := Session.SetDataBreakpoints([Spec]);
+    Assert.AreEqual<Integer>(1, Length(Bps), 'expected one result');
+    Assert.IsFalse(Bps[0].Verified, 'a local must be refused, not armed');
+    Assert.IsTrue(Bps[0].Message.ToLower.Contains('local'),
+      'refusal reason does not say WHY (local lifetime): ' + Bps[0].Message);
+    Assert.AreEqual(-1, Bps[0].Slot, 'a refused request must not report a slot');
+  finally
+    Session.Terminate;
+    Session.Free;
+  end;
+end;
+
+// Five distinct 4-byte globals through the SESSION API: exhaustion must be
+// reported PER SPEC (the first four Verified, the fifth not), never by
+// failing the whole request or silently dropping one.
+procedure TDebugSessionTests.DataBp_SessionApi_SlotExhaustion_PerSpecResults;
+const
+  Globals: array[0..4] of string = (
+    'GDataBpWatched', 'GDataBpOther', 'GCounter', 'GDataBpThreadWatched', 'GDataBpThreadLate');
+begin
+  var ReadyLine := MarkerLineIn(TargetDir + DATABP_SOURCE, 'DATABP_READY');
+  Assert.IsTrue(ReadyLine > 0, 'DATABP_READY marker not found');
+
+  var Session := OpenSessionAtMarker(TargetExe, TargetMap, TargetRsm, TargetDir,
+    DATABP_SOURCE, ReadyLine, DATABP_ARGS);
+  try
+    Assert.AreEqual(Ord(dsStopped), Ord(Session.State), 'did not stop at DATABP_READY');
+
+    var Specs: TArray<TDataBpSpec>;
+    SetLength(Specs, 5);
+    for var I := 0 to 4 do begin
+      Specs[I]           := Default(TDataBpSpec);
+      Specs[I].Expression := Globals[I];
+      Specs[I].SizeBytes   := 4;
+      Specs[I].WriteOnly   := True;
+    end;
+    var Bps := Session.SetDataBreakpoints(Specs);
+    Assert.AreEqual<Integer>(5, Length(Bps), 'expected five results, one per spec');
+
+    for var I := 0 to 3 do
+      Assert.IsTrue(Bps[I].Verified,
+        Format('spec %d (%s) should have armed: %s', [I, Globals[I], Bps[I].Message]));
+    Assert.IsFalse(Bps[4].Verified, 'the fifth spec should have been refused');
+    Assert.AreNotEqual('', Bps[4].Message, 'exhaustion was refused with no reason');
+    Assert.AreEqual(-1, Bps[4].Slot, 'a refused request must not report a slot');
+
+    // Listed state must match what was just returned.
+    var Listed := Session.ListDataBreakpoints;
+    Assert.AreEqual<Integer>(5, Length(Listed), 'ListDataBreakpoints disagrees with SetDataBreakpoints');
+  finally
+    Session.Terminate;
+    Session.Free;
+  end;
+end;
+
+// RemoveAllDataBreakpoints must genuinely clear the hardware slot: after
+// removal, the target must run PAST the write it used to stop on.
+procedure TDebugSessionTests.DataBp_SessionApi_RemoveAll_StopsWatching;
+begin
+  var ReadyLine := MarkerLineIn(TargetDir + DATABP_SOURCE, 'DATABPTHREAD_READY');
+  var DoneLine  := MarkerLineIn(TargetDir + DATABP_SOURCE, 'DATABPTHREAD_DONE');
+  Assert.IsTrue((ReadyLine > 0) and (DoneLine > 0),
+    'DATABPTHREAD_READY / DATABPTHREAD_DONE markers not found');
+
+  var Session := OpenSessionAtMarker(TargetExe, TargetMap, TargetRsm, TargetDir,
+    DATABP_SOURCE, ReadyLine, DATABPTHREAD_ARGS);
+  try
+    Assert.AreEqual(Ord(dsStopped), Ord(Session.State),
+      'did not stop at DATABPTHREAD_READY');
+
+    var Spec: TDataBpSpec;
+    Spec             := Default(TDataBpSpec);
+    Spec.Expression   := 'GDataBpThreadWatched';
+    Spec.SizeBytes     := 4;
+    Spec.WriteOnly     := True;
+    var Bps := Session.SetDataBreakpoints([Spec]);
+    Assert.IsTrue(Bps[0].Verified, 'setup: watchpoint should have armed');
+
+    Session.RemoveAllDataBreakpoints;
+    Assert.AreEqual<Integer>(0, Length(Session.ListDataBreakpoints),
+      'RemoveAllDataBreakpoints must empty the list');
+
+    var DoneSpec: TBpLineSpec;
+    DoneSpec      := Default(TBpLineSpec);
+    DoneSpec.Line := DoneLine;
+    Session.SetBreakpoints(DATABP_SOURCE, [DoneSpec]);
+
+    Session.ContinueExecution;
+    PumpUntilStop(Session, 30000);
+    Assert.AreEqual(Ord(dsStopped), Ord(Session.State), 'never reached DATABPTHREAD_DONE');
+
+    var Snap := Session.Snapshot;
+    Assert.AreNotEqual(Ord(srDataBreakpoint), Ord(Snap.StopReason),
+      'the removed watchpoint still fired -- RemoveAllDataBreakpoints left the slot armed');
+    Assert.AreEqual(DoneLine, Snap.CurrentLine,
+      'expected to run past the write and land on DATABPTHREAD_DONE');
+  finally
+    Session.Terminate;
+    Session.Free;
+  end;
+end;
+
+// A watchpoint firing INSIDE a synthetic call must abort the call, exactly
+// like a raise -- silently swallowing it would make the invoked code behave
+// differently from the same code running normally, and DR6 would leak into
+// the first ordinary step after the call returns (TRAPS.md).
+procedure RunDataBpDuringSyntheticCallAbortsEvaluation(const ExePath, MapPath,
+  RsmPath, SourceDir: string);
+begin
+  var ReadyLine := MarkerLineIn(SourceDir + DATABP_SOURCE, 'DATABP_READY');
+  Assert.IsTrue(ReadyLine > 0, 'DATABP_READY marker not found');
+
+  var Session := OpenSessionAtMarker(ExePath, MapPath, RsmPath, SourceDir,
+    DATABP_SOURCE, ReadyLine, DATABP_ARGS);
+  try
+    Assert.AreEqual(Ord(dsStopped), Ord(Session.State), 'did not stop at DATABP_READY');
+
+    var Spec: TDataBpSpec;
+    Spec             := Default(TDataBpSpec);
+    Spec.Expression   := 'GDataBpWatched';
+    Spec.SizeBytes     := 4;
+    Spec.WriteOnly     := True;
+    var Bps := Session.SetDataBreakpoints([Spec]);
+    Assert.IsTrue(Bps[0].Verified, 'setup: watchpoint should have armed');
+
+    // DataBpWriteWatched: GDataBpOther+=1; Inc(GDataBpWatched) <- watched;
+    // GDataBpOther+=2. The middle statement must trap and abort the call
+    // BEFORE the trailing +=2 executes.
+    var R := Session.Evaluate('DataBpWriteWatched()');
+    Assert.IsFalse(R.Success, 'the call should have been aborted by the watchpoint');
+    Assert.IsTrue(R.ErrorText.ToLower.Contains('data breakpoint'),
+      'error text does not mention the data breakpoint: ' + R.ErrorText);
+
+    Assert.AreEqual(Ord(dsStopped), Ord(Session.State),
+      'the session must stay stopped and usable after an aborted call');
+
+    var Other := Session.Evaluate('GDataBpOther');
+    Assert.IsTrue(Other.Success, 'session unusable after the aborted call: ' + Other.ErrorText);
+    Assert.AreEqual<UInt64>(1, Other.RawValue,
+      'GDataBpOther should show only the FIRST +=1 -- the trailing +=2 must ' +
+      'never have run if the call was really aborted at the trap: ' + Other.Value);
+  finally
+    Session.Terminate;
+    Session.Free;
+  end;
+end;
+
+procedure TDebugSessionTests.DataBp_DuringSyntheticCall_AbortsEvaluation;
+begin
+  RunDataBpDuringSyntheticCallAbortsEvaluation(TargetExe, TargetMap, TargetRsm, TargetDir);
+end;
+
+procedure TWin32RunControlTests.Win32_DataBp_DuringSyntheticCall_AbortsEvaluation;
+begin
+  RunDataBpDuringSyntheticCallAbortsEvaluation(Win32Exe, Win32Map, Win32Rsm, TargetDir);
 end;
 
 procedure TDebugSessionTests.DataBp_WorkerThreadWrite_NamesTheWorkerThread;

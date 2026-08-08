@@ -58,6 +58,12 @@ type
     Description: string;   // who asked for it, e.g. an expression or "GCounter";
                            // '' when armed through the raw per-thread primitive
                            // directly (tests, probes) rather than the allocator.
+    // "old -> new" is the whole point of a data breakpoint (DATA_BREAKPOINTS_PLAN.md
+    // "Reporting a hit"). A write watchpoint traps AFTER the store completes, so
+    // NewValue is readable at the stop; OldValue only exists because it was
+    // captured HERE at arm time and refreshed at every hit -- read at Address
+    // the moment the slot is claimed, zero-extended into the low SizeBytes.
+    OldValue:    UInt64;
   end;
 
   TWinDebugger = class(TInterfacedObject, IDebugTarget)
@@ -185,6 +191,12 @@ type
     FWatchHitCount:   Integer;
     FLastWatchHit:    TWatchpointHit;
     FCommandQueue: TQueue<TCommand>;
+    // Cheap synchronous request/reply for ckSetDataBreakpoints: the caller posts
+    // one command and drains it right back (DrainDataBreakpointCommand), so
+    // there is never more than one outcome to hold at a time.
+    FLastDataBpSlot:   Integer;
+    FLastDataBpOk:     Boolean;
+    FLastDataBpReason: string;
     FQueueLock:    TRTLCriticalSection;
     FOnStopped:          TOnStopped;
     FOnExited:           TOnExited;
@@ -329,6 +341,15 @@ type
     procedure SetRIP(TID: DWORD; NewRIP: UInt64);
     function  CurrentRIP(TID: DWORD): UInt64;
     function  CurrentRSP(TID: DWORD): UInt64;
+    // Executes one ckSetDataBreakpoints spec: SetDataWatchpoint / ClearDataWatchpoint,
+    // result stashed in FLastDataBp*.
+    procedure DoDataBreakpointCommand(const Spec: TDataBpArmSpec);
+    // Mirrors DrainBreakpointCommands: dequeues everything, executes the
+    // (single) queued ckSetDataBreakpoints command immediately, re-enqueues
+    // every other kind untouched. Called right after PostCommand so
+    // ApplyDataBreakpointCommand can hand the caller a REAL outcome.
+    function  DrainDataBreakpointCommand(out Slot: Integer;
+                out RefusalReason: string): Boolean;
   protected
     // Where the current frame will return to. Drives step-over's run-to-return
     // and step-out, so a wrong answer plants a one-shot breakpoint at an address
@@ -485,6 +506,8 @@ type
                 const OwnerDescription: string; out Slot: Integer;
                 out RefusalReason: string): Boolean;
     function  ClearDataWatchpoint(Slot: Integer): Boolean;
+    function  ApplyDataBreakpointCommand(const Spec: TDataBpArmSpec;
+                out Slot: Integer; out RefusalReason: string): Boolean;
     // Resolves a fully-qualified symbol name (e.g. `TWidget.GetScore`) to its
     // run-time VA via the loaded MAP/RSM data. Returns False when no match.
     function  TryResolveSymbolVA(const Name: string; out VA: UInt64): Boolean;
@@ -1603,6 +1626,8 @@ begin
   FWatchSlots[Free].SizeBytes   := SizeBytes;
   FWatchSlots[Free].WriteOnly   := WriteOnly;
   FWatchSlots[Free].Description := OwnerDescription;
+  FWatchSlots[Free].OldValue    := 0;
+  ReadProcessMemoryAt(Address, @FWatchSlots[Free].OldValue, SizeBytes);
   FWatchArmedSlots := FWatchArmedSlots or Byte(1 shl Free);
   Slot   := Free;
   Result := True;
@@ -1660,13 +1685,23 @@ begin
   while (Lowest < 3) and ((FiredSlots and Byte(1 shl Lowest)) = 0) do
     Inc(Lowest);
   Inc(FWatchHitCount);
-  FLastWatchHit.ThreadId   := TID;
-  FLastWatchHit.Slot       := Lowest;
-  FLastWatchHit.FiredSlots := FiredSlots;
-  FLastWatchHit.Address    := FWatchSlots[Lowest].Address;
-  FLastWatchHit.Pc         := Pc;
-  DapLog(Format('watchpoint HIT tid=%d slot=%d slots=$%x addr=$%x pc=$%x (hit %d)',
-    [TID, Lowest, FiredSlots, FWatchSlots[Lowest].Address, Pc, FWatchHitCount]));
+  FLastWatchHit.ThreadId    := TID;
+  FLastWatchHit.Slot        := Lowest;
+  FLastWatchHit.FiredSlots  := FiredSlots;
+  FLastWatchHit.Address     := FWatchSlots[Lowest].Address;
+  FLastWatchHit.Pc          := Pc;
+  FLastWatchHit.SizeBytes   := FWatchSlots[Lowest].SizeBytes;
+  FLastWatchHit.Description := FWatchSlots[Lowest].Description;
+  // "old" is whatever "new" was at the previous hit (or at arm time, for the
+  // first one); "new" is read now, AFTER the store the trap reports completed.
+  FLastWatchHit.OldValue := FWatchSlots[Lowest].OldValue;
+  var NewVal: UInt64 := 0;
+  ReadProcessMemoryAt(FWatchSlots[Lowest].Address, @NewVal, FWatchSlots[Lowest].SizeBytes);
+  FLastWatchHit.NewValue     := NewVal;
+  FWatchSlots[Lowest].OldValue := NewVal;
+  DapLog(Format('watchpoint HIT tid=%d slot=%d slots=$%x addr=$%x pc=$%x old=$%x new=$%x (hit %d)',
+    [TID, Lowest, FiredSlots, FWatchSlots[Lowest].Address, Pc,
+     FLastWatchHit.OldValue, FLastWatchHit.NewValue, FWatchHitCount]));
 end;
 
 function TWinDebugger.SetInstructionPointer(VA: UInt64): Boolean;
@@ -2414,6 +2449,61 @@ begin
   end;
 end;
 
+procedure TWinDebugger.DoDataBreakpointCommand(const Spec: TDataBpArmSpec);
+begin
+  if Spec.Clear then begin
+    FLastDataBpOk     := ClearDataWatchpoint(Spec.Slot);
+    FLastDataBpSlot    := Spec.Slot;
+    FLastDataBpReason := '';
+    if not FLastDataBpOk then
+      FLastDataBpReason := Format('slot %d is not in use', [Spec.Slot]);
+  end else
+    FLastDataBpOk := SetDataWatchpoint(Spec.Address, Spec.SizeBytes, Spec.WriteOnly,
+      Spec.OwnerDescription, FLastDataBpSlot, FLastDataBpReason);
+end;
+
+function TWinDebugger.DrainDataBreakpointCommand(out Slot: Integer;
+  out RefusalReason: string): Boolean;
+// Mirrors DrainBreakpointCommands: dequeue everything, execute the queued
+// ckSetDataBreakpoints command(s) synchronously (there is only ever one --
+// ApplyDataBreakpointCommand posts and drains in the same call), re-enqueue
+// every other kind untouched and in order.
+var
+  Pending: TArray<TCommand>;
+begin
+  Result := False;
+  Slot   := -1;
+  RefusalReason := '';
+  EnterCriticalSection(FQueueLock);
+  try
+    SetLength(Pending, 0);
+    while FCommandQueue.Count > 0 do
+      Pending := Pending + [FCommandQueue.Dequeue];
+    for var C in Pending do
+      if C.Kind = ckSetDataBreakpoints then begin
+        DoDataBreakpointCommand(C.DataBpSpec);
+        Slot          := FLastDataBpSlot;
+        RefusalReason := FLastDataBpReason;
+        Result        := FLastDataBpOk;
+      end else
+        FCommandQueue.Enqueue(C);
+  finally
+    LeaveCriticalSection(FQueueLock);
+  end;
+end;
+
+function TWinDebugger.ApplyDataBreakpointCommand(const Spec: TDataBpArmSpec;
+  out Slot: Integer; out RefusalReason: string): Boolean;
+var
+  Cmd: TCommand;
+begin
+  Cmd := Default(TCommand);
+  Cmd.Kind       := ckSetDataBreakpoints;
+  Cmd.DataBpSpec := Spec;
+  PostCommand(Cmd);
+  Result := DrainDataBreakpointCommand(Slot, RefusalReason);
+end;
+
 procedure TWinDebugger.ProcessCommandQueue;
 var
   Cmd: TCommand;
@@ -2431,6 +2521,11 @@ begin
     case Cmd.Kind of
       ckSetBreakpoints:
         DoSetBreakpoints(Cmd.BpSpec);
+      ckSetDataBreakpoints:
+        // Reached only if a caller posts without draining immediately
+        // (ApplyDataBreakpointCommand always drains in the same call); kept so
+        // an un-drained command is still applied rather than silently dropped.
+        DoDataBreakpointCommand(Cmd.DataBpSpec);
       ckContinue:
         if (FProcess <> 0) and FIsStopped then begin
           var ContStatus := FPendingContinueStatus;
@@ -2635,11 +2730,12 @@ procedure TWinDebugger.ReportStopped(Reason: TStopReason; VA: UInt64);
   begin
     case Reason of
       srEntry:      Result := 'entry';
-      srBreakpoint: Result := 'breakpoint';
-      srStep:       Result := 'step';
-      srException:  Result := 'exception';
-      srPause:      Result := 'pause';
-    else              Result := '?';
+      srBreakpoint:     Result := 'breakpoint';
+      srStep:           Result := 'step';
+      srException:      Result := 'exception';
+      srPause:          Result := 'pause';
+      srDataBreakpoint: Result := 'data breakpoint';
+    else                  Result := '?';
     end;
   end;
 var
@@ -3275,11 +3371,22 @@ begin
         RecordWatchpointHit(Ev.dwThreadId, Trap.FiredSlots, ExcAddr);
         if not Trap.TrapFlagStep then begin
           // A watched cell was written while the target was running free: no
-          // step of ours completed here, and the machinery below would read
-          // this event as one and report a stop at the wrong place. Increment 2
-          // has no stop reason for a watchpoint yet (that is increment 4), so
-          // the honest thing is to resume and leave every in-flight step
-          // exactly as it was -- its own resume breakpoint still owns it.
+          // step of ours completed here.
+          if FStepMode = smNone then begin
+            // Nothing owns this thread right now (a plain Continue, not a
+            // step) -- this is a genuine, user-visible stop. Increment 2/3
+            // deliberately locked in the OTHER case below (a hit during an
+            // in-flight step must not redirect it, see
+            // RunWatchpointHitDuringStepIsNotAStepCompletion); this is that
+            // rule's complement.
+            FStoppedTid := Ev.dwThreadId;
+            ReportStopped(srDataBreakpoint, ExcAddr);
+            Exit;
+          end;
+          // A step (or its own resume/re-arm machinery) is in flight and
+          // still owns this thread -- the honest thing is to resume and
+          // leave it exactly as it was; its own resume breakpoint still owns
+          // it. The hit is already recorded above.
           //
           // The trap flag is deliberately NOT touched on the way out: BS was
           // clear, so it was already off, and writing the thread context here
@@ -4608,6 +4715,33 @@ begin
             [HitVA, Ev.dwThreadId]));
           ContinueDebugEvent(Ev.dwProcessId, Ev.dwThreadId, DBG_CONTINUE);
           Continue;
+        end;
+      end;
+
+      // A hardware watchpoint fired while the synthetic call was running. DR6
+      // must be sampled before anything else touches this thread's context --
+      // TRAPS.md, the ordering that made increment 2's WOW64 measurement
+      // observable in the first place -- or the bits leak into the FIRST
+      // ordinary step after the call returns, and that step is misread as a
+      // watchpoint hit. Increment 4 decision: a watchpoint hit during a
+      // synthetic call aborts the call exactly like a raise (the model this
+      // whole function already follows) -- silently swallowing it would make
+      // code invoked by evaluation behave differently from the same code
+      // running normally, and the user's own watchpoint would go unreported.
+      if (Ev.dwDebugEventCode = EXCEPTION_DEBUG_EVENT) and
+         IsSingleStepExceptionCode(Ev.Exception.ExceptionRecord.ExceptionCode) then begin
+        var Trap := TakeDebugTrapCause(Ev.dwThreadId);
+        if Trap.FiredSlots <> 0 then begin
+          RecordWatchpointHit(Ev.dwThreadId, Trap.FiredSlots,
+            UInt64(Ev.Exception.ExceptionRecord.ExceptionAddress));
+          DapLog(Format('RunMethodCall: watchpoint fired mid-call (tid=%d addr=$%x) ' +
+            '-> aborting', [Ev.dwThreadId, FLastWatchHit.Address]));
+          FLastSyntheticCallError := Format(
+            'data breakpoint hit during evaluation (thread %d wrote %s)',
+            [Ev.dwThreadId, FLastWatchHit.Description]);
+          SetThreadContext(TH, SavedCtx);
+          Result := False;
+          Exit;
         end;
       end;
 
