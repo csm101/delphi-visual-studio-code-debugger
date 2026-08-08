@@ -27,25 +27,23 @@ longer true, delete it.
 
 ## Current task (2026-08-08)
 
-**Data breakpoints (watchpoints), increment 1.** Plan:
-`DATA_BREAKPOINTS_PLAN.md`. Nothing implemented yet.
+**Data breakpoints (watchpoints), increment 1 — DONE.** Plan:
+`DATA_BREAKPOINTS_PLAN.md`. Probe `DevTools\DataBpProbe.dpr` confirmed WOW64
+debug registers (`Wow64Get/SetThreadContext` + `WOW64_CONTEXT_DEBUG_REGISTERS`)
+work identically to native x64: `DR6` bit `B0` set, write already visible at
+trap, `DR7` survives scheduling, both bitnesses sustained 3 consecutive hits.
+Plan NOT invalidated. One trap found and recorded in the plan doc: arming at
+`CREATE_PROCESS_DEBUG_EVENT` never fires (initial thread hasn't run user code
+yet); must arm after the process's own initial system breakpoint
+(`$80000003` native, `$4000001F` for the WOW64 target's own bp, which fires
+after the native one).
 
-Increment 1 is a DevTools probe that arms a hardware debug register by hand and
-observes the hit, on BOTH bitnesses. It deliberately does not touch the event
-pump; it exists to answer the one question that could invalidate the plan.
+### Next action
 
-**The question to answer first:** do debug registers set through
-`Wow64Get/SetThreadContext` with `WOW64_CONTEXT_DEBUG_REGISTERS` survive on a
-WOW64 target, and do they survive a context switch? The x64 answer is frequently
-correct by accident and wrong under emulation — that is the standing lesson of the
-Win32 port.
-
-### Next action if interrupted right now
-
-Write `DevTools\DataBpProbe.dpr`: launch a 32-bit and a 64-bit `TestTarget`, arm
-`DR0` for write on a known global, continue, and report whether the hit arrives,
-which `DR6` bit is set, and whether the write completed before the trap. Build via
-`DevTools\build_all.bat`.
+Increment 2: `DR6` disambiguation in the exception handler
+(`WinDebuggerBase.pas:2823`), plus tests that a normal step still completes
+with a watchpoint armed and vice versa. No production wiring beyond that yet
+(no session API, no MCP/DAP surfaces — those are increments 3-6).
 
 ### Chosen sequencing
 

@@ -795,3 +795,23 @@ control, and compare against this table.
 
 In a cmd batch a `*.dpr` wildcard also matches `*.dproj` through 8.3 short names,
 so the auto-discovery must keep its `%~xF` extension guard.
+
+## `DataBpProbe` — hardware watchpoint feasibility (2026-08-08)
+
+```
+DataBpProbe.exe <exe> [-maxhits <n>]
+```
+
+Launches the target, arms `DR0` for write on a known global, and reports each
+trap: which `DR6` bit fired, whether the watched write was already visible in
+target memory, and whether `DR7` survived. Works against both a native x64 and a
+WOW64 x86 target from the same 64-bit probe.
+
+Built for increment 1 of `DATA_BREAKPOINTS_PLAN.md`, and kept because it is the
+fastest way to re-check debug-register behaviour after any change to the thread
+context funnel.
+
+**The finding it exists to record**: arming at `CREATE_PROCESS_DEBUG_EVENT` never
+fires, on EITHER bitness — the initial thread has not run user code yet. Arm
+after the process's own initial system breakpoint (`$80000003` native,
+`$4000001F` for the WOW64 target's own, which follows the native one).

@@ -80,10 +80,33 @@ The 32-bit path reads and writes debug registers through
 `Wow64Get/SetThreadContext` with `WOW64_CONTEXT_DEBUG_REGISTERS`
 (`WinDebuggerX86.pas` already owns every `Wow64GetThreadContext` call site).
 
-TO VERIFY BY MEASUREMENT, not assumed: whether debug registers set through the
-64-bit context on a WOW64 target survive, and whether the emulation layer resets
-them across a context switch. The Win32 port's standing lesson applies — the
-64-bit answer is frequently correct by accident and wrong on WOW64.
+MEASURED (`DevTools\DataBpProbe.dpr`, both `TestTarget.exe` builds): WOW64 debug
+registers set via `Wow64Get/SetThreadContext` with `WOW64_CONTEXT_DEBUG_REGISTERS`
+work exactly like the native x64 path. Arming at `CREATE_PROCESS_DEBUG_EVENT`
+does NOT work on EITHER bitness — the initial thread hasn't run user code yet
+and the watchpoint never fires. Arm instead after the loader's own initial
+system breakpoint (`EXCEPTION_BREAKPOINT` $80000003 for native,
+`STATUS_WX86_BREAKPOINT` $4000001F for WOW64 — the WOW64 target raises the
+native one first, then its own; arm on the bitness-matching one). Once armed
+there:
+
+- the trap arrives every time, reported as `STATUS_WX86_SINGLE_STEP`
+  ($4000001E) on WOW64 vs `EXCEPTION_SINGLE_STEP` ($80000004) natively;
+- `DR6` correctly names the slot (`B0`) on both, read via `Wow64GetThreadContext`
+  for the WOW64 target;
+- the watched write was already visible in `ReadProcessMemory` at the trap on
+  both (traps after the store completes, as documented above);
+- `DR7` survived three consecutive hits, each separated by real target
+  execution (multiple nested CALL/RET reusing the same stack slot) — i.e. it
+  survives ordinary OS scheduling/context switches on WOW64 exactly as on x64.
+  Native x64 readback showed one extra bit (bit 10, architecturally
+  reserved-as-1) that WOW64 readback did not — cosmetic, not a persistence
+  difference.
+
+Conclusion: the WOW64 path is NOT the risk this section anticipated. The real
+trap for both bitnesses is arming too early (at `CREATE_PROCESS_DEBUG_EVENT`);
+the production implementation must arm after the process's own initial
+breakpoint, not at process creation.
 
 ## Where it plugs into the existing architecture
 
