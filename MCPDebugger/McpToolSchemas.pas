@@ -358,6 +358,40 @@ begin
     'live process. The session must be stopped.',
     [Prop('address', 'string', 'Start address, decimal or 0x-hex.', True),
      Prop('hexBytes', 'string', 'Bytes to write as contiguous hex (e.g. "48008B00"); whitespace ignored.', True)]));
+
+  Result.Add(MakeTool('disassemble',
+    'Disassemble machine code (Zydis, x86/x64, either bitness) starting at an address or at a ' +
+    'call-stack frame''s instruction pointer. Use this instead of reading raw bytes with ' +
+    'read_memory and reading them yourself — hand-decoding bytes produces a confident WRONG ' +
+    'answer, which this tool exists to prevent. Each instruction reports its address (the same ' +
+    '"0x..." string a frame or a raw-stack-scan hit already carries in its own "address" field — ' +
+    'pass that straight back in, no re-parsing needed), raw bytes, Intel-syntax text, and — when ' +
+    'a symbol provider knows one — the nearest function+offset and source file/line. An ' +
+    'instruction Zydis cannot decode is reported as "db XX" with decoded:false — NEVER a guessed ' +
+    'mnemonic. If the Zydis DLL is missing or the wrong version (no VC++ runtime, or not ' +
+    'installed at all), the call returns available:false with a reason and no instructions at ' +
+    'all — the ORDINARY case on a machine without it, not an error. ' +
+    'Optional "before" asks for up to that many instructions PRECEDING the address. x86/x64 ' +
+    'cannot be decoded backwards, so this is answered ONLY when a PROVEN earlier instruction ' +
+    'boundary exists (the containing function''s start — from debug info, or from the module''s ' +
+    'PE export table when it has none at all — or a nearer line-table boundary) AND decoding ' +
+    'forward from it lands EXACTLY on the requested address. When neither holds, "before" comes ' +
+    'back with refused:true and a reason naming the cause — but the forward "instructions" are ' +
+    'still returned: a refused "before" is not a failed call. The result never mixes proven and ' +
+    'unproven instructions in one list.',
+    [Prop('address', 'string',
+       'Start address, decimal or 0x-hex — e.g. the "address" field already on a stack frame or a ' +
+       'raw-stack-scan hit. Omit to use frameIndex/threadId instead.'),
+     Prop('frameIndex', 'integer',
+       'Used only when address is omitted: which call-stack frame''s instruction pointer to start ' +
+       'at, as returned by get_call_stack (0 = innermost). Omit for the top frame.'),
+     Prop('threadId', 'integer',
+       'Used only when address is omitted: OS thread id owning the frame (from get_threads). ' +
+       'Omit for the stopped thread.'),
+     Prop('count', 'integer', 'Number of instructions to decode forward from the address (1..500). Default 10.'),
+     Prop('before', 'integer',
+       'Number of instructions to also return PRECEDING the address (0..100). Default 0 (omitted). ' +
+       'May come back refused — see the tool description.')]));
 end;
 
 end.

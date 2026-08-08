@@ -119,6 +119,8 @@ type
     function  TargetLayout: TTargetLayout;
     function  ReadProcessMemoryAt(VA: UInt64; Buf: Pointer; Size: NativeUInt): Boolean;
     function  ReadCodeMemoryAt(VA: UInt64; Buf: Pointer; Size: NativeUInt): NativeUInt;
+    function  NearestInstructionBoundaryBefore(VA: UInt64; out BoundaryVA: UInt64): Boolean;
+    function  NearestExportedEntryBefore(VA: UInt64; out BoundaryVA: UInt64): Boolean;
     // --- everything below is an inert stub ---
     function  ProcessHandle: THandle;
     function  ImageBase: UInt64;
@@ -237,6 +239,19 @@ begin
   Result := AvailLen;
 end;
 
+// This fake carries no debug-info set and no PE image at all, so neither
+// boundary source has anything to answer with -- both must refuse, never
+// invent an address.
+function  TFakeMemTarget.NearestInstructionBoundaryBefore(VA: UInt64; out BoundaryVA: UInt64): Boolean;
+begin
+  BoundaryVA := 0;
+  Result := False;
+end;
+function  TFakeMemTarget.NearestExportedEntryBefore(VA: UInt64; out BoundaryVA: UInt64): Boolean;
+begin
+  BoundaryVA := 0;
+  Result := False;
+end;
 function  TFakeMemTarget.ProcessHandle: THandle; begin Result := 0; end;
 function  TFakeMemTarget.ImageBase: UInt64; begin Result := 0; end;
 function  TFakeMemTarget.HasExited: Boolean; begin Result := False; end;

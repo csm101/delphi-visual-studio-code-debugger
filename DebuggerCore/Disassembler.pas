@@ -72,6 +72,48 @@ type
     function Disassemble(VA: UInt64; Count: Integer): TArray<TDisasmInstruction>;
   end;
 
+  // Reusable backward-disassembly mechanism (DISASSEMBLY_PLAN.md, "before" --
+  // decision: proven-boundary-only). x86/x64 cannot be decoded backwards, so
+  // the only exact way to find instructions PRECEDING TargetVA is to start
+  // from a PROVEN earlier boundary and decode FORWARD, keeping the result
+  // only if it lands EXACTLY on TargetVA. BoundaryVA must already be such a
+  // boundary (from IDebugTarget.NearestInstructionBoundaryBefore, or its
+  // PE-export fallback for a module with no debug info) -- this function
+  // does not find one itself and never guesses at a shorter or longer span:
+  // it returns NO instructions at all, rather than a partial or misaligned
+  // list, when the forward decode does not land exactly on TargetVA (e.g. an
+  // inline exception-handler table straddled between the boundary and the
+  // target). Increment 6's DAP negative instructionOffset must call this
+  // same function rather than re-implement backward disassembly.
+  function DisassembleBackward(const Disasm: IDisassembler;
+    BoundaryVA, TargetVA: UInt64; Before: Integer): TArray<TDisasmInstruction>;
+
 implementation
+
+function DisassembleBackward(const Disasm: IDisassembler;
+  BoundaryVA, TargetVA: UInt64; Before: Integer): TArray<TDisasmInstruction>;
+begin
+  Result := nil;
+  if (Before <= 0) or (BoundaryVA >= TargetVA) then
+    Exit;
+
+  var Chain: TArray<TDisasmInstruction> := nil;
+  var Cursor := BoundaryVA;
+  while Cursor < TargetVA do begin
+    var Step := Disasm.Disassemble(Cursor, 1);
+    if Length(Step) = 0 then
+      Exit;   // reader ran dry before reaching the target -- refuse, no guess
+    Chain := Chain + [Step[0]];
+    Inc(Cursor, UInt64(Step[0].Length));
+  end;
+  if Cursor <> TargetVA then
+    Exit;   // overshot or (impossible, but checked) fell short of the target
+            // exactly -- refuse rather than trust a decode that did not land
+
+  var Keep := Length(Chain);
+  if Keep > Before then
+    Keep := Before;
+  Result := Copy(Chain, Length(Chain) - Keep, Keep);
+end;
 
 end.

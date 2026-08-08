@@ -82,6 +82,12 @@ type
     procedure CheckWaitTimeout;
     procedure HandleReadMemory(const IdJson, AddrStr: string; Count: Integer);
     procedure HandleWriteMemory(const IdJson, AddrStr, HexBytes: string);
+    // DISASSEMBLY_PLAN.md increment 4. AddrStr = '' means "resolve from
+    // FrameIndex/ThreadId instead" (same frame-selection convention
+    // get_locals/get_variable/evaluate_expression already use -- no separate
+    // opaque frameId shape).
+    procedure HandleDisassemble(const IdJson, AddrStr: string;
+                FrameIndex: Integer; ThreadId: Cardinal; Count, Before: Integer);
 
     // Tool-result envelopes.
     procedure SendToolJson(const IdJson: string; Payload: TJSONValue);
@@ -98,7 +104,8 @@ procedure RunMcpServer;
 implementation
 
 uses
-  System.IOUtils, McpToolSchemas, McpJson, LaunchConfig;
+  System.IOUtils, McpToolSchemas, McpJson, LaunchConfig,
+  Disassembler, ZydisDisassembler;
 
 var
   GLogPath: string;
@@ -887,6 +894,11 @@ begin
       HandleWriteMemory(IdJson, ArgStr('address'), ArgStr('hexBytes'));
       Exit;
     end;
+    if Name = 'disassemble' then begin
+      HandleDisassemble(IdJson, ArgStr('address'), ArgInt('frameIndex', 0),
+        Cardinal(ArgInt('threadId', 0)), ArgInt('count', 10), ArgInt('before', 0));
+      Exit;
+    end;
 
     SendToolError(IdJson, 'Unknown tool: ' + Name);
   except
@@ -969,6 +981,176 @@ begin
   var Obj := TJSONObject.Create;
   Obj.AddPair('address', Format('0x%x', [Addr]));
   Obj.AddPair('written', TJSONNumber.Create(Length(Buf)));
+  SendToolJson(IdJson, Obj);
+end;
+
+// MCPDebugger\Win64\<Config>\DelphiDebuggerMcp.exe is three levels below the
+// repo root, same depth as DevTools\Win64\<Config>\*.exe (see Disasm.dpr's
+// DefaultZydisDllPath, which this mirrors) -- lets a dev/test build find the
+// committed DLL without any install step. An installed copy (no repo beside
+// it, no DLL sitting next to the exe) falls through to ZydisTryLoad('')'s
+// own bare-name search, which is the ordinary "Zydis unavailable" path this
+// feature is built to report honestly rather than hide.
+function DefaultZydisDllPath: string;
+begin
+  Result := TPath.GetFullPath(TPath.Combine(ExtractFileDir(ParamStr(0)),
+    '..\..\..\ThirdParty\Zydis\bin\x64\Zydis.dll'));
+end;
+
+function ResolveZydisDllPath: string;
+var
+  NextToExe: string;
+begin
+  NextToExe := TPath.Combine(ExtractFileDir(ParamStr(0)), 'Zydis.dll');
+  if FileExists(NextToExe) then
+    Exit(NextToExe);
+  if FileExists(DefaultZydisDllPath) then
+    Exit(DefaultZydisDllPath);
+  Result := '';
+end;
+
+// Which loaded module (main exe or a runtime package/DLL) owns VA, or ''
+// when none of them do (kernel32, ntdll, or anything the debugger has not
+// logged a LOAD_DLL event for yet). Same GetModules the get_loaded_modules
+// tool already exposes, reused here so a `before` refusal can name the
+// module rather than just the bare address.
+function ModuleNameForVA(Session: TDebugSession; VA: UInt64): string;
+begin
+  Result := '';
+  for var M in Session.GetModules do
+    if (M.Base <> 0) and (VA >= M.Base) and (VA < M.Base + M.Size) then
+      Exit(M.Name);
+end;
+
+// DISASSEMBLY_PLAN.md increment 4: MCP `disassemble`. Requires a stop, same
+// as get_call_stack/get_raw_stack_scan -- both the byte read and (when
+// resolving via frameIndex/threadId) the call stack need a consistent,
+// non-running snapshot.
+//
+// Zydis is optional (DISASSEMBLY_PLAN.md, "Constraints"): a missing or
+// version-mismatched DLL is reported as available:false with a reason, never
+// a partial or fabricated result -- the ORDINARY case on a machine without
+// the VC++ runtime, not an error. `before` is a SEPARATE refusal channel
+// from the call itself (decision recorded in DISASSEMBLY_PLAN.md): backward
+// disassembly is answered only from a PROVEN earlier instruction boundary
+// (debug info, or a module's PE export table when it has none) that decodes
+// forward to land EXACTLY on the requested address; anything else refuses
+// with a reason while the forward `instructions` are still returned
+// untouched -- a refused `before` is not a failed call.
+procedure TMcpServer.HandleDisassemble(const IdJson, AddrStr: string;
+  FrameIndex: Integer; ThreadId: Cardinal; Count, Before: Integer);
+var
+  Addr: UInt64;
+begin
+  if FSession.State <> dsStopped then begin
+    SendToolError(IdJson, 'Cannot disassemble while the debuggee is running. Pause or wait for a stop first.');
+    Exit;
+  end;
+  if (Count < 1) or (Count > 500) then begin
+    SendToolError(IdJson, 'count must be 1..500');
+    Exit;
+  end;
+  if (Before < 0) or (Before > 100) then begin
+    SendToolError(IdJson, 'before must be 0..100');
+    Exit;
+  end;
+
+  if Trim(AddrStr) <> '' then begin
+    if not ParseAddress(AddrStr, Addr) then begin
+      SendToolError(IdJson, 'invalid address: ' + AddrStr);
+      Exit;
+    end;
+  end
+  else begin
+    var Frames: TArray<TSessionFrame>;
+    if ThreadId <> 0 then
+      Frames := FSession.GetCallStack(ThreadId)
+    else
+      Frames := FSession.GetCallStack;
+    if (FrameIndex < 0) or (FrameIndex > High(Frames)) then begin
+      SendToolError(IdJson, Format(
+        'frameIndex %d out of range (0..%d). Use get_call_stack first, or pass address directly.',
+        [FrameIndex, High(Frames)]));
+      Exit;
+    end;
+    Addr := Frames[FrameIndex].IP;
+  end;
+
+  var Mode: TDisasmMachineMode;
+  if FSession.Debugger.TargetLayout.PointerSize = 8 then
+    Mode := dmmLong64
+  else
+    Mode := dmmLegacy32;
+
+  var Debugger := FSession.Debugger;
+  var Reader: TDisasmByteReader :=
+    function(VA: UInt64; Buf: Pointer; Size: Integer): Integer
+    begin
+      Result := Integer(Debugger.ReadCodeMemoryAt(VA, Buf, NativeUInt(Size)));
+    end;
+
+  var Disasm: IDisassembler := TZydisDisassembler.Create(Mode, Reader,
+    FSession.DebugInfo, Debugger.ImageBase, ResolveZydisDllPath);
+
+  var Obj := TJSONObject.Create;
+  Obj.AddPair('address', '0x' + IntToHex(Addr, 1));
+  var ModName := ModuleNameForVA(FSession, Addr);
+  if ModName <> '' then
+    Obj.AddPair('module', ModName);
+  if Mode = dmmLong64 then
+    Obj.AddPair('machineMode', 'x64')
+  else
+    Obj.AddPair('machineMode', 'x86');
+  Obj.AddPair('available', TJSONBool.Create(Disasm.Available));
+
+  if not Disasm.Available then begin
+    // Fail closed BEFORE decoding anything: no `instructions`, no `before` --
+    // the whole point is that an unavailable backend never hands back a
+    // partial result an agent could mistake for a real one.
+    Obj.AddPair('reason', Disasm.StatusText);
+    SendToolJson(IdJson, Obj);
+    Exit;
+  end;
+
+  var Forward := Disasm.Disassemble(Addr, Count);
+  Obj.AddPair('instructions', McpJson.DisasmInstructionListToJson(Forward));
+
+  if Before > 0 then begin
+    var BeforeObj := TJSONObject.Create;
+    BeforeObj.AddPair('requested', TJSONNumber.Create(Before));
+
+    var BoundaryVA: UInt64;
+    var HaveBoundary := Debugger.NearestInstructionBoundaryBefore(Addr, BoundaryVA);
+    if not HaveBoundary then
+      HaveBoundary := Debugger.NearestExportedEntryBefore(Addr, BoundaryVA);
+
+    var Backward: TArray<TDisasmInstruction> := nil;
+    if HaveBoundary then
+      Backward := DisassembleBackward(Disasm, BoundaryVA, Addr, Before);
+
+    if Length(Backward) > 0 then begin
+      BeforeObj.AddPair('returned', TJSONNumber.Create(Length(Backward)));
+      BeforeObj.AddPair('refused', TJSONBool.Create(False));
+      BeforeObj.AddPair('instructions', McpJson.DisasmInstructionListToJson(Backward));
+    end
+    else begin
+      BeforeObj.AddPair('returned', TJSONNumber.Create(0));
+      BeforeObj.AddPair('refused', TJSONBool.Create(True));
+      if not HaveBoundary then begin
+        var ReasonModule := ModName;
+        if ReasonModule = '' then
+          ReasonModule := 'an unknown module';
+        BeforeObj.AddPair('reason', Format(
+          'no proven instruction boundary precedes this address in %s', [ReasonModule]));
+      end
+      else
+        BeforeObj.AddPair('reason',
+          'decoding forward from the nearest known boundary does not land exactly on the ' +
+          'requested address, so preceding instruction boundaries cannot be determined without guessing');
+    end;
+    Obj.AddPair('before', BeforeObj);
+  end;
+
   SendToolJson(IdJson, Obj);
 end;
 

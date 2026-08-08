@@ -82,6 +82,22 @@ type
   end;
 
   [TestFixture]
+  TDisassembleBackwardTests = class
+  public
+    // A known 12-byte x64 prologue (push rbp/push rbx/sub rsp,0x98/mov
+    // rbp,rsp) fed through DisassembleBackward with the TRUE function-start
+    // VA as the boundary: forward decode from it lands EXACTLY on the
+    // target, so the result must be the exact preceding instructions, most
+    // recent last.
+    [Test] procedure ProvenBoundary_LandsExactly_ReturnsExactPrecedingInstructions;
+    // The same bytes, but TargetVA points MID-INSTRUCTION (inside the 7-byte
+    // `sub rsp, 0x98`), so forward decode from the boundary overshoots it.
+    // DISASSEMBLY_PLAN.md "before": this must refuse (empty result), never
+    // hand back a misaligned guess.
+    [Test] procedure Misalignment_DoesNotLandExactly_RefusesWithEmptyResult;
+  end;
+
+  [TestFixture]
   TReadCodeMemoryAtTests = class
   private
     function RepoRoot: string;
@@ -330,6 +346,63 @@ begin
   end;
 end;
 
+{ TDisassembleBackwardTests }
+
+procedure TDisassembleBackwardTests.ProvenBoundary_LandsExactly_ReturnsExactPrecedingInstructions;
+begin
+  ZydisResetForTests;
+
+  // Same known x64 prologue as Long64_KnownPrologueBytes_DecodeToExpectedMnemonics:
+  // push rbp(1) / push rbx(1) / sub rsp,0x98(7) / mov rbp,rsp(3) -- 12 bytes,
+  // instruction boundaries at $1000/$1001/$1002/$1009/$100C.
+  const BaseVA = UInt64($1000);
+  var Bytes: TBytes := [$55, $53, $48, $81, $EC, $98, $00, $00, $00, $48, $8B, $EC];
+  var Reader := MakeFixedBytesReader(BaseVA, Bytes);
+  var Disasm: IDisassembler := TZydisDisassembler.Create(dmmLong64, Reader, nil, 0, RealZydisDllPath);
+  Assert.IsTrue(Disasm.Available, 'real Zydis.dll must load: ' + Disasm.StatusText);
+
+  // BoundaryVA = the true function start ($1000): a hand-supplied stand-in
+  // for what IDebugTarget.NearestInstructionBoundaryBefore would have found.
+  // This test is about DisassembleBackward's own forward-decode-and-verify
+  // logic, not about boundary discovery.
+  var TargetVA := BaseVA + 9;   // $1009, right after "sub rsp, 0x98" (before "mov rbp, rsp")
+  var Result3 := DisassembleBackward(Disasm, BaseVA, TargetVA, 3);
+  Assert.AreEqual<Integer>(3, Length(Result3), 'expected all 3 preceding instructions');
+  Assert.AreEqual('push rbp', Result3[0].Text);
+  Assert.AreEqual('push rbx', Result3[1].Text);
+  Assert.AreEqual('sub rsp, 0x98', Result3[2].Text);
+  Assert.AreEqual<UInt64>(TargetVA, Result3[2].VA + UInt64(Result3[2].Length),
+    'the last returned instruction must end EXACTLY at the requested address');
+
+  // Asking for fewer than the whole chain keeps the MOST RECENT ones (closest
+  // to the target), not the earliest.
+  var Result2 := DisassembleBackward(Disasm, BaseVA, TargetVA, 2);
+  Assert.AreEqual<Integer>(2, Length(Result2));
+  Assert.AreEqual('push rbx', Result2[0].Text);
+  Assert.AreEqual('sub rsp, 0x98', Result2[1].Text);
+end;
+
+procedure TDisassembleBackwardTests.Misalignment_DoesNotLandExactly_RefusesWithEmptyResult;
+begin
+  ZydisResetForTests;
+
+  const BaseVA = UInt64($1000);
+  var Bytes: TBytes := [$55, $53, $48, $81, $EC, $98, $00, $00, $00, $48, $8B, $EC];
+  var Reader := MakeFixedBytesReader(BaseVA, Bytes);
+  var Disasm: IDisassembler := TZydisDisassembler.Create(dmmLong64, Reader, nil, 0, RealZydisDllPath);
+  Assert.IsTrue(Disasm.Available, 'real Zydis.dll must load: ' + Disasm.StatusText);
+
+  // $1003 sits in the MIDDLE of the 7-byte "sub rsp, 0x98" (which starts at
+  // $1002): decoding forward from the true boundary $1000 necessarily
+  // overshoots it (push rbp -> $1001, push rbx -> $1002, sub rsp,0x98 ->
+  // $1009, which is already past $1003). No real instruction stream can
+  // land here, so this must refuse rather than return a truncated guess.
+  var TargetVA := BaseVA + 3;   // $1003
+  var Result := DisassembleBackward(Disasm, BaseVA, TargetVA, 3);
+  Assert.AreEqual<Integer>(0, Length(Result),
+    'a forward decode that does not land EXACTLY on the target must refuse (empty), never guess');
+end;
+
 { shared marker/path helpers -- duplicated (not shared) deliberately: each
   fixture below targets a different bitness's TestTarget.exe, and this keeps
   every helper trivially inspectable without reaching into DebugSessionTests.pas. }
@@ -487,6 +560,7 @@ initialization
   TDUnitX.RegisterTestFixture(TDisassemblerBackendTests);
   TDUnitX.RegisterTestFixture(TZydisPositiveDecodeTests);
   TDUnitX.RegisterTestFixture(TCallTargetWhitelistTests);
+  TDUnitX.RegisterTestFixture(TDisassembleBackwardTests);
   TDUnitX.RegisterTestFixture(TReadCodeMemoryAtTests);
   TDUnitX.RegisterTestFixture(TReadCodeMemoryAtWin32Tests);
 

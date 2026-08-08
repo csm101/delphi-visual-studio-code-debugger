@@ -242,6 +242,13 @@ type
     // rather than handing descendants the whole debug-info set.
     function  NearestInstructionBoundaryBefore(VA: UInt64;
                 out BoundaryVA: UInt64): Boolean;
+    // IDebugTarget.NearestExportedEntryBefore -- the PE-export fallback for a
+    // module NearestInstructionBoundaryBefore cannot answer for at all (no
+    // debug-info provider owns it). Declared here (not IDebugTarget-only)
+    // so TWin32Debugger inherits the one implementation unchanged, same as
+    // NearestInstructionBoundaryBefore itself.
+    function  NearestExportedEntryBefore(VA: UInt64;
+                out BoundaryVA: UInt64): Boolean;
     // Entry address of the routine containing VA, as a VA. Lets a descendant
     // ask "are these two addresses in the same routine" without reaching into
     // the debug-info set or doing its own RVA arithmetic.
@@ -962,6 +969,133 @@ begin
   // symbols but no line table. The entry is still a guaranteed instruction
   // boundary, so the decode is longer but no less exact.
   BoundaryVA := RvaToVA(FuncStart);
+  Result := True;
+end;
+
+// See DebugTarget.IDebugTarget.NearestExportedEntryBefore. Reads the PE
+// headers and export directory straight out of the LIVE mapped image
+// (ReadProcessMemoryAt), never from the file on disk: the loaded image is
+// already relocated and is exactly what will be decoded, and RVA-within-the-
+// image equals VA-within-the-image directly, with no section/raw-offset
+// translation to get wrong.
+//
+// The search key is VA-1, not VA, for the same reason
+// NearestInstructionBoundaryBefore anchors on TargetRva-1: if VA is itself
+// an export's entry point, decoding "before" it must still be answerable by
+// walking through whatever PRECEDES it in the module (the tail of the
+// previous exported routine, or unexported code between two exports) -- the
+// byte stream does not stop meaning anything at a routine boundary, and the
+// caller verifies the result lands exactly on VA regardless of which
+// routine the boundary came from.
+function TWinDebugger.NearestExportedEntryBefore(VA: UInt64;
+  out BoundaryVA: UInt64): Boolean;
+const
+  DIR_LEN = 40;         // sizeof(IMAGE_EXPORT_DIRECTORY)
+  PE32_PLUS_MAGIC = $20B;
+
+  function ModuleRangeContaining(TestVA: UInt64; out Base, Size: UInt64): Boolean;
+
+    function InRange(TryBase, TrySize: UInt64): Boolean;
+    begin
+      Result := (TryBase <> 0) and (TrySize <> 0) and
+        (TestVA >= TryBase) and (TestVA < TryBase + TrySize);
+    end;
+
+  begin
+    Base := 0;
+    Size := 0;
+    if InRange(FImageBase, FImageSize) then begin
+      Base := FImageBase;
+      Size := FImageSize;
+      Exit(True);
+    end;
+    for var KV in FDllBases do begin
+      var DllSize: UInt64 := 0;
+      if FDllSizes.TryGetValue(KV.Key, DllSize) and InRange(KV.Value, DllSize) then begin
+        Base := KV.Value;
+        Size := DllSize;
+        Exit(True);
+      end;
+    end;
+    Result := False;
+  end;
+
+  function ReadDword(Addr: UInt64; out Value: DWORD): Boolean;
+  begin
+    Value := 0;
+    Result := ReadProcessMemoryAt(Addr, @Value, 4);
+  end;
+
+  function ReadWord(Addr: UInt64; out Value: Word): Boolean;
+  begin
+    Value := 0;
+    Result := ReadProcessMemoryAt(Addr, @Value, 2);
+  end;
+
+var
+  ModBase, ModSize: UInt64;
+begin
+  BoundaryVA := 0;
+  if not ModuleRangeContaining(VA, ModBase, ModSize) then
+    Exit(False);
+
+  var ELfanew: DWORD;
+  if not ReadDword(ModBase + $3C, ELfanew) then
+    Exit(False);
+  var PESig: DWORD;
+  if not ReadDword(ModBase + ELfanew, PESig) or (PESig <> $00004550) then
+    Exit(False);
+
+  var OptBase := ModBase + ELfanew + 24;   // Signature(4) + IMAGE_FILE_HEADER(20)
+  var OptMagic: Word;
+  if not ReadWord(OptBase, OptMagic) then
+    Exit(False);
+
+  // DataDirectory[] sits right after the fixed optional-header fields: 96
+  // bytes in for PE32 (Magic $10B), 112 bytes in for PE32+ (Magic $20B) --
+  // same offsets DevTools\DisasmCoverage.dpr's TPEImage measures from a file.
+  var DataDirBase: UInt64;
+  if OptMagic = PE32_PLUS_MAGIC then
+    DataDirBase := OptBase + 112
+  else
+    DataDirBase := OptBase + 96;
+
+  var ExportRva, ExportSize: DWORD;
+  if not ReadDword(DataDirBase, ExportRva) or not ReadDword(DataDirBase + 4, ExportSize) then
+    Exit(False);
+  if (ExportRva = 0) or (ExportSize = 0) then
+    Exit(False);   // module has no export directory at all
+
+  var NumFuncs, AddrFuncs: DWORD;
+  if not ReadDword(ModBase + ExportRva + 20, NumFuncs) or
+     not ReadDword(ModBase + ExportRva + 28, AddrFuncs) then
+    Exit(False);
+
+  if VA <= ModBase then
+    Exit(False);
+  var SearchRva := (VA - ModBase) - 1;   // see header comment: VA-1, not VA
+
+  var BestRva: UInt64 := 0;
+  var HaveBest := False;
+  for var I := 0 to Integer(NumFuncs) - 1 do begin
+    var FuncRva: DWORD;
+    if not ReadDword(ModBase + UInt64(AddrFuncs) + UInt64(I) * 4, FuncRva) then
+      Continue;
+    if FuncRva = 0 then
+      Continue;   // unused ordinal slot
+    if (FuncRva >= ExportRva) and (FuncRva < ExportRva + ExportSize) then
+      Continue;   // forwarder: RVA points at a string inside the export directory, not code
+    if UInt64(FuncRva) > SearchRva then
+      Continue;
+    if (not HaveBest) or (UInt64(FuncRva) > BestRva) then begin
+      BestRva := FuncRva;
+      HaveBest := True;
+    end;
+  end;
+  if not HaveBest then
+    Exit(False);
+
+  BoundaryVA := ModBase + BestRva;
   Result := True;
 end;
 

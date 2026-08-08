@@ -1,6 +1,6 @@
 # Disassembly and address breakpoints — plan
 
-Status: **increment 3 landed, not committed** (2026-08-08). This document is the
+Status: **increment 4 landed, not committed** (2026-08-09). This document is the
 agreed design; `PROJECT_STATE.md` carries only the one-line roadmap entry
 pointing here.
 
@@ -160,10 +160,18 @@ consistent with how frames already render.
 - `disassemble(address | frameId, count, [before])` → instructions with VA, bytes,
   text, and symbol/source when known. Explicit in the tool description: an
   undecodable instruction is reported as such, never guessed.
+  **DONE, increment 4.** Shipped as `disassemble(address?, frameIndex?,
+  threadId?, count?, before?)` in `MCPDebugger\McpServer.pas`
+  (`TMcpServer.HandleDisassemble`) — `frameId` became `frameIndex`+`threadId`
+  (see "Verified in increment 4" for why), everything else matches.
 - `set_breakpoint_at_address(address)` / the address form of `remove`.
+  Increment 5, not started.
 - Frames and raw-stack hits should carry the address they already have in a field
   an agent can feed straight back into `disassemble` — no re-parsing of display
-  text.
+  text. **Already true before increment 4 started**: `McpJson.FrameListToJson`
+  (used by both `get_call_stack` and `get_raw_stack_scan`) has emitted
+  `"address": "0x..."` from `TSessionFrame.IP` since the raw-stack-scan work —
+  no new field was needed.
 
 ## DAP surface
 
@@ -234,10 +242,26 @@ Decisions:
      it surfaced, in "Verified in increment 3 — Half B" below and
      `DevTools\README.md`'s `DisasmCoverage` entry.
    - Full suite after both halves: see "Verified in increment 3 — Half A".
-4. MCP `disassemble`.
+4. **DONE, not committed (2026-08-09).** MCP `disassemble`. Full detail,
+   including the backward-disassembly decision and what it cost, in
+   "Decision: backward disassembly is proven-boundary-only" and "Verified in
+   increment 4" below.
 5. Address breakpoints in `DebugSession` (module+RVA identity, deferred bind),
    then the MCP tool, then `setInstructionBreakpoints` over DAP.
 6. DAP `disassemble` + `instructionPointerReference`.
+7. **Packaging — and it decides whether any of this works on a user's machine.**
+   Until it is done, every increment above is a feature that reports UNAVAILABLE
+   in the field while passing every test here, because the tests run out of the
+   build tree where `Zydis.dll` happens to be reachable. Three parts:
+   * `install\Install.exe` and the extension folder ship the DLL next to
+     `VisualStudioCodeDelphiDebugger.exe`, and the MCP server build gets it too —
+     `disassemble` over MCP is useless without it.
+   * the MIT licence text ships with it.
+   * **decide `/MD` vs `/MT`.** The committed DLL is a `/MD` build, so it needs
+     the VC++ runtime installed. `/MT` removes that dependency at the cost of a
+     larger DLL. A user without the redistributable currently gets a correct but
+     permanently unavailable feature — which is the honest failure mode, but not
+     an acceptable default.
 
 ## Traps
 
@@ -578,9 +602,172 @@ performs a full, unsampled sweep of any binary, `Hydra2SingleEXE.exe`
 included — the tool's default is always the full sweep; sampling is an
 explicit, disclosed opt-in via `-sample N`, never a silent cap.
 
+## Decision: backward disassembly is proven-boundary-only
+
+Increment 4's MCP surface names a `before` parameter ("instructions preceding
+an address") without specifying HOW to compute it — flagged mid-increment per
+this project's "STOP on an unanticipated design decision" rule, and resolved
+by the maintainer rather than guessed, because it collides directly with the
+standing "no heuristics" constraint.
+
+**The problem.** x86/x64 is a variable-length ISA with no way to find
+instruction boundaries walking backward from an arbitrary byte. Every tool
+that offers this (x64dbg, IDA, VS Code's own Disassembly View via a negative
+DAP `instructionOffset`) picks some earlier byte offset, decodes forward, and
+keeps whichever interpretation's last instruction happens to end exactly at
+the target — a search over candidate alignments. More than one alignment can
+legitimately land exactly on the target byte for different, both "valid"
+instruction streams: an inherent ambiguity, not a decoder gap. That is a
+heuristic by construction.
+
+**The three options weighed:**
+
+- **A — proven-boundary-only.** Answer `before` only when a PROVEN earlier
+  boundary exists (the containing function's start — from debug info, or
+  from the module's PE export table when it has none at all — or a nearer
+  line-table boundary) AND decoding forward from it lands EXACTLY on the
+  requested address. Refuse, naming the cause, otherwise. Deterministic by
+  construction, at the cost of refusing whenever no such boundary exists.
+- **B — defer `before` to increment 6.** Ship forward-only now; decide the
+  backward algorithm once, when DAP's negative `instructionOffset` forces the
+  identical question anyway.
+- **C — best-effort backward scan, labelled unproven.** Scan-and-realign like
+  x64dbg/IDA, but mark the result as unproven. Rejected outright: this tool
+  exists to stop an agent constructing a confident wrong answer from raw
+  bytes, and producing one INSIDE the debugger and merely labelling it is the
+  same failure moved one layer up, not removed.
+
+**Chosen: A.** It is the answer increment 6 would have reached anyway (B only
+sequences the work, it does not avoid the question), and shipping the
+refusal now means it is tested at the MCP layer before DAP depends on it.
+Two hard constraints on how the refusal must appear, both honoured by
+`Disassembler.DisassembleBackward` and `TMcpServer.HandleDisassemble`:
+
+- the result must NEVER mix proven and unproven instructions in one list —
+  `DisassembleBackward` returns either the FULL exact chain or nothing at
+  all, never a partial one;
+- a refusal of `before` is not a failure of the call — the forward
+  `instructions` are still returned, untouched, alongside a `before.refused`
+  object that names the cause.
+
+Proven boundaries, in preference order (mirrors
+`WinDebuggerBase.NearestInstructionBoundaryBefore`'s own existing
+preference, extended with one new source):
+
+1. the nearest line-table RVA within the same routine (tightest span, least
+   chance of meeting an inline exception-handler table);
+2. the routine's own entry (from debug info) when no line record exists
+   there;
+3. **new for increment 4**: the nearest PE export-table entry at or before
+   the address, scoped to the owning module — the boundary source of last
+   resort for a module with NO debug info at all (a package built by someone
+   else, or an OS DLL). An export entry is still a genuinely PROVEN
+   instruction boundary — the exact address `GetProcAddress` would return —
+   just not a named one.
+
+**Increment 6 must call the same mechanism, not re-derive it.** DAP's
+`disassemble` request answers "instructions before the current PC" through
+exactly the same negative-offset shape VS Code's Disassembly View already
+uses; re-implementing backward disassembly there instead of calling
+`IDebugTarget.NearestInstructionBoundaryBefore` /
+`NearestExportedEntryBefore` + `Disassembler.DisassembleBackward` would
+re-open an argument this document already settled.
+
+## Verified in increment 4
+
+- **The seam extension.** `IDebugTarget` (`DebugTarget.pas`) gained two
+  methods: `NearestInstructionBoundaryBefore` (already implemented on
+  `TWinDebugger` since increment 2 for the raw-stack-scan call-site-proving
+  path, but declared only `protected` there and not part of the interface —
+  promoted to the interface with NO change to its body, since Delphi lets a
+  non-public method satisfy an interface) and `NearestExportedEntryBefore`
+  (new: the PE-export fallback described above).
+  `DebuggerTests\ValueReaderTests.pas`'s `TFakeMemTarget` (the only other
+  `IDebugTarget` implementer) got trivial `False`-returning implementations
+  of both — it has no debug info and no PE image to answer from.
+- **`NearestExportedEntryBefore` reads the LIVE mapped image**
+  (`ReadProcessMemoryAt`), never a file on disk: the loaded image is already
+  relocated, so RVA-within-the-image equals VA-within-the-image directly,
+  with no section/raw-offset translation to get wrong (unlike
+  `DevTools\DisasmCoverage.dpr`'s file-based `TPEImage`, whose export-parsing
+  byte offsets this method otherwise mirrors exactly — same
+  `IMAGE_EXPORT_DIRECTORY` layout, same forwarder-entry exclusion). Anchored
+  on `VA - 1` (not `VA`), for the identical reason
+  `NearestInstructionBoundaryBefore` anchors on `TargetRva - 1`: if `VA` is
+  itself an export's entry point, `before` must still be answerable by
+  walking through whatever precedes it in the module — the byte stream does
+  not stop meaning anything at a routine boundary.
+- **`Disassembler.DisassembleBackward`** (library-free, like the rest of
+  `Disassembler.pas`) is the ONE mechanism both the MCP tool and (later)
+  increment 6 call: decodes one instruction at a time forward from
+  `BoundaryVA`, and returns the whole chain trimmed to the last `Before`
+  entries ONLY if the running cursor lands EXACTLY on `TargetVA`; any
+  overshoot (or the reader running dry) returns nothing. Proven both ways in
+  `DebuggerTests\DisassemblerTests.pas`'s `TDisassembleBackwardTests`, x64,
+  against the same known 12-byte prologue increment 1 measured
+  (`push rbp`/`push rbx`/`sub rsp,0x98`/`mov rbp,rsp`):
+  `ProvenBoundary_LandsExactly_ReturnsExactPrecedingInstructions` (exact
+  landing, most-recent-instructions-last, both a full-chain and a
+  shorter-than-chain request) and
+  `Misalignment_DoesNotLandExactly_RefusesWithEmptyResult` (`TargetVA`
+  pointed mid-instruction, inside the 7-byte `sub rsp, 0x98` — forward decode
+  necessarily overshoots it). Negative-controlled: commenting out the
+  `Cursor <> TargetVA` refusal made the misalignment test fail with
+  `Expected [0] but got [3]`, i.e. it silently returned 3 instructions that
+  do NOT end at the requested address — exactly the guessed/misaligned
+  result the design forbids.
+- **`frameId` → `frameIndex` + `threadId`.** The plan named a `frameId`
+  parameter without specifying its shape. The MCP surface has no existing
+  opaque-frame-id concept anywhere — `get_locals`, `get_variable` and
+  `evaluate_expression` all already select a frame via `frameIndex` (from
+  `get_call_stack`) plus `threadId`, so `disassemble` reuses that exact
+  convention instead of inventing a second one.
+  `TMcpE2ETests.Disassemble_ViaFrameIndex_MatchesAddressForm` proves the two
+  forms agree: `disassemble` with no `address` (resolving via
+  `frameIndex:0`/`threadId:0`) and `disassemble` with `address` set to the
+  first call's own echoed address decode to the identical first instruction.
+- **The address round trip needed no new field, confirmed by test, not just
+  inspection.** `McpJson.FrameListToJson` already emits `"address"` from
+  `TSessionFrame.IP` for both `get_call_stack` frames and
+  `get_raw_stack_scan` hits (present since the raw-stack-scan work, unrelated
+  to this increment). `Disassemble_Forward_ReturnsDecodedInstructionsAtStopAddress`
+  takes a real breakpoint stop's `frames[0].address` string from
+  `continue_and_wait`'s snapshot UNMODIFIED and passes it straight into
+  `disassemble`'s `address` argument, asserting the tool's own echoed
+  `address` and the first decoded instruction's `address` both equal it
+  exactly.
+- **Fail-closed `available:false`, proven against a REAL isolated process,
+  not simulated.** `Disassemble_ReportsUnavailable_WhenZydisDllNotFound`
+  copies the built `DelphiDebuggerMcp.exe` to a scratch directory outside the
+  repo (so neither its own-directory `Zydis.dll` check nor its
+  repo-relative fallback — `..\..\..\ThirdParty\Zydis\bin\x64\Zydis.dll`,
+  the same three-levels-below-repo-root convention `DevTools\Disasm.exe`
+  uses — can resolve), launches THAT copy, and asserts `available:false`
+  with a non-empty `reason` and — critically — no `instructions` key and no
+  `before` key at all. Negative-controlled: temporarily short-circuiting the
+  `if not Disasm.Available` guard let the call fall through to
+  `Obj.AddPair('instructions', ...)` with an EMPTY array attached anyway,
+  failing the "no `instructions` key at all" assertion with
+  `available:false ... "instructions":[]` visible in the failure message —
+  exactly the fabricated-partial-result shape the guard exists to prevent.
+- **Bitness coverage.** `Disassemble_Forward_ReturnsDecodedInstructionsAtStopAddress`
+  (x64, `machineMode:"x64"`) and `Disassemble_Win32_Forward_ReturnsDecodedInstructions`
+  (x86, `machineMode:"x86"`, plus an explicit check that every decoded
+  instruction's address fits an 8-hex-digit 32-bit VA) both drive the SAME
+  built `DelphiDebuggerMcp.exe` and the SAME `Zydis.dll` against the two
+  `TestTarget.exe` bitnesses, mirroring how `TZydisPositiveDecodeTests`
+  already covered both machine modes at the seam level.
+- **Never presents disassembly-derived call targets as call-stack frames —
+  satisfied by construction**, same as increment 2: `disassemble`'s result
+  type is a fresh JSON object with its own `instructions` array; nothing in
+  this increment writes into `FrameListToJson`, `GetCallStack`, or
+  `GetRawStackScan`.
+- Full suite (`DebuggerTests\build_and_run.bat`): see `TASK_RESUME.md` for
+  the exact counts from this session's run.
+
 ## Open, to verify before writing code
 
-(none remaining for increment 3 — resolved above)
+(none remaining for increment 4 — resolved above)
 
 ## Not in scope, deliberately
 

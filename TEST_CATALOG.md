@@ -493,7 +493,7 @@ fixture):
 - [ ] Set clipboard text
 - [ ] Class with > 30 fields -- truncated representation
 
-## M. Disassembly (DISASSEMBLY_PLAN.md increments 2-3)
+## M. Disassembly (DISASSEMBLY_PLAN.md increments 2-4)
 
 - [x] Backend reports `Available=False` with a non-empty `StatusText` and
       `Disassemble` returns an empty array -- WITHOUT ever invoking the byte
@@ -545,8 +545,45 @@ fixture):
       non-mnemonic divergence, and the dumpbin-scale artifact this sweep
       surfaced are in `DISASSEMBLY_PLAN.md` "Verified in increment 3 — Half
       B" and `DevTools\README.md`'s `DisasmCoverage` entry.
-- [ ] MCP `disassemble` / DAP `disassemble` request -- out of scope here,
-      increments 4 and 6 of `DISASSEMBLY_PLAN.md`.
+- [x] MCP `disassemble` -- increment 4. Forward decode at a resolved address
+      returns the right instructions starting exactly there, both bitnesses
+      (`TMcpE2ETests.Disassemble_Forward_ReturnsDecodedInstructionsAtStopAddress`
+      x64, `.Disassemble_Win32_Forward_ReturnsDecodedInstructions` x86).
+      `frameIndex`/`threadId` (no separate opaque frameId) resolves to the
+      SAME address form (`.Disassemble_ViaFrameIndex_MatchesAddressForm`).
+      `available:false` with a reason and no `instructions`/`before` at all
+      when Zydis cannot load -- proven against a real isolated copy of the
+      MCP exe with no discoverable DLL, not simulated
+      (`.Disassemble_ReportsUnavailable_WhenZydisDllNotFound`).
+- [x] `before` (backward disassembly) -- proven-boundary-only, per the
+      decision recorded in `DISASSEMBLY_PLAN.md` ("Decision: backward
+      disassembly is proven-boundary-only"). The pure mechanism
+      (`Disassembler.DisassembleBackward`): a forward decode from a known
+      boundary that lands exactly on the target returns the correct
+      preceding instructions, most-recent-last
+      (`TDisassembleBackwardTests.ProvenBoundary_LandsExactly_ReturnsExactPrecedingInstructions`);
+      a boundary whose forward decode does NOT land exactly on the target
+      (mid-instruction) refuses with an EMPTY result rather than a
+      misaligned guess
+      (`.Misalignment_DoesNotLandExactly_RefusesWithEmptyResult`, negative-
+      controlled -- see `DISASSEMBLY_PLAN.md`). End to end through the MCP
+      tool at an ordinary breakpoint stop (past its routine's prologue, so a
+      debug-info boundary exists): `before.refused=false` and the last
+      returned instruction ends exactly at the stop address
+      (`TMcpE2ETests.Disassemble_Before_ReturnsProvenPrecedingInstructions`).
+- [ ] `before`'s PE-export-table fallback (`IDebugTarget
+      .NearestExportedEntryBefore`, for a module with no debug info at all)
+      has no automated fixture: the only symbol-less modules in the test
+      fixtures (kernel32/ntdll) also have such large export tables that a
+      targeted regression is hard to construct deterministically. Exercised
+      only by construction (the same PE export-directory parse
+      `DevTools\DisasmCoverage.exe`'s `TPEImage.ExportedFunctionRvas` already
+      validates against real binaries, read from live memory instead of a
+      file here) -- not by a DUnitX test.
+- [ ] DAP `disassemble` request -- out of scope here, increment 6 of
+      `DISASSEMBLY_PLAN.md`. Must reuse `Disassembler.DisassembleBackward`
+      for its negative `instructionOffset`, not re-derive backward
+      disassembly.
 
 ## What the suite does NOT prove (2026-08-08)
 

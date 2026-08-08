@@ -18,6 +18,7 @@ type
     function McpExe: string;
     function TargetDir: string;
     function TargetExe: string;
+    function TargetExe32: string;
     function HostExe: string;
     function MarkerLine(const SourceBaseName, Marker: string): Integer;
   public
@@ -58,6 +59,12 @@ type
     [Test] procedure DataBreakpoint_LocalRefusedWithReason;
     [Test] procedure DataBreakpoint_SlotExhaustion_RefusesFifthWithEngineMessage;
     [Test] procedure DataBreakpoint_ListAndRemove_ClearsHardwareSlotForReal;
+    // DISASSEMBLY_PLAN.md increment 4: MCP `disassemble`.
+    [Test] procedure Disassemble_Forward_ReturnsDecodedInstructionsAtStopAddress;
+    [Test] procedure Disassemble_ViaFrameIndex_MatchesAddressForm;
+    [Test] procedure Disassemble_Before_ReturnsProvenPrecedingInstructions;
+    [Test] procedure Disassemble_Win32_Forward_ReturnsDecodedInstructions;
+    [Test] procedure Disassemble_ReportsUnavailable_WhenZydisDllNotFound;
   end;
 
 implementation
@@ -265,6 +272,11 @@ end;
 function TMcpE2ETests.TargetExe: string;
 begin
   Result := TargetDir + 'Win64\Debug\TestTarget.exe';
+end;
+
+function TMcpE2ETests.TargetExe32: string;
+begin
+  Result := TargetDir + 'Win32\Debug\TestTarget.exe';
 end;
 
 function TMcpE2ETests.HostExe: string;
@@ -1634,6 +1646,292 @@ begin
     C.CallTool('terminate_debuggee', nil).Free;
   finally
     C.Free;
+  end;
+end;
+
+// DISASSEMBLY_PLAN.md increment 4: MCP `disassemble`.
+
+function ParseHexAddr(const S: string): UInt64;
+var
+  T: string;
+begin
+  T := S;
+  if T.StartsWith('0x', True) then
+    T := '$' + T.Substring(2);
+  Result := StrToUInt64(T);
+end;
+
+// The stop address a real breakpoint hit is fed straight back into
+// `disassemble` -- proving the "no re-parsing of display text" claim: the
+// SAME "0x..." string already sitting in the snapshot's top frame is used
+// as the request, unmodified.
+procedure TMcpE2ETests.Disassemble_Forward_ReturnsDecodedInstructionsAtStopAddress;
+begin
+  var Line := MarkerLine(EVAL_SOURCE, EVAL_MARKER);
+  var C := TMcpTestClient.Start(McpExe);
+  try
+    C.Call('initialize', nil).Free;
+
+    var LaunchArgs := TJSONObject.Create;
+    LaunchArgs.AddPair('program', TargetExe);
+    LaunchArgs.AddPair('sourceRoot', TargetDir);
+    C.CallTool('launch_debuggee', LaunchArgs).Free;
+
+    var BpArgs := TJSONObject.Create;
+    BpArgs.AddPair('sourceFile', EVAL_SOURCE);
+    BpArgs.AddPair('line', TJSONNumber.Create(Line));
+    C.CallTool('set_breakpoint', BpArgs).Free;
+
+    var StopAddr := '';
+    var Snap := C.CallTool('continue_and_wait', nil);
+    try
+      var S := TJSONObject(Snap);
+      Assert.AreEqual('stopped', S.GetValue<string>('state', ''), 'not stopped: ' + S.ToJSON);
+      var Frames := S.GetValue('frames') as TJSONArray;
+      Assert.IsTrue((Frames <> nil) and (Frames.Count > 0), 'no frames in snapshot: ' + S.ToJSON);
+      StopAddr := (Frames.Items[0] as TJSONObject).GetValue<string>('address', '');
+      Assert.IsTrue(StopAddr <> '', 'top frame carries no "address" field: ' + S.ToJSON);
+    finally
+      Snap.Free;
+    end;
+
+    var DisArgs := TJSONObject.Create;
+    DisArgs.AddPair('address', StopAddr);
+    DisArgs.AddPair('count', TJSONNumber.Create(5));
+    var R := C.CallTool('disassemble', DisArgs);
+    try
+      Assert.IsTrue(R is TJSONObject, 'disassemble did not return an object: ' + R.ToJSON);
+      var O := TJSONObject(R);
+      Assert.IsTrue(O.GetValue<Boolean>('available', False),
+        'Zydis reported unavailable (is ThirdParty\Zydis\bin\x64\Zydis.dll present?): ' + O.ToJSON);
+      Assert.AreEqual('x64', O.GetValue<string>('machineMode', ''), 'wrong machine mode: ' + O.ToJSON);
+      Assert.AreEqual(StopAddr, O.GetValue<string>('address', ''), 'echoed address does not match the request');
+      var Insns := O.GetValue('instructions') as TJSONArray;
+      Assert.IsTrue((Insns <> nil) and (Insns.Count = 5),
+        'expected exactly 5 decoded instructions: ' + O.ToJSON);
+      var First := Insns.Items[0] as TJSONObject;
+      Assert.AreEqual(StopAddr, First.GetValue<string>('address', ''),
+        'the first instruction must start EXACTLY at the requested address');
+      Assert.IsTrue(First.GetValue<string>('bytes', '') <> '', 'first instruction has no bytes');
+      Assert.IsTrue(First.GetValue<string>('text', '') <> '', 'first instruction has no text');
+    finally
+      R.Free;
+    end;
+
+    C.CallTool('terminate_debuggee', nil).Free;
+  finally
+    C.Free;
+  end;
+end;
+
+// frameIndex/threadId is a convenience over the SAME address form -- reuses
+// the existing get_locals/get_variable/evaluate_expression frame-selection
+// convention rather than a separate opaque "frameId".
+procedure TMcpE2ETests.Disassemble_ViaFrameIndex_MatchesAddressForm;
+begin
+  var Line := MarkerLine(EVAL_SOURCE, EVAL_MARKER);
+  var C := TMcpTestClient.Start(McpExe);
+  try
+    C.Call('initialize', nil).Free;
+
+    var LaunchArgs := TJSONObject.Create;
+    LaunchArgs.AddPair('program', TargetExe);
+    LaunchArgs.AddPair('sourceRoot', TargetDir);
+    C.CallTool('launch_debuggee', LaunchArgs).Free;
+
+    var BpArgs := TJSONObject.Create;
+    BpArgs.AddPair('sourceFile', EVAL_SOURCE);
+    BpArgs.AddPair('line', TJSONNumber.Create(Line));
+    C.CallTool('set_breakpoint', BpArgs).Free;
+    C.CallTool('continue_and_wait', nil).Free;
+
+    var ByFrame := C.CallTool('disassemble', nil);   // no address -> frameIndex 0 / threadId 0
+    var ByAddr: TJSONValue := nil;
+    try
+      var OFrame := TJSONObject(ByFrame);
+      var Addr := OFrame.GetValue<string>('address', '');
+      Assert.IsTrue(Addr <> '', 'disassemble via frameIndex resolved no address: ' + OFrame.ToJSON);
+
+      var DisArgs := TJSONObject.Create;
+      DisArgs.AddPair('address', Addr);
+      ByAddr := C.CallTool('disassemble', DisArgs);
+      var OAddr := TJSONObject(ByAddr);
+
+      Assert.AreEqual(Addr, OAddr.GetValue<string>('address', ''), 'address-form echoed a different address');
+      var InsnsFrame := OFrame.GetValue('instructions') as TJSONArray;
+      var InsnsAddr := OAddr.GetValue('instructions') as TJSONArray;
+      Assert.AreEqual(InsnsFrame.Count, InsnsAddr.Count, 'instruction counts differ between the two forms');
+      Assert.AreEqual(
+        (InsnsFrame.Items[0] as TJSONObject).GetValue<string>('text', ''),
+        (InsnsAddr.Items[0] as TJSONObject).GetValue<string>('text', ''),
+        'the two forms decoded a different first instruction');
+    finally
+      ByFrame.Free;
+      ByAddr.Free;
+    end;
+
+    C.CallTool('terminate_debuggee', nil).Free;
+  finally
+    C.Free;
+  end;
+end;
+
+// The "before" success path, end to end through the MCP tool (not just the
+// DisassembleBackward unit tested directly in DisassemblerTests.pas): the
+// ordinary EVAL_BODY stop sits past its routine's prologue, so a PROVEN
+// earlier boundary exists and decoding forward from it must land exactly on
+// the stop address.
+procedure TMcpE2ETests.Disassemble_Before_ReturnsProvenPrecedingInstructions;
+begin
+  var Line := MarkerLine(EVAL_SOURCE, EVAL_MARKER);
+  var C := TMcpTestClient.Start(McpExe);
+  try
+    C.Call('initialize', nil).Free;
+
+    var LaunchArgs := TJSONObject.Create;
+    LaunchArgs.AddPair('program', TargetExe);
+    LaunchArgs.AddPair('sourceRoot', TargetDir);
+    C.CallTool('launch_debuggee', LaunchArgs).Free;
+
+    var BpArgs := TJSONObject.Create;
+    BpArgs.AddPair('sourceFile', EVAL_SOURCE);
+    BpArgs.AddPair('line', TJSONNumber.Create(Line));
+    C.CallTool('set_breakpoint', BpArgs).Free;
+    C.CallTool('continue_and_wait', nil).Free;
+
+    var DisArgs := TJSONObject.Create;
+    DisArgs.AddPair('count', TJSONNumber.Create(1));
+    DisArgs.AddPair('before', TJSONNumber.Create(2));
+    var R := C.CallTool('disassemble', DisArgs);
+    try
+      var O := TJSONObject(R);
+      Assert.IsTrue(O.GetValue<Boolean>('available', False), 'Zydis unavailable: ' + O.ToJSON);
+      var StopAddr := O.GetValue<string>('address', '');
+
+      var Before := O.GetValue('before') as TJSONObject;
+      Assert.IsNotNull(Before, '"before" missing from the result: ' + O.ToJSON);
+      Assert.AreEqual(2, Before.GetValue<Integer>('requested', -1));
+      Assert.IsFalse(Before.GetValue<Boolean>('refused', True),
+        'a stop past its routine''s prologue must have a provable "before": ' + Before.ToJSON);
+      var BInsns := Before.GetValue('instructions') as TJSONArray;
+      Assert.IsTrue((BInsns <> nil) and (BInsns.Count > 0), '"before" returned no instructions: ' + Before.ToJSON);
+      Assert.AreEqual(BInsns.Count, Before.GetValue<Integer>('returned', -1));
+
+      // The LAST "before" instruction must end EXACTLY at the stop address --
+      // the whole point of the proven-boundary-only design.
+      var LastB := BInsns.Items[BInsns.Count - 1] as TJSONObject;
+      var LastAddr := ParseHexAddr(LastB.GetValue<string>('address', '0x0'));
+      var LastLen := Length(LastB.GetValue<string>('bytes', '')) div 2;
+      Assert.AreEqual(ParseHexAddr(StopAddr), LastAddr + UInt64(LastLen),
+        'the last "before" instruction does not end exactly at the stop address');
+    finally
+      R.Free;
+    end;
+
+    C.CallTool('terminate_debuggee', nil).Free;
+  finally
+    C.Free;
+  end;
+end;
+
+// Bitness coverage: the SAME tool, SAME Zydis.dll, against a 32-bit target.
+procedure TMcpE2ETests.Disassemble_Win32_Forward_ReturnsDecodedInstructions;
+begin
+  var Line := MarkerLine(EVAL_SOURCE, EVAL_MARKER);
+  var C := TMcpTestClient.Start(McpExe);
+  try
+    C.Call('initialize', nil).Free;
+
+    var LaunchArgs := TJSONObject.Create;
+    LaunchArgs.AddPair('program', TargetExe32);
+    LaunchArgs.AddPair('sourceRoot', TargetDir);
+    C.CallTool('launch_debuggee', LaunchArgs).Free;
+
+    var BpArgs := TJSONObject.Create;
+    BpArgs.AddPair('sourceFile', EVAL_SOURCE);
+    BpArgs.AddPair('line', TJSONNumber.Create(Line));
+    C.CallTool('set_breakpoint', BpArgs).Free;
+    C.CallTool('continue_and_wait', nil).Free;
+
+    var DisArgs := TJSONObject.Create;
+    DisArgs.AddPair('count', TJSONNumber.Create(3));
+    var R := C.CallTool('disassemble', DisArgs);
+    try
+      var O := TJSONObject(R);
+      Assert.IsTrue(O.GetValue<Boolean>('available', False), 'Zydis unavailable: ' + O.ToJSON);
+      Assert.AreEqual('x86', O.GetValue<string>('machineMode', ''), 'wrong machine mode: ' + O.ToJSON);
+      var Insns := O.GetValue('instructions') as TJSONArray;
+      Assert.IsTrue((Insns <> nil) and (Insns.Count = 3), 'expected 3 instructions: ' + O.ToJSON);
+      for var I := 0 to Insns.Count - 1 do begin
+        var Ins := Insns.Items[I] as TJSONObject;
+        // A 32-bit address must fit in 8 hex digits -- proves the x64 adapter
+        // process actually decoded in legacy32 mode, not long64.
+        var AddrHex := Ins.GetValue<string>('address', '');
+        Assert.IsTrue(AddrHex.StartsWith('0x') and (AddrHex.Length - 2 <= 8),
+          'address does not look like a 32-bit VA: ' + AddrHex);
+      end;
+    finally
+      R.Free;
+    end;
+
+    C.CallTool('terminate_debuggee', nil).Free;
+  finally
+    C.Free;
+  end;
+end;
+
+// Zydis is optional (DISASSEMBLY_PLAN.md "Constraints"): this is the path
+// every user without the VC++ runtime hits, so it must report cleanly, never
+// crash and never fabricate a result. Copies the MCP exe to a scratch
+// directory outside the repo, so neither its own-directory Zydis.dll check
+// nor its repo-relative fallback can resolve -- leaving ZydisTryLoad's own
+// bare-name search (this exe's directory, then PATH) as the only path left,
+// which finds nothing on an ordinary machine with no Zydis.dll on PATH.
+procedure TMcpE2ETests.Disassemble_ReportsUnavailable_WhenZydisDllNotFound;
+begin
+  var ScratchDir := TPath.Combine(TPath.GetTempPath, 'mcp_no_zydis_test');
+  TDirectory.CreateDirectory(ScratchDir);
+  var IsolatedExe := TPath.Combine(ScratchDir, 'DelphiDebuggerMcp.exe');
+  TFile.Copy(McpExe, IsolatedExe, True);
+  try
+    var Line := MarkerLine(EVAL_SOURCE, EVAL_MARKER);
+    var C := TMcpTestClient.Start(IsolatedExe);
+    try
+      C.Call('initialize', nil).Free;
+
+      var LaunchArgs := TJSONObject.Create;
+      LaunchArgs.AddPair('program', TargetExe);
+      LaunchArgs.AddPair('sourceRoot', TargetDir);
+      C.CallTool('launch_debuggee', LaunchArgs).Free;
+
+      var BpArgs := TJSONObject.Create;
+      BpArgs.AddPair('sourceFile', EVAL_SOURCE);
+      BpArgs.AddPair('line', TJSONNumber.Create(Line));
+      C.CallTool('set_breakpoint', BpArgs).Free;
+      C.CallTool('continue_and_wait', nil).Free;
+
+      var R := C.CallTool('disassemble', nil);
+      try
+        Assert.IsTrue(R is TJSONObject, 'disassemble did not return an object: ' + R.ToJSON);
+        var O := TJSONObject(R);
+        Assert.IsFalse(O.GetValue<Boolean>('available', True),
+          'expected available:false with no Zydis.dll reachable: ' + O.ToJSON);
+        Assert.IsTrue(O.GetValue<string>('reason', '') <> '',
+          'no reason given for the UNAVAILABLE result: ' + O.ToJSON);
+        Assert.IsNull(O.FindValue('instructions'),
+          'an UNAVAILABLE result must never carry instructions -- never partial, never fabricated: ' + O.ToJSON);
+        Assert.IsNull(O.FindValue('before'),
+          'an UNAVAILABLE result must never carry a "before" section either: ' + O.ToJSON);
+      finally
+        R.Free;
+      end;
+
+      C.CallTool('terminate_debuggee', nil).Free;
+    finally
+      C.Free;
+    end;
+  finally
+    TDirectory.Delete(ScratchDir, True);
   end;
 end;
 

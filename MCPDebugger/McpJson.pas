@@ -9,7 +9,8 @@ interface
 
 uses
   System.JSON, System.Generics.Collections,
-  DebugSessionTypes, DebugTarget, DebugInfoTypes, DebugSession, ProcessEnum;
+  DebugSessionTypes, DebugTarget, DebugInfoTypes, DebugSession, ProcessEnum,
+  Disassembler;
 
 function IdJsonOf(Msg: TJSONObject): string;
 function ParseIdOrNull(const IdJson: string): TJSONValue;
@@ -35,6 +36,13 @@ function StringListToJson(const Items: TArray<string>): TJSONArray;
 function DataBreakpointToJson(const Bp: TSessionDataBreakpoint; const OwnId: string): TJSONObject;
 function DataBreakpointListToJson(const Bps: TArray<TSessionDataBreakpoint>;
   const OwnIds: TArray<string>): TJSONArray;
+
+// One disassembled instruction: address (same '0x' + hex spelling frames use,
+// so it feeds straight back into `disassemble`), raw bytes, Intel-syntax
+// text, whether Zydis decoded it (False -> Text is 'db XX', never a guessed
+// mnemonic), and symbol/source when a provider knows one.
+function DisasmInstructionToJson(const Ins: TDisasmInstruction): TJSONObject;
+function DisasmInstructionListToJson(const Insns: TArray<TDisasmInstruction>): TJSONArray;
 
 implementation
 
@@ -403,6 +411,31 @@ begin
       OwnId := Bps[I].Id;
     Result.Add(DataBreakpointToJson(Bps[I], OwnId));
   end;
+end;
+
+function DisasmInstructionToJson(const Ins: TDisasmInstruction): TJSONObject;
+begin
+  Result := TJSONObject.Create;
+  Result.AddPair('address', '0x' + IntToHex(Ins.VA, 1));
+  var BytesHex := '';
+  for var B in Ins.Bytes do
+    BytesHex := BytesHex + IntToHex(B, 2);
+  Result.AddPair('bytes', BytesHex);
+  Result.AddPair('text', Ins.Text);
+  Result.AddPair('decoded', TJSONBool.Create(Ins.Decoded));
+  if Ins.Symbol <> '' then
+    Result.AddPair('symbol', Ins.Symbol);
+  if Ins.SrcFile <> '' then begin
+    Result.AddPair('sourceFile', Ins.SrcFile);
+    Result.AddPair('sourceLine', TJSONNumber.Create(Ins.SrcLine));
+  end;
+end;
+
+function DisasmInstructionListToJson(const Insns: TArray<TDisasmInstruction>): TJSONArray;
+begin
+  Result := TJSONArray.Create;
+  for var Ins in Insns do
+    Result.Add(DisasmInstructionToJson(Ins));
 end;
 
 end.

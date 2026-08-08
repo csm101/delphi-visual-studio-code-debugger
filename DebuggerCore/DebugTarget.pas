@@ -285,6 +285,29 @@ type
     // nothing at VA was readable at all. Never raises for a partially-mapped
     // request.
     function  ReadCodeMemoryAt(VA: UInt64; Buf: Pointer; Size: NativeUInt): NativeUInt;
+    // Greatest address strictly below VA that is a PROVEN instruction
+    // boundary belonging to the same routine as VA, taken from debug info
+    // (the line table, or the routine's own entry when there is no line
+    // there). x86/x64 cannot be decoded backwards, so this -- plus decoding
+    // FORWARD from it and checking the result lands exactly on VA -- is the
+    // only exact way to find instructions preceding an address
+    // (DISASSEMBLY_PLAN.md, "before"). False when no debug-info provider
+    // owns VA's routine at all; callers needing a boundary for a
+    // symbol-less module fall back to NearestExportedEntryBefore, never to
+    // a guess here.
+    function  NearestInstructionBoundaryBefore(VA: UInt64;
+                out BoundaryVA: UInt64): Boolean;
+    // Boundary source of last resort: the nearest PE export-table entry at
+    // or before VA, scoped to whichever loaded module VA falls inside. Used
+    // only after NearestInstructionBoundaryBefore fails -- a module with NO
+    // debug info at all (a third-party package, an OS DLL) still gives a
+    // genuinely PROVEN boundary through its export directory, if it has
+    // one: an export entry IS the exact address GetProcAddress would return,
+    // not a guess. Read from the LIVE mapped image, not a file on disk.
+    // False when VA is in no module the debugger has logged, the owning
+    // module has no export directory, or every export lies at or after VA.
+    function  NearestExportedEntryBefore(VA: UInt64;
+                out BoundaryVA: UInt64): Boolean;
     function  RvaToVA(Rva: UInt64): UInt64;
     // Memory layout of the TARGET's address space. Callers decoding target
     // structures must take strides and header offsets from here rather than

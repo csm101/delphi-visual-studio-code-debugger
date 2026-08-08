@@ -178,6 +178,31 @@ did it is frequently the whole answer.
   with `expandable:true` and a `handle`; pass that handle here. Nested
   classes/records in the result carry their own handles, so object graphs are
   walked step by step. Handles are valid until the next stop.
+- `disassemble` (`address` | `frameIndex`/`threadId`, `count`, `before`) —
+  machine-code disassembly (Zydis, x86/x64, either bitness) for the case an
+  agent cannot safely do by hand: a frame inside a package with no symbols,
+  diagnosing a failed synthetic call, or naming which call a raw-stack-scan
+  hit follows. `address` is the exact `"0x..."` string a stack frame
+  (`get_call_stack`) or a raw-stack-scan hit (`get_raw_stack_scan`) **already
+  carries in its own `address` field** — no separate lookup, no re-parsing of
+  display text; feed it straight back in. `frameIndex`/`threadId` (the same
+  convention `get_locals`/`get_variable`/`evaluate_expression` use, not a
+  separate opaque frameId) resolves to that frame's instruction pointer
+  instead. Each instruction reports `address`, `bytes`, Intel-syntax `text`,
+  `decoded` (false → `text` is `"db XX"`, never a guessed mnemonic — the
+  exact-or-nothing contract `X86Decode.pas` already has), and `symbol`/
+  `sourceFile`/`sourceLine` when a provider knows one. `available:false` with
+  a `reason` and no `instructions`/`before` at all means Zydis could not load
+  (missing DLL, wrong version, no VC++ runtime) — the ORDINARY case on a
+  machine without it, never an error and never a partial result. Optional
+  `before` asks for instructions PRECEDING the address; x86/x64 cannot be
+  decoded backwards, so it is answered ONLY from a PROVEN earlier instruction
+  boundary (debug info, or a module's PE export table when it has none) that
+  decodes forward to land EXACTLY on the address — otherwise it comes back
+  `refused:true` with a reason, while the forward `instructions` are
+  untouched (a refused `before` is not a failed call). Requires the session
+  to be stopped. Full design and the "no heuristics" reasoning behind
+  `before` are in `DISASSEMBLY_PLAN.md`.
 
 No raw DAP identifiers cross the boundary: frames carry a semantic `index`,
 breakpoints a `file|line` id, variables a formatted value.
