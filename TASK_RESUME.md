@@ -5,9 +5,7 @@ The cursor inside the task in flight, and nothing else.
 **This file is OVERWRITTEN, not appended to, and stays under ~150 lines.** It grew
 to 3343 lines (~91k tokens) by being used as a lab journal, until reading it cost
 more than reading the code it described — and by then its "next action" pointed at
-work finished weeks earlier, which is worse than having no cursor at all. It was
-cut back on 2026-08-08; the content it held was triaged into the documents below,
-and the rest is in the commit history.
+work finished weeks earlier, which is worse than having no cursor at all.
 
 Where everything else goes:
 
@@ -27,49 +25,56 @@ longer true, delete it.
 
 ## Current task (2026-08-08)
 
-**Data breakpoints (watchpoints), increments 1 and 2 — DONE.** Plan and every
-measurement: `DATA_BREAKPOINTS_PLAN.md`. Increment 2 landed the debug registers
-as a fourth role behind the thread-context funnel, `ArmHardwareWatchpoint` /
-`DisarmHardwareWatchpoint` on `IDebugTarget`, and the `DR6` disambiguation in the
-single-step branch of `HandleException`. Six tests (`*DataBp_*` in
-`DebugSessionTests.pas`, three scenarios × both bitnesses) over the new
-`RunDataBpStepFixture` fixture; both negative controls run and recorded in the
-plan doc. No session API, no MCP, no DAP — those are increments 3-6.
-
-The one that cost the session, now in `TRAPS.md`: `DR6` must be sampled BEFORE
-anything else touches the thread context. On WOW64 the slot bits were already
-gone once the pump had cleared the trap flag through `Wow64SetThreadContext`;
-native x64 survived it, so the feature recorded no hits on one bitness only.
+**Data breakpoints (watchpoints), increment 3 of 6 — DONE and gated.** Plan,
+what was built, and the negative controls run are all in
+`DATA_BREAKPOINTS_PLAN.md` (increment 3 section) and `PROJECT_STATE.md`'s
+roadmap entry. Full suite green before and after: 1052 found / 1048 passed /
+0 failed / 0 errored / 4 ignored.
 
 ### Next action
 
-Increment 3: per-thread replication — arm-on-create (`HandleCreateThread`),
-arm-on-attach, clear-on-detach, plus the four-slot allocator with explicit
-exhaustion. `FWatchArmedSlots` / `FWatchAddr` in `TWinDebugger` are process-wide
-bookkeeping today and are only correct because a watchpoint currently lives on a
-single thread; increment 3 owns replacing them.
+Start **increment 4: session API + stop reason + old/new capture.**
+`SetDataWatchpoint`/`ClearDataWatchpoint` currently exist only on
+`IDebugTarget` and are called directly by tests/probes — there is no
+session-level entry point and no stop reason yet, so a watchpoint hit today is
+just logged and resumed (`TakeDebugTrapCause` in `WinDebuggerBase.pas`).
 
-### Chosen sequencing
+Per `DATA_BREAKPOINTS_PLAN.md` §"Where it plugs into the existing
+architecture":
+- **Command queue** (`DebugTarget.pas:185`, `TCommandKind`): new
+  `ckSetDataBreakpoints` kind with its own spec record, so arming runs on the
+  debug thread like `ckSetBreakpoints`.
+- **Session** (`DebugSession.pas:220`): `SetDataBreakpoints` /
+  `ListDataBreakpoints` / removal, mirroring the source-breakpoint API.
+- **Stop reporting**: a new `TStopReason` value — a watchpoint stop is not a
+  breakpoint stop and must not be reported as one.
+- **Old/new capture**: a write watchpoint traps AFTER the store completes, so
+  "new" reads at the stop; "old" must be captured when the watchpoint is armed
+  and refreshed at every hit.
+- Second interaction to decide deliberately (not default-swallow): a
+  watchpoint firing during a synthetic call — abort the call or suppress the
+  hit? The `RunMethodCall` abort-on-raise machinery
+  (`FLastSyntheticCallError`) is the model to follow or deviate from,
+  consciously.
 
-Data breakpoints first, to completion; disassembly (`DISASSEMBLY_PLAN.md`)
-afterwards. Not interleaved: both end at the same gate (the suite, ~400 s, never
-run twice at once), so two open features make any red ambiguous.
+No code has been written for increment 4 yet — this is a cold start.
 
 ## Standing constraint from the user
 
 **No heuristics.** A fix must be deterministic. A solution that patches the
 observed case and misleads elsewhere is worse than leaving the defect open and
-documented. This has already forced two rewrites (dynamic-array detection by
-memory probing, nested-type detection by name shape) and it applies to everything
-written here.
+documented.
 
 ## State of the tree
 
 - `public-main`, clean. Release **0.3.0 is committed but NOT tagged and NOT
   pushed**; no GitHub release exists. The push is the outward-facing step and
   waits on the maintainer.
-- Last full suite: **1046 found / 1042 passed / 0 failed / 0 errored / 4 ignored.**
-  Extension suite: 152 passed / 0 failed.
+- Last full suite: **1052 found / 1048 passed / 0 failed / 0 errored / 4
+  ignored.** Extension suite: 152 passed / 0 failed. One unrelated flake seen
+  during the increment-3 session (`Test_RtlStringGetter_VarOutFromPropertyType`
+  in the BPL scenario, failed once in a full run, passed 3/3 in isolation) —
+  logged, not chased.
 - Win32 support is functionally complete for `-$O-` targets. Debug-info format
   coverage (TD32, RSM, MAP, JCL, DCP, `.tds`) is closed; DCU is WON'T DO.
 

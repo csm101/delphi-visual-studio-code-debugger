@@ -102,7 +102,7 @@ VS Code  ── DAP (JSON over stdio) ──>  VisualStudioCodeDelphiDebugger.ex
 - `DebuggerTests\`: DUnitX integration test suite. Launches the adapter,
   exercises BPs / locals / step / globals / evaluate.
   Run with `cmd /c "C:\Athens\GitHub\Win64Debugger\DebuggerTests\build_and_run.bat"`.
-  Current status: **958 found / 956 pass / 0 fail / 0 leaked / 2 ignored.**
+  Current status: **1052 found / 1048 pass / 0 fail / 0 leaked / 4 ignored.**
   Attach/detach tests self-skip when SeDebugPrivilege
   isn't held; run elevated to exercise them. The count includes the TD32
   + RSM reader unit tests (`TD32ReaderTests`, `RsmReaderTests`), the
@@ -514,22 +514,28 @@ Debugger features:
 - PE import-table reader so MAP can be dropped entirely.
 - Child process tracking.
 - **Data breakpoints / watchpoints ("stop when this address is written") — IN
-  PROGRESS, increments 1-2 of 6 done (2026-08-08).** Full plan, measurements and
+  PROGRESS, increments 1-3 of 6 done (2026-08-08).** Full plan, measurements and
   increment list in `DATA_BREAKPOINTS_PLAN.md`.
   * **Built:** debug registers as a fourth role behind the thread-context funnel
     (`ReadDebugRegisters` / `WriteDebugRegisters`, with the `Wow64` variant in
-    `WinDebuggerX86`); `ArmHardwareWatchpoint` / `DisarmHardwareWatchpoint` on
-    `IDebugTarget`, refusing a bad slot, size or alignment rather than rounding;
-    and the `DR6` disambiguation in the event pump, because a hit arrives as a
-    SINGLE-STEP exception — the same event the stepping engine consumes. `DR6` is
-    sampled BEFORE anything else touches the thread context (on WOW64 the slot
-    bits do not survive an intervening context write) and cleared afterwards.
-    Tested on both bitnesses, three scenarios each, with both negative controls
-    run.
-  * **Not built:** the four-slot allocator with explicit exhaustion, replication
-    onto every thread (including ones created later) and clear-on-detach, the
-    stop reason with old→new capture, and the MCP / DAP surfaces. x86 has no
-    read-only watchpoint, so DAP `read` maps to read-or-write and must say so.
+    `WinDebuggerX86`); the `DR6` disambiguation in the event pump, because a hit
+    arrives as a SINGLE-STEP exception — the same event the stepping engine
+    consumes — sampled BEFORE anything else touches the thread context and
+    cleared afterwards; and the real allocator, `IDebugTarget.SetDataWatchpoint`
+    / `ClearDataWatchpoint`, which arms a slot on EVERY thread (present and
+    every thread created afterwards, via `HandleCreateThread`), rolls back on
+    partial failure, refuses exhaustion by name rather than stealing a slot, and
+    is cleared on clean detach before `DebugActiveProcessStop`. Attach needs no
+    separate arming path: Windows synthesizes a `CREATE_THREAD_DEBUG_EVENT` for
+    every thread already running in the target, which arrives through the same
+    handler. Tested on both bitnesses (worker-thread attribution, thread created
+    after arm) and x64-only where the scenario needs four distinct globals or
+    the attach path (slot exhaustion, clean detach), with negative controls run
+    and reverted for the replication loop, the exhaustion refusal and the
+    detach-clears-watchpoints step.
+  * **Not built:** the session API, the stop reason with old→new capture, and
+    the MCP / DAP surfaces. x86 has no read-only watchpoint, so DAP `read` maps
+    to read-or-write and must say so.
   Ranked above disassembly in diagnostic value: "who writes this variable" has no
   other answer.
 - **Disassembly + address breakpoints — DESIGNED, not built (2026-08-08).** Full

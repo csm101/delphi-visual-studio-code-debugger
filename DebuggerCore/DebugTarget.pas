@@ -330,6 +330,21 @@ type
     function  HardwareWatchpointHitCount: Integer;
     function  LastHardwareWatchpointHit: TWatchpointHit;
 
+    // Process-wide allocator (increment 3 of DATA_BREAKPOINTS_PLAN.md): picks a
+    // free slot and arms it on EVERY thread the debugger knows about -- live now,
+    // created later, or already running at attach -- and keeps it that way until
+    // ClearDataWatchpoint or detach. The raw per-thread pair above only ever
+    // touches one thread, which is correct for a probe or a single-thread test
+    // and wrong for a real watchpoint: a slot armed on the thread that reads a
+    // variable and not on the one that writes it reports success while
+    // answering nothing. Exhaustion of the four hardware slots is refused
+    // explicitly, naming what already holds them -- never silently drops the
+    // fifth request.
+    function  SetDataWatchpoint(Address: UInt64; SizeBytes: Integer; WriteOnly: Boolean;
+                const OwnerDescription: string; out Slot: Integer;
+                out RefusalReason: string): Boolean;
+    function  ClearDataWatchpoint(Slot: Integer): Boolean;
+
     // Mutators (used by `setVariable` and the synthetic remote-call path).
     function  SetRegisterByName(const Name: string; Value: UInt64): Boolean;
     function  SetInstructionPointer(VA: UInt64): Boolean;

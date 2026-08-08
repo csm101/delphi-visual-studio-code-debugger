@@ -1,10 +1,15 @@
 # Data breakpoints (watchpoints) — plan
 
-Status: **designed, not built** (2026-08-08). Nothing exists today: no `DR0`/`DR7`
-handling in the engine, no `supportsDataBreakpoints` / `dataBreakpointInfo` /
-`setDataBreakpoints` in the DAP layer, no MCP tool, and no prior mention in any
-document or commit message. Every breakpoint the debugger plants is a software
-`INT3` on code.
+Status: **in progress** (2026-08-08), increments 1-3 of 6 done and gated on a
+green suite. The engine can arm/disarm hardware watchpoints, tell a watchpoint
+hit apart from a completed step, replicate a watchpoint onto every thread
+(present and future), and allocate/free the four slots with explicit
+exhaustion — all at the `IDebugTarget` level only. Still missing: the session
+API, stop reason with old/new capture, the MCP tool surface, and
+`supportsDataBreakpoints` / `dataBreakpointInfo` / `setDataBreakpoints` in the
+DAP layer (increments 4-6). Every breakpoint the debugger plants today is still
+either a software `INT3` on code or a raw watchpoint driven directly by tests
+and probes — nothing is user-facing yet.
 
 "Stop when THIS address is written" is one of the few questions only a debugger
 can answer. Ranked against the other two address-oriented features
@@ -209,8 +214,55 @@ menu appears once the capabilities are declared):
    a bad slot, size or alignment rather than rounding it. `ReadDebugRegisters` /
    `WriteDebugRegisters` are the fourth role behind the thread-context funnel,
    with the `Wow64Get/SetThreadContext` variant in `WinDebuggerX86`.
-3. Per-thread replication: arm-on-create, arm-on-attach, clear-on-detach, plus the
-   slot allocator with explicit exhaustion.
+3. **DONE.** Per-thread replication and the slot allocator. `IDebugTarget` gained
+   `SetDataWatchpoint(Address, SizeBytes, WriteOnly, OwnerDescription; out Slot,
+   RefusalReason): Boolean` and `ClearDataWatchpoint(Slot): Boolean` — the real
+   allocator, built on top of increment 2's raw per-thread
+   `ArmHardwareWatchpoint`/`DisarmHardwareWatchpoint` (now thin wrappers around
+   private `ArmWatchRegistersOnThread`/`DisarmWatchRegistersOnThread`, pure
+   register I/O with no bookkeeping). `SetDataWatchpoint` finds the first free
+   slot (0..3), arms it on every thread in `FThreads`, rolls back threads already
+   armed on partial failure, and only records bookkeeping once every thread
+   succeeded. `FWatchSlots: array[0..3] of TWatchSlotState`
+   (InUse/Address/SizeBytes/WriteOnly/Description) replaces the old
+   `FWatchArmedSlots`/`FWatchAddr` pair, which was process-wide state that was
+   only correct by accident of every increment-2 test using one thread;
+   `FWatchArmedSlots` (byte bitmask) survives as a cached derivative for the
+   zero-cost fast path in `TakeDebugTrapCause`. `HandleCreateThread` re-arms
+   every in-use slot on a newly-seen thread, best-effort with a loud `DapLog` on
+   failure. `Terminate`'s clean-detach branch (`FKillOnDetach=False`) clears
+   every in-use slot on every thread before `DebugActiveProcessStop`; the kill
+   branch does not need it because the target is terminated anyway.
+
+   **No separate attach code path was needed.** `DebugActiveProcess` makes
+   Windows synthesize a `CREATE_THREAD_DEBUG_EVENT` for every thread already
+   running in the target, alongside the synthesized `CREATE_PROCESS_DEBUG_EVENT`
+   — both arrive through the normal event pump, so `HandleCreateThread` covers
+   attach for free. This was verified against the synthesized-event behaviour
+   already documented in `Attach()`'s own comment, not assumed.
+
+   Negative controls run and reverted (`TRAPS.md` "Proving a fix"):
+   * `Break` after arming only the first thread in the replication loop →
+     `DataBp_WorkerThreadWrite_NamesTheWorkerThread` and its Win32 mirror both
+     failed ("Expected [1] but got [0]", no hit recorded on the worker thread).
+   * Exhaustion refusal changed to silently steal slot 0 instead of refusing →
+     `DataBp_SlotExhaustion_RefusesTheFifth` failed ("the fifth watchpoint was
+     armed").
+   * Clean-detach branch changed to skip clearing watchpoints →
+     `DataBp_CleanDetach_LeavesTargetUnarmed` failed with `WAIT_TIMEOUT` (258),
+     and the detached target process was confirmed genuinely hung (force-killed
+     to clean up).
+
+   Tests: `DataBp_WorkerThreadWrite_NamesTheWorkerThread`,
+   `DataBp_ThreadCreatedAfterArm_StillTrips` (both mirrored into
+   `TWin32RunControlTests`), `DataBp_SlotExhaustion_RefusesTheFifth` and
+   `DataBp_CleanDetach_LeavesTargetUnarmed` (x64 only — exhaustion needs four
+   distinct globals to be interesting, and clean-detach needs the attach path)
+   in `DebuggerTests\DebugSessionTests.pas`, over a new TestTarget fixture
+   `RunDataBpThreadFixture` (`-run-databp-thread`) with two worker threads
+   writing separate globals (`DataBpThreadWorkerA`, created before the READY
+   stop; `DataBpThreadWorkerB`, created after resume) so each test arms only
+   the global it cares about.
 4. Session API + stop reason + old/new capture.
 5. MCP tools.
 6. DAP capabilities and requests.
@@ -220,8 +272,11 @@ menu appears once the capabilities are declared):
 - A worker thread writes a global the main thread never touches: the stop must
   name the WORKER thread. This is the test that proves per-thread replication and
   the one a single-threaded fixture would pass while the feature is broken.
-- A thread created AFTER the watchpoint is set trips it.
-- Slot exhaustion refuses the fifth with a message, and the first four still work.
+  DONE, both bitnesses.
+- A thread created AFTER the watchpoint is set trips it. DONE, both bitnesses.
+- Slot exhaustion refuses the fifth with a message, and the first four still
+  work — proved by freeing one slot and confirming its number is reused. DONE
+  (x64 only).
 - Misaligned or odd-sized request is refused, not rounded.
 - Stepping still works with a watchpoint armed (the `DR6` case), and a watchpoint
   hit during a step is not reported as a step completion. DONE — and the negative
@@ -237,7 +292,11 @@ menu appears once the capabilities are declared):
     whose own instruction tripped the watchpoint never completed".
 - A watchpoint hit on an instruction that is ALSO a single step (`BS` + slot bit)
   must still complete the step. DONE, both bitnesses.
-- Detach leaves the target unarmed — verified by continuing it afterwards.
+- Detach leaves the target unarmed — verified by continuing it afterwards. DONE
+  (x64, attach-based, since only attach-mode detach takes the clean-detach path
+  — a bounded `WaitForSingleObject` on the target process is the failure
+  signature for a stray armed `DR7`, which would otherwise trap into no
+  debugger and hang the process behind a modal RTL exception dialog).
 - A local-scoped watchpoint is reported stale after its frame exits.
 
 ## Deferred, with the reason

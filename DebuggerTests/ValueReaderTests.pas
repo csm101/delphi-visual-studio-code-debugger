@@ -152,6 +152,10 @@ type
     function  DisarmHardwareWatchpoint(TID: DWORD; Slot: Integer): Boolean;
     function  HardwareWatchpointHitCount: Integer;
     function  LastHardwareWatchpointHit: TWatchpointHit;
+    function  SetDataWatchpoint(Address: UInt64; SizeBytes: Integer; WriteOnly: Boolean;
+                const OwnerDescription: string; out Slot: Integer;
+                out RefusalReason: string): Boolean;
+    function  ClearDataWatchpoint(Slot: Integer): Boolean;
     function  AllocateRemoteString(const Text, TypeHint: string; out NewPtr: UInt64): Boolean;
     function  SetStringVariable(TargetAddr: UInt64; const Text, TypeHint: string): Boolean;
     function  TryResolveSymbolVA(const Name: string; out VA: UInt64): Boolean;
@@ -246,6 +250,14 @@ function  TFakeMemTarget.SetInstructionPointer(VA: UInt64): Boolean; begin Resul
 // FAIL rather than silently claim a watchpoint nothing can deliver.
 function  TFakeMemTarget.ArmHardwareWatchpoint(TID: DWORD; Slot: Integer; Address: UInt64; SizeBytes: Integer; WriteOnly: Boolean): Boolean; begin Result := False; end;
 function  TFakeMemTarget.DisarmHardwareWatchpoint(TID: DWORD; Slot: Integer): Boolean; begin Result := False; end;
+function  TFakeMemTarget.SetDataWatchpoint(Address: UInt64; SizeBytes: Integer; WriteOnly: Boolean;
+  const OwnerDescription: string; out Slot: Integer; out RefusalReason: string): Boolean;
+begin
+  Slot := -1;
+  RefusalReason := 'not supported by TFakeMemTarget';
+  Result := False;
+end;
+function  TFakeMemTarget.ClearDataWatchpoint(Slot: Integer): Boolean; begin Result := False; end;
 function  TFakeMemTarget.HardwareWatchpointHitCount: Integer; begin Result := 0; end;
 function  TFakeMemTarget.LastHardwareWatchpointHit: TWatchpointHit; begin Result := Default(TWatchpointHit); Result.Slot := -1; end;
 function  TFakeMemTarget.AllocateRemoteString(const Text, TypeHint: string; out NewPtr: UInt64): Boolean; begin NewPtr := 0; Result := False; end;

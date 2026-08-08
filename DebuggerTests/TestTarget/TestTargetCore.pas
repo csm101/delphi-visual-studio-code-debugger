@@ -456,6 +456,16 @@ var
   // requires, and the reason not to make it a Boolean or an Int64.
   GDataBpWatched: Integer;
   GDataBpOther:   Integer;
+  // Per-thread watchpoint replication fixture (see RunDataBpThreadFixture).
+  // GDataBpThreadWatched is written by a worker thread ALIVE before the
+  // watchpoint is armed (proves replication onto every live thread);
+  // GDataBpThreadLate is written by a worker thread created AFTER the arm
+  // (proves HandleCreateThread re-arms it). The main thread never touches
+  // either -- a stop naming the main thread would mean the feature is broken,
+  // not working.
+  GDataBpThreadGo:      Boolean;
+  GDataBpThreadWatched: Integer;
+  GDataBpThreadLate:    Integer;
 
 procedure ComputeNested(var X: Integer);
 procedure RunAllScenarios;
@@ -1879,6 +1889,53 @@ begin
   GSink.Use(['databp done ', GDataBpWatched, GDataBpOther]);  // {BP:DATABP_DONE}
 end;
 
+// --- Per-thread watchpoint replication fixture -----------------------------
+// WorkerA is created and spinning BEFORE the debugger arms a watchpoint at
+// DATABPTHREAD_READY -- proving arm-time replication onto every live thread.
+// WorkerB is created AFTER the debugger has resumed past that stop -- proving
+// HandleCreateThread re-arms an in-use slot on a thread it did not know about
+// yet. Each writes a DIFFERENT global so a test that arms only one of them
+// sees exactly one hit, from exactly the thread that must have caused it.
+
+function DataBpThreadWorkerA(Param: Pointer): DWORD; stdcall;
+begin
+  NameCurrentThread('DataBpWorkerA');
+  while not GDataBpThreadGo do
+    Sleep(1);
+  Inc(GDataBpThreadWatched);                              // {BP:DATABPTHREAD_WORKERA_WRITE}
+  Result := 0;
+end;
+
+function DataBpThreadWorkerB(Param: Pointer): DWORD; stdcall;
+begin
+  NameCurrentThread('DataBpWorkerB');
+  Inc(GDataBpThreadLate);                                 // {BP:DATABPTHREAD_WORKERB_WRITE}
+  Result := 0;
+end;
+
+procedure RunDataBpThreadFixture;
+var
+  HA, HB: THandle;
+  IdA, IdB: DWORD;
+begin
+  NameCurrentThread('DataBpThreadMain');
+  GDataBpThreadGo      := False;
+  GDataBpThreadWatched := 0;
+  GDataBpThreadLate    := 0;
+  HA := CreateThread(nil, 0, @DataBpThreadWorkerA, nil, 0, IdA);
+  Sleep(100);   // let WorkerA reach its poll loop before the debugger stops us
+  GSink.Use(['databp thread ready ', GDataBpThreadWatched]);   // {BP:DATABPTHREAD_READY}
+  // Debugger arms a watchpoint here (on GDataBpThreadWatched and/or
+  // GDataBpThreadLate) and resumes.
+  HB := CreateThread(nil, 0, @DataBpThreadWorkerB, nil, 0, IdB);  // created AFTER the arm
+  GDataBpThreadGo := True;  // release WorkerA to write
+  WaitForSingleObject(HA, 5000);
+  WaitForSingleObject(HB, 5000);
+  CloseHandle(HA);
+  CloseHandle(HB);
+  GSink.Use(['databp thread done ', GDataBpThreadWatched, GDataBpThreadLate]);  // {BP:DATABPTHREAD_DONE}
+end;
+
 procedure RunBpTests;
 var
   I, Acc: Integer;
@@ -1974,6 +2031,9 @@ begin
 
   if FindCmdLineSwitch('run-databp-step') or FindCmdLineSwitch('-run-databp-step') then
     RunDataBpStepFixture;
+
+  if FindCmdLineSwitch('run-databp-thread') or FindCmdLineSwitch('-run-databp-thread') then
+    RunDataBpThreadFixture;
 
   if FindCmdLineSwitch('run-av') or FindCmdLineSwitch('-run-av') then
     RunAccessViolation;

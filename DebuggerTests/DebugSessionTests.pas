@@ -366,6 +366,10 @@ type
     [Test] procedure Win32_DataBp_StepCompletesWithWatchpointArmed;
     [Test] procedure Win32_DataBp_HitDuringStep_IsNotReportedAsStepCompletion;
     [Test] procedure Win32_DataBp_HitOnTheSteppedInstruction_StillCompletesTheStep;
+    // Increment 3, WOW64: per-thread replication reached through
+    // Wow64Get/SetThreadContext must hold exactly as it does natively.
+    [Test] procedure Win32_DataBp_WorkerThreadWrite_NamesTheWorkerThread;
+    [Test] procedure Win32_DataBp_ThreadCreatedAfterArm_StillTrips;
     // An application split across runtime packages is this project's core use
     // case and the shape where debugger bugs have historically surfaced, so it
     // has to hold on both bitnesses rather than only x64. The breakpoint is
@@ -426,6 +430,13 @@ type
     [Test] procedure DataBp_StepCompletesWithWatchpointArmed;
     [Test] procedure DataBp_HitDuringStep_IsNotReportedAsStepCompletion;
     [Test] procedure DataBp_HitOnTheSteppedInstruction_StillCompletesTheStep;
+    // Increment 3 (DATA_BREAKPOINTS_PLAN.md): the per-thread allocator. A
+    // single-threaded fixture would pass every one of these while the feature
+    // stayed process-wide-on-one-thread by accident.
+    [Test] procedure DataBp_WorkerThreadWrite_NamesTheWorkerThread;
+    [Test] procedure DataBp_ThreadCreatedAfterArm_StillTrips;
+    [Test] procedure DataBp_SlotExhaustion_RefusesTheFifth;
+    [Test] procedure DataBp_CleanDetach_LeavesTargetUnarmed;
     // F19: a step-into used to report at the callee's ENTRY address, before the
     // prologue had spilled the register arguments into their home slots, so Self
     // and every by-register parameter read as the CALLER's leftover frame bytes
@@ -626,8 +637,9 @@ end;
 // under test is that the stepping engine never sees it.
 
 const
-  DATABP_SOURCE = 'TestTargetCore.pas';
-  DATABP_ARGS   = '-run-databp-step';
+  DATABP_SOURCE       = 'TestTargetCore.pas';
+  DATABP_ARGS         = '-run-databp-step';
+  DATABPTHREAD_ARGS   = '-run-databp-thread';
 
 // Address of a unit global in the debuggee, through the same resolution the
 // evaluator uses. Asserted here so a moved fixture fails talking about the
@@ -649,6 +661,17 @@ begin
       Session.GetStoppedThreadId, 0, Addr, 4, True),
     Format('arming a 4-byte write watchpoint on GDataBpWatched at $%x was refused',
       [Addr]));
+end;
+
+// Increment 3's own surface: the allocator, not the raw per-thread primitive.
+// Replicates onto every live thread and every thread created afterward.
+procedure SetDataWatchOnGlobal(Session: TDebugSession; const GlobalName: string;
+  out Addr: UInt64; out Slot: Integer);
+begin
+  Addr := WatchedGlobalAddress(Session, GlobalName);
+  var Reason: string;
+  Assert.IsTrue(Session.Debugger.SetDataWatchpoint(Addr, 4, True, GlobalName, Slot, Reason),
+    Format('SetDataWatchpoint on %s at $%x was refused: %s', [GlobalName, Addr, Reason]));
 end;
 
 function StopLineOf(Session: TDebugSession; const Context: string): Integer;
@@ -806,6 +829,210 @@ begin
     Session.Terminate;
     Session.Free;
   end;
+end;
+
+{ ---------------------------------- increment 3: per-thread replication --- }
+// A hit from a thread that is NOT the main/stopped thread proves the
+// watchpoint was really armed on the worker -- the one thing a single-thread
+// fixture could never distinguish from "armed process-wide" by accident.
+
+procedure RunWorkerThreadWriteNamesTheWorkerThread(const ExePath, MapPath,
+  RsmPath, SourceDir: string);
+begin
+  var ReadyLine := MarkerLineIn(SourceDir + DATABP_SOURCE, 'DATABPTHREAD_READY');
+  var DoneLine  := MarkerLineIn(SourceDir + DATABP_SOURCE, 'DATABPTHREAD_DONE');
+  Assert.IsTrue((ReadyLine > 0) and (DoneLine > 0),
+    'DATABPTHREAD_READY / DATABPTHREAD_DONE markers not found');
+
+  var Session := OpenSessionAtMarker(ExePath, MapPath, RsmPath, SourceDir,
+    DATABP_SOURCE, ReadyLine, DATABPTHREAD_ARGS);
+  try
+    Assert.AreEqual(Ord(dsStopped), Ord(Session.State),
+      'did not stop at DATABPTHREAD_READY');
+    var MainTid := Session.GetStoppedThreadId;
+
+    // Only GDataBpThreadWatched is armed: WorkerA (already alive) writes it;
+    // WorkerB (created after the arm) writes a DIFFERENT, unwatched global.
+    var Addr: UInt64; var Slot: Integer;
+    SetDataWatchOnGlobal(Session, 'GDataBpThreadWatched', Addr, Slot);
+
+    var DoneSpec: TBpLineSpec;
+    DoneSpec      := Default(TBpLineSpec);
+    DoneSpec.Line := DoneLine;
+    Session.SetBreakpoints(DATABP_SOURCE, [DoneSpec]);
+
+    Session.ContinueExecution;
+    PumpUntilStop(Session, 30000);
+    Assert.AreEqual(Ord(dsStopped), Ord(Session.State),
+      'never reached DATABPTHREAD_DONE');
+
+    Assert.AreEqual(1, Session.Debugger.HardwareWatchpointHitCount,
+      'expected exactly one hit (WorkerA''s write); GDataBpThreadLate was never armed');
+    var Hit := Session.Debugger.LastHardwareWatchpointHit;
+    Assert.AreEqual(Addr, Hit.Address, 'hit reported the wrong address');
+    Assert.AreNotEqual(MainTid, Hit.ThreadId,
+      'the watchpoint hit was attributed to the MAIN thread -- WorkerA''s write ' +
+      'was not caught, which is what "armed on the wrong thread" looks like');
+  finally
+    Session.Terminate;
+    Session.Free;
+  end;
+end;
+
+procedure RunThreadCreatedAfterArmStillTrips(const ExePath, MapPath, RsmPath,
+  SourceDir: string);
+begin
+  var ReadyLine := MarkerLineIn(SourceDir + DATABP_SOURCE, 'DATABPTHREAD_READY');
+  var DoneLine  := MarkerLineIn(SourceDir + DATABP_SOURCE, 'DATABPTHREAD_DONE');
+  Assert.IsTrue((ReadyLine > 0) and (DoneLine > 0),
+    'DATABPTHREAD_READY / DATABPTHREAD_DONE markers not found');
+
+  var Session := OpenSessionAtMarker(ExePath, MapPath, RsmPath, SourceDir,
+    DATABP_SOURCE, ReadyLine, DATABPTHREAD_ARGS);
+  try
+    Assert.AreEqual(Ord(dsStopped), Ord(Session.State),
+      'did not stop at DATABPTHREAD_READY');
+    var MainTid := Session.GetStoppedThreadId;
+
+    // Only GDataBpThreadLate is armed, and WorkerB (which writes it) does not
+    // exist yet at this stop -- it is created only after we resume.
+    var Addr: UInt64; var Slot: Integer;
+    SetDataWatchOnGlobal(Session, 'GDataBpThreadLate', Addr, Slot);
+
+    var DoneSpec: TBpLineSpec;
+    DoneSpec      := Default(TBpLineSpec);
+    DoneSpec.Line := DoneLine;
+    Session.SetBreakpoints(DATABP_SOURCE, [DoneSpec]);
+
+    Session.ContinueExecution;
+    PumpUntilStop(Session, 30000);
+    Assert.AreEqual(Ord(dsStopped), Ord(Session.State),
+      'never reached DATABPTHREAD_DONE');
+
+    Assert.AreEqual(1, Session.Debugger.HardwareWatchpointHitCount,
+      'expected exactly one hit (WorkerB''s write, from a thread created after the arm)');
+    var Hit := Session.Debugger.LastHardwareWatchpointHit;
+    Assert.AreEqual(Addr, Hit.Address, 'hit reported the wrong address');
+    Assert.AreNotEqual(MainTid, Hit.ThreadId,
+      'the watchpoint hit was attributed to the MAIN thread');
+  finally
+    Session.Terminate;
+    Session.Free;
+  end;
+end;
+
+procedure TDebugSessionTests.DataBp_WorkerThreadWrite_NamesTheWorkerThread;
+begin
+  RunWorkerThreadWriteNamesTheWorkerThread(TargetExe, TargetMap, TargetRsm, TargetDir);
+end;
+
+procedure TDebugSessionTests.DataBp_ThreadCreatedAfterArm_StillTrips;
+begin
+  RunThreadCreatedAfterArmStillTrips(TargetExe, TargetMap, TargetRsm, TargetDir);
+end;
+
+// Five distinct 4-byte globals, all resolvable at DATABP_READY: only four
+// hardware slots exist, so arming the fifth must be refused explicitly --
+// never silently steal or round onto an existing slot -- and the message
+// must name what already holds all four.
+procedure TDebugSessionTests.DataBp_SlotExhaustion_RefusesTheFifth;
+const
+  Globals: array[0..4] of string = (
+    'GDataBpWatched', 'GDataBpOther', 'GCounter', 'GDataBpThreadWatched', 'GDataBpThreadLate');
+begin
+  var ReadyLine := MarkerLineIn(TargetDir + DATABP_SOURCE, 'DATABP_READY');
+  Assert.IsTrue(ReadyLine > 0, 'DATABP_READY marker not found');
+
+  var Session := OpenSessionAtMarker(TargetExe, TargetMap, TargetRsm, TargetDir,
+    DATABP_SOURCE, ReadyLine, DATABP_ARGS);
+  try
+    Assert.AreEqual(Ord(dsStopped), Ord(Session.State), 'did not stop at DATABP_READY');
+
+    var Slots: array[0..3] of Integer;
+    for var I := 0 to 3 do begin
+      var Addr: UInt64;
+      SetDataWatchOnGlobal(Session, Globals[I], Addr, Slots[I]);
+    end;
+
+    var FifthAddr := WatchedGlobalAddress(Session, Globals[4]);
+    var FifthSlot: Integer;
+    var Reason: string;
+    Assert.IsFalse(
+      Session.Debugger.SetDataWatchpoint(FifthAddr, 4, True, Globals[4], FifthSlot, Reason),
+      'the fifth watchpoint was armed -- only four hardware slots exist');
+    Assert.AreNotEqual('', Reason, 'exhaustion was refused with no reason');
+    Assert.AreEqual(-1, FifthSlot, 'a refused request must not report a slot');
+
+    // The first four must still be genuinely armed: freeing one and re-arming
+    // the fifth in its place must succeed, which is only possible if the
+    // allocator's bookkeeping for the first four is still accurate.
+    Assert.IsTrue(Session.Debugger.ClearDataWatchpoint(Slots[0]),
+      'clearing one of the first four slots failed');
+    var RetryAddr: UInt64; var RetrySlot: Integer;
+    SetDataWatchOnGlobal(Session, Globals[4], RetryAddr, RetrySlot);
+    Assert.AreEqual(Slots[0], RetrySlot,
+      'the freed slot number should have been reused');
+  finally
+    Session.Terminate;
+    Session.Free;
+  end;
+end;
+
+// A detached target must resume unarmed: if DR7 (or a stale DR6/trap flag)
+// survives DebugActiveProcessStop, the watched write in DataBpWriteWatched
+// traps into a debugger no longer listening, and the RTL surfaces it as an
+// unhandled External exception -- a modal dialog that hangs the process. The
+// bounded WaitForSingleObject below turns that hang into a clean test failure.
+procedure TDebugSessionTests.DataBp_CleanDetach_LeavesTargetUnarmed;
+var
+  SI: TStartupInfo;
+  PI: TProcessInformation;
+begin
+  SI := Default(TStartupInfo);
+  SI.cb := SizeOf(SI);
+  var CmdLine := '"' + TargetExe + '" --attach-pause --run-databp-step';
+  Assert.IsTrue(CreateProcess(nil, PChar(CmdLine), nil, nil, False,
+    CREATE_NEW_CONSOLE, nil, nil, SI, PI), 'CreateProcess for detach target failed');
+  CloseHandle(PI.hThread);
+
+  var Session := TDebugSession.Create;
+  try
+    var Opts: TAttachOptions;
+    Opts             := Default(TAttachOptions);
+    Opts.ProgramPath := TargetExe;
+    Opts.MapPath     := TargetMap;
+    Opts.RsmPath     := TargetRsm;
+    Opts.SourceRoot  := TargetDir;
+    Session.Attach(PI.dwProcessId, False, Opts);   // killOnDetach = False -- clean detach
+
+    var Line := MarkerLineIn(TargetDir + DATABP_SOURCE, 'DATABP_READY');
+    Assert.IsTrue(Line > 0, 'DATABP_READY marker not found');
+    var Spec: TBpLineSpec;
+    Spec      := Default(TBpLineSpec);
+    Spec.Line := Line;
+    Session.SetBreakpoints(DATABP_SOURCE, [Spec]);
+
+    var Deadline := GetTickCount64 + 25000;
+    while (Session.State <> dsStopped) and (not Session.HasExited) and
+          (GetTickCount64 < Deadline) do
+      Session.Pump;
+    Assert.AreEqual(Ord(dsStopped), Ord(Session.State), 'did not stop at DATABP_READY');
+
+    var Addr: UInt64; var Slot: Integer;
+    SetDataWatchOnGlobal(Session, 'GDataBpWatched', Addr, Slot);
+
+    Session.Terminate;   // killOnDetach=False -> the clean-detach path
+  finally
+    Session.Free;
+  end;
+
+  var WaitResult := WaitForSingleObject(PI.hProcess, 15000);
+  Assert.AreEqual(Cardinal(WAIT_OBJECT_0), Cardinal(WaitResult),
+    'detached target did not exit within the timeout -- a stray trap likely hung it');
+  var ExitCode: DWORD;
+  GetExitCodeProcess(PI.hProcess, ExitCode);
+  CloseHandle(PI.hProcess);
+  Assert.AreEqual(DWORD(0), ExitCode, 'detached target exited abnormally');
 end;
 
 procedure TDebugSessionTests.Launch_StopsAtBreakpoint;
@@ -5697,6 +5924,16 @@ procedure TWin32RunControlTests.Win32_DataBp_HitOnTheSteppedInstruction_StillCom
 begin
   RunWatchpointHitOnTheSteppedInstructionStillCompletesTheStep(Win32Exe,
     Win32Map, Win32Rsm, TargetDir);
+end;
+
+procedure TWin32RunControlTests.Win32_DataBp_WorkerThreadWrite_NamesTheWorkerThread;
+begin
+  RunWorkerThreadWriteNamesTheWorkerThread(Win32Exe, Win32Map, Win32Rsm, TargetDir);
+end;
+
+procedure TWin32RunControlTests.Win32_DataBp_ThreadCreatedAfterArm_StillTrips;
+begin
+  RunThreadCreatedAfterArmStillTrips(Win32Exe, Win32Map, Win32Rsm, TargetDir);
 end;
 
 procedure TWin32RunControlTests.Win32_Bpl_BreakpointInPackage_FiresWithLocals;
