@@ -513,7 +513,30 @@ Debugger features:
   external `.tds`. Full plan + decisions in `DEBUG_INFO_FORMATS_TODO.md`.
 - PE import-table reader so MAP can be dropped entirely.
 - Child process tracking.
-- Disassembly view (DAP `disassemble`).
+- **Data breakpoints / watchpoints ("stop when this address is written") —
+  DESIGNED, not built (2026-08-08).** Nothing exists today: no debug-register
+  handling in the engine, no DAP capability, no MCP tool. Full plan in
+  `DATA_BREAKPOINTS_PLAN.md`. Key points: hardware `DR0..DR3`, so four slots and
+  explicit refusal when exhausted; **debug registers are PER-THREAD**, so a
+  watchpoint must be replicated onto every thread including ones created later,
+  and cleared on detach; a hit arrives as a SINGLE-STEP exception, so `DR6` must
+  disambiguate it from the stepping engine's own steps — a change to the event
+  pump's most delicate path; x86 has no read-only watchpoint, so DAP `read` maps
+  to read-or-write and must say so. Ranked above disassembly in diagnostic value:
+  "who writes this variable" has no other answer.
+- **Disassembly + address breakpoints — DESIGNED, not built (2026-08-08).** Full
+  plan, decisions and increments in `DISASSEMBLY_PLAN.md`. In short: complete ISA
+  coverage is a requirement (target code is not only Delphi-compiled), so the
+  backend is **Zydis** (MIT, committed DLL + pinned submodule under
+  `ThirdParty\Zydis`, ONE x64 DLL because machine mode is a decoder parameter),
+  behind an `IDisassembler` seam, dynamically loaded and fail-closed —
+  undecodable renders `db XX`, missing DLL reports UNAVAILABLE. `X86Decode.pas`
+  stays for the dependency-free call-site proving path. Coverage is measured
+  against an independent oracle (XED / `dumpbin /DISASM`), not claimed. Surfaces:
+  MCP `disassemble` + `set_breakpoint_at_address`; DAP `disassemble`,
+  `instructionPointerReference`, `setInstructionBreakpoints`. Address breakpoints
+  are stored as module+RVA (a bare VA does not survive relaunch or a rebased
+  package), reusing the existing deferred-bind path.
 - Win32 (32-bit) targets — **DONE**. Run control, locals, object expansion,
   evaluation and the multi-BPL case all work on a WOW64 target from the same
   64-bit adapter binary. See "Target architecture" under Implemented features
