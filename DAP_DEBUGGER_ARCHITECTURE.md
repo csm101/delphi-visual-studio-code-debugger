@@ -1894,8 +1894,66 @@ low address bits, so a rounded request would silently watch a neighbouring cell
 and report success. The DR7 bit maths is architecture-neutral and lives once in
 `TWinDebugger`; only the register access is behind the funnel.
 
-Not yet built (see `DATA_BREAKPOINTS_PLAN.md`): the slot allocator, replication
-onto every thread, clear-on-detach, a stop reason, and the MCP/DAP surfaces.
+### Data breakpoints: the request flows
+
+Complete as of 2026-08-08; the full record of what was measured and what was
+deliberately not built is in `DATA_BREAKPOINTS_PLAN.md`.
+
+**`dataBreakpointInfo`** (adapter: `HandleDataBreakpointInfo`; engine:
+`TDebugSession.GetDataBreakpointInfo`). The client sends a `name` plus either
+the CONTAINER's `variablesReference` (what VS Code does from the Variables
+tree) or a `frameId`. A container reference carries no frame, so the Locals
+scope resolves against `FLastScopeFrameId` — the frame the `scopes` request was
+last made for, which is the same frame the following `variables` request
+resolves against. The session tries a literal address, then a LOCAL of that
+frame, then a global, derives the watch width from the declared type, and
+returns either a `dataId` or a refusal with the reason in `description`.
+Refused (never guessed): a register-allocated local, a frame with no frame
+pointer, a type with no 1/2/4/8 width, a misaligned address, the Registers
+scope, and an expansion handle (an object/record field — the expander answers
+in values, not addresses).
+
+`accessTypes` is `["write","readWrite"]` and never contains `read`: x86/x64 has
+no read-only watchpoint, so listing one would advertise a filter that cannot be
+applied. `canPersist` is `false` for a frame-scoped local and `true` otherwise.
+
+**The `dataId` is adapter-private and self-contained**, because
+`setDataBreakpoints` sends nothing but the id and an access type, and VS Code
+persists data breakpoints across sessions:
+
+- `d1|g|<size>|<name>` — a global by NAME, re-resolved at set time;
+- `d1|a|<size>|<module>|<rva>` — an address as module+RVA (bare VA outside every
+  image), so it survives a rebased package;
+- `d1|l|<size>|<nonce>|<tid>|<base>|<entry>|<addr>|<name>` — a frame-scoped
+  local, stamped with a per-run nonce so an id from a previous process is
+  refused by name instead of re-armed at whatever now lives at that address.
+
+**`setDataBreakpoints`** (adapter: `HandleSetDataBreakpoints`) is a whole-set
+replace, which is exactly what `TDebugSession.SetDataBreakpoints` already was.
+Entries that fail to decode, and `accessType:"read"`, are answered per entry
+without being sent to the session. The whole request is refused per entry while
+the target is RUNNING — arming touches live thread contexts — rather than
+letting the session refuse everything with one sentence, which would make
+already-armed watchpoints look newly broken.
+
+**Frame lifetime.** A local's address is a stack slot. `TDataBpSpec` carries
+`TDataBpFrameScope` (thread + frame base + function entry VA), and
+`TDebugSession.PruneStaleDataBreakpoints` runs at EVERY stop — the only moment
+a stack is readable — walking the owning thread RAW (`GetStackFrames(Tid)`: no
+symbolication, no trim, no cache write) for a frame matching that pair. Gone →
+the slot is cleared, the watchpoint dropped, and `OnDataBreakpointRemoved`
+fires; the adapter turns that into a Debug Console line and a `breakpoint`
+removed event. `ArmOneDataBreakpoint` runs the same test, so the client's next
+whole-set replace cannot put it back. One case is undetectable by construction
+and is documented rather than guessed at: the same routine re-entered at the
+same stack depth reproduces the same frame identity, so the watchpoint follows
+the same local of a new invocation — it can never drift onto a different
+variable.
+
+**The stop.** `srDataBreakpoint` maps to DAP reason `"data breakpoint"`, with
+`description`/`text` = `expr: $old -> $new (thread N)`. The reason case was
+missing until increment 6, which made a watchpoint stop arrive with no `reason`
+at all — the DAP twin of the `McpJson.ReasonName` gap increment 5 fixed.
 
 ## Exception handling
 
@@ -2116,10 +2174,11 @@ after the first instant.
 | `supportsEvaluateForHovers`             | true  |
 | `supportsSetVariable`                   | true  |
 | `supportsGotoTargetsRequest`            | true  |
+| `supportsDataBreakpoints`               | true  |
 | `supportsProgressReporting`             | true  |
 
-Anything else is currently absent (function breakpoints, attach,
-disassembly, set-next-statement).
+Anything else is currently absent (function breakpoints, disassembly,
+instruction breakpoints).
 
 ## Known assumptions and limits
 

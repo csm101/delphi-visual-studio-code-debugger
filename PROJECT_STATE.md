@@ -102,7 +102,7 @@ VS Code  ── DAP (JSON over stdio) ──>  VisualStudioCodeDelphiDebugger.ex
 - `DebuggerTests\`: DUnitX integration test suite. Launches the adapter,
   exercises BPs / locals / step / globals / evaluate.
   Run with `cmd /c "C:\Athens\GitHub\Win64Debugger\DebuggerTests\build_and_run.bat"`.
-  Current status: **1065 found / 1061 pass / 0 fail / 0 leaked / 4 ignored.**
+  Current status: **1081 found / 1077 pass / 0 fail / 0 leaked / 4 ignored.**
   Attach/detach tests self-skip when SeDebugPrivilege
   isn't held; run elevated to exercise them. The count includes the TD32
   + RSM reader unit tests (`TD32ReaderTests`, `RsmReaderTests`), the
@@ -513,9 +513,11 @@ Debugger features:
   external `.tds`. Full plan + decisions in `DEBUG_INFO_FORMATS_TODO.md`.
 - PE import-table reader so MAP can be dropped entirely.
 - Child process tracking.
-- **Data breakpoints / watchpoints ("stop when this address is written") — IN
-  PROGRESS, increments 1-5 of 6 done (2026-08-08).** Full plan, measurements and
-  increment list in `DATA_BREAKPOINTS_PLAN.md`.
+- **Data breakpoints / watchpoints ("stop when this address is written") — DONE,
+  all six increments (2026-08-08).** Available over MCP and over DAP ("Break on
+  Value Change" in VS Code's Variables context menu). Full plan, measurements and
+  increment list in `DATA_BREAKPOINTS_PLAN.md`; the limitations that survive are
+  listed at the end of this entry.
   * **Built:** debug registers as a fourth role behind the thread-context funnel
     (`ReadDebugRegisters` / `WriteDebugRegisters`, with the `Wow64` variant in
     `WinDebuggerX86`); the `DR6` disambiguation in the event pump, because a hit
@@ -558,10 +560,35 @@ Debugger features:
     API change. Also fixed in this pass: `McpJson.ReasonName` had no case for
     `srDataBreakpoint`, so a watchpoint stop reported `stopReason:"unknown"`
     over MCP -- a real latent bug, not something increment 5 introduced.
-  * **Not built:** the DAP surface (increment 6). x86 has no read-only
-    watchpoint, so DAP `read` (via `dataBreakpointInfo`'s supported access
-    types) maps to read-or-write and must say so -- already proven at the MCP
-    layer, increment 6 just needs the DAP request shape.
+  * **DAP surface + watchpoints on LOCALS (increment 6).** Capability
+    `supportsDataBreakpoints`, requests `dataBreakpointInfo` and
+    `setDataBreakpoints`, and the `stopped` event with reason
+    `"data breakpoint"` carrying `expr: $old -> $new (thread N)` as its
+    `description`. `TDebugSession.GetDataBreakpointInfo(name, frameIndex,
+    threadId)` is the neutral engine behind the first request: it resolves a
+    literal address, a LOCAL of the named frame, or a global (in that order),
+    derives the watch width from the declared type, and refuses anything it
+    cannot justify (register-allocated local, no 1/2/4/8 width, misaligned
+    address, unknown name) instead of guessing one.
+    A local's address is only valid while its frame lives, so a local spec
+    carries that frame's identity (`TDataBpFrameScope`: thread + frame base +
+    function entry VA). `PruneStaleDataBreakpoints` runs at EVERY stop — the
+    only moment a stack can be read — and the first time the frame is gone it
+    clears the hardware slot, drops the watchpoint and fires
+    `OnDataBreakpointRemoved`, which the DAP layer turns into a Debug Console
+    line and a `breakpoint` removed event. Re-arming the same `dataId`
+    afterwards is refused by name. `read` access is refused outright and
+    `accessTypes` never advertises it: x86/x64 has no read-only watchpoint.
+  * **Limitations that remain** (all deliberate, all reported to the user
+    rather than smoothed over): watching a FIELD of an expanded object/record
+    is refused (an expansion handle carries no address); a `setDataBreakpoints`
+    request that arrives while the target is RUNNING is refused per entry
+    (arming touches live thread contexts), so a watchpoint deleted from the
+    UI mid-run stays armed until the next stop; and one staleness case is
+    undetectable by construction — the SAME routine re-entered at the SAME
+    stack depth reproduces the same frame identity, so the watchpoint follows
+    the same local of a new invocation. It can never drift onto a DIFFERENT
+    variable, which is the failure the mechanism exists to prevent.
   Ranked above disassembly in diagnostic value: "who writes this variable" has no
   other answer.
 - **Disassembly + address breakpoints — DESIGNED, not built (2026-08-08).** Full

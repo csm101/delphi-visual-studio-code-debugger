@@ -25,35 +25,47 @@ longer true, delete it.
 
 ## Current task (2026-08-08)
 
-**Data breakpoints (watchpoints), increment 5 of 6 — DONE, not yet committed.**
-MCP tool surface (`set_data_breakpoint` / `list_data_breakpoints` /
-`remove_data_breakpoint` in `MCPDebugger\McpServer.pas` / `McpToolSchemas.pas`,
-JSON shape in `McpJson.pas`) over the increment-4 session API. Also fixed a
-real bug found while wiring it: `McpJson.ReasonName` had no case for
-`srDataBreakpoint`, so a watchpoint stop reported `stopReason:"unknown"` over
-MCP. Full detail (including the granularity mismatch between the session's
-whole-set-replace API and the MCP tools' add/remove-one shape, and how it was
-resolved without touching the session) in `DATA_BREAKPOINTS_PLAN.md`
-(increment 5 section) and `TEST_CATALOG.md`. 6 new tests in
-`DebuggerTests\McpE2ETests.pas` (`DataBreakpoint_*`); two negative controls run
-(revert `ReasonName` case, revert the `access="read"` refusal) — both failed
-exactly as expected, then reverted back and reconfirmed green. Full suite:
-1065 found / 1061 passed / 0 failed / 0 errored / 4 ignored (delta vs the
-increment-4 baseline of 1059/1055 is exactly the 6 new tests).
+**Data breakpoints (watchpoints), increment 6 of 6 — DONE. The plan is now
+COMPLETE. Not committed; left in the tree for review.**
 
-**Not committed yet** — left in the tree for review, per instruction.
+Increment 6 is the DAP surface plus the case increments 4 and 5 both refused: a
+watchpoint on a **LOCAL**. Capability `supportsDataBreakpoints`, requests
+`dataBreakpointInfo` / `setDataBreakpoints`, and the `stopped` reason
+`"data breakpoint"` (which was MISSING — a watchpoint stop arrived with no
+`reason` at all, the DAP twin of the `McpJson.ReasonName` gap increment 5 found).
+
+Full detail, including the `dataId` encoding, the frame-lifetime rule and every
+deliberate refusal, is in `DATA_BREAKPOINTS_PLAN.md` (increment 6 section) and
+`DAP_DEBUGGER_ARCHITECTURE.md` ("Data breakpoints: the request flows"). Test
+inventory in `TEST_CATALOG.md`.
+
+Files changed:
+`DebuggerCore\DebugSessionTypes.pas`, `DebuggerCore\DebugSession.pas`,
+`VisualStudioCodeDelphiDebugger\DapServer.pas`,
+`DebuggerTests\TestTarget\TestTargetCore.pas`, `DebuggerTests\DapClient.pas`,
+`DebuggerTests\DebuggerTests.pas`, `DebuggerTests\DebugSessionTests.pas`,
+plus the docs above and `PROJECT_STATE.md` / `README.md`.
+
+Full suite: **1081 found / 1077 passed / 0 failed / 0 errored / 4 ignored**
+(delta vs the increment-5 baseline of 1065/1061 is exactly the 16 new tests:
+5 DAP tests × 2 fixtures, 4 session tests, 2 Win32 mirrors).
+
+Negative controls run and reverted, each RED with the intended message:
+removed `stopped` reason case; `read` access accepted instead of refused;
+Registers-scope branch dropped; `PruneStaleDataBreakpoints` disabled;
+arm-time frame-liveness test disabled.
 
 ### Next action
 
-Start **increment 6: DAP capabilities and requests** (not started).
-`supportsDataBreakpoints`, request `dataBreakpointInfo` (variable reference ->
-`dataId` + supported access types, needed for LOCALS which increment 5
-explicitly refused), request `setDataBreakpoints`, the `stopped` event with
-the new reason/description, and address-form persistence across relaunch. See
-`DATA_BREAKPOINTS_PLAN.md` §"Surfaces" (DAP half) and increment 5's own
-section for what the MCP side already proved works (old->new capture, thread
-attribution, the read-only-watchpoint caveat) so increment 6 does not
-re-derive it.
+Nothing pending on data breakpoints. The next roadmap item is the operator's
+choice — `DISASSEMBLY_PLAN.md` (disassembly + address breakpoints, DESIGNED, not
+built) is the ranked successor, and the two smaller gaps this increment left
+open, both written up in `DATA_BREAKPOINTS_PLAN.md` §"Deferred", are:
+
+- a watchpoint on a FIELD of an expanded object/record (needs expansion handles
+  to carry the address of what they expanded, not a heuristic);
+- applying a `setDataBreakpoints` that arrives while the target is RUNNING
+  (needs a pending-set queue plus a corrective `breakpoint` event).
 
 ## Standing constraint from the user
 
@@ -63,14 +75,9 @@ documented.
 
 ## State of the tree
 
-- `public-main`, clean. Release **0.3.0 is committed but NOT tagged and NOT
-  pushed**; no GitHub release exists. The push is the outward-facing step and
-  waits on the maintainer.
-- Last full suite: **1065 found / 1061 passed / 0 failed / 0 errored / 4
-  ignored.** One unrelated flake seen during the increment-3 session
-  (`Test_RtlStringGetter_VarOutFromPropertyType` in the BPL scenario, failed
-  once in a full run, passed 3/3 in isolation) — logged, not chased, not seen
-  again in increment 4 or 5's runs.
+- `public-main`, with the increment 5 AND increment 6 work uncommitted. Release
+  **0.3.0 is committed but NOT tagged and NOT pushed**; no GitHub release exists.
+  The push is the outward-facing step and waits on the maintainer.
 - Win32 support is functionally complete for `-$O-` targets. Debug-info format
   coverage (TD32, RSM, MAP, JCL, DCP, `.tds`) is closed; DCU is WON'T DO.
 

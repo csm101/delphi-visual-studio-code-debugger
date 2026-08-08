@@ -43,6 +43,12 @@ type
   TSessionModuleSymbolsEvent  = procedure(Module: TModuleSymbols) of object;
   TSessionBpChangedEvent      = procedure(const SourceFile: string;
                                   Line: Integer; Verified: Boolean) of object;
+  // A data breakpoint the session REMOVED on its own, with the reason. Today
+  // that is exactly one case: a frame-scoped watchpoint whose frame has exited
+  // (increment 6 of DATA_BREAKPOINTS_PLAN.md). The user must be told -- a
+  // watchpoint silently left on dead stack reports hits that are lies.
+  TSessionDataBpRemovedEvent  = procedure(const Bp: TSessionDataBreakpoint;
+                                  const Reason: string) of object;
 
   TDebugSession = class
   private
@@ -86,6 +92,11 @@ type
     // replaces the WHOLE set on every call, mirroring DAP's own setDataBreakpoints.
     FDataBreakpoints: TList<TSessionDataBreakpoint>;
     FNextDataBpId:    Integer;
+    // Set by PruneStaleDataBreakpoints when the watchpoint that produced THIS
+    // stop is the one just found stale, so the stop description says the hit
+    // landed on reused stack instead of reading like a genuine change. Cleared
+    // at the start of every stop.
+    FStaleDataBpNote: string;
 
     // Launch/attach-configured runtime-module sidecar overrides (empty = today's
     // auto-discovery; applied in HandleDllLoaded).
@@ -111,6 +122,7 @@ type
     FOnDllLoadedHook:           TSessionDllLoadedEvent;
     FOnModuleSymbolsLoadedHook: TSessionModuleSymbolsEvent;
     FOnBreakpointChanged:       TSessionBpChangedEvent;
+    FOnDataBpRemoved:           TSessionDataBpRemovedEvent;
     FOnSymbolsArrived:          TNotifyEvent;
 
     function  Readers: TDelphiValueReader;
@@ -135,6 +147,20 @@ type
     // hit. Shared by HandleTargetStopped (the OnStopped event) and Snapshot
     // (a later poll) so the two never disagree.
     function  BuildDataBreakpointDescription: string;
+    // Is the frame a dbsLocal watchpoint was scoped to still on its thread's
+    // stack? Answerable only AT A STOP, which is why staleness is detected at a
+    // stop and nowhere else.
+    function  FrameStillLive(const Frame: TDataBpFrameScope): Boolean;
+    // Called at every stop, before the stop is reported. Removes (and clears the
+    // hardware slot of) every frame-scoped watchpoint whose frame is gone, and
+    // fires OnDataBreakpointRemoved for each. Runs only when a frame-scoped
+    // watchpoint exists, so an ordinary stop costs nothing.
+    procedure PruneStaleDataBreakpoints;
+    // Byte width to watch for a resolved local/global, from its declared type.
+    // 0 = could not be established at one of the four hardware widths, which is
+    // a REFUSAL (never a rounded guess -- the hardware ignores the low address
+    // bits, so a wrong width watches a neighbouring cell).
+    function  WatchWidthForType(const TypeHint: string; TypeKind: Byte): Integer;
     // Free + recreate-empty the symbol infrastructure so its memory-mapped files
     // (target .exe TD32 section, .rsm, BPL .dcp) are released on terminate/detach.
     procedure ReleaseSymbolProviders;
@@ -263,6 +289,21 @@ type
     function  SetDataBreakpoints(const Specs: TArray<TDataBpSpec>): TArray<TSessionDataBreakpoint>;
     function  ListDataBreakpoints: TArray<TSessionDataBreakpoint>;
     procedure RemoveAllDataBreakpoints;
+    // Can this variable be watched, and at what address/width? The neutral
+    // engine behind DAP's dataBreakpointInfo request (increment 6).
+    //
+    // Name is resolved in frame FrameIndex of thread ThreadId (0 = the stopped
+    // thread) exactly as the locals view resolves it, then as a global, then as
+    // a literal address. A LOCAL comes back Kind=dbsLocal with Frame filled in:
+    // its address is only valid while that frame lives, and the caller must
+    // hand Frame back in the spec so the session can retire the watchpoint the
+    // moment the frame is gone.
+    //
+    // Everything that cannot be justified is REFUSED with a Reason: a
+    // register-allocated local (no address at all), a type whose width is not
+    // 1/2/4/8, a misaligned address, an unknown name. Never a rounded guess.
+    function  GetDataBreakpointInfo(const Name: string; FrameIndex: Integer;
+                ThreadId: Cardinal = 0): TDataBpTargetInfo;
 
     // Introspection (valid only when State = dsStopped).
     function  GetCallStack: TArray<TSessionFrame>; overload;
@@ -396,6 +437,12 @@ type
       read FOnModuleSymbolsLoadedHook write FOnModuleSymbolsLoadedHook;
     property OnBreakpointChanged: TSessionBpChangedEvent
       read FOnBreakpointChanged write FOnBreakpointChanged;
+    // Fired when the session retires a data breakpoint by itself (a frame-scoped
+    // watchpoint whose frame has exited). Unsubscribed = the watchpoint is still
+    // removed, the user simply is not told -- so a frontend that offers
+    // frame-scoped watchpoints must subscribe.
+    property OnDataBreakpointRemoved: TSessionDataBpRemovedEvent
+      read FOnDataBpRemoved write FOnDataBpRemoved;
     // Fired from Pump, on the dispatch thread, when the background prefetcher has
     // just registered a module's symbol providers WHILE THE TARGET IS STOPPED.
     // Anything the client already rendered from the old provider set (a stack with
@@ -944,6 +991,11 @@ begin
     Name := Format('$%x', [Hit.Address]);
   Result := Format('%s: $%x -> $%x (thread %d)',
     [Name, Hit.OldValue, Hit.NewValue, Hit.ThreadId]);
+  // The hit that produced THIS stop came from a watchpoint whose frame had
+  // already exited: the cell it names is reused stack, not the variable the
+  // user asked about. Saying "old -> new" alone would be a lie.
+  if FStaleDataBpNote <> '' then
+    Result := Result + ' -- ' + FStaleDataBpNote;
 end;
 
 function TDebugSession.ListBreakpoints: TArray<TSessionBreakpoint>;
@@ -1023,6 +1075,22 @@ begin
   Result.SizeBytes   := Spec.SizeBytes;
   Result.WriteOnly   := Spec.WriteOnly;
   Result.Slot        := -1;
+  Result.DisplayName := Spec.DisplayName;
+  Result.Frame       := Spec.Frame;
+
+  // A frame-scoped spec carries an address that was resolved against ONE live
+  // frame. Re-arming it after that frame has exited would watch reused stack,
+  // which is the whole failure mode frame scoping exists to prevent -- so the
+  // liveness test runs here too, not only at the stop-time prune.
+  if Spec.Frame.Scoped and not FrameStillLive(Spec.Frame) then begin
+    var Shown := Spec.DisplayName;
+    if Shown = '' then
+      Shown := Spec.Expression;
+    Result.Message := Format('the stack frame that owned %s (thread %d) is no longer ' +
+      'on the stack -- its address is now reused stack; select the variable again ' +
+      'in a live frame', [Shown, Spec.Frame.ThreadId]);
+    Exit;
+  end;
 
   if not (Spec.SizeBytes in [1, 2, 4, 8]) then begin
     Result.Message := Format('unsupported size %d bytes (must be 1, 2, 4 or 8)',
@@ -1060,7 +1128,13 @@ begin
   ArmSpec.Address          := Addr;
   ArmSpec.SizeBytes        := Spec.SizeBytes;
   ArmSpec.WriteOnly        := Spec.WriteOnly;
-  ArmSpec.OwnerDescription := Spec.Expression;
+  // What a stop description will call this watchpoint. A frame-scoped local
+  // arrives as a literal address, so without DisplayName every hit would read
+  // "$19fe44: ..." instead of naming the variable the user picked.
+  if Spec.DisplayName <> '' then
+    ArmSpec.OwnerDescription := Spec.DisplayName
+  else
+    ArmSpec.OwnerDescription := Spec.Expression;
 
   var Slot: Integer;
   var RefusalReason: string;
@@ -1121,6 +1195,337 @@ begin
         FDebugger.ApplyDataBreakpointCommand(ClearSpec, Slot, Reason);
       end;
   FDataBreakpoints.Clear;
+end;
+
+// A local's address is a stack slot, and a stack slot means the variable the
+// user picked only while the frame that owns it is still there. There is no way
+// to be told when a frame is popped -- a `ret` is not an event -- so the frame
+// is checked at every STOP, which is the only moment the stack can be read.
+//
+// Identity is (FrameBase, FuncEntryVA), not FrameBase alone: an unrelated
+// routine reaching the same stack depth gets the same base and would otherwise
+// look like the original frame.
+//
+// One case remains undetectable BY CONSTRUCTION, and is a limitation rather
+// than a bug: the SAME routine called again at the SAME stack depth produces an
+// identical (FrameBase, FuncEntryVA) pair. The watchpoint then follows the same
+// local of a NEW invocation -- the same variable in the same routine, a
+// different call. It can never drift onto a DIFFERENT variable, which is the
+// failure this whole mechanism exists to prevent.
+function TDebugSession.FrameStillLive(const Frame: TDataBpFrameScope): Boolean;
+begin
+  Result := False;
+  if (not Frame.Scoped) or (FDebugger = nil) or (FState <> dsStopped) then
+    Exit;
+  var Tid := Frame.ThreadId;
+  if Tid = 0 then
+    Tid := FStopTid;
+  // The RAW walk on purpose: no symbol loading, no raise-plumbing trim, and no
+  // write to the stopped thread's frame cache. This runs at every stop while a
+  // frame-scoped watchpoint exists, and it only needs geometry.
+  for var F in FDebugger.GetStackFrames(Tid) do
+    if (F.FrameRBP = Frame.FrameBase) and (F.FuncEntryVA = Frame.FuncEntryVA) then
+      Exit(True);
+end;
+
+procedure TDebugSession.PruneStaleDataBreakpoints;
+begin
+  FStaleDataBpNote := '';
+  if (FDebugger = nil) or (FDataBreakpoints.Count = 0) then
+    Exit;
+
+  var AnyScoped := False;
+  for var Bp in FDataBreakpoints do
+    if Bp.Frame.Scoped then begin
+      AnyScoped := True;
+      Break;
+    end;
+  if not AnyScoped then
+    Exit;
+
+  // When THIS stop is a watchpoint hit, remember which address fired, so a hit
+  // produced by the very watchpoint being retired can be labelled as landing on
+  // reused stack instead of being reported as a genuine change.
+  var HitAddress: UInt64 := 0;
+  if FStopReason = srDataBreakpoint then
+    HitAddress := FDebugger.LastHardwareWatchpointHit.Address;
+
+  for var I := FDataBreakpoints.Count - 1 downto 0 do begin
+    var Bp := FDataBreakpoints[I];
+    if not Bp.Frame.Scoped then
+      Continue;
+    if FrameStillLive(Bp.Frame) then
+      Continue;
+
+    var Shown := Bp.DisplayName;
+    if Shown = '' then
+      Shown := Bp.Expression;
+
+    if Bp.Slot >= 0 then begin
+      var ClearSpec: TDataBpArmSpec;
+      ClearSpec       := Default(TDataBpArmSpec);
+      ClearSpec.Clear := True;
+      ClearSpec.Slot  := Bp.Slot;
+      var Slot: Integer;
+      var Reason: string;
+      FDebugger.ApplyDataBreakpointCommand(ClearSpec, Slot, Reason);
+    end;
+    FDataBreakpoints.Delete(I);
+
+    if (HitAddress <> 0) and (HitAddress = Bp.Address) then
+      FStaleDataBpNote := Format('STALE: the frame that owned %s has exited, so this ' +
+        'hit was on reused stack, not on the variable; the data breakpoint has been ' +
+        'removed', [Shown]);
+
+    if Assigned(FOnDataBpRemoved) then
+      FOnDataBpRemoved(Bp, Format('data breakpoint on %s removed: the stack frame that ' +
+        'owned it (thread %d) has exited, so its address is now reused stack',
+        [Shown, Bp.Frame.ThreadId]));
+  end;
+end;
+
+function TDebugSession.WatchWidthForType(const TypeHint: string;
+  TypeKind: Byte): Integer;
+const
+  // Delphi TTypeKind ordinals whose STORAGE is one pointer: the variable itself
+  // holds a reference. Watching it answers "when is this reference reassigned",
+  // which is the only thing a hardware slot can answer about them.
+  TK_CLASS_    = 7;
+  TK_LSTRING   = 10;
+  TK_WSTRING   = 11;
+  TK_INTERFACE_= 15;
+  TK_DYNARRAY  = 17;
+  TK_USTRING   = 18;
+  TK_CLASSREF  = 19;
+  TK_POINTER   = 20;
+var
+  PtrSize: Integer;
+
+  function NamedWidth(const N: string): Integer;
+  begin
+    for var Nm in ['Byte', 'ShortInt', 'Boolean', 'ByteBool', 'AnsiChar', 'UInt8', 'Int8'] do
+      if SameText(N, Nm) then Exit(1);
+    for var Nm in ['Word', 'SmallInt', 'WordBool', 'Char', 'WideChar', 'UInt16', 'Int16'] do
+      if SameText(N, Nm) then Exit(2);
+    for var Nm in ['Integer', 'LongInt', 'Cardinal', 'LongWord', 'LongBool', 'Single',
+                   'UInt32', 'Int32', 'FixedInt', 'FixedUInt'] do
+      if SameText(N, Nm) then Exit(4);
+    for var Nm in ['Int64', 'UInt64', 'Double', 'Currency', 'TDateTime', 'TDate',
+                   'TTime', 'Comp', 'Real'] do
+      if SameText(N, Nm) then Exit(8);
+    for var Nm in ['Pointer', 'NativeInt', 'NativeUInt', 'THandle', 'string',
+                   'UnicodeString', 'AnsiString', 'WideString', 'PChar', 'PAnsiChar',
+                   'PWideChar'] do
+      if SameText(N, Nm) then Exit(PtrSize);
+    // Extended is the one float whose width is target-dependent: 10 bytes of x87
+    // on Win32 (no hardware watchpoint width fits it), a plain Double on Win64.
+    if SameText(N, 'Extended') then
+      Exit(WideFloatByteSize(N, PtrSize));
+    Result := 0;
+  end;
+
+begin
+  PtrSize := 8;
+  if FDebugger <> nil then
+    PtrSize := FDebugger.TargetLayout.PointerSize;
+
+  Result := NamedWidth(Trim(TypeHint));
+  if Result = 0 then begin
+    var Sz: Integer;
+    if (FDebugInfo <> nil) and FDebugInfo.GetTypeSize(TypeHint, Sz) and (Sz > 0) then
+      Result := Sz;
+  end;
+  if (Result = 0) and (TypeKind in [TK_CLASS_, TK_LSTRING, TK_WSTRING, TK_INTERFACE_,
+                                    TK_DYNARRAY, TK_USTRING, TK_CLASSREF, TK_POINTER]) then
+    Result := PtrSize;
+  // Anything the hardware cannot express is NOT rounded down to a slot that
+  // would watch part of the variable and part of its neighbour.
+  if not (Result in [1, 2, 4, 8]) then
+    Result := 0;
+end;
+
+function TDebugSession.GetDataBreakpointInfo(const Name: string; FrameIndex: Integer;
+  ThreadId: Cardinal): TDataBpTargetInfo;
+var
+  Tid: Cardinal;
+
+  procedure Refuse(const AReason: string);
+  begin
+    Result.CanWatch := False;
+    Result.Reason   := AReason;
+  end;
+
+  // A literal address: "$hex", "0xhex", or a plain decimal.
+  function TryParseLiteral(const S: string; out V: UInt64): Boolean;
+  begin
+    var Norm := S;
+    if (Norm <> '') and (Norm[1] = '$') then
+      // already Delphi hex syntax
+    else if (Length(Norm) > 2) and (Norm[1] = '0') and CharInSet(Norm[2], ['x', 'X']) then
+      Norm := '$' + Copy(Norm, 3, MaxInt)
+    else if not ((Norm <> '') and CharInSet(Norm[1], ['0'..'9'])) then
+      Exit(False);
+    Result := TryStrToUInt64(Norm, V);
+  end;
+
+  procedure FillModule(Addr: UInt64);
+  begin
+    for var M in GetModules do
+      if (M.Size > 0) and (Addr >= M.Base) and (Addr < M.Base + M.Size) then begin
+        Result.ModuleName := M.Name;
+        Result.Rva        := Addr - M.Base;
+        Break;
+      end;
+  end;
+
+begin
+  Result := Default(TDataBpTargetInfo);
+  // The access types that genuinely exist on this CPU. `read` is absent on
+  // purpose and must never be added: x86/x64 has no read-only watchpoint, and
+  // advertising one would promise a filter the hardware cannot apply.
+  Result.AccessWrite     := True;
+  Result.AccessReadWrite := True;
+  Result.ReadWriteCaveat := 'no read-only watchpoint on this CPU -- ' +
+    '"readWrite" also fires on writes';
+
+  var Expr := Trim(Name);
+  if Expr = '' then begin
+    Refuse('no variable name given');
+    Exit;
+  end;
+  if (FDebugger = nil) or (FState <> dsStopped) then begin
+    Refuse('data breakpoints can only be resolved while the target is stopped');
+    Exit;
+  end;
+
+  Tid := ThreadId;
+  if Tid = 0 then
+    Tid := FStopTid;
+
+  // A literal address is unambiguous and needs no frame at all.
+  var LitAddr: UInt64;
+  if TryParseLiteral(Expr, LitAddr) then begin
+    var LitSize := FDebugger.TargetLayout.PointerSize;
+    if (LitAddr mod UInt64(LitSize)) <> 0 then begin
+      Refuse(Format('address $%x is not aligned to %d bytes', [LitAddr, LitSize]));
+      Exit;
+    end;
+    Result.CanWatch    := True;
+    Result.Kind        := dbsAddress;
+    Result.Address     := LitAddr;
+    Result.SizeBytes   := LitSize;
+    Result.DisplayName := Format('$%x', [LitAddr]);
+    FillModule(LitAddr);
+    Result.Description := Format('$%x, %d bytes (default width for a literal address)',
+      [LitAddr, LitSize]);
+    Exit;
+  end;
+
+  // Make sure the frame cache holds the thread the caller means, so FrameIndex
+  // resolves against the right stack (a frame index is only meaningful together
+  // with its thread).
+  if (Tid = FStopTid) and (Length(FLastFrames) = 0) then
+    GetCallStack;
+  SelectFrame(FrameIndex, Tid);
+  try
+    var LV: TLocalValue;
+    if FDebugger.EvaluateLocalName(Expr, LV) then begin
+      if LV.RegId > 0 then begin
+        Refuse(Format('%s is held in a register in this frame, so it has no address ' +
+          'a hardware watchpoint could watch', [Expr]));
+        Exit;
+      end;
+      if (FrameIndex < 0) or (FrameIndex >= Length(FLastFrames)) then begin
+        Refuse('no such stack frame');
+        Exit;
+      end;
+      var Frm := FLastFrames[FrameIndex];
+      if Frm.FrameRBP = 0 then begin
+        Refuse(Format('the frame holding %s has no frame pointer, so the watchpoint ' +
+          'could not be retired when the frame exits', [Expr]));
+        Exit;
+      end;
+
+      // A var/reference parameter's own slot holds a POINTER; the storage the
+      // user means is the pointee. Watching the slot would only report the
+      // reference being rebound, which never happens.
+      var Addr := LV.Address;
+      var ViaRef := False;
+      if LV.Kind = lkVarParam then begin
+        if not (LV.DerefValid and (LV.DerefValue <> 0)) then begin
+          Refuse(Format('%s is a var parameter whose target address could not be read',
+            [Expr]));
+          Exit;
+        end;
+        Addr   := LV.DerefValue;
+        ViaRef := True;
+      end;
+      if Addr = 0 then begin
+        Refuse(Format('%s has no address in this frame', [Expr]));
+        Exit;
+      end;
+
+      var Width := WatchWidthForType(LV.TypeHint, LV.TypeKind);
+      if Width = 0 then begin
+        Refuse(Format('cannot watch %s: its type (%s) has no 1/2/4/8-byte width a ' +
+          'hardware watchpoint can express', [Expr, LV.TypeHint]));
+        Exit;
+      end;
+      if (Addr mod UInt64(Width)) <> 0 then begin
+        Refuse(Format('the address of %s ($%x) is not aligned to its %d-byte width',
+          [Expr, Addr, Width]));
+        Exit;
+      end;
+
+      Result.CanWatch          := True;
+      Result.Kind              := dbsLocal;
+      Result.Address           := Addr;
+      Result.SizeBytes         := Width;
+      Result.DisplayName       := Expr;
+      Result.Frame.Scoped      := True;
+      Result.Frame.ThreadId    := Tid;
+      Result.Frame.FrameBase   := Frm.FrameRBP;
+      Result.Frame.FuncEntryVA := Frm.FuncEntryVA;
+      FillModule(Addr);
+      var Where := Frm.FunctionName;
+      if Where = '' then
+        Where := Format('frame %d', [FrameIndex]);
+      Result.Description := Format('%s: %s, %d bytes at $%x (local of %s on thread %d)',
+        [Expr, LV.TypeHint, Width, Addr, Where, Tid]);
+      if ViaRef then
+        Result.Description := Result.Description + ' [var parameter: watching the ' +
+          'storage it references]';
+      Exit;
+    end;
+
+    var GV: TLocalValue;
+    if FDebugger.EvaluateGlobalName(Expr, GV) and (GV.Address <> 0) then begin
+      var GWidth := WatchWidthForType(GV.TypeHint, GV.TypeKind);
+      if GWidth = 0 then begin
+        Refuse(Format('cannot watch %s: its type (%s) has no 1/2/4/8-byte width a ' +
+          'hardware watchpoint can express', [Expr, GV.TypeHint]));
+        Exit;
+      end;
+      if (GV.Address mod UInt64(GWidth)) <> 0 then begin
+        Refuse(Format('the address of %s ($%x) is not aligned to its %d-byte width',
+          [Expr, GV.Address, GWidth]));
+        Exit;
+      end;
+      Result.CanWatch    := True;
+      Result.Kind        := dbsGlobal;
+      Result.Address     := GV.Address;
+      Result.SizeBytes   := GWidth;
+      Result.DisplayName := Expr;
+      FillModule(GV.Address);
+      Result.Description := Format('%s: %s, %d bytes at $%x (global)',
+        [Expr, GV.TypeHint, GWidth, GV.Address]);
+      Exit;
+    end;
+
+    Refuse('unresolved symbol: ' + Expr);
+  finally
+    ClearFrame;
+  end;
 end;
 
 procedure TDebugSession.RemoveAllBreakpoints;
@@ -1187,6 +1592,12 @@ begin
 
   SetState(dsStopped);
   Inc(FStopGeneration);
+
+  // A stop is the only moment a stack can be read, so it is the only moment a
+  // frame-scoped watchpoint can be found stale. Do it BEFORE the stop is
+  // reported: when the stale watchpoint is what caused this very stop, the
+  // description must say the hit landed on reused stack.
+  PruneStaleDataBreakpoints;
 
   if Assigned(FOnStopped) then begin
     var Info: TStopInfo;

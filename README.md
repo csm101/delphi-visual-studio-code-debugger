@@ -73,7 +73,8 @@ The three front ends are thin.
 > inspection (locals, registers, globals, nested object / record /
 > dynamic-array expansion) with type-aware formatting, a full Pascal
 > expression evaluator for watch/hover/REPL, `setVariable` (primitives,
-> strings, enums, sets, `var` parameters), and a configurable exception
+> strings, enums, sets, `var` parameters), data breakpoints (hardware
+> watchpoints, on globals and on locals), and a configurable exception
 > engine (filters + per-exception rules) are all functional. See
 > [What works](#what-works) for the full list.
 
@@ -795,6 +796,7 @@ At runtime the adapter compares the debuggee's actual `ImageBase` (from `CREATE_
 - [x] Step over (`F10`), step into (`F11`), step out (`Shift+F11`)
 - [x] Continue (`F5`), pause (injected `DebugBreakProcess`)
 - [x] Set next statement (DAP `gotoTargets` / `goto`)
+- [x] **Data breakpoints (hardware watchpoints)** — "Break on Value Change" / "Break on Value Access" in the Variables context menu, on a global, a unit variable or a **local**. The stop names the thread that wrote the cell and shows `old -> new`. Four hardware slots exist, so the fifth request is refused by name rather than dropped; there is no read-only watchpoint on x86/x64, so only `write` and `readWrite` are offered. A watchpoint on a local is withdrawn — and said so in the Debug Console — the moment the frame that owned it exits, instead of quietly watching reused stack
 - [x] Current source line highlighted in editor
 - [x] Multi-module debugging: DLLs and runtime-loaded BPLs (lazy per-module symbol loading)
 - [x] All threads enumerated (with names); the whole process stops together (`allThreadsStopped`)

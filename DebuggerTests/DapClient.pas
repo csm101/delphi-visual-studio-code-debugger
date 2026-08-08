@@ -116,6 +116,17 @@ type
     // for the Delphi filter).
     function    SetExceptionBreakpoints(
                   const FilterIds, Conditions: TArray<string>): TJSONObject; overload;
+    // DAP dataBreakpointInfo: ask whether a variable can be watched and get the
+    // opaque `dataId` back. VariablesReference names the CONTAINER the variable
+    // belongs to (the Locals scope ref for a plain local, 0 for an expression);
+    // FrameId < 0 omits the field, which is what VS Code does when it sends a
+    // container reference.
+    function    DataBreakpointInfo(const Name: string;
+                  VariablesReference: Integer; FrameId: Integer = -1): TJSONObject;
+    // DAP setDataBreakpoints: whole-set replace. AccessTypes must be the same
+    // length as DataIds (or empty, meaning `write` for every entry).
+    function    SetDataBreakpoints(const DataIds: TArray<string>;
+                  const AccessTypes: TArray<string> = nil): TJSONObject;
     function    ConfigDone: TJSONObject;
     function    Continue_(ThreadId: Integer = 1): TJSONObject;
     function    StepIn(ThreadId: Integer = 1): TJSONObject;
@@ -755,6 +766,38 @@ begin
   Args.AddPair('breakpoints', BpArr);
   Seq    := SendCmd('setBreakpoints', Args);
   Result := WaitResp(Seq);
+end;
+
+function TDapClient.DataBreakpointInfo(const Name: string;
+  VariablesReference: Integer; FrameId: Integer): TJSONObject;
+var
+  Args: TJSONObject;
+begin
+  Args := TJSONObject.Create;
+  Args.AddPair('name', Name);
+  Args.AddPair('variablesReference', TJSONNumber.Create(VariablesReference));
+  if FrameId >= 0 then
+    Args.AddPair('frameId', TJSONNumber.Create(FrameId));
+  Result := WaitResp(SendCmd('dataBreakpointInfo', Args));
+end;
+
+function TDapClient.SetDataBreakpoints(const DataIds: TArray<string>;
+  const AccessTypes: TArray<string>): TJSONObject;
+var
+  Args:  TJSONObject;
+  BpArr: TJSONArray;
+begin
+  BpArr := TJSONArray.Create;
+  for var I := 0 to High(DataIds) do begin
+    var BP := TJSONObject.Create;
+    BP.AddPair('dataId', DataIds[I]);
+    if (I <= High(AccessTypes)) and (AccessTypes[I] <> '') then
+      BP.AddPair('accessType', AccessTypes[I]);
+    BpArr.Add(BP);
+  end;
+  Args := TJSONObject.Create;
+  Args.AddPair('breakpoints', BpArr);
+  Result := WaitResp(SendCmd('setDataBreakpoints', Args));
 end;
 
 function TDapClient.SetExceptionBreakpoints(

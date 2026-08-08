@@ -251,8 +251,10 @@ so they are covered here rather than under their own heading. Both bitnesses,
       (`DataBp_CleanDetach_LeavesTargetUnarmed`, x64 attach-based)
 - [x] The stop names the WRITING thread, and old -> new -- session API
       (`DataBp_SessionApi_StopsWithOldNewAndThread` / `Win32_...`)
-- [x] A local is refused by name, not treated as a stale address
-      (`DataBp_SessionApi_RejectsLocalWithReason`)
+- [x] A BARE local name (no frame identity behind it) is refused by name, not
+      treated as a stale address (`DataBp_SessionApi_RejectsLocalWithReason`).
+      A local resolved through `GetDataBreakpointInfo` DOES arm -- see the
+      frame-scoped block below.
 - [x] Exhaustion reported PER SPEC through the session API, not failing the
       whole request (`DataBp_SessionApi_SlotExhaustion_PerSpecResults`)
 - [x] `RemoveAllDataBreakpoints` genuinely clears the hardware slot
@@ -283,8 +285,48 @@ re-proven here, only the tool wiring on top of it):
       every `SetDataBreakpoints` call), and removal genuinely frees the hardware
       slot -- the target runs PAST the watched write afterward
       (`DataBreakpoint_ListAndRemove_ClearsHardwareSlotForReal`)
-- [ ] DAP surface (`supportsDataBreakpoints`, `dataBreakpointInfo`,
-      `setDataBreakpoints`) -- increment 6, not started
+**Frame-scoped watchpoints on LOCALS** (increment 6 --
+`TDebugSession.GetDataBreakpointInfo` + `PruneStaleDataBreakpoints`; DUnitX in
+`DebuggerTests\DebugSessionTests.pas`, over the `-run-databp-local` fixture.
+Mirrored on Win32 because frame identity is EBP-based there and liveness runs
+over the x86 walk):
+
+- [x] The offered access types are exactly `write` + `readWrite`, with the
+      no-read-only caveat, and the width comes from the declared type
+      (`DataBp_Info_OffersWriteAndReadWriteButNeverRead`)
+- [x] An unknown name is refused with a reason and carries no address
+      (`DataBp_Info_RefusesUnknownNameWithReason`)
+- [x] A watchpoint on a LOCAL fires and the stop names the variable (not the raw
+      address) with old -> new (`DataBp_LocalWatch_FiresWithOldNew` / `Win32_...`)
+- [x] Once the owning frame exits, the watchpoint is retired at the next stop,
+      the removal is ANNOUNCED with the reason, the list is empty, and re-arming
+      the same address+frame is refused
+      (`DataBp_LocalWatch_GoesStaleWhenFrameExits` / `Win32_...`)
+
+**DAP surface** (increment 6 -- `supportsDataBreakpoints`,
+`dataBreakpointInfo`, `setDataBreakpoints`, and the `stopped` reason;
+`DebuggerTests\DebuggerTests.pas`, so each runs in BOTH the mono and the BPL
+fixture):
+
+- [x] `supportsDataBreakpoints` is advertised -- without it VS Code never offers
+      "Break on Value Change" and neither request is ever sent
+      (`Test_DataBp_CapabilityAdvertised`)
+- [x] info -> set -> continue stops with reason `"data breakpoint"` and a
+      description naming the variable, old -> new and the thread; `accessTypes`
+      never contains `read`; `canPersist` is false for a frame-scoped local
+      (`Test_DataBp_LocalWrite_StopsWithOldNewAndThread`)
+- [x] The stale flow end to end: announced on the Debug Console, removed, and
+      re-arming the same `dataId` refused
+      (`Test_DataBp_LocalGoesStale_RemovedAndAnnounced`)
+- [x] `accessType:"read"` refused with a reason pointing at `readWrite`
+      (`Test_DataBp_ReadAccessRefusedWithReason`)
+- [x] The Registers scope is refused with its OWN reason, distinct from the
+      expansion-handle one (`Test_DataBp_Info_RegisterScopeRefusedWithReason`)
+- [ ] A watchpoint on a FIELD of an expanded object/record -- refused today (the
+      expansion handle carries no address); see `DATA_BREAKPOINTS_PLAN.md`
+- [ ] A `setDataBreakpoints` that arrives while the target is RUNNING is refused
+      per entry rather than queued -- no fixture; the consequence (a watchpoint
+      deleted mid-run stays armed until the next stop) is documented, not tested
 
 ---
 

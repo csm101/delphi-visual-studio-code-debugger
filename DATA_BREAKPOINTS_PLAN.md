@@ -1,18 +1,22 @@
 # Data breakpoints (watchpoints) — plan
 
-Status: **in progress** (2026-08-08), increments 1-5 of 6 done and gated on a
-green suite. The engine can arm/disarm hardware watchpoints, tell a watchpoint
-hit apart from a completed step, replicate a watchpoint onto every thread
-(present and future), allocate/free the four slots with explicit exhaustion,
-a real session-level API (`TDebugSession.SetDataBreakpoints` /
-`ListDataBreakpoints` / `RemoveAllDataBreakpoints`) that resolves an
-expression, arms it, and reports a genuine `srDataBreakpoint` stop with
-old->new capture and the firing thread, and now the MCP tool surface
-(`set_data_breakpoint` / `list_data_breakpoints` / `remove_data_breakpoint`)
-that drives it. Still missing: `supportsDataBreakpoints` /
-`dataBreakpointInfo` / `setDataBreakpoints` in the DAP layer (increment 6).
-The feature is user-facing over MCP as of increment 5; VS Code's own "Break on
-Value Change" UI is still increment 6.
+Status: **COMPLETE** (2026-08-08), all six increments done and gated on a green
+suite. The engine can arm/disarm hardware watchpoints, tell a watchpoint hit
+apart from a completed step, replicate a watchpoint onto every thread (present
+and future), allocate/free the four slots with explicit exhaustion, a real
+session-level API (`TDebugSession.SetDataBreakpoints` / `ListDataBreakpoints` /
+`RemoveAllDataBreakpoints` / `GetDataBreakpointInfo`) that resolves an
+expression or a live frame's local, arms it, and reports a genuine
+`srDataBreakpoint` stop with old->new capture and the firing thread; the MCP
+tool surface (`set_data_breakpoint` / `list_data_breakpoints` /
+`remove_data_breakpoint`); and the DAP surface (`supportsDataBreakpoints`,
+`dataBreakpointInfo`, `setDataBreakpoints`), which is what puts "Break on Value
+Change" into VS Code's Variables context menu.
+
+What did NOT get built, each with the reason, is in "Deferred" and in the
+increment 6 section: a watchpoint on a FIELD of an expanded object, a
+`setDataBreakpoints` that arrives while the target is running, and one
+staleness case that is undetectable by construction.
 
 "Stop when THIS address is written" is one of the few questions only a debugger
 can answer. Ranked against the other two address-oriented features
@@ -413,7 +417,136 @@ menu appears once the capabilities are declared):
    `DataBreakpoint_ReadWriteAccessCarriesCaveat`, `DataBreakpoint_ReadAccessRefusedExplicitly`,
    `DataBreakpoint_LocalRefusedWithReason`, `DataBreakpoint_SlotExhaustion_RefusesFifthWithEngineMessage`,
    `DataBreakpoint_ListAndRemove_ClearsHardwareSlotForReal`.
-6. DAP capabilities and requests.
+6. **DONE.** DAP capabilities and requests, and with them the case increments
+   4 and 5 both refused: a watchpoint on a **LOCAL**.
+
+   **Capability + requests.** `supportsDataBreakpoints` in the `initialize`
+   response, `dataBreakpointInfo` and `setDataBreakpoints` in the dispatcher
+   (`VisualStudioCodeDelphiDebugger\DapServer.pas`), and a `srDataBreakpoint`
+   case in the `stopped` event that was MISSING -- exactly the DAP twin of the
+   `McpJson.ReasonName` bug increment 5 found. Without it a watchpoint stop
+   arrived with NO `reason` field at all, which VS Code renders as an unnamed
+   pause. `description` and `text` carry the session's own
+   `BuildDataBreakpointDescription` string ("V: $1 -> $2A (thread N)").
+
+   **The neutral engine is in the session, not the adapter.**
+   `TDebugSession.GetDataBreakpointInfo(Name, FrameIndex, ThreadId)` returns a
+   `TDataBpTargetInfo`: it tries a literal address, then a LOCAL of the named
+   frame, then a global (locals shadow globals, which is Delphi scope), derives
+   the watch width from the declared type (`WatchWidthForType`: an explicit
+   name table first -- bitness-aware, so `Pointer`/`NativeInt`/`string` are 4
+   bytes on a WOW64 target -- then the type providers, then the pointer-width
+   type KINDS), and refuses anything it cannot justify: a register-allocated
+   local (`RegId > 0`, no address exists at all), a frame with no frame pointer,
+   a type with no 1/2/4/8 width, a misaligned address, an unknown name. A
+   `var` parameter is followed to its POINTEE, because the slot itself only
+   holds the reference. Putting this in the session (rather than in DapServer)
+   is what let the LOCAL behaviour be tested on BOTH bitnesses -- the DAP
+   fixture is x64-only.
+
+   **Frame lifetime, the hard part.** A local's address is a stack slot, so it
+   names the user's variable only while the owning frame lives. `TDataBpSpec`
+   gained `TDataBpFrameScope` (thread + frame base + function entry VA) and a
+   `DisplayName` (a frame-scoped spec travels as a literal address, so without
+   it every stop would read "$19FE44: ..." instead of "V: ..."). Two guards,
+   both deterministic, both proven by their own negative control:
+
+   * `PruneStaleDataBreakpoints` runs at EVERY stop, before the stop is
+     reported -- a stop is the only moment a stack can be read, so it is the
+     only moment staleness is detectable at all. It walks the owning thread
+     RAW (`IDebugTarget.GetStackFrames(Tid)`: no symbolication, no
+     raise-plumbing trim, no write to the stopped thread's frame cache) and
+     looks for a frame matching (FrameBase, FuncEntryVA). Not found -> clear
+     the hardware slot, drop the watchpoint, fire `OnDataBreakpointRemoved`.
+     When the hit that CAUSED this stop belongs to the watchpoint just
+     retired, the description gains a "STALE: ... this hit was on reused
+     stack" note, so the old->new never reads as a genuine change.
+   * `ArmOneDataBreakpoint` runs the same liveness test before arming. Without
+     it, the client's next whole-set replace (VS Code sends the full set every
+     time) would put the watchpoint straight back onto dead stack.
+
+   **The residual case, undetectable BY CONSTRUCTION and therefore documented
+   rather than guessed at:** the SAME routine re-entered at the SAME stack
+   depth reproduces an identical (FrameBase, FuncEntryVA) pair. The watchpoint
+   then follows the same local of a NEW invocation -- the same variable in the
+   same routine, a different call. It can never drift onto a DIFFERENT
+   variable, which is the failure this mechanism exists to prevent. Frame
+   identity deliberately includes the entry VA and not just the base, because
+   the base alone is shared by any routine reaching that depth.
+
+   **`dataId` encoding.** DAP's `setDataBreakpoints` sends the id and an
+   access type and nothing else -- no address, no width, no frame -- and VS
+   Code PERSISTS data breakpoints in workspace state and re-sends them at the
+   next launch. So the id carries everything, and carries the shape that
+   survives a relaunch where one exists:
+   * `d1|g|<size>|<name>` -- a global, by NAME, re-resolved at set time;
+   * `d1|a|<size>|<module>|<rva>` -- an address as module+RVA (bare VA when
+     outside every image), same reasoning as an address breakpoint;
+   * `d1|l|<size>|<nonce>|<tid>|<base>|<entry>|<addr>|<name>` -- a
+     frame-scoped local, stamped with a per-run nonce. A `dataId` from an
+     earlier session is refused BY NAME ("...created for a stack frame of an
+     earlier debug session"), never re-armed at whatever now lives there.
+     `canPersist` is reported `false` for exactly this kind, so a
+     well-behaved client does not even try.
+
+   **Access types.** `accessTypes` is `["write","readWrite"]` and never
+   contains `read`: there is no read-only watchpoint on x86/x64, and listing
+   one would advertise a filter the hardware cannot apply. The `readWrite`
+   caveat travels in the `dataBreakpointInfo` description and again in the
+   armed breakpoint's `message`. `accessType:"read"` in `setDataBreakpoints`
+   is refused per entry, pointing at `readWrite` -- same decision the MCP
+   layer took in increment 5.
+
+   **Refused, with the reason surfaced instead of a guess:**
+   * a `variablesReference` that is an expansion handle (a field of an
+     expanded object or record): the expander answers in values, not
+     addresses, so there is no address to watch. This is a real gap -- "which
+     assignment corrupts this field" is a question users have -- and closing
+     it needs an address-bearing expansion handle, not a heuristic;
+   * the Registers scope: a CPU register has no memory address;
+   * `setDataBreakpoints` while the target is RUNNING: arming reads and writes
+     live thread contexts, which are only stable at a stop. Every entry comes
+     back `verified:false` with that reason (the same gate the MCP tools use,
+     for the same reason: letting the session refuse them uniformly makes
+     already-armed watchpoints look newly broken). Consequence to know about:
+     a data breakpoint DELETED from the UI while the target runs stays armed
+     until the next stop.
+
+   Tests -- `Test_DataBp_*` in `DebuggerTests\DebuggerTests.pas` (5 tests, each
+   run in BOTH the mono and the BPL fixture): capability advertised;
+   info+set+continue stops with reason `data breakpoint` and `V: $1 -> $2A
+   (thread N)`; the stale flow (announced, removed, and re-arming refused);
+   `read` refused; the Registers scope refused with a reason. Session-level --
+   `DataBp_Info_OffersWriteAndReadWriteButNeverRead`,
+   `DataBp_Info_RefusesUnknownNameWithReason`,
+   `DataBp_LocalWatch_FiresWithOldNew`,
+   `DataBp_LocalWatch_GoesStaleWhenFrameExits` in
+   `DebuggerTests\DebugSessionTests.pas`, the last two mirrored into
+   `TWin32RunControlTests` (frame identity is EBP-based there and liveness runs
+   over the x86 walk -- neither is exercised by the x64 pair). New TestTarget
+   fixture `RunDataBpLocalFixture` (`-run-databp-local`): `DataBpLocalWriter`
+   holds `V` live and writes it once; `DataBpLocalAfter` then runs at the SAME
+   stack depth with a local of the same width, so the slot is genuinely reused.
+
+   Negative controls run and reverted, all failing exactly as intended in both
+   DAP fixtures and (where they exist) on both bitnesses:
+   * remove the `srDataBreakpoint` case from the `stopped` event ->
+     `Test_DataBp_LocalWrite_StopsWithOldNewAndThread` failed with
+     `Expected [data breakpoint] but got []` -- i.e. the pre-fix wire really
+     did carry no reason at all;
+   * accept `accessType:"read"` as read-or-write ->
+     `Test_DataBp_ReadAccessRefusedWithReason` failed with "a read-only
+     watchpoint must be refused, not silently armed as readWrite";
+   * drop the Registers-scope branch -> the refusal fell through to the
+     expansion-handle message and `Test_DataBp_Info_RegisterScopeRefusedWithReason`
+     failed;
+   * disable `PruneStaleDataBreakpoints` -> `DataBp_LocalWatch_GoesStaleWhenFrameExits`
+     and its Win32 mirror failed with "the watchpoint on a dead frame was NOT
+     retired -- it is now watching reused stack", and both DAP stale tests
+     timed out waiting for the announcement;
+   * disable the arm-time liveness test -> all four stale tests failed with
+     "re-arming a dead frame must be refused", confirming the client's next
+     whole-set replace would indeed re-arm it.
 
 ## Tests to write (both bitnesses, mono and BPL fixtures)
 
@@ -425,7 +558,12 @@ menu appears once the capabilities are declared):
 - Slot exhaustion refuses the fifth with a message, and the first four still
   work — proved by freeing one slot and confirming its number is reused. DONE
   (x64 only).
-- Misaligned or odd-sized request is refused, not rounded.
+- Misaligned or odd-sized request is refused, not rounded. DONE for the width
+  half (`DataBp_Info_OffersWriteAndReadWriteButNeverRead` pins the derived
+  width; `GetDataBreakpointInfo` refuses a type with no 1/2/4/8 width and a
+  misaligned address). The alignment branch itself has no fixture: every local
+  and global in the test targets is naturally aligned, and manufacturing a
+  misaligned one would be a fixture about the fixture.
 - Stepping still works with a watchpoint armed (the `DR6` case), and a watchpoint
   hit during a step is not reported as a step completion. DONE — and the negative
   controls are worth recording, because one of them says less than it looks:
@@ -445,9 +583,47 @@ menu appears once the capabilities are declared):
   — a bounded `WaitForSingleObject` on the target process is the failure
   signature for a stray armed `DR7`, which would otherwise trap into no
   debugger and hang the process behind a modal RTL exception dialog).
-- A local-scoped watchpoint is reported stale after its frame exits.
+- A local-scoped watchpoint is reported stale after its frame exits. DONE, both
+  bitnesses at the session level and both fixtures at the DAP level
+  (`DataBp_LocalWatch_GoesStaleWhenFrameExits`, `Win32_...`,
+  `Test_DataBp_LocalGoesStale_RemovedAndAnnounced`).
 
 ## Deferred, with the reason
+
+**A watchpoint on a FIELD of an expanded object or record.** DAP offers it --
+VS Code puts "Break on Value Change" on every row of the Variables tree -- and
+`dataBreakpointInfo` receives the expansion handle as `variablesReference`. The
+expander (`VariableExpander`) answers in formatted VALUES, not addresses, so
+there is nothing to derive an address from without either re-resolving the whole
+`evaluateName` chain (which returns a value, not an lvalue) or teaching the
+expansion handles to carry the address of what they expanded. The second is the
+real fix; until then the request is refused with that sentence rather than
+answered with an address that is not the field's.
+
+**Applying a `setDataBreakpoints` that arrives while the target is running.**
+Arming touches live thread contexts. A pending-set queue drained at the next
+stop is buildable (the source-breakpoint path already has `FPendingBps`), but it
+also needs the already-sent `verified:false` response to be corrected by a later
+`breakpoint` event, so it is a whole async path rather than a small addition.
+Deliberately not built; the refusal names the state instead.
+
+**Following a local across ALL its activations — CONSIDERED AND REJECTED
+(2026-08-08, maintainer's decision).** A frame-scoped watchpoint covers ONE
+activation: the frame that was live when it was armed. The alternative — "watch
+this variable every time the routine runs" — would need a breakpoint on the
+routine's ENTRY to recompute the slot address per call, which stops the target
+thousands of times on a hot routine; it collides with recursion, where many
+activations are live at once and each has a different address against four
+hardware slots in total; and it multiplies again per thread. It also answers a
+question users rarely ask: "who corrupts this variable" almost always means *in
+this activation, now*.
+
+What makes the single-activation version honest is that a stale watchpoint
+cannot lie quietly: the only way it misleads is by FIRING, and firing is a stop,
+which is exactly when `PruneStaleDataBreakpoints` can see the frame is gone. The
+worst case is one spurious stop, labelled as landing on reused stack — not a
+stream of false hits. Do not reopen this without a concrete case the
+single-activation form cannot serve.
 
 **Software (page-guard) watchpoints** for regions larger than 8 bytes or beyond
 four slots. `PAGE_GUARD` traps the whole page, so every access to anything else on

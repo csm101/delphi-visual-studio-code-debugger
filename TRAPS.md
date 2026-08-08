@@ -150,6 +150,10 @@ absurdly.
   vacuously.
 - **Do not assert `proven:true` on raw-stack hits from an x64 fixture** — the
   call-site decoder is x86 only, so on x64 every hit is honestly `proven:false`.
+- **`Format('%x', ...)` emits UPPERCASE hex.** Every debugger-rendered address or
+  value string (`$2A`, not `$2a`) follows it, so an assertion written in lowercase
+  fails on a feature that works. Cost one full build+run round on the
+  data-breakpoint description tests.
 
 ## What the suite cannot prove
 

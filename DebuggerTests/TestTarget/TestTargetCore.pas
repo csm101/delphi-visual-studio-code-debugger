@@ -1936,6 +1936,47 @@ begin
   GSink.Use(['databp thread done ', GDataBpThreadWatched, GDataBpThreadLate]);  // {BP:DATABPTHREAD_DONE}
 end;
 
+// --- Frame-scoped (local) watchpoint fixture -------------------------------
+// A watchpoint on a LOCAL is only meaningful while the frame that owns it is
+// still on the stack, and this fixture supplies both halves of that:
+//
+//   * DataBpLocalWriter stops with V already initialised (so a watchpoint set
+//     there has a real OLD value) and then writes it exactly once -- the hit;
+//   * that frame then EXITS and DataBpLocalAfter runs at the SAME stack depth
+//     with a local of the same width, so the slot is genuinely reused. From
+//     that point the watchpoint must be reported stale and withdrawn, never
+//     reported as another change to V.
+//
+// The watched write is deliberately not the routine's first statement (see the
+// same note on DataBpWriteWatched).
+
+procedure DataBpLocalAfter;
+var
+  Reuse: Integer;
+begin
+  Reuse := 4242;                                        // {BP:DATABPLOCAL_REUSE}
+  GDataBpOther := GDataBpOther + Reuse;
+end;
+
+procedure DataBpLocalWriter;
+var
+  V: Integer;
+begin
+  V := 1;
+  GSink.Use(['databp local start ', V]);                // {BP:DATABPLOCAL_ARM}
+  V := V + 41;                                          // {BP:DATABPLOCAL_WRITE}
+  GSink.Use(['databp local end ', V]);                  // {BP:DATABPLOCAL_END}
+end;
+
+procedure RunDataBpLocalFixture;
+begin
+  GDataBpOther := 0;
+  GSink.Use(['databp local ready']);                    // {BP:DATABPLOCAL_READY}
+  DataBpLocalWriter;
+  DataBpLocalAfter;                                     // {BP:DATABPLOCAL_AFTER_CALL}
+  GSink.Use(['databp local done ', GDataBpOther]);      // {BP:DATABPLOCAL_DONE}
+end;
+
 procedure RunBpTests;
 var
   I, Acc: Integer;
@@ -2034,6 +2075,9 @@ begin
 
   if FindCmdLineSwitch('run-databp-thread') or FindCmdLineSwitch('-run-databp-thread') then
     RunDataBpThreadFixture;
+
+  if FindCmdLineSwitch('run-databp-local') or FindCmdLineSwitch('-run-databp-local') then
+    RunDataBpLocalFixture;
 
   if FindCmdLineSwitch('run-av') or FindCmdLineSwitch('-run-av') then
     RunAccessViolation;

@@ -375,6 +375,11 @@ type
     // Wow64Get/SetThreadContext, not just the raw per-thread primitive.
     [Test] procedure Win32_DataBp_SessionApi_StopsWithOldNewAndThread;
     [Test] procedure Win32_DataBp_DuringSyntheticCall_AbortsEvaluation;
+    // Increment 6, WOW64: a watchpoint scoped to a LOCAL's frame. Frame
+    // identity is EBP + entry VA here rather than RBP, and the stack walk that
+    // decides liveness is the x86 one -- neither is exercised by the x64 pair.
+    [Test] procedure Win32_DataBp_LocalWatch_FiresWithOldNew;
+    [Test] procedure Win32_DataBp_LocalWatch_GoesStaleWhenFrameExits;
     // An application split across runtime packages is this project's core use
     // case and the shape where debugger bugs have historically surfaced, so it
     // has to hold on both bitnesses rather than only x64. The breakpoint is
@@ -450,6 +455,14 @@ type
     [Test] procedure DataBp_SessionApi_SlotExhaustion_PerSpecResults;
     [Test] procedure DataBp_SessionApi_RemoveAll_StopsWatching;
     [Test] procedure DataBp_DuringSyntheticCall_AbortsEvaluation;
+    // Increment 6 (DATA_BREAKPOINTS_PLAN.md): watchpoints on LOCALS, which
+    // increment 4 refused. GetDataBreakpointInfo derives the address and the
+    // frame identity; the session retires the watchpoint at the first stop
+    // where that frame is gone rather than watching reused stack.
+    [Test] procedure DataBp_Info_OffersWriteAndReadWriteButNeverRead;
+    [Test] procedure DataBp_Info_RefusesUnknownNameWithReason;
+    [Test] procedure DataBp_LocalWatch_FiresWithOldNew;
+    [Test] procedure DataBp_LocalWatch_GoesStaleWhenFrameExits;
     // F19: a step-into used to report at the callee's ENTRY address, before the
     // prologue had spilled the register arguments into their home slots, so Self
     // and every by-register parameter read as the CALLER's leftover frame bytes
@@ -1156,6 +1169,217 @@ begin
     Assert.AreEqual<UInt64>(1, Other.RawValue,
       'GDataBpOther should show only the FIRST +=1 -- the trailing +=2 must ' +
       'never have run if the call was really aborted at the trap: ' + Other.Value);
+  finally
+    Session.Terminate;
+    Session.Free;
+  end;
+end;
+
+{ ---------------- increment 6: watchpoints scoped to a LOCAL's frame ------- }
+// A local's address is a stack slot, so it only means the variable the user
+// picked while the frame that owns it is on the stack. GetDataBreakpointInfo
+// resolves BOTH -- the address and the identity of that frame -- and the
+// session retires the watchpoint at the first stop where the frame is gone.
+
+const
+  DATABPLOCAL_ARGS = '-run-databp-local';
+
+type
+  // Receiver for TDebugSession.OnDataBreakpointRemoved. A stale watchpoint that
+  // is removed WITHOUT telling anyone is only half the fix, so the notification
+  // is asserted, not assumed.
+  TDataBpRemovalSink = class
+  public
+    Count:      Integer;
+    LastReason: string;
+    LastShown:  string;
+    procedure Removed(const Bp: TSessionDataBreakpoint; const Reason: string);
+  end;
+
+procedure TDataBpRemovalSink.Removed(const Bp: TSessionDataBreakpoint;
+  const Reason: string);
+begin
+  Inc(Count);
+  LastReason := Reason;
+  LastShown  := Bp.DisplayName;
+end;
+
+// Resolves the local V at DATABPLOCAL_ARM and returns a spec ready to arm.
+function LocalWatchSpecForV(Session: TDebugSession): TDataBpSpec;
+begin
+  var Info := Session.GetDataBreakpointInfo('V', 0);
+  Assert.IsTrue(Info.CanWatch, 'GetDataBreakpointInfo refused the local V: ' + Info.Reason);
+  Assert.AreEqual(Ord(dbsLocal), Ord(Info.Kind), 'V must resolve as a frame-scoped local');
+  Assert.AreEqual(4, Info.SizeBytes, 'V is an Integer: the watch width must be 4 bytes');
+  Assert.IsTrue(Info.Frame.Scoped, 'a local must come back with its frame identity');
+  Assert.IsTrue(Info.Frame.FrameBase <> 0, 'the owning frame must have a frame pointer');
+
+  Result             := Default(TDataBpSpec);
+  Result.Expression  := Format('$%x', [Info.Address]);
+  Result.SizeBytes   := Info.SizeBytes;
+  Result.WriteOnly   := True;
+  Result.DisplayName := Info.DisplayName;
+  Result.Frame       := Info.Frame;
+end;
+
+procedure RunDataBpLocalWatchFiresWithOldNew(const ExePath, MapPath,
+  RsmPath, SourceDir: string);
+begin
+  var ArmLine := MarkerLineIn(SourceDir + DATABP_SOURCE, 'DATABPLOCAL_ARM');
+  Assert.IsTrue(ArmLine > 0, 'DATABPLOCAL_ARM marker not found');
+
+  var Session := OpenSessionAtMarker(ExePath, MapPath, RsmPath, SourceDir,
+    DATABP_SOURCE, ArmLine, DATABPLOCAL_ARGS);
+  try
+    Assert.AreEqual(Ord(dsStopped), Ord(Session.State), 'did not stop at DATABPLOCAL_ARM');
+
+    var Bps := Session.SetDataBreakpoints([LocalWatchSpecForV(Session)]);
+    Assert.AreEqual<Integer>(1, Length(Bps), 'expected one result');
+    Assert.IsTrue(Bps[0].Verified, 'the watchpoint on local V was refused: ' + Bps[0].Message);
+
+    Session.ContinueExecution;
+    PumpUntilStop(Session, 30000);
+    Assert.AreEqual(Ord(dsStopped), Ord(Session.State), 'the target never stopped');
+
+    var Snap := Session.Snapshot;
+    Assert.AreEqual(Ord(srDataBreakpoint), Ord(Snap.StopReason),
+      'expected a data-breakpoint stop');
+    var Desc := Snap.DataBreakpointDescription;
+    Assert.IsTrue(Desc.StartsWith('V:'),
+      'the stop must name the VARIABLE, not the raw address: ' + Desc);
+    Assert.IsTrue(Desc.Contains('$1 -> $2A'),
+      'the stop must carry old -> new (1 -> 42): ' + Desc);
+  finally
+    Session.Terminate;
+    Session.Free;
+  end;
+end;
+
+procedure RunDataBpLocalWatchGoesStale(const ExePath, MapPath,
+  RsmPath, SourceDir: string);
+begin
+  var ArmLine  := MarkerLineIn(SourceDir + DATABP_SOURCE, 'DATABPLOCAL_ARM');
+  var DoneLine := MarkerLineIn(SourceDir + DATABP_SOURCE, 'DATABPLOCAL_DONE');
+  Assert.IsTrue((ArmLine > 0) and (DoneLine > 0),
+    'DATABPLOCAL_ARM / DATABPLOCAL_DONE markers not found');
+
+  var Sink := TDataBpRemovalSink.Create;
+  var Session := OpenSessionAtMarker(ExePath, MapPath, RsmPath, SourceDir,
+    DATABP_SOURCE, ArmLine, DATABPLOCAL_ARGS);
+  try
+    Assert.AreEqual(Ord(dsStopped), Ord(Session.State), 'did not stop at DATABPLOCAL_ARM');
+    Session.OnDataBreakpointRemoved := Sink.Removed;
+
+    // A stop that is GUARANTEED to happen after the owning frame has exited, so
+    // staleness is detected at a stop that must occur rather than at a hit on
+    // reused stack that may or may not.
+    var ArmSpec, DoneSpec: TBpLineSpec;
+    ArmSpec       := Default(TBpLineSpec);
+    ArmSpec.Line  := ArmLine;
+    DoneSpec      := Default(TBpLineSpec);
+    DoneSpec.Line := DoneLine;
+    Session.SetBreakpoints(DATABP_SOURCE, [ArmSpec, DoneSpec]);
+
+    var Spec := LocalWatchSpecForV(Session);
+    var Bps  := Session.SetDataBreakpoints([Spec]);
+    Assert.IsTrue(Bps[0].Verified, 'setup: the watchpoint on V should have armed: ' +
+      Bps[0].Message);
+
+    // First stop: the write to V while its frame is still live. Nothing stale yet.
+    Session.ContinueExecution;
+    PumpUntilStop(Session, 30000);
+    Assert.AreEqual(0, Sink.Count,
+      'the watchpoint was retired while its frame was still on the stack');
+    Assert.AreEqual<Integer>(1, Length(Session.ListDataBreakpoints),
+      'the watchpoint must still be armed while its frame lives');
+
+    // Resume. DataBpLocalWriter returns and DataBpLocalAfter runs at the same
+    // depth, reusing the slot; at the next stop the frame is gone.
+    Session.ContinueExecution;
+    PumpUntilStop(Session, 30000);
+    Assert.AreEqual(Ord(dsStopped), Ord(Session.State), 'the target never stopped again');
+
+    Assert.AreEqual(1, Sink.Count,
+      'the watchpoint on a dead frame was NOT retired -- it is now watching reused stack');
+    Assert.AreEqual('V', Sink.LastShown, 'the notification must name the variable');
+    Assert.IsTrue(Sink.LastReason.Contains('frame'),
+      'the notification must say WHY: ' + Sink.LastReason);
+    Assert.AreEqual<Integer>(0, Length(Session.ListDataBreakpoints),
+      'a stale watchpoint must be gone from the list, not merely disarmed');
+
+    // Re-arming the same address+frame must be refused by name: otherwise the
+    // next whole-set replace from a frontend would put it straight back.
+    var Again := Session.SetDataBreakpoints([Spec]);
+    Assert.IsFalse(Again[0].Verified, 're-arming a dead frame must be refused');
+    Assert.IsTrue(Again[0].Message.Contains('no longer on the stack'),
+      'the refusal must say the frame is gone: ' + Again[0].Message);
+  finally
+    Session.Terminate;
+    Session.Free;
+    Sink.Free;
+  end;
+end;
+
+procedure TDebugSessionTests.DataBp_LocalWatch_FiresWithOldNew;
+begin
+  RunDataBpLocalWatchFiresWithOldNew(TargetExe, TargetMap, TargetRsm, TargetDir);
+end;
+
+procedure TWin32RunControlTests.Win32_DataBp_LocalWatch_FiresWithOldNew;
+begin
+  RunDataBpLocalWatchFiresWithOldNew(Win32Exe, Win32Map, Win32Rsm, TargetDir);
+end;
+
+procedure TDebugSessionTests.DataBp_LocalWatch_GoesStaleWhenFrameExits;
+begin
+  RunDataBpLocalWatchGoesStale(TargetExe, TargetMap, TargetRsm, TargetDir);
+end;
+
+procedure TWin32RunControlTests.Win32_DataBp_LocalWatch_GoesStaleWhenFrameExits;
+begin
+  RunDataBpLocalWatchGoesStale(Win32Exe, Win32Map, Win32Rsm, TargetDir);
+end;
+
+// The access types reported must be the ones the CPU has. x86/x64 has no
+// read-only watchpoint, so a `read` type would advertise a filter that cannot
+// be applied -- the user would get write hits on a "read" break and read it as
+// a bug.
+procedure TDebugSessionTests.DataBp_Info_OffersWriteAndReadWriteButNeverRead;
+begin
+  var ArmLine := MarkerLineIn(TargetDir + DATABP_SOURCE, 'DATABPLOCAL_ARM');
+  Assert.IsTrue(ArmLine > 0, 'DATABPLOCAL_ARM marker not found');
+
+  var Session := OpenSessionAtMarker(TargetExe, TargetMap, TargetRsm, TargetDir,
+    DATABP_SOURCE, ArmLine, DATABPLOCAL_ARGS);
+  try
+    var Info := Session.GetDataBreakpointInfo('V', 0);
+    Assert.IsTrue(Info.CanWatch, 'GetDataBreakpointInfo refused V: ' + Info.Reason);
+    Assert.IsTrue(Info.AccessWrite,     'write must be offered');
+    Assert.IsTrue(Info.AccessReadWrite, 'readWrite must be offered');
+    Assert.IsTrue(Info.ReadWriteCaveat.Contains('read-only'),
+      'the read-or-write caveat must say there is no read-only watchpoint: ' +
+      Info.ReadWriteCaveat);
+    Assert.IsTrue(Info.Description.Contains('Integer'),
+      'the description must name the type it derived the width from: ' + Info.Description);
+  finally
+    Session.Terminate;
+    Session.Free;
+  end;
+end;
+
+procedure TDebugSessionTests.DataBp_Info_RefusesUnknownNameWithReason;
+begin
+  var ArmLine := MarkerLineIn(TargetDir + DATABP_SOURCE, 'DATABPLOCAL_ARM');
+  Assert.IsTrue(ArmLine > 0, 'DATABPLOCAL_ARM marker not found');
+
+  var Session := OpenSessionAtMarker(TargetExe, TargetMap, TargetRsm, TargetDir,
+    DATABP_SOURCE, ArmLine, DATABPLOCAL_ARGS);
+  try
+    var Info := Session.GetDataBreakpointInfo('NoSuchVariableAnywhere', 0);
+    Assert.IsFalse(Info.CanWatch, 'an unknown name must be refused, not resolved');
+    Assert.IsTrue(Info.Reason.Contains('unresolved'),
+      'the refusal must say the name did not resolve: ' + Info.Reason);
+    Assert.AreEqual<UInt64>(0, Info.Address, 'a refusal must carry no address');
   finally
     Session.Terminate;
     Session.Free;

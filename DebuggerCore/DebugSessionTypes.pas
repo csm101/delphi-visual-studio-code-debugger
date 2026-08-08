@@ -146,12 +146,38 @@ type
     HitCount:     Integer;
   end;
 
-  // Session-facing data-breakpoint spec (increment 4 of DATA_BREAKPOINTS_PLAN.md).
-  // Expression is a literal address ("$1234" / "0x1234" / a plain decimal) or a
-  // global/unit variable name resolved the same way the evaluator resolves one.
-  // Locals are explicitly out of scope here -- their lifetime is tied to a
-  // stack frame, which needs dataBreakpointInfo (increment 6); SetDataBreakpoints
-  // refuses them by name rather than silently accepting a stale address.
+  // Which frame a data breakpoint's address belongs to, and therefore how long
+  // that address means anything. dbtLocal is the ONLY kind whose address dies:
+  // it is valid exactly while the frame identified by (ThreadId, FrameBase,
+  // FuncEntryVA) is still on the stack (increment 6 of DATA_BREAKPOINTS_PLAN.md).
+  TDataBpScopeKind = (dbsAddress, dbsGlobal, dbsLocal);
+
+  // Identity of the stack frame a dbsLocal watchpoint is scoped to. Compared
+  // against the thread's live frames at EVERY stop; a frame that is gone makes
+  // the watchpoint STALE and it is removed rather than left watching whatever
+  // the next call reuses that slot for.
+  //
+  // Frame identity is (FrameBase, FuncEntryVA) rather than FrameBase alone
+  // because a different routine reaching the same stack depth reuses the same
+  // base. The residual, undetectable case is documented at FrameStillLive.
+  TDataBpFrameScope = record
+    Scoped:      Boolean;
+    ThreadId:    Cardinal;
+    FrameBase:   UInt64;
+    FuncEntryVA: UInt64;
+  end;
+
+  // Session-facing data-breakpoint spec (increment 4 of DATA_BREAKPOINTS_PLAN.md;
+  // frame scoping added by increment 6). Expression is a literal address
+  // ("$1234" / "0x1234" / a plain decimal) or a global/unit variable name
+  // resolved the same way the evaluator resolves one.
+  //
+  // A LOCAL is only accepted through Frame: the caller must first have resolved
+  // it against a live frame (TDebugSession.GetDataBreakpointInfo, which is what
+  // DAP's dataBreakpointInfo request drives) and must pass the resulting address
+  // as a literal together with that frame's identity. A bare local NAME is still
+  // refused by name -- an address with no frame behind it is a watchpoint on
+  // reused stack waiting to happen.
   TDataBpSpec = record
     Expression: string;
     SizeBytes:  Integer;   // must be 1, 2, 4 or 8; anything else is refused
@@ -160,6 +186,11 @@ type
     // writes, and the caller is told so via Message rather than left to find
     // out from a surprise hit.
     WriteOnly:  Boolean;
+    // What to CALL this watchpoint in a stop description. '' = use Expression.
+    // A frame-scoped local arrives as a literal address, so without this every
+    // stop would read "$7ff6...: $1 -> $2a" instead of naming the variable.
+    DisplayName: string;
+    Frame:       TDataBpFrameScope;
   end;
 
   TSessionDataBreakpoint = record
@@ -179,6 +210,34 @@ type
     // Refusal reason when Verified=False, or an informational note (e.g. the
     // read-or-write caveat above) when Verified=True.
     Message:    string;
+    DisplayName: string;
+    Frame:       TDataBpFrameScope;
+  end;
+
+  // What TDebugSession.GetDataBreakpointInfo could work out about a candidate
+  // watchpoint target -- the neutral answer behind DAP's dataBreakpointInfo.
+  // CanWatch=False means REFUSED, and Reason says why in the user's terms; the
+  // request never guesses an address it cannot justify.
+  //
+  // AccessWrite / AccessReadWrite are the access types genuinely available on
+  // this CPU. There is deliberately no read-only member: x86/x64 has no
+  // read-only watchpoint, so offering one would be a filter that does not
+  // exist. ReadWriteCaveat carries the sentence that must reach the user when
+  // read-or-write is chosen.
+  TDataBpTargetInfo = record
+    CanWatch:    Boolean;
+    Reason:      string;   // refusal reason when CanWatch=False
+    Kind:        TDataBpScopeKind;
+    DisplayName: string;   // what to call it ('V', 'GCounter', '$401000')
+    Description: string;   // human-readable summary for the frontend to echo
+    Address:     UInt64;
+    SizeBytes:   Integer;
+    ModuleName:  string;   // '' when the address is outside every known module
+    Rva:         UInt64;
+    Frame:       TDataBpFrameScope;
+    AccessWrite:     Boolean;
+    AccessReadWrite: Boolean;
+    ReadWriteCaveat: string;
   end;
 
   TSessionExceptionInfo = record

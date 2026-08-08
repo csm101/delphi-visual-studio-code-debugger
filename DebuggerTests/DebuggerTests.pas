@@ -893,6 +893,13 @@ type
     [Test] procedure Test_Flow_RecByVal_FieldsReadable;
     [Test] procedure Test_Bp_NoCodeLine_HandledCleanly;
 
+    // --- data breakpoints (hardware watchpoints) over the DAP surface ---
+    [Test] procedure Test_DataBp_CapabilityAdvertised;
+    [Test] procedure Test_DataBp_LocalWrite_StopsWithOldNewAndThread;
+    [Test] procedure Test_DataBp_LocalGoesStale_RemovedAndAnnounced;
+    [Test] procedure Test_DataBp_ReadAccessRefusedWithReason;
+    [Test] procedure Test_DataBp_Info_RegisterScopeRefusedWithReason;
+
     // --- BACKLOG stubs: registered so they are never forgotten. Each has
     //     [Ignore] + an Assert.Fail body documenting what to build. Remove
     //     [Ignore] when tackling; the Assert.Fail forces a real impl. ---
@@ -9873,6 +9880,217 @@ begin
     Assert.IsFalse(Res.Contains('not found') or (Res = ''),
       'param v must be evaluable from inside the body; got: ' + Res);
   finally Resp.Free; end;
+end;
+
+{ --- data breakpoints (hardware watchpoints) over the DAP surface ----------- }
+
+// One `breakpoints[i]` entry of a setDataBreakpoints response.
+function DataBpEntry(Resp: TJSONObject; Index: Integer): TJSONObject;
+begin
+  Result := nil;
+  var Arr := Resp.GetValue<TJSONArray>('breakpoints');
+  if (Arr <> nil) and (Index < Arr.Count) then
+    Result := Arr.Items[Index] as TJSONObject;   // owned by Resp
+end;
+
+procedure TDebuggerTests.Test_DataBp_CapabilityAdvertised;
+// Without this capability VS Code never puts "Break on Value Change" in the
+// Variables context menu, so neither of the two requests behind it is ever
+// sent -- the whole feature is invisible however well it works.
+begin
+  FClient := TDapClient.Create;
+  FClient.Start(AdapterExe);
+  var Caps := FClient.Initialize;
+  try
+    Assert.IsTrue(Caps.GetValue<Boolean>('supportsDataBreakpoints', False),
+      'the adapter must advertise supportsDataBreakpoints');
+  finally
+    Caps.Free;
+  end;
+end;
+
+procedure TDebuggerTests.Test_DataBp_LocalWrite_StopsWithOldNewAndThread;
+// The case increment 5 refused outright: a watchpoint on a LOCAL, derived from
+// the variable the user right-clicked through dataBreakpointInfo.
+var
+  FrameId, LocalsRef: Integer;
+  DataId: string;
+begin
+  StartSession('DATABPLOCAL_ARM', FrameId, LocalsRef, ['--run-databp-local']);
+
+  var Info := FClient.DataBreakpointInfo('V', LocalsRef);
+  try
+    DataId := Info.GetValue<string>('dataId', '');
+    Assert.IsFalse(DataId = '', 'dataBreakpointInfo refused the local V: ' +
+      Info.GetValue<string>('description', ''));
+
+    // Exactly the access types the hardware has. `read` must never appear: there
+    // is no read-only watchpoint on x86/x64, and offering one would promise a
+    // filter that cannot be applied.
+    var Acc := Info.GetValue<TJSONArray>('accessTypes');
+    Assert.IsNotNull(Acc, 'dataBreakpointInfo reported no accessTypes');
+    var HasWrite     := False;
+    var HasReadWrite := False;
+    for var A in Acc do begin
+      Assert.AreNotEqual('read', A.Value,
+        'a read-only access type must never be offered -- x86/x64 has no such watchpoint');
+      if A.Value = 'write'     then HasWrite     := True;
+      if A.Value = 'readWrite' then HasReadWrite := True;
+    end;
+    Assert.IsTrue(HasWrite and HasReadWrite, 'both write and readWrite must be offered');
+
+    Assert.IsFalse(Info.GetValue<Boolean>('canPersist', True),
+      'a frame-scoped local must not be persisted by the client: the frame it ' +
+      'names will not exist in the next session');
+  finally
+    Info.Free;
+  end;
+
+  var SetResp := FClient.SetDataBreakpoints([DataId]);
+  try
+    var E := DataBpEntry(SetResp, 0);
+    Assert.IsNotNull(E, 'setDataBreakpoints returned no breakpoint entry');
+    Assert.IsTrue(E.GetValue<Boolean>('verified', False),
+      'the watchpoint on local V was not armed: ' + E.GetValue<string>('message', ''));
+  finally
+    SetResp.Free;
+  end;
+
+  FClient.Continue_.Free;
+  var Stopped := FClient.WaitForStopped(20000);
+  try
+    Assert.AreEqual('data breakpoint', Stopped.GetValue<string>('reason', ''),
+      'a watchpoint hit must report the data-breakpoint reason, not an unnamed stop');
+    var Desc := Stopped.GetValue<string>('description', '');
+    Assert.IsTrue(Desc.StartsWith('V:'),
+      'the stop must name the VARIABLE, not the raw address: ' + Desc);
+    Assert.IsTrue(Desc.Contains('$1 -> $2A'),
+      'the stop must carry old -> new (1 -> 42): ' + Desc);
+    Assert.IsTrue(Desc.Contains('thread '),
+      'the stop must name the thread that wrote the cell: ' + Desc);
+  finally
+    Stopped.Free;
+  end;
+end;
+
+procedure TDebuggerTests.Test_DataBp_LocalGoesStale_RemovedAndAnnounced;
+// The failure mode this whole mechanism exists to prevent: once the frame that
+// owned the local has exited, its address is reused stack, and every hit
+// reported afterwards would be a lie. The watchpoint must be withdrawn at the
+// first stop where the frame is gone, the user must be TOLD, and re-arming the
+// same dataId must be refused.
+var
+  FrameId, LocalsRef: Integer;
+  DataId: string;
+begin
+  StartSession('DATABPLOCAL_ARM', FrameId, LocalsRef, ['--run-databp-local']);
+  // A guaranteed later stop, so staleness is detected at a stop that must
+  // happen rather than at a hit on reused stack that may or may not.
+  var ArmLine  := Bp('DATABPLOCAL_ARM');
+  var DoneLine := Bp('DATABPLOCAL_DONE');
+  FClient.SetBreakpoints(FBpSourceFile, [ArmLine, DoneLine]).Free;
+
+  var Info := FClient.DataBreakpointInfo('V', LocalsRef);
+  try
+    DataId := Info.GetValue<string>('dataId', '');
+    Assert.IsFalse(DataId = '', 'dataBreakpointInfo refused the local V: ' +
+      Info.GetValue<string>('description', ''));
+  finally
+    Info.Free;
+  end;
+  FClient.SetDataBreakpoints([DataId]).Free;
+
+  // First stop: the write to V while its frame is still live -- a genuine hit.
+  FClient.Continue_.Free;
+  FClient.WaitForStopped(20000).Free;
+
+  // Resume. The frame exits; the next stop must retire the watchpoint and say so.
+  FClient.Continue_.Free;
+  var Msg := FClient.WaitForOutputContaining('data breakpoint on', 30000);
+  Assert.IsTrue(Msg.Contains('removed'),
+    'the announcement must say the watchpoint was removed: ' + Msg);
+  Assert.IsTrue(Msg.Contains('frame'),
+    'the announcement must say WHY (the frame is gone): ' + Msg);
+
+  FClient.WaitForStopped(20000).Free;
+
+  // Re-arming the same dataId must now be refused by name -- otherwise the very
+  // next setDataBreakpoints from the client would put it back on dead stack.
+  var Again := FClient.SetDataBreakpoints([DataId]);
+  try
+    var E := DataBpEntry(Again, 0);
+    Assert.IsNotNull(E, 'setDataBreakpoints returned no breakpoint entry');
+    Assert.IsFalse(E.GetValue<Boolean>('verified', False),
+      're-arming a watchpoint whose frame has exited must be refused');
+    Assert.IsTrue(E.GetValue<string>('message', '').Contains('no longer on the stack'),
+      'the refusal must say the frame is gone: ' + E.GetValue<string>('message', ''));
+  finally
+    Again.Free;
+  end;
+end;
+
+procedure TDebuggerTests.Test_DataBp_ReadAccessRefusedWithReason;
+// DAP has a `read` access type; x86/x64 has no read-only watchpoint. Arming
+// read-or-write instead would report a "read" breakpoint that fires on writes.
+var
+  FrameId, LocalsRef: Integer;
+  DataId: string;
+begin
+  StartSession('DATABPLOCAL_ARM', FrameId, LocalsRef, ['--run-databp-local']);
+
+  var Info := FClient.DataBreakpointInfo('V', LocalsRef);
+  try
+    DataId := Info.GetValue<string>('dataId', '');
+    Assert.IsFalse(DataId = '', 'dataBreakpointInfo refused the local V');
+  finally
+    Info.Free;
+  end;
+
+  var Resp := FClient.SetDataBreakpoints([DataId], ['read']);
+  try
+    var E := DataBpEntry(Resp, 0);
+    Assert.IsNotNull(E, 'setDataBreakpoints returned no breakpoint entry');
+    Assert.IsFalse(E.GetValue<Boolean>('verified', False),
+      'a read-only watchpoint must be refused, not silently armed as readWrite');
+    var M := E.GetValue<string>('message', '');
+    Assert.IsTrue(M.Contains('read-only'),
+      'the refusal must say no read-only watchpoint exists: ' + M);
+    Assert.IsTrue(M.Contains('readWrite'),
+      'the refusal must point at the access type that DOES work: ' + M);
+  finally
+    Resp.Free;
+  end;
+end;
+
+procedure TDebuggerTests.Test_DataBp_Info_RegisterScopeRefusedWithReason;
+// A register-held value has no address at all. Answering with one would be a
+// watchpoint on unrelated memory.
+var
+  FrameId, LocalsRef: Integer;
+begin
+  StartSession('DATABPLOCAL_ARM', FrameId, LocalsRef, ['--run-databp-local']);
+
+  var RegRef := 0;
+  var Sc := FClient.Scopes(FrameId);
+  try
+    for var S in Sc.GetValue<TJSONArray>('scopes') do
+      if (S as TJSONObject).GetValue<string>('name', '') = 'Registers' then
+        RegRef := (S as TJSONObject).GetValue<Integer>('variablesReference', 0);
+  finally
+    Sc.Free;
+  end;
+  Assert.IsTrue(RegRef > 0, 'no Registers scope found');
+
+  var Info := FClient.DataBreakpointInfo('RIP', RegRef);
+  try
+    var Did := Info.FindValue('dataId');
+    Assert.IsTrue((Did = nil) or (Did is TJSONNull),
+      'a CPU register must not yield a dataId');
+    Assert.IsTrue(Info.GetValue<string>('description', '').Contains('register'),
+      'the refusal must say why: ' + Info.GetValue<string>('description', ''));
+  finally
+    Info.Free;
+  end;
 end;
 
 initialization

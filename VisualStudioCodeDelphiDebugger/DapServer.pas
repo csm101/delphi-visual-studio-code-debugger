@@ -242,6 +242,12 @@ type
     // meaningful only together with its thread -- scopes/evaluate carry no
     // threadId, and without this the index was paired with the stopped thread.
     FLastStackTid: Cardinal;
+    // frameId of the last `scopes` request. A `dataBreakpointInfo` for a
+    // variable in the Locals scope carries the CONTAINER's variablesReference
+    // and no frameId, so the frame it means is the one the Locals scope was
+    // last opened for -- exactly what the following `variables` request resolves
+    // against too.
+    FLastScopeFrameId: Integer;
     // `rawStackScan` in launch.json: append the brute-force sweep of the
     // thread's stack below the walked frames. Off by default -- the results are
     // POSITIONS on the stack, not a chain, and a user who has not asked for
@@ -286,6 +292,14 @@ type
     FBpIds:         TDictionary<string, Integer>; // session 'file|line' -> stable DAP breakpoint id
     FBpSourcePath:  TDictionary<string, string>;  // lcase basename -> original request source path
     FNextBpId:      Integer;
+    // Data breakpoints. FDataBpIds gives each dataId a stable numeric DAP id so
+    // a `breakpoint` event can name one; FDataBpNonce stamps frame-scoped
+    // dataIds with the identity of THIS run, because VS Code persists data
+    // breakpoints across sessions and a stack frame from a previous process is
+    // not something to re-arm silently.
+    FDataBpIds:     TDictionary<string, Integer>;
+    FNextDataBpId:  Integer;
+    FDataBpNonce:   string;
     FModulesConfig: TArray<TModuleConfig>;         // from launch 'modules' array
     // The RTTI reader, leaf value readers and the nested-variable expansion engine
     // (opaque-handle table) all live in FSession now; reached via the FRtti / Readers
@@ -407,6 +421,23 @@ type
     procedure HandleSetExceptionBreakpoints(Seq: Integer; Args: TJSONObject);
     procedure HandleExceptionInfo(Seq: Integer; Args: TJSONObject);
     function  BuildExceptionFilterCapability: TJSONArray;
+    // Data breakpoints (watchpoints). `dataBreakpointInfo` turns a variable the
+    // user right-clicked into an opaque dataId; `setDataBreakpoints` replaces
+    // the whole armed set from those ids.
+    procedure HandleDataBreakpointInfo(Seq: Integer; Args: TJSONObject);
+    procedure HandleSetDataBreakpoints(Seq: Integer; Args: TJSONObject);
+    // dataId <-> what it names. The id is adapter-private and round-trips
+    // through the client (VS Code even persists it between sessions), so it
+    // carries everything needed to re-derive the target -- and, for a
+    // frame-scoped local, the session nonce that makes a stale one refusable.
+    function  EncodeDataId(const Info: TDataBpTargetInfo): string;
+    function  DecodeDataId(const DataId: string; out Spec: TDataBpSpec;
+                out Error: string): Boolean;
+    // Stable numeric DAP breakpoint id per dataId, for the `breakpoint` event.
+    function  DataBpIdFor(const DataId: string): Integer;
+    // The session retired a frame-scoped watchpoint because its frame exited.
+    procedure SessionDataBreakpointRemoved(const Bp: TSessionDataBreakpoint;
+                const Reason: string);
     procedure HandleContinue(Seq: Integer; Args: TJSONObject);
     function  StepThreadFromArgs(Args: TJSONObject): DWORD;
     procedure HandleNext(Seq: Integer; Args: TJSONObject);
@@ -554,10 +585,18 @@ begin
   FSession.OnSessionOutput           := OnSessionOutput;
   FSession.OnDllLoadedHook           := SessionDllLoaded;
   FSession.OnBreakpointChanged       := SessionBreakpointChanged;
+  FSession.OnDataBreakpointRemoved   := SessionDataBreakpointRemoved;
   FSession.OnSymbolsArrivedWhileStopped := SessionSymbolsArrived;
   FBpIds        := TDictionary<string, Integer>.Create;
   FBpSourcePath := TDictionary<string, string>.Create;
   FNextBpId     := 1;
+  FDataBpIds    := TDictionary<string, Integer>.Create;
+  FNextDataBpId := 10000;   // kept clear of the source-breakpoint id space
+  // Identity of THIS adapter run, stamped into every frame-scoped dataId. VS
+  // Code persists data breakpoints in workspace state and re-sends them at the
+  // next launch; a stack frame from a dead process must be refused by name, not
+  // re-armed at whatever now lives at that address.
+  FDataBpNonce  := Format('%x%x', [GetCurrentProcessId, GetTickCount64]);
   FRefToHandle := TDictionary<Integer, TVarHandle>.Create;
   FHandleToRef := TDictionary<TVarHandle, Integer>.Create;
   FEvalMissCache   := TDictionary<string, string>.Create;
@@ -673,6 +712,7 @@ begin
   FSynthSourceRefs.Free;
   FSynthSourceTexts.Free;
   FBpIds.Free;
+  FDataBpIds.Free;
   FBpSourcePath.Free;
   FIO.Free;
   inherited;
@@ -1516,6 +1556,19 @@ begin
         end;
       end;
       srPause:      Body.AddPair('reason', 'pause');
+      srDataBreakpoint: begin
+        // DAP's own reason string for a watchpoint hit. Without this case the
+        // stop arrived with NO reason at all, which VS Code renders as a plain
+        // pause -- indistinguishable from the user hitting the pause button.
+        Body.AddPair('reason', 'data breakpoint');
+        if Info.DataBreakpointDescription <> '' then begin
+          // "V: $1 -> $2a (thread 5)" -- old -> new and the thread that wrote
+          // it are the answer the feature exists to give, so they go in the
+          // inline header, not only in the log.
+          Body.AddPair('description', Info.DataBreakpointDescription);
+          Body.AddPair('text',        Info.DataBreakpointDescription);
+        end;
+      end;
     end;
     var StoppedTid: DWORD := Info.OsThreadId;
     if StoppedTid = 0 then StoppedTid := 1;
@@ -1735,6 +1788,13 @@ begin
     Caps.AddPair('supportsEvaluateForHovers',        TJSONBool.Create(True));
     Caps.AddPair('supportsSetVariable',              TJSONBool.Create(True));
     Caps.AddPair('supportsGotoTargetsRequest',       TJSONBool.Create(True));
+    // Hardware watchpoints. Declaring this is what puts "Break on Value Change"
+    // (and "... Value Access") into the Variables context menu, so the two
+    // requests behind it must be right before it is advertised:
+    // `dataBreakpointInfo` derives the dataId, `setDataBreakpoints` replaces the
+    // whole set. Only `write` and `readWrite` are ever offered -- x86/x64 has no
+    // read-only watchpoint (see HandleDataBreakpointInfo).
+    Caps.AddPair('supportsDataBreakpoints',          TJSONBool.Create(True));
     // NOTE: `supportsProgressReporting` is a CLIENT capability in the DAP spec
     // (InitializeRequestArguments), not an adapter one. VS Code ignores it in the
     // initialize response, so it does not gate whether progress toasts appear --
@@ -2290,6 +2350,355 @@ begin
   end;
 end;
 
+{ --------------------------- data breakpoints ------------------------------ }
+// A `dataId` is adapter-private and round-trips through the client verbatim, so
+// it must carry everything needed to re-derive the target: DAP's
+// setDataBreakpoints request sends the id and an access type and NOTHING else --
+// no address, no width, no frame.
+//
+// VS Code also PERSISTS data breakpoints in workspace state and re-sends them at
+// the next launch, which is why the frame-scoped form is stamped with this run's
+// nonce: an id naming a stack frame of a process that no longer exists is
+// refused by name instead of being re-armed at whatever now lives there.
+const
+  DATA_ID_PREFIX = 'd1';
+
+function TDapServer.EncodeDataId(const Info: TDataBpTargetInfo): string;
+begin
+  case Info.Kind of
+    dbsGlobal:
+      // By NAME, so it survives a relaunch and a rebased module: the address is
+      // resolved again at set time.
+      Result := Format('%s|g|%d|%s', [DATA_ID_PREFIX, Info.SizeBytes, Info.DisplayName]);
+    dbsLocal:
+      Result := Format('%s|l|%d|%s|%d|%x|%x|%x|%s',
+        [DATA_ID_PREFIX, Info.SizeBytes, FDataBpNonce, Info.Frame.ThreadId,
+         Info.Frame.FrameBase, Info.Frame.FuncEntryVA, Info.Address, Info.DisplayName]);
+  else
+    // module+RVA when the address falls inside a known image, a bare VA
+    // otherwise -- same reasoning as an address breakpoint.
+    if Info.ModuleName <> '' then
+      Result := Format('%s|a|%d|%s|%x', [DATA_ID_PREFIX, Info.SizeBytes,
+        Info.ModuleName, Info.Rva])
+    else
+      Result := Format('%s|a|%d||%x', [DATA_ID_PREFIX, Info.SizeBytes, Info.Address]);
+  end;
+end;
+
+function TDapServer.DecodeDataId(const DataId: string; out Spec: TDataBpSpec;
+  out Error: string): Boolean;
+
+  function HexToU64(const S: string; out V: UInt64): Boolean;
+  begin
+    Result := TryStrToUInt64('$' + S, V);
+  end;
+
+begin
+  Spec   := Default(TDataBpSpec);
+  Error  := '';
+  Result := False;
+  var P := DataId.Split(['|']);
+  if (Length(P) < 4) or (P[0] <> DATA_ID_PREFIX) then begin
+    Error := 'unrecognised dataId (obtain one from dataBreakpointInfo)';
+    Exit;
+  end;
+  Spec.SizeBytes := StrToIntDef(P[2], 0);
+  if not (Spec.SizeBytes in [1, 2, 4, 8]) then begin
+    Error := 'dataId carries an unsupported width';
+    Exit;
+  end;
+
+  if P[1] = 'g' then begin
+    Spec.Expression  := P[3];
+    Spec.DisplayName := P[3];
+    Exit(True);
+  end;
+
+  if P[1] = 'a' then begin
+    if Length(P) < 5 then begin
+      Error := 'malformed address dataId';
+      Exit;
+    end;
+    var Raw: UInt64;
+    if not HexToU64(P[4], Raw) then begin
+      Error := 'malformed address in dataId';
+      Exit;
+    end;
+    var Addr := Raw;
+    if P[3] <> '' then begin
+      var Found := False;
+      for var M in FSession.GetModules do
+        if SameText(M.Name, P[3]) then begin
+          Addr  := M.Base + Raw;
+          Found := True;
+          Break;
+        end;
+      if not Found then begin
+        Error := Format('module %s is not loaded, so this address cannot be resolved',
+          [P[3]]);
+        Exit;
+      end;
+    end;
+    Spec.Expression  := Format('$%x', [Addr]);
+    Spec.DisplayName := Spec.Expression;
+    Exit(True);
+  end;
+
+  if P[1] = 'l' then begin
+    if Length(P) < 9 then begin
+      Error := 'malformed local dataId';
+      Exit;
+    end;
+    if P[3] <> FDataBpNonce then begin
+      Error := 'this data breakpoint was created for a stack frame of an earlier ' +
+        'debug session; select the variable again and set it anew';
+      Exit;
+    end;
+    var Base, Entry, Addr: UInt64;
+    if not (HexToU64(P[5], Base) and HexToU64(P[6], Entry) and HexToU64(P[7], Addr)) then begin
+      Error := 'malformed frame data in dataId';
+      Exit;
+    end;
+    Spec.Expression         := Format('$%x', [Addr]);
+    Spec.DisplayName        := P[8];
+    Spec.Frame.Scoped       := True;
+    Spec.Frame.ThreadId     := StrToIntDef(P[4], 0);
+    Spec.Frame.FrameBase    := Base;
+    Spec.Frame.FuncEntryVA  := Entry;
+    Exit(True);
+  end;
+
+  Error := 'unrecognised dataId kind';
+end;
+
+function TDapServer.DataBpIdFor(const DataId: string): Integer;
+begin
+  if FDataBpIds.TryGetValue(DataId, Result) then
+    Exit;
+  Result := FNextDataBpId;
+  Inc(FNextDataBpId);
+  FDataBpIds.AddOrSetValue(DataId, Result);
+end;
+
+procedure TDapServer.HandleDataBreakpointInfo(Seq: Integer; Args: TJSONObject);
+
+  procedure Answer(const DataId, Description: string; Persist: Boolean;
+    WithAccessTypes: Boolean);
+  begin
+    var Body := TJSONObject.Create;
+    try
+      if DataId = '' then
+        Body.AddPair('dataId', TJSONNull.Create)
+      else
+        Body.AddPair('dataId', DataId);
+      Body.AddPair('description', Description);
+      if WithAccessTypes then begin
+        // Exactly the two the hardware has. `read` is NOT listed: x86/x64 has no
+        // read-only watchpoint, and offering it would advertise a filter that
+        // cannot be applied -- the user would get write hits on a "read" break
+        // and read it as a bug.
+        var Acc := TJSONArray.Create;
+        Acc.Add('write');
+        Acc.Add('readWrite');
+        Body.AddPair('accessTypes', Acc);
+      end;
+      Body.AddPair('canPersist', TJSONBool.Create(Persist));
+      FIO.SendResponse(Seq, 'dataBreakpointInfo', True, Body);
+    finally
+      Body.Free;
+    end;
+  end;
+
+begin
+  MarkBusy('Delphi debugger: resolving watchpoint target...');
+  EnsureMainRsm;
+  var Name    := '';
+  var VarsRef := 0;
+  var FrameId := -1;
+  if Args <> nil then begin
+    Name    := Args.GetValue<string>('name', '');
+    VarsRef := Args.GetValue<Integer>('variablesReference', 0);
+    if Args.FindValue('frameId') <> nil then
+      FrameId := Args.GetValue<Integer>('frameId', 0);
+  end;
+
+  if not FLaunched or (FDebugger = nil) then begin
+    Answer('', 'no debug session is running', False, False);
+    Exit;
+  end;
+
+  // A register genuinely has no address, and an expansion handle (an object /
+  // record child) does not carry one either -- the expander answers in values,
+  // not addresses. Say which, instead of returning an address that is not the
+  // variable's.
+  if VarsRef = REGISTERS_VAR_REF then begin
+    Answer('', 'a CPU register has no memory address to watch', False, False);
+    Exit;
+  end;
+  if (VarsRef <> 0) and (VarsRef <> LOCALS_VAR_REF) then begin
+    Answer('', 'watching a field of an expanded object or record is not supported ' +
+      'yet -- the expansion handle carries no address. Watch the variable itself, ' +
+      'or a global, instead', False, False);
+    Exit;
+  end;
+
+  // The Locals scope sends the container ref and no frameId; the frame it means
+  // is the one the scope was last opened for.
+  var EffFrame := FrameId;
+  if EffFrame < 0 then
+    EffFrame := FLastScopeFrameId;
+  if EffFrame < 0 then
+    EffFrame := 0;
+
+  var Info := FSession.GetDataBreakpointInfo(Name, EffFrame, FLastStackTid);
+  // GetDataBreakpointInfo selects the frame it resolves in and clears the
+  // selection afterwards. HandleScopes deliberately LEAVES a frame selected, so
+  // restore it: without this the next `variables` request on the Locals scope
+  // would read the TOP frame's locals instead of the frame the user is on.
+  FSession.SelectFrame(FLastScopeFrameId, FLastStackTid);
+  if not Info.CanWatch then begin
+    Answer('', Info.Reason, False, False);
+    Exit;
+  end;
+
+  var Desc := Info.Description;
+  if Info.ReadWriteCaveat <> '' then
+    Desc := Desc + ' -- ' + Info.ReadWriteCaveat;
+  // A frame-scoped local must NOT be persisted by the client: the frame it names
+  // will not exist in the next session, and re-arming it there would watch
+  // unrelated stack.
+  Answer(EncodeDataId(Info), Desc, Info.Kind <> dbsLocal, True);
+end;
+
+procedure TDapServer.HandleSetDataBreakpoints(Seq: Integer; Args: TJSONObject);
+type
+  TReq = record
+    DataId: string;
+    Spec:   TDataBpSpec;
+    Error:  string;   // '' = send this spec to the session
+  end;
+var
+  Reqs: TArray<TReq>;
+begin
+  MarkBusy('Delphi debugger: arming watchpoints...');
+  var Items: TJSONArray := nil;
+  if Args <> nil then
+    Items := Args.GetValue<TJSONArray>('breakpoints');
+
+  if Items <> nil then
+    for var It in Items do begin
+      var O := It as TJSONObject;
+      var R: TReq;
+      R        := Default(TReq);
+      R.DataId := O.GetValue<string>('dataId', '');
+      var Access := O.GetValue<string>('accessType', 'write');
+      if SameText(Access, 'read') then begin
+        // Refused OUTRIGHT rather than silently promoted: there is no read-only
+        // watchpoint on x86/x64, and quietly arming read-or-write would report a
+        // "read" breakpoint that fires on writes.
+        R.Error := 'no read-only watchpoint exists on x86/x64 -- use "readWrite" ' +
+          '(it fires on reads AND writes)';
+      end
+      else if DecodeDataId(R.DataId, R.Spec, R.Error) then
+        R.Spec.WriteOnly := not SameText(Access, 'readWrite');
+      Reqs := Reqs + [R];
+    end;
+
+  // Arming reads and writes live thread contexts, which are only stable at a
+  // stop. Gate here rather than letting the session refuse every entry with the
+  // same sentence: a request that arrives while running would otherwise make
+  // already-armed watchpoints look newly broken.
+  var Running := (FDebugger = nil) or (FSession.State <> dsStopped);
+
+  var Specs: TArray<TDataBpSpec>;
+  var Slots: TArray<Integer>;   // index into Specs for each Req, -1 when not sent
+  SetLength(Slots, Length(Reqs));
+  for var I := 0 to High(Reqs) do begin
+    Slots[I] := -1;
+    if Running or (Reqs[I].Error <> '') then
+      Continue;
+    Slots[I] := Length(Specs);
+    Specs    := Specs + [Reqs[I].Spec];
+  end;
+
+  var Results: TArray<TSessionDataBreakpoint>;
+  if not Running then
+    Results := FSession.SetDataBreakpoints(Specs);
+
+  var Body := TJSONObject.Create;
+  try
+    var Arr := TJSONArray.Create;
+    for var I := 0 to High(Reqs) do begin
+      var Item := TJSONObject.Create;
+      if Reqs[I].DataId <> '' then
+        Item.AddPair('id', TJSONNumber.Create(DataBpIdFor(Reqs[I].DataId)));
+      if Running then begin
+        Item.AddPair('verified', TJSONBool.Create(False));
+        Item.AddPair('message', 'data breakpoints can only be set while the target ' +
+          'is stopped');
+      end
+      else if Reqs[I].Error <> '' then begin
+        Item.AddPair('verified', TJSONBool.Create(False));
+        Item.AddPair('message', Reqs[I].Error);
+      end
+      else begin
+        var R := Results[Slots[I]];
+        Item.AddPair('verified', TJSONBool.Create(R.Verified));
+        if R.Message <> '' then
+          Item.AddPair('message', R.Message);
+      end;
+      Arr.AddElement(Item);
+    end;
+    Body.AddPair('breakpoints', Arr);
+    FIO.SendResponse(Seq, 'setDataBreakpoints', True, Body);
+  finally
+    Body.Free;
+  end;
+end;
+
+// TDebugSession.OnDataBreakpointRemoved subscriber. The session retires a
+// frame-scoped watchpoint the first time it stops and finds the owning frame
+// gone. Removing it silently would be the worst outcome available -- the user
+// would keep a breakpoint in the view that watches reused stack -- so this both
+// SAYS so in the Debug Console and withdraws it from the client.
+procedure TDapServer.SessionDataBreakpointRemoved(const Bp: TSessionDataBreakpoint;
+  const Reason: string);
+begin
+  SendOutputEvent('[data breakpoint] ' + Reason + sLineBreak, 'console');
+  DapLog('data breakpoint removed as stale: ' + Reason);
+  // The dataId is not carried on the session record, so the numeric id is only
+  // known when this watchpoint came through setDataBreakpoints in this run --
+  // which is the only way a frame-scoped one can exist.
+  for var Pair in FDataBpIds do begin
+    var Spec: TDataBpSpec;
+    var Err:  string;
+    if not DecodeDataId(Pair.Key, Spec, Err) then
+      Continue;
+    if not Spec.Frame.Scoped then
+      Continue;
+    // Frame identity ALONE is not enough to pick the right id: two locals of the
+    // same frame share it. The literal address in the decoded expression is what
+    // separates them.
+    if (Spec.Frame.FrameBase <> Bp.Frame.FrameBase) or
+       (Spec.Frame.FuncEntryVA <> Bp.Frame.FuncEntryVA) or
+       not SameText(Spec.Expression, Format('$%x', [Bp.Address])) then
+      Continue;
+    var EvBody := TJSONObject.Create;
+    try
+      var BpObj := TJSONObject.Create;
+      BpObj.AddPair('id',       TJSONNumber.Create(Pair.Value));
+      BpObj.AddPair('verified', TJSONBool.Create(False));
+      BpObj.AddPair('message',  Reason);
+      EvBody.AddPair('reason',     'removed');
+      EvBody.AddPair('breakpoint', BpObj);
+      FIO.SendEvent('breakpoint', EvBody);
+    finally
+      EvBody.Free;
+    end;
+    Break;
+  end;
+end;
+
 procedure TDapServer.HandleContinue(Seq: Integer; Args: TJSONObject);
 var
   Body: TJSONObject;
@@ -2597,8 +3006,10 @@ begin
   // the last stackTrace (GetCallStack). frameId 0 (top) or a frame without an RBP
   // clears the selection. The session clears the active frame again on the next
   // stop, so it never leaks across a resume (set-then-clear discipline).
-  if Args <> nil then
-    FSession.SelectFrame(Args.GetValue<Integer>('frameId', 0), FLastStackTid);
+  if Args <> nil then begin
+    FLastScopeFrameId := Args.GetValue<Integer>('frameId', 0);
+    FSession.SelectFrame(FLastScopeFrameId, FLastStackTid);
+  end;
   var Body     := TJSONObject.Create;
   var ScopeArr := TJSONArray.Create;
   try
@@ -3282,6 +3693,8 @@ begin
     else if Cmd = 'configurationDone' then HandleConfigurationDone(Seq)
     else if Cmd = 'setBreakpoints'    then HandleSetBreakpoints(Seq, Args)
     else if Cmd = 'setExceptionBreakpoints' then HandleSetExceptionBreakpoints(Seq, Args)
+    else if Cmd = 'dataBreakpointInfo'  then HandleDataBreakpointInfo(Seq, Args)
+    else if Cmd = 'setDataBreakpoints'  then HandleSetDataBreakpoints(Seq, Args)
     else if Cmd = 'exceptionInfo'     then HandleExceptionInfo(Seq, Args)
     else if Cmd = 'continue'          then HandleContinue(Seq, Args)
     else if Cmd = 'next'              then HandleNext(Seq, Args)
