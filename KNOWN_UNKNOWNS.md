@@ -670,16 +670,16 @@ channel; `TDebugSession.OnConsole` would be the sink).
   over/into/out act on the selected thread while the others are frozen (see
   `DAP_DEBUGGER_ARCHITECTURE.md` "Stepping" and `PROJECT_STATE.md`). Only the
   synthetic-call evaluator still runs on the stopped thread (frame-independent).
-- **Disassembly view** — `disassemble` request is unimplemented; need
-  a disassembler we can ship (zydis? capstone?) or a hand-rolled
-  Delphi-prologue-aware one.
 - **`readMemory` / `writeMemory` on DAP — DEFERRED, not missed.** The engine
   has both (`ReadProcessMemoryAt` / `WriteMemoryAt`) and the MCP server exposes
   them as `read_memory` / `write_memory`; only the DAP side is absent, so
   VS Code's hex viewer never lights up (it keys off
-  `supportsReadMemoryRequest`). The maintainer's call, 2026-08-03: not useful
-  enough to a HUMAN on its own, and it belongs with the disassembly view — a
-  memory pane without a disassembler is half a tool. Do the two together.
+  `supportsReadMemoryRequest`). The maintainer's call, 2026-08-03, was to do
+  it together with the Disassembly View since a memory pane without a
+  disassembler is half a tool. The Disassembly View itself shipped in
+  DISASSEMBLY_PLAN.md increment 6 (DAP `disassemble` +
+  `instructionPointerReference`); `readMemory`/`writeMemory` were not part of
+  that increment and remain unimplemented on DAP.
 - **`modules` / `loadedSources` requests — DONE for MCP, deliberately not for
   DAP.** `get_loaded_modules` exposes every mapped image with its base, size,
   symbol state and the debug-info formats that actually registered. The DAP

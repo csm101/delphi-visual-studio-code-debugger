@@ -762,6 +762,14 @@ type
     [Test] procedure Test_SetInstructionBreakpoints_Bpl_UnloadReload_Rebinds;
     [Test] procedure Test_SetInstructionBreakpoints_Basic_StopsAndVerifies;
 
+    // DISASSEMBLY_PLAN.md increment 6: DAP `disassemble` +
+    // `instructionPointerReference`, the last functional increment.
+    [Test] procedure Test_Initialize_AdvertisesSupportsDisassembleRequest;
+    [Test] procedure Test_StackTrace_InstructionPointerReference_MatchesRip;
+    [Test] procedure Test_Disassemble_Forward_ReturnsExactCountAtInstructionPointer;
+    [Test] procedure Test_Disassemble_NegativeOffset_ProvenBoundary_ReturnsRealPrecedingInstruction;
+    [Test] procedure Test_Disassemble_UnprovenAddress_MarksEveryInstructionInvalid_NeverGuessed;
+
     // --- type-sampler battery (TestTargetTypes.pas) ---
     // Tests marked [Ignore('TODO-RED: ...')] are documented BACKLOG: the
     // test asserts correct behaviour the debugger does not yet provide.
@@ -1329,6 +1337,39 @@ begin
     end;
   finally
     V.Free;
+  end;
+end;
+
+// Parses a '0x...'/'$...'/decimal address string into a comparable value.
+// DAP hex fields in this adapter are not zero-padded to a fixed width (unlike
+// a register's rendered value, which is), so string comparison between the
+// two is not safe -- always compare through this.
+function ParseHex64(S: string): UInt64;
+begin
+  S := Trim(S);
+  if S.StartsWith('0x', True) then
+    S := '$' + S.Substring(2);
+  Result := StrToUInt64(S);
+end;
+
+// The top stack frame's `instructionPointerReference` (DISASSEMBLY_PLAN.md
+// increment 6) -- the field that makes "Open Disassembly View" available
+// from the Call Stack, and the address form disassemble tests feed straight
+// back into FClient.Disassemble.
+function TopInstructionPointerRef(Client: TDapClient): string;
+var
+  ST:     TJSONObject;
+  Frames: TJSONArray;
+begin
+  Result := '';
+  ST := Client.StackTrace(1);
+  try
+    Frames := ST.GetValue<TJSONArray>('stackFrames');
+    if (Frames = nil) or (Frames.Count = 0) then
+      Exit;
+    Result := (Frames.Items[0] as TJSONObject).GetValue<string>('instructionPointerReference', '');
+  finally
+    ST.Free;
   end;
 end;
 
@@ -7276,6 +7317,152 @@ begin
       'address breakpoint did not stop the target');
   finally
     Stopped.Free;
+  end;
+end;
+
+procedure TDebuggerTests.Test_Initialize_AdvertisesSupportsDisassembleRequest;
+begin
+  FClient := TDapClient.Create;
+  FClient.Start(AdapterExe);
+  var Caps := FClient.Initialize;
+  try
+    Assert.IsTrue(Caps.GetValue<Boolean>('supportsDisassembleRequest', False),
+      'initialize response did not advertise supportsDisassembleRequest: ' + Caps.ToJSON);
+  finally
+    Caps.Free;
+  end;
+end;
+
+// instructionPointerReference is the field that makes "Open Disassembly
+// View" available from the Call Stack. Cross-checked against the
+// independent, already-trusted Registers-scope RIP oracle
+// (DISASSEMBLY_PLAN.md increment 5 used the same oracle before this field
+// existed), not merely asserted non-empty.
+procedure TDebuggerTests.Test_StackTrace_InstructionPointerReference_MatchesRip;
+var
+  FrameId, LocalsRef: Integer;
+begin
+  StartSession('EVAL_BODY', FrameId, LocalsRef);
+
+  var RipHex := CurrentRipHex(FClient, FrameId);
+  Assert.IsTrue(RipHex <> '', 'could not read RIP off the Registers scope');
+
+  var IPRef := TopInstructionPointerRef(FClient);
+  Assert.IsTrue(IPRef <> '', 'top frame carries no instructionPointerReference');
+  Assert.AreEqual(ParseHex64(RipHex), ParseHex64(IPRef),
+    'instructionPointerReference does not match the Registers-scope RIP');
+end;
+
+// instructionOffset:0 -- the plain forward case that fills the Disassembly
+// View's initial page.
+procedure TDebuggerTests.Test_Disassemble_Forward_ReturnsExactCountAtInstructionPointer;
+var
+  FrameId, LocalsRef: Integer;
+begin
+  StartSession('EVAL_BODY', FrameId, LocalsRef);
+
+  var IPRef := TopInstructionPointerRef(FClient);
+  Assert.IsTrue(IPRef <> '', 'top frame carries no instructionPointerReference');
+
+  var R := FClient.Disassemble(IPRef, 0, 5);
+  try
+    var Insns := R.GetValue<TJSONArray>('instructions');
+    Assert.IsTrue((Insns <> nil) and (Insns.Count = 5),
+      'expected exactly 5 decoded instructions: ' + R.ToJSON);
+
+    var First := Insns.Items[0] as TJSONObject;
+    Assert.AreEqual(ParseHex64(IPRef), ParseHex64(First.GetValue<string>('address', '0x0')),
+      'the first instruction must start EXACTLY at memoryReference');
+    Assert.IsTrue(First.GetValue<string>('instruction', '') <> '', 'first instruction has no text');
+    Assert.IsTrue(First.GetValue<string>('instructionBytes', '') <> '', 'first instruction has no bytes');
+    Assert.IsNull(First.FindValue('presentationHint'),
+      'a real decoded instruction must not carry presentationHint (reserved for invalid filler)');
+
+    var PrevAddr: UInt64 := 0;
+    for var I := 0 to Insns.Count - 1 do begin
+      var Addr := ParseHex64((Insns.Items[I] as TJSONObject).GetValue<string>('address', '0x0'));
+      if I > 0 then
+        Assert.IsTrue(Addr > PrevAddr, 'instruction addresses must be strictly ascending');
+      PrevAddr := Addr;
+    end;
+  finally
+    R.Free;
+  end;
+end;
+
+procedure TDebuggerTests.Test_Disassemble_NegativeOffset_ProvenBoundary_ReturnsRealPrecedingInstruction;
+var
+  FrameId, LocalsRef: Integer;
+begin
+  StartSession('EVAL_BODY', FrameId, LocalsRef);
+
+  var IPRef := TopInstructionPointerRef(FClient);
+  Assert.IsTrue(IPRef <> '', 'top frame carries no instructionPointerReference');
+
+  // EVAL_BODY sits past its routine's prologue -- McpE2ETests.pas'
+  // Disassemble_Before_ReturnsProvenPrecedingInstructions already proves a
+  // provable boundary exists here for a "before" request. instructionOffset
+  // -1 asks for exactly the ONE instruction immediately preceding the stop,
+  // plus the stop instruction itself at offset 0.
+  var R := FClient.Disassemble(IPRef, -1, 2);
+  try
+    var Insns := R.GetValue<TJSONArray>('instructions');
+    Assert.IsTrue((Insns <> nil) and (Insns.Count = 2), 'expected exactly 2 instructions: ' + R.ToJSON);
+
+    var Before := Insns.Items[0] as TJSONObject;
+    Assert.IsNull(Before.FindValue('presentationHint'),
+      'the preceding instruction must be a REAL proven decode, not invalid filler: ' + Before.ToJSON);
+    Assert.IsTrue(Before.GetValue<string>('instructionBytes', '') <> '',
+      'a proven preceding instruction must carry real bytes');
+
+    var AtStop := Insns.Items[1] as TJSONObject;
+    Assert.AreEqual(ParseHex64(IPRef), ParseHex64(AtStop.GetValue<string>('address', '0x0')),
+      'the slot at instructionOffset 0 must be exactly the stop address');
+
+    // The whole point of the proven-boundary-only design: the preceding
+    // instruction must end EXACTLY at the stop address, never overshoot or
+    // fall short of it.
+    var BeforeAddr := ParseHex64(Before.GetValue<string>('address', '0x0'));
+    var BeforeLen := Length(StringReplace(
+      Before.GetValue<string>('instructionBytes', ''), ' ', '', [rfReplaceAll])) div 2;
+    Assert.AreEqual(ParseHex64(IPRef), BeforeAddr + UInt64(BeforeLen),
+      'the preceding instruction does not end exactly at the stop address');
+  finally
+    R.Free;
+  end;
+end;
+
+// The refusal path (DISASSEMBLY_PLAN.md, "Decision: backward disassembly is
+// proven-boundary-only") expressed at the DAP layer. 0x1000 sits inside
+// Windows' reserved NULL-page region and belongs to no loaded module, so
+// neither a debug-info boundary nor a PE export can prove anything about it
+// in either direction -- the DAP spec still requires EXACTLY instructionCount
+// entries back (debugAdapterProtocol.json, DisassembleArguments
+// .instructionCount), so both the backward AND the forward halves must come
+// back as clearly-marked invalid filler, never a guessed decode.
+procedure TDebuggerTests.Test_Disassemble_UnprovenAddress_MarksEveryInstructionInvalid_NeverGuessed;
+var
+  FrameId, LocalsRef: Integer;
+begin
+  StartSession('EVAL_BODY', FrameId, LocalsRef);
+
+  var R := FClient.Disassemble('0x1000', -3, 5);
+  try
+    var Insns := R.GetValue<TJSONArray>('instructions');
+    Assert.IsTrue((Insns <> nil) and (Insns.Count = 5),
+      'the DAP spec requires EXACTLY instructionCount entries back: ' + R.ToJSON);
+    for var I := 0 to Insns.Count - 1 do begin
+      var Item := Insns.Items[I] as TJSONObject;
+      Assert.AreEqual('invalid', Item.GetValue<string>('presentationHint', ''),
+        Format('slot %d at an address with no proven boundary must be marked invalid: %s',
+          [I, Item.ToJSON]));
+      Assert.IsNull(Item.FindValue('instructionBytes'),
+        'an invalid filler slot must never carry instructionBytes -- no real bytes are known');
+      Assert.IsTrue(Item.GetValue<string>('address', '') <> '',
+        'even an invalid slot must carry the address field the DAP spec requires');
+    end;
+  finally
+    R.Free;
   end;
 end;
 

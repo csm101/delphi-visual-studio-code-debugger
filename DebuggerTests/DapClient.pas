@@ -143,6 +143,17 @@ type
     function    StepOver(ThreadId: Integer = 1): TJSONObject;
     function    SourceContent(SourceReference: Integer): TJSONObject;
     function    StackTrace(ThreadId: Integer = 1): TJSONObject;
+    // DAP disassemble (DISASSEMBLY_PLAN.md increment 6). InstructionOffset
+    // can be negative -- VS Code's own convention for "instructions before
+    // memoryReference". Raises on a success:false response; use
+    // DisassembleRaw to inspect a failure (e.g. "not stopped") without
+    // raising.
+    function    Disassemble(const MemoryReference: string; InstructionOffset,
+                  InstructionCount: Integer; ByteOffset: Integer = 0): TJSONObject;
+    // Same request, returning the FULL response (success + message/body)
+    // without raising -- for tests that expect the request to fail cleanly.
+    function    DisassembleRaw(const MemoryReference: string; InstructionOffset,
+                  InstructionCount: Integer; ByteOffset: Integer = 0): TJSONObject;
     function    Threads: TJSONObject;
     function    ExceptionInfo(ThreadId: Integer): TJSONObject;
     function    Scopes(FrameId: Integer): TJSONObject;
@@ -928,6 +939,34 @@ begin
   Args.AddPair('threadId', TJSONNumber.Create(ThreadId));
   Args.AddPair('levels',   TJSONNumber.Create(10));
   Result := WaitResp(SendCmd('stackTrace', Args));
+end;
+
+function TDapClient.Disassemble(const MemoryReference: string;
+  InstructionOffset, InstructionCount, ByteOffset: Integer): TJSONObject;
+var
+  Args: TJSONObject;
+begin
+  Args := TJSONObject.Create;
+  Args.AddPair('memoryReference',   MemoryReference);
+  Args.AddPair('instructionOffset', TJSONNumber.Create(InstructionOffset));
+  Args.AddPair('instructionCount',  TJSONNumber.Create(InstructionCount));
+  if ByteOffset <> 0 then
+    Args.AddPair('offset', TJSONNumber.Create(ByteOffset));
+  Result := WaitResp(SendCmd('disassemble', Args));
+end;
+
+function TDapClient.DisassembleRaw(const MemoryReference: string;
+  InstructionOffset, InstructionCount, ByteOffset: Integer): TJSONObject;
+var
+  Args: TJSONObject;
+begin
+  Args := TJSONObject.Create;
+  Args.AddPair('memoryReference',   MemoryReference);
+  Args.AddPair('instructionOffset', TJSONNumber.Create(InstructionOffset));
+  Args.AddPair('instructionCount',  TJSONNumber.Create(InstructionCount));
+  if ByteOffset <> 0 then
+    Args.AddPair('offset', TJSONNumber.Create(ByteOffset));
+  Result := WaitRespRaw(SendCmd('disassemble', Args));
 end;
 
 // DAP `source`: fetches the content behind a frame's sourceReference. The

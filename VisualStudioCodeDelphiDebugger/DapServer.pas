@@ -14,7 +14,7 @@ uses
   MapFileReader, TD32FileReader, RsmFileReader, WinDebuggerBase, DelphiRtti, DebugSourceIndex,
   DelphiValueReaders, SourceResolver, DebugSessionTypes, DebugSession, VariableExpander,
   BreakpointEval, PeSymbolSupport, ModuleSymbolLoader,
-  ExprEval, ValueEncoders;
+  ExprEval, ValueEncoders, Disassembler, ZydisDisassembler;
 
 // Defined further down; used earlier by OnDllLoaded. Forward-declared so
 // call order is irrelevant.
@@ -455,6 +455,26 @@ type
     procedure HandleStepOut(Seq: Integer; Args: TJSONObject);
     procedure HandlePause(Seq: Integer; Args: TJSONObject);
     procedure HandleStackTrace(Seq: Integer; Args: TJSONObject);
+    // DISASSEMBLY_PLAN.md increment 6: DAP `disassemble`, what makes the
+    // Disassembly View work. Reuses the exact same IDisassembler/Zydis
+    // pipeline the MCP `disassemble` tool already uses, and the SAME
+    // proven-boundary-only backward-decode mechanism (Disassembler
+    // .DisassembleBackward / IDebugTarget.NearestInstructionBoundaryBefore /
+    // NearestExportedEntryBefore) established in increment 4 -- see
+    // "Decision: backward disassembly is proven-boundary-only" in
+    // DISASSEMBLY_PLAN.md.
+    procedure HandleDisassemble(Seq: Integer; Args: TJSONObject);
+    // A slot this backend actually decoded: real bytes, real text, and
+    // symbol/source location when a provider knows one.
+    function  BuildDapInstruction(const Ins: TDisasmInstruction;
+                ResolveSymbols: Boolean): TJSONObject;
+    // A slot nothing could prove (an unproven backward span, or a forward
+    // read that ran off mapped memory): `presentationHint: 'invalid'`, the
+    // DAP spec's own mechanism for "filler, not reachable code"
+    // (DisassembleArguments.instructionCount requires EXACTLY instructionCount
+    // entries back; this is how the ones that cannot be decoded are padded).
+    // Addr is a synthetic filler address, never a proven instruction start.
+    function  BuildInvalidDapInstruction(Addr: UInt64): TJSONObject;
     // Placeholder document for a frame the providers could not give source for.
     procedure HandleSource(Seq: Integer; Args: TJSONObject);
     function  SyntheticSourceText(const F: TSessionFrame): string;
@@ -1810,6 +1830,12 @@ begin
     // let a click plant one. `setInstructionBreakpoints` behind it replaces the
     // whole address-breakpoint set on every call, matching the DAP spec.
     Caps.AddPair('supportsInstructionBreakpoints',   TJSONBool.Create(True));
+    // Disassembly View (DISASSEMBLY_PLAN.md increment 6): the `disassemble`
+    // request behind it decodes real target memory through the same
+    // IDisassembler/Zydis backend the MCP `disassemble` tool already uses.
+    // `instructionPointerReference` on every StackFrame (HandleStackTrace) is
+    // what enables "Open Disassembly View" from the Call Stack.
+    Caps.AddPair('supportsDisassembleRequest',       TJSONBool.Create(True));
     // NOTE: `supportsProgressReporting` is a CLIENT capability in the DAP spec
     // (InitializeRequestArguments), not an adapter one. VS Code ignores it in the
     // initialize response, so it does not gate whether progress toasts appear --
@@ -3021,6 +3047,11 @@ begin
       var F  := Frames[I];
       var FO := TJSONObject.Create;
       FO.AddPair('id', TJSONNumber.Create(I));
+      // DISASSEMBLY_PLAN.md increment 6: what enables "Open Disassembly View"
+      // from the Call Stack. Emitted for every frame, including raw-scan hits
+      // and nameless ones -- IP is always populated (TSessionFrame.IP), same
+      // field McpJson.FrameListToJson already echoes as "address".
+      FO.AddPair('instructionPointerReference', '0x' + IntToHex(F.IP, 1));
       // A raw hit must not be able to pass for a walked frame. Two independent
       // markers, because either one alone can be lost: the name carries it into
       // any log or copy-paste, and `subtle` greys it in the Call Stack view.
@@ -3072,6 +3103,232 @@ begin
     Body.AddPair('stackFrames', FrameArr);
     Body.AddPair('totalFrames', TJSONNumber.Create(Length(Frames)));
     FIO.SendResponse(Seq, 'stackTrace', True, Body);
+  finally
+    Body.Free;
+  end;
+end;
+
+{ ----------------------------- disassemble ---------------------------------
+  DISASSEMBLY_PLAN.md increment 6. Mirrors MCPDebugger\McpServer.pas'
+  ResolveZydisDllPath/DefaultZydisDllPath exactly -- VisualStudioCodeDelphiDebugger.exe
+  sits at the same three-levels-below-repo-root depth
+  (VisualStudioCodeDelphiDebugger\Win64\<Config>\*.exe) as DelphiDebuggerMcp.exe
+  (MCPDebugger\Win64\<Config>\*.exe), so the same relative fallback path finds
+  the committed dev-build DLL. Kept as a local copy rather than shared: the two
+  frontends are separate executables (see "Two frontends over one core" in
+  DAP_DEBUGGER_ARCHITECTURE.md), and increments 4/5 already duplicate small
+  helpers like this one across them rather than introduce a shared unit for a
+  few lines. }
+
+function DefaultZydisDllPath: string;
+begin
+  Result := TPath.GetFullPath(TPath.Combine(ExtractFileDir(ParamStr(0)),
+    '..\..\..\ThirdParty\Zydis\bin\x64\Zydis.dll'));
+end;
+
+function ResolveZydisDllPath: string;
+var
+  NextToExe: string;
+begin
+  NextToExe := TPath.Combine(ExtractFileDir(ParamStr(0)), 'Zydis.dll');
+  if FileExists(NextToExe) then
+    Exit(NextToExe);
+  if FileExists(DefaultZydisDllPath) then
+    Exit(DefaultZydisDllPath);
+  Result := '';
+end;
+
+function TDapServer.BuildDapInstruction(const Ins: TDisasmInstruction;
+  ResolveSymbols: Boolean): TJSONObject;
+begin
+  Result := TJSONObject.Create;
+  Result.AddPair('address', '0x' + IntToHex(Ins.VA, 1));
+  var BytesStr := '';
+  for var B in Ins.Bytes do begin
+    if BytesStr <> '' then
+      BytesStr := BytesStr + ' ';
+    BytesStr := BytesStr + IntToHex(B, 2);
+  end;
+  Result.AddPair('instructionBytes', BytesStr);
+  Result.AddPair('instruction', Ins.Text);   // 'db XX' when Zydis could not decode --
+                                              // real bytes, just an unrecognised
+                                              // encoding, never presentationHint 'invalid'
+  if ResolveSymbols and (Ins.Symbol <> '') then
+    Result.AddPair('symbol', Ins.Symbol);
+  if Ins.SrcFile <> '' then begin
+    var Src := TJSONObject.Create;
+    Src.AddPair('name', ExtractFileName(Ins.SrcFile));
+    var FullPath := ResolveSourcePath(Ins.SrcFile);
+    if FullPath <> '' then
+      Src.AddPair('path', FullPath);
+    Result.AddPair('location', Src);
+    Result.AddPair('line', TJSONNumber.Create(Ins.SrcLine));
+  end;
+end;
+
+function TDapServer.BuildInvalidDapInstruction(Addr: UInt64): TJSONObject;
+begin
+  Result := TJSONObject.Create;
+  Result.AddPair('address', '0x' + IntToHex(Addr, 1));
+  Result.AddPair('instruction', '??');
+  Result.AddPair('presentationHint', 'invalid');
+end;
+
+// DAP `disassemble`: memoryReference + offset (bytes) + instructionOffset
+// (instructions, can be negative) + instructionCount. The spec requires
+// returning EXACTLY instructionCount entries, padding whatever cannot be
+// decoded with an implementation-defined "invalid instruction" value
+// (debugAdapterProtocol.json, DisassembleArguments.instructionCount) --
+// BuildInvalidDapInstruction/presentationHint:'invalid' is this adapter's
+// answer, and it is also how the proven-boundary-only backward-decode
+// refusal from DISASSEMBLY_PLAN.md's increment-4 decision reaches the
+// client: never a partial or guessed decode presented as real, only fewer
+// PROVEN entries with the rest clearly marked. A forward read that runs off
+// mapped memory is padded the same way, for the same reason.
+procedure TDapServer.HandleDisassemble(Seq: Integer; Args: TJSONObject);
+var
+  BaseAddr: UInt64;
+  Disasm:   IDisassembler;
+
+  // The FULL backward range [instructionOffset .. -1], ascending by address,
+  // NegCount entries. Proven ones come from DisassembleBackward, which is
+  // all-or-nothing for the SPAN it is asked to decode: when the natural chain
+  // from the nearest proven boundary to BaseAddr is shorter than NegCount,
+  // only its LATEST entries (closest to BaseAddr) are proven; the earlier
+  // slots, closer to the boundary, have no proof at all and become invalid
+  // placeholders anchored on the boundary's own genuinely proven address
+  // (Proven[0].VA IS that boundary whenever it is the whole natural chain).
+  // When no boundary exists at all, every slot is invalid, anchored on
+  // BaseAddr itself.
+  function BuildBackwardSlots(ResolveSymbols: Boolean; NegCount: Int64): TArray<TJSONObject>;
+  var
+    Proven:       TArray<TDisasmInstruction>;
+    BoundaryVA:   UInt64;
+    HaveBoundary: Boolean;
+    Anchor:       UInt64;
+    ProvenLen, InvalidLen: Int64;
+  begin
+    SetLength(Result, NegCount);
+    HaveBoundary := FDebugger.NearestInstructionBoundaryBefore(BaseAddr, BoundaryVA);
+    if not HaveBoundary then
+      HaveBoundary := FDebugger.NearestExportedEntryBefore(BaseAddr, BoundaryVA);
+    Proven := nil;
+    if HaveBoundary then
+      Proven := DisassembleBackward(Disasm, BoundaryVA, BaseAddr, NegCount);
+
+    ProvenLen  := Length(Proven);
+    InvalidLen := NegCount - ProvenLen;
+    Anchor     := BaseAddr;
+    if ProvenLen > 0 then
+      Anchor := Proven[0].VA;
+    for var I := 0 to InvalidLen - 1 do
+      Result[I] := BuildInvalidDapInstruction(Anchor - UInt64(InvalidLen - I));
+    for var I := 0 to ProvenLen - 1 do
+      Result[InvalidLen + I] := BuildDapInstruction(Proven[I], ResolveSymbols);
+  end;
+
+  // PosCount entries starting PosSkip instructions after BaseAddr. A reader
+  // that runs dry (unmapped memory) truncates per IDisassembler's own
+  // contract; the missing tail is padded the same way as an unproven
+  // backward slot -- a truncated forward read is just as unprovable as an
+  // unproven backward span, and must never be guessed either.
+  function BuildForwardSlots(ResolveSymbols: Boolean; PosSkip, PosCount: Int64): TArray<TJSONObject>;
+  var
+    Forward: TArray<TDisasmInstruction>;
+    LastVA:  UInt64;
+  begin
+    SetLength(Result, PosCount);
+    Forward := Disasm.Disassemble(BaseAddr, Integer(PosSkip + PosCount));
+    LastVA := BaseAddr;
+    if Length(Forward) > 0 then
+      LastVA := Forward[High(Forward)].VA + UInt64(Forward[High(Forward)].Length);
+    for var I := 0 to PosCount - 1 do begin
+      var Idx := PosSkip + I;
+      if Idx < Length(Forward) then
+        Result[I] := BuildDapInstruction(Forward[Idx], ResolveSymbols)
+      else
+        Result[I] := BuildInvalidDapInstruction(LastVA + UInt64(Idx - Length(Forward)));
+    end;
+  end;
+
+begin
+  if (not FLaunched) or (FDebugger = nil) then begin
+    FIO.SendErrorResponse(Seq, 'disassemble', 'Not running');
+    Exit;
+  end;
+  if FSession.State <> dsStopped then begin
+    FIO.SendErrorResponse(Seq, 'disassemble', 'Cannot disassemble while the debuggee is running');
+    Exit;
+  end;
+  if Args = nil then begin
+    FIO.SendErrorResponse(Seq, 'disassemble', 'Missing arguments');
+    Exit;
+  end;
+
+  var MemRef := Args.GetValue<string>('memoryReference', '');
+  var RefAddr: UInt64;
+  if not TryStrToUInt64Lit(Trim(MemRef), RefAddr) then begin
+    FIO.SendErrorResponse(Seq, 'disassemble', 'invalid memoryReference: ' + MemRef);
+    Exit;
+  end;
+  var InstrCount := Args.GetValue<Int64>('instructionCount', 0);
+  if InstrCount <= 0 then begin
+    FIO.SendErrorResponse(Seq, 'disassemble', 'instructionCount must be > 0');
+    Exit;
+  end;
+  var ByteOffset     := Args.GetValue<Int64>('offset', 0);
+  var InstrOffset    := Args.GetValue<Int64>('instructionOffset', 0);
+  var ResolveSymbols := Args.GetValue<Boolean>('resolveSymbols', True);
+  BaseAddr := UInt64(Int64(RefAddr) + ByteOffset);
+
+  var Mode: TDisasmMachineMode;
+  if FDebugger.TargetLayout.PointerSize = 8 then
+    Mode := dmmLong64
+  else
+    Mode := dmmLegacy32;
+  var Reader: TDisasmByteReader :=
+    function(VA: UInt64; Buf: Pointer; Size: Integer): Integer
+    begin
+      Result := Integer(FDebugger.ReadCodeMemoryAt(VA, Buf, NativeUInt(Size)));
+    end;
+  Disasm := TZydisDisassembler.Create(Mode, Reader, FDebugInfo,
+    FDebugger.ImageBase, ResolveZydisDllPath);
+  if not Disasm.Available then begin
+    FIO.SendErrorResponse(Seq, 'disassemble', 'disassembler unavailable: ' + Disasm.StatusText);
+    Exit;
+  end;
+
+  var TrueNegCount: Int64 := 0;
+  var PosSkip:       Int64 := 0;
+  if InstrOffset < 0 then
+    TrueNegCount := -InstrOffset
+  else
+    PosSkip := InstrOffset;
+  var WantedBack := TrueNegCount;
+  if WantedBack > InstrCount then
+    WantedBack := InstrCount;
+  var PosCount := InstrCount - WantedBack;
+
+  var Slots: TArray<TJSONObject> := nil;
+  if TrueNegCount > 0 then begin
+    var FullBack := BuildBackwardSlots(ResolveSymbols, TrueNegCount);
+    // Slots beyond WantedBack fall outside the requested window entirely
+    // (a "far" backward request that never reaches BaseAddr) -- proven or
+    // not, they are not part of the response and must not leak.
+    for var I := WantedBack to TrueNegCount - 1 do
+      FullBack[I].Free;
+    Slots := Slots + Copy(FullBack, 0, WantedBack);
+  end;
+  if PosCount > 0 then
+    Slots := Slots + BuildForwardSlots(ResolveSymbols, PosSkip, PosCount);
+
+  var Body := TJSONObject.Create;
+  try
+    var InsArr := TJSONArray.Create;
+    for var S in Slots do
+      InsArr.AddElement(S);
+    Body.AddPair('instructions', InsArr);
+    FIO.SendResponse(Seq, 'disassemble', True, Body);
   finally
     Body.Free;
   end;
@@ -3788,6 +4045,7 @@ begin
     else if Cmd = 'stepOut'           then HandleStepOut(Seq, Args)
     else if Cmd = 'pause'             then HandlePause(Seq, Args)
     else if Cmd = 'stackTrace'        then HandleStackTrace(Seq, Args)
+    else if Cmd = 'disassemble'       then HandleDisassemble(Seq, Args)
     else if Cmd = 'source'            then HandleSource(Seq, Args)
     else if Cmd = 'scopes'            then HandleScopes(Seq, Args)
     else if Cmd = 'variables'         then HandleVariables(Seq, Args)

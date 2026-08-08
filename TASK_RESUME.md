@@ -25,94 +25,91 @@ longer true, delete it.
 
 ## Current task (2026-08-09)
 
-**`DISASSEMBLY_PLAN.md` increment 5 — address breakpoints. DONE, not
-committed; left in the tree for review.** Full detail (identity design, the
-cross-layer bug caught by the tests, every proof) lives in
-`DISASSEMBLY_PLAN.md` "Address breakpoints — the design point" and "Verified
-in increment 5" — this cursor is a pointer, not a repeat.
+**`DISASSEMBLY_PLAN.md` increment 6 — DAP `disassemble` + `instructionPointerReference`.
+DONE, not committed; left in the tree for review.** This closes the FUNCTIONAL
+plan: increments 1-6 are all landed. Only increment 7 (packaging: ship
+`Zydis.dll` with the installed adapter/MCP server, decide `/MD` vs `/MT`)
+remains. Full detail (the DAP-spec-mandated refusal shape, every proof, every
+negative control) is in `DISASSEMBLY_PLAN.md` "Verified in increment 6" and
+"Functional plan closed" — this cursor is a pointer, not a repeat.
 
-Both design points the task flagged as likely STOP candidates were resolved
-without a maintainer decision, because the plan text already answered them:
-identity stays module+RVA internally but the client-facing surface (MCP tool,
-`setInstructionBreakpoints`) only ever sees a plain address; module unload
-needed no new engine code (the existing VA-range unplant sweep in
-`TWinDebugger.HandleUnloadDll` is kind-agnostic), only a session-level
-`Verified` flip, and the plan's own words ("Deferred binding when the module
-loads should follow the path source breakpoints already use") pointed
-directly at reusing `RepostBreakpoints`'s SHAPE for `RepostAddressBreakpoints`.
+### The one design question resolved without a maintainer STOP
+
+The task flagged "how a refusal reaches VS Code" as possibly ambiguous. It was
+not: the DAP spec ITSELF answers it. `DisassembleArguments.instructionCount`
+(`debugAdapterProtocol.json`) requires returning EXACTLY that many entries,
+"any unavailable instructions ... replaced with an implementation-defined
+'invalid instruction' value"; `DisassembledInstruction.presentationHint:
+'invalid'` is documented as exactly that mechanism ("filler ... cannot be
+reached by the program"). Confirmed by fetching the schema directly, not
+recalled from memory. `BuildInvalidDapInstruction` in `DapServer.pas`
+implements it: no `instructionBytes`, `instruction: '??'`, a synthetic filler
+`address` anchored on the nearest thing actually proven.
 
 ### Files changed this session
 
-Engine/session: `DebuggerCore\DebugTarget.pas` (`TBreakpointKind`,
-`TAddrBpSpec`, `ckSetAddressBreakpoints`), `WinDebuggerBase.pas`
-(`ClearAddressBreakpointsByModule`, `DoSetAddressBreakpoints`, mirrors the
-source-bp equivalents, wired into `ProcessCommandQueue` +
-`DrainBreakpointCommands` — `HandleUnloadDll` needed NO change),
-`DebugSessionTypes.pas` (`TSessionBreakpoint` gained
-`Kind`/`ModuleName`/`Rva`/`Address`/`Message`), `DebugSession.pas`
-(`SetAddressBreakpoint`, `RemoveAddressBreakpoint`, `ResolveModuleForAddress`,
-`EngineModuleNameFor`, `RepostAddressBreakpoints`, hooked into
-`HandleDllLoaded`/`HandleDllUnloaded`/`RemoveAllBreakpoints`).
-MCP: `McpJson.pas`, `McpServer.pas` (`set_breakpoint_at_address` /
-`remove_breakpoint_at_address`), `McpToolSchemas.pas`.
-DAP: `DapServer.pas` (`HandleSetInstructionBreakpoints`, `FInstrBpIds`
-mirrors `FDataBpOwnIds`, `supportsInstructionBreakpoints: true`).
-Tests: `DapClient.pas` (`SetInstructionBreakpoints` helper),
-`DebugSessionTests.pas` (6 `AddrBp_*`), `McpE2ETests.pas` (4 tests, both
-bitnesses), `DebuggerTests.pas` (2 `Test_SetInstructionBreakpoints_*`,
-inherited by `TDebuggerTestsBpl` too → 4 instances; `CurrentRipHex` helper).
-Docs: `DISASSEMBLY_PLAN.md`, `DAP_DEBUGGER_ARCHITECTURE.md`, `MCP_SERVER.md`,
-`TEST_CATALOG.md`, `PROJECT_STATE.md`, `TRAPS.md` (3 new entries).
-
-### A real bug the tests caught, not designed around in advance
-
-The main-exe module-name SENTINEL differs by layer (`''` at the engine,
-matching `FDllBases`; the real lowercase filename at the session, from
-`GetModules`). The first cut sent the friendly name straight to the engine,
-so every main-exe address breakpoint resolved `Verified=True` at the session
-layer but the engine silently dropped the plant.
-`AddrBp_MainExe_SetAtKnownAddress_StopsThere` caught it on its FIRST run:
-`Expected [5] but got [6] address breakpoint did not stop the target (not
-planted?)`. Fixed with `TDebugSession.EngineModuleNameFor`. Full trail in
-`DISASSEMBLY_PLAN.md` "Verified in increment 5"; the trap itself in
-`TRAPS.md`.
+`VisualStudioCodeDelphiDebugger\DapServer.pas`: `supportsDisassembleRequest`
+capability; `instructionPointerReference` on every `StackFrame`
+(`HandleStackTrace`); `HandleDisassemble` (+ `BuildDapInstruction` /
+`BuildInvalidDapInstruction` / local `ResolveZydisDllPath`); dispatch wiring.
+Reuses `Disassembler.DisassembleBackward` +
+`IDebugTarget.NearestInstructionBoundaryBefore`/`NearestExportedEntryBefore`
+exactly as increment 4's decision required — no second backward mechanism.
+`DebuggerTests\DapClient.pas`: `Disassemble`/`DisassembleRaw` helpers.
+`DebuggerTests\DebuggerTests.pas`: `ParseHex64`/`TopInstructionPointerRef`
+helpers, 5 new `[Test]` methods (each runs under mono + BPL).
+Docs: `DISASSEMBLY_PLAN.md`, `DAP_DEBUGGER_ARCHITECTURE.md`, `TEST_CATALOG.md`,
+`PROJECT_STATE.md`, `KNOWN_UNKNOWNS.md` (removed the now-resolved
+"Disassembly view unimplemented" entry), `README.md`.
 
 ### Proven, not just implemented
 
-All 6 new `DebugSessionTests` tests plus the DAP dispatch wiring
-negative-controlled (revert/disable, re-run, confirm the intended failure
-text, revert back) — exact messages in `DISASSEMBLY_PLAN.md`. One control
-needed a second try: disabling only `HandleDllLoaded`'s repost did NOT break
-`AddrBp_Bpl_UnloadReload_Rebinds`, because `HandleDllUnloaded`'s own queued
-command gets drained by the next load event anyway — both sites had to be
-disabled together (now recorded in `TRAPS.md`).
-
-### Not done, not blocking
-
-No mid-flight fixture for the unload `Verified` transition (only the
-eventual refire is asserted); no live DAP `breakpoint`-changed event on an
-address breakpoint's verified-flip (a follow-up, not a correctness gap —
-`list_breakpoints` still reports the truth); no DAP-layer Win32 test
-(bitness proven at the MCP layer instead, a scoping choice recorded in
-`TEST_CATALOG.md`). Full list in `DISASSEMBLY_PLAN.md` "Verified in
-increment 5".
+All 5 new tests negative-controlled (revert the fix, rebuild the adapter,
+rerun via `RUNTESTS_ONLY`, confirm the intended failure text, revert back) —
+5 independent controls: capability flag forced False, the
+`instructionPointerReference` `AddPair` commented out, the `disassemble`
+dispatch line commented out, `HaveBoundary` forced False in the backward-slot
+builder, `presentationHint` omitted from the invalid-slot builder. Exact
+failure text for each in `DISASSEMBLY_PLAN.md` "Verified in increment 6".
 
 ### Full suite
 
-`DebuggerTests\build_and_run.bat`, run once via the test-runner agent:
-**1108 found / 1104 passed / 0 failed / 0 errored / 4 ignored** — exact +14
-delta over the increment-4 baseline (1094/1090/0/0/4), matching the 14 new
-tests (6 `AddrBp_*` + 4 `McpE2ETests` + 2 `Test_SetInstructionBreakpoints_*`
-× 2 fixtures). Every consumer rebuilt first: `build_mcp.bat`,
-`DevTools\build_all.bat`, `build_dap.bat`, `DebuggerTests\build_runner.bat`.
+Filtered runs (`RUNTESTS_ONLY`) during development: all green, 22/22 on the
+"Disassemble" substring, 2/2 on each of the two standalone tests, both before
+AND after each negative control's revert (i.e. both the RED and the
+re-GREEN were observed, not assumed).
+
+Full unfiltered suite via the `test-runner` agent (`build_and_run.bat`):
+**1118 found / 1114 passed / 0 failed / 0 errored / 4 ignored** — exact +10
+delta over the increment-5 baseline (1108/1104/0/0/4), matching the 5 new
+tests × 2 fixtures (mono + BPL). (First guess while writing this cursor was
+"6 new tests / +12" — miscounted; the actual test list only ever had 5
+`[Test]` declarations. Caught by the delta not matching the guess, not by
+re-reading the source — a live example of why this section states the
+MEASURED number, not the expected one.)
+
+### Not done, not blocking
+
+No test drives an actual VS Code Disassembly View — every assertion is at the
+DAP protocol layer (`DapClient.pas`). No DAP-layer Win32 coverage for
+`disassemble` (bitness proven at the MCP layer, same scoping choice increment
+5 made for `setInstructionBreakpoints`). The mixed
+backward-and-forward-straddling `instructionOffset` case is covered by
+construction (the `TrueNegCount`/`PosCount` split in `HandleDisassemble`
+handles it uniformly) but has no dedicated test. Full list in
+`DISASSEMBLY_PLAN.md` "Verified in increment 6".
 
 ### Next action
 
-Increment 6 (`DISASSEMBLY_PLAN.md` "Increments"): DAP `disassemble` +
-`instructionPointerReference`. Not started. MUST reuse
-`Disassembler.DisassembleBackward` + `IDebugTarget
-.NearestInstructionBoundaryBefore`/`NearestExportedEntryBefore` for its
-negative `instructionOffset`, per the increment-4 decision already recorded.
+**Increment 7 — packaging** (`DISASSEMBLY_PLAN.md` "Increments", item 7). Not
+started. Three parts: ship `Zydis.dll` next to the installed adapter AND the
+MCP server build (`install\Install.exe`, the extension folder, `build_mcp.bat`
+output); ship the MIT licence text alongside it; decide `/MD` vs `/MT` for the
+committed DLL (currently `/MD`, needs the VC++ redistributable on the user's
+machine — the honest-but-not-acceptable-default failure mode the plan already
+names). Until increment 7 lands, disassembly/address-breakpoints pass every
+test in this build tree but report UNAVAILABLE (or fail cleanly on DAP) on an
+installed user's machine.
 
 ## Standing constraint from the user
 
@@ -122,19 +119,15 @@ documented.
 
 ## State of the tree
 
-- `public-main`, with THIS increment, disassembly increments 1-4, and the
-  prior data-breakpoints increment (6/6) all uncommitted. Release **0.3.0
-  is committed but NOT tagged and NOT pushed**; no GitHub release exists.
+- `public-main`, with disassembly increments 1-6 (this session's increment 6
+  included) and the prior data-breakpoints increment (6/6) all uncommitted.
+  Release **0.3.0 is committed but NOT tagged and NOT pushed**; no GitHub
+  release exists.
 - Win32 support is functionally complete for `-$O-` targets. Debug-info format
   coverage (TD32, RSM, MAP, JCL, DCP, `.tds`) is closed; DCU is WON'T DO.
-- `DebuggerTests\DebugSessionTests.pas` and `DebuggerTests\DebuggerTests.pas`
-  are LF-only line endings end to end (confirmed pre-existing at HEAD, not
-  introduced this session — `.gitattributes` will normalize on the next git
-  operation regardless). Not touched further; out of scope for this task.
 
 ## Traps
 
-`TRAPS.md` has full detail; this session added three entries there (the
-main-exe module-name sentinel mismatch, `@FuncName` rendering as `"Pointer"`,
-and the two-repost-call-sites negative control) rather than repeating them
-here.
+`TRAPS.md` has full detail; no new entries were needed this session — every
+mechanism increment 6 relies on (`DisassembleBackward`, the boundary lookups,
+the main-exe module-name sentinel) was already documented from increments 2-5.

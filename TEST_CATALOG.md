@@ -493,7 +493,7 @@ fixture):
 - [ ] Set clipboard text
 - [ ] Class with > 30 fields -- truncated representation
 
-## M. Disassembly (DISASSEMBLY_PLAN.md increments 2-4)
+## M. Disassembly (DISASSEMBLY_PLAN.md increments 2-6)
 
 - [x] Backend reports `Available=False` with a non-empty `StatusText` and
       `Disassemble` returns an empty array -- WITHOUT ever invoking the byte
@@ -580,10 +580,47 @@ fixture):
       `DevTools\DisasmCoverage.exe`'s `TPEImage.ExportedFunctionRvas` already
       validates against real binaries, read from live memory instead of a
       file here) -- not by a DUnitX test.
-- [ ] DAP `disassemble` request -- out of scope here, increment 6 of
-      `DISASSEMBLY_PLAN.md`. Must reuse `Disassembler.DisassembleBackward`
-      for its negative `instructionOffset`, not re-derive backward
-      disassembly.
+- [x] DAP `disassemble` request + `instructionPointerReference` -- increment
+      6, the last functional increment. Capability advertised
+      (`Test_Initialize_AdvertisesSupportsDisassembleRequest`);
+      `instructionPointerReference` on the top stack frame matches the
+      independent Registers-scope RIP oracle
+      (`Test_StackTrace_InstructionPointerReference_MatchesRip`); forward
+      decode returns exactly `instructionCount` real instructions starting
+      exactly at `memoryReference`, strictly ascending
+      (`Test_Disassemble_Forward_ReturnsExactCountAtInstructionPointer`);
+      negative `instructionOffset` at a stop with a provable boundary returns
+      a REAL preceding instruction ending exactly at the stop address, reusing
+      `Disassembler.DisassembleBackward` per the increment-4 decision, not
+      re-deriving it
+      (`Test_Disassemble_NegativeOffset_ProvenBoundary_ReturnsRealPrecedingInstruction`);
+      an address with no proven boundary in either direction (`0x1000`, inside
+      Windows' reserved NULL-page region) returns EXACTLY the requested count
+      with every slot marked `presentationHint: 'invalid'`, no
+      `instructionBytes`, never a guessed decode
+      (`Test_Disassemble_UnprovenAddress_MarksEveryInstructionInvalid_NeverGuessed`).
+      All five run under both the mono and BPL fixture. Negative-controlled
+      (5 independent controls: capability flag, `instructionPointerReference`
+      emission, the dispatch line, the boundary lookup, and the
+      `presentationHint` marking) -- exact failure text in `DISASSEMBLY_PLAN.md`
+      "Verified in increment 6".
+- [ ] No test drives a REAL VS Code Disassembly View against the adapter --
+      every assertion above is at the DAP protocol layer through
+      `DebuggerTests\DapClient.pas`, the same synchronous test client every
+      other DAP integration test in this suite uses.
+- [ ] DAP-layer Win32 (32-bit target) coverage for `disassemble` -- not
+      written this increment, same scoping choice as `setInstructionBreakpoints`
+      below: bitness is already proven at the MCP layer
+      (`Disassemble_Win32_Forward_ReturnsDecodedInstructions`), and DAP's
+      `HandleDisassemble` shares the exact same `TargetLayout.PointerSize` ->
+      machine-mode dispatch MCP's does.
+- [ ] No test exercises a request whose window straddles `memoryReference`
+      with a NEGATIVE `instructionOffset` smaller in magnitude than
+      `instructionCount` (the mixed backward+forward case) -- covered by
+      construction (the same `TrueNegCount`/`PosCount` split in
+      `HandleDisassemble` handles it), not by a dedicated test. The two
+      shipped negative-offset tests are the reaches-`memoryReference`-exactly
+      case and the entirely-below-zero refusal case.
 
 ## N. Address breakpoints (DISASSEMBLY_PLAN.md increment 5)
 
@@ -635,8 +672,9 @@ fixture):
 - [x] DAP `setInstructionBreakpoints` + `supportsInstructionBreakpoints`,
       mono (`Test_SetInstructionBreakpoints_Basic_StopsAndVerifies`,
       reading the exact stop address off the DAP Registers scope since no
-      address-echoing stack-frame field exists yet -- that is increment 6's
-      `instructionPointerReference`) and the BPL reload scenario above.
+      address-echoing stack-frame field existed yet at the time -- increment
+      6 later added `instructionPointerReference`, not retrofitted into this
+      test) and the BPL reload scenario above.
       Negative-controlled: commenting out the dispatch wire-up fails with
       `Value 'breakpoints' not found` (the generic unknown-command
       fallback), proving the wire-up itself is exercised, not just the

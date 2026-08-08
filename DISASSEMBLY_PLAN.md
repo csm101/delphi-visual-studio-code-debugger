@@ -1,14 +1,70 @@
 # Disassembly and address breakpoints — plan
 
-Status: **increment 5 landed, not committed** (2026-08-09). This document is the
-agreed design; `PROJECT_STATE.md` carries only the one-line roadmap entry
-pointing here.
+Status: **all six functional increments landed, not committed** (2026-08-09).
+Increment 6 (DAP `disassemble` + `instructionPointerReference`) closes the
+functional plan; only increment 7 (packaging) remains. See "Functional plan
+closed" below for what works, what is refused and why, and what packaging
+still owes. This document is the agreed design; `PROJECT_STATE.md` carries
+only the one-line roadmap entry pointing here.
 
 Two features that share one prerequisite and are therefore planned together:
 
 1. **Disassembly** of arbitrary target memory, exposed over MCP and DAP.
 2. **Breakpoints at an address**, not only at a source line — which is what makes
    a disassembly view actionable rather than decorative.
+
+## Functional plan closed (increments 1-6)
+
+What works, end to end, over both frontends:
+
+- **Disassembly** of any readable target address, on both bitnesses, with
+  symbolication (nearest function+offset, source file/line) when a provider
+  knows one, and undecodable bytes rendered as `db XX` rather than a guess.
+  MCP: `disassemble` (increment 4). DAP: `disassemble` request +
+  `instructionPointerReference` on every stack frame, enabling VS Code's
+  Disassembly View (increment 6).
+- **Address breakpoints**, identified by module+RVA (survives relaunch and
+  ASLR rebasing), deferred-bound when the owning module is not yet loaded,
+  rebinding across an unload/reload of the same module. MCP:
+  `set_breakpoint_at_address` / `remove_breakpoint_at_address`. DAP:
+  `setInstructionBreakpoints` + `supportsInstructionBreakpoints` (increment
+  5).
+- **Instructions preceding a given address** ("what came before this stop"),
+  answered from the SAME mechanism on both frontends
+  (`Disassembler.DisassembleBackward` fed a boundary from
+  `IDebugTarget.NearestInstructionBoundaryBefore` /
+  `NearestExportedEntryBefore`): MCP's `before` parameter (increment 4) and
+  DAP's negative `instructionOffset` (increment 6).
+
+What is refused, and why — the one design decision this whole plan turns on:
+x86/x64 has no way to find an instruction boundary by scanning backward from
+an arbitrary byte; every candidate alignment that happens to land on the
+target byte is indistinguishable from any other without an independent
+anchor. So "instructions before this address" is answered ONLY when a
+PROVEN earlier boundary exists (a debug-info line/routine boundary, or a
+module's PE export entry when it has none at all) and decoding forward from
+it lands EXACTLY on the requested address. Anything else is refused rather
+than guessed:
+- MCP reports `before.refused: true` with a `reason`, alongside the
+  (unaffected) forward `instructions` — a refusal of `before` is not a
+  failure of the call.
+- DAP has no protocol field for "I could not prove this" in a response that
+  must otherwise carry decoded instructions, so it uses the mechanism the DAP
+  spec itself defines for exactly this case:
+  `DisassembledInstruction.presentationHint: 'invalid'`, with no
+  `instructionBytes` and a synthetic filler `address` — never a real decode
+  presented as one. The response still carries EXACTLY `instructionCount`
+  entries, as the spec requires; some of them are just clearly marked as
+  unprovable rather than omitted. See "Decision: backward disassembly is
+  proven-boundary-only" and "Verified in increment 6" below for the full
+  reasoning and the DAP spec text it rests on.
+
+What remains: **increment 7, packaging.** Every increment above works only
+inside this build tree, where `Zydis.dll` happens to be reachable at a
+repo-relative path. Until the DLL ships next to the installed adapter and
+MCP server (and the `/MD` vs `/MT` runtime-dependency question is decided),
+disassembly is a feature that passes every test here and reports
+`unavailable`/fails cleanly on every user machine. See increment 7 below.
 
 ## Why
 
@@ -442,7 +498,9 @@ flagged as likely STOP candidates:**
    `setInstructionBreakpoints` + `supportsInstructionBreakpoints`. Full detail,
    including a genuine bug the tests caught (not merely designed around), in
    "Verified in increment 5" below.
-6. DAP `disassemble` + `instructionPointerReference`.
+6. **DONE, not committed (2026-08-09).** DAP `disassemble` +
+   `instructionPointerReference`. Full detail in "Verified in increment 6"
+   below.
 7. **Packaging — and it decides whether any of this works on a user's machine.**
    Until it is done, every increment above is a feature that reports UNAVAILABLE
    in the field while passing every test here, because the tests run out of the
@@ -958,6 +1016,165 @@ re-open an argument this document already settled.
   `GetRawStackScan`.
 - Full suite (`DebuggerTests\build_and_run.bat`): see `TASK_RESUME.md` for
   the exact counts from this session's run.
+
+## Verified in increment 6
+
+- **Capability + wiring.** `TDapServer.HandleInitialize` adds
+  `supportsDisassembleRequest: true`; `ProcessRequest` dispatches `disassemble`
+  to the new `HandleDisassemble`; `HandleStackTrace` adds
+  `instructionPointerReference` (`'0x' + IntToHex(F.IP, 1)`) to every emitted
+  `StackFrame` — including raw-scan and nameless frames, since
+  `TSessionFrame.IP` is always populated (the same field
+  `McpJson.FrameListToJson` has echoed as `address` since the raw-stack-scan
+  work). This is what enables VS Code's "Open Disassembly View" action from
+  the Call Stack.
+- **Same pipeline as MCP, not a second one.** `HandleDisassemble` builds a
+  `TZydisDisassembler` exactly like `TMcpServer.HandleDisassemble` does
+  (`FDebugger.TargetLayout.PointerSize` picks `dmmLong64`/`dmmLegacy32`,
+  `FDebugger.ReadCodeMemoryAt` is the byte reader, `FDebugInfo` +
+  `FDebugger.ImageBase` drive symbolication) — a local `ResolveZydisDllPath` /
+  `DefaultZydisDllPath` pair mirrors `McpServer.pas`'s exactly (same
+  three-levels-below-repo-root relative fallback the two executables share by
+  construction), since the two frontends are separate executables and this
+  codebase already duplicates helpers this small across them (increments 4/5).
+  Zydis unavailable is answered with `SendErrorResponse` (`success:false`,
+  `disassembler unavailable: <reason>`) — the DAP-idiomatic version of MCP's
+  `available:false`, since a DAP response has no field for a partial-success
+  envelope the way a JSON-RPC tool result does.
+- **The DAP shape for the backward-window refusal was NOT ambiguous — the
+  spec already answers it.** `disassemble`'s `instructionCount` is documented
+  (`debugAdapterProtocol.json`, `DisassembleArguments.instructionCount`):
+  *"An adapter must return exactly this number of instructions - any
+  unavailable instructions should be replaced with an implementation-defined
+  'invalid instruction' value."* `DisassembledInstruction.presentationHint`
+  is documented right beside it: *"A value of `invalid` may be used to
+  indicate this instruction is 'filler' and cannot be reached by the
+  program."* Confirmed by fetching the schema directly
+  (`microsoft/vscode-debugadapter-node`'s `debugProtocol.json`), not
+  recalled from memory. This is precisely the contract the project's own
+  fail-closed rule needs: exactly `instructionCount` entries back, every
+  entry that could not be proven marked `presentationHint: 'invalid'` with no
+  `instructionBytes` (no real bytes are known — unlike a genuine `db XX`,
+  where the bytes ARE real and only the mnemonic is not, which stays
+  `presentationHint`-less), `instruction: '??'`, and a synthetic filler
+  `address` that is never presented as a real instruction boundary. No
+  maintainer STOP was needed because the protocol itself, not a project
+  convention, settles the shape.
+- **`HandleDisassemble`'s index algebra reuses `DisassembleBackward` exactly
+  as increment 4's decision required**, not a second backward mechanism.
+  `instructionOffset` splits into `TrueNegCount = -instructionOffset` (only
+  when negative) and `PosSkip = instructionOffset` (only when positive) —
+  mutually exclusive. The backward half asks `DisassembleBackward` for the
+  FULL `TrueNegCount`-instruction span ending at `memoryReference` (never a
+  pre-clamped smaller count), because `DisassembleBackward`'s landing check
+  (forward decode from the boundary must land EXACTLY on the target) is the
+  only available proof for ANY instruction in that span, including ones far
+  from `memoryReference` — clamping the request would silently ask for less
+  proof than the response claims to have. The result is then sliced
+  client-side (`Copy(FullBack, 0, WantedBack)`, `WantedBack = min(TrueNegCount,
+  instructionCount)`) to the portion the request actually asked for, freeing
+  the discarded tail — this is what makes a "far" backward window (one whose
+  `[instructionOffset .. instructionOffset+instructionCount-1]` range never
+  reaches `memoryReference` itself) return the EARLIEST proven/invalid slots
+  rather than the ones nearest the current PC.
+- **Partial proof degrades slot-by-slot, not all-or-nothing at the DAP
+  layer**, even though `DisassembleBackward` itself is all-or-nothing per
+  call. When the natural chain from the nearest boundary to `memoryReference`
+  is SHORTER than the requested span, the slots closest to `memoryReference`
+  are the genuinely decoded ones (`Proven`) and the earlier slots — closer to
+  the boundary — have no proof at all; those are filled with
+  `BuildInvalidDapInstruction`, anchored on `Proven[0].VA` (which IS the real
+  boundary address whenever the natural chain is shorter than asked — proven,
+  not guessed) rather than on an arbitrary offset. When NO boundary exists at
+  all (no debug info AND no PE export before the address, or the forward
+  decode from a found boundary does not land exactly), every slot is invalid,
+  anchored on `memoryReference` itself. A forward request whose reader runs
+  dry (memory that is not committed) is padded the identical way, for the
+  identical reason: a truncated forward decode is exactly as unprovable as an
+  unproven backward span, and the DAP spec's exact-count requirement applies
+  to both directions equally.
+- **Proven, not just implemented — five new tests in `DebuggerTests.pas`**,
+  each running under both the mono and BPL fixture (`TDebuggerTests` /
+  `TDebuggerTestsBpl`):
+  - `Test_Initialize_AdvertisesSupportsDisassembleRequest` — the capability
+    flag itself.
+  - `Test_StackTrace_InstructionPointerReference_MatchesRip` — the new field
+    cross-checked against the INDEPENDENT Registers-scope RIP oracle
+    increment 5's tests already established (`CurrentRipHex`), not merely
+    asserted non-empty.
+  - `Test_Disassemble_Forward_ReturnsExactCountAtInstructionPointer` —
+    `instructionOffset:0`, exactly `instructionCount` real instructions,
+    strictly ascending addresses, first instruction starting EXACTLY at
+    `memoryReference`, no `presentationHint` on a real decode.
+  - `Test_Disassemble_NegativeOffset_ProvenBoundary_ReturnsRealPrecedingInstruction`
+    — reuses the EVAL_BODY fixture McpE2ETests.pas' `Disassemble_Before_
+    ReturnsProvenPrecedingInstructions` already proved has a provable
+    boundary, asking for exactly the ONE instruction the underlying
+    `DisassembleBackward` success is independent of the requested `Before`
+    count (so `instructionOffset:-1` is provably safe given increment 4's own
+    `Before:2` test already succeeded there) — asserts it is a real decode
+    (no `presentationHint`) whose bytes end EXACTLY at `memoryReference`, and
+    that the slot at `instructionOffset:0` is `memoryReference` itself.
+  - `Test_Disassemble_UnprovenAddress_MarksEveryInstructionInvalid_NeverGuessed`
+    — `memoryReference: '0x1000'` (inside Windows' reserved NULL-page region,
+    owned by no loaded module — a deterministic, hardcode-free way to force
+    BOTH `NearestInstructionBoundaryBefore` and `NearestExportedEntryBefore`
+    to fail, and the forward reader to run dry) with `instructionOffset:-3,
+    instructionCount:5` asserts all 5 returned entries carry
+    `presentationHint: 'invalid'`, no `instructionBytes`, and a non-empty
+    `address` — the exact-count-back, never-a-guess contract from end to end.
+- **Every new test negative-controlled** (revert, rebuild the adapter, rerun
+  the SAME test via `RUNTESTS_ONLY`, confirm the intended failure text, revert
+  back), five controls covering every load-bearing line independently:
+  - capability flag forced `False`: `Test_Initialize_
+    AdvertisesSupportsDisassembleRequest` fails — `Condition is False when
+    True expected. [initialize response did not advertise
+    supportsDisassembleRequest: ...]`.
+  - `instructionPointerReference` `AddPair` commented out:
+    `Test_StackTrace_InstructionPointerReference_MatchesRip` fails —
+    `Condition is False when True expected. [top frame carries no
+    instructionPointerReference]`.
+  - the `disassemble` dispatch line commented out:
+    `Test_Disassemble_Forward_ReturnsExactCountAtInstructionPointer` ERRORS —
+    `Value 'instructions' not found` (the unknown-command fallback has no
+    `instructions` key), proving the wire-up itself, not just the handler
+    logic underneath it.
+  - `HaveBoundary` forced `False` unconditionally in the backward-slot
+    builder: `Test_Disassemble_NegativeOffset_ProvenBoundary_
+    ReturnsRealPrecedingInstruction` fails — `Object is Not Nil when Nil
+    expected. [the preceding instruction must be a REAL proven decode, not
+    invalid filler: {"address":"0x95180C","instruction":"??",
+    "presentationHint":"invalid"}]` — and simultaneously demonstrates the
+    invalid-padding path degrading correctly when no boundary exists (address
+    anchored on `memoryReference` itself, as designed).
+  - `presentationHint` `AddPair` commented out of
+    `BuildInvalidDapInstruction`: `Test_Disassemble_UnprovenAddress_
+    MarksEveryInstructionInvalid_NeverGuessed` fails — `Expected [invalid]
+    but got []` — with the placeholder address (`0xFFD`, i.e.
+    `0x1000 - 3`) visible in the failure text, confirming the synthetic
+    filler addressing math independently of the presentationHint assertion.
+- **Full suite** (`DebuggerTests\build_and_run.bat`): **1118 found / 1114
+  passed / 0 failed / 0 errored / 4 ignored** — exact +10 delta over the
+  increment-5 baseline (1108/1104/0/0/4), matching the 5 new tests × 2
+  fixtures (mono + BPL).
+- **Not verified in this increment — stated plainly, not smoothed over.**
+  No test drives a REAL VS Code Disassembly View against the adapter; every
+  assertion above is at the DAP protocol layer (`DapClient.pas`, the same
+  synchronous test client every other DAP integration test in this suite
+  uses). VS Code's own scroll-driven re-anchoring behavior (issuing a new
+  `disassemble` request with `memoryReference` set to a previously-returned
+  instruction's address as the user scrolls) is therefore exercised only by
+  construction of the response shape (ascending addresses, exact count,
+  clearly marked filler), not by an actual editor session. The mixed
+  `instructionOffset < 0 <= instructionOffset+instructionCount-1` case (partly
+  backward, partly forward, both provable) is covered by construction — the
+  same `TrueNegCount`/`PosCount` split handles it — but has no test whose
+  requested window straddles `memoryReference` with a NEGATIVE
+  `instructionOffset` smaller in magnitude than `instructionCount`; the two
+  shipped negative-offset tests are the reaches-`memoryReference`-exactly case
+  (`instructionOffset:-1, instructionCount:2`) and the entirely-below-zero
+  refusal case (`instructionOffset:-3, instructionCount:5` at an address with
+  no proof of anything).
 
 ## Open, to verify before writing code
 

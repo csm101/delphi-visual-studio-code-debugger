@@ -823,6 +823,8 @@ At runtime the adapter compares the debuggee's actual `ImageBase` (from `CREATE_
 - [x] `setVariable` for strings via in-process `@UStrAsg` / `@LStrAsg` (no refcount leak)
 - [x] `setVariable` writes through the pointer for `var` parameters
 - [x] Read and write raw debuggee process memory (MCP `read_memory` / `write_memory`)
+- [x] Disassembly View: "Open Disassembly View" from the Call Stack, real x86/x64 decode (Zydis) with symbolication, undecodable bytes shown honestly as `db XX` rather than guessed. Instructions before the current position are shown only when provably correct (a known boundary decodes forward to land exactly there); otherwise they are clearly marked unavailable rather than guessed
+- [x] Breakpoints at a raw address, not only a source line — set from the Disassembly View gutter or via MCP; survive a runtime package unloading and reloading (module + relative address, not a bare pointer)
 - [x] First-chance exception break (continue past handled exceptions)
 - [x] Exception class name and message shown on stop (`exceptionInfo` details panel)
 - [x] `$exception` pseudo-variable: live exception object inspectable in Locals and Watch
@@ -837,7 +839,6 @@ At runtime the adapter compares the debuggee's actual `ImageBase` (from `CREATE_
 Debugger features:
 
 - [ ] Child process tracking (currently `DEBUG_ONLY_THIS_PROCESS` only)
-- [ ] Disassembly view (DAP `disassemble` request)
 - [ ] On a 32-bit target: locals in optimised (`-$O+`) builds
 
 Variable / type system:

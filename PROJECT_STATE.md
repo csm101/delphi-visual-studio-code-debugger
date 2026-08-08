@@ -591,14 +591,15 @@ Debugger features:
     variable, which is the failure the mechanism exists to prevent.
   Ranked above disassembly in diagnostic value: "who writes this variable" has no
   other answer.
-- **Disassembly + address breakpoints — increments 1-5 landed, not committed
-  (2026-08-09); increment 6 remaining.** `IDisassembler` + Zydis backend +
+- **Disassembly + address breakpoints — DONE, all six functional increments
+  (2026-08-09), not committed.** `IDisassembler` + Zydis backend +
   symbolication + `DevTools\Disasm.exe` (increment 2); measured coverage
   against an independent oracle (`DevTools\DisasmCoverage.exe` vs dumpbin,
   13.2M instruction positions compared across the test fixtures,
   `rtl290.bpl`/`vcl290.bpl`, and a 500+ MB real binary both bitnesses, zero
   mnemonic divergences — increment 3); MCP `disassemble` shipped (increment
-  4). Full plan, decisions and increments in `DISASSEMBLY_PLAN.md`. In
+  4); DAP `disassemble` + `instructionPointerReference` shipped (increment
+  6). Full plan, decisions and increments in `DISASSEMBLY_PLAN.md`. In
   short: complete ISA coverage is a requirement (target code is not only
   Delphi-compiled), so the backend is **Zydis** (MIT, committed DLL + pinned
   submodule under `ThirdParty\Zydis`, ONE x64 DLL because machine mode is a
@@ -606,12 +607,21 @@ Debugger features:
   fail-closed — undecodable renders `db XX`, missing DLL reports
   UNAVAILABLE. `X86Decode.pas` stays for the dependency-free call-site
   proving path. Coverage is measured against an independent oracle
-  (dumpbin), not claimed. The MCP `disassemble` tool's `before` (instructions
-  preceding an address) is proven-boundary-only by deliberate decision —
+  (dumpbin), not claimed.
+  **Backward disassembly ("instructions before this address") is
+  proven-boundary-only across BOTH frontends**, by deliberate decision:
   refuses rather than heuristically scanning backward when no proven
-  boundary lands exactly on the target; see `DISASSEMBLY_PLAN.md` "Decision:
-  backward disassembly is proven-boundary-only", which increment 6's DAP
-  `disassemble` must reuse rather than re-derive.
+  boundary decodes forward to land exactly on the target. MCP's `before`
+  parameter (increment 4) and DAP's negative `instructionOffset` (increment
+  6) both call the SAME mechanism (`Disassembler.DisassembleBackward` fed a
+  boundary from `IDebugTarget.NearestInstructionBoundaryBefore` /
+  `NearestExportedEntryBefore`) rather than each deriving their own. DAP
+  expresses a refusal through the DAP spec's own mechanism for it —
+  `DisassembledInstruction.presentationHint: 'invalid'`, with the response
+  still carrying EXACTLY `instructionCount` entries as the spec requires —
+  not a project-invented convention; see `DISASSEMBLY_PLAN.md` "Decision:
+  backward disassembly is proven-boundary-only" and "Verified in increment
+  6".
   **Address breakpoints — increment 5, DONE.** Stored as module+RVA (a bare
   VA does not survive relaunch or a rebased package), resolved from the
   caller's absolute address against the current module table and refused
@@ -626,8 +636,26 @@ Debugger features:
   unload/reload lifecycle) at all three layers. Full detail in
   `DISASSEMBLY_PLAN.md` "Verified in increment 5", including a genuine
   cross-layer identity bug the tests caught on their first run.
-  **Remaining: increment 6** — DAP `disassemble` request and
-  `instructionPointerReference` on stack frames.
+  **DAP `disassemble` + `instructionPointerReference` — increment 6, DONE.**
+  `instructionPointerReference` on every stack frame enables VS Code's "Open
+  Disassembly View" from the Call Stack; `disassemble` shares the exact same
+  `TZydisDisassembler` construction MCP's tool uses. Proven at the DAP
+  protocol layer on both the mono and BPL fixture (capability advertised,
+  field cross-checked against the independent Registers-scope RIP oracle,
+  forward decode, a proven negative-offset case, and a fully-refused
+  negative-offset case at an address with no boundary in either direction).
+  **Limitations that remain, stated plainly:** no test drives a real VS Code
+  Disassembly View, only the DAP protocol layer; no DAP-layer Win32 coverage
+  for `disassemble` (bitness is proven at the MCP layer, same scoping choice
+  as increment 5's `setInstructionBreakpoints`); the mixed
+  backward-and-forward `instructionOffset` case is covered by construction,
+  not by a dedicated test. Full detail in `DISASSEMBLY_PLAN.md` "Verified in
+  increment 6" and `TEST_CATALOG.md` "M. Disassembly".
+  **Remaining: increment 7, packaging.** Every increment above works only
+  inside this build tree, where `Zydis.dll` happens to be reachable at a
+  repo-relative path — until it ships next to the installed adapter and MCP
+  server, disassembly reports UNAVAILABLE (or fails cleanly on DAP) on a
+  user's machine. See `DISASSEMBLY_PLAN.md` increment 7.
 - Win32 (32-bit) targets — **DONE**. Run control, locals, object expansion,
   evaluation and the multi-BPL case all work on a WOW64 target from the same
   64-bit adapter binary. See "Target architecture" under Implemented features

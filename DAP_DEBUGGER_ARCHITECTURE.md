@@ -156,8 +156,16 @@ it sits in the module graph and the one engine primitive it added.
 - `IDisassembler` (`Disassembler.pas`) is frontend- and library-neutral, same
   discipline as `IDebugTarget`: no third-party type crosses it.
   `TZydisDisassembler` (`ZydisDisassembler.pas`) is the only implementation
-  and the only unit outside `ZydisApi.pas` that references Zydis. Neither
-  MCP nor DAP consumes this yet — that is increments 4 and 6.
+  and the only unit outside `ZydisApi.pas` that references Zydis. Both
+  frontends consume it now: MCP's `disassemble` tool (increment 4,
+  `MCPDebugger\McpServer.pas`, `TMcpServer.HandleDisassemble`) and DAP's
+  `disassemble` request (increment 6, `VisualStudioCodeDelphiDebugger\
+  DapServer.pas`, `TDapServer.HandleDisassemble`) build the SAME
+  `TZydisDisassembler` the same way — `FDebugger.TargetLayout.PointerSize`
+  picks the machine mode, `FDebugger.ReadCodeMemoryAt` is the byte reader,
+  `FDebugInfo` + `FDebugger.ImageBase` drive symbolication — each frontend
+  keeping its own small `ResolveZydisDllPath`/`DefaultZydisDllPath` pair
+  rather than sharing a unit across the two separate executables.
 - Bytes reach the backend through a caller-supplied `TDisasmByteReader`
   callback, not through `IDebugTarget` directly, so the backend itself knows
   nothing about live sessions, breakpoints, or file formats. A live-session
@@ -184,6 +192,51 @@ it sits in the module graph and the one engine primitive it added.
   `TDebugInfoSet` (multi-module aware); a static-file probe builds one from
   the sibling `.rsm`/`.map` in the same provider order
   `TModuleSymbolLoader.LoadMainModule` uses for a main exe.
+
+### DAP `disassemble` and `instructionPointerReference`
+
+Full design/decision detail and every proof lives in `DISASSEMBLY_PLAN.md`
+("Decision: backward disassembly is proven-boundary-only", "Verified in
+increment 6"); this is the pointer to where it sits and the one thing worth
+restating here: **the DAP spec itself, not a project convention, decides how
+an unprovable instruction is expressed.**
+
+- `instructionPointerReference` (`'0x' + IntToHex(F.IP, 1)`) is added to
+  EVERY `StackFrame` `HandleStackTrace` emits, including raw-scan and
+  nameless frames — `TSessionFrame.IP` is always populated. This is what
+  enables VS Code's "Open Disassembly View" action from the Call Stack.
+- `HandleDisassemble` splits `instructionOffset` into a backward span
+  (`TrueNegCount = -instructionOffset`, when negative) and a forward span
+  (`PosSkip = instructionOffset`, when positive) — mutually exclusive. The
+  backward span is answered by `Disassembler.DisassembleBackward`, called
+  with the FULL span length (never pre-clamped to `instructionCount`) so that
+  the landing proof covers every slot the response might need, then sliced
+  client-side to the requested window — this is what makes a "far" backward
+  request (one that never reaches `memoryReference`) return the earliest
+  provable/unprovable slots rather than the ones nearest the current PC. The
+  forward span is a plain `IDisassembler.Disassemble` call.
+- **Every slot the backend could not produce — an unproven backward span
+  (no boundary, or a decode that does not land exactly), or a forward read
+  that ran off unmapped memory — is filled by
+  `BuildInvalidDapInstruction`: `presentationHint: 'invalid'`, no
+  `instructionBytes`, `instruction: '??'`, and a synthetic filler `address`
+  anchored on the nearest thing actually proven** (the real boundary address
+  when the natural chain from it is shorter than asked; `memoryReference`
+  itself when nothing at all could be proven). This is not an adapter
+  convention invented for this feature: `DisassembleArguments
+  .instructionCount` in the DAP spec (`debugAdapterProtocol.json`) states an
+  adapter "must return exactly this number of instructions - any unavailable
+  instructions should be replaced with an implementation-defined 'invalid
+  instruction' value", and `DisassembledInstruction.presentationHint`'s
+  `invalid` value is documented for exactly this: "filler" that "cannot be
+  reached by the program". A genuine `db XX` (real bytes, unrecognised
+  encoding) is NOT marked `invalid` — that distinction is preserved through
+  this path exactly as it already is over MCP.
+- **Not verified by this codebase: real VS Code behaviour.** Every assertion
+  is at the DAP protocol layer through the same synchronous test client
+  (`DebuggerTests\DapClient.pas`) every other integration test in this suite
+  uses. No test drives an actual VS Code Disassembly View against the
+  adapter.
 
 ## Target architecture: one adapter, x64 and WOW64 x86
 
@@ -2279,10 +2332,12 @@ after the first instant.
 | `supportsSetVariable`                   | true  |
 | `supportsGotoTargetsRequest`            | true  |
 | `supportsDataBreakpoints`               | true  |
+| `supportsInstructionBreakpoints`        | true  |
+| `supportsDisassembleRequest`            | true  |
 | `supportsProgressReporting`             | true  |
 
-Anything else is currently absent (function breakpoints, disassembly,
-instruction breakpoints).
+Anything else is currently absent (function breakpoints, `readMemory` /
+`writeMemory`, `modules`, `setExpression`).
 
 ## Known assumptions and limits
 
