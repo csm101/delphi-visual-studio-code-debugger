@@ -101,6 +101,13 @@ The debugger engine is exposed through two frontends:
   (pointer size, dynamic-array header shape, VMT slot offsets) as a plain data
   record. `SizeOf(Pointer)` describes the adapter and says nothing about the
   address space being decoded.
+- `Disassembler.pas` — the disassembly seam (`DISASSEMBLY_PLAN.md` increment
+  2): `IDisassembler`, `TDisasmInstruction`, `TDisasmMachineMode`,
+  `TDisasmByteReader`. No third-party reference — see "Disassembly seam"
+  below.
+- `ZydisDisassembler.pas` — `TZydisDisassembler`, the Zydis-backed
+  `IDisassembler` implementation. The only unit besides `ZydisApi.pas` itself
+  allowed to reference Zydis.
 - `MapFileReader.pas` — parses the Delphi `.map`. Supplies
   `ISourceLineProvider` (RVA ↔ source line), `IFunctionNameProvider`
   (RVA ↔ public symbol, lookup by name, enclosing-procedure mapping
@@ -139,6 +146,44 @@ The debugger engine is exposed through two frontends:
   probe-once negative cache; `SymbolFileIsStale`'s 2 s grace. The DAP keeps its
   background loader (still off by default), progress/spinner, and evaluate
   warm-up caches on top of the shared synchronous primitives.
+
+## Disassembly seam
+
+Full design and verification detail lives in `DISASSEMBLY_PLAN.md`
+("The seam", "Verified in increment 2"); this section is the pointer to where
+it sits in the module graph and the one engine primitive it added.
+
+- `IDisassembler` (`Disassembler.pas`) is frontend- and library-neutral, same
+  discipline as `IDebugTarget`: no third-party type crosses it.
+  `TZydisDisassembler` (`ZydisDisassembler.pas`) is the only implementation
+  and the only unit outside `ZydisApi.pas` that references Zydis. Neither
+  MCP nor DAP consumes this yet — that is increments 4 and 6.
+- Bytes reach the backend through a caller-supplied `TDisasmByteReader`
+  callback, not through `IDebugTarget` directly, so the backend itself knows
+  nothing about live sessions, breakpoints, or file formats. A live-session
+  caller wires the callback to `IDebugTarget.ReadCodeMemoryAt`; a static-file
+  caller (`DevTools\Disasm.exe`'s file+RVA mode) wires it to a plain
+  file read.
+- **`IDebugTarget.ReadCodeMemoryAt(VA, Buf, Size): NativeUInt`**
+  (`DebugTarget.pas`, implemented once in `WinDebuggerBase.pas` and shared
+  unchanged by `TWin32Debugger` — breakpoint planting and `FProcess` are
+  already architecture-neutral) is the one new engine primitive this
+  increment added. It behaves like `ReadProcessMemoryAt` except: any of the
+  debugger's OWN planted `INT3` bytes in the returned window are restored to
+  `FBreakpoints[].OrigByte`, and a request running past the end of the
+  committed `VirtualQueryEx` region truncates instead of failing. Both
+  properties matter beyond disassembly — any future caller that wants to
+  read CODE rather than data should reach for this over
+  `ReadProcessMemoryAt`.
+- Symbolication (`Symbol`, `SrcFile`, `SrcLine` on `TDisasmInstruction`, and
+  the inline `; Name+offset` comment appended to a resolvable direct
+  call/jmp/jcc's `Text`) goes through `TDebugInfoSet.RvaToFunctionName` /
+  `RvaToFunctionStart` / `RvaToSourceLine` — the exact calls
+  `WinDebuggerBase.pas` makes to name an ordinary stack frame (see "Frame
+  symbol attribution" below). A live session hands the disassembler its own
+  `TDebugInfoSet` (multi-module aware); a static-file probe builds one from
+  the sibling `.rsm`/`.map` in the same provider order
+  `TModuleSymbolLoader.LoadMainModule` uses for a main exe.
 
 ## Target architecture: one adapter, x64 and WOW64 x86
 

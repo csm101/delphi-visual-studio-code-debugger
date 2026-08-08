@@ -43,7 +43,11 @@ uses
   LaunchConfig    in '..\MCPDebugger\LaunchConfig.pas',
   DebugSessionTests in 'DebugSessionTests.pas',
   McpE2ETests     in 'McpE2ETests.pas',
-  ValueReaderTests in 'ValueReaderTests.pas';
+  ValueReaderTests in 'ValueReaderTests.pas',
+  Disassembler    in '..\DebuggerCore\Disassembler.pas',
+  ZydisApi        in '..\DebuggerCore\ZydisApi.pas',
+  ZydisDisassembler in '..\DebuggerCore\ZydisDisassembler.pas',
+  DisassemblerTests in 'DisassemblerTests.pas';
 
 type
   // Dev-iteration filter: when the RUNTESTS_ONLY env var is set, only tests

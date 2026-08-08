@@ -271,6 +271,20 @@ type
     // Memory I/O.
     function  ReadProcessMemoryAt(VA: UInt64; Buf: Pointer; Size: NativeUInt): Boolean;
     function  WriteMemoryAt(VA: UInt64; Buf: Pointer; Size: NativeUInt): Boolean;
+    // Like ReadProcessMemoryAt, but for reading CODE a caller intends to
+    // disassemble or otherwise inspect as instructions rather than data.
+    // Two differences (DISASSEMBLY_PLAN.md, "Traps"):
+    //   1. Any byte the debugger itself planted an INT3 over (a user
+    //      breakpoint) is returned as the ORIGINAL opcode, not $CC -- reading
+    //      raw process memory at a planted breakpoint would otherwise show
+    //      `int3` where the user's code actually is.
+    //   2. A request that runs past the end of the committed region TRUNCATES
+    //      instead of failing outright -- a disassembly window near the end
+    //      of a section is a normal case, not an error.
+    // Returns the number of bytes actually placed in Buf (0..Size); 0 means
+    // nothing at VA was readable at all. Never raises for a partially-mapped
+    // request.
+    function  ReadCodeMemoryAt(VA: UInt64; Buf: Pointer; Size: NativeUInt): NativeUInt;
     function  RvaToVA(Rva: UInt64): UInt64;
     // Memory layout of the TARGET's address space. Callers decoding target
     // structures must take strides and header offsets from here rather than

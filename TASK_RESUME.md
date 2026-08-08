@@ -25,62 +25,76 @@ longer true, delete it.
 
 ## Current task (2026-08-08)
 
-**`DISASSEMBLY_PLAN.md` increment 1 — Zydis dependency landed. DONE, not
-committed; left in the tree for review.**
+**`DISASSEMBLY_PLAN.md` increment 2 — `IDisassembler` seam + Zydis backend +
+symbolication + `DevTools\Disasm.exe`. DONE, not committed; left in the tree
+for review.**
 
-No feature or engine behaviour changed. Deliverables, all present:
+Deliverables, all present:
 
-- `ThirdParty\Zydis\zydis.submodule` — submodule on `zyantific/zydis`, pinned
-  to tag `v4.1.1` (commit `a2278f1d2`), nested `dependencies/zycore` at
-  `0b2432ced`.
-- `ThirdParty\Zydis\bin\x64\Zydis.dll` (+ `.sha256`) — built via
-  `build_zydis.bat` (VS2026/MSVC 14.51.36231, CMake `NMake Makefiles`,
-  `ZYDIS_BUILD_SHARED_LIB=ON`). SHA-256
-  `f81ca7d636d4679a0794da84dc32790d270b9c9bf293722844cd3ac4302ea745`.
-- `ThirdParty\Zydis\LICENSE`, `PROVENANCE.md` (exact invocation, struct-layout
-  measurement, the three verification answers).
-- `DebuggerCore\ZydisApi.pas` — dynamic-load import unit (`ZydisDisassembleIntel`
-  + `ZydisGetVersion` only). The output struct has C bitfields/unions that
-  cannot be safely hand-transcribed, so its layout (1232 bytes total, length
-  at offset 16, text at offset 1136/96 bytes) was MEASURED with a throwaway
-  `offsetof`/`sizeof` C probe compiled against the pinned headers (probe was
-  scratch-only, not kept in the repo — the measured constants live as
-  commented facts in `ZydisApi.pas` and `PROVENANCE.md`).
-- `DevTools\DisasmProbe.dpr` — argv-driven, no hardcoded target. Auto-detects
-  machine mode from the target's own PE header (never the host), with a
-  `-mode` override proven to actually change decoding (fed the same x64 bytes
-  as `legacy32`: `push rbp`→`push ebp`, then desyncs at the REX prefix exactly
-  as expected). Ran clean against both `DebuggerTests\TestTarget\Win64\Debug\
-  TestTarget.exe` (`long64`, entry `$167FC0`) and `...\Win32\Debug\TestTarget.exe`
-  (`legacy32`, entry `$F4E78`) — same DLL, both modes, correct Delphi
-  prologues decoded in each.
-- `.gitattributes` (`*.dll binary`) and `.gitignore`
-  (`!ThirdParty/Zydis/bin/x64/*.dll`, `ThirdParty/Zydis/build/` ignored) —
-  verified with `git check-ignore` / `git status` that the DLL is trackable
-  and the CMake scratch dir is not.
-- `DISASSEMBLY_PLAN.md` and `DevTools\README.md` updated in this change set.
+- `DebuggerCore\Disassembler.pas` — the seam: `IDisassembler`,
+  `TDisasmInstruction`, `TDisasmMachineMode`, `TDisasmByteReader`. No
+  third-party reference.
+- `DebuggerCore\ZydisDisassembler.pas` — `TZydisDisassembler`, the only unit
+  besides `ZydisApi.pas` allowed to reference Zydis.
+- `DebuggerCore\DebugTarget.pas` / `WinDebuggerBase.pas` — new
+  `IDebugTarget.ReadCodeMemoryAt` (restores planted-breakpoint bytes,
+  truncates at the `VirtualQueryEx` region boundary; shared unchanged by
+  `TWin32Debugger`). This is an interface addition beyond what the plan's
+  seam section specified — the plan named the need ("the engine already
+  keeps OrigByte") but not the shape; decided in favour of the smallest
+  addition reusing existing engine state, flagged in the report rather than
+  silently assumed.
+- `DebuggerTests\ValueReaderTests.pas` — `TFakeMemTarget` (the only other
+  `IDebugTarget` implementer) got a trivial `ReadCodeMemoryAt`.
+- `DebuggerTests\DisassemblerTests.pas` — 3 new tests, registered in
+  `RunTests.dpr`. Both negative-controlled RED (breakpoint-restore loop
+  disabled -> `Expected [204] equals actual [204]`; fail-closed guard
+  disabled -> "byte reader must never be invoked..."), then reverted green.
+- `DevTools\Disasm.dpr` — static file+RVA mode AND live-session mode (via
+  `TDebugSession`), argv-driven, no hardcoded target. Symbolication verified
+  on both bitnesses against `TestTarget.exe` with real resolved call
+  targets (`_InitExe`, `RunAllScenarios`, `TWidget.Create`, ...).
+- Docs updated in this change set: `DISASSEMBLY_PLAN.md` ("Verified in
+  increment 2"), `DAP_DEBUGGER_ARCHITECTURE.md` ("Disassembly seam"),
+  `DevTools\README.md` (`Disasm` tool entry), `TEST_CATALOG.md` ("M.
+  Disassembly"), `TRAPS.md` (ZydisApi one-shot-latch trap),
+  `PROJECT_STATE.md` (one-line roadmap pointer updated).
 
 Full suite (`DebuggerTests\build_and_run.bat`, run once via the test-runner
-agent): **1081 found / 1077 passed / 0 failed / 0 errored / 4 ignored** —
-exact match to baseline. Expected: nothing new is referenced by any existing
-consumer.
+agent): **1084 found / 1080 passed / 0 failed / 0 errored / 4 ignored** —
+exact +3 delta over the 1081/1077/0/0/4 baseline, matching the 3 new tests.
+Both mono and BPL fixtures compiled and ran (parametrized into the single
+count).
 
-### Verification answers (also in `DISASSEMBLY_PLAN.md`)
+### Real bug caught during manual verification (not by a test)
 
-1. `ZydisDisassembleIntel` exists as assumed. `ZydisGetVersion()` on this
-   pinned commit reports `4.1.0.0` (patch digit stuck at the last macro bump,
-   not the tag) — version check compares major.minor only.
-2. `zyantific/zydis-pascal` exists (official, MIT) but is a full header
-   translation predating this pin (last commit 2023-11-20 vs. tag
-   2025-02-16) and contradicts the decided minimal-surface design. Not used.
-3. One DLL genuinely serves both machine modes — confirmed by CMake (no
-   per-mode build knob) and empirically by the probe.
+First cut of call-target symbolication matched any `[A-Za-z]+ 0x<hex>` in
+Zydis's formatted text. `push 0x2A` (a plain immediate push) has that exact
+shape, and got mislabelled with a fabricated call-target symbol. Caught by
+eyeballing `DevTools\Disasm.exe` output, not by a unit test. Fixed with a
+CLOSED whitelist of the actual Zydis control-transfer mnemonics
+(`call`/`jmp`/every `Jcc`/`loop` family) in `ZydisDisassembler.pas`. No
+automated regression test guards this specific case — noted as a gap in
+`TEST_CATALOG.md` "M. Disassembly".
+
+### What is NOT covered by an automated test (documented gaps)
+
+- Trap 2 (truncate at a page/section boundary) — no fixture; exercised
+  manually only.
+- The positive Zydis decode path (real DLL, correct output) — deliberately
+  excluded from `RunTests.exe` because `ZydisApi.ZydisTryLoad` is a
+  one-shot process-wide latch (see `TRAPS.md`); proven via
+  `DevTools\Disasm.exe` instead.
+- Call-target symbolication / mnemonic-whitelist correctness — no
+  regression test.
 
 ### Next action
 
-Nothing pending on increment 1. Increment 2 (`IDisassembler` interface + Zydis
-backend + symbolication, `DevTools\Disasm.exe`) is next, per
-`DISASSEMBLY_PLAN.md` "Increments" and "The seam". Not started.
+Increment 3 (`DISASSEMBLY_PLAN.md` "Increments"): differential coverage tool
+vs. an independent oracle (XED and/or `dumpbin /DISASM`), over fixtures and
+real binaries — record measured divergence counts in the plan. "Open, to
+verify before writing code" in the plan already flags the XED-vs-iced
+oracle choice as unresolved. Not started.
 
 ## Standing constraint from the user
 
@@ -90,22 +104,21 @@ documented.
 
 ## State of the tree
 
-- `public-main`, with this increment AND the prior data-breakpoints increment
-  (6/6, also DONE) both uncommitted. Release **0.3.0 is committed but NOT
-  tagged and NOT pushed**; no GitHub release exists.
+- `public-main`, with THIS increment, the prior disassembly increment 1, and
+  the prior data-breakpoints increment (6/6) all uncommitted. Release
+  **0.3.0 is committed but NOT tagged and NOT pushed**; no GitHub release
+  exists.
 - Win32 support is functionally complete for `-$O-` targets. Debug-info format
   coverage (TD32, RSM, MAP, JCL, DCP, `.tds`) is closed; DCU is WON'T DO.
 
 ## Traps
 
-`TRAPS.md`. The ones that bit this session:
+`TRAPS.md`. The one that bit this session:
 
-- Batch files need CRLF, not LF — an LF-only `.bat` tokenizes as garbage word
-  by word instead of erroring cleanly. `build_zydis.bat` hit this first.
-- A Delphi unit's `finalization` section requires a preceding `initialization`
-  section (even empty) — `finalization` alone is a parse error.
-- `ZydisGetVersion()` under-reports the patch digit of a patch release (see
-  above) — never gate DLL compatibility on an exact version match.
-- Rebuild EVERY consumer of `DebuggerCore` before trusting a measurement.
-- Never edit `DebuggerTests\TestTarget\*.pas` while the suite runs; never run
-  the suite twice at once (~400 s, I/O-bound).
+- `ZydisApi.ZydisTryLoad` is a one-shot process-wide latch — a negative-DLL
+  test and a positive-decode test can never safely share a process. Full
+  detail now in `TRAPS.md`.
+- Rebuild EVERY consumer (`build_runner.bat`, `build_dap.bat`,
+  `build_mcp.bat`, `DevTools\build_all.bat`) before trusting a measurement —
+  all four were rebuilt clean in this session after the `IDebugTarget`
+  interface change.

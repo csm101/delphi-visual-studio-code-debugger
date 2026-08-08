@@ -118,6 +118,7 @@ type
     procedure SetLayout(const ALayout: TTargetLayout);
     function  TargetLayout: TTargetLayout;
     function  ReadProcessMemoryAt(VA: UInt64; Buf: Pointer; Size: NativeUInt): Boolean;
+    function  ReadCodeMemoryAt(VA: UInt64; Buf: Pointer; Size: NativeUInt): NativeUInt;
     // --- everything below is an inert stub ---
     function  ProcessHandle: THandle;
     function  ImageBase: UInt64;
@@ -218,6 +219,22 @@ begin
   if (VA < FBase) or (VA + Size > FBase + UInt64(Length(FMem))) then Exit;
   Move(FMem[VA - FBase], Buf^, Size);
   Result := True;
+end;
+
+// No breakpoints exist on this fake (there is no live process), so this is
+// just a truncating version of ReadProcessMemoryAt over the fixed window --
+// enough to satisfy the interface without claiming trap-1 behaviour this
+// fake cannot exercise.
+function TFakeMemTarget.ReadCodeMemoryAt(VA: UInt64; Buf: Pointer; Size: NativeUInt): NativeUInt;
+var
+  AvailLen: UInt64;
+begin
+  Result := 0;
+  if (VA < FBase) or (VA >= FBase + UInt64(Length(FMem))) then Exit;
+  AvailLen := (FBase + UInt64(Length(FMem))) - VA;
+  if UInt64(Size) < AvailLen then AvailLen := Size;
+  Move(FMem[VA - FBase], Buf^, AvailLen);
+  Result := AvailLen;
 end;
 
 function  TFakeMemTarget.ProcessHandle: THandle; begin Result := 0; end;

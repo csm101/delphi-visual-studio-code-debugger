@@ -591,8 +591,10 @@ Debugger features:
     variable, which is the failure the mechanism exists to prevent.
   Ranked above disassembly in diagnostic value: "who writes this variable" has no
   other answer.
-- **Disassembly + address breakpoints — DESIGNED, not built (2026-08-08).** Full
-  plan, decisions and increments in `DISASSEMBLY_PLAN.md`. In short: complete ISA
+- **Disassembly + address breakpoints — increment 2/6 landed, not committed
+  (2026-08-08).** `IDisassembler` + Zydis backend + symbolication +
+  `DevTools\Disasm.exe` are done; no MCP/DAP surface yet. Full plan,
+  decisions and increments in `DISASSEMBLY_PLAN.md`. In short: complete ISA
   coverage is a requirement (target code is not only Delphi-compiled), so the
   backend is **Zydis** (MIT, committed DLL + pinned submodule under
   `ThirdParty\Zydis`, ONE x64 DLL because machine mode is a decoder parameter),

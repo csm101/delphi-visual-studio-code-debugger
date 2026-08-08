@@ -470,6 +470,7 @@ type
     function  EvaluateLocalName(const Name: string; out Value: TLocalValue): Boolean;
     function  EvaluateGlobalName(const Name: string; out Value: TLocalValue): Boolean;
     function  ReadProcessMemoryAt(VA: UInt64; Buf: Pointer; Size: NativeUInt): Boolean;
+    function  ReadCodeMemoryAt(VA: UInt64; Buf: Pointer; Size: NativeUInt): NativeUInt;
     function  WriteMemoryAt(VA: UInt64; Buf: Pointer; Size: NativeUInt): Boolean;
     function  SetRegisterByName(const Name: string; Value: UInt64): Boolean;
     // Sets a Delphi string variable in the debuggee. Allocates a new
@@ -4380,6 +4381,51 @@ begin
   Result := (FProcess <> 0) and
     Winapi.Windows.ReadProcessMemory(FProcess, Pointer(VA), Buf, Size, R) and
     (R = Size);
+end;
+
+// See DebugTarget.IDebugTarget.ReadCodeMemoryAt: restores the debugger's own
+// planted INT3 bytes within the returned window (DISASSEMBLY_PLAN.md trap 1)
+// and truncates at the end of the committed region instead of failing the
+// whole request (trap 2). Shared, unchanged, by TWin32Debugger: breakpoint
+// planting and FProcess are inherited as-is (only the architecture seam --
+// registers, stack walk, prologue decode -- is overridden for x86).
+function TWinDebugger.ReadCodeMemoryAt(VA: UInt64; Buf: Pointer;
+  Size: NativeUInt): NativeUInt;
+var
+  AvailInRegion: UInt64;
+  ReadLen: NativeUInt;
+  BytesRead: SIZE_T;
+begin
+  Result := 0;
+  if (FProcess = 0) or (Size = 0) then
+    Exit;
+  var Mbi := Default(MEMORY_BASIC_INFORMATION);
+  if VirtualQueryEx(FProcess, Pointer(VA), Mbi, SizeOf(Mbi)) <> SizeOf(Mbi) then
+    Exit;
+  if (Mbi.State <> MEM_COMMIT) or (Mbi.Protect = PAGE_NOACCESS) or
+     (Mbi.Protect and PAGE_GUARD <> 0) then
+    Exit;
+
+  {$Q-}
+  AvailInRegion := (UInt64(Mbi.BaseAddress) + Mbi.RegionSize) - VA;
+  {$Q+}
+  ReadLen := Size;
+  if UInt64(ReadLen) > AvailInRegion then
+    ReadLen := AvailInRegion;   // truncate at the region boundary -- trap 2
+  if ReadLen = 0 then
+    Exit;
+
+  if not Winapi.Windows.ReadProcessMemory(FProcess, Pointer(VA), Buf, ReadLen, BytesRead) then
+    Exit;
+  Result := BytesRead;
+
+  // Restore any of OUR planted breakpoints inside [VA, VA+Result) -- trap 1.
+  for var I := 0 to FBreakpoints.Count - 1 do begin
+    var BP := FBreakpoints[I];
+    if not BP.IsPlanted then Continue;
+    if (BP.VA < VA) or (BP.VA >= VA + Result) then Continue;
+    PByte(NativeUInt(Buf) + NativeUInt(BP.VA - VA))^ := BP.OrigByte;
+  end;
 end;
 
 function TWinDebugger.WriteMemoryAt(VA: UInt64; Buf: Pointer;

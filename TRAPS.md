@@ -81,6 +81,15 @@ absurdly.
   it costs a debuggable adapter build. The scans are memory-bound.
 - `settings.local.json` is machine-specific — never touched by reorganisations.
 - `.claude/worktrees/` is git-ignored (agent worktrees are full checkouts).
+- **`ZydisApi.ZydisTryLoad` is a ONE-SHOT, process-wide latch** (`ZydisApi.pas`):
+  the FIRST call in a process decides Available/StatusText for that process's
+  whole lifetime; later calls are no-ops that return the cached outcome. A test
+  that deliberately points it at a missing/bad DLL to prove the "unavailable"
+  path therefore poisons every OTHER test in the SAME process that wanted a
+  real decode. Keep negative-DLL tests and positive-decode tests in separate
+  processes (`RunTests.exe` carries only the negative test;
+  `DevTools\Disasm.exe` proves the positive path manually) — never both in one
+  `RunTests` run.
 
 ## Proving a fix
 

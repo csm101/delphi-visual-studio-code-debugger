@@ -493,6 +493,37 @@ fixture):
 - [ ] Set clipboard text
 - [ ] Class with > 30 fields -- truncated representation
 
+## M. Disassembly (DISASSEMBLY_PLAN.md increment 2)
+
+- [x] Backend reports `Available=False` with a non-empty `StatusText` and
+      `Disassemble` returns an empty array -- WITHOUT ever invoking the byte
+      reader -- when the DLL is missing
+      (`TDisassemblerBackendTests.Unavailable_WhenDllMissing_DisassembleReturnsEmptyAndNeverReads`)
+- [x] Trap 1 (a planted breakpoint elsewhere in the disassembly window reads
+      back as its ORIGINAL opcode via `IDebugTarget.ReadCodeMemoryAt`, not the
+      `$CC` raw process memory shows), on both bitnesses
+      (`TReadCodeMemoryAtTests` / `TReadCodeMemoryAtWin32Tests`
+      `.ReadCodeMemoryAt_RestoresAnotherStillPlantedBreakpoint`)
+- [ ] Trap 2 (a read that runs past a committed region's end truncates rather
+      than fails) -- no automated fixture; exercised manually via
+      `DevTools\Disasm.exe` (static mode truncates at file EOF, live mode at
+      the `VirtualQueryEx` region boundary in `ReadCodeMemoryAt`)
+- [ ] The positive decode path (real `Zydis.dll`, correct bytes/mnemonics) --
+      deliberately NOT in the automated suite: `ZydisApi.ZydisTryLoad` is a
+      one-shot, process-wide latch, so a negative-DLL test sharing the process
+      with a positive one would poison it (see `DisassemblerTests.pas`
+      header). Proven manually via `DevTools\Disasm.exe` against
+      `TestTarget.exe` on both bitnesses, including a symbolicated call
+      target in each.
+- [ ] Call-target symbolication correctness (mnemonic whitelist, name+offset
+      annotation) -- no automated fixture; verified manually. Caught and fixed
+      a real bug during development: an open `[A-Za-z]+ 0x<hex>` match
+      mislabelled `push 0x2A` as a resolved call target, because a plain
+      immediate operand formats identically to a direct branch target. Fixed
+      with a closed whitelist of the actual Zydis control-transfer mnemonics.
+- [ ] MCP `disassemble` / DAP `disassemble` request -- out of scope here,
+      increments 4 and 6 of `DISASSEMBLY_PLAN.md`.
+
 ## What the suite does NOT prove (2026-08-08)
 
 Coverage-honesty notes. Each records a place where a green run is weaker evidence

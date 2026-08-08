@@ -450,6 +450,61 @@ $000F4E7B  83 C4 C8                  add esp, 0xFFFFFFC8
 $000F4E7F  53                        push ebx
 ```
 
+#### Disasm
+
+```bat
+rem static mode: decode straight out of a PE file at an RVA, no live process
+DevTools\Win64\Debug\Disasm.exe DebuggerTests\TestTarget\Win64\Debug\TestTarget.exe 167FC0 12
+DevTools\Win64\Debug\Disasm.exe DebuggerTests\TestTarget\Win32\Debug\TestTarget.exe F4E78 12
+
+rem live mode: launch through a real TDebugSession, break at a source marker,
+rem disassemble from the stop PC through IDebugTarget.ReadCodeMemoryAt
+DevTools\Win64\Debug\Disasm.exe -live ^
+  DebuggerTests\TestTarget\Win64\Debug\TestTarget.exe ^
+  DebuggerTests\TestTarget\Win64\Debug\TestTarget.map ^
+  DebuggerTests\TestTarget\Win64\Debug\TestTarget.rsm ^
+  DebuggerTests\TestTarget TestTargetCore.pas EVAL_BODY 12
+```
+
+Exercises the real feature (`DISASSEMBLY_PLAN.md` increment 2): the
+`IDisassembler` seam (`DebuggerCore\Disassembler.pas`), the Zydis backend
+behind it (`DebuggerCore\ZydisDisassembler.pas` — the only unit besides
+`ZydisApi.pas` itself allowed to reference Zydis), and symbolication of the
+output through the SAME provider set (`TDebugInfoSet`: MAP + RSM + TD32) the
+adapter queries when naming a stack frame. `DisasmProbe` (above) only proves
+the raw Zydis pipeline decodes bytes; this tool proves the actual feature,
+including the two live-session traps the plan calls out:
+
+- **Planted breakpoints don't corrupt the view.** Live mode prints the raw
+  byte at the stop PC (via `ReadProcessMemoryAt`, which shows the debugger's
+  own `$CC`) next to the same byte through `ReadCodeMemoryAt` (what the
+  disassembler is actually fed), so the fix is visible in the tool's own
+  output, not just asserted.
+- **A window near the end of a section truncates, not fails.** Static mode
+  clamps the file read at EOF; live mode clamps at the `VirtualQueryEx`
+  region boundary inside `ReadCodeMemoryAt` — neither raises past that edge.
+
+Static-mode arguments: `<exe-or-dll> <hexRVA> [count] [-zydisdll <path>]`.
+Symbolication is best-effort from the file's sibling `.rsm`/`.map` (loaded in
+the same RSM-then-TD32-primary-then-MAP order `ModuleSymbolLoader` uses for a
+main exe); missing sidecars just mean no symbolication, not an error.
+
+Live-mode arguments: `-live <exe> <map> <rsm> <sourceRoot> <sourceBaseName>
+<marker> [count] [-args <targetArgs>] [-zydisdll <path>]`, where `<marker>` is
+the text inside a `{BP:...}` tag in the source file (same convention as
+`Win32SessionProbe`). Symbolication uses the session's OWN `TDebugInfoSet`
+(multi-module aware), and machine mode comes from
+`IDebugTarget.TargetLayout.PointerSize` — never assumed from the host.
+
+A direct `call`/`jmp`/`jcc` with a resolvable static target gets an inline `;
+Name+offset` comment appended to its `Text`; an unresolvable one keeps the
+bare address Zydis printed, matching the plan's "a call into a module with
+symbols shows a name and one without shows an address". The match is a CLOSED
+whitelist of the actual Zydis control-transfer mnemonics, not a bare
+`<word> 0x<hex>` pattern — measured during development that a plain `push
+0x2A` formats identically to a direct branch and would otherwise be
+mislabelled as a resolved call target.
+
 #### HexDump
 
 ```bat

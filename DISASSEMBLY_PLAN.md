@@ -1,6 +1,6 @@
 # Disassembly and address breakpoints — plan
 
-Status: **increment 1 landed, not committed** (2026-08-08). This document is the
+Status: **increment 2 landed, not committed** (2026-08-08). This document is the
 agreed design; `PROJECT_STATE.md` carries only the one-line roadmap entry
 pointing here.
 
@@ -212,7 +212,9 @@ Decisions:
    run afterward: 1081 found / 1077 passed / 0 failed / 0 errored / 4 ignored —
    exact match to baseline, as expected since nothing new is wired into any
    existing consumer.
-2. `IDisassembler` + Zydis backend + symbolication of the output. `DevTools\Disasm.exe`.
+2. **DONE, not committed (2026-08-08).** `IDisassembler` + Zydis backend +
+   symbolication of the output. `DevTools\Disasm.exe`. Full detail in
+   "Verified in increment 2" below.
 3. Differential coverage tool vs the oracle, over the fixtures and the real
    binaries. Record the measured numbers in this file.
 4. MCP `disassemble`.
@@ -258,6 +260,110 @@ Decisions:
   x64 code from the 64-bit `TestTarget.exe` (auto-detected `long64` from its PE
   header) and correct x86 code from the 32-bit `TestTarget.exe` (auto-detected
   `legacy32`) through the same built `Zydis.dll`.
+
+## Verified in increment 2
+
+- **The seam.** `DebuggerCore\Disassembler.pas` declares `IDisassembler`,
+  `TDisasmInstruction`, `TDisasmMachineMode` (`dmmLong64` / `dmmLegacy32`) and
+  a `TDisasmByteReader` callback (`reference to function(VA; Buf; Size):
+  Integer`, returning bytes actually placed — never failing outright, so a
+  short read at a boundary is the reader's own truncation contract, not an
+  exception). No third-party reference in this unit.
+  `DebuggerCore\ZydisDisassembler.pas` (`TZydisDisassembler`) is the only
+  other unit allowed to reference `ZydisApi` — DevTools and any future
+  MCP/DAP surface depend on `IDisassembler` only.
+- **Memory comes through a caller-supplied reader, not `IDebugTarget`
+  directly.** `IDisassembler` takes bytes from whatever
+  `TDisasmByteReader` the caller wires up — a live process, a PE file on
+  disk, or a test double — so the backend itself has no notion of
+  breakpoints, live sessions, or file formats. Decoupling choice beyond what
+  this document specified; see the two traps below for how each caller
+  satisfies its side of the contract.
+- **Trap 1 (planted breakpoints) — solved with a new engine primitive.**
+  `IDebugTarget.ReadCodeMemoryAt(VA, Buf, Size): NativeUInt`
+  (`DebugTarget.pas`, implemented once in `TWinDebuggerBase.pas` and shared
+  unchanged by `TWin32Debugger`) reads like `ReadProcessMemoryAt` but restores
+  any of the debugger's own planted `INT3` bytes found in the returned window
+  from `FBreakpoints[].OrigByte`, and truncates at the end of the committed
+  `VirtualQueryEx` region instead of failing (this doubles as trap 2's fix for
+  the live-session path). This is an interface addition the plan named the
+  need for ("the engine already keeps `OrigByte` per breakpoint") but did not
+  specify the shape of — flagged here per the task's "STOP on an
+  unanticipated design decision" instruction, decided in favour of the
+  smallest addition that reuses existing engine state, matching how
+  `ReadProcessMemoryAt` already sits directly on `IDebugTarget`.
+  `DebuggerTests\ValueReaderTests.pas`'s `TFakeMemTarget` (the only other
+  `IDebugTarget` implementer) got a trivial truncating implementation with no
+  breakpoint concept, since it has no live process.
+- **Trap 1, proven, not just implemented.** `DebuggerTests\DisassemblerTests.pas`
+  plants TWO breakpoints on consecutive source lines of the same routine,
+  stops at the first, and reads the SECOND (still-armed) breakpoint's address
+  both raw (`ReadProcessMemoryAt`, must be `$CC`) and through
+  `ReadCodeMemoryAt` (must be the restored original opcode) — on both
+  bitnesses (`TReadCodeMemoryAtTests`, `TReadCodeMemoryAtWin32Tests`).
+  Negative-controlled: with the restore loop commented out, both failed with
+  `Expected [204] equals actual [204]` (`$CC` = 204) against the "must
+  restore the ORIGINAL opcode" message.
+- **Trap 2 (truncate, don't fail) — no shared automated fixture.** Static
+  mode (`Disasm.dpr`) clamps its file read at EOF; live mode clamps inside
+  `ReadCodeMemoryAt` at the `VirtualQueryEx` region boundary. Exercised
+  manually (`TEST_CATALOG.md` "M. Disassembly"), not by a DUnitX test — a
+  disassembly window genuinely crossing a section/page boundary is hard to
+  provoke deterministically from a fixture without a purpose-built target.
+- **Trap 3 (never merge into the call stack) — satisfied by construction.**
+  `IDisassembler.Disassemble` returns `TDisasmInstruction`, not `TStackFrame`;
+  nothing in this increment writes into `GetStackFrames` / `GetRawStackFrames`
+  or any DAP/MCP stack-rendering path. There is nothing to opt out of because
+  the two outputs share no type and no call path.
+- **Fail-closed, proven.** `TDisassemblerBackendTests
+  .Unavailable_WhenDllMissing_DisassembleReturnsEmptyAndNeverReads` points
+  `TZydisDisassembler` at a DLL path guaranteed not to exist and asserts
+  `Available=False`, `Disassemble` returns an empty array, AND the byte
+  reader is never invoked at all (fail closed BEFORE touching memory).
+  Negative-controlled: with the `if not Available then Exit` guard commented
+  out, it failed with "the byte reader must never be invoked...". This is
+  the ONLY Zydis-related test in the automated suite — `ZydisApi.ZydisTryLoad`
+  is a one-shot, process-wide latch (first call decides the outcome for the
+  process's whole lifetime), so a negative-DLL test sharing a process with a
+  positive-decode test would poison the latter. The positive (real DLL,
+  correct decode, real symbolication) path is proven manually via
+  `DevTools\Disasm.exe`, not in `RunTests.exe`.
+- **Symbolication reuses the production provider set exactly.** Both
+  `Symbol` (nearest function+offset for the instruction's own address) and
+  `SrcFile`/`SrcLine` go through `TDebugInfoSet.RvaToFunctionName` /
+  `RvaToFunctionStart` / `RvaToSourceLine` — the same calls
+  `WinDebuggerBase.pas` makes when naming an ordinary stack frame. Live mode
+  hands the disassembler the session's own `TDebugInfoSet` (multi-module
+  aware); static mode builds a fresh one from the file's sibling `.rsm`/`.map`
+  in the same RSM-added / TD32-primary / MAP-last order
+  `TModuleSymbolLoader.LoadMainModule` uses, so a standalone probe symbolicates
+  the same way the adapter would for that one binary.
+- **Call-target annotation needed a whitelist, not an open pattern — found by
+  testing, not by inspection.** Zydis's default formatter resolves a direct
+  near call/jmp/jcc's relative operand to an absolute address and prints it
+  as `<mnemonic> 0x<hex>` (measured: `call 0x0000000000019F10` on x64,
+  16 hex digits; `call 0x0001160C` on x86, 8 digits). An indirect form prints
+  brackets or a bare register (`call [rbx]`) and never matches. The FIRST
+  implementation matched any `[A-Za-z]+ 0x<hex>` and mislabelled `push 0x2A`
+  (a plain immediate push, same text shape) as a resolved call target in the
+  live smoke test — caught by manually eyeballing `Disasm.exe` output on
+  `TestTarget.exe`, not by a unit test. Fixed with a CLOSED whitelist of every
+  Zydis control-transfer mnemonic (`call`, `jmp`, every `Jcc`, the `loop`
+  family) instead of an open word-class match. Missing a real branch here
+  only loses one annotation (`Text` still shows Zydis's own raw address,
+  which is the documented answer for an unresolved target); matching a
+  NON-branch would print a fabricated symbol next to an unrelated operand,
+  which the project's fail-closed rule forbids. No automated regression test
+  guards this specific case (see `TEST_CATALOG.md` "M. Disassembly").
+- **Sample output (`DevTools\Disasm.exe`, both bitnesses, symbolicated call
+  targets):**
+  ```
+  $0000000000167FD8  E8 33 1F EB FF   call 0x0000000000019F10  ; _InitExe [Testtarget+0x18]  ; TestTarget.dpr:22
+  $0000000000167FDD  E8 1E ED FF FF   call 0x0000000000166D00  ; RunAllScenarios [Testtarget+0x1D]  ; TestTarget.dpr:23
+  ```
+  ```
+  $00000000000F4EA5  E8 5A 42 FF FF   call 0x000E9104  ; TWidget.Create [Testtarget+0x2D]  ; TestTarget.dpr:29
+  ```
 
 ## Open, to verify before writing code
 
