@@ -1066,3 +1066,15 @@ VS Code:
 
 `%TEMP%\dap_adapter.log`, line-timestamped. Always on today.
 Make opt-in is a roadmap item.
+
+## Repository and release invariants (recorded 2026-08-08)
+
+- **Branch topology.** `public-main` carries the real lineage (fast-forwarded onto
+  the Win32 branch, 127 commits). `main` is an UNRELATED PRIVATE archive whose last
+  commit sanitised the tree that became the public root — **it must never be
+  merged**.
+- **The extension manifest version is the single place the release script reads.**
+- **The debug type id `delphi-win64` and every extension command id are
+  deliberately unchanged despite Win32 support**: renaming them breaks every
+  existing `launch.json`. Only the diagnostics output channel was renamed
+  (`Delphi Debug` -> `Delphi Debugger`) to match the command category.

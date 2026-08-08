@@ -280,3 +280,16 @@ frontend's `ModuleClass` / `ShouldRetryModule` / `RequiresFor` / `OnLog` overrid
 triggered today because the MCP creates a fresh session per launch and the DAP runs one
 session per adapter process. Fix later by preserving all loader hooks across the
 recreate.
+
+## JCL provider integration rules (recovered from the task journal, 2026-08-08)
+
+Two constraints that are not optional, both learned from the adapter's threading
+and range checking:
+
+- `TJclBinDebugScanner` with `CacheData=True` lazily MUTATES its caches on the
+  first query, so it must be lock-serialized and primed eagerly at load. The
+  adapter queries providers from two threads.
+- It must be range-guarded (`InModuleCodeRange`: answer only within
+  `[shift, shift+ImageSize)` at or above the `$1000` code base), because JCL clamps
+  an out-of-range address to a wrong symbol and range-errors under `{$R+}`. TD32
+  and MAP bounds-check internally; JCL does not.

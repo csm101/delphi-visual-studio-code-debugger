@@ -1670,3 +1670,109 @@ Next step when it recurs: capture `%TEMP%\dap_adapter.log` from the failing run
   What it does not provide, and nobody has asked for: automatic updates (users
   re-run the installer) and hosted distribution of the installer itself
   (`build_setup_zip.bat` / `make_release.bat` package it).
+
+## Open items recovered from the task journal (2026-08-08)
+
+Carried over when `TASK_RESUME.md` was cut back to a cursor. All of these were
+open at that date; none had a home in this file.
+
+### Reverted, and not to be retried blindly
+
+**Labelling an interface with its concrete class via the interface-table search.**
+Reached from an arbitrary formatted value it walks into module data where the RTTI
+readers raise `EIntOverflow` and fail the whole `variables` request. Bounding by
+the OS allocation did not help (the object and the reference share a region), and
+bisection did NOT converge — `IsClassInstance`, `GetInstanceSize`,
+`GetInstanceClassName` and the table walk each stayed implicated. **Cause not
+located.** The concrete-class label therefore remains x64-only through IMT-thunk
+decoding. The interface-table mechanism itself IS used, and green, for member
+ACCESS through an interface.
+
+### Deferred refactor: the x64 class was never extracted
+
+`Win64Debugger.pas` is now `WinDebuggerBase.pas`, which is what the name needed to
+stop claiming — the unit holds the architecture-NEUTRAL engine and debugs 32-bit
+targets too. What was NOT done is extracting a `TWin64Debugger` into
+`WinDebuggerX64.pas`: the base class still carries the x64 seam implementation as
+its DEFAULT and `TWin32Debugger` overrides it. Splitting means promoting whatever
+private state those ~12 seam methods touch to `protected`, which is a real design
+change to a 4000-line unit rather than the pure move the plan assumed.
+
+### Still open, logged not fixed
+
+- **RSM resolves nested type names wrongly on Win32 too** (`Col` ->
+  `PPCharArray`). TD32 wins at runtime so nothing is visibly broken, but a binary
+  with RSM and no TD32 would show it.
+- **`<.Field not found>` loses the receiver** — it should name the class.
+- **`Length()` returns `Int64` where Delphi says `Integer`**, and a dynamic array
+  reports `^Element` as its type rather than `TArray<T>`.
+- **STRING arguments to a synthetic method call fail** with a bare
+  `<method invocation failed>` that gives no reason. Float / Int64 / Currency
+  arguments work.
+- **A Win32-only duplicate `Testtarget` frame** appears in the main block.
+- **Win32 stack walk**: frame 1 can still render as `0x14FF318 (unknown module)` —
+  a stack address mistaken for a return address by the i386 EBP walk.
+- **An unresolved local does not fail loudly.** Without RSM, `TheWidget` falls
+  through and binds to a GARBAGE global address, then displays plausible wrong
+  values (`TheWidget.FName` read as `'Windows 11'`). A guard that refuses instead
+  of silently binding to an unrelated global is worthwhile regardless of RSM
+  policy.
+
+### `Application` on a real host: which provider offers RVA $1C38
+
+On a live `bds.exe`, a bare `Application` resolved to a bogus code-resident
+RVA `$1C38` (VA `$2D1C38`, Raw `$F8BAE850`, no type) EARLY in startup and
+correctly to `$4295900 (TApplication)` later in the SAME session — so it depends
+on which providers have registered, not on the expression. **WHICH provider offers
+`$1C38` is still unknown.**
+
+An earlier note blamed "the DLL MAP is registered unscoped". That was WRONG and is
+retracted: `EnsureModuleMap` shifts a module MAP into exe-RVA space and registers
+it range-scoped through `AddModuleProvider`, so a `vcl290` RVA cannot surface as a
+bare `$1C38`.
+
+**The means to answer it already ships**: `EvaluateGlobalName` now dumps EVERY
+candidate when it refuses — RVA, VA, data/code classification, whether the address
+is a function entry, and the nearest function name. The instrumentation was left
+in deliberately so that the next live run NAMES the provider instead of producing
+another guess. Do not write a probe for this; run the adapter.
+
+Full resolution needs unit-scoped AND module-scoped MAP globals.
+
+### Live hazard: `LookupEnumInfo` mutates a dictionary without the lock
+
+`TRsmFile.LookupEnumInfo` mutates `FEnumInfoByName` (lazy set base-type
+resolution) WITHOUT `FLock`, while the index thread writes the same dictionary
+under it. A rehash under a concurrent read is an access violation — the same class
+as the `LookupTypeName` bug fixed 2026-07-20. Verified still unlocked at
+`DebuggerCore\RsmFileReader.pas:3498-3510`. Four-line fix.
+
+### Sidecar policy: two open decisions
+
+- Sidecars are written into the Embarcadero `Bpl\Win64` / `Dcp\Win64` directories.
+  Moving them to a user-writable cache changes the freshness contract, the
+  `PrebuildIdx` workflow and the shipped-corpus story.
+- **Two disagreeing freshness rules for the same question**:
+  `RsmFileReader.pas:664-665` accepts sidecar mtime >= source, while
+  `PeSymbolSupport.pas:69-81` uses a different rule.
+
+### Machine state: the shipped `.idx` corpus on this machine is degraded
+
+The `.idx` sidecars sitting in the local Embarcadero `Bpl\Win64` / `Dcp\Win64`
+trees do NOT match what the current parser produces: `PrebuildIdx -verify`
+reported **6/6 MISMATCH** against them, while HEAD-built ones verify 6/6. They
+predate the 2026-07-20 two-wave index fix — that is, they are the degraded, LOSSY
+indexes. Because sidecar freshness is decided by mtime and not by content, they
+are accepted and served **silently**.
+
+Until someone runs `PrebuildIdx -r -force` over those trees, every debug session
+against a DevExpress / Spring / Tee package on this machine gets an index missing
+an unknown subset of resolved type hints, and nothing reports it. This is also the
+standing first explanation for any future "types missing for package X" report.
+
+### TD32 locals are exposed for DLL/BPL modules too
+
+`EnsureDllTD32` sets `Obj.ExposeLocals := True`, not only the main exe's TD32.
+Without it, a BPL whose RSM has zero locals for a function — while its TD32 has
+them — shows empty locals and `Self: not found`. Regression test:
+`Test_Bpl_Td32Only_LocalsVisible`.

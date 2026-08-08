@@ -376,3 +376,10 @@ hash); the parser only consumes the first one.
 - **Var-param storage**: the 8-byte slot at the local's address holds a
   pointer; the real value lives at `*slot`. Both `RawValue` (slot) and
   `DerefValue` (`*slot`) are surfaced to the caller.
+
+## Class member hash, 1-byte form (recovered from the task journal, 2026-08-08)
+
+The 1-byte class member hash encoded as `$08 lo $FF` decodes to `$00lo`, **not**
+`$FFlo`, for unit-section Variant-D classes. The Variant-D branch of
+`ParseTypeDeclarationSection` must therefore also register the even 1-byte
+low-byte class-hash candidate, or those members never bind.

@@ -125,7 +125,17 @@ The debugger engine is exposed through two frontends:
   diagnostic/console log sinks. The invariants preserved verbatim: provider
   order RSM-before-TD32-before-MAP-before-DCP with the main TD32 front-inserted
   as Primary; RVA shift = `Base − exeImageBase` under `{$Q-}`; DLL MAP added
-  UNSCOPED while RSM/TD32/DCP are RVA-range-scoped; the per-module `*Tried`
+  RANGE-SCOPED like RSM/TD32/DCP — `EnsureModuleMap` registers it through
+  `AddModuleProvider` (`ModuleSymbolLoader.pas:1216`), which adds it to the flat
+  name/line lists AND to the ranged RVA lists, so an RVA the module owns that its
+  ranged TD32 cannot name (an anonymous-method body, for which TD32 emits no proc
+  symbol) falls through to the MAP instead of being blocked by an "owned but none"
+  answer. (This line previously stated the opposite, "DLL MAP added UNSCOPED".
+  That was a diagnosis from a field round, later RETRACTED — it was the wrong
+  explanation for the bogus `Application` RVA `$1C38`, and it survived here after
+  the code had moved on. A module MAP's RVAs are shifted into exe-RVA space and
+  range-scoped, so a `vcl290` RVA cannot surface as a bare `$1C38`.); the
+  per-module `*Tried`
   probe-once negative cache; `SymbolFileIsStale`'s 2 s grace. The DAP keeps its
   background loader (still off by default), progress/spinner, and evaluate
   warm-up caches on top of the shared synchronous primitives.
@@ -2091,3 +2101,163 @@ disassembly, set-next-statement).
   or hand-rolled native code without `push rbp; sub rsp, NN` will
   return `FrameSize = 0` and the locals readout will be wrong for
   that frame.
+
+## Mechanisms recovered from the task journal (2026-08-08)
+
+Facts that lived only in `TASK_RESUME.md` until it was cut back to a cursor. Each
+was measured when it was written; none is restated elsewhere in this document.
+
+### Target architecture and pointer width
+
+- **One 64-bit adapter binary debugs both x64 and WOW64 x86 targets, and the
+  two-binary alternative was rejected on a concrete constraint**: the MCP server
+  is registered once at editor startup with a fixed command, long before any
+  target exists, so it cannot pick a per-bitness binary. Two binaries would force
+  an IPC proxy for no gain. `Win64Debugger.pas` was renamed `WinDebuggerBase.pas`
+  alongside `WinDebuggerX86.pas`; the repository, extension and MCP names are
+  deliberately unchanged.
+- **Host and target pointer size are different things, and on x64 every site that
+  conflates them is correct by accident.** Five such sites were found, each in a
+  different layer: `LocalReadSize` (stack locals), `SyntheticLocal` (expanded
+  fields), `PrimTypeSize` and `SizeForKind` (ExprEval), and — the worst —
+  `GetClassProperties`' walk of the published-RTTI records, which disabled live
+  RTTI entirely on x86 while still returning plausible values through the
+  debug-info fallback. **A wrong pointer width rarely fails loudly**: three of the
+  four degraded into a fallback or a plausible number rather than an error. Assume
+  any remaining one is currently invisible.
+- **Exception readers are pointer-width sensitive.** `Exception.FMessage` is the
+  first field after the VMT pointer, so offset 4 on Win32 and 8 on Win64;
+  `VMT -> TypeInfo` is at -72 (Win32) / -168 (Win64); `ParentInfo` follows at
+  `+PointerSize`, not a literal `+8`. All of it must go through
+  `ReadTargetPointer` / `TargetLayout.VmtTypeInfo`.
+- **One root cause, four symptoms**: `FExceptionObjAddr` is published ONLY when the
+  exception-class read succeeds, so any failure of that read also removes
+  `$exception` from the evaluator AND leaves exception-TYPE filters nothing to
+  match.
+
+### Stack walking
+
+- **`NearestInstructionBoundaryBefore` must not be bounded to the main image.**
+  RVAs are one space anchored there and every module registers inside it, so the
+  bound made runtime-package code permanently undecidable — and the user's own
+  code mostly lives in packages. Separately: when the candidate IS a function
+  entry there is no boundary before it, so the decode must anchor on the routine
+  containing the byte BEFORE the candidate. That decode proves `ret`, not `call`,
+  and correctly rejects the fabricated frame.
+- **On a 32-bit target `StackWalk64` can return frame 0's PC SIGN-EXTENDED to 64
+  bits** (`$B5C34A23` -> `$FFFFFFFFB5C34A23`), matching no module and losing the
+  source line — even when the adapter had already resolved the stop correctly.
+  Frame 0's PC is therefore re-anchored to the authoritative seed PC,
+  symbolication follows `Frame.IP` rather than `SF.AddrPC.Offset`, and a 32-bit
+  frame address above 4 GB stops the walk. Why dbghelp sign-extends is NOT
+  root-caused; the fix is to stop asking it for a value already held exactly.
+
+### Evaluation and the synthetic call
+
+- **Member access through an interface reference is exact, not heuristic.** Debug
+  info emits no member list for an interface, and the reference addresses a field
+  INSIDE the object; the containing object is recovered by walking back to the
+  first candidate with a valid VMT whose instance size REACHES the reference
+  address. Only the containing object can cover that address (`cfbc3ad`).
+- **x87 capture stub, the trap that cost three wrong conclusions**: the FNSAVE tag
+  word is indexed by PHYSICAL register, but the saved register AREA is in STACK
+  order with ST(0) always FIRST. Multiplying the register offset by TOP reads
+  ST(7). The tag word only reports whether ST(0) was occupied; if not, the float
+  slot stays zero and the call is read as an integer one (`IntResult` = EDX:EAX).
+- **The x87 stack does NOT leak across synthetic calls — do not "fix" it.** The
+  `fnsave`/`frstor` capture stub restores the callee's state including the
+  un-popped result, but `RunMethodCall` saves the thread context with
+  `CONTEXT_FULL` / `CONTEXT_FLOATING_POINT` before the call and restores it after
+  reading the result (`WinDebuggerBase.pas:3277` / `:3335`). On a WOW64 thread that
+  is the same physical x87 stack. Measured: 12 consecutive float evaluations, all
+  correct.
+- **Win64 parameter home-slot address for the current frame** =
+  `RBP + subRspN + extraPush + 16 + 8*paramIndex` (the same anchor
+  `ReadParentFramePointer` uses). For a method, `Self` is ABI slot 0 and declared
+  parameters start at slot 1.
+- **A small POD record return (<= 8 bytes) is packed in RAX under the Win64 ABI**,
+  not returned through the hidden var-out slot. Routing every record through the
+  hidden slot yields a bogus zero AND shifts the user arguments by one, so return
+  handling must be size-routed.
+- **`AnsiString` / `UTF8String` decoding must read the code page from
+  `TStrRec.codePage`** (a Word at `Ptr-12`). Using the system ANSI code page gives
+  mojibake for any string whose code page is not the default.
+- **Set-typed variables are byte-granular.** `setVariable` must write exactly the
+  provider-reported size — 3, 5, 6 and 7 bytes are real — through a little-endian
+  byte loop. A `case 1,2,4` store plus a packing table that rounds 3 -> 4 writes
+  wrong bytes into the debuggee and corrupts the neighbouring variable.
+- **Variant-array expansion** reads the `varArray` header, enumerates bounds in
+  USER declaration order, and caps enumerated elements at 1024 (verified against
+  `Arr1D=[10..50]` 1-D and `Mat[1,1]=1.5` / `Mat[2,3]=7.25` 2-D).
+- **Evaluate warm-up is scope-bounded, and Delphi has NO transitive uses**: a bare
+  identifier's visibility is exactly the frame's unit plus its DIRECT uses.
+  `DebugInfoSet.ScopeUnitsForFrame(FrameRva)` returns that set, and
+  `DapServer.WarmupUsesScopeForFrame` loads only the modules owning those units
+  (`Module.ContainsSourceFile`). On a miss with a known scope the identifier is
+  REJECTED as out of scope — no brute-force sweep. The all-modules
+  `WarmupSymbolProvidersForEvaluate` runs only when no uses graph exists for the
+  frame, and is still O(N) over eligible modules: a launch config naming a module
+  in a shared BPL output directory WITH PREFETCH DISABLED still hits the 7-55 s
+  worst case (prefetch is off by default).
+
+### Symbol loading and the prefetcher
+
+- **`TRsmFile` does NOT implement `IFunctionNameProvider`** — only
+  `TD32FileReader`, `MapFileReader` and `JclDebugReader` do. Frame NAMES are
+  therefore gated on `EnsureModuleTD32/Map/Jcl` having run for that module (~157 ms
+  of synchronous TD32 per module, lazily at the stop). The `.idx` sidecar governs a
+  different symptom: locals and types arriving late.
+- **TD32 in a monolithic exe PHYSICALLY CONTAINS the rich data long assumed to be
+  RSM-only**: enum info (kind 3 names, sets kind 6 with base type), full class
+  member lists with offsets including non-RTTI members, `Result` locals for every
+  getter (the return ABI), and the parent-class hierarchy. TD32 is already
+  front-inserted as Primary in `FMemberProviders` / `FEnumProviders`. The NO_RSM
+  gaps were routing and fidelity problems, not missing data.
+- **Accepted narrow prefetch hole**: a breakpoint SET WHILE THE TARGET IS RUNNING,
+  in a module whose prefetch the worker has already started, does not bind on that
+  call — the sweep declines rather than waits, and publication is held until the
+  next stop, where the drain repost binds it. Modules owning a breakpoint at their
+  `LOAD_DLL` event are unaffected (the eager gate loads them synchronously and
+  `EnqueuePrefetch` then skips them).
+
+### Session and MCP behaviour
+
+- **MCP `launch_debuggee` FORCES stop-at-entry by design.** The session Run loop
+  pumps debug events continuously, so breakpoints must be set while the process is
+  parked at entry, before `continue_and_wait`, or the target races past them.
+- **Ownership in `TDebugSession`**: `FMap` / `FTD32` / `FRsm` are
+  `TInterfacedObject` instances owned by `FDebugInfo` through ARC. The destructor
+  must NOT free them.
+- **`FindBreakpointByVA` cannot become a VA -> index hash map**: it returns a LIST
+  INDEX used for `FBreakpoints[idx]` mutation and `.Delete(idx)`, and every
+  per-step one-shot delete shifts indices. Any O(1) lookup must key on identity,
+  not position. Descoped as not worth the refactor risk below ~100 breakpoints.
+- **Pre-attach gate rule** (`ProcessEnum.CanDebug`): an x64 host accepts BOTH x64
+  and x86 (WOW64) targets; ARM64 is refused as UNVERIFIED, which is a different
+  claim from impossible. Demanding that the target match the debugger's
+  architecture wrongly reported every 32-bit process as not attachable while the
+  engine attached to them perfectly well. Pinned by
+  `Json_Wow64Target_IsAttachableFromAnX64Debugger`.
+- **`QueryFullProcessImageNameW` and `PROCESSOR_ARCHITECTURE_ARM64` are not
+  declared in this Delphi's `Winapi.Windows`** and are imported manually in
+  `ProcessEnum`, following the pattern already in `DapServer.pas`.
+- **Provider-interface GUIDs share a prefix differing only in the last suffix**;
+  the last allocated is `...0013` (`ISourceFileListProvider`) and the NEXT FREE is
+  `0014`. A duplicate makes `Supports` hand back the wrong vtable silently — a
+  `...0011` clash with `IThreadLocalNameProvider` wrote a `TArray` result through
+  the address of a `Boolean` and errored 13 tests far from the cause.
+  `TProviderInterfaceTests.ProviderInterfaceGuids_AreUnique` pins pairwise
+  distinctness; its list is hand-maintained.
+- **`get_source_files` contract**: `ISourceFileListProvider` + `TSourceFileEntry`
+  (`DebugInfoTypes.pas`), implemented by `TTD32FileReader` (`Complete` always true)
+  and `TMapFile` (`Complete` mirrors `FIndexReady` — the unit-section index IS the
+  "Line numbers for" set). Exposed through `TModuleSymbols.SourceFileList`,
+  `TModuleSymbolLoader.MainSourceFileList` (the exe sits outside the runtime module
+  registry, so it needs its own) and `TDebugSession.GetModuleSources`. Only
+  ALREADY-LOADED formats are queried, so enumeration never stalls a session parsing
+  a 500 MB sidecar.
+- **The extension's hover-provider registration must stay guarded**: an editor of
+  the VS Code family lacking `registerEvaluatableExpressionProvider` would throw
+  out of `activate()` and lose the DEBUG TYPE with it. The JS tests under
+  `install/local.delphi-win64-debug/test/` are run by
+  `install/extension-tests/run.bat`, which the release procedure calls.

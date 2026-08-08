@@ -770,3 +770,28 @@ whole `DebugSession.pas` facade) via relative paths in their `uses`
 clauses, so they always test the current version of the code the adapter ships.
 `build_all.bat` and `build_one.bat` pass `-U..\DebuggerCore` to resolve the
 transitive dependencies.
+
+## `CompareMapTD32` — expected residual (baseline, 2026-08-08)
+
+The tool is only readable against a baseline, otherwise a normal run cannot be
+told from a regression. Measured after the MAP segment-column fix, with DevTools
+rebuilt against the fixed reader:
+
+| target | TD32 entries | forward divergences | reverse divergences |
+|---|---|---|---|
+| Win32, before the fix | 1568 | **all** (constant `$1000`) | **all** |
+| Win32, after the fix | 1568 | 9 | 10 |
+| Win64 (control) | 1487 | 6 | 9 |
+
+Win32 sits at the same residual level as the always-correct x64 control, so the
+leftovers are ordinary MAP-vs-TD32 granularity — one source line owning many RVAs
+in instantiated generics — and not a bitness defect.
+
+**To prove any MAP/TD32 reader change**: rebuild DevTools against the changed
+reader, then run `CompareMapTD32.exe <exe> <map>` on a 32-bit target AND a 64-bit
+control, and compare against this table.
+
+### `build_all.bat` wildcard guard
+
+In a cmd batch a `*.dpr` wildcard also matches `*.dproj` through 8.3 short names,
+so the auto-discovery must keep its `%~xF` extension guard.

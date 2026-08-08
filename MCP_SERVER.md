@@ -181,3 +181,11 @@ breakpoints a `file|line` id, variables a formatted value.
 
 These are tracked for the next phase. The DAP adapter is unaffected by any of the
 above — it is untouched by the MCP work.
+
+## Design decision: no `get_scopes` / `get_arguments` (recorded 2026-08-08)
+
+Both are intentionally absent. The neutral model exposes a direct `get_locals`
+plus opaque variable handles instead of scope-reference indirection, and arguments
+are not reliably separable from locals without parameter metadata — DAP does not
+separate them either, so the indirection would buy nothing and imply a distinction
+the debug info cannot back.

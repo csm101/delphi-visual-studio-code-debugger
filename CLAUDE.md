@@ -107,6 +107,26 @@ When a long step is still in progress, TASK_RESUME.md must describe the current 
 
 The cursor should be brief but specific enough that a new session can continue without re-reading broad context.
 
+TASK_RESUME.md is OVERWRITTEN, never appended to, and stays under ~150 lines.
+
+"Update continuously" means keep the cursor CURRENT, not accumulate a journal.
+The file once reached 3343 lines (~91k tokens), at which point reading it cost
+more than reading the code it described, and its "next action" pointed at work
+finished weeks earlier. A stale cursor is worse than no cursor: it sends the next
+session in the wrong direction with confidence.
+
+Before adding a paragraph, ask where it belongs once this task ends:
+
+- a measured fact about a format -> `RSM_*.md`, `TD32_FORMAT_NOTES.md`
+- an architectural decision or mechanism -> `DAP_DEBUGGER_ARCHITECTURE.md`
+- an open question or a refuted hypothesis -> `KNOWN_UNKNOWNS.md`
+- a rule that prevents wasted work -> `TRAPS.md`
+- what is done / what is next at project scale -> `PROJECT_STATE.md`
+- the narrative of a change that landed -> the commit message, not a file
+
+Only what is true RIGHT NOW about the task in flight stays in TASK_RESUME.md.
+When the task ends, move what survives and delete the rest.
+
 PROJECT_STATE.md must contain:
 
 - architecture status
@@ -130,6 +150,9 @@ architecture and are maintained continuously alongside the code:
 - `DAP_DEBUGGER_ARCHITECTURE.md` — modules, threading model, breakpoint /
   evaluate / setVariable flows, capability list.
 - `KNOWN_UNKNOWNS.md` — open questions that block or condition the work.
+- `TRAPS.md` — operational rules that prevent wasted work. Every entry is there
+  because it already cost time once. Read it before an unfamiliar kind of change,
+  and grep it when something behaves absurdly.
 
 Rules:
 
@@ -154,7 +177,7 @@ When starting a new session:
 3. Read the living specifications relevant to the next step:
    - work on symbols / locals / globals / types → the `RSM_*` documents
    - work on the adapter, debug loop, DAP requests, stepping → `DAP_DEBUGGER_ARCHITECTURE.md`
-   - in every session, regardless of focus → `KNOWN_UNKNOWNS.md`
+   - in every session, regardless of focus → `KNOWN_UNKNOWNS.md` and `TRAPS.md`
 4. Inspect only referenced files first
 5. Resume exactly from next step
 

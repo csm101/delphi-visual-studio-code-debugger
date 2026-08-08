@@ -396,3 +396,55 @@ real implementation. Run summary shows the live count
 - [ ] Variant clipboard text
 - [ ] Set clipboard text
 - [ ] Class with > 30 fields -- truncated representation
+
+## What the suite does NOT prove (2026-08-08)
+
+Coverage-honesty notes. Each records a place where a green run is weaker evidence
+than it looks, so that a future session does not read the suite as a guarantee it
+never gave. Recovered from `TASK_RESUME.md` when that file was cut back.
+
+- **`Win32_RecordAndDynArrayExpansion_MatchWin64` asserts cross-bitness PARITY of
+  the result, not that the live-RTTI path served it.** The record could have been
+  expanded through TD32 members instead. The RTTI table-walk fixes
+  (`TFieldExEntry`, `TRecordTypeField`, `tkDynArray` `elType2`, the parent-info
+  walks) are correct by construction against the RTL's own declarations in
+  `System.TypInfo` — not by test. It is nonetheless the guard the suite is credited
+  with for the whole pointer-width RTTI sweep.
+- **The x86 field failure condition cannot be reproduced here.** It needs a caller
+  in a module dbghelp knows nothing about, and dbghelp knows every test module.
+- **`HandleSmOverStep`'s entry-RSP handling is defensive, not covered.** Stepping
+  over from the RAW function-entry address is no longer reachable — neither a
+  breakpoint nor a step-into parks there.
+- **The "symbols still indexing" retry path has no fixture and cannot get one.**
+  The window is real at a `stopAtEntry` stop, but the frames blank there are
+  `kernel32.dll` / `ntdll.dll` — genuinely `saNoSymbols` — so no name was ever
+  observed to appear on retry. The fixture MAP index finishes far faster than any
+  frame it would resolve is needed.
+- **A named-frame-count improvement cannot be measured in the fixtures.** Every
+  fixture stop has a breakpoint in the module it stops in, and the conservative
+  `ContainsSourceFile` makes any breakpoint load every module, so old and new code
+  behave identically.
+- **The live-attach test is gated by `HaveDebugPrivilege` and silently SKIPS when
+  not elevated.**
+- **`SkipIfNoRsm(reason)` skips ONLY the mono scenario** under `NO_RSM=1`; BPL and
+  RSM-on mono still execute, so a green `NO_RSM` run is not proof that those
+  capabilities work without RSM.
+
+### Fixture-design rules that follow from the above
+
+- **An argument containing ZERO BYTES silently makes an over-wide read look
+  correct.** `Win32_StepOver_AdvancesWithinTheSameFrame` could never have caught
+  the over-wide return-address read: it steps over
+  `W.StepIntoProbe(1234, 'probe-str', 2.5)`, where on x86 the first three
+  arguments travel in EAX/EDX/ECX and the fourth pushed value is the Double 2.5,
+  whose low 4 bytes are ZERO — so an 8-byte read of a 4-byte slot produced the
+  RIGHT address by accident. The replacement fixture `RunStepOverStackArg` passes
+  `Integer($5EEDBEEF)` precisely so that every byte is non-zero. Apply this to
+  every width or bitness regression fixture; the host-vs-target pointer-width class
+  of bug is explicitly expected to recur.
+- **`RunMainObjectScenarioPortable` runs only inside the BPL on purpose.** In the
+  exe the `.dpr` MAIN_* block already exercises those markers, and running the
+  portable proc there as well flips the `MAIN_GCOUNTER`-before-`STUFF_PUBBUMP`
+  first-hit order that `Test_Bug16` depends on. Do not "tidy it for parity".
+
+See `TRAPS.md` for the operational rules around running the suite.

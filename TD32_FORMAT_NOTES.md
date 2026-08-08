@@ -619,3 +619,56 @@ Against `SampleAppSingleExe.exe`, manual probing confirmed:
 
 These numbers move with every recompile of SampleApp, but the encoding
 formula does not.
+
+## Recovered from the task journal (2026-08-08)
+
+### dcc32 Borland mangling: the type name continues AFTER the `$` marker
+
+A type declared inside a routine is mangled `@Unit@Proc$qqrv@TColor` — the TYPE
+NAME follows the `$` signature marker, so truncating at `$` renames the type to
+the routine. Enums and sets then lose their identity: `Big` printed 10 instead of
+`beK`, and an EMPTY set printed `Red`. Signature-internal `@` (a class-typed
+argument is `$qqrx20System@UnicodeString`) is skipped by consuming length-prefixed
+runs.
+
+### Method-signature decode chain (`TryGetMethodParams`)
+
+class FIELDLIST -> `LF_METHOD` / `LF_ONEMETHOD` by name -> `LF_METHODLIST`, whose
+entry is `attr(2) + mfunction(4)` -> `LF_MFUNCTION` (`parmCount@14`,
+`argList@16`, `thisType@8`) -> `LF_ARGLIST` in Borland form: `count(u16)` then
+`count * type(u32)`. The class-name lookup retries with `$` replaced by `_`. A CV
+ARGLIST carries no parameter names, which is why anonymous-method parameters
+surface positionally.
+
+### Locals storage: append-only store plus linked index chains
+
+`AppendLocalToScope` was quadratic (an array realloc and copy per local, into two
+dictionaries). It is now one append-only `FLocalsStore` plus two `-1`-terminated
+linked index chains (`FLocalNextByName` / `FLocalNextByRva`) with heads and tails
+in `FProcLocalChains` / `FRvaLocalChains`: amortised O(1), each local stored once,
+chain order equal to the old parse order. **The gain is only -13..-16 %**
+(cxLibraryRS29 585 -> 494 ms) — the rest is byte-walking, not container churn.
+
+### Measured before widening `ArrayElemByteSize` for `$42` (Extended), 8 -> 10
+
+The blast radius was MEASURED rather than assumed: `TypeSizeById`'s only
+size-sensitive consumers are the SET and RECORD return paths in `ApplyMethodCall`
+(`ExprEval.pas:1477`, `:1501`), and a float reaches neither. That is what made the
+change safe after it had been deferred in an earlier round for fear of widening a
+read into an 8-byte slot. The same fear will recur for every other primitive whose
+recorded size is wrong; this is how to answer it.
+
+### Rejected on measurement: a TD32 sidecar
+
+A TD32 sidecar mirroring the RSM `.idx`, for the PE `.debug` section, was
+investigated and rejected: only 2.1-2.4x faster than a full TD32 parse, and the
+sidecar is 2.6-3.8x LARGER than the section it replaces (105 MB for a 44 MB
+package). Do not revisit without a new argument.
+
+### Rejected: moving `LoadFromFile` off the main thread
+
+`TD32FileReader.LoadFromFile` is fully SYNCHRONOUS with no `WaitForIndex` gating,
+unlike the RSM and MAP readers. Moving it to a background thread would require
+adding `WaitForIndex` to ~20 consumers — missing one yields incomplete-data
+corruption — and the first `stackTrace` needs TD32 immediately, so the stall
+relocates rather than disappears. Deliberately descoped.
