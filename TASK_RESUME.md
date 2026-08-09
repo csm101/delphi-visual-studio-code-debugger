@@ -25,71 +25,91 @@ longer true, delete it.
 
 ## Current task (2026-08-09)
 
-**`ASSEMBLY_LEVEL_DEBUGGING.md` increment 6 — WOW64 register writes. DONE, not
-committed; left in the tree for review.** `TWinDebugger.SetRegisterByName` had
-no WOW64 override; gave it one (`TWin32Debugger.SetRegisterByName`,
-`WinDebuggerX86.pas`, `Wow64Get/SetThreadContext` by name, refuses `R8`..`R15`).
-DAP `setVariable`/MCP `set_register` share the fix (same engine path).
+**`ASSEMBLY_LEVEL_DEBUGGING.md` increment 5 — the placeholder document for a
+sourceless frame becomes useful. DONE, not committed; left in the tree for
+review.** This was the last increment of the plan; the plan is now complete.
 
-**The measurement reversed the task's own starting premise, and that is the
-finding that matters most.** At the WOW64 loader breakpoint a native register
-write is genuinely invisible to `Wow64GetThreadContext` — but at a REAL
-application breakpoint (an `INT3` planted in running 32-bit code, every stop
-this debugger actually reports to a user) the native and WOW64 views alias
-exactly for every register including `Rip`/`Rsp`/`Rbp`, on this measured
-Windows build (11, build 26200). The write path was kept fixed anyway
-(documented-correct API, funnel consistency, and it's REQUIRED to close the
-one genuinely real defect: `R8`..`R15` don't exist on x86 and the unfixed
-base silently "wrote" them). Full writeup, both measurements, both probe runs:
-`ASSEMBLY_LEVEL_DEBUGGING.md` increment 6. Coverage and which tests are RED
-controls vs. regression guards: `TEST_CATALOG.md` section S. New TRAPS.md
-entry: the loader breakpoint is not a representative WOW64-context state.
+`TDapServer.SyntheticSourceText` (`DapServer.pas`) appends a real disassembly
+section below the unchanged explanatory header: proven backward instructions
+(`NearestInstructionBoundaryBefore`/`NearestExportedEntryBefore` +
+`DisassembleBackward`) plus a forward decode from the frame's PC
+(`BuildPlaceholderDisassembly`/`FormatPlaceholderInstruction`), reusing the
+exact `disassemble`-request mechanism (increment 6): same `TZydisDisassembler`,
+same `ReadCodeMemoryAt` reader (restores planted `INT3` bytes), same
+symbol/line lookups. Current instruction marked `=>` plus a `<-- current
+instruction` suffix; per-instruction source file/line shown where the line
+table has one, with "(not found in the source path)" when the file cannot be
+resolved. Zydis-unavailable falls back to naming `Disasm.StatusText`, never a
+guess. The Disassembly View reference is hedged ("where it offers one") per
+the plan's own constraint — no claim that a Call Stack menu entry exists.
+
+**A plan assumption did not hold, and I stopped to report it rather than
+routing around it silently (an explicit instruction for this task):**
+`NoSourceStop.dpr`'s `-rtl`/`-os` fixture, driven through a normal DAP
+exception stop, does NOT reach a sourceless placeholder frame — frame 0
+resolves to the CALLING Delphi frame (real source), not the true fault
+address, even though the exception event's own address is correct. Measured
+twice independently (DAP session + `DevTools\LiveSessionProbe` against the
+engine directly). Root cause NOT FOUND despite real investigation (traced
+through `TWinDebugger.GetStackFrames`/`WalkRawFrames`/`FillStackWalkContext`,
+which by their own code should make this impossible). Full writeup:
+`KNOWN_UNKNOWNS.md`, "An exception stop's frame 0 does not reliably resolve to
+the true faulting address..."; operational warning in `TRAPS.md`. Tests were
+built against the ALREADY-PROVEN sourceless-frame path instead (parked worker
+thread in ntdll, same fixture `Test_SourcelessFrame_HasPlaceholderDocument`
+uses) — this proves the `saNoSymbols` case end-to-end; the `saLoaded` case
+uses the identical code path but was not exercised by an automated fixture
+(see `TEST_CATALOG.md` "T." for exactly what is and is not covered).
 
 ### Files changed
 
-- `DebuggerCore\WinDebuggerBase.pas` — `SetRegisterByName` now `virtual`.
-- `DebuggerCore\WinDebuggerX86.pas` — `TWin32Debugger.SetRegisterByName`
-  override (public, matching base visibility).
-- `DevTools\Wow64RegWriteProbe.dpr` (new probe) — reproduces the base's exact
-  mechanism; `-rva` plants a real breakpoint instead of relying on the loader
-  break; `CompareAllFields` dumps native-vs-WOW64 for every role register.
-- `DebuggerTests\DebugSessionTests.pas` (`TWin32RunControlTests`) —
-  `Win32_SetRegister_WritesAndReadsBack`, `Win32_SetRegister_
-  ExtendedRegister_Refused` (+ file-scope `FindRegister` helper).
-- `DebuggerTests\McpE2ETests.pas` — `SetRegister_Win32_WritesAndReadsBack`,
-  `SetRegister_Win32_ExtendedRegister_Refused`.
-- `DebuggerTests\RegisterWriteDapTests.pas` (new file, 3 tests) —
-  `X64_SetVariable_Register_WritesAndReadsBack`, `Win32_SetVariable_
-  Register_WritesAndReadsBack`, `Win32_SetVariable_Register_
-  ExtendedRegister_Refused`. Registered in `RunTests.dpr`.
-- Docs (same change set): `ASSEMBLY_LEVEL_DEBUGGING.md` (increment 6, full
-  writeup), `DAP_DEBUGGER_ARCHITECTURE.md` (funnel table row + increment 4's
-  register section corrected), `TEST_CATALOG.md` (section S + Q's stale
-  bullet resolved), `TRAPS.md` (new entry), `PROJECT_STATE.md` (one-line
-  status correction), this file.
+- `VisualStudioCodeDelphiDebugger\DapServer.pas` — `BuildPlaceholderDisassembly`,
+  `FormatPlaceholderInstruction` (new), `SyntheticSourceText` (appends the
+  disassembly section), a forward declaration for `ResolveZydisDllPath` (used
+  earlier in the file than its existing definition).
+- `DebuggerTests\PlaceholderDisassemblyTests.pas` (new, 2 tests) — registered
+  in `RunTests.dpr`.
+- Docs (same change set): `ASSEMBLY_LEVEL_DEBUGGING.md` (increment 5 writeup +
+  closing status — plan complete), `DAP_DEBUGGER_ARCHITECTURE.md` ("The
+  document's content — increment 5" + a `presentationHint` correction that was
+  stale independent of this increment), `KNOWN_UNKNOWNS.md` (placeholder
+  question removed — resolved; new exception-frame-0 entry added; a stale
+  "readMemory/writeMemory on DAP — deferred" entry corrected to DONE, noticed
+  while in this section), `TRAPS.md` (new entry), `TEST_CATALOG.md` (section
+  T), `PROJECT_STATE.md`, `README.md` (two new feature bullets), this file.
 
 ### Gates
 
-- **Full suite green**: 1180 found / 1176 passed / 0 failed / 0 errored / 4
-  ignored — baseline 1173/1169/0/0/4 plus exactly the 7 new tests (2 session +
-  2 MCP + 3 DAP), ignored count unchanged.
-- Every consumer rebuilt: `build_dap.bat`, `build_mcp.bat`,
-  `DevTools\build_all.bat`, `DebuggerTests\build_and_run.bat` — all clean.
-- **RED control, confirmed**: temporarily made `TWin32Debugger.
-  SetRegisterByName` fall back to `inherited` (`Result := inherited
-  SetRegisterByName(Name, Value); Exit;`), reran the Win32 register tests —
-  the two `*ExtendedRegister_Refused` tests failed (`Condition is True when
-  False expected`), the two `*WritesAndReadsBack` tests still PASSED (the
-  aliasing finding above, not a broken control). Reverted before the final
-  build.
-- **Not verified**: on any Windows version other than the one measured here;
-  the "debuggee is running" refusal gate on `setVariable`/`set_register`
-  (same racy-to-construct precedent as `disassemble`/`readMemory`).
+- **New tests RED confirmed**: `git stash` on `DapServer.pas` alone (increments
+  1-4/6 are already committed as separate commits, so this reverts exactly the
+  increment-5 diff), rebuilt the adapter, reran
+  `Win64_WorkerParkedInNtdll_PlaceholderShowsDisassemblyWithCurrentMarker` —
+  failed with `[placeholder must carry a disassembly section; got: No source
+  available for this stack frame. ... Selecting a frame further down the call
+  stack will open real source if any frame there has it.]` (the disassembly
+  section simply absent). `git stash pop` restored the fix; rebuilt; both new
+  tests green again.
+- Every consumer rebuilt: `build_dap.bat`, `DevTools\build_all.bat`,
+  `build_runner.bat` — all clean (only pre-existing hints).
+- **Full suite green**: 1182 found / 1178 passed / 0 failed / 0 errored / 4
+  ignored — baseline 1180/1176/0/0/4 plus exactly the 2 new tests, ignored
+  count unchanged. Both fixtures (mono + BPL) ran (`build_and_run.bat`).
+- **Not verified**: the `saLoaded` disassembly-section rendering (see above);
+  the per-instruction "line known, file missing" annotation (implemented,
+  reuses `disassemble`'s own tested `BuildDapInstruction` logic, but not
+  independently exercised — no fixture surfaces that exact byte pattern); the
+  Zydis-unavailable fallback at the DAP-process level (same limitation
+  increment 1 already recorded — no external knob to force it).
 
 ## State of the tree
 
-- `public-main`. Increments 1, 2, 3, 4 and 6 are all UNCOMMITTED by
-  instruction. **DO NOT COMMIT.**
-- Next per `ASSEMBLY_LEVEL_DEBUGGING.md`'s order: increment 5 (the
-  placeholder document for a sourceless frame becomes useful) — the last
-  remaining increment, and depends on everything above already working.
+- `public-main`. Increments 1-4 and 6 are COMMITTED (separate commits,
+  `c805e85`..`7ae434b`). Increment 5 (this task) is UNCOMMITTED by
+  instruction — **DO NOT COMMIT.**
+- `DebuggerTests\RunTests.dpr` modified (registers the new test file);
+  `DebuggerTests\PlaceholderDisassemblyTests.pas` untracked.
+- Next: review + commit increment 5 if accepted. Separately worth picking up:
+  the exception-stop frame-0 finding in `KNOWN_UNKNOWNS.md` — it is a
+  correctness question (a stack trace at an exception stop in unsymbolicated
+  code cannot currently be trusted), independent of this plan, not chosen for
+  me to fix.

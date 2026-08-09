@@ -825,6 +825,8 @@ At runtime the adapter compares the debuggee's actual `ImageBase` (from `CREATE_
 - [x] Read and write raw debuggee process memory (MCP `read_memory` / `write_memory`)
 - [x] Disassembly View: "Open Disassembly View" from the Call Stack, real x86/x64 decode (Zydis) with symbolication, undecodable bytes shown honestly as `db XX` rather than guessed. Instructions before the current position are shown only when provably correct (a known boundary decodes forward to land exactly there); otherwise they are clearly marked unavailable rather than guessed
 - [x] Breakpoints at a raw address, not only a source line — set from the Disassembly View gutter or via MCP; survive a runtime package unloading and reloading (module + relative address, not a bare pointer)
+- [x] Instruction-granularity stepping (`next`/`stepIn`/`stepOut` at the instruction level from the Disassembly View, MCP `step_over`/`step_into`/`step_out` with `granularity: "instruction"`), and register / memory read-write (`readMemory`/`writeMemory`/`memoryReference` on DAP, `get_registers`/`set_register`/`read_memory`/`write_memory` on MCP)
+- [x] A stop with no source (OS code, a module with no debug info, an address a loaded module's debug info does not cover) opens a real document instead of going silent: the address, module and reason; the disassembly around the stop with the current instruction marked; and the source file + line per instruction where the line table has one, even when the file itself is not on disk
 - [x] First-chance exception break (continue past handled exceptions)
 - [x] Exception class name and message shown on stop (`exceptionInfo` details panel)
 - [x] `$exception` pseudo-variable: live exception object inspectable in Locals and Watch

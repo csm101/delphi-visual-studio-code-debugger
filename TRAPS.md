@@ -264,6 +264,24 @@ absurdly.
 
 ## Engine and language gotchas
 
+- **An exception stop's frame 0 is not proven to equal the true faulting
+  address when the fault is in code with no debug info.** Measured twice
+  independently (a DAP session AND `DevTools\LiveSessionProbe` driving
+  `TDebugSession` directly, so not a wire/JSON artifact) against
+  `DebuggerTests\TestTarget\NoSourceStop.dpr`: the exception EVENT's own
+  `ExceptionAddress` is correct (confirmed by the `EAccessViolation` message
+  text built from it), but the STACK TRACE reported for that same stop
+  resolves frame 0 to the CALLING Delphi frame instead — real source, real
+  line, ~0x1FE00+ bytes away from the true fault. `TWinDebugger.
+  GetStackFrames` explicitly forces frame 0's IP to the freshly-read
+  `GetThreadContext` RIP, which by the code's own contract should make this
+  impossible; root cause NOT FOUND (see `KNOWN_UNKNOWNS.md`, "An exception
+  stop's frame 0..."). Do not trust a stack trace taken at an exception stop
+  in unsymbolicated code without re-verifying against the exception event's
+  own address first. Do not use `NoSourceStop.dpr`'s exception scenarios to
+  reach a sourceless placeholder frame — they don't; use the parked-worker
+  fixture (`Test_SourcelessFrame_HasPlaceholderDocument`,
+  `PlaceholderDisassemblyTests.pas`) instead.
 - **The WOW64 loader breakpoint (the process's FIRST stop, before `-rva` or a
   planted `INT3`) is NOT a representative state for measuring native-vs-WOW64
   context behaviour.** `DevTools\Wow64RegWriteProbe.dpr` measured a native

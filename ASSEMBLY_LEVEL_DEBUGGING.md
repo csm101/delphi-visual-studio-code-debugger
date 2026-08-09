@@ -1,7 +1,6 @@
 # Assembly-level debugging — plan
 
-Status: **increments 1, 2, 3, 4 and 6 BUILT (2026-08-09); increment 5 designed, not
-built.**
+Status: **all six increments BUILT (2026-08-09). Plan complete.**
 Wanted in the next release.
 
 Debugging at the instruction level, in the Disassembly View and over MCP: plant a
@@ -405,41 +404,106 @@ They do not diverge.
 increment 4" carried the "not measured" caveat this increment resolves; see
 that section (now updated) for the funnel's shape.
 
-## Increment 5 — the placeholder document becomes useful
+## Increment 5 — the placeholder document becomes useful — **BUILT** (2026-08-09)
 
-MEASURED 2026-08-09, in VS Code, and it settles the question `KNOWN_UNKNOWNS.md`
-was holding open: **selecting a sourceless frame shows the adapter's placeholder
-document, not the Disassembly View.** The client opens what the adapter hands it,
-so the placeholder does not merely compete with disassembly — it precludes it.
+MEASURED 2026-08-09, in VS Code, and it settled the question `KNOWN_UNKNOWNS.md`
+was holding open (entry removed — the answer lives here and in
+`DAP_DEBUGGER_ARCHITECTURE.md`, "The document's content — increment 5"):
+**selecting a sourceless frame shows the adapter's placeholder document, not the
+Disassembly View.** The client opens what the adapter hands it, so the
+placeholder does not merely compete with disassembly — it precludes it.
 
-The placeholder is a virtual document served by the adapter, so its content is
-entirely ours to choose. Rather than deleting it and depending on client
-behaviour, fill it with what the reader actually wants:
+`TDapServer.SyntheticSourceText` now appends a real disassembly section below
+the unchanged explanatory header: up to 8 PROVEN backward instructions
+(`NearestInstructionBoundaryBefore`, falling back to `NearestExportedEntryBefore`,
+via `DisassembleBackward` — proven-boundary-only, never a guessed span) plus 16
+forward instructions starting exactly at the frame's PC (`BuildPlaceholderDisassembly`,
+`FormatPlaceholderInstruction`), reusing the EXACT mechanism `disassemble`
+(increment 6) uses: the same `TZydisDisassembler` construction, the same
+`IDebugTarget.ReadCodeMemoryAt` reader (restores this debugger's own planted
+`INT3` bytes — never a raw read), the same symbol/line lookups. Each line
+carries the nearest symbol + offset or an explicit `(no symbol)`, and — when the
+line table has one for THAT instruction's own address, independently of whether
+the frame's own PC has one — the source file and line: the resolved path when
+found, or the bare name plus "(not found in the source path)" when not. The
+current instruction gets both a `=>` marker and a `<-- current instruction`
+suffix.
 
-- a header naming the address, module and function, and why there is no source;
-- the disassembly around the frame's PC, annotated with symbol + offset, with the
-  current instruction marked;
-- a pointer to the real Disassembly View for interaction (gutter breakpoints,
-  scrolling) — **conditional on that view actually being reachable from the Call
-  Stack context menu, which must be confirmed before the sentence is written.**
+**Zydis is optional**: when `IDisassembler.Available` is False the section is one
+line naming the real reason (`Disasm.StatusText`); when nothing at the PC was
+readable at all, it says so instead of an empty list. Never blank, never a
+guessed listing, never a claim of failure for a reason that was not the real
+one.
 
-Keep separate, because they call for different answers:
-- **no line information at all** — disassembly is the only truth available;
-- **a line is known but the file is not on disk** — the actionable answer is the
-  file name and line, and how to fix the search path. Assembly there hides a
-  configuration problem behind what looks like a debugger limitation. Note that
-  the DAP disassembly output already carries `location.name` and `line` even when
-  the path cannot be resolved, so the two can be shown together.
+**The Disassembly View reference is deliberately hedged**, per the plan's own
+constraint: "An editor's own Disassembly View, **where it offers one**, can show
+more of this routine than this snippet, with gutter breakpoints and scrolling" —
+true whether or not a "jump to disassembly" command exists in the Call Stack
+context menu, which was never confirmed and is not claimed.
+
+**The two "why is there no source" cases stay apart**, as the plan required, but
+at a finer grain than expected: at the FRAME level, the placeholder is ALWAYS
+the "no line information at all for this exact address" case — `TSessionFrame.
+SourceFile` empty is precisely what triggers the placeholder
+(`TDapServer.HandleStackTrace`; confirmed by reading `TDebugSession.
+FrameToSession` and `TWinDebugger.SymbolicateAddress`), so a frame whose file is
+merely unresolvable-on-disk never reaches this code path at all — it takes the
+direct `source: {name, ...}` branch instead. The "line known, file missing" case
+therefore shows up only PER INSTRUCTION, inside the disassembly window, for an
+address near (but not at) the frame's own PC that the line table does cover.
+
+### A plan assumption that did not hold: `NoSourceStop.dpr` via an exception stop
+
+The plan pointed at `DebuggerTests\TestTarget\NoSourceStop.dpr` (`-rtl` faults
+inside `System.Move`, `-os` faults inside ntdll's `RtlMoveMemory`) to exercise
+both cases. Measured, independently, twice (a DAP session and
+`DevTools\LiveSessionProbe` driving the engine directly): an exception stop on
+either scenario does **not** reach a sourceless frame at all — frame 0 resolves
+to the CALLING Delphi frame (real source, real line), not the true fault
+address, even though the exception EVENT's own `ExceptionAddress` is correct.
+Full writeup: `KNOWN_UNKNOWNS.md`, "An exception stop's frame 0 does not
+reliably resolve to the true faulting address in code with no debug info";
+`TRAPS.md` carries the operational warning. This is a pre-existing property of
+`TWinDebugger.GetStackFrames` for exception stops, unrelated to this increment
+and not fixed here — the root cause was not found within the time spent
+investigating it, and deciding whether/how to fix it is a separate task.
+
+Because of this, the increment's tests use the ALREADY-PROVEN sourceless-frame
+path instead (`Test_SourcelessFrame_HasPlaceholderDocument`'s parked-worker-thread
+fixture — `Sleep(INFINITE)` bottoms out in ntdll/kernel32, `saNoSymbols`), new
+file `DebuggerTests\PlaceholderDisassemblyTests.pas`. That proves the
+`saNoSymbols` case (real decoded syscall stub, current instruction marked,
+every line honestly `(no symbol)`) end-to-end; the `saLoaded` case ("debug info
+loaded, this address not covered") runs through the identical
+`BuildPlaceholderDisassembly` code path — only the header's `Reason`/`Advice`
+text differs, unchanged pre-increment-5 code — but was not exercised by an
+automated fixture in this increment, for the reason above.
+
+### Coverage
+
+`TEST_CATALOG.md`, section T.
 
 ## Order
 
 1, then 2 and 4 in either order (they are the two surfaces over the same
-primitive), then 3, then 6 — all now done — then 5. Increment 5 last on
-purpose: it is the only one whose content depends on everything above already
-working.
+primitive), then 3, then 6, then 5 last — it was the only one whose content
+depended on everything above already working. All six now built.
 
 ## Gate
 
 Same as every other plan here: full suite green at each increment, every consumer
 rebuilt, each new test proven RED without its fix, both bitnesses where behaviour
 can differ. `TRAPS.md` applies in full.
+
+## Closing status (2026-08-09)
+
+All six increments built, tested and documented. The plan is complete:
+instruction-level stepping (into/over/out, with the `rep`/recursion/re-plant
+hazards it required), DAP stepping granularity, DAP memory read/write, MCP
+registers and instruction stepping, the WOW64 register-write fix increment 4's
+work surfaced, and the placeholder document that makes a sourceless stop
+inspectable instead of merely acknowledged. What is left is not part of this
+plan: the exception-stop frame-0 finding above (`KNOWN_UNKNOWNS.md`), and the
+other open DAP-adapter items already tracked independently in
+`KNOWN_UNKNOWNS.md`'s "DAP adapter / debugger" section (`setExpression`,
+`modules`/`loadedSources` on DAP, hover-safety, and the rest).

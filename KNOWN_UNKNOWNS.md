@@ -670,16 +670,14 @@ channel; `TDebugSession.OnConsole` would be the sink).
   over/into/out act on the selected thread while the others are frozen (see
   `DAP_DEBUGGER_ARCHITECTURE.md` "Stepping" and `PROJECT_STATE.md`). Only the
   synthetic-call evaluator still runs on the stopped thread (frame-independent).
-- **`readMemory` / `writeMemory` on DAP — DEFERRED, not missed.** The engine
-  has both (`ReadProcessMemoryAt` / `WriteMemoryAt`) and the MCP server exposes
-  them as `read_memory` / `write_memory`; only the DAP side is absent, so
-  VS Code's hex viewer never lights up (it keys off
-  `supportsReadMemoryRequest`). The maintainer's call, 2026-08-03, was to do
-  it together with the Disassembly View since a memory pane without a
-  disassembler is half a tool. The Disassembly View itself shipped in
-  DISASSEMBLY_PLAN.md increment 6 (DAP `disassemble` +
-  `instructionPointerReference`); `readMemory`/`writeMemory` were not part of
-  that increment and remain unimplemented on DAP.
+- **`readMemory` / `writeMemory` on DAP — DONE (ASSEMBLY_LEVEL_DEBUGGING.md
+  increment 3, 2026-08-09).** This entry was stale: `supportsReadMemoryRequest`
+  / `supportsWriteMemoryRequest` are advertised, `TDapServer.HandleReadMemory`
+  / `HandleWriteMemory` are wired, and `memoryReference` rides on every
+  variable that has a real backing address. Mechanism, the `unreadableBytes`/
+  `allowPartial` wire contract, and which variables carry a `memoryReference`:
+  `DAP_DEBUGGER_ARCHITECTURE.md`, "DAP memory: readMemory/writeMemory,
+  memoryReference — increment 3".
 - **`modules` / `loadedSources` requests — DONE for MCP, deliberately not for
   DAP.** `get_loaded_modules` exposes every mapped image with its base, size,
   symbol state and the debug-info formats that actually registered. The DAP
@@ -1777,66 +1775,64 @@ Without it, a BPL whose RSM has zero locals for a function — while its TD32 ha
 them — shows empty locals and `Self: not found`. Regression test:
 `Test_Bpl_Td32Only_LocalsVisible`.
 
-## Does the placeholder source SUPPRESS VS Code's own disassembly? (open, 2026-08-09)
+## An exception stop's frame 0 does not reliably resolve to the true faulting address in code with no debug info (open, 2026-08-09)
 
-When a stop has no source, the adapter fabricates a placeholder document and
-attaches it to the frame as `source`, because without a `source` VS Code opened
-nothing at all and the target simply went quiet. That behaviour predates
-disassembly.
+Found while building `ASSEMBLY_LEVEL_DEBUGGING.md` increment 5, trying to drive
+`DebuggerTests\TestTarget\NoSourceStop.dpr` (the fixture built for exactly this:
+`-rtl` faults inside `System.Move`, `-os` faults inside ntdll's
+`RtlMoveMemory`) through a normal DAP exception stop to reach a sourceless
+placeholder frame. It never did.
 
-Since 2026-08-09 the adapter declares `supportsDisassembleRequest` and every
-frame carries `instructionPointerReference`. **The open question: does VS Code
-open the Disassembly View by itself when a frame has no source — and does our
-placeholder prevent it, by making the frame look as though source exists?**
+**Measured twice, independently** — once over the DAP wire (a throwaway test
+against `NoSourceStop.exe -rtl`) and once with `DevTools\LiveSessionProbe`
+driving `TDebugSession` directly (no DAP involved) — so this is not a
+harness/JSON artifact:
 
-If it does, the placeholder now suppresses the better answer it was invented to
-approximate.
+- The exception EVENT itself is correct. `Ev.Exception.ExceptionRecord.
+  ExceptionAddress` (`WinDebuggerBase.pas`'s exception handler) is `$C35C24`,
+  and the `EAccessViolation` message built from it (`Access violation at
+  $C35C24 reading address $0`) confirms it — this IS the true fault, inside
+  `System.Move`, no debug info.
+- The STACK TRACE reported for that same stop is a different address
+  entirely: frame 0 resolves to `FaultInsideRtl` at the exact source line of
+  the `Move(...)` call (real source, real line), with an IP roughly 0x1FE00+
+  bytes away from the true fault address — consistent with "the caller's
+  return address", not the faulting instruction.
 
-### The experiment, and it needs a human in front of VS Code
+This should not be possible by the code's own contract: `TWinDebugger.
+GetStackFrames` explicitly forces `Frame.IP := SeedRip` for frame 0
+(`WinDebuggerBase.pas` ~line 4573, comment: "Frame 0's PC is not the walker's
+to decide"), and `SeedRip` comes straight from `GetThreadContext` on the
+excepting thread with no adjustment (`FillStackWalkContext`). The thread is
+genuinely frozen at the point of a first-chance exception `ContinueDebugEvent`
+was never called for by the time the stack is walked. Where the caller-address
+value actually originates was NOT found within the time spent on it: the AV's
+own exception-record address and the later `GetThreadContext`-read RIP
+disagree, and nothing in the traced code path between the two should be able
+to move it.
 
-Two ready launch configurations, both in `.vscode/launch.json`:
+**Not the same thing as the WOW64-loader-breakpoint trap** (`TRAPS.md`) — this
+reproduced on native x64, at a REAL first-chance hardware exception, not a
+transitional loader state.
 
-- **"No-source stop: fault inside OS code (ntdll)"** — an access violation inside
-  `ntdll`, where there is no debug info at all. This is the pure case.
-- **"No-source stop: fault inside the RTL (System.Move)"** — the fault lands in
-  RTL code linked into the exe, so the top frame may resolve to a NAME from the
-  MAP while still having no source file. This is the mixed case.
+**Practical consequence**: `NoSourceStop.dpr`'s `-rtl`/`-os` scenarios, driven
+through a plain exception stop, land on a NAMED frame with real source, not a
+placeholder — so they could not be used to test the increment-5 placeholder
+disassembly content. That content was instead verified against the
+already-proven sourceless-frame path (`Test_SourcelessFrame_HasPlaceholderDocument`'s
+parked-worker-thread fixture, `TestTargetCore.pas` `THREADS_READY` /
+`--run-threads`), which reaches `saNoSymbols` but never `saLoaded`
+("debug info loaded, this address not covered") — see
+`PlaceholderDisassemblyTests.pas`.
 
-Fixture: `DebuggerTests\TestTarget\NoSourceStop.dpr`, built for both bitnesses by
-`build_target.bat`. Both modes were verified under `LiveSessionProbe` to fault
-where intended (`EAccessViolation in module ntdll.dll` and an AV at an RTL RVA
-inside the exe respectively).
-
-MEASURED WHILE BUILDING THE FIXTURE, and the reason it does not use `lstrlenW`:
-`lstrlenW` is SEH-wrapped inside kernel32 on current Windows and returns 0 for a
-bogus pointer, so the first version never faulted at all. `RtlMoveMemory` from
-`ntdll` carries no such guard.
-
-What to record when running it:
-
-1. does an editor open by itself, and is it the Disassembly View, the placeholder
-   document, or nothing?
-2. does the `>>> DEBUGGER STOPPED` line appear in the Debug Console?
-3. is "Open Disassembly View" offered in the Call Stack context menu, and does it
-   land on the faulting instruction?
-4. does `debug.disassemblyView.showSourceCode` or any related setting change the
-   answer?
-
-### The three outcomes and what each implies
-
-- **VS Code opens disassembly by itself** → suppress the placeholder when the
-  frame has an `instructionPointerReference` AND the client declared
-  `supportsDisassembleRequest`; keep it otherwise.
-- **It does not** → the placeholder stays; only its text changes (already done —
-  it now names the Disassembly View).
-- **It depends on a user setting** → neither default is safe to assume, so the
-  choice becomes explicit configuration in `launch.json`.
-
-### Do not conflate the two reasons a source can be missing
-
-- **No line information at all** (OS code, a package built without debug info):
-  disassembly is the only truth available.
-- **A line IS known but the FILE is not on disk**: the actionable answer is the
-  file name and line, and how to fix the search path. Showing assembly there
-  hides a configuration problem behind what looks like a limitation of the
-  debugger. Any change made after this experiment must keep these apart.
+**Not yet done**: find out where the true fault address is lost between the
+exception event and the stack walk. Candidates not yet checked: whether
+`ThreadHandle(TID)` in `GetStackFrames`/`WalkRawFrames` resolves the SAME
+handle the exception fired on; whether `StackWalk64`'s own x64 unwind (which,
+per Microsoft's documentation, primarily consults the `CONTEXT` record rather
+than `STACKFRAME64.AddrPC` on this architecture) is somehow given a `Ctx` that
+disagrees with the `SeedPc`/`SeedSp`/`SeedFp` triple returned alongside it, despite
+both being filled from the same `GetThreadContext` call in the code as read.
+A repro that isolates `GetStackFrames` from the DAP/exception-filter plumbing
+(a unit test calling it directly against a frozen thread known to be at a
+specific PC) would settle this faster than re-deriving it from a live session.

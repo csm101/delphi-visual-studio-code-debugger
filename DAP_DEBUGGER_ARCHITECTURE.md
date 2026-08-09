@@ -1850,12 +1850,16 @@ stopped at `0x76549F54 (kernelbase.dll: no symbols)` and the editor did nothing.
 
 Every frame that would otherwise carry no `source` now gets one built on a
 **`sourceReference`** rather than a path (`TDapServer.AttachPlaceholderSource`),
-with `presentationHint: deemphasize` (the client greys it and keeps it out of
-recent files — it is a diagnostic, not a file the user opened) and `origin` set
-to the module. The `source` request (`HandleSource`) returns a generated document
-that names the address, the module and the function, states plainly that the
-debugger IS stopped there, and spells out which of the four
-`TSymbolAvailability` reasons applies together with what to do about it.
+with `origin` set to the module. **No `presentationHint`** — `deemphasize` was
+tried first, to grey the entry and keep it out of recent files, and it defeated
+the entire point: VS Code treats a deemphasized source as one the user is not
+meant to look at and will not open it when the frame is focused, so the stop
+stayed just as invisible as it was with no source at all (verified in the
+field: the frame label rendered, but no editor ever appeared). The `source`
+request (`HandleSource`) returns a generated document that names the address,
+the module and the function, states plainly that the debugger IS stopped
+there, and spells out which of the four `TSymbolAvailability` reasons applies
+together with what to do about it.
 
 References are minted per frame LABEL and reused (`FSynthSourceRefs` /
 `FSynthSourceTexts`), so the client can cache content and a long session does not
@@ -1869,6 +1873,67 @@ Pinned by `Test_SourcelessFrame_HasPlaceholderDocument`, which uses the parked
 worker thread (`Sleep(INFINITE)`, so the bottom of its stack is always
 ntdll/kernel32) and fails loudly if no sourceless frame is present rather than
 passing vacuously.
+
+#### The document's content — increment 5 (ASSEMBLY_LEVEL_DEBUGGING.md)
+
+MEASURED 2026-08-09 in VS Code: selecting a sourceless frame opens THIS
+document, not the client's own Disassembly View — the placeholder does not
+compete with disassembly, it precludes it (`KNOWN_UNKNOWNS.md`'s "does the
+placeholder suppress VS Code's own disassembly" question is answered by this
+one fact and the entry has been removed). So the document has to carry the
+weight on its own, and `SyntheticSourceText` (`DapServer.pas`) now does:
+
+1. The header, unchanged from before this increment: address, module,
+   function, which of the four `TSymbolAvailability` reasons applies, and
+   advice specific to that reason.
+2. A disassembly section, `BuildPlaceholderDisassembly`, appended below it.
+   Same mechanism the `disassemble` request uses (`DISASSEMBLY_PLAN.md`
+   increment 6): the same `TZydisDisassembler` construction, the same
+   `IDebugTarget.ReadCodeMemoryAt` byte reader (restores this debugger's own
+   planted `INT3` bytes before decoding — never a raw read, so a breakpoint
+   sitting on the current instruction cannot show up as `int3`), the same
+   symbol/line lookups. `NearestInstructionBoundaryBefore`, falling back to
+   `NearestExportedEntryBefore`, plus `DisassembleBackward` supply up to 8
+   PROVEN instructions before the frame's PC (proven-boundary-only, per
+   `DISASSEMBLY_PLAN.md`'s "before" decision — no boundary or an unproven span
+   means fewer, or zero, "before" lines, never a guessed one); a plain forward
+   `Disassemble` call supplies 16 instructions starting exactly at the PC (so
+   the current instruction is always the first forward line). Each line
+   (`FormatPlaceholderInstruction`) shows the address, the nearest symbol +
+   offset or an explicit `(no symbol)` — never a blank column — the decoded
+   mnemonic, and, when the line table has one for THAT INSTRUCTION'S OWN
+   address (independently of whether the frame's own PC has one), the source
+   file and line: the resolved full path when `ResolveSourcePath` finds it,
+   or the bare name plus "(not found in the source path)" when it does not —
+   naming the file IS the actionable answer in exactly that case
+   (`ASSEMBLY_LEVEL_DEBUGGING.md`'s "line known, file missing" distinction).
+   The current instruction gets a `=>` marker AND a `<-- current instruction`
+   suffix — both, so the mark survives being read as either a symbol or plain
+   text.
+3. **Zydis is optional.** When `IDisassembler.Available` is False, the section
+   is one line naming the REAL reason (`Disasm.StatusText`) — never a guess,
+   never a claim that decoding failed for a reason it did not. When nothing
+   at all was readable at the PC (unmapped/protected memory), the section
+   says that plainly instead of rendering an empty list.
+4. A closing line about the Disassembly View, phrased so it is true whether
+   or not a "jump to disassembly" command exists in the Call Stack context
+   menu (unconfirmed, and the plan explicitly forbids writing a sentence that
+   assumes it): "An editor's own Disassembly View, **where it offers one**,
+   can show more of this routine than this snippet, with gutter breakpoints
+   and scrolling."
+
+Verified end-to-end via the parked-worker-thread fixture (the same one
+`Test_SourcelessFrame_HasPlaceholderDocument` uses): the ntdll/kernel32 case
+(`saNoSymbols`) renders a real decoded syscall stub with the current
+instruction marked and every line honestly `(no symbol)`. The `saLoaded`
+case (debug info loaded, this address not covered by it) uses the identical
+`BuildPlaceholderDisassembly` code path — only the header's `Reason`/`Advice`
+text differs, which is unchanged pre-increment-5 code — but was not exercised
+by an automated fixture in this increment: `DebuggerTests\TestTarget\
+NoSourceStop.dpr` was built for exactly this, but an exception stop on it does
+not reach a sourceless frame at all (see the new TRAPS.md entry "An exception
+stop's frame 0 does not reliably resolve to the true faulting address in code
+with no debug info").
 
 ## Local variable readout
 

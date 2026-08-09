@@ -1084,6 +1084,80 @@ surfaces:
 - [ ] **The "while running" gate on `setVariable`/`set_register` is
       unverified**, same racy-to-construct reason as sections M/R.
 
+## T. Placeholder document disassembly (ASSEMBLY_LEVEL_DEBUGGING.md increment 5)
+
+`DebuggerTests\PlaceholderDisassemblyTests.pas` — new file. Measured 2026-08-09
+in VS Code: selecting a sourceless frame opens the adapter's placeholder
+document, not the client's own Disassembly View, so the document's content had
+to become real disassembly rather than only a paragraph of explanation
+(`TDapServer.BuildPlaceholderDisassembly` / `FormatPlaceholderInstruction`,
+appended by `SyntheticSourceText`). Mechanism: `DAP_DEBUGGER_ARCHITECTURE.md`,
+"The document's content — increment 5".
+
+Fixture: the SAME parked-worker-thread mechanism
+`Test_SourcelessFrame_HasPlaceholderDocument` (`DebuggerTests.pas`, not
+separately cataloged in this file) already proves reaches a genuinely
+sourceless frame — `TestTarget.exe
+--run-threads`, breakpoint at `THREADS_READY` (`TestTargetCore.pas`) on the
+main thread, then a `stackTrace` on the spawned worker thread, which is parked
+in `Sleep(INFINITE)` and therefore bottoms out inside ntdll/kernel32
+(`Symbols = saNoSymbols`). Deliberately NOT `NoSourceStop.dpr`: see
+`KNOWN_UNKNOWNS.md`, "An exception stop's frame 0 does not reliably resolve to
+the true faulting address..." — an exception stop on that fixture lands on a
+NAMED Delphi frame with real source, never reaching the placeholder at all, so
+it could not be used here.
+
+- [x] **`Win64_WorkerParkedInNtdll_PlaceholderShowsDisassemblyWithCurrentMarker`**
+      — the header still names the `saNoSymbols` reason; the disassembly
+      section is present; the current instruction carries both the `=>` marker
+      and the `<-- current instruction` suffix; every line says `(no symbol)`
+      (no Delphi provider covers ntdll/kernel32); the text never contains the
+      literal phrase `Open Disassembly View` (that menu entry was never
+      confirmed to exist) and does contain the hedged `where it offers one`
+      phrasing instead. RED confirmed: reverting `DapServer.pas` to its
+      pre-increment-5 state (via `git stash` on that one file — increments
+      1-4/6 are committed, so this reverts exactly the increment-5 diff and
+      nothing else) reproduces the OLD placeholder text (header only, no
+      "Disassembly around the current instruction" section at all) and this
+      test fails with `Condition is False when True expected. [placeholder
+      must carry a disassembly section; got: No source available for this
+      stack frame. ... Selecting a frame further down the call stack will
+      open real source if any frame there has it.]` — the disassembly section
+      is simply absent, exactly the pre-fix shape.
+- [x] **`Win64_WorkerParkedInNtdll_HeaderStillNamesAddressAndStoppedState`** —
+      regression guard on the UNCHANGED header text
+      (`Test_SourcelessFrame_HasPlaceholderDocument`'s own assertions,
+      duplicated here so a header regression fails two independent tests, not
+      one). Passes with or without the increment-5 fix, by design — it is not
+      a RED control.
+- [ ] **The `saLoaded` case (debug info loaded, this address not covered) runs
+      through the identical `BuildPlaceholderDisassembly` code path but was
+      NOT exercised by an automated fixture** — see the `NoSourceStop.dpr`
+      finding above. Only the header's `Reason`/`Advice` text differs between
+      `saNoSymbols` and `saLoaded`, and that text is unchanged pre-increment-5
+      code, unit-tested by construction of the existing `case F.Symbols of`
+      branches, but the disassembly section specifically has not been observed
+      rendering for a `saLoaded` frame.
+- [ ] **The per-instruction "line known, file not on disk" annotation
+      (`FormatPlaceholderInstruction`'s `ResolveSourcePath` branch) is
+      implemented but not independently exercised by a test.** Neither
+      `NoSourceStop.dpr` scenario nor the parked-worker fixture surfaces a
+      nearby instruction whose line IS known but whose file cannot be
+      resolved — building a fixture for exactly that byte pattern was out of
+      scope. The code path is the SAME one `disassemble`'s `BuildDapInstruction`
+      already uses for `location.name`/`line` (increment 6), which IS
+      exercised by the `disassemble` request tests (section M).
+- [ ] **The Zydis-unavailable fallback (`Disasm.Available = False`) is not
+      exercised at the DAP-adapter-process level**, same limitation increment
+      1 already recorded: `ZydisApi.ZydisTryLoad` is a one-shot,
+      process-wide latch with no launch-config knob to force it unavailable
+      from outside the process, and the adapter runs as a separate executable
+      from `RunTests.exe`. Verified by code inspection instead: `if not
+      Disasm.Available then Exit('Disassembly is unavailable: ' +
+      Disasm.StatusText + '.');` is the first statement after constructing
+      the disassembler, identical in shape to `HandleDisassemble`'s own
+      (tested) refusal.
+
 ## What the suite does NOT prove (2026-08-08)
 
 Coverage-honesty notes. Each records a place where a green run is weaker evidence

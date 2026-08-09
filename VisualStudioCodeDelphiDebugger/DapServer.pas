@@ -17,6 +17,12 @@ uses
   BreakpointEval, PeSymbolSupport, ModuleSymbolLoader,
   ExprEval, ValueEncoders, Disassembler, ZydisDisassembler;
 
+// Full definition lives in the disassemble section further down (it is the
+// same helper HandleDisassemble uses to locate Zydis.dll); needed earlier by
+// TDapServer.BuildPlaceholderDisassembly (ASSEMBLY_LEVEL_DEBUGGING.md
+// increment 5). Forward-declared so call order is irrelevant.
+function ResolveZydisDllPath: string; forward;
+
 // Defined further down; used earlier by OnDllLoaded. Forward-declared so
 // call order is irrelevant.
 
@@ -499,6 +505,13 @@ type
     // Placeholder document for a frame the providers could not give source for.
     procedure HandleSource(Seq: Integer; Args: TJSONObject);
     function  SyntheticSourceText(const F: TSessionFrame): string;
+    // ASSEMBLY_LEVEL_DEBUGGING.md increment 5: the disassembly section of that
+    // document -- real decode around the frame's PC, not prose, using the same
+    // mechanism HandleDisassemble uses. Falls back to naming the real reason
+    // when the Zydis backend is unavailable; never blank.
+    function  BuildPlaceholderDisassembly(const F: TSessionFrame): string;
+    function  FormatPlaceholderInstruction(const Ins: TDisasmInstruction;
+                CurrentVA: UInt64): string;
     function  SyntheticSourceRef(const ALabel: string; const F: TSessionFrame): Integer;
     procedure AttachPlaceholderSource(FO: TJSONObject; const F: TSessionFrame;
                 const ALabel: string);
@@ -1481,6 +1494,15 @@ begin
   Result := FSourceResolver.Resolve(BaseName);
 end;
 
+// HISTORICAL — the routine this described NO LONGER EXISTS. Kept only because
+// the behaviour it describes is still observed and is currently UNEXPLAINED (see
+// KNOWN_UNKNOWNS.md, "an exception stop does not report the faulting frame"):
+// on an exception stop the reported frame 0 is the calling Delphi frame with
+// real source, not the true fault address, and that also reproduces against the
+// engine directly rather than only through this adapter. So whatever produces
+// it, it is NOT this trimming. Do not read the paragraph below as a description
+// of live code.
+//
 // On an exception stop the top frames are RTL raise plumbing
 // (@RaiseExcept / @Assert / AssertErrorHandler / ...). They have no locally
 // resolvable source, so VS Code cannot open them and shows them as
@@ -2960,10 +2982,106 @@ begin
   end;
 end;
 
+// One line of the placeholder's disassembly section: the current-instruction
+// marker, address, nearest symbol + offset (or an explicit "(no symbol)" --
+// never blank, so a missing annotation cannot be mistaken for a formatting
+// gap), the decoded mnemonic, and -- when the line table has one -- the source
+// file and line for THIS instruction's own address, independently of whether
+// the frame's own PC has one. When the file is named but cannot be resolved on
+// disk, naming it plainly IS the actionable answer (ASSEMBLY_LEVEL_DEBUGGING.md
+// increment 5's "line known, file missing" case); when it resolves, the full
+// path is shown so the reader knows disassembly was not the only option.
+function TDapServer.FormatPlaceholderInstruction(const Ins: TDisasmInstruction;
+  CurrentVA: UInt64): string;
+begin
+  var Marker := '   ';
+  if Ins.VA = CurrentVA then
+    Marker := '=> ';
+  var SymPart := Ins.Symbol;
+  if SymPart = '' then
+    SymPart := '(no symbol)';
+  Result := Format('%s0x%s  %-28s %s', [Marker, IntToHex(Ins.VA, 1), SymPart, Ins.Text]);
+  if Ins.VA = CurrentVA then
+    Result := Result + '   <-- current instruction';
+  if Ins.SrcFile <> '' then begin
+    var FullPath := ResolveSourcePath(Ins.SrcFile);
+    if FullPath <> '' then
+      Result := Result + Format('   ; %s:%d', [FullPath, Ins.SrcLine])
+    else
+      Result := Result + Format('   ; %s:%d (not found in the source path)',
+        [Ins.SrcFile, Ins.SrcLine]);
+  end;
+end;
+
+// The disassembly section of a sourceless frame's placeholder document
+// (ASSEMBLY_LEVEL_DEBUGGING.md increment 5). Deliberately the SAME mechanism
+// HandleDisassemble (increment 6) uses -- the same byte reader
+// (FDebugger.ReadCodeMemoryAt, which restores this debugger's own planted
+// breakpoint bytes before decoding, never a raw read), the same backend, the
+// same symbol/line lookups -- so what appears here is exactly what a real
+// `disassemble` request would answer for this address, shown in the one place
+// nothing else currently offers to. The backend is optional: when Zydis did
+// not load, this names the REAL reason (Disasm.StatusText) and decodes
+// nothing -- never a guessed listing, and never a claim of failure the
+// backend did not actually report.
+function TDapServer.BuildPlaceholderDisassembly(const F: TSessionFrame): string;
+const
+  INSTRS_BEFORE = 8;
+  INSTRS_AFTER  = 16;   // includes the current instruction
+begin
+  if FDebugger = nil then
+    Exit('Disassembly is unavailable: the debugger is not attached.');
+
+  var Mode: TDisasmMachineMode;
+  if FDebugger.TargetLayout.PointerSize = 8 then
+    Mode := dmmLong64
+  else
+    Mode := dmmLegacy32;
+  var Reader: TDisasmByteReader :=
+    function(VA: UInt64; Buf: Pointer; Size: Integer): Integer
+    begin
+      Result := Integer(FDebugger.ReadCodeMemoryAt(VA, Buf, NativeUInt(Size)));
+    end;
+  var Disasm: IDisassembler := TZydisDisassembler.Create(Mode, Reader, FDebugInfo,
+    FDebugger.ImageBase, ResolveZydisDllPath);
+  if not Disasm.Available then
+    Exit('Disassembly is unavailable: ' + Disasm.StatusText + '.');
+
+  var Lines: TArray<string> := nil;
+
+  // Backward span: proven-boundary-only, exactly DisassembleBackward's own
+  // contract -- no boundary or an unproven span simply means fewer (or zero)
+  // "before" lines, never a guessed one.
+  var BoundaryVA: UInt64;
+  var HaveBoundary := FDebugger.NearestInstructionBoundaryBefore(F.IP, BoundaryVA);
+  if not HaveBoundary then
+    HaveBoundary := FDebugger.NearestExportedEntryBefore(F.IP, BoundaryVA);
+  if HaveBoundary then begin
+    var Before := DisassembleBackward(Disasm, BoundaryVA, F.IP, INSTRS_BEFORE);
+    for var Ins in Before do
+      Lines := Lines + [FormatPlaceholderInstruction(Ins, F.IP)];
+  end;
+
+  // Forward span starts exactly at the frame's own PC, so the current
+  // instruction is always the first forward line (and always present when
+  // anything at all was readable).
+  var Forward := Disasm.Disassemble(F.IP, INSTRS_AFTER);
+  for var Ins in Forward do
+    Lines := Lines + [FormatPlaceholderInstruction(Ins, F.IP)];
+
+  if Length(Lines) = 0 then
+    Exit('No bytes could be read at this address; the memory here may be' +
+      ' unmapped or protected.');
+
+  Result := string.Join(sLineBreak, Lines);
+end;
+
 // Text of the placeholder document opened for a frame with no source. It exists
 // to make a stop VISIBLE: without any `source` the client has nothing to bring
 // forward, so stopping in sourceless code is indistinguishable from not stopping
-// at all. Says which of the three reasons applies and what can be done about it.
+// at all. Says which of the three reasons applies and what can be done about it,
+// then shows the disassembly around the frame's PC -- real code, not just an
+// explanation of its absence (ASSEMBLY_LEVEL_DEBUGGING.md increment 5).
 function TDapServer.SyntheticSourceText(const F: TSessionFrame): string;
 begin
   var Reason: string;
@@ -3002,7 +3120,16 @@ begin
     'Why there is no source: ' + Reason + '.' + sLineBreak + sLineBreak +
     Advice + sLineBreak + sLineBreak +
     'Selecting a frame further down the call stack will open real source if any' +
-    ' frame there has it.' + sLineBreak;
+    ' frame there has it.' + sLineBreak + sLineBreak +
+    '------------------------------------------------------------------------' + sLineBreak +
+    'Disassembly around the current instruction (=> marks it):' + sLineBreak +
+    '------------------------------------------------------------------------' + sLineBreak +
+    BuildPlaceholderDisassembly(F) + sLineBreak + sLineBreak +
+    'A line shown above came from this module''s own line table; where none is' +
+    ' shown, no line-number information exists for that instruction. An' +
+    ' editor''s own Disassembly View, where it offers one, can show more of' +
+    ' this routine than this snippet, with gutter breakpoints and scrolling.' +
+    sLineBreak;
 end;
 
 // Gives a sourceless frame a `source` backed by a sourceReference instead of a

@@ -51,7 +51,8 @@ uses
   InstructionStepTests in 'InstructionStepTests.pas',
   InstructionStepDapTests in 'InstructionStepDapTests.pas',
   MemoryDapTests  in 'MemoryDapTests.pas',
-  RegisterWriteDapTests in 'RegisterWriteDapTests.pas';
+  RegisterWriteDapTests in 'RegisterWriteDapTests.pas',
+  PlaceholderDisassemblyTests in 'PlaceholderDisassemblyTests.pas';
 
 type
   // Dev-iteration filter: when the RUNTESTS_ONLY env var is set, only tests
