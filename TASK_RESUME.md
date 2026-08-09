@@ -25,96 +25,116 @@ longer true, delete it.
 
 ## Current task (2026-08-09)
 
-**`ASSEMBLY_LEVEL_DEBUGGING.md` increment 4 — MCP: registers and instruction
-stepping. DONE, not committed; left in the tree for review.** Thin plumbing on
-top of increment 1's engine primitive (`TDebugSession.StepInstruction`,
-`GetRegisters`/`SetRegister`) — no new engine code.
+**`ASSEMBLY_LEVEL_DEBUGGING.md` increment 3 — DAP: memory. DONE, not
+committed; left in the tree for review.** DAP `readMemory`/`writeMemory` +
+`memoryReference` on variables, reusing the same engine primitive MCP's
+`read_memory`/`write_memory` and `disassemble` already use
+(`IDebugTarget.ReadCodeMemoryAt`) — one new engine primitive,
+`IDebugTarget.WriteMemoryPartial`, added for `writeMemory`'s `allowPartial`
+byte-count reporting.
 
-Mechanism, both refusal surfaces, the WOW64 `set_register` caveat, and the
-non-obvious `step_out` RED control: `DAP_DEBUGGER_ARCHITECTURE.md`, "Registers
-and instruction stepping (MCP) — increment 4". Decisions (why `granularity` on
-the existing tools, not a `step_instruction` tool): `ASSEMBLY_LEVEL_DEBUGGING.md`
-increment 4. Coverage: `TEST_CATALOG.md` "Q.". This cursor is a pointer, not a
-repeat.
+Mechanism, the full "which variables carry a memoryReference" decision
+record, and the `allowPartial` wire contract: `DAP_DEBUGGER_ARCHITECTURE.md`,
+"DAP memory: readMemory/writeMemory, memoryReference — increment 3".
+Decisions: `ASSEMBLY_LEVEL_DEBUGGING.md` increment 3. Coverage:
+`TEST_CATALOG.md` section R. This cursor is a pointer, not a repeat.
 
 ### Files changed
 
-- `MCPDebugger\McpServer.pas` — `get_registers`/`set_register` dispatch (gated
-  on `Stopped`, going through `FSession.GetRegisters`/`SetRegister`); new
-  `TMcpServer.HandleStepTool` (shared by `step_over`/`step_into`/`step_out`,
-  reads an optional `granularity` arg, calls `TDebugSession.StepInstruction`
-  BEFORE arming the wait so a refusal reaches the caller as `isError:true`);
-  forward-declared `ParseAddress` (was previously only referenced after its
-  own definition; `set_register` now calls it earlier in the file).
-- `MCPDebugger\McpJson.pas` — `RegisterToJson`/`RegisterListToJson`
-  (`{name, value, size}`, `value` a variable-width hex string).
-- `MCPDebugger\McpToolSchemas.pas` — `get_registers`/`set_register` tool
-  schemas; `granularity` documented on `step_over`/`step_into`/`step_out`.
-- `DebuggerTests\McpE2ETests.pas` (+22 tests, +2 free-function helpers
-  `McpExePath`/`OpenInstrSampleAt`, +3 snapshot readers
-  `SnapshotLine`/`SnapshotFunction`/`SnapshotIp`) — registers (5) + stepping
-  (8 procedures, 2 run on both bitnesses = ~10 test cases). No other files
-  in `DebuggerTests\` changed; `RunTests.dpr` already registers
-  `McpE2ETests`.
-- Docs (same change set): `ASSEMBLY_LEVEL_DEBUGGING.md` (increment 4 status +
-  capability table), `MCP_SERVER.md` (Registers section, `granularity` on the
-  step tools), `DAP_DEBUGGER_ARCHITECTURE.md` (new subsection), this file.
+- `DebuggerCore\DebugTarget.pas` — `IDebugTarget.WriteMemoryPartial` (new).
+- `DebuggerCore\WinDebuggerBase.pas` — `TWinDebugger.WriteMemoryPartial`
+  (separate body from `WriteMemoryAt`, not a wrapper — see the comment at
+  its definition for the `Size=0` edge case that makes a wrapper wrong).
+- `DebuggerCore\DebugSessionTypes.pas` — `TSessionVariable.Address: UInt64`
+  (0 = no real address, the same sentinel `TLocalValue.Address` already
+  established).
+- `DebuggerCore\DebugSession.pas` — `LocalToSession` sets `Result.Address :=
+  LV.Address`.
+- `DebuggerCore\VariableExpander.pas` — five sites set `.Address` from a
+  value already used for a real memory read one line away:
+  `MemberFieldToSession`, `ExpandRttiTyped`, `ExpandProperties` (field-backed
+  branch only), `ExpandDynArray`, `ExpandVariantArray`.
+- `VisualStudioCodeDelphiDebugger\DapServer.pas` — `uses System.NetEncoding`;
+  `HandleInitialize` advertises `supportsReadMemoryRequest`/
+  `supportsWriteMemoryRequest`; new `HandleReadMemory`/`HandleWriteMemory`
+  + `ProcessRequest` dispatch; `EmitVar` emits `memoryReference` when
+  `V.Address <> 0`; `BuildCurrentExceptionRef` grew an `out ObjAddr` param,
+  threaded into `AppendExceptionLocal` and the `$exception` branch of
+  `HandleEvaluate`.
+- `DebuggerTests\DapClient.pas` — `ReadMemory`/`ReadMemoryRaw`/
+  `WriteMemory`/`WriteMemoryRaw`; `Initialize` now declares
+  `supportsMemoryReferences` (mirrors real VS Code; the adapter does not
+  currently gate emission on it, same as the pre-existing
+  `instructionPointerReference`).
+- `DebuggerTests\ValueReaderTests.pas` — `TFakeMemTarget.WriteMemoryPartial`
+  (interface completeness only; not exercised).
+- `DebuggerTests\MemoryDapTests.pas` (new, 14 tests) — capability, read/write
+  round-trip on a real local (both bitnesses), memoryReference presence
+  (local) vs. absence (Registers scope), unmapped-address partial-read,
+  invalid-reference refusal, missing-required-field refusals (`count`/
+  `data`, via raw JSON), not-launched refusals, unwritable-address refusal
+  with/without `allowPartial`.
+- `DebuggerTests\RunTests.dpr` — registers `MemoryDapTests`.
+- Docs (same change set): `ASSEMBLY_LEVEL_DEBUGGING.md` (increment 3 status +
+  capability table + full write-up), `DAP_DEBUGGER_ARCHITECTURE.md` (new
+  subsection + capability table rows), `TEST_CATALOG.md` (section R), this
+  file.
 
-### Design decision made (not left open)
+### Design decision made (not left open, per the task's own anticipation)
 
-`granularity` argument on the EXISTING `step_over`/`step_into`/`step_out`,
-not a `step_instruction` tool — the three tool names already name the three
-`TInstructionStepKind` values 1:1; a fourth tool would have reintroduced that
-choice as a `kind` argument, duplicating a distinction the surface already
-makes by which tool is called.
+Which variables carry a `memoryReference`: anything whose displayed value
+was read from a real, already-known target address (locals, fields, array/
+Variant-array elements, the live `$exception` object) carries one; anything
+computed (a getter's scalar CALL result), synthetic (a group row), or not
+memory at all (a register) does not. Full list with the reasoning per case
+is in `DAP_DEBUGGER_ARCHITECTURE.md`, not repeated here.
+
+`writeMemory`'s `allowPartial=false` path ATTEMPTS the write and reports
+what happened, rather than pre-verifying writability across the whole range
+first (the DAP spec's suggested shape) — a rejected write can therefore
+already have changed however many bytes were writable before the boundary,
+and the refusal message says so explicitly. Traded a multi-region
+pre-flight walk against reusing one already-simple mechanism.
 
 ### Gates
 
-- **Isolated filtered runs, all GREEN after the final rebuild**: `RUNTESTS_ONLY`
-  passes for `Register` (10/10), `StepInto_Instruction` (4/4), `StepOut_
-  Instruction` (4/4), `StepOver_` (5/5), `GranularityAbsent` (3/3).
-- **Full suite (`build_and_run.bat`) — CONFIRMED GREEN**: 1159 found / 1155
-  passed / 0 failed / 0 errored / 4 ignored — baseline 1145/1141/0/0/4 plus
-  exactly the 14 new `[Test]` procedures (5 registers + 9 stepping), all
-  passing, ignored count unchanged.
-- Every consumer rebuilt after the final revert: `build_mcp.bat`,
-  `build_dap.bat`, `DevTools\build_all.bat` — all clean (only pre-existing
-  hints/warnings).
-- **Four RED controls, all reverted and reconfirmed clean** (verified via
-  `RUNTESTS_ONLY`, mutation source diffed clean afterward — no stray
-  `RED_CONTROL` markers left):
-  1. Rename the `get_registers`/`set_register` dispatch strings → 3 fail
-     outright (`Unknown tool: ...` surfaces in the assertion message) + 2
-     error with "Invalid class typecast" (array expected, got the plain-text
-     error).
-  2. Force `HandleStepTool`'s `"instruction"` branch to `if False and ...` →
-     3 of 4 `StepInto_Instruction_*` tests fail (both bitness "same line"
-     assertions, plus the disassembler-unavailable refusal test, which now
-     silently succeeds instead of refusing). The 4th
-     (`RefusedBeforeLaunch`) is NOT a valid control for this mutation — see
-     TEST_CATALOG.md section Q for why.
-  3. Swap `Kind` from `iskOut` to `iskInto` in the `step_out` dispatch call
-     → both `StepOut_Instruction_LandsInTheCaller` cases fail. A plain
-     dispatch-disable revert does NOT fail this test (measured before
-     settling on this control) — same non-obvious-negative-control shape
-     increment 2's DAP `HandleStepOut` test already hit.
-  4. Disable the unknown-granularity validation branch → `StepOver_
-     UnknownGranularity_Refused` fails: the bogus value is silently accepted
-     and the program counter visibly advances.
-- **Not verified**: `set_register` on a WOW64 (32-bit) target.
-  `SetRegisterByName` has no WOW64 override, unlike `ReadThreadRegisters`
-  (which does, and IS verified both-bitness via `get_registers`). If a
-  WOW64 write turns out wrong, that is a pre-existing engine gap shared
-  identically by DAP's Registers-scope `setVariable`, not introduced here.
-  The `iskOut` "no provable return address" refusal still has no fixture
-  (same reason as section O: needs unwind-data-less x64 code; dbghelp knows
-  every test module).
+- **Isolated filtered run, GREEN**: `RUNTESTS_ONLY=MemoryDapTests` — 14/14.
+- **Full suite (`build_and_run.bat`) — CONFIRMED GREEN**: 1173 found / 1169
+  passed / 0 failed / 0 errored / 4 ignored — baseline 1159/1155/0/0/4 plus
+  exactly the 14 new `[Test]` procedures, ignored count unchanged.
+- Every consumer rebuilt: `build_dap.bat`, `build_mcp.bat`,
+  `DevTools\build_all.bat`, `DebuggerTests\build_runner.bat` — all clean
+  (only pre-existing hints/warnings). `DevTools\ValueReaderTests.pas`'s
+  `TFakeMemTarget` needed `WriteMemoryPartial` added to compile
+  (interface-completeness fallout from the new `IDebugTarget` method, not a
+  behaviour change).
+- **Four RED controls, all reverted and reconfirmed clean** (`grep
+  RED_CONTROL DapServer.pas` empty afterward; final rebuild byte-for-byte
+  the same size as the pre-mutation build):
+  1. Disable `EmitVar`'s `memoryReference` emission → the 5 tests that start
+     from a variable's own reference fail (`*_ReadMemory_LocalVariable_*`
+     both bitnesses, `*_WriteMemory_LocalVariable_*` both bitnesses,
+     `Variables_LocalCarriesMemoryReference_...`).
+  2. Disable the `readMemory`/`writeMemory` dispatch cases in
+     `ProcessRequest` → 12 of 14 fail (only the capability test and the
+     memoryReference-presence half of one control survive, neither of which
+     sends either request).
+  3. Force the `writeMemory` partial-refusal check to `False` →
+     `WriteMemory_UnwritableAddress_RefusedWithoutAllowPartial` fails alone
+     (the refused write wrongly succeeds).
+  4. Disable the `unreadableBytes`-computing branch in `HandleReadMemory` →
+     `ReadMemory_UnmappedAddress_ReportsUnreadableBytesNotFailure` fails
+     alone (`Expected [16] but got [0]`).
+- **Not verified**: the "debuggee is running" refusal gate on either
+  request (racy to construct; same gate shape `disassemble` already uses,
+  itself also untested this way); `memoryReference` on a nested field/array/
+  Variant-array element has no dedicated DAP-level fixture (covered by
+  inspection — each site reuses a value already proven for a real read).
 
 ## State of the tree
 
-- `public-main`. Increments 1, 2 and 4 are all UNCOMMITTED by instruction.
-  **DO NOT COMMIT.**
-- Next obvious step per `ASSEMBLY_LEVEL_DEBUGGING.md`'s order: increment 3
-  (DAP: `readMemory`/`writeMemory`, `memoryReference` on variables) — the
-  engine work already exists (MCP's `read_memory`/`write_memory`), this is
-  surface only. Increment 5 (placeholder doc) comes last.
+- `public-main`. Increments 1, 2, 3 and 4 are all UNCOMMITTED by
+  instruction. **DO NOT COMMIT.**
+- Next per `ASSEMBLY_LEVEL_DEBUGGING.md`'s order: increment 5 (the
+  placeholder document for a sourceless frame becomes useful) — the last
+  remaining increment, and depends on everything above already working.

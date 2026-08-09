@@ -1,6 +1,6 @@
 # Assembly-level debugging — plan
 
-Status: **increments 1-2 and 4 BUILT (2026-08-09); increments 3 and 5 designed, not
+Status: **increments 1, 2, 3 and 4 BUILT (2026-08-09); increment 5 designed, not
 built.**
 Wanted in the next release.
 
@@ -16,7 +16,7 @@ what shipped with `DISASSEMBLY_PLAN.md`.
 | disassemble | yes (`disassemble`, `instructionPointerReference`) | yes (`disassemble`) |
 | breakpoint at an address | yes (`setInstructionBreakpoints`) | yes |
 | registers, read AND write | yes (a `Registers` scope, writable by name) | yes (`get_registers`, `set_register`) |
-| read / write memory | **no** | yes (`read_memory`, `write_memory`) |
+| read / write memory | yes (`readMemory`/`writeMemory`, `memoryReference`) | yes (`read_memory`, `write_memory`) |
 | step one instruction | yes (`granularity: "instruction"` on `next`/`stepIn`/`stepOut`) | yes (`granularity: "instruction"` on `step_over`/`step_into`/`step_out`) |
 
 Two surfaces, each missing something the other has when this table was first
@@ -24,7 +24,7 @@ measured, and instruction stepping missing from both. The engine underneath was
 largely present already: it already single-steps with the trap flag, and
 `TWinDebugger` already knew how to plant a one-shot breakpoint at a return
 address. Increment 4 closed the last two MCP gaps by exposing that engine
-surface; increment 3 (below) still owes DAP `readMemory`/`writeMemory`.
+surface; increment 3 closed the last DAP gap the same way.
 
 ## Increment 1 — the engine primitive — **BUILT**
 
@@ -155,15 +155,106 @@ alternative was available and wrong:
    client can trigger is "not running" (before `launch`), which is what the
    new negative control proves.
 
-## Increment 3 — DAP: memory
+## Increment 3 — DAP: memory — **BUILT**
 
 - `readMemory` / `writeMemory` with `supportsReadMemoryRequest` /
   `supportsWriteMemoryRequest`;
 - `memoryReference` on variables, so "View Binary Data" opens the memory
   inspector on the right address.
 
-The engine work exists — MCP's `read_memory` / `write_memory` are built and
-tested. This is surface.
+The engine primitives already existed (`IDebugTarget.ReadCodeMemoryAt`, used
+by MCP's `read_memory`/`write_memory` and by `disassemble`) and are reused
+as-is; this increment is DAP surface plus one new engine primitive
+`writeMemory`'s `allowPartial` semantics needed
+(`IDebugTarget.WriteMemoryPartial`, mechanism below). Mechanism, decisions,
+and the exact base64/`unreadableBytes`/`allowPartial` wire contract:
+`DAP_DEBUGGER_ARCHITECTURE.md`, "DAP memory: readMemory/writeMemory,
+memoryReference — increment 3". Coverage: `TEST_CATALOG.md` section R.
+
+**Which variables carry a `memoryReference`, decided rather than left open.**
+The plan flagged this as the likely design question; the answer follows the
+convention this codebase already uses everywhere else for "does this value
+have a real address" (`TLocalValue.Address <> 0`, tested at a dozen call
+sites before this increment):
+
+- **Carries one**: a stack-resident local/parameter (`TDebugSession.
+  LocalToSession`, from `TLocalValue.Address`); a class/record field
+  (`VariableExpander.MemberFieldToSession`, `FieldAddr`); an RTTI-typed
+  field rescue (`ExpandRttiTyped`, `F.FieldAddr`); a field-backed property
+  (`ExpandProperties`, the field-backed branch only); a dynamic-array element
+  (`ExpandDynArray`, `ElemAddr`); a Variant-array element (`ExpandVariantArray`,
+  `ElemAddr`); the live `$exception` object (`BuildCurrentExceptionRef`'s new
+  `ObjAddr` out param, threaded into both the Locals-scope row and the
+  `evaluate` response for the literal expression `$exception`). Every one of
+  these is an address the SAME code already dereferences with
+  `ReadProcessMemoryAt`/`ReadCodeMemoryAt` two lines away to produce the
+  displayed value — not a new computation, just exposing what was already
+  known.
+- **Never carries one** (default `TSessionVariable.Address = 0`, so `EmitVar`
+  omits the field entirely rather than emitting a zero/placeholder address):
+  a register-resident local (no provider ever sets `LV.Address` for one —
+  the same sentinel the rest of the codebase already relies on); the
+  `Registers` scope (a CPU register is not a byte-addressable location at
+  all; `HandleVariables`' Registers branch builds its rows directly, never
+  through `EmitVar`, so this is structural, not a value that happens to come
+  out empty); a synthetic group row (`properties`/`event handlers`/`fields`,
+  `Kind = vkGroup`, no value to back); a getter-backed property's evaluated
+  result (`ExpandPropertyGetter`'s scalar `'(value)'` leaf) — the value came
+  from a synthetic CALL, not a read of an existing slot, so there is no
+  address that is honestly "where this value lives"; an indexed property
+  leaf (no single backing slot exists to name). A getter that returns a
+  STRUCTURED value (object/record) is the one subtle case: its OWN fields
+  still get `memoryReference` once expanded (`ExpandPropertyGetter` hands off
+  to `ExpandViaMembers` on the real object/record address the getter
+  returned), because those fields are genuine memory regardless of how the
+  base address was obtained — only the getter's un-expanded scalar result is
+  addressless.
+- Deliberately **not extended to `evaluate`/watch results** beyond the
+  `$exception` special case above — DAP's `EvaluateResponse.body` has its own
+  optional `memoryReference` field, and a plain evaluated expression (`p^`,
+  `SomeGlobal.Field`) could honestly carry one the same way a `variables` row
+  does, but wiring every branch of `HandleEvaluate` was out of scope for this
+  increment and is not attempted. `$exception` was included because the
+  DAP request handler already had every fact needed after the
+  `BuildCurrentExceptionRef` signature change; nothing else did.
+
+**`readMemory`.** Same primitive `disassemble` already uses
+(`IDebugTarget.ReadCodeMemoryAt`): restores the debugger's own planted `INT3`
+bytes within the window, and truncates at the end of the committed
+`VirtualQueryEx` region instead of failing. A truncated (or entirely
+unreadable) read comes back as a **partial success** — `unreadableBytes` set,
+`data` covering whatever WAS read (omitted entirely when nothing was) — never
+as a failed request. `data` is base64, encoded with
+`TNetEncoding.Base64String` specifically (the default `TNetEncoding.Base64`
+wraps at 76 characters with embedded CRLFs, wrong for a JSON string field).
+`count` and `data`/`memoryReference` are required DAP fields; a request
+missing one is refused rather than defaulted (a missing `count` is NOT
+"read zero bytes" — it is a malformed request).
+
+**`writeMemory` and `allowPartial`.** Writing into a live debuggee is
+destructive and deliberate, but a write that only PARTLY lands must never be
+reported the same way as one that fully lands. New primitive
+`IDebugTarget.WriteMemoryPartial` (mirrors `WriteMemoryAt`'s
+`VirtualProtectEx`/`WriteProcessMemory` mechanism exactly, as a SEPARATE
+function body rather than `WriteMemoryAt` reimplemented on top of it — see
+the comment at its definition for why the `Size=0`/`FProcess=0` edge case
+makes that refactor wrong) reports the actual byte count
+`WriteProcessMemory` transferred instead of collapsing every outcome to a
+Boolean. The DAP handler's contract, decided rather than left as a TODO: this
+adapter ATTEMPTS the write and reports what actually happened, rather than
+pre-verifying writability across the whole range before touching anything
+(the DAP spec's suggested shape for `allowPartial: false`). This means a
+rejected (`allowPartial` absent/false) write CAN have already mutated
+whatever bytes were writable before hitting the boundary — `WriteProcessMemory`
+is not transactional — and the refusal message says exactly how many bytes
+already changed rather than leaving the caller to assume zero effect. This
+was a deliberate trade against building a multi-region pre-flight
+writability walk (VS Code's memory editor writes one value at a time in
+practice, so the multi-region case is rare) in exchange for reusing a single,
+already-simple mechanism; it is documented here because it is the one place
+this increment's behaviour does not literally match the spec's suggested
+implementation strategy, only its observable contract (never a false
+"succeeded", always an honest byte count).
 
 ## Increment 4 — MCP: registers and instruction stepping — **BUILT**
 
@@ -219,6 +310,23 @@ tested. This is surface.
   `HandleStepOut` test) are in `DAP_DEBUGGER_ARCHITECTURE.md`. Coverage:
   `TEST_CATALOG.md` "Q.".
 
+## Increment 6 — WOW64 register WRITES are unverified, and may be wrong
+
+Added 2026-08-09, surfaced while building increment 4 rather than predicted.
+
+`SetRegisterByName` has **no WOW64 override**, while the read path has one and is
+verified on both bitnesses. So writing a register on a 32-bit target may land on
+the wrong logical register, and nothing reports it. This predates the assembly
+work — DAP's own `setVariable` on the `Registers` scope shares the same path — so
+it is not a regression, but it is now on a surface being shipped as a feature.
+
+A write that silently hits the wrong register is precisely the class of defect
+this project refuses everywhere else. Two acceptable outcomes, in order of
+preference: give the write a WOW64 override mirroring the read path and prove it
+on both bitnesses; or REFUSE the write on a 32-bit target with the reason, until
+someone can. What is not acceptable is leaving it to be discovered by a user
+whose register write appeared to succeed.
+
 ## Increment 5 — the placeholder document becomes useful
 
 MEASURED 2026-08-09, in VS Code, and it settles the question `KNOWN_UNKNOWNS.md`
@@ -248,7 +356,7 @@ Keep separate, because they call for different answers:
 ## Order
 
 1, then 2 and 4 in either order (they are the two surfaces over the same
-primitive) — both now done — then 3, then 5. Increment 5 last on purpose: it is
+primitive), then 3 — all now done — then 5. Increment 5 last on purpose: it is
 the only one whose content depends on everything above already working.
 
 ## Gate

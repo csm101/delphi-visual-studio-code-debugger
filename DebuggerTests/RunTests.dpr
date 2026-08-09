@@ -49,7 +49,8 @@ uses
   ZydisDisassembler in '..\DebuggerCore\ZydisDisassembler.pas',
   DisassemblerTests in 'DisassemblerTests.pas',
   InstructionStepTests in 'InstructionStepTests.pas',
-  InstructionStepDapTests in 'InstructionStepDapTests.pas';
+  InstructionStepDapTests in 'InstructionStepDapTests.pas',
+  MemoryDapTests  in 'MemoryDapTests.pas';
 
 type
   // Dev-iteration filter: when the RUNTESTS_ONLY env var is set, only tests

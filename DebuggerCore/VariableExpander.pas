@@ -558,6 +558,10 @@ begin
   Result.Value    := FormatMemberValue(M.TypeName, TypeKind, FieldAddr);
   Result.TypeName := M.TypeName;
   Result.Kind     := vkScalar;
+  // A field lives at a real, directly-read address in the debuggee -- always
+  // addressable, unlike a getter-backed property (ExpandPropertyGetter),
+  // which never sets this.
+  Result.Address  := FieldAddr;
   if Exp.EvaluateName <> '' then
     Result.EvaluateName := Exp.EvaluateName + '.' + M.Name;
 
@@ -674,6 +678,7 @@ begin
     Child.Value    := FormatMemberValue(F.TypeName, F.TypeKind, F.FieldAddr);
     Child.TypeName := F.TypeName;
     Child.Kind     := vkScalar;
+    Child.Address  := F.FieldAddr;   // real field address, same as MemberFieldToSession
     if Exp.EvaluateName <> '' then begin
       if F.Name.StartsWith('[') then
         Child.EvaluateName := Exp.EvaluateName + F.Name          // array element
@@ -872,6 +877,7 @@ begin
           TypeKind := DebugInfo.LookupTypeKind(P.TypeName);
         Child.Value    := FormatMemberValue(P.TypeName, TypeKind, FieldAddr);
         Child.TypeName := P.TypeName;
+        Child.Address  := FieldAddr;   // field-backed: a real address, unlike the getter-backed branch below
         var PtrVal: UInt64 := 0;
         Debugger.ReadProcessMemoryAt(FieldAddr, @PtrVal, Debugger.TargetLayout.PointerSize);
         var ChildExp: TSessionExpansion;
@@ -1034,6 +1040,7 @@ begin
       Child.Name     := Format('[%d]', [I]);
       Child.TypeName := Exp.ElemTypeName;
       Child.Kind     := vkScalar;
+      Child.Address  := ElemAddr;   // real element slot in the array's data buffer
       if Exp.EvaluateName <> '' then
         Child.EvaluateName := Format('%s[%d]', [Exp.EvaluateName, I]);
 
@@ -1224,9 +1231,10 @@ begin
       end;
       Nm := Nm + ']';
       var Child := Default(TSessionVariable);
-      Child.Name  := Nm;
-      Child.Kind  := vkVariant;
-      Child.Value := FormatVariantElement(ElemAddr, Exp.VarBaseType, ElemSize);
+      Child.Name    := Nm;
+      Child.Kind    := vkVariant;
+      Child.Value   := FormatVariantElement(ElemAddr, Exp.VarBaseType, ElemSize);
+      Child.Address := ElemAddr;   // real element slot in the VarArray's data buffer
       if Exp.EvaluateName <> '' then
         Child.EvaluateName := Exp.EvaluateName + Nm;
       List.Add(Child);

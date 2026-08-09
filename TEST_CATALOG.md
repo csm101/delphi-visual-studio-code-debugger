@@ -927,6 +927,100 @@ all:
       for the same reason section O records at the engine level: it needs
       x64 code with no unwind data, and dbghelp knows every test module.
 
+## R. DAP memory: readMemory/writeMemory, memoryReference (ASSEMBLY_LEVEL_DEBUGGING.md increment 3)
+
+`DebuggerTests\MemoryDapTests.pas`, driving the real adapter process over
+stdio (`TDapClient`), against the SAME `InstructionStepSample.exe`/`.map`/
+`.rsm` fixture increments 1/2 built — no new fixture needed. `X` at the
+`INSTR_MULTI` marker (a plain stack-resident Integer under this sample's
+`{$O-}` build, value 7 at that stop) is the one local these tests read and
+write. The ENGINE primitives (`IDebugTarget.ReadCodeMemoryAt`'s truncate-at-
+region-boundary and INT3-restoring behaviour) are already proven at the
+engine level (`DisassemblerTests.pas`, `InstructionStepTests.pas`); this file
+proves the THIN layer on top: does the request reach the engine with the
+right address/count, does a truncated/refused outcome come back reported
+correctly rather than as a silent success, and does a variable's
+`memoryReference` actually point at the address backing its displayed value.
+
+- [x] **Capability advertised** (`Capability_SupportsReadWriteMemoryRequest_
+      IsAdvertised`): the `initialize` response carries
+      `supportsReadMemoryRequest: true` and `supportsWriteMemoryRequest: true`.
+- [x] **`readMemory` on a local's `memoryReference` returns exactly the bytes
+      backing its displayed value** (`*_ReadMemory_LocalVariable_
+      MatchesDisplayedValue`, both bitnesses): reads `X`'s 4-byte slot and
+      decodes base64 `data` to `[07,00,00,00]` (little-endian Integer 7), with
+      `unreadableBytes` absent/0. RED control: disable `EmitVar`'s
+      `memoryReference` emission — both bitness cases fail at "carries no
+      memoryReference" before the read is even attempted (see the
+      `memoryReference`-presence control below; the same mutation invalidates
+      every test that starts from a variable's own reference).
+- [x] **`writeMemory` on a local's `memoryReference` changes the value the
+      NEXT `variables` request shows** (`*_WriteMemory_LocalVariable_
+      ChangesVisibleValue`, both bitnesses): writes little-endian 42 into `X`,
+      then re-fetches Locals and asserts the displayed value now contains
+      `(0x2a)`. RED control: disable the `readMemory`/`writeMemory` dispatch
+      cases in `ProcessRequest` — 12 of the 14 tests in this section fail (the
+      2 survivors are the capability test and the memoryReference-presence
+      half of the Registers-scope control, neither of which sends a
+      `readMemory`/`writeMemory` request at all).
+- [x] **A stack local carries `memoryReference`; the Registers scope never
+      does** (`Variables_LocalCarriesMemoryReference_RegistersScopeDoesNot`) —
+      the omission side of the "if in doubt, omit" rule, not just the
+      presence side the read/write tests above prove. A register is a CPU
+      register, not a byte-addressable location; `HandleVariables`' Registers
+      branch builds its rows directly rather than through `EmitVar`, so this
+      is structural, not a value check that happens to come out empty.
+- [x] **A read that runs off mapped memory is a PARTIAL SUCCESS, never a
+      failure** (`ReadMemory_UnmappedAddress_ReportsUnreadableBytesNotFailure`):
+      reads 16 bytes starting at `0x10` (the reserved null-page region — never
+      `MEM_COMMIT` for any usermode process, on either bitness, so this is a
+      deterministic "definitely not there" address rather than a guess at a
+      real boundary). Asserts `unreadableBytes = 16` and no `data` field.
+      RED control: disable the `unreadableBytes`-computing branch in
+      `HandleReadMemory` — this one test fails (`Expected [16] but got [0]`),
+      nothing else does.
+- [x] **An invalid `memoryReference` is refused, not silently read as address
+      0** (`ReadMemory_InvalidMemoryReference_Refused`).
+- [x] **`count` is a required field; omitting it is refused, not treated as
+      count=0** (`ReadMemory_MissingCount_Refused`) — sent via raw JSON
+      (`{"memoryReference":"0x1000"}`, no `count`) since `TDapClient.ReadMemory`
+      itself cannot construct a malformed request.
+- [x] **Refused before any launch** (`ReadMemory_RefusedWhenNotLaunched`) —
+      mirrors the `Refused_WhenNotLaunched_...` pattern sections P/Q already use.
+- [x] **A write that lands PARTLY (here: not at all) is refused when the
+      caller did not opt into `allowPartial`** (`WriteMemory_
+      UnwritableAddress_RefusedWithoutAllowPartial`): writes 4 bytes to
+      `0x10`; `WriteMemoryPartial` reports 0 bytes landed, and without
+      `allowPartial` that is a REFUSAL (`success:false`), never a quiet
+      no-op — the message states how many bytes actually changed (0) so the
+      caller is not left assuming the request had no effect at all when it
+      might have partially. RED control: force the refusal check to `False`
+      — this one test fails (the request wrongly succeeds).
+- [x] **The SAME write, with `allowPartial: true`, succeeds and truthfully
+      reports zero bytes written** (`WriteMemory_UnwritableAddress_
+      AllowPartial_ReportsZeroBytesWritten`) — `bytesWritten = 0`, not the 4
+      requested.
+- [x] **`data` is a required field; omitting it is refused, not treated as
+      "write zero bytes"** (`WriteMemory_MissingData_Refused`) — same raw-JSON
+      technique as the `count` control above.
+- [x] **Refused before any launch** (`WriteMemory_RefusedWhenNotLaunched`).
+- [ ] **The "while running" gate on both requests is unverified** — matching
+      `disassemble`'s own precedent (section M), a test that deliberately
+      catches the debuggee mid-`continue` is racy to construct reliably in
+      this fixture and was not attempted; the code path
+      (`FSession.State <> dsStopped`) is the same shape `HandleDisassemble`
+      already uses.
+- [ ] **`memoryReference` on nested fields/array/Variant-array elements
+      (`MemberFieldToSession`, `ExpandRttiTyped`, `ExpandProperties`
+      field-backed properties, `ExpandDynArray`, `ExpandVariantArray` in
+      `VariableExpander.pas`) is implemented but has no DAP-level test of its
+      own** — only the top-level Locals-scope case above is driven end-to-end
+      through a real adapter session. Each of those five sites sets
+      `.Address` from a value already used for a genuine memory read one line
+      away (`FieldAddr`/`ElemAddr`), the same mechanism proven for the
+      top-level case, so the gap is coverage breadth, not a different
+      mechanism.
+
 ## What the suite does NOT prove (2026-08-08)
 
 Coverage-honesty notes. Each records a place where a green run is weaker evidence

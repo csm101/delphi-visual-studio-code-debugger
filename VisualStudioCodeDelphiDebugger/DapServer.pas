@@ -9,6 +9,7 @@ implementation
 uses
   System.SysUtils, System.Classes, System.JSON, System.Generics.Collections,
   System.SyncObjs, System.StrUtils, System.IOUtils, System.Math, System.DateUtils,
+  System.NetEncoding,
   Winapi.Windows, Winapi.TlHelp32,
   DapProtocol, DebugInfoTypes, DebugInfoSet, DebugTarget, ExceptionRules,
   MapFileReader, TD32FileReader, RsmFileReader, WinDebuggerBase, DelphiRtti, DebugSourceIndex,
@@ -478,6 +479,12 @@ type
     // "Decision: backward disassembly is proven-boundary-only" in
     // DISASSEMBLY_PLAN.md.
     procedure HandleDisassemble(Seq: Integer; Args: TJSONObject);
+    // ASSEMBLY_LEVEL_DEBUGGING.md increment 3: `readMemory`/`writeMemory`.
+    // Thin surface over the engine primitives MCP's read_memory/write_memory
+    // already use -- see the implementation comments for the base64/
+    // unreadableBytes/allowPartial contract.
+    procedure HandleReadMemory(Seq: Integer; Args: TJSONObject);
+    procedure HandleWriteMemory(Seq: Integer; Args: TJSONObject);
     // A slot this backend actually decoded: real bytes, real text, and
     // symbol/source location when a provider knows one.
     function  BuildDapInstruction(const Ins: TDisasmInstruction;
@@ -593,7 +600,7 @@ type
     // carries value + type; the child ref comes from RefForHandle(V.Handle).
     procedure EmitVar(Arr: TJSONArray; const V: TSessionVariable);
     function  BuildCurrentExceptionRef(out ValueStr, ClassName: string;
-                out VarRef: Integer): Boolean;
+                out VarRef: Integer; out ObjAddr: UInt64): Boolean;
     procedure AppendExceptionLocal(Arr: TJSONArray);
   public
     constructor Create;
@@ -1852,6 +1859,12 @@ begin
     // `instructionPointerReference` on every StackFrame (HandleStackTrace) is
     // what enables "Open Disassembly View" from the Call Stack.
     Caps.AddPair('supportsDisassembleRequest',       TJSONBool.Create(True));
+    // ASSEMBLY_LEVEL_DEBUGGING.md increment 3: `readMemory`/`writeMemory`,
+    // what backs VS Code's "View Binary Data" memory inspector. Same engine
+    // primitives (IDebugTarget.ReadCodeMemoryAt / WriteMemoryPartial) the MCP
+    // `read_memory`/`write_memory` tools already use -- not a second path.
+    Caps.AddPair('supportsReadMemoryRequest',        TJSONBool.Create(True));
+    Caps.AddPair('supportsWriteMemoryRequest',       TJSONBool.Create(True));
     // ASSEMBLY_LEVEL_DEBUGGING.md increment 2: `granularity: "instruction"` on
     // next/stepIn/stepOut, routed to TDebugSession.StepInstruction (increment
     // 1's engine primitive). VS Code sends the field only when the
@@ -3397,6 +3410,162 @@ begin
   end;
 end;
 
+// DAP `readMemory` (ASSEMBLY_LEVEL_DEBUGGING.md increment 3). Reuses the SAME
+// engine primitive the MCP `read_memory` tool and `disassemble` already use
+// (IDebugTarget.ReadCodeMemoryAt) -- not a second read path. That primitive
+// restores the debugger's OWN planted INT3 bytes within the returned window
+// (so a byte the user breakpointed reads back as their original code, not
+// $CC) and TRUNCATES at the end of the committed VirtualQueryEx region
+// instead of failing outright. A truncated read is reported as a PARTIAL
+// success (`unreadableBytes`, the DAP spec's own mechanism for this), never
+// as a request failure -- running off the end of a mapped region (the last
+// page of the heap, an object near a guard page) is a normal thing to ask
+// for, not a caller error. `data` is base64, per the DAP spec; encoded with
+// TBase64StringEncoding (TNetEncoding.Base64String) specifically because the
+// default TNetEncoding.Base64 wraps at 76 characters with embedded CRLFs,
+// which is not what a JSON string field wants.
+procedure TDapServer.HandleReadMemory(Seq: Integer; Args: TJSONObject);
+const
+  MAX_READ = 64 * 1024 * 1024;   // sanity guard against a malformed request, not a protocol limit
+begin
+  if (not FLaunched) or (FDebugger = nil) then begin
+    FIO.SendErrorResponse(Seq, 'readMemory', 'Not running');
+    Exit;
+  end;
+  if FSession.State <> dsStopped then begin
+    FIO.SendErrorResponse(Seq, 'readMemory', 'Cannot read memory while the debuggee is running');
+    Exit;
+  end;
+  if Args = nil then begin
+    FIO.SendErrorResponse(Seq, 'readMemory', 'Missing arguments');
+    Exit;
+  end;
+
+  var MemRef := Args.GetValue<string>('memoryReference', '');
+  var RefAddr: UInt64;
+  if not TryStrToUInt64Lit(Trim(MemRef), RefAddr) then begin
+    FIO.SendErrorResponse(Seq, 'readMemory', 'invalid memoryReference: ' + MemRef);
+    Exit;
+  end;
+  if Args.FindValue('count') = nil then begin
+    FIO.SendErrorResponse(Seq, 'readMemory', 'Missing "count"');
+    Exit;
+  end;
+  var Count := Args.GetValue<Int64>('count', 0);
+  if Count < 0 then begin
+    FIO.SendErrorResponse(Seq, 'readMemory', 'count must be >= 0');
+    Exit;
+  end;
+  if Count > MAX_READ then begin
+    FIO.SendErrorResponse(Seq, 'readMemory',
+      Format('count %d exceeds the %d-byte guard', [Count, MAX_READ]));
+    Exit;
+  end;
+  var ByteOffset := Args.GetValue<Int64>('offset', 0);
+  var Addr := UInt64(Int64(RefAddr) + ByteOffset);
+
+  var Body := TJSONObject.Create;
+  try
+    Body.AddPair('address', '0x' + IntToHex(Addr, 1));
+    if Count > 0 then begin
+      var Buf: TBytes;
+      SetLength(Buf, Count);
+      var Got := FDebugger.ReadCodeMemoryAt(Addr, @Buf[0], NativeUInt(Count));
+      if Got > 0 then
+        Body.AddPair('data', TNetEncoding.Base64String.EncodeBytesToString(Copy(Buf, 0, Got)));
+      if UInt64(Got) < UInt64(Count) then
+        Body.AddPair('unreadableBytes', TJSONNumber.Create(Count - Int64(Got)));
+    end;
+    FIO.SendResponse(Seq, 'readMemory', True, Body);
+  finally
+    Body.Free;
+  end;
+end;
+
+// DAP `writeMemory` (ASSEMBLY_LEVEL_DEBUGGING.md increment 3). Writing into a
+// live debuggee is destructive and the caller is doing it deliberately, but a
+// write that only PARTLY lands (the tail of the requested range crosses from
+// writable into read-only/unmapped memory) must never be reported the same
+// way as one that fully lands.
+//
+// `allowPartial` (DAP spec, WriteMemoryArguments) is the caller's explicit
+// opt-in to that outcome:
+//   - absent/false: the response is success:false whenever fewer than
+//     Length(data) bytes actually landed. This is a REFUSAL, not a silent
+//     no-op -- WriteMemoryPartial may already have written the bytes that
+//     WERE writable before hitting the boundary (WriteProcessMemory is not
+//     transactional), so the error message states exactly how many bytes
+//     already changed rather than leaving the caller to assume nothing did.
+//   - true: the response is success:true and the body's `bytesWritten`
+//     reports exactly how many bytes landed (`offset` is always 0 -- this
+//     adapter attempts one contiguous write starting at the requested
+//     address; it never skips a leading unwritable span, only truncates a
+//     trailing one, so the first attempted byte is always the first
+//     requested byte).
+procedure TDapServer.HandleWriteMemory(Seq: Integer; Args: TJSONObject);
+begin
+  if (not FLaunched) or (FDebugger = nil) then begin
+    FIO.SendErrorResponse(Seq, 'writeMemory', 'Not running');
+    Exit;
+  end;
+  if FSession.State <> dsStopped then begin
+    FIO.SendErrorResponse(Seq, 'writeMemory', 'Cannot write memory while the debuggee is running');
+    Exit;
+  end;
+  if Args = nil then begin
+    FIO.SendErrorResponse(Seq, 'writeMemory', 'Missing arguments');
+    Exit;
+  end;
+
+  var MemRef := Args.GetValue<string>('memoryReference', '');
+  var RefAddr: UInt64;
+  if not TryStrToUInt64Lit(Trim(MemRef), RefAddr) then begin
+    FIO.SendErrorResponse(Seq, 'writeMemory', 'invalid memoryReference: ' + MemRef);
+    Exit;
+  end;
+  if Args.FindValue('data') = nil then begin
+    FIO.SendErrorResponse(Seq, 'writeMemory', 'Missing "data"');
+    Exit;
+  end;
+  var DataStr      := Args.GetValue<string>('data', '');
+  var ByteOffset   := Args.GetValue<Int64>('offset', 0);
+  var AllowPartial := Args.GetValue<Boolean>('allowPartial', False);
+
+  var Buf: TBytes;
+  try
+    Buf := TNetEncoding.Base64String.DecodeStringToBytes(DataStr);
+  except
+    on E: Exception do begin
+      FIO.SendErrorResponse(Seq, 'writeMemory', 'invalid base64 data: ' + E.Message);
+      Exit;
+    end;
+  end;
+
+  var Addr := UInt64(Int64(RefAddr) + ByteOffset);
+  var Written: NativeUInt := 0;
+  if Length(Buf) > 0 then
+    Written := FDebugger.WriteMemoryPartial(Addr, @Buf[0], NativeUInt(Length(Buf)));
+
+  if (not AllowPartial) and (Written <> NativeUInt(Length(Buf))) then begin
+    FIO.SendErrorResponse(Seq, 'writeMemory', Format(
+      'write at 0x%x refused: only %d of %d bytes are writable there ' +
+      '(%d bytes were already changed in the debuggee -- retry with allowPartial to accept this)',
+      [Addr, Written, Length(Buf), Written]));
+    Exit;
+  end;
+
+  var Body := TJSONObject.Create;
+  try
+    if AllowPartial then begin
+      Body.AddPair('offset',       TJSONNumber.Create(0));
+      Body.AddPair('bytesWritten', TJSONNumber.Create(Int64(Written)));
+    end;
+    FIO.SendResponse(Seq, 'writeMemory', True, Body);
+  finally
+    Body.Free;
+  end;
+end;
+
 procedure TDapServer.HandleScopes(Seq: Integer; Args: TJSONObject);
   function MakeScope(const Name: string; VarRef: Integer): TJSONObject;
   begin
@@ -3466,6 +3635,15 @@ begin
     Item.AddPair('type',  V.TypeName);
   end;
   Item.AddPair('variablesReference', TJSONNumber.Create(RefForHandle(V.Handle)));
+  // `memoryReference` (ASSEMBLY_LEVEL_DEBUGGING.md increment 3): only when the
+  // value genuinely lives at a known target address -- a stack local, a
+  // class/record field, an array element. A register-resident local, a
+  // synthetic group row ('properties'/'fields'), or a getter-produced value
+  // carries V.Address = 0 and gets no reference. Omitted, never fabricated:
+  // a wrong memoryReference opens VS Code's "View Binary Data" on a location
+  // that has nothing to do with the value shown.
+  if V.Address <> 0 then
+    Item.AddPair('memoryReference', '0x' + IntToHex(V.Address, 1));
   Arr.AddElement(Item);
 end;
 
@@ -3474,16 +3652,18 @@ end;
 // ValueStr = "Class: Message", ClassName = the raised class, VarRef = an
 // expansion ref so the object's members can be drilled into.
 function TDapServer.BuildCurrentExceptionRef(out ValueStr, ClassName: string;
-  out VarRef: Integer): Boolean;
+  out VarRef: Integer; out ObjAddr: UInt64): Boolean;
 begin
   ValueStr  := '';
   ClassName := '';
   VarRef    := 0;
+  ObjAddr   := 0;
   Result    := False;
   if not FStoppedOnException then Exit;
   if (FDebugger = nil) or (FRtti = nil) then Exit;
   var ExcObj := FDebugger.CurrentExceptionObject;
   if (ExcObj < 65536) or not FRtti.IsClassInstance(ExcObj) then Exit;
+  ObjAddr := ExcObj;
 
   ClassName := FDebugger.LastExceptionClass;
   var Msg   := FDebugger.LastExceptionMessage;
@@ -3506,14 +3686,19 @@ procedure TDapServer.AppendExceptionLocal(Arr: TJSONArray);
 var
   ValueStr, ClsName: string;
   VarRef: Integer;
+  ObjAddr: UInt64;
 begin
-  if not BuildCurrentExceptionRef(ValueStr, ClsName, VarRef) then Exit;
+  if not BuildCurrentExceptionRef(ValueStr, ClsName, VarRef, ObjAddr) then Exit;
   var Item := TJSONObject.Create;
   Item.AddPair('name',               '$exception');
   Item.AddPair('evaluateName',       '$exception');
   Item.AddPair('value',              ValueStr);
   Item.AddPair('type',               ClsName);
   Item.AddPair('variablesReference', TJSONNumber.Create(VarRef));
+  // The live exception object's own address -- always genuine when
+  // BuildCurrentExceptionRef succeeded (ASSEMBLY_LEVEL_DEBUGGING.md increment 3).
+  if ObjAddr <> 0 then
+    Item.AddPair('memoryReference', '0x' + IntToHex(ObjAddr, 1));
   Arr.AddElement(Item);
 end;
 
@@ -3762,10 +3947,13 @@ begin
     if SameText(Trim(Expr), '$exception') then begin
       var ValueStr, ClsName: string;
       var VarRef: Integer;
-      if BuildCurrentExceptionRef(ValueStr, ClsName, VarRef) then begin
+      var ObjAddr: UInt64;
+      if BuildCurrentExceptionRef(ValueStr, ClsName, VarRef, ObjAddr) then begin
         Body.AddPair('result', ValueStr);
         if ClsName <> '' then Body.AddPair('type', ClsName);
         Body.AddPair('variablesReference', TJSONNumber.Create(VarRef));
+        if ObjAddr <> 0 then
+          Body.AddPair('memoryReference', '0x' + IntToHex(ObjAddr, 1));
       end else begin
         Body.AddPair('result', '<no current exception>');
         Body.AddPair('variablesReference', TJSONNumber.Create(0));
@@ -4109,6 +4297,8 @@ begin
     else if Cmd = 'pause'             then HandlePause(Seq, Args)
     else if Cmd = 'stackTrace'        then HandleStackTrace(Seq, Args)
     else if Cmd = 'disassemble'       then HandleDisassemble(Seq, Args)
+    else if Cmd = 'readMemory'        then HandleReadMemory(Seq, Args)
+    else if Cmd = 'writeMemory'       then HandleWriteMemory(Seq, Args)
     else if Cmd = 'source'            then HandleSource(Seq, Args)
     else if Cmd = 'scopes'            then HandleScopes(Seq, Args)
     else if Cmd = 'variables'         then HandleVariables(Seq, Args)

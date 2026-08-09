@@ -2643,6 +2643,11 @@ begin
   Result.Expandable   := False;
   Result.Handle       := 0;
   Result.EvaluateName := LV.Name;
+  // The local's own storage address (0 for a register-resident local -- every
+  // provider already leaves Address unset in that case, which is why the rest
+  // of this codebase already tests LV.Address <> 0 as "has a real address").
+  // Feeds DAP's `memoryReference` (ASSEMBLY_LEVEL_DEBUGGING.md increment 3).
+  Result.Address      := LV.Address;
   // Attach an expansion handle when the value is a class/record/array/Variant.
   SyncExpander;
   FExpander.ClassifyLocal(LV, Result);

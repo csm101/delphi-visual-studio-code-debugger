@@ -538,6 +538,7 @@ type
     function  ReadProcessMemoryAt(VA: UInt64; Buf: Pointer; Size: NativeUInt): Boolean;
     function  ReadCodeMemoryAt(VA: UInt64; Buf: Pointer; Size: NativeUInt): NativeUInt;
     function  WriteMemoryAt(VA: UInt64; Buf: Pointer; Size: NativeUInt): Boolean;
+    function  WriteMemoryPartial(VA: UInt64; Buf: Pointer; Size: NativeUInt): NativeUInt;
     function  SetRegisterByName(const Name: string; Value: UInt64): Boolean;
     // Sets a Delphi string variable in the debuggee. Allocates a new
     // immortal-literal buffer (refcount = -1) for the new value, then
@@ -5068,6 +5069,28 @@ begin
   Result := WriteProcessMemory(FProcess, Pointer(VA), Buf, Size, W) and
     (W = Size);
   VirtualProtectEx(FProcess, Pointer(VA), Size, OldProt, Dummy);
+end;
+
+// See IDebugTarget.WriteMemoryPartial: same mechanism as WriteMemoryAt (make
+// the page(s) writable, attempt the write, restore protection), but reports
+// the actual byte count WriteProcessMemory transferred instead of folding it
+// into a Boolean. A separate body rather than WriteMemoryAt re-implemented in
+// terms of this one -- WriteMemoryAt's FProcess=0 short-circuit returns False
+// unconditionally regardless of Size, which a `Result = Size` wrapper around
+// this function would get wrong for Size=0.
+function TWinDebugger.WriteMemoryPartial(VA: UInt64; Buf: Pointer;
+  Size: NativeUInt): NativeUInt;
+var
+  W: SIZE_T;
+  OldProt, Dummy: DWORD;
+begin
+  Result := 0;
+  if (FProcess = 0) or (Size = 0) then Exit;
+  VirtualProtectEx(FProcess, Pointer(VA), Size, PAGE_READWRITE, OldProt);
+  W := 0;
+  WriteProcessMemory(FProcess, Pointer(VA), Buf, Size, W);
+  VirtualProtectEx(FProcess, Pointer(VA), Size, OldProt, Dummy);
+  Result := NativeUInt(W);
 end;
 
 // Build an immortal Delphi-style string buffer in the debuggee's memory and

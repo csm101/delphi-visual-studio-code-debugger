@@ -238,6 +238,116 @@ an unprovable instruction is expressed.**
   uses. No test drives an actual VS Code Disassembly View against the
   adapter.
 
+### DAP memory: readMemory/writeMemory, memoryReference — increment 3
+
+`ASSEMBLY_LEVEL_DEBUGGING.md` increment 3 owns the decision record (which
+variables carry a `memoryReference` and why); this is the mechanism and the
+wire contract. Handlers: `TDapServer.HandleReadMemory`/`HandleWriteMemory`
+(`DapServer.pas`), dispatched from `ProcessRequest` on `'readMemory'`/
+`'writeMemory'`. Coverage: `TEST_CATALOG.md` section R.
+
+- **`readMemory`** reuses `IDebugTarget.ReadCodeMemoryAt` — the SAME call
+  `disassemble` already makes, not a second read path. That primitive
+  restores the debugger's own planted `INT3` bytes within the returned
+  window and truncates at the end of the committed `VirtualQueryEx` region
+  instead of failing. The DAP response mirrors that truncation directly: a
+  short (or zero-length) read is a `success: true` response with
+  `unreadableBytes = count - bytesActuallyRead` and `data` covering only
+  what was read (the `data` key is omitted entirely, not sent empty, when
+  nothing was readable). `count` and `memoryReference` are DAP-required
+  fields; a request missing `count` is refused (`Args.FindValue('count') =
+  nil`), never silently treated as `count = 0` — an absent required field is
+  a malformed request, not "read nothing". `data` is base64 via
+  `TNetEncoding.Base64String` specifically: the default
+  `TNetEncoding.Base64`/`TBase64Encoding.Create` wraps output at 76
+  characters with embedded CRLFs, which is wrong for a JSON string field;
+  `Base64String` (`TBase64StringEncoding`) is the single-line variant.
+
+- **`writeMemory`** uses a new engine primitive,
+  `IDebugTarget.WriteMemoryPartial(VA, Buf, Size): NativeUInt`
+  (`WinDebuggerBase.pas`, shared by `TWin32Debugger` unchanged — same
+  inheritance as `WriteMemoryAt`/`ReadProcessMemoryAt`). It performs the
+  identical `VirtualProtectEx(PAGE_READWRITE)` / `WriteProcessMemory` /
+  `VirtualProtectEx(restore)` sequence `WriteMemoryAt` already used, but
+  returns the actual byte count `WriteProcessMemory` reports instead of
+  collapsing every outcome to a Boolean. It is a SEPARATE function body
+  rather than `WriteMemoryAt` rewritten in terms of it, because
+  `WriteMemoryAt`'s `if FProcess = 0 then Exit(False)` guard fires
+  unconditionally (even for `Size = 0`), and a `Result = Size` wrapper
+  around `WriteMemoryPartial` would get that one edge case wrong (`0 = 0`
+  reads as success). MCP's `write_memory` keeps using the plain, unchanged
+  `WriteMemoryAt` — no reason for it to change shape.
+
+  The DAP `allowPartial` contract (`WriteMemoryArguments`, DAP spec):
+  - **absent/false**: the response is `success: false` whenever fewer than
+    `Length(data)` bytes actually landed. This adapter ATTEMPTS the write
+    first and reports what happened, rather than pre-verifying writability
+    across the whole requested range before touching anything (the shape
+    the spec suggests for this case). Consequence, stated plainly because it
+    is the one place behaviour does not match the spec's suggested
+    *implementation strategy* (though it does match its *observable
+    contract* — never a false "succeeded"): a refused write can already have
+    changed however many bytes were writable before the boundary
+    (`WriteProcessMemory` is not transactional). The refusal message states
+    that count explicitly (`"... N bytes were already changed in the
+    debuggee ..."`) so the caller is not left assuming zero effect.
+  - **true**: `success: true`; body carries `bytesWritten` (the true count)
+    and `offset` (always `0` — this handler only ever attempts ONE
+    contiguous write starting at the requested address; it never skips a
+    leading unwritable span, only truncates a trailing one).
+  - `data` is a required field; a request missing it is refused
+    (`Args.FindValue('data') = nil`), never treated as "write zero bytes".
+
+- **`memoryReference` on variables**: `TSessionVariable` (`DebugSessionTypes.pas`)
+  gained an `Address: UInt64` field, `0` meaning "no real address" — the
+  exact convention `TLocalValue.Address <> 0` already established throughout
+  this codebase. `EmitVar` (`DapServer.pas`) adds `memoryReference` to a
+  `variables` row only when `V.Address <> 0`; a missing reference is silence,
+  never a fabricated `0x0`. Producers, and the reasoning for each:
+  - `TDebugSession.LocalToSession` sets it from `LV.Address` — covers every
+    top-level Locals-scope row (plain locals, closure-captured fields,
+    anon-method params, all of which already flow through this one
+    function).
+  - `VariableExpander.pas`, five sites, each setting `.Address` from a value
+    the SAME function already dereferences to produce the displayed value —
+    `MemberFieldToSession` (`FieldAddr`), `ExpandRttiTyped`
+    (`F.FieldAddr`), `ExpandProperties`'s field-backed branch only
+    (`FieldAddr` — the getter-backed branch deliberately does not),
+    `ExpandDynArray` (`ElemAddr`), `ExpandVariantArray` (`ElemAddr`).
+  - `TDapServer.BuildCurrentExceptionRef` grew an `out ObjAddr: UInt64`
+    (the live exception object's own address), threaded into both the
+    `$exception` row `AppendExceptionLocal` builds and the `evaluate`
+    response for the literal expression `"$exception"`.
+  - Never set (stays the record's zero default): a register-resident local
+    (no provider sets `LV.Address` for one); the `Registers` scope (built
+    directly in `HandleVariables`, never through `EmitVar` — a CPU register
+    is not a byte-addressable location at all); a synthetic group row
+    (`Kind = vkGroup`); a getter-backed property's evaluated SCALAR result
+    (`ExpandPropertyGetter`'s `'(value)'` leaf — the value came from a
+    synthetic method CALL, not a read of an existing slot); an indexed
+    property leaf. A getter that returns a STRUCTURED value is the one
+    non-obvious case: `ExpandPropertyGetter` hands a class/record result off
+    to `ExpandViaMembers` on the real address the getter returned, so THOSE
+    fields still get `memoryReference` — they are genuine memory regardless
+    of how the base address was obtained; only the getter's own un-expanded
+    result is addressless.
+  - Not extended to `evaluate`/watch results beyond the `$exception` special
+    case: DAP's `EvaluateResponse.body` has its own optional
+    `memoryReference` field and a plain evaluated expression could honestly
+    carry one, but wiring every branch of `HandleEvaluate` was out of scope
+    for this increment.
+
+- **Not verified**: no test drives a real VS Code memory inspector against
+  the adapter (same caveat `disassemble`'s own section already records for
+  the Disassembly View) or exercises the "debuggee is running" refusal gate
+  on either request (racy to construct reliably; the gate itself
+  `FSession.State <> dsStopped` is the same shape `HandleDisassemble` already
+  uses). `memoryReference` on a nested field/array/Variant-array element has
+  no DAP-level end-to-end test — only the top-level Locals case is driven
+  through a real adapter session; the five `VariableExpander.pas` sites are
+  covered by inspection (each sets `.Address` from a value already used for
+  a real read one line away), not by a dedicated fixture.
+
 ## Target architecture: one adapter, x64 and WOW64 x86
 
 **One 64-bit adapter binary debugs both bitnesses.** A 64-bit process can debug
@@ -2552,10 +2662,12 @@ after the first instant.
 | `supportsInstructionBreakpoints`        | true  |
 | `supportsDisassembleRequest`            | true  |
 | `supportsSteppingGranularity`            | true  |
+| `supportsReadMemoryRequest`             | true  |
+| `supportsWriteMemoryRequest`            | true  |
 | `supportsProgressReporting`             | true  |
 
-Anything else is currently absent (function breakpoints, `readMemory` /
-`writeMemory`, `modules`, `setExpression`).
+Anything else is currently absent (function breakpoints, `modules`,
+`setExpression`).
 
 ## Known assumptions and limits
 

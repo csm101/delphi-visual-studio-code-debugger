@@ -105,6 +105,15 @@ type
     Expandable:   Boolean;
     Handle:       TVarHandle;
     EvaluateName: string;
+    // The variable's own address in the debuggee, when it genuinely has one
+    // (a stack local, a class/record field, an array element). 0 means "no
+    // real address" -- a register-resident local, a synthetic group row
+    // ('properties'/'fields'), or a value a getter CALL produced rather than
+    // read from a slot. DAP's `memoryReference` (ASSEMBLY_LEVEL_DEBUGGING.md
+    // increment 3) is built from this and only emitted when it is non-zero;
+    // every producer of a TSessionVariable follows the same convention
+    // established locals already use (LV.Address <> 0 means addressable).
+    Address:      UInt64;
   end;
 
   TSessionScope = record

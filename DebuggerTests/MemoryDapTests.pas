@@ -1,0 +1,442 @@
+unit MemoryDapTests;
+
+// DAP-layer plumbing for `readMemory`/`writeMemory` and `memoryReference` on
+// variables (ASSEMBLY_LEVEL_DEBUGGING.md increment 3). The engine primitives
+// (IDebugTarget.ReadCodeMemoryAt / WriteMemoryPartial) are the SAME ones the
+// MCP `read_memory`/`write_memory` tools and the `disassemble` request already
+// use -- their truncate-at-region-boundary and INT3-restoring behaviour is
+// proven elsewhere (DisassemblerTests.pas, InstructionStepTests.pas). This
+// file proves the THIN layer on top: does the DAP request reach the engine
+// with the right address/count, does a truncated read come back as a PARTIAL
+// success (`unreadableBytes`) rather than a failure, does a rejected write
+// report itself as a REFUSAL (never a silent no-op or a false success), and
+// does a variable's `memoryReference` actually point at the address that
+// backs its displayed value.
+//
+// Bitness scope: the read/write positive scenarios (does the byte round-trip
+// through the wire at all) run on both bitnesses. Everything else here is
+// plain JSON glue with no bitness-sensitive content -- same scoping call
+// InstructionStepDapTests.pas already recorded for its own JSON-glue tests.
+
+interface
+
+uses
+  DUnitX.TestFramework, DapClient;
+
+type
+  [TestFixture]
+  TMemoryDapTests = class
+  private
+    FClient: TDapClient;
+    procedure OpenSampleAt(const Bitness, Marker: string);
+  public
+    [TearDown] procedure TearDown;
+
+    [Test] procedure Capability_SupportsReadWriteMemoryRequest_IsAdvertised;
+
+    [Test] procedure X64_ReadMemory_LocalVariable_MatchesDisplayedValue;
+    [Test] procedure Win32_ReadMemory_LocalVariable_MatchesDisplayedValue;
+    [Test] procedure X64_WriteMemory_LocalVariable_ChangesVisibleValue;
+    [Test] procedure Win32_WriteMemory_LocalVariable_ChangesVisibleValue;
+
+    [Test] procedure Variables_LocalCarriesMemoryReference_RegistersScopeDoesNot;
+
+    [Test] procedure ReadMemory_UnmappedAddress_ReportsUnreadableBytesNotFailure;
+    [Test] procedure ReadMemory_InvalidMemoryReference_Refused;
+    [Test] procedure ReadMemory_MissingCount_Refused;
+    [Test] procedure ReadMemory_RefusedWhenNotLaunched;
+
+    [Test] procedure WriteMemory_UnwritableAddress_RefusedWithoutAllowPartial;
+    [Test] procedure WriteMemory_UnwritableAddress_AllowPartial_ReportsZeroBytesWritten;
+    [Test] procedure WriteMemory_MissingData_Refused;
+    [Test] procedure WriteMemory_RefusedWhenNotLaunched;
+  end;
+
+implementation
+
+uses
+  System.SysUtils, System.StrUtils, System.JSON, System.NetEncoding;
+
+const
+  SAMPLE_SOURCE = 'InstructionStepSample.dpr';
+  // Reserved null-page region: never MEM_COMMIT for any usermode process, on
+  // either bitness. A deterministic "definitely not there" address, not a
+  // guess -- the same role Win32's guard page plays for the disassembler's
+  // own boundary-truncation tests.
+  UNMAPPED_ADDR = '0x10';
+
+function RepoRoot: string;
+begin
+  // RunTests.exe lives in <repo>\DebuggerTests\Win64\Debug\
+  Result := ExpandFileName(ExtractFilePath(ParamStr(0)) + '..\..\..\');
+end;
+
+function TargetDir: string;
+begin
+  Result := RepoRoot + 'DebuggerTests\TestTarget\';
+end;
+
+function SamplePath: string;
+begin
+  Result := TargetDir + SAMPLE_SOURCE;
+end;
+
+function SampleExe(const Bitness: string): string;
+begin
+  Result := TargetDir + Bitness + '\Debug\InstructionStepSample.exe';
+end;
+
+function SampleMap(const Bitness: string): string;
+begin
+  Result := TargetDir + Bitness + '\Debug\InstructionStepSample.map';
+end;
+
+function SampleRsm(const Bitness: string): string;
+begin
+  Result := TargetDir + Bitness + '\Debug\InstructionStepSample.rsm';
+end;
+
+function AdapterExe: string;
+begin
+  Result := RepoRoot + 'VisualStudioCodeDelphiDebugger\Win64\Debug\VisualStudioCodeDelphiDebugger.exe';
+end;
+
+{ ------------------------------------------------------------------ setup -- }
+
+procedure TMemoryDapTests.OpenSampleAt(const Bitness, Marker: string);
+begin
+  var Line := FindBpLine(SamplePath, Marker);
+  Assert.IsTrue(Line > 0, 'marker ' + Marker + ' not found in ' + SAMPLE_SOURCE);
+  Assert.IsTrue(FileExists(SampleExe(Bitness)),
+    'fixture not built: ' + SampleExe(Bitness));
+
+  FClient := TDapClient.Create;
+  FClient.Start(AdapterExe);
+  FClient.Initialize.Free;
+  Assert.IsTrue(FClient.WaitForInitialized, 'adapter did not send initialized event');
+
+  FClient.SetBreakpoints(SamplePath, [Line]).Free;
+  FClient.SetExceptionBreakpoints([]).Free;
+  FClient.Launch(SampleExe(Bitness), SampleMap(Bitness), SampleRsm(Bitness), TargetDir).Free;
+  FClient.ConfigDone.Free;
+
+  var Stopped := FClient.WaitForStopped;
+  try
+    Assert.AreEqual('breakpoint', Stopped.GetValue<string>('reason', ''),
+      Format('%s: did not stop at %s (line %d)', [Bitness, Marker, Line]));
+  finally
+    Stopped.Free;
+  end;
+end;
+
+procedure TMemoryDapTests.TearDown;
+begin
+  if Assigned(FClient) then begin
+    try
+      FClient.Disconnect.Free;
+    except
+    end;
+    FClient.Stop;
+    FreeAndNil(FClient);
+  end;
+end;
+
+{ ---------------------------------------------------- shared local lookup -- }
+
+// `X` at INSTR_MULTI: the breakpoint sits ON the multi-instruction line, so it
+// has not run yet -- X is still the 7 the PRECEDING statement assigned
+// (InstructionStepSample.dpr: `X := 7;` then `X := (X * 3) + ...  // {BP:INSTR_MULTI}`).
+// A plain Integer stack local under this sample's `{$O-}` build, so it is
+// always stack-resident (never register-allocated) -- a real, stable address
+// on both bitnesses.
+function FindLocalX(Client: TDapClient): TJSONObject;
+begin
+  var FrameId := Client.GetFrameId;
+  var LocalsRef := Client.GetLocalsRef(FrameId);
+  Assert.IsTrue(LocalsRef > 0, 'no Locals scope');
+  Result := Client.FindVar(LocalsRef, 'X');
+  Assert.IsTrue(Result <> nil, '"X" not found in Locals');
+end;
+
+{ ---------------------------------------------------------------- tests ---- }
+
+procedure TMemoryDapTests.Capability_SupportsReadWriteMemoryRequest_IsAdvertised;
+begin
+  FClient := TDapClient.Create;
+  FClient.Start(AdapterExe);
+  var InitResp := FClient.Initialize;
+  try
+    Assert.IsTrue(InitResp.GetValue<Boolean>('supportsReadMemoryRequest', False),
+      'initialize response did not advertise supportsReadMemoryRequest');
+    Assert.IsTrue(InitResp.GetValue<Boolean>('supportsWriteMemoryRequest', False),
+      'initialize response did not advertise supportsWriteMemoryRequest');
+  finally
+    InitResp.Free;
+  end;
+end;
+
+procedure RunReadMemoryLocalVariableMatchesDisplayedValue(const Bitness: string;
+  Client: TDapClient);
+begin
+  var XVar := FindLocalX(Client);
+  var MemRef: string;
+  try
+    MemRef := XVar.GetValue<string>('memoryReference', '');
+  finally
+    XVar.Free;
+  end;
+  Assert.IsTrue(MemRef <> '',
+    Format('%s: local "X" carries no memoryReference -- it is a real stack local ' +
+           'under -O-, this should never be empty', [Bitness]));
+
+  var Resp := Client.ReadMemory(MemRef, 4);
+  try
+    Assert.AreEqual(0, Resp.GetValue<Integer>('unreadableBytes', 0),
+      Format('%s: a 4-byte read of a live stack slot reported unreadable bytes', [Bitness]));
+    var DataStr := Resp.GetValue<string>('data', '');
+    Assert.IsTrue(DataStr <> '', Format('%s: readMemory returned no data', [Bitness]));
+    var Bytes := TNetEncoding.Base64String.DecodeStringToBytes(DataStr);
+    Assert.AreEqual(4, Integer(Length(Bytes)), Format('%s: expected 4 bytes back', [Bitness]));
+    // Little-endian Integer 7: 07 00 00 00.
+    Assert.AreEqual<Byte>(7, Bytes[0], Format('%s: byte 0', [Bitness]));
+    Assert.AreEqual<Byte>(0, Bytes[1], Format('%s: byte 1', [Bitness]));
+    Assert.AreEqual<Byte>(0, Bytes[2], Format('%s: byte 2', [Bitness]));
+    Assert.AreEqual<Byte>(0, Bytes[3], Format('%s: byte 3', [Bitness]));
+  finally
+    Resp.Free;
+  end;
+end;
+
+procedure TMemoryDapTests.X64_ReadMemory_LocalVariable_MatchesDisplayedValue;
+begin
+  OpenSampleAt('Win64', 'INSTR_MULTI');
+  RunReadMemoryLocalVariableMatchesDisplayedValue('Win64', FClient);
+end;
+
+procedure TMemoryDapTests.Win32_ReadMemory_LocalVariable_MatchesDisplayedValue;
+begin
+  OpenSampleAt('Win32', 'INSTR_MULTI');
+  RunReadMemoryLocalVariableMatchesDisplayedValue('Win32', FClient);
+end;
+
+procedure RunWriteMemoryLocalVariableChangesVisibleValue(const Bitness: string;
+  Client: TDapClient);
+begin
+  var XVar := FindLocalX(Client);
+  var MemRef: string;
+  var LocalsRef: Integer;
+  try
+    MemRef := XVar.GetValue<string>('memoryReference', '');
+  finally
+    XVar.Free;
+  end;
+  Assert.IsTrue(MemRef <> '', Format('%s: local "X" carries no memoryReference', [Bitness]));
+
+  // Little-endian Integer 42: 2A 00 00 00.
+  var NewBytes: TBytes := [42, 0, 0, 0];
+  var Resp := Client.WriteMemory(MemRef, TNetEncoding.Base64String.EncodeBytesToString(NewBytes));
+  Resp.Free;
+
+  LocalsRef := Client.GetLocalsRef(Client.GetFrameId);
+  var NewVal := Client.VarValue(LocalsRef, 'X');
+  Assert.IsTrue(ContainsText(NewVal, '(0x2a)'),
+    Format('%s: X did not show 42 after writeMemory -- got "%s"', [Bitness, NewVal]));
+end;
+
+procedure TMemoryDapTests.X64_WriteMemory_LocalVariable_ChangesVisibleValue;
+begin
+  OpenSampleAt('Win64', 'INSTR_MULTI');
+  RunWriteMemoryLocalVariableChangesVisibleValue('Win64', FClient);
+end;
+
+procedure TMemoryDapTests.Win32_WriteMemory_LocalVariable_ChangesVisibleValue;
+begin
+  OpenSampleAt('Win32', 'INSTR_MULTI');
+  RunWriteMemoryLocalVariableChangesVisibleValue('Win32', FClient);
+end;
+
+// A register-resident value has no memory slot at all -- the Registers scope
+// never goes through EmitVar (DapServer.HandleVariables builds those rows
+// directly), so it is the one place in the existing wire format guaranteed
+// to carry no memoryReference. Proves the omission side of the "if in doubt,
+// omit" rule, not just the presence side the read/write tests above prove.
+procedure TMemoryDapTests.Variables_LocalCarriesMemoryReference_RegistersScopeDoesNot;
+begin
+  OpenSampleAt('Win64', 'INSTR_MULTI');
+
+  var XVar := FindLocalX(FClient);
+  try
+    Assert.IsTrue(XVar.GetValue<string>('memoryReference', '') <> '',
+      'local "X" should carry a memoryReference');
+  finally
+    XVar.Free;
+  end;
+
+  var FrameId := FClient.GetFrameId;
+  var ScopesResp := FClient.Scopes(FrameId);
+  var RegistersRef := 0;
+  try
+    var Arr := ScopesResp.GetValue('scopes') as TJSONArray;
+    Assert.IsTrue(Arr <> nil, 'no scopes array');
+    for var I := 0 to Arr.Count - 1 do begin
+      var S := Arr[I] as TJSONObject;
+      if SameText(S.GetValue<string>('name', ''), 'Registers') then
+        RegistersRef := S.GetValue<Integer>('variablesReference', 0);
+    end;
+  finally
+    ScopesResp.Free;
+  end;
+  Assert.IsTrue(RegistersRef > 0, 'no Registers scope');
+
+  var RegsResp := FClient.Variables(RegistersRef);
+  try
+    var Arr := RegsResp.GetValue('variables') as TJSONArray;
+    Assert.IsTrue((Arr <> nil) and (Arr.Count > 0), 'Registers scope returned no rows');
+    for var I := 0 to Arr.Count - 1 do begin
+      var R := Arr[I] as TJSONObject;
+      Assert.IsFalse(R.FindValue('memoryReference') <> nil,
+        Format('register "%s" carries a memoryReference -- a register is not a memory address',
+          [R.GetValue<string>('name', '?')]));
+    end;
+  finally
+    RegsResp.Free;
+  end;
+end;
+
+// The null-page region: VirtualQueryEx reports it MEM_FREE, never MEM_COMMIT,
+// for any usermode process. ReadCodeMemoryAt's existing truncation rule
+// (DebugTarget.IDebugTarget.ReadCodeMemoryAt, already proven at the engine
+// level) then returns 0 bytes -- and that must surface as a PARTIAL success
+// (unreadableBytes = count, no `data`), never as a failed request. Running
+// off the end of mapped memory is a normal thing to ask for, not an error.
+procedure TMemoryDapTests.ReadMemory_UnmappedAddress_ReportsUnreadableBytesNotFailure;
+begin
+  OpenSampleAt('Win64', 'INSTR_MULTI');
+  var Resp := FClient.ReadMemory(UNMAPPED_ADDR, 16);
+  try
+    Assert.AreEqual(16, Resp.GetValue<Integer>('unreadableBytes', 0),
+      'a read entirely inside the null page should report all bytes unreadable');
+    Assert.IsFalse(Resp.FindValue('data') <> nil,
+      'no bytes were readable -- there should be no `data` field at all');
+  finally
+    Resp.Free;
+  end;
+end;
+
+procedure TMemoryDapTests.ReadMemory_InvalidMemoryReference_Refused;
+begin
+  OpenSampleAt('Win64', 'INSTR_MULTI');
+  var Resp := FClient.ReadMemoryRaw('not-an-address', 4);
+  try
+    Assert.IsFalse(Resp.GetValue<Boolean>('success', True),
+      'a malformed memoryReference should be refused, not silently read from address 0');
+  finally
+    Resp.Free;
+  end;
+end;
+
+// `count` is a REQUIRED field (DAP spec, ReadMemoryArguments). A request that
+// omits it must be refused, not silently treated as count=0 -- an absent
+// required field is a malformed request, not "read nothing".
+procedure TMemoryDapTests.ReadMemory_MissingCount_Refused;
+begin
+  OpenSampleAt('Win64', 'INSTR_MULTI');
+  var Seq := FClient.SendRequest('readMemory', '{"memoryReference":"0x1000"}');
+  var Resp := FClient.WaitRawResponse(Seq);
+  try
+    Assert.IsFalse(Resp.GetValue<Boolean>('success', True),
+      'readMemory with no "count" field should be refused');
+  finally
+    Resp.Free;
+  end;
+end;
+
+procedure TMemoryDapTests.ReadMemory_RefusedWhenNotLaunched;
+begin
+  FClient := TDapClient.Create;
+  FClient.Start(AdapterExe);
+  FClient.Initialize.Free;
+  Assert.IsTrue(FClient.WaitForInitialized, 'adapter did not send initialized event');
+
+  var Resp := FClient.ReadMemoryRaw('0x1000', 4);
+  try
+    Assert.IsFalse(Resp.GetValue<Boolean>('success', True),
+      'a readMemory before launch was accepted -- there is nothing to read');
+  finally
+    Resp.Free;
+  end;
+end;
+
+// Writing 4 bytes into the null page: WriteMemoryPartial reports 0 bytes
+// landed (VirtualProtectEx/WriteProcessMemory both fail against an
+// uncommitted region). Without allowPartial the caller did not opt into a
+// partial outcome, so this must come back as a REFUSAL -- never as a quiet
+// success that leaves the caller believing 4 bytes changed when 0 did.
+procedure TMemoryDapTests.WriteMemory_UnwritableAddress_RefusedWithoutAllowPartial;
+begin
+  OpenSampleAt('Win64', 'INSTR_MULTI');
+  var Payload := TNetEncoding.Base64String.EncodeBytesToString(TBytes.Create(1, 2, 3, 4));
+  var Resp := FClient.WriteMemoryRaw(UNMAPPED_ADDR, Payload);
+  try
+    Assert.IsFalse(Resp.GetValue<Boolean>('success', True),
+      'a write into the null page without allowPartial should be refused');
+  finally
+    Resp.Free;
+  end;
+end;
+
+// Same write, but the caller explicitly accepted a partial outcome: the
+// request must succeed and truthfully report zero bytes written, not the
+// 4 that were requested.
+procedure TMemoryDapTests.WriteMemory_UnwritableAddress_AllowPartial_ReportsZeroBytesWritten;
+begin
+  OpenSampleAt('Win64', 'INSTR_MULTI');
+  var Payload := TNetEncoding.Base64String.EncodeBytesToString(TBytes.Create(1, 2, 3, 4));
+  var Resp := FClient.WriteMemory(UNMAPPED_ADDR, Payload, 0, True);
+  try
+    Assert.AreEqual(0, Resp.GetValue<Integer>('bytesWritten', -1),
+      'allowPartial write into the null page should report bytesWritten=0');
+  finally
+    Resp.Free;
+  end;
+end;
+
+// `data` is a REQUIRED field (DAP spec, WriteMemoryArguments). Omitting it
+// must be refused, not silently treated as "write zero bytes" -- a caller
+// that forgot the payload gets told so, not a quiet vacuous success.
+procedure TMemoryDapTests.WriteMemory_MissingData_Refused;
+begin
+  OpenSampleAt('Win64', 'INSTR_MULTI');
+  var Seq := FClient.SendRequest('writeMemory', '{"memoryReference":"0x1000"}');
+  var Resp := FClient.WaitRawResponse(Seq);
+  try
+    Assert.IsFalse(Resp.GetValue<Boolean>('success', True),
+      'writeMemory with no "data" field should be refused');
+  finally
+    Resp.Free;
+  end;
+end;
+
+procedure TMemoryDapTests.WriteMemory_RefusedWhenNotLaunched;
+begin
+  FClient := TDapClient.Create;
+  FClient.Start(AdapterExe);
+  FClient.Initialize.Free;
+  Assert.IsTrue(FClient.WaitForInitialized, 'adapter did not send initialized event');
+
+  var Payload := TNetEncoding.Base64String.EncodeBytesToString(TBytes.Create(1, 2, 3, 4));
+  var Resp := FClient.WriteMemoryRaw('0x1000', Payload);
+  try
+    Assert.IsFalse(Resp.GetValue<Boolean>('success', True),
+      'a writeMemory before launch was accepted -- there is nothing to write to');
+  finally
+    Resp.Free;
+  end;
+end;
+
+initialization
+  // EXPLICIT registration: this project does not use RTTI auto-scan, and an
+  // unregistered fixture silently never runs (TRAPS.md).
+  TDUnitX.RegisterTestFixture(TMemoryDapTests);
+
+end.

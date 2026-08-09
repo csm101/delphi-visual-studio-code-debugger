@@ -344,6 +344,14 @@ type
     // Memory I/O.
     function  ReadProcessMemoryAt(VA: UInt64; Buf: Pointer; Size: NativeUInt): Boolean;
     function  WriteMemoryAt(VA: UInt64; Buf: Pointer; Size: NativeUInt): Boolean;
+    // Like WriteMemoryAt, but reports how many bytes actually landed instead
+    // of collapsing every outcome to a Boolean. DAP `writeMemory`'s
+    // `allowPartial` (ASSEMBLY_LEVEL_DEBUGGING.md increment 3) needs the true
+    // count when a write crosses from writable into read-only/unmapped
+    // memory; MCP's all-or-nothing `write_memory` keeps using WriteMemoryAt.
+    // Returns whatever WriteProcessMemory itself reports (0..Size); never
+    // guesses at a partial count.
+    function  WriteMemoryPartial(VA: UInt64; Buf: Pointer; Size: NativeUInt): NativeUInt;
     // Like ReadProcessMemoryAt, but for reading CODE a caller intends to
     // disassemble or otherwise inspect as instructions rather than data.
     // Two differences (DISASSEMBLY_PLAN.md, "Traps"):

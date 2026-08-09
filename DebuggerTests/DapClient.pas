@@ -162,6 +162,17 @@ type
     // without raising -- for tests that expect the request to fail cleanly.
     function    DisassembleRaw(const MemoryReference: string; InstructionOffset,
                   InstructionCount: Integer; ByteOffset: Integer = 0): TJSONObject;
+    // DAP readMemory/writeMemory (ASSEMBLY_LEVEL_DEBUGGING.md increment 3).
+    // Raises on success:false; use the Raw variants to inspect a refusal
+    // (e.g. "not stopped", a rejected partial write) without raising.
+    function    ReadMemory(const MemoryReference: string; Count: Integer;
+                  ByteOffset: Integer = 0): TJSONObject;
+    function    ReadMemoryRaw(const MemoryReference: string; Count: Integer;
+                  ByteOffset: Integer = 0): TJSONObject;
+    function    WriteMemory(const MemoryReference, DataBase64: string;
+                  ByteOffset: Integer = 0; AllowPartial: Boolean = False): TJSONObject;
+    function    WriteMemoryRaw(const MemoryReference, DataBase64: string;
+                  ByteOffset: Integer = 0; AllowPartial: Boolean = False): TJSONObject;
     function    Threads: TJSONObject;
     function    ExceptionInfo(ThreadId: Integer): TJSONObject;
     function    Scopes(FrameId: Integer): TJSONObject;
@@ -555,6 +566,12 @@ begin
   // on that event to redraw the Call Stack. A test client that stayed silent
   // would leave that path unexercised.
   Args.AddPair('supportsInvalidatedEvent', TJSONBool.Create(True));
+  // Real VS Code declares this so the adapter knows the client understands
+  // `memoryReference` fields (ASSEMBLY_LEVEL_DEBUGGING.md increment 3). The
+  // adapter does not currently gate memoryReference emission on it (neither
+  // does the pre-existing `instructionPointerReference`), but a test client
+  // that stayed silent here would not mirror what a real client sends.
+  Args.AddPair('supportsMemoryReferences', TJSONBool.Create(True));
   Seq    := SendCmd('initialize', Args);
   Result := WaitResp(Seq);
 end;
@@ -988,6 +1005,62 @@ begin
   if ByteOffset <> 0 then
     Args.AddPair('offset', TJSONNumber.Create(ByteOffset));
   Result := WaitRespRaw(SendCmd('disassemble', Args));
+end;
+
+function TDapClient.ReadMemory(const MemoryReference: string; Count: Integer;
+  ByteOffset: Integer): TJSONObject;
+var
+  Args: TJSONObject;
+begin
+  Args := TJSONObject.Create;
+  Args.AddPair('memoryReference', MemoryReference);
+  Args.AddPair('count',           TJSONNumber.Create(Count));
+  if ByteOffset <> 0 then
+    Args.AddPair('offset', TJSONNumber.Create(ByteOffset));
+  Result := WaitResp(SendCmd('readMemory', Args));
+end;
+
+function TDapClient.ReadMemoryRaw(const MemoryReference: string; Count: Integer;
+  ByteOffset: Integer): TJSONObject;
+var
+  Args: TJSONObject;
+begin
+  Args := TJSONObject.Create;
+  Args.AddPair('memoryReference', MemoryReference);
+  Args.AddPair('count',           TJSONNumber.Create(Count));
+  if ByteOffset <> 0 then
+    Args.AddPair('offset', TJSONNumber.Create(ByteOffset));
+  Result := WaitRespRaw(SendCmd('readMemory', Args));
+end;
+
+function TDapClient.WriteMemory(const MemoryReference, DataBase64: string;
+  ByteOffset: Integer; AllowPartial: Boolean): TJSONObject;
+var
+  Args: TJSONObject;
+begin
+  Args := TJSONObject.Create;
+  Args.AddPair('memoryReference', MemoryReference);
+  Args.AddPair('data',            DataBase64);
+  if ByteOffset <> 0 then
+    Args.AddPair('offset', TJSONNumber.Create(ByteOffset));
+  if AllowPartial then
+    Args.AddPair('allowPartial', TJSONBool.Create(True));
+  Result := WaitResp(SendCmd('writeMemory', Args));
+end;
+
+function TDapClient.WriteMemoryRaw(const MemoryReference, DataBase64: string;
+  ByteOffset: Integer; AllowPartial: Boolean): TJSONObject;
+var
+  Args: TJSONObject;
+begin
+  Args := TJSONObject.Create;
+  Args.AddPair('memoryReference', MemoryReference);
+  Args.AddPair('data',            DataBase64);
+  if ByteOffset <> 0 then
+    Args.AddPair('offset', TJSONNumber.Create(ByteOffset));
+  if AllowPartial then
+    Args.AddPair('allowPartial', TJSONBool.Create(True));
+  Result := WaitRespRaw(SendCmd('writeMemory', Args));
 end;
 
 // DAP `source`: fetches the content behind a frame's sourceReference. The
