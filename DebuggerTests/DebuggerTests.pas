@@ -7784,7 +7784,10 @@ var
   Stopped, V: TJSONObject;
 begin
   SkipIfBpl('main-exe .rsm staleness is a monolithic concern; a BPL is described by its own .dcp');
-  TmpDir := TPath.Combine(TPath.GetTempPath, 'dbg_stale_rsm_' + IntToStr(GetTickCount));
+  // Pid AND tick scoped: the tick alone can collide between two RunTests workers
+  // that reach this test in the same millisecond.
+  TmpDir := TPath.Combine(TPath.GetTempPath,
+    Format('dbg_stale_rsm_%d_%d', [GetCurrentProcessId, GetTickCount]));
   TDirectory.CreateDirectory(TmpDir);
   try
     TmpExe := TPath.Combine(TmpDir, 'TestTarget.exe');

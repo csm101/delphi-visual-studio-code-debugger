@@ -1594,7 +1594,7 @@ type, deferred), F21 (`detach_debugger` on a LAUNCHED session terminates instead
 of refusing), F23 (after ATTACH, already-mapped modules are not symbolicated
 until something forces a load — visibility fixed, root cause deliberately not).
 
-## A one-off suite failure that would not reproduce — OPEN, and deliberately not closed
+## A one-off suite failure that would not reproduce — OPEN, but now REPRODUCIBLE ON DEMAND
 
 `TDebuggerTestsBpl.Test_RtlStringGetter_VarOutFromPropertyType` failed once,
 during an ordinary full-suite run, with:
@@ -1615,8 +1615,27 @@ disabled (see "PARTIAL: background symbol PREFETCH" in `TASK_RESUME.md`), and
 
 Left open on purpose. A flake that cannot be reproduced is not a flake that has
 been fixed, and writing it off as noise is how it comes back as a field report.
-Next step when it recurs: capture `%TEMP%\dap_adapter.log` from the failing run
--- the indexing state at that moment is logged -- rather than re-running.
+
+**2026-08-09 — a repro finally exists, and it confirms the load hypothesis.**
+Running the suite as concurrent worker processes (`RunTestsParallel.exe --jobs N`)
+makes the failure appear as a function of N, with the same message:
+
+| jobs | runs | this failure |
+|---|---|---|
+| 1, 2, 4, 6, 8, 10 | 12 | never |
+| 12 | 3 | 1 |
+| 20 | 1 | 1 |
+
+So the trigger is contention around the stop, not anything in the test — which is
+exactly what "passes in isolation, fails under load" said, now with a dial. This
+is also why `MAX_WORKERS_CAP` in `RunTestsParallel.dpr` is 8 and not 16: the
+suite stops being trustworthy above it.
+
+Next step: run `--jobs 16` in a loop with adapter logging on and capture
+`%TEMP%\dap_adapter.log` from a failing worker — the indexing state at that
+moment is logged. The suspected gap is unchanged: `GetStackFrames` refuses to
+cache a walk taken while `AnyBackgroundIndexingPending`, and the evaluate path
+has no equivalent guard. Fixing it is a prerequisite for raising the cap.
 
 ## Large-project scale (SampleApp / 780 MB RSM)
 

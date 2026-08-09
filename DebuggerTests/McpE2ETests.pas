@@ -1043,7 +1043,10 @@ begin
     '    },' + sLineBreak +
     '  ],' + sLineBreak +
     '}';
-  var CfgPath := TPath.Combine(TPath.GetTempPath, 'mcp_test_launch.json');
+  // Pid-scoped: several RunTests workers may execute concurrently and a shared
+  // fixed name would let one worker read another's half-written config.
+  var CfgPath := TPath.Combine(TPath.GetTempPath,
+    Format('mcp_test_launch_%d.json', [GetCurrentProcessId]));
   TFile.WriteAllText(CfgPath, Content);
 
   var C := TMcpTestClient.Start(McpExe);
@@ -1962,7 +1965,10 @@ end;
 // which finds nothing on an ordinary machine with no Zydis.dll on PATH.
 procedure TMcpE2ETests.Disassemble_ReportsUnavailable_WhenZydisDllNotFound;
 begin
-  var ScratchDir := TPath.Combine(TPath.GetTempPath, 'mcp_no_zydis_test');
+  // Pid-scoped: the directory holds a private copy of the MCP exe, and a second
+  // concurrent worker copying over it would race this one's process launch.
+  var ScratchDir := TPath.Combine(TPath.GetTempPath,
+    Format('mcp_no_zydis_test_%d', [GetCurrentProcessId]));
   TDirectory.CreateDirectory(ScratchDir);
   var IsolatedExe := TPath.Combine(ScratchDir, 'DelphiDebuggerMcp.exe');
   TFile.Copy(McpExe, IsolatedExe, True);
@@ -2884,7 +2890,9 @@ end;
 // the only path left, which finds nothing on an ordinary machine.
 procedure TMcpE2ETests.StepInto_Instruction_RefusedWhenDisassemblerUnavailable;
 begin
-  var ScratchDir := TPath.Combine(TPath.GetTempPath, 'mcp_no_zydis_step_test');
+  // Pid-scoped: see Disassemble_ReportsUnavailable_WhenZydisDllNotFound.
+  var ScratchDir := TPath.Combine(TPath.GetTempPath,
+    Format('mcp_no_zydis_step_test_%d', [GetCurrentProcessId]));
   TDirectory.CreateDirectory(ScratchDir);
   var IsolatedExe := TPath.Combine(ScratchDir, 'DelphiDebuggerMcp.exe');
   TFile.Copy(McpExe, IsolatedExe, True);

@@ -102,7 +102,10 @@ VS Code  ── DAP (JSON over stdio) ──>  VisualStudioCodeDelphiDebugger.ex
 - `DebuggerTests\`: DUnitX integration test suite. Launches the adapter,
   exercises BPs / locals / step / globals / evaluate.
   Run with `cmd /c "C:\Athens\GitHub\Win64Debugger\DebuggerTests\build_and_run.bat"`.
-  Current status: **1182 found / 1178 pass / 0 fail / 0 leaked / 4 ignored.**
+  Current status: **1188 found / 1184 pass / 0 fail / 0 leaked / 4 ignored**,
+  in ~80 s (~12 s build + ~68 s of tests across 8 concurrent worker processes).
+  Set `RUNTESTS_JOBS=1` for the sequential path — same results, ~440 s. See
+  "Parallel execution" in `CLAUDE.md`.
   Attach/detach tests self-skip when SeDebugPrivilege
   isn't held; run elevated to exercise them. The count includes the TD32
   + RSM reader unit tests (`TD32ReaderTests`, `RsmReaderTests`), the

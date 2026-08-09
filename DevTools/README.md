@@ -953,9 +953,28 @@ Measures per-phase step latency (step, `stackTrace`, `scopes`, `variables`, and
 each watch expression) over N iterations, reporting min/avg/max. Arguments:
 `<adapter.exe> <target.exe> <source-file> <line> [-n<count>] [watch-expr ...]`.
 
-**Caveat:** every phase bottoms out near 30 ms because of the response-polling
-granularity in `DebuggerTests\DapClient.pas`. The tool cannot resolve costs
-below that floor — treat sub-30 ms readings as noise.
+**Historic caveat, now fixed:** every phase used to bottom out near 30 ms
+because `DapClient.Dequeue` polled on a 15 ms sleep and the adapter's idle loop
+slept another 10 ms. Both are event-driven now, and simple round trips resolve
+at ~1 ms — readings below 30 ms are meaningful again.
+
+#### DapSessionTiming
+
+```bat
+DevTools\Win64\Debug\DapSessionTiming.exe 20 EVAL_BODY
+```
+
+Times the fixed cost of ONE integration-test debug session, phase by phase:
+adapter spawn, `initialize`, `setBreakpoints`, `launch` (debuggee spawn +
+symbol load), `configurationDone`, run-to-breakpoint, `stackTrace`, `scopes`,
+`variables`, `disconnect` and teardown. Uses the suite's own
+`DebuggerTests\DapClient.pas`, so what it measures is exactly what ~1200 tests
+each pay. Arguments: `[iterations] [bp-marker]` (defaults 10 and `EVAL_BODY`);
+one warm-up session runs first and is excluded from the average.
+
+Reach for it before optimising the suite: the per-test timings in
+`TestResults.xml` say WHICH tests are slow, this says WHERE inside a test the
+time goes.
 
 #### Wow64StackProbe
 

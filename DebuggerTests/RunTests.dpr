@@ -54,36 +54,122 @@ uses
   RegisterWriteDapTests in 'RegisterWriteDapTests.pas',
   PlaceholderDisassemblyTests in 'PlaceholderDisassemblyTests.pas';
 
+const
+  // Tests that cannot run while another RunTests worker is executing, because
+  // they reach for a process by NAME rather than by handle or pid and would
+  // therefore pick up a sibling worker's debuggee. RunTestsParallel excludes
+  // them from the parallel shards and runs them alone afterwards. Keep the list
+  // as short as the evidence justifies: everything else in the suite addresses
+  // its own processes and its own pid-scoped temp files.
+  NOT_PARALLEL_SAFE: array[0..1] of string = (
+    // Attaches to a process found by NAME: with siblings running it can pick up
+    // another worker's debuggee.
+    'test_attach_byprocessname',
+    // Asserts that TestTarget.exe can be opened EXCLUSIVELY once the session
+    // released its symbol mappings. Any sibling worker with a live session on
+    // the same exe holds that lock, and the exclusive open would in turn make a
+    // sibling's CreateProcess fail. Shared-resource by nature.
+    'terminate_releasessymbolfilelock'
+  );
+
 type
-  // Dev-iteration filter: when the RUNTESTS_ONLY env var is set, only tests
-  // whose full name contains that (case-insensitive) substring run. Inert when
-  // the var is empty -- the committed full-suite behavior is unchanged. Lets a
-  // STEP-9-style edit be validated on a handful of tests in seconds instead of
-  // the whole doubled suite. Set e.g. RUNTESTS_ONLY=Test_BP_Conditional, or
-  // RUNTESTS_ONLY=Bpl to run every BPL-fixture test.
-  TSubstringFilter = class(TInterfacedObject, ITestFilter)
+  // Test selection driven by the environment, so the same binary serves the full
+  // suite, a targeted dev iteration and one worker of a parallel run.
+  //
+  //   RUNTESTS_ONLY=<substring>   only tests whose full name contains it
+  //                               (case-insensitive). The long-standing fast
+  //                               path for day-to-day work; unchanged.
+  //   RUNTESTS_SHARD=<i>/<n>      run only shard i of n. Assignment is a stable
+  //                               hash of the test's full name, so a shard is
+  //                               reproducible from its number alone and does
+  //                               not depend on discovery order.
+  //   RUNTESTS_SERIAL=exclude     skip the NOT_PARALLEL_SAFE tests (shards)
+  //   RUNTESTS_SERIAL=only        run ONLY those tests (the serial tail)
+  //
+  // With none of them set the filter is empty and every test runs, which is
+  // exactly the committed sequential behaviour.
+  TSelectionFilter = class(TInterfacedObject, ITestFilter)
   private
-    FNeedle: string;
+    FNeedle:      string;
+    FShardIndex:  Integer;
+    FShardCount:  Integer;
+    FSerialMode:  string;
+    function IsNotParallelSafe(const AFullName: string): Boolean;
   public
-    constructor Create(const ANeedle: string);
+    constructor Create(const ANeedle: string; AShardIndex, AShardCount: Integer;
+      const ASerialMode: string);
     function IsEmpty: Boolean;
     function Match(const Test: ITest): Boolean;
   end;
 
-constructor TSubstringFilter.Create(const ANeedle: string);
+constructor TSelectionFilter.Create(const ANeedle: string;
+  AShardIndex, AShardCount: Integer; const ASerialMode: string);
 begin
   inherited Create;
-  FNeedle := LowerCase(ANeedle);
+  FNeedle     := LowerCase(ANeedle);
+  FShardIndex := AShardIndex;
+  FShardCount := AShardCount;
+  FSerialMode := LowerCase(ASerialMode);
 end;
 
-function TSubstringFilter.IsEmpty: Boolean;
+function TSelectionFilter.IsEmpty: Boolean;
 begin
-  Result := FNeedle = '';
+  Result := (FNeedle = '') and (FShardCount <= 1) and (FSerialMode = '');
 end;
 
-function TSubstringFilter.Match(const Test: ITest): Boolean;
+function TSelectionFilter.IsNotParallelSafe(const AFullName: string): Boolean;
 begin
-  Result := (FNeedle = '') or (Pos(FNeedle, LowerCase(Test.FullName)) > 0);
+  for var Name in NOT_PARALLEL_SAFE do
+    if Pos(Name, AFullName) > 0 then
+      Exit(True);
+  Result := False;
+end;
+
+// FNV-1a. Any stable hash would do; what matters is that shard membership is a
+// pure function of the name, so re-running "shard 3 of 8" reruns the same tests
+// even if discovery order changes.
+function StableHash(const S: string): Cardinal;
+begin
+  Result := 2166136261;
+  for var I := 1 to Length(S) do begin
+    Result := Result xor Ord(S[I]);
+    Result := Result * 16777619;
+  end;
+end;
+
+function TSelectionFilter.Match(const Test: ITest): Boolean;
+begin
+  var FullName := LowerCase(Test.FullName);
+
+  if (FNeedle <> '') and (Pos(FNeedle, FullName) = 0) then
+    Exit(False);
+
+  if FSerialMode = 'only' then
+    Exit(IsNotParallelSafe(FullName));
+
+  if (FSerialMode = 'exclude') and IsNotParallelSafe(FullName) then
+    Exit(False);
+
+  if FShardCount > 1 then
+    Exit(Integer(StableHash(FullName) mod Cardinal(FShardCount)) = FShardIndex);
+
+  Result := True;
+end;
+
+// Parses "i/n" into its two parts. Anything malformed leaves sharding off.
+procedure ParseShardSpec(const Spec: string; out AIndex, ACount: Integer);
+begin
+  AIndex := 0;
+  ACount := 0;
+  var Slash := Pos('/', Spec);
+  if Slash <= 1 then
+    Exit;
+  AIndex := StrToIntDef(Copy(Spec, 1, Slash - 1), -1);
+  ACount := StrToIntDef(Copy(Spec, Slash + 1, MaxInt), 0);
+  if (ACount < 1) or (AIndex < 0) or (AIndex >= ACount) then begin
+    AIndex := 0;
+    ACount := 0;
+  end;
 end;
 
 var
@@ -92,6 +178,9 @@ var
   Logger:  ITestLogger;
   XmlLog:  ITestLogger;
   OnlyNeedle: string;
+  ShardIndex, ShardCount: Integer;
+  SerialMode: string;
+  Selection:  ITestFilter;
 begin
   try
     TDUnitX.CheckCommandLine;
@@ -106,9 +195,18 @@ begin
     Runner.AddLogger(XmlLog);
 
     OnlyNeedle := GetEnvironmentVariable('RUNTESTS_ONLY');
-    if OnlyNeedle <> '' then begin
-      TDUnitX.Filter := TSubstringFilter.Create(OnlyNeedle);
-      Writeln('FILTER: only tests matching "', OnlyNeedle, '"');
+    SerialMode := LowerCase(GetEnvironmentVariable('RUNTESTS_SERIAL'));
+    ParseShardSpec(GetEnvironmentVariable('RUNTESTS_SHARD'), ShardIndex, ShardCount);
+
+    Selection := TSelectionFilter.Create(OnlyNeedle, ShardIndex, ShardCount, SerialMode);
+    if not Selection.IsEmpty then begin
+      TDUnitX.Filter := Selection;
+      if OnlyNeedle <> '' then
+        Writeln('FILTER: only tests matching "', OnlyNeedle, '"');
+      if ShardCount > 1 then
+        Writeln(Format('FILTER: shard %d of %d', [ShardIndex, ShardCount]));
+      if SerialMode <> '' then
+        Writeln('FILTER: serial-set mode "', SerialMode, '"');
     end;
 
     Results := Runner.Execute;

@@ -16,9 +16,29 @@ absurdly.
   runner reads those files at run time to resolve `{BP:...}` markers, so the `.exe`
   compiles from the old source while the marker lookup reads the new one. Fakes a
   ~70-failure regression.
-- **Never run the suite twice at once.** A second `build_and_run.bat` hangs. A
-  healthy full run is ~400 s, and it is I/O-bound by design — CPU time is not a
+- **Never run the suite twice at once.** Two `build_and_run.bat` invocations
+  clobber the same build outputs. This is still true with the parallel runner:
+  concurrency inside ONE run is safe because each worker has its own report file
+  and the `.idx` sidecars are published atomically, but two runs still rebuild
+  the same binaries on top of each other.
+- **A healthy full run is ~80 s** (~12 s build + ~68 s at 8 workers), or ~440 s
+  with `RUNTESTS_JOBS=1`. It is latency-bound, not CPU-bound — low CPU is not a
   hang signal.
+- **More workers is not automatically better.** Throughput keeps rising past 8
+  on a 16C/32T machine (10.8x at 20 workers vs 6.4x at 8), but from 12 workers
+  up, load-sensitive symbol lookups start missing their deadline and the suite
+  goes intermittently red — `Test_RtlStringGetter_VarOutFromPropertyType` failing
+  with "TStrings.GetTextStr not found" is the signature. The default cap of 8 is
+  set by that, not by the speedup curve. If you raise `RUNTESTS_JOBS` past it and
+  see an odd symbol-not-found failure, halve it before investigating the symbol.
+- **When a failure smells like interference, re-run with `RUNTESTS_JOBS=1`
+  first.** Sequential is a fully supported mode and gives identical counts; a
+  failure that survives it is a real failure.
+- **A test that needs to be the only session on the machine must go in
+  `NOT_PARALLEL_SAFE` in `RunTests.dpr`**, which holds it back for the serial
+  tail. Two are there already: one attaches to a process found by NAME, the other
+  asserts it can open `TestTarget.exe` EXCLUSIVELY. Both were silently correct
+  only because nothing else used to run at the same time.
 - **Capture the WHOLE log.** The habitual `Select-Object -Last 40` truncates the
   pass/fail counts off the top when the failure list is long. That once looked
   exactly like a regression.

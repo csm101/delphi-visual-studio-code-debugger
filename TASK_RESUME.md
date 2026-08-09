@@ -25,105 +25,83 @@ longer true, delete it.
 
 ## Current task (2026-08-09)
 
-**An exception stop must keep the faulting frame AND still answer with the right
-frame's locals. DONE, not committed; left in the tree for review.**
+**Make the test suite fast. DONE, not committed; left in the tree for review.**
 
-The reported defect: an access violation inside OS code did not stop AT the
-fault — the debugger reported the calling Delphi frame and the ntdll frame was
-missing from the stack entirely. Cause (found, fixed):
-`TSourceResolver.TrimRaisePlumbing` dropped every leading frame whose source did
-not resolve on disk, and the trimmed array was assigned to `FLastFrames`, so the
-frames were not hidden, they were REMOVED.
+Full `build_and_run.bat`: **568 s → 80.5 s**, same counts (1188 found / 1184
+passed / 0 failed / 0 errored / 4 ignored) on both fixtures.
 
-The trim was load-bearing for THREE things — which frames exist, where the editor
-points, and which frame locals come from. They are now separate:
+### Where the time actually went (measured, not estimated)
 
-- `TSourceResolver.TrimRaisePlumbing` trims by NAME only (`IsRaisePlumbingFrame`),
-  never the whole stack. `GetCallStack` keeps every frame.
-- `TDebugSession.DefaultFrameIndex` (new) decides which frame ANSWERS: 0 for an
-  ordinary stop, the first frame with a source file at an exception stop. Set
-  once per stop in `HandleTargetStopped`, recomputed by the new `SetLastFrames`
-  on every re-walk, applied by `GetLocals` / frame-less `Evaluate` /
-  `GetCurrentLocation` via `ApplyDefaultFrame`.
-- `SelectFrame(Index)` is now EXPLICIT for every index including 0 and always
-  beats the default. `DEFAULT_FRAME_INDEX` (= -1) is how a frontend says its
-  client named no frame; both frontends decide by the PRESENCE of the field
-  (`Args.FindValue('frameId'/'frameIndex')`), never its value.
+- Build is ~12 s of the whole thing. It was never the problem.
+- The run had **no long pole**: 1188 tests, mean 0.42 s, p50 0.39 s, p99 1.6 s,
+  max 10.15 s; the 15 slowest together are ~51 s of 500 s. It was ~1100 debug
+  sessions each paying the same fixed cost.
+- `DevTools\DapSessionTiming.exe` broke that fixed cost down. Original:
+  **425.5 ms/session**, of which every trivial round trip (`setBreakpoints`,
+  `scopes`, `configurationDone`…) cost 27-36 ms — for work that takes ~1 ms.
+  Two sleep loops in series explained it: `DapClient.Dequeue` polled on
+  `Sleep(15)`, and the adapter's idle loop did `Sleep(10)`.
 
-Rationale and the full rule table: `DAP_DEBUGGER_ARCHITECTURE.md`, "Frames versus
-the active frame".
+### What changed
 
-### Files changed (all uncommitted)
+1. `DebuggerTests/DapClient.pas` — `Dequeue` waits on a manual-reset `TEvent`
+   signalled by `Enqueue` instead of polling. 425.5 → 325.4 ms/session.
+2. `VisualStudioCodeDelphiDebugger/DapServer.pas` — the idle branch of `Run`
+   waits on a new `MsgArrived` event (set by the stdin thread) instead of
+   `Sleep(10)`. 325.4 → **256.1 ms/session**. This also cuts real VS Code
+   latency, it is not a test-only change.
+   Sequential suite after 1+2: 556.5 s → **426.2 s**.
+3. `DebuggerTests/RunTests.dpr` — `TSubstringFilter` became `TSelectionFilter`:
+   `RUNTESTS_ONLY` (unchanged), plus `RUNTESTS_SHARD=i/n` (stable FNV-1a hash of
+   the full test name) and `RUNTESTS_SERIAL=exclude|only` over a
+   `NOT_PARALLEL_SAFE` list.
+4. `DebuggerTests/RunTestsParallel.dpr` + `build_parallel_runner.bat` +
+   `run_tests_parallel.bat` (new) — N worker processes, own XML + own log each,
+   then a serial tail, then a merged `TestResults.xml` carrying per-test timings
+   AND failure messages. `build_and_run.bat` now goes through it.
+5. Pid-scoped four fixed temp paths that two workers would have shared
+   (`McpE2ETests.pas` ×3, `DebugSessionTests.pas` ×1, `DebuggerTests.pas` ×1).
 
-- `DebuggerCore/DebugSession.pas` — `DEFAULT_FRAME_INDEX`, `FDefaultFrameIndex` +
-  `DefaultFrameIndex` property, `DefaultFrameIndexFor`, `SetLastFrames`,
-  `ApplyDefaultFrame`; `HandleTargetStopped`, `GetCallStack`, `SelectFrame`,
-  `GetLocals`, `Evaluate`, `EvaluateForFrame`, `GetCurrentLocation` updated.
-- `DebuggerCore/SourceResolver.pas` — the by-name trim (was already in the tree
-  when this task started; unchanged by it).
-- `VisualStudioCodeDelphiDebugger/DapServer.pas` — `HandleScopes` and
-  `HandleEvaluate` distinguish an absent `frameId` from `frameId: 0`.
-- `MCPDebugger/McpServer.pas` — `FrameArgGiven`; `BeginSelectedFrame` /
-  `EndSelectedFrame` / `evaluate_expression` distinguish absent `frameIndex`
-  from `frameIndex: 0`.
-- `DebuggerTests/DebugSessionTests.pas` — new
-  `ExceptionStop_DefaultFrameServesLocals_ExplicitSelectionWins` (both
-  bitnesses, failures collected).
-- `DebuggerTests/DebuggerTests.pas` — new
-  `Test_ExceptionStop_LocalsDefaultToRaisingFrame_ScopesFrameWins` (DAP wire,
-  runs in both the mono and BPL fixtures).
-- `DevTools/ExceptionStopProbe.dpr` (new, untracked) — drives a session to the
-  first exception stop and prints the raw walk, the reported stack, the
-  no-selection locals and the per-frame locals side by side.
-- Docs: `DAP_DEBUGGER_ARCHITECTURE.md` (new section), `TRAPS.md` (old entry
-  replaced by two), `TEST_CATALOG.md` (new section U + three corrected
-  references), `KNOWN_UNKNOWNS.md` (the "exception stop's frame 0" entry
-  REMOVED — resolved), `PROJECT_STATE.md`, `ASSEMBLY_LEVEL_DEBUGGING.md`
-  (its "plan assumption that did not hold" now records the resolution),
-  `DevTools/README.md`, this file.
+### Measured scaling (16C/32T, 32 GB free, 1188 tests)
 
-### Gates
+| jobs | wall | speedup | failures seen |
+|---|---|---|---|
+| 1 | 426.2 s | 1.00x | none |
+| 2 | 220.4 s | 1.93x | none |
+| 4 | 119.6 s | 3.56x | none (3 runs) |
+| 6 | 85.8 s | 4.97x | none |
+| **8** | **66.5 s** | **6.41x** | none (5 runs) |
+| 10 | 61.7 s | 6.91x | none |
+| 12 | 50.7 s | 8.41x | 1 in 3 runs |
+| 16 | 42.1 s | 10.13x | none (1 run) |
+| 20 | 39.4 s | 10.82x | 1 in 1 run |
 
-- **Full suite green**: 1184 found / 1180 passed / 0 failed / 0 errored / 4
-  ignored (`build_and_run.bat`, both fixtures). Baseline before the task was
-  1182/1178/0/0/4 plus one in-tree test and one in-tree failure; +1 new session
-  test here, +1 new DAP test added after that run and verified filtered in both
-  fixtures.
-- **RED control**: `git stash push -- DebuggerCore/DebugSession.pas` leaves the
-  new by-name trim in place, reproducing exactly the broken intermediate state.
-  The new session test then fails with `Win64: RnInnerVal missing with no frame
-  selected -- locals did not come from the default frame | Win32: <same>`. The
-  `DefaultFrameIndex` assertion must be commented out for the control to
-  compile.
-- Every consumer rebuilt: `build_dap.bat`, `build_mcp.bat`,
-  `DevTools\build_all.bat`, `build_runner.bat`.
+Throughput does **not** flatten at 8. The cap is set by correctness: at 12+,
+`Test_RtlStringGetter_VarOutFromPropertyType` intermittently fails with
+`TStrings.GetTextStr not found` — a load-sensitive symbol-index deadline, not a
+scheduling artefact. Default = `min(CPUs div 2, (availMB-1024) div 384, 8)`,
+overridable with `RUNTESTS_JOBS`; `1` is exactly today's sequential behaviour.
 
-### Open — a DESIGN DECISION deliberately NOT taken
+### Next if interrupted
 
-The by-name trim removes NOTHING from an ordinary Delphi `raise` stack: frame 0
-is a nameless `kernelbase.dll` frame (measured, both bitnesses), which stops the
-trim before it reaches `_RaiseExcept`. So VS Code's Call Stack at ANY Delphi
-exception now opens on that frame with the placeholder disassembly document,
-where it used to open on the raise site. Locals are correct either way (the
-default frame), but the focus is not.
+Nothing is half-done. Optional follow-ups, in value order:
 
-A deterministic fix exists and was not applied because it redesigns work the
-brief declared settled: **gate the trim on the exception KIND, which the engine
-already knows** (`FExceptionObjAddr` / `LastExceptionClass` distinguish a Delphi
-raise from a hardware fault). A Delphi raise trims to the raise site; a fault
-trims nothing, so frame 0 stays the fault. That satisfies both cases without a
-name list and without the frame-0 ambiguity. Decide before committing.
+1. The adapter still burns up to 10 ms per post-launch round trip inside
+   `WaitForDebugEvent(Ev, 10)` in `TWinDebugger.ProcessOneEvent`, which is dead
+   time while the debuggee is stopped and cannot produce an event. Skipping the
+   pump while stopped would cut ~5 ms × ~6 round trips per session (~35 s of a
+   sequential run, ~5 s at 8 workers). Debugger-loop surgery — measure before and
+   after with `DapSessionTiming`.
+2. `McpE2ETests.TMcpTestClient.ReadLine` still polls `PeekNamedPipe` with
+   `Sleep(2)` and reads ONE byte per `ReadFile`. ~48 MCP tests; unmeasured.
+3. Raising the worker cap requires fixing (1) the symbol-index wait under load —
+   see `KNOWN_UNKNOWNS.md`.
 
 ## State of the tree
 
-- `public-main`, everything above UNCOMMITTED by instruction — **DO NOT COMMIT.**
-- **A concurrent session committed `58f5961` (`feat(devtools): ExcHandlerProbe`)
-  during this work.** It swept this task's `DevTools/README.md` section into its
-  own commit, and it DELETED `DevTools/ExceptionStopProbe.dpr` as "an earlier
-  draft ... never documented" — which was no longer true by then. The probe has
-  been restored (untracked again) and the README now says how it differs from
-  `ExcHandlerProbe`: that one measures where an exception is DISPATCHED to, this
-  one measures what the session REPORTS at the stop. If the maintainer still
-  wants only one, delete the probe AND its references in `DevTools/README.md`
-  and `TEST_CATALOG.md` section U together.
-- Next: review; then decide the trim-gating question above.
+- `public-main`; everything above UNCOMMITTED by instruction — **DO NOT COMMIT.**
+- Rebuilt and green: `build_dap.bat`, `build_runner.bat`,
+  `build_parallel_runner.bat`, `DevTools\build_one.bat DapSessionTiming`.
+  `build_mcp.bat` and `DevTools\build_all.bat` were NOT re-run — no code they
+  own changed, but `DapServer.pas` did, so re-run `build_dap.bat` consumers
+  before committing.

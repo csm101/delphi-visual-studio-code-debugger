@@ -304,12 +304,41 @@ cmd /c "C:\Athens\GitHub\Win64Debugger\DebuggerTests\build_target.bat" 2>&1
 # Build only the test runner (RunTests.exe)
 cmd /c "C:\Athens\GitHub\Win64Debugger\DebuggerTests\build_runner.bat" 2>&1
 
-# Run already-built tests
+# Run already-built tests (parallel workers, adaptive count)
+cmd /c "C:\Athens\GitHub\Win64Debugger\DebuggerTests\run_tests_parallel.bat" 2>&1
+
+# Run already-built tests sequentially, in one process (the escape hatch)
 cmd /c "C:\Athens\GitHub\Win64Debugger\DebuggerTests\run_tests.bat" 2>&1
 ```
 
 These patterns are pre-approved in `.claude/settings.json` (committed).
 Run the full suite after every change to the adapter or RSM parser.
+
+## Parallel execution
+
+`build_and_run.bat` runs the suite as several concurrent `RunTests.exe` worker
+processes — not threads: `DebuggerCore` has process-wide state, so in-process
+parallelism would be a flakiness generator. Each worker takes a shard (a stable
+hash of the test's full name) and writes its own XML and console log into
+`DebuggerTests\Win64\Debug\`; `RunTestsParallel.exe` merges them into the usual
+`TestResults.xml`.
+
+| Variable / flag | Meaning |
+|---|---|
+| `RUNTESTS_JOBS` / `--jobs N` | Worker count. Default adapts to logical CPUs and free memory, capped at 8. |
+| `RUNTESTS_JOBS=1` | Sequential: one unsharded worker, identical results, ~6x slower. First thing to try when parallelism is suspected in a failure. |
+| `RUNTESTS_ONLY` / `--only` | Substring filter; passed through to every worker unchanged. |
+
+A few tests reach for a process by NAME or take an exclusive lock on a shared
+binary, so they cannot run beside a sibling worker. They are listed in
+`NOT_PARALLEL_SAFE` in `RunTests.dpr` and run alone in a serial tail after the
+shards finish. Add to that list rather than weakening a test if a new one turns
+out to depend on being the only session on the machine.
+
+Measured on 16C/32T: 1188 tests in 426 s sequential, 66 s at 8 workers, plus
+~12 s of build. Throughput keeps rising past 8, but load-sensitive symbol
+lookups start missing their deadline at 12+, so the cap is set by correctness
+rather than by throughput — see the comment on `MAX_WORKERS_CAP`.
 
 # Build
 

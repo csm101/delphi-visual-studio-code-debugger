@@ -2755,7 +2755,10 @@ begin
     '    },' + sLineBreak +
     '  ],' + sLineBreak +
     '}';
-  var CfgPath := TPath.Combine(TPath.GetTempPath, 'mcp_test_attach.json');
+  // Pid-scoped: several RunTests workers may execute concurrently and a shared
+  // fixed name would let one worker read another's half-written config.
+  var CfgPath := TPath.Combine(TPath.GetTempPath,
+    Format('mcp_test_attach_%d.json', [GetCurrentProcessId]));
   TFile.WriteAllText(CfgPath, Content);
 
   var Opts: TAttachOptions;

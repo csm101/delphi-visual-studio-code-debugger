@@ -64,6 +64,15 @@ call "%~dp0build_runner.bat"
 if errorlevel 1 ( echo FAILED: RunTests & exit /b 1 )
 
 echo.
+echo === Build RunTestsParallel ===
+call "%~dp0build_parallel_runner.bat"
+if errorlevel 1 ( echo FAILED: RunTestsParallel & exit /b 1 )
+
+echo.
 echo === Run Tests ===
-Win64\Debug\RunTests.exe --xmlfile:Win64\Debug\TestResults.xml
+rem Several worker processes by default; the count adapts to the machine's cores
+rem and free memory. Set RUNTESTS_JOBS=1 for the sequential path (identical
+rem results, ~6x slower) whenever parallelism is suspected in a failure.
+rem RUNTESTS_ONLY is passed through to every worker unchanged.
+call "%~dp0run_tests_parallel.bat"
 exit /b %errorlevel%

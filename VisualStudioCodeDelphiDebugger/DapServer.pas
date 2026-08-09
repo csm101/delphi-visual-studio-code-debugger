@@ -4562,10 +4562,17 @@ procedure TDapServer.Run;
 var
   StdinThread: TThread;
   MsgQueue:    TThreadedQueue<TJSONObject>;
+  MsgArrived:  TEvent;
   Msg:         TJSONObject;
   QueueSize:   Integer;
 begin
   MsgQueue := TThreadedQueue<TJSONObject>.Create(256, INFINITE, 0);
+  // Signalled by the stdin thread on every push. The idle branch below waits on
+  // it instead of sleeping a flat 10 ms, so a request that arrives while the
+  // adapter has nothing to do is picked up at once rather than up to 10 ms
+  // later. Manual-reset, cleared at the top of each iteration before the drain,
+  // so a push racing the drain can never be missed.
+  MsgArrived := TEvent.Create(nil, True, False, '');
   try
     StdinThread := TThread.CreateAnonymousThread(
       procedure
@@ -4589,8 +4596,10 @@ begin
               end;
           end;
           MsgQueue.PushItem(M);
+          MsgArrived.SetEvent;
         until False;
         MsgQueue.DoShutDown;
+        MsgArrived.SetEvent;
       end);
     StdinThread.FreeOnTerminate := True;
     StdinThread.Start;
@@ -4600,6 +4609,7 @@ begin
         Break;
 
       var DidWork := False;
+      MsgArrived.ResetEvent;
 
       // Drain the incoming request queue FIRST (non-blocking). Handling pending
       // client requests before the 10ms debug-event poll below cuts up to ~10ms of
@@ -4650,10 +4660,12 @@ begin
       if CheckSynchronize(0) then
         DidWork := True;
 
-      // Nothing to do this iteration (no debugger events, empty queue): yield the
-      // CPU so an idle or orphaned adapter does not spin a core at 100%.
+      // Nothing to do this iteration (no debugger events, empty queue): block
+      // until the next request arrives, at most 10 ms, so an idle or orphaned
+      // adapter does not spin a core at 100% and a request that arrives 1 ms
+      // from now is not made to wait out a full sleep quantum.
       if not DidWork then
-        Sleep(10);
+        MsgArrived.WaitFor(10);
 
       if FLaunched and FSession.HasExited then begin
         DapLog('Run: debuggee has exited');
@@ -4676,6 +4688,7 @@ begin
     until False;
   finally
     MsgQueue.Free;
+    MsgArrived.Free;
   end;
 end;
 

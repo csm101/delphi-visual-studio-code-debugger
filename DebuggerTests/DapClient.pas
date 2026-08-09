@@ -22,6 +22,11 @@ type
     FSeq:         Integer;
     FQueue:       TList<TJSONObject>;  // owns objects
     FLock:        TCriticalSection;
+    // Signalled by the reader thread whenever a message is enqueued, so Dequeue
+    // wakes on arrival instead of polling. Manual-reset: Dequeue resets it while
+    // holding FLock right after a scan found nothing, so any Set that races in
+    // afterwards is still observed and cannot be lost.
+    FDataEvent:   TEvent;
     FReader:      TThread;
     FDead:        Boolean;
 
@@ -264,6 +269,7 @@ begin
   inherited;
   FQueue  := TList<TJSONObject>.Create;
   FLock   := TCriticalSection.Create;
+  FDataEvent := TEvent.Create(nil, True, False, '');
   FProc   := 0;
   FThread := 0;
   FStdinW := INVALID_HANDLE_VALUE;
@@ -284,6 +290,7 @@ begin
   end;
   FQueue.Free;
   FLock.Free;
+  FDataEvent.Free;
   inherited;
 end;
 
@@ -453,6 +460,7 @@ begin
   FLock.Acquire;
   try
     FQueue.Add(Obj);
+    FDataEvent.SetEvent;
   finally
     FLock.Release;
   end;
@@ -463,11 +471,16 @@ function TDapClient.Dequeue(Pred: TFunc<TJSONObject, Boolean>;
 var
   Deadline: UInt64;
   I:        Integer;
+  Now:      UInt64;
 begin
   Result   := False;
   Msg      := nil;
   Deadline := GetTickCount64 + UInt64(TimeoutMs);
-  while GetTickCount64 < Deadline do begin
+  // Event-driven, not polled. The previous Sleep(15) loop quantised EVERY DAP
+  // round trip to a 15 ms grid: a reply that arrived in 1 ms was still handed
+  // back ~8 ms later on average. With ~30 waits per test and ~1200 tests that
+  // quantisation alone was minutes of wall clock.
+  while True do begin
     FLock.Acquire;
     try
       for I := 0 to FQueue.Count - 1 do
@@ -476,10 +489,16 @@ begin
           FQueue.Delete(I);
           Exit(True);
         end;
+      // Nothing matched what is in the queue right now. Clearing the event here,
+      // under the same lock Enqueue takes, means a message added from now on is
+      // guaranteed to re-signal it.
+      FDataEvent.ResetEvent;
     finally
       FLock.Release;
     end;
-    Sleep(15);
+    Now := GetTickCount64;
+    if Now >= Deadline then Exit(False);
+    FDataEvent.WaitFor(Cardinal(Deadline - Now));
   end;
 end;
 
