@@ -16,6 +16,8 @@ uses
   Winapi.Windows,
   DapProtocol, DebugInfoTypes, DebugInfoSet, DebugTarget, ExceptionRules,
   TargetLayout, DelphiValueReaders,
+  Disassembler,        // IDisassembler: exact instruction lengths for stepping
+  ZydisDisassembler,   // the only backend today; reached ONLY through the seam
   X86Decode;   // TCallSiteAnswer: the call-site verdict seam (x86 supplies it)
 
 type
@@ -88,7 +90,11 @@ type
     FPreferredBase: UInt64;
     FDebugInfo:    TDebugInfoSet;
     FBreakpoints:  TList<TBreakpointRec>;
-    FStepMode:     (smNone, smInto, smOver, smOut);
+    // smInstr is instruction granularity (ASSEMBLY_LEVEL_DEBUGGING.md increment
+    // 1) and is deliberately a MODE of its own rather than a flag on smInto /
+    // smOver: those two terminate on a new SOURCE LINE, which is not a condition
+    // that exists in the code instruction stepping is for.
+    FStepMode:     (smNone, smInto, smOver, smOut, smInstr);
     FStepOverVA:   UInt64;  // temp one-shot BP address for step-over/out
     // Range-based step-over: single-step inside the current function's RVA
     // range; when a CALL leaves the function (or recurses into it) run
@@ -109,6 +115,25 @@ type
     FStepResumeSP:  UInt64;
     FStepPrevSP:    UInt64;         // RSP at the previous single-step (for call/ret delta)
     FStepRaiseArmed: Boolean;       // in-function line BPs planted to catch an unwinding raise
+    // True while a single step exists ONLY to move the thread off a transient
+    // step breakpoint that fired for someone else (see
+    // RearmStepBpAfterForeignHit). That trap advances one instruction but
+    // decides nothing: whichever step is in flight must resume exactly as it
+    // was, or the trap it did not ask for is mistaken for progress.
+    FSteppingOffStepBp: Boolean;
+    // Instruction-granularity stepping (smInstr). The resume address lives in
+    // FStepOverVA and the recursion guard in FStepResumeSP, reusing the
+    // step-over machinery rather than duplicating it; only what is genuinely
+    // new is kept here.
+    FInstrStepKind:     TInstructionStepKind;
+    FInstrStepTid:      DWORD;      // the thread this instruction step belongs to
+    FInstrStepTrapFlag: Boolean;    // True = one trap-flag step, False = run to FStepOverVA
+    // The decoder instruction stepping uses. Built lazily on first use (needs
+    // the target's pointer width, which is only known once the process exists);
+    // replaced wholesale by SetInstructionDisassembler. Symbolication is
+    // deliberately NOT wired in -- stepping needs lengths and mnemonics, and a
+    // symbol lookup per step would be paid for nothing.
+    FInstrDisasm:       IDisassembler;
     // Per-thread stepping. While a step is in flight, every thread EXCEPT the
     // stepped one is explicitly SuspendThread'd so only it runs -- the Win32
     // debug API resumes ALL threads on ContinueDebugEvent, but an explicit
@@ -381,11 +406,35 @@ type
     function  ReadImageSizeOf(Base: UInt64): UInt64;
     function  AddressInLoadedModule(VA: UInt64): Boolean;
     procedure PlantStepBp(VA: UInt64);
+    // A transient step breakpoint fired for someone ELSE -- a deeper recursive
+    // incarnation returning to the very same address, or another thread. It has
+    // to stay armed, but the trapped thread is parked ON it with the original
+    // byte already restored, so planting the INT3 straight back would trap on it
+    // again the instant the thread resumes, forever. Same dance a persistent
+    // breakpoint hit uses: leave it unplanted, single-step the thread off it,
+    // re-plant on that trap and keep running.
+    procedure RearmStepBpAfterForeignHit(BpVA: UInt64; Tid: DWORD);
     procedure ClearStepBps;
     procedure PlantInFuncStepBps;
     function  RvaInStepFunc(Rva: UInt64): Boolean;
     function  StepOverAtNewLine(Rva: UInt64): Boolean;
     procedure HandleSmOverStep(Tid: DWORD; PcVA: UInt64);
+    // --- instruction granularity (ASSEMBLY_LEVEL_DEBUGGING.md increment 1) ---
+    // The decoder, built on first use. Nil only when the process does not exist
+    // yet; an UNAVAILABLE backend is still a live instance whose Available is
+    // False, so the refusal can quote its StatusText.
+    function  InstructionDisassembler: IDisassembler;
+    // Decides one instruction step without mutating anything the debuggee can
+    // observe. Runs on the REQUESTING thread (see TInstrStepPlan).
+    function  BuildInstructionStepPlan(Kind: TInstructionStepKind; Tid: DWORD;
+                out Plan: TInstrStepPlan; out RefusalReason: string): Boolean;
+    // Executes an already-decided plan. Runs on the Run thread.
+    procedure DoStepInstruction(const Cmd: TCommand);
+    // True when a stop at BpVA on Tid is THIS instruction step's landing rather
+    // than a deeper recursive incarnation reaching the same address, or another
+    // thread's business.
+    function  InstrStepLandedAt(BpVA: UInt64; Tid: DWORD): Boolean;
+    procedure EndInstructionStep;
     procedure ApplyAllBreakpoints;
     // Moves a breakpoint that landed on a routine's ENTRY (a `begin` line) to
     // the first address of its body, where the parameters are actually spilled.
@@ -441,6 +490,12 @@ type
     property  Running:   Boolean read FRunning;
     // Thread-safe: called from stdin reader thread
     procedure PostCommand(const Cmd: TCommand);
+    // Instruction-granularity stepping (IDebugTarget; see its declaration for
+    // the contract). Decides and refuses synchronously on the CALLING thread,
+    // then posts the decided plan for the Run thread to execute.
+    function  StepInstruction(Kind: TInstructionStepKind; ThreadId: DWORD;
+                out RefusalReason: string): Boolean;
+    procedure SetInstructionDisassembler(const Disasm: IDisassembler);
     // Thread enumeration (IDebugTarget).
     function  GetThreadIds: TArray<DWORD>;
     function  GetThreadName(TID: DWORD): string;
@@ -1882,6 +1937,35 @@ begin
   FStepBpVAs := FStepBpVAs + [VA];
 end;
 
+procedure TWinDebugger.RearmStepBpAfterForeignHit(BpVA: UInt64; Tid: DWORD);
+begin
+  // The hit handler already deleted the one-shot record and restored the byte.
+  // Put the record back UNPLANTED and let the re-arm path plant it after one
+  // trap step, exactly as a persistent breakpoint is re-armed -- planting it
+  // here would re-trap immediately on the very instruction the thread is
+  // parked on and never make progress.
+  if FindBreakpointByVA(BpVA) < 0 then begin
+    var BP := Default(TBreakpointRec);
+    BP.VA        := BpVA;
+    BP.IsOneShot := True;
+    BP.IsPlanted := False;
+    FBreakpoints.Add(BP);
+  end;
+  var AlreadyTracked := False;
+  for var VA in FStepBpVAs do
+    if VA = BpVA then begin
+      AlreadyTracked := True;
+      Break;
+    end;
+  if not AlreadyTracked then
+    FStepBpVAs := FStepBpVAs + [BpVA];
+
+  FPendingReactivateVA := BpVA;
+  FReactivateTid       := Tid;
+  FSteppingOffStepBp   := True;
+  SetTrapFlag(Tid, True);
+end;
+
 // Remove every still-planted step BP. Called when a step-over completes or is
 // interrupted by another stop, so the transient INT3s never leak.
 procedure TWinDebugger.ClearStepBps;
@@ -1976,6 +2060,250 @@ begin
   // Returned to the caller (or no usable return address): stop here.
   FStepMode := smNone;
   ReportStopped(srStep, PcVA);
+end;
+
+{ ---------------- instruction granularity (ASSEMBLY_LEVEL_DEBUGGING.md #1) --- }
+
+// The mnemonic Zydis's Intel formatter printed, lowercased. Classifying by the
+// decoder's OWN text is the same discipline ZydisDisassembler already uses for
+// direct-branch annotation: this unit never re-derives from raw bytes what the
+// decoder was asked to produce. `syscall` / `sysenter` are single tokens and so
+// cannot be mistaken for `call`.
+function FirstMnemonicToken(const Text: string): string;
+begin
+  Result := LowerCase(Trim(Text));
+  var SpaceAt := Pos(' ', Result);
+  if SpaceAt > 0 then
+    Result := Copy(Result, 1, SpaceAt - 1);
+end;
+
+// A `rep`-family prefix, which Zydis prints as its own leading token. THE new
+// hazard of instruction stepping: such an instruction traps once per ITERATION,
+// so a trap-flag step retires one iteration and leaves the PC exactly where it
+// was. Stepped that way a `rep movsb` over a large block produces thousands of
+// stops and reads as a hang, so it is completed as a whole -- one-shot at
+// PC + length -- by BOTH step-into and step-over. A string move has no callee,
+// so nothing is lost by not entering it.
+function MnemonicIsRepPrefix(const Mnemonic: string): Boolean;
+begin
+  for var Prefix in ['rep', 'repe', 'repz', 'repne', 'repnz'] do
+    if Mnemonic = Prefix then
+      Exit(True);
+  Result := False;
+end;
+
+function TWinDebugger.InstructionDisassembler: IDisassembler;
+begin
+  if FInstrDisasm = nil then begin
+    var Mode: TDisasmMachineMode;
+    if TargetLayout.PointerSize = 8 then
+      Mode := dmmLong64
+    else
+      Mode := dmmLegacy32;
+    // ReadCodeMemoryAt, never ReadProcessMemoryAt: it restores the debugger's
+    // OWN planted INT3 bytes, so an instruction carrying a breakpoint decodes as
+    // the user's opcode rather than as `int3`, and it truncates at the end of a
+    // committed region instead of failing the whole read.
+    var Reader: TDisasmByteReader :=
+      function(VA: UInt64; Buf: Pointer; Size: Integer): Integer
+      begin
+        Result := Integer(ReadCodeMemoryAt(VA, Buf, NativeUInt(Size)));
+      end;
+    FInstrDisasm := TZydisDisassembler.Create(Mode, Reader, nil, 0,
+      ResolveZydisDllPathForThisExe);
+  end;
+  Result := FInstrDisasm;
+end;
+
+procedure TWinDebugger.SetInstructionDisassembler(const Disasm: IDisassembler);
+begin
+  FInstrDisasm := Disasm;
+end;
+
+function TWinDebugger.BuildInstructionStepPlan(Kind: TInstructionStepKind;
+  Tid: DWORD; out Plan: TInstrStepPlan; out RefusalReason: string): Boolean;
+
+  function Refuse(const Reason: string): Boolean;
+  begin
+    RefusalReason := Reason;
+    Result        := False;
+  end;
+
+begin
+  Plan          := Default(TInstrStepPlan);
+  Plan.Kind     := Kind;
+  RefusalReason := '';
+
+  var Regs: TRegisterSnapshot;
+  if not ReadThreadRegisters(Tid, Regs) or not Regs.Valid then
+    Exit(Refuse(Format('the register context of thread %d could not be read', [Tid])));
+
+  // Every kind requires the backend, including step-out, which decodes nothing
+  // itself: a surface where two of three kinds refuse and the third silently
+  // works is a worse contract than one sentence. There is no fallback decoder
+  // anywhere in this project and instruction lengths are never guessed.
+  var Disasm := InstructionDisassembler;
+  if (Disasm = nil) or not Disasm.Available then begin
+    var Status := 'no disassembler backend is configured';
+    if Disasm <> nil then
+      Status := Disasm.StatusText;
+    Exit(Refuse('instruction stepping needs the disassembler backend: ' + Status));
+  end;
+
+  if Kind = iskOut then begin
+    // .pdata on x64, [EBP+4] on x86 -- CallerReturnAddress is already that seam.
+    var Ret := CallerReturnAddress(Tid);
+    if not IsPlausibleReturnAddress(Ret) then
+      Exit(Refuse(Format('no return address can be proven for the frame at $%x ' +
+        '(no unwind data and no usable frame pointer): instruction step-out ' +
+        'refuses rather than running to a plausible-looking address', [Regs.Pc])));
+    Plan.UseTrapFlag := False;
+    Plan.ResumeVA    := Ret;
+    // The matching RET pops at least one target pointer, so a hit at or below
+    // the current stack pointer belongs to a deeper incarnation of a recursive
+    // callee returning to the very same site.
+    {$Q-}
+    Plan.MinResumeSP := Regs.StackPtr + UInt64(TargetLayout.PointerSize);
+    {$Q+}
+    Exit(True);
+  end;
+
+  var Insns := Disasm.Disassemble(Regs.Pc, 1);
+  if (Length(Insns) = 0) or (not Insns[0].Decoded) or (Insns[0].Length <= 0) then
+    Exit(Refuse(Format('the bytes at $%x do not decode as an instruction, so its ' +
+      'length is unknown; refusing to guess one', [Regs.Pc])));
+
+  var Mnemonic := FirstMnemonicToken(Insns[0].Text);
+  var MustRunPastIt := MnemonicIsRepPrefix(Mnemonic) or
+                       ((Mnemonic = 'call') and (Kind = iskOver));
+  if not MustRunPastIt then begin
+    Plan.UseTrapFlag := True;
+    Exit(True);
+  end;
+
+  // Exact, because the decoder just produced the length -- which makes this
+  // MORE reliable than the source-level step-over's return-address arithmetic,
+  // not less.
+  {$Q-}
+  Plan.ResumeVA := Regs.Pc + UInt64(Insns[0].Length);
+  {$Q+}
+  if not AddressIsExecutable(Plan.ResumeVA) then
+    Exit(Refuse(Format('the address after the instruction at $%x ($%x) is not ' +
+      'executable memory; refusing to plant a breakpoint there',
+      [Regs.Pc, Plan.ResumeVA])));
+  Plan.UseTrapFlag := False;
+  // A call+ret nets to no stack change, and a rep touches the stack not at all,
+  // so the landing must be at the SAME stack pointer this step started from.
+  Plan.MinResumeSP := Regs.StackPtr;
+  Result := True;
+end;
+
+function TWinDebugger.StepInstruction(Kind: TInstructionStepKind;
+  ThreadId: DWORD; out RefusalReason: string): Boolean;
+begin
+  RefusalReason := '';
+  Result        := False;
+  if (FProcess = 0) or FHasExited then begin
+    RefusalReason := 'there is no live debuggee to step';
+    Exit;
+  end;
+  if not FIsStopped then begin
+    RefusalReason := 'the debuggee is running; instruction stepping needs a stop';
+    Exit;
+  end;
+  var Tid := ThreadId;
+  if Tid = 0 then
+    Tid := FStoppedTid;
+  if (Tid = 0) or not FThreads.ContainsKey(Tid) then begin
+    RefusalReason := Format('thread %d is not a live thread of the debuggee', [Tid]);
+    Exit;
+  end;
+
+  // On x86 a stack walk does not survive a still-planted breakpoint (TRAPS.md),
+  // and step-out takes one. At a breakpoint stop the byte is already restored
+  // and the PC already rewound by the hit handler; this covers the remaining
+  // case -- a step that LANDED on an address carrying a persistent breakpoint --
+  // and is the same call the step command itself makes on the Run thread.
+  var PcBpIdx := FindBreakpointByVA(CurrentRIP(Tid));
+  if (PcBpIdx >= 0) and FBreakpoints[PcBpIdx].IsPlanted and
+     (not FBreakpoints[PcBpIdx].IsOneShot) then
+    UnpatchBpAtRip(Tid);
+
+  var Plan: TInstrStepPlan;
+  if not BuildInstructionStepPlan(Kind, Tid, Plan, RefusalReason) then begin
+    DapLog('StepInstruction REFUSED: ' + RefusalReason);
+    Exit;
+  end;
+
+  var Cmd := Default(TCommand);
+  Cmd.Kind      := ckStepInstruction;
+  Cmd.ThreadId  := Tid;
+  Cmd.InstrStep := Plan;
+  PostCommand(Cmd);
+  Result := True;
+end;
+
+procedure TWinDebugger.DoStepInstruction(const Cmd: TCommand);
+begin
+  var Tid := Cmd.ThreadId;
+  if Tid = 0 then
+    Tid := FStoppedTid;
+  FIsStopped             := False;
+  FPendingContinueStatus := DBG_CONTINUE;
+  UnpatchBpAtRip(Tid);
+  FreezeThreadsForStep(Tid);
+  ClearStepBps;
+
+  FStepMode          := smInstr;
+  FInstrStepKind     := Cmd.InstrStep.Kind;
+  FInstrStepTid      := Tid;
+  FInstrStepTrapFlag := Cmd.InstrStep.UseTrapFlag;
+  FStepOverVA        := Cmd.InstrStep.ResumeVA;
+  FStepResumeSP      := Cmd.InstrStep.MinResumeSP;
+  FStepResumeVA      := 0;
+  FStepRaiseArmed    := False;
+  FStepSafetyCount   := 0;
+  FStepMinSP         := 0;
+  FStepHasFromLoc    := False;
+
+  if FInstrStepTrapFlag then
+    SetTrapFlag(Tid, True)
+  else
+    // Thread-scoped by construction: every other thread is frozen for the
+    // duration, and InstrStepLandedAt re-checks both the thread and the stack
+    // pointer, so a recursive callee reaching the same address one frame deeper
+    // cannot end the step early.
+    PlantStepBp(Cmd.InstrStep.ResumeVA);
+
+  DapLog(Format('StepInstruction: kind=%d tid=%d trapFlag=%s resumeVA=$%x minSP=$%x',
+    [Ord(FInstrStepKind), Tid, BoolToStr(FInstrStepTrapFlag, True),
+     FStepOverVA, FStepResumeSP]));
+  ReleasePendingEvent(DBG_CONTINUE);
+end;
+
+function TWinDebugger.InstrStepLandedAt(BpVA: UInt64; Tid: DWORD): Boolean;
+begin
+  Result := False;
+  if (FStepMode <> smInstr) or FInstrStepTrapFlag then
+    Exit;
+  if (BpVA = 0) or (BpVA <> FStepOverVA) or (Tid <> FInstrStepTid) then
+    Exit;
+  // A deeper recursive incarnation returns to the SAME address at a LOWER stack
+  // pointer. Reported there, the step lands on the right instruction in the
+  // wrong frame and every local belongs to another recursion level.
+  if (FStepResumeSP <> 0) and (CurrentRSP(Tid) < FStepResumeSP) then
+    Exit;
+  Result := True;
+end;
+
+procedure TWinDebugger.EndInstructionStep;
+begin
+  ClearStepBps;
+  FStepMode          := smNone;
+  FStepOverVA        := 0;
+  FStepResumeSP      := 0;
+  FInstrStepTid      := 0;
+  FInstrStepTrapFlag := False;
 end;
 
 // Plant a one-shot BP at every source line of the function currently being
@@ -2854,6 +3182,13 @@ begin
         SetTrapFlag(StepTid, True);
         ReleasePendingEvent(DBG_CONTINUE);
       end;
+      ckStepInstruction:
+        // Already decided (and already refused, if it had to be) on the
+        // requesting thread -- see TInstrStepPlan. Nothing here may decide
+        // anything: the resume has to happen on THIS thread, and the refusal
+        // had to happen on the other one.
+        if FIsStopped then
+          DoStepInstruction(Cmd);
       ckStepOut: begin
         // Find the caller's resume RIP via StackWalk64 (uses .pdata unwind
         // info), then plant a one-shot INT3 there. Reading [RSP] directly
@@ -2975,6 +3310,7 @@ begin
     [ReasonStr, VA, SF, SL]));
   FStepMinSP             := 0;
   FStepMode              := smNone;
+  FSteppingOffStepBp     := False;
   FIsStopped             := True;
   FPendingContinueStatus := DBG_CONTINUE;
   if FRearmAfterStopVA <> 0 then begin
@@ -3471,6 +3807,20 @@ begin
 
       if BP.IsOneShot then begin
         FBreakpoints.Delete(BpIdx);
+        // Instruction granularity: the one-shot planted past a `call` / a
+        // `rep`-prefixed instruction, or at a step-out's return address.
+        if (FStepMode = smInstr) and (BpVA = FStepOverVA) then begin
+          if not InstrStepLandedAt(BpVA, Ev.dwThreadId) then begin
+            // A deeper recursive incarnation reached the same address (or
+            // another thread did): step off it, re-arm, and keep running.
+            RearmStepBpAfterForeignHit(BpVA, Ev.dwThreadId);
+            ContinueDebugEvent(Ev.dwProcessId, Ev.dwThreadId, DBG_CONTINUE);
+            Exit;
+          end;
+          EndInstructionStep;
+          ReportStopped(srStep, BpVA);
+          Exit;
+        end;
         // Range-based step-over: a transient step BP fired.
         var IsStepBp := False;
         for var SV in FStepBpVAs do
@@ -3486,7 +3836,12 @@ begin
             // frames deeper, and every local came from the wrong incarnation.
             if (FStepResumeSP <> 0) and
                (CurrentRSP(Ev.dwThreadId) < FStepResumeSP) then begin
-              PlantStepBp(BpVA);
+              // The thread is parked ON the breakpoint with its original byte
+              // restored, so it must be stepped off before the INT3 goes back
+              // (an immediate re-plant re-traps on the same instruction and
+              // never progresses -- measured while building instruction
+              // stepping, on the identical guard).
+              RearmStepBpAfterForeignHit(BpVA, Ev.dwThreadId);
               ContinueDebugEvent(Ev.dwProcessId, Ev.dwThreadId, DBG_CONTINUE);
               Exit;
             end;
@@ -3543,15 +3898,22 @@ begin
         // running but bypass ReportStopped so VS Code never sees the stop.
         Inc(BP.HitCount);
         FBreakpoints[BpIdx] := BP;
+        // A persistent breakpoint already occupied an instruction step's resume
+        // address, so PlantStepBp left it alone and the hit arrives here instead
+        // of on the one-shot path. Same landing, same guards.
+        var InstrStepLanded := InstrStepLandedAt(BpVA, Ev.dwThreadId);
         var ShouldStop := True;
-        if Assigned(FOnBpHit) and not (
+        if Assigned(FOnBpHit) and not InstrStepLanded and not (
             (FStepMode in [smOver, smOut]) and (BpVA = FStepOverVA)) then
           ShouldStop := FOnBpHit(BP);
         if not ShouldStop then begin
           ContinueDebugEvent(Ev.dwProcessId, Ev.dwThreadId, DBG_CONTINUE);
           Exit;
         end;
-        if (FStepMode in [smOver, smOut]) and (BpVA = FStepOverVA) then begin
+        if InstrStepLanded then begin
+          EndInstructionStep;
+          ReportStopped(srStep, BpVA);
+        end else if (FStepMode in [smOver, smOut]) and (BpVA = FStepOverVA) then begin
           FStepOverVA := 0;
           ReportStopped(srStep, BpVA);
         end else begin
@@ -3565,6 +3927,11 @@ begin
             FStepRaiseArmed := False;
             FStepMode := smNone;
           end;
+          // The same, for an instruction step: a breakpoint anywhere inside the
+          // callee being stepped over pre-empts it, and its one-shot must not
+          // survive into later execution.
+          if FStepMode = smInstr then
+            EndInstructionStep;
           ReportStopped(srBreakpoint, BpVA);
         end;
         Exit;
@@ -3627,6 +3994,15 @@ begin
           FBreakpoints[BpIdx] := BP;
         end;
         FPendingReactivateVA := 0;
+        // The trap existed ONLY to move the thread off a transient step
+        // breakpoint that fired for someone else; it decided nothing. Whatever
+        // step is in flight still owns the thread through its own (now
+        // re-planted) breakpoint, so resume without touching its state.
+        if FSteppingOffStepBp then begin
+          FSteppingOffStepBp := False;
+          ContinueDebugEvent(Ev.dwProcessId, Ev.dwThreadId, DBG_CONTINUE);
+          Exit;
+        end;
         // The rearm consumed our trap-step. For smOver, that step may have been
         // the `call` that entered a callee -- evaluate NOW, at the callee entry,
         // where [RSP] is still the return address (one more step would be past
@@ -3636,8 +4012,40 @@ begin
           HandleSmOverStep(Ev.dwThreadId, CurrentRIP(Ev.dwThreadId));
           Exit;
         end;
+        // Instruction granularity: the re-arm's trap-step IS the one instruction
+        // we asked for, so a trap-flag plan is complete here. A run-to-one-shot
+        // plan (a `call` / `rep` / step-out) must NOT re-arm the trap flag: the
+        // step it just consumed executed the call, and the rest of the plan is
+        // the one-shot breakpoint already planted at the resume address.
+        if FStepMode = smInstr then begin
+          if FInstrStepTrapFlag and (Ev.dwThreadId = FInstrStepTid) then begin
+            var LandedAt := CurrentRIP(Ev.dwThreadId);
+            EndInstructionStep;
+            ReportStopped(srStep, LandedAt);
+            Exit;
+          end;
+          ContinueDebugEvent(Ev.dwProcessId, Ev.dwThreadId, DBG_CONTINUE);
+          Exit;
+        end;
         if FStepMode = smInto then
           SetTrapFlag(Ev.dwThreadId, True);
+        ContinueDebugEvent(Ev.dwProcessId, Ev.dwThreadId, DBG_CONTINUE);
+        Exit;
+      end;
+
+      // Instruction granularity. This trap IS the completed instruction --
+      // there is no line-table condition to satisfy and nothing to run on to,
+      // which is the whole point of the mode. Reached only for a trap-flag
+      // plan; while a run-to-one-shot plan is in flight the trap flag is off,
+      // so a single-step event here is not ours and the one-shot still owns
+      // the thread. A watchpoint that fired during either was already dealt
+      // with above, through DR6, and never arrives here as a step completion.
+      if FStepMode = smInstr then begin
+        if FInstrStepTrapFlag and (Ev.dwThreadId = FInstrStepTid) then begin
+          EndInstructionStep;
+          ReportStopped(srStep, ExcAddr);
+          Exit;
+        end;
         ContinueDebugEvent(Ev.dwProcessId, Ev.dwThreadId, DBG_CONTINUE);
         Exit;
       end;
@@ -3889,6 +4297,10 @@ begin
           FStepRaiseArmed := False;
           FStepMode := smNone;
         end;
+        // Same for an instruction step: once the stack unwinds past the resume
+        // address, its one-shot can only fire somewhere unrelated.
+        if FStepMode = smInstr then
+          EndInstructionStep;
         ReportStopped(srException, ExcAddr);
         // Keep the exception pending so the program's own try/except handles it.
         // FPendingContinueStatus is also set here so ckContinue/step use the right status.

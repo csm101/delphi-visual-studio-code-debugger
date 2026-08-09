@@ -665,6 +665,23 @@ Debugger features:
   `launch`/`disassemble` round trip — both returned real decoded instructions,
   not a refusal. Full detail in `DISASSEMBLY_PLAN.md` "Verified in increment
   7" and `ThirdParty\Zydis\PROVENANCE.md`.
+- **Assembly-level debugging — increment 1 (the engine primitive) DONE; 2-5
+  open.** `IDebugTarget.StepInstruction(iskInto|iskOver|iskOut, ThreadId, out
+  RefusalReason)` and its `TDebugSession` facade step exactly ONE machine
+  instruction, with no line table required and no DAP/MCP surface yet
+  (increments 2 and 4). Step-over runs past a `call` with a one-shot at PC + the
+  DECODED length; a `rep`-prefixed instruction is completed the same way by BOTH
+  into and over, because a trap-flag step at one retires a single ITERATION and
+  leaves the PC where it was (measured, both bitnesses). Step-out takes the
+  return address from `.pdata` on x64 / `[EBP+4]` on x86 and REFUSES where
+  neither proves one. Everything refuses when the disassembler backend is
+  unavailable — there is no fallback decoder in this project and a length is
+  never guessed. Mechanism in `DAP_DEBUGGER_ARCHITECTURE.md` "Instruction
+  granularity"; decisions and their negative controls in
+  `ASSEMBLY_LEVEL_DEBUGGING.md`; 16 tests in `TEST_CATALOG.md` "O.". Fixed a
+  latent HANG in the source-level step-over on the way: a transient step
+  breakpoint rejected by the recursion guard was re-planted under the parked PC
+  and re-trapped forever.
 - Win32 (32-bit) targets — **DONE**. Run control, locals, object expansion,
   evaluation and the multi-BPL case all work on a WOW64 target from the same
   64-bit adapter binary. See "Target architecture" under Implemented features

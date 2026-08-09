@@ -695,6 +695,57 @@ fixture):
       A follow-up, not a correctness gap: a fresh `list_breakpoints` /
       `setInstructionBreakpoints` call reports the current truth regardless.
 
+## O. Instruction-granularity stepping (ASSEMBLY_LEVEL_DEBUGGING.md increment 1)
+
+`DebuggerTests\InstructionStepTests.pas`, 8 scenarios x BOTH bitnesses as
+separate test cases (16), driving `TDebugSession.StepInstruction` directly — no
+DAP, no MCP (those are increments 2 and 4). The fixture is its own target,
+`TestTarget\InstructionStepSample.dpr`, for the usual reason: adding scenarios to
+`TestTarget` shifts RSM import indices and marker ordering. Every one was proven
+RED by removing its rule and re-running; the measured failure text is in the
+increment-1 report.
+
+- [x] **One instruction, not one line.** The marker line is deliberately several
+      instructions long, so the step must land at PC + the decoded length with
+      the source line UNCHANGED
+      (`*_Into_AdvancesOneInstructionAndEntersTheCallee`). RED control: degrade
+      the plan to the source-level `smInto` and it runs to the next line.
+- [x] **Step-into a `call` enters the callee** (same test, second half).
+- [x] **Step-over does NOT single-step a `call`**: lands at PC + length, in the
+      same frame, same routine (`*_Over_StaysInTheCallerFrame`). RED control:
+      drop the call rule and it lands at the callee's entry.
+- [x] **The stack-pointer guard, on a genuinely recursive callee**: stepping over
+      the recursive `call` inside the OUTERMOST incarnation must land at the same
+      stack pointer it started from (`*_Over_RecursiveCallee_StaysInTheOuterFrame`).
+      RED control: zero `MinResumeSP` and it lands at the right address with a
+      lower stack pointer — the innermost incarnation ended the step.
+- [x] **A `rep`-prefixed instruction completes as ONE step**, for step-over AND
+      step-into (`*_Over_/_Into_RepPrefixed_CompletesTheWholeStringOperation`).
+      Proven by the COUNT REGISTER — 65536 before, 0 after — which needs no
+      symbol resolution and cannot be satisfied by one iteration. RED control:
+      drop the rep rule and the PC is byte-identical before and after.
+- [x] **Step-out lands in the caller** with a risen stack pointer
+      (`*_Out_LandsInTheCaller`). RED control: make it a trap-flag step and it
+      stays inside the callee.
+- [x] **Refusal when the disassembler backend is unavailable**, for all three
+      kinds, with the session left stopped and the PC unmoved
+      (`*_Refused_WhenDisassemblerUnavailable`). The backend is an INJECTED
+      `IDisassembler` double with `Available=False`, not a bad DLL path: the
+      Zydis loader is a process-wide one-shot latch (`TRAPS.md`).
+- [x] **A watchpoint firing inside a stepped-over call is not the step
+      completing** (`*_WatchpointHitDuringStepOver_IsNotAStepCompletion`) — the
+      instruction-granularity twin of the existing source-level DR6 tests. RED
+      control: remove the in-flight-step gate in the DR6 branch and the step
+      stops inside the callee, at the write.
+- [ ] The `iskOut` branch that refuses because NO return address can be proven
+      (x64 code with no unwind data and no frame pointer) has no fixture — the
+      same limitation `TRAPS.md` already records for the x86 walk, since dbghelp
+      knows every test module. What IS proven is that the refusal MECHANISM
+      works and leaves the session untouched, via the unavailable-backend test.
+- [ ] No test drives instruction stepping on a NON-stopped session or an unknown
+      thread id; both are guarded in `StepInstruction` and answered with a
+      reason, but only by construction.
+
 ## What the suite does NOT prove (2026-08-08)
 
 Coverage-honesty notes. Each records a place where a green run is weaker evidence

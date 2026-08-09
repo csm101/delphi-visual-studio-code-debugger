@@ -1,6 +1,7 @@
 # Assembly-level debugging — plan
 
-Status: **designed, not built** (2026-08-09). Wanted in the next release.
+Status: **increment 1 BUILT (2026-08-09); increments 2-5 designed, not built.**
+Wanted in the next release.
 
 Debugging at the instruction level, in the Disassembly View and over MCP: plant a
 breakpoint on an instruction, step one instruction at a time, read and write
@@ -22,7 +23,7 @@ missing from both. The engine underneath is largely present: it already
 single-steps with the trap flag, and `TWinDebugger` already knows how to plant a
 one-shot breakpoint at a return address.
 
-## Increment 1 — the engine primitive
+## Increment 1 — the engine primitive — **BUILT**
 
 A real single-instruction step, exposed rather than buried inside the line-step
 logic. Today stepping means "advance until the source line changes", which has no
@@ -67,6 +68,47 @@ The rules, and they are the substance of this plan:
 - **On x86, the stack walk does not survive a still-planted breakpoint.** Also
   measured during the Win32 port: restore the byte and rewind EIP before any walk
   taken during an instruction step.
+
+### What increment 1 actually built, and the three rules it had to sharpen
+
+The surface is `IDebugTarget.StepInstruction(Kind, ThreadId, out RefusalReason)`
+(`TInstructionStepKind = (iskInto, iskOver, iskOut)`) with a `TDebugSession`
+facade of the same shape. The mechanism is in
+`DAP_DEBUGGER_ARCHITECTURE.md`, "Instruction granularity"; only the decisions the
+plan left open are recorded here.
+
+**1. `rep` is completed as a whole by step-INTO as well as step-over.** The plan
+listed the rep hazard under step-over. Measured (negative control, both
+bitnesses): a trap-flag step at `rep movsb` leaves the PC *exactly where it was*
+— `$46B34C` before and after — having retired one iteration. So "step one
+instruction" would appear not to advance at all, and any caller looping until the
+PC moves takes 65536 stops, which is the hang the rule exists to prevent. A
+string move has no callee, so entering it is not a thing a user can want:
+both kinds run to a one-shot at PC + length. The count register proves it —
+`REP_BLOCK_SIZE` before the step, zero after.
+
+**2. Refusing when the disassembler backend is unavailable covers ALL THREE
+kinds**, including `iskOut`, which decodes nothing itself. A surface where two of
+three kinds refuse and the third silently works is a worse contract than one
+sentence naming what is missing. `IDisassembler.StatusText` is quoted in the
+refusal.
+
+**3. A rejected transient step breakpoint has to be STEPPED OFF, not re-planted
+in place.** Found while building this, and it was a latent hang in the
+*source-level* step-over too (fixed in the same change): when the recursion guard
+rejects a hit, the thread is parked ON that address with the original byte
+already restored, so writing the INT3 straight back re-traps on the same
+instruction the instant the thread resumes. Measured as an unbounded
+trap/re-plant loop in the debug log before the fix. `RearmStepBpAfterForeignHit`
+now does the same dance a persistent breakpoint hit does — leave it unplanted,
+single-step off it, re-plant on that trap — and `FSteppingOffStepBp` marks that
+trap as deciding nothing, so neither step mode mistakes it for progress.
+
+The classification (`call`, `rep`-family) is read from the DECODER'S OWN
+mnemonic text, the same discipline `ZydisDisassembler`'s direct-branch whitelist
+already uses; nothing re-derives from raw bytes what the decoder was asked to
+produce. An instruction that does not decode is refused, never given a guessed
+length.
 
 ## Increment 2 — DAP: stepping granularity
 

@@ -13,11 +13,52 @@ unit DebugTarget;
 interface
 
 uses
-  System.SysUtils, Winapi.Windows, DebugInfoTypes, ExceptionRules, TargetLayout;
+  System.SysUtils, Winapi.Windows, DebugInfoTypes, ExceptionRules, TargetLayout,
+  Disassembler;
 
 type
   TStopReason = (srEntry, srBreakpoint, srStep, srException, srPause,
     srDataBreakpoint);
+
+  // Instruction-granularity stepping (ASSEMBLY_LEVEL_DEBUGGING.md increment 1).
+  // Deliberately NOT the same as the source-level TStepMode: "advance until the
+  // source line changes" has no terminating condition in code with no line
+  // table, which is exactly the code someone steps through one instruction at a
+  // time.
+  //
+  //   iskInto -- one trap-flag step; land wherever it goes, including inside a
+  //              callee.
+  //   iskOver -- the same, EXCEPT for an instruction that must not be
+  //              single-stepped: a `call` (stepping it would enter the callee)
+  //              and a `rep`-prefixed string instruction (the trap fires once
+  //              per ITERATION, so a trap-flag step retires one iteration and
+  //              leaves the PC where it was). Both run to a one-shot breakpoint
+  //              at PC + the DECODED length instead.
+  //   iskOut  -- run to this frame's return address, which comes from `.pdata`
+  //              on x64 and from [EBP+4] on x86 (IDebugTarget's own
+  //              CallerReturnAddress). Where neither can prove one, it REFUSES;
+  //              unlike the source-level step-out it never degrades to
+  //              single-stepping, which cannot terminate without a line table.
+  TInstructionStepKind = (iskInto, iskOver, iskOut);
+
+  // A fully-decided instruction step, handed to the debug loop. The DECISION
+  // (decode, refuse, choose trap flag vs one-shot) is made on the requesting
+  // thread while the target is stopped, because a refusal has to be synchronous;
+  // the EXECUTION has to happen on the Run thread, because ContinueDebugEvent
+  // must be called from the thread that called WaitForDebugEvent. This record is
+  // what crosses between the two.
+  TInstrStepPlan = record
+    Kind:        TInstructionStepKind;
+    // True  -> arm the trap flag and take exactly one step.
+    // False -> plant a one-shot breakpoint at ResumeVA and run full speed.
+    UseTrapFlag: Boolean;
+    ResumeVA:    UInt64;
+    // Smallest stack pointer a ResumeVA hit may have and still be OUR step
+    // landing. A recursive callee returns to the SAME address one (or many)
+    // frames deeper, where the stack pointer is LOWER; without this the step
+    // reports the right address in the wrong incarnation. 0 = no constraint.
+    MinResumeSP: UInt64;
+  end;
 
   // How one synthetic-call argument has to be materialised in the TARGET.
   //
@@ -237,7 +278,8 @@ type
   end;
 
   TCommandKind = (ckContinue, ckStepInto, ckStepOver, ckStepOut, ckPause,
-    ckSetBreakpoints, ckSetDataBreakpoints, ckSetAddressBreakpoints);
+    ckSetBreakpoints, ckSetDataBreakpoints, ckSetAddressBreakpoints,
+    ckStepInstruction);
 
   TBpSpec = record
     SourceFile:    string;
@@ -271,6 +313,7 @@ type
     BpSpec:     TBpSpec;
     DataBpSpec: TDataBpArmSpec;
     AddrBpSpec: TAddrBpSpec;
+    InstrStep:  TInstrStepPlan;   // ckStepInstruction only
   end;
 
   TOnStopped     = procedure(Reason: TStopReason; const SourceFile: string;
@@ -442,6 +485,27 @@ type
     // ClearDataWatchpoint's own True/False.
     function  ApplyDataBreakpointCommand(const Spec: TDataBpArmSpec;
                 out Slot: Integer; out RefusalReason: string): Boolean;
+
+    // --- Instruction-granularity stepping (ASSEMBLY_LEVEL_DEBUGGING.md inc 1) --
+    // Steps ThreadId (0 = the currently-stopped thread) by exactly one machine
+    // instruction, per TInstructionStepKind. Returns False WITHOUT resuming the
+    // debuggee and fills RefusalReason when the step cannot be taken exactly:
+    // no live debuggee, the debuggee is running, an unknown thread, a decoder
+    // that is unavailable or cannot decode the bytes at the PC, or (iskOut) a
+    // return address that cannot be proven. This project refuses rather than
+    // guesses an instruction length or a plausible-looking address.
+    //
+    // True means the step was ACCEPTED and the debuggee resumed; the resulting
+    // stop arrives on the normal OnStopped path with reason srStep, exactly like
+    // the source-level steps.
+    function  StepInstruction(Kind: TInstructionStepKind; ThreadId: DWORD;
+                out RefusalReason: string): Boolean;
+    // Replaces the disassembler instruction stepping decodes with. Injection
+    // seam: production leaves it unset and the engine builds a Zydis-backed one
+    // on first use, while a test can supply a double (notably an unavailable
+    // backend, which the process-wide one-shot Zydis load latch makes impossible
+    // to produce by pointing the loader at a bad path -- see TRAPS.md).
+    procedure SetInstructionDisassembler(const Disasm: IDisassembler);
 
     // Mutators (used by `setVariable` and the synthetic remote-call path).
     function  SetRegisterByName(const Name: string; Value: UInt64): Boolean;

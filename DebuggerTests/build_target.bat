@@ -42,6 +42,17 @@ dcc64 -$O- -V -VN -E.\Win64\Debug -NU.\Win64\Debug NoSourceStop.dpr 2>&1
 set NOSRC64_ERR=%errorlevel%
 dcc32 -$O- -V -VN -E.\Win32\Debug -NU.\Win32\Debug NoSourceStop.dpr 2>&1
 set NOSRC32_ERR=%errorlevel%
+rem Instruction-stepping fixture: a multi-instruction line, a plain call, a
+rem recursive call, a `rep movsb` over 64 KB and a watched write inside a call
+rem (ASSEMBLY_LEVEL_DEBUGGING.md increment 1). Full debug info (-V -VN -VR -GD)
+rem because the tests place source breakpoints in it and read stop locations.
+rem Both bitnesses: instruction stepping is where x86 and x64 differ most.
+rem Separate target for the usual reason -- adding scenarios to TestTarget
+rem shifts RSM import indices and marker ordering.
+dcc64 -$O- -V -VN -VR -GD -E.\Win64\Debug -NU.\Win64\Debug InstructionStepSample.dpr 2>&1
+set INSTR64_ERR=%errorlevel%
+dcc32 -$O- -V -VN -VR -GD -E.\Win32\Debug -NU.\Win32\Debug InstructionStepSample.dpr 2>&1
+set INSTR32_ERR=%errorlevel%
 rem External-TDS target (-VT): debug info in a standalone .tds, no embedded .debug.
 dcc64 -$O- -VT -VN -E.\Win64\Debug -NU.\Win64\Debug TdsSample.dpr 2>&1
 set TDS_ERR=%errorlevel%
@@ -64,4 +75,6 @@ if not "%NESTED64_ERR%"=="0" exit /b %NESTED64_ERR%
 if not "%NESTED32_ERR%"=="0" exit /b %NESTED32_ERR%
 if not "%NOSRC64_ERR%"=="0" exit /b %NOSRC64_ERR%
 if not "%NOSRC32_ERR%"=="0" exit /b %NOSRC32_ERR%
+if not "%INSTR64_ERR%"=="0" exit /b %INSTR64_ERR%
+if not "%INSTR32_ERR%"=="0" exit /b %INSTR32_ERR%
 exit /b %TT32_ERR%

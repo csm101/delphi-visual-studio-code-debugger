@@ -287,6 +287,15 @@ type
     procedure StepOver(ThreadId: DWORD = 0);
     procedure StepInto(ThreadId: DWORD = 0);
     procedure StepOut(ThreadId: DWORD = 0);
+    // One MACHINE INSTRUCTION rather than one source line
+    // (ASSEMBLY_LEVEL_DEBUGGING.md increment 1). Unlike the three above it can
+    // REFUSE -- there is no line table to fall back on in the code this exists
+    // for, so an instruction whose length cannot be decoded, or a frame whose
+    // return address cannot be proven, is answered with False and a reason
+    // rather than with a step to somewhere plausible. False leaves the session
+    // stopped exactly where it was.
+    function  StepInstruction(Kind: TInstructionStepKind; ThreadId: DWORD;
+                out RefusalReason: string): Boolean;
     procedure Pause;
 
     // Breakpoints.
@@ -951,6 +960,26 @@ begin
   Cmd.ThreadId := ThreadId;
   FDebugger.PostCommand(Cmd);
   SetState(dsRunning);
+end;
+
+function TDebugSession.StepInstruction(Kind: TInstructionStepKind;
+  ThreadId: DWORD; out RefusalReason: string): Boolean;
+begin
+  RefusalReason := '';
+  if FDebugger = nil then begin
+    RefusalReason := 'no active debuggee to step';
+    Exit(False);
+  end;
+  if FState <> dsStopped then begin
+    RefusalReason := 'the debuggee is not stopped';
+    Exit(False);
+  end;
+  // The engine decides and refuses synchronously; the session only follows it
+  // into dsRunning when the step was actually accepted, so a refusal leaves the
+  // session exactly as it was rather than waiting for a stop that never comes.
+  Result := FDebugger.StepInstruction(Kind, ThreadId, RefusalReason);
+  if Result then
+    SetState(dsRunning);
 end;
 
 procedure TDebugSession.Pause;

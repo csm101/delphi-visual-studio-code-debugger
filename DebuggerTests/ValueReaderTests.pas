@@ -90,7 +90,7 @@ implementation
 uses
   System.SysUtils, System.TypInfo, Winapi.Windows,
   DebugInfoTypes, DebugTarget, DebugInfoSet, DelphiValueReaders, ExceptionRules,
-  ValueEncoders, TargetLayout, WinDebuggerBase;
+  ValueEncoders, TargetLayout, Disassembler, WinDebuggerBase;
 
 type
   // Minimal IDebugTarget fake: only ReadProcessMemoryAt is live, serving a fixed
@@ -150,6 +150,9 @@ type
     function  EvaluateGlobalName(const Name: string; out Value: TLocalValue): Boolean;
     function  SetRegisterByName(const Name: string; Value: UInt64): Boolean;
     function  SetInstructionPointer(VA: UInt64): Boolean;
+    function  StepInstruction(Kind: TInstructionStepKind; ThreadId: DWORD;
+                out RefusalReason: string): Boolean;
+    procedure SetInstructionDisassembler(const Disasm: IDisassembler);
     function  ArmHardwareWatchpoint(TID: DWORD; Slot: Integer; Address: UInt64;
                 SizeBytes: Integer; WriteOnly: Boolean): Boolean;
     function  DisarmHardwareWatchpoint(TID: DWORD; Slot: Integer): Boolean;
@@ -280,6 +283,13 @@ function  TFakeMemTarget.EvaluateLocalName(const Name: string; out Value: TLocal
 function  TFakeMemTarget.EvaluateGlobalName(const Name: string; out Value: TLocalValue): Boolean; begin Value := Default(TLocalValue); Result := False; end;
 function  TFakeMemTarget.SetRegisterByName(const Name: string; Value: UInt64): Boolean; begin Result := False; end;
 function  TFakeMemTarget.SetInstructionPointer(VA: UInt64): Boolean; begin Result := False; end;
+function  TFakeMemTarget.StepInstruction(Kind: TInstructionStepKind; ThreadId: DWORD;
+  out RefusalReason: string): Boolean;
+begin
+  RefusalReason := 'this fake target has no debuggee to step';
+  Result := False;
+end;
+procedure TFakeMemTarget.SetInstructionDisassembler(const Disasm: IDisassembler); begin end;
 // This fake has no live process and therefore no debug registers: arming must
 // FAIL rather than silently claim a watchpoint nothing can deliver.
 function  TFakeMemTarget.ArmHardwareWatchpoint(TID: DWORD; Slot: Integer; Address: UInt64; SizeBytes: Integer; WriteOnly: Boolean): Boolean; begin Result := False; end;

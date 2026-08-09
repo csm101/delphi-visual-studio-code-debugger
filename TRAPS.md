@@ -267,6 +267,20 @@ absurdly.
   and never test it for "non-zero".
 - **The CPU never clears `DR6`.** Leave it and the next trap on that thread carries
   the same bits, so every later step looks like a watchpoint hit.
+- **A `rep`-prefixed instruction traps ONCE PER ITERATION.** Measured on both
+  bitnesses: a trap-flag step at `rep movsb` leaves the PC at the *same address*
+  it started from, having retired one iteration. Anything that single-steps such
+  an instruction, or loops until the PC moves, produces one stop per byte moved
+  and reads as a hang. Run past it with a one-shot at PC + the decoded length,
+  exactly like a `call`.
+- **A transient step breakpoint rejected by the recursion guard must be STEPPED
+  OFF before the INT3 goes back.** The hit handler has already restored the
+  original byte and rewound the PC onto that address, so re-planting in place
+  re-traps on the same instruction forever — an unbounded `BP hit / PlantInt3 OK`
+  loop in `%TEMP%\dap_adapter.log`, with the target apparently running and no
+  stop ever arriving. `RearmStepBpAfterForeignHit` is the one place that does it
+  correctly (leave unplanted, trap-step off, re-plant), and `FSteppingOffStepBp`
+  marks that trap as deciding nothing so no step mode reads it as progress.
 - **Never name a Delphi method `Continue`** — it shadows the loop keyword. Use
   `ContinueExecution`.
 - **The main-exe module-name sentinel differs by layer.** `TWinDebugger`'s own

@@ -1237,6 +1237,95 @@ Three modes plus a none state:
   new-line test a few bytes into the same function and a failed step-out
   reported success.
 
+### A rejected transient step breakpoint must be stepped OFF, not re-planted
+
+Both the `smOver` recursion guard and its `smInstr` twin can decide that a
+one-shot step breakpoint fired for someone else — a deeper recursive incarnation
+returning to the very same address, or another thread. The breakpoint has to stay
+armed, and the obvious move (plant the INT3 straight back and resume) does not
+work: the hit handler has already restored the original byte and rewound the PC
+onto that address, so the thread re-traps on the same instruction the instant it
+resumes, forever. Measured as an unbounded `BP hit / PlantInt3 OK` loop in
+`%TEMP%\dap_adapter.log` while building instruction stepping; the identical
+defect was latent in the source-level `smOver` guard and is fixed with it.
+
+`RearmStepBpAfterForeignHit` does the dance a persistent breakpoint hit already
+does: re-add the record UNPLANTED, set `FPendingReactivateVA` / `FReactivateTid`,
+arm the trap flag, and let the re-arm path plant it after one step.
+`FSteppingOffStepBp` marks that trap as one that DECIDES NOTHING, so the re-arm
+path resumes the in-flight step untouched instead of letting `HandleSmOverStep`
+(or the instruction step) read it as progress.
+
+## Instruction granularity (ASSEMBLY_LEVEL_DEBUGGING.md increment 1)
+
+`smInstr` is a mode of its own, not a flag on `smInto`/`smOver`: those terminate
+on a new SOURCE LINE, and the code instruction stepping exists for has no line
+table at all. The engine surface is
+`IDebugTarget.StepInstruction(Kind, ThreadId, out RefusalReason): Boolean` with
+`TInstructionStepKind = (iskInto, iskOver, iskOut)`, mirrored by
+`TDebugSession.StepInstruction`. No DAP or MCP surface yet — increments 2 and 4.
+
+**Two phases, because the two constraints pull apart.** A refusal has to be
+synchronous (the caller must learn "this cannot be stepped exactly" rather than
+wait for a stop that never comes), but `ContinueDebugEvent` must be called from
+the thread that called `WaitForDebugEvent`. So the REQUESTING thread decides —
+read-only: registers, `ReadCodeMemoryAt`, `CallerReturnAddress` — and produces a
+`TInstrStepPlan`; the Run thread executes an already-decided plan through
+`ckStepInstruction` and decides nothing. The plan is `UseTrapFlag` (one trap-flag
+step) or a `ResumeVA` to run to, plus `MinResumeSP`.
+
+**The rules:**
+
+- `iskInto` — one trap-flag step, landing wherever it goes including inside a
+  callee.
+- `iskOver` — the same, except for an instruction that must not be single-stepped:
+  a `call`, and a `rep`-prefixed string instruction. Both run to a one-shot
+  breakpoint at PC + the DECODED length, which is exact because the disassembler
+  just produced it.
+- `rep` is completed as a whole by `iskInto` TOO. A trap-flag step at a
+  `rep`-prefixed instruction traps once per ITERATION and leaves the PC exactly
+  where it was (measured, both bitnesses), so "one instruction" would appear not
+  to advance and a caller looping until it does would take one stop per byte
+  moved. A string move has no callee, so nothing is lost.
+- `iskOut` — `CallerReturnAddress` (`.pdata` on x64, `[EBP+4]` on x86 — the seam
+  already exists) filtered through `IsPlausibleReturnAddress`, then a one-shot
+  there. Where neither can prove an address it REFUSES; unlike source `smOut` it
+  never degrades to single-stepping, which has no terminating condition without a
+  line table.
+- Everything refuses when the disassembler backend is unavailable, quoting
+  `IDisassembler.StatusText` — including `iskOut`, which decodes nothing itself:
+  a surface where two of three kinds refuse and the third silently works is a
+  worse contract than one sentence. There is no fallback decoder in this project
+  and an instruction length is never guessed; bytes that do not decode are
+  refused too.
+
+**Reused rather than reinvented:** `FStepOverVA` holds the resume address,
+`FStepResumeSP` the stack-pointer guard, and `PlantStepBp`/`ClearStepBps`/
+`FreezeThreadsForStep` are the same one-shot and per-thread machinery source
+stepping uses. The one-shot is thread-scoped twice over — every other thread is
+frozen for the duration, and `InstrStepLandedAt` re-checks the thread AND
+requires `RSP >= MinResumeSP` (the RSP at decision time for a call/rep, since
+call+ret nets to zero; plus one target pointer for a step-out, the minimum the
+matching RET pops). Without that, a recursive callee returning to the same
+address one frame deeper ends the step at the right instruction in the wrong
+incarnation.
+
+**Classification comes from the decoder's own mnemonic text** (`call`, `rep` /
+`repe` / `repz` / `repne` / `repnz` as the leading token), the same discipline
+`ZydisDisassembler`'s direct-branch whitelist already applies — nothing
+re-derives from raw bytes what the decoder was asked to produce. The decode goes
+through `ReadCodeMemoryAt`, so an instruction carrying one of our own planted
+INT3 bytes decodes as the user's opcode rather than as `int3`. The disassembler
+is built lazily per engine instance (mode from `TargetLayout.PointerSize`, no
+symbolication — stepping needs lengths, not names) and can be replaced through
+`SetInstructionDisassembler`, which is how a test injects an unavailable backend
+without touching the process-wide one-shot Zydis load latch.
+
+**Watchpoints are handled by the existing DR6 branch, unchanged**: a slot bit
+without `BS` while `FStepMode <> smNone` is recorded and resumed, so a watchpoint
+firing inside a stepped-over call cannot be reported as the instruction step
+completing.
+
 ## Stack walking
 
 Uses `StackWalk64` with `dbghelp.dll`'s `SymFunctionTableAccess64` /

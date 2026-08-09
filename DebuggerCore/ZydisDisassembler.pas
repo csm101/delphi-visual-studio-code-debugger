@@ -46,7 +46,36 @@ type
     function Disassemble(VA: UInt64; Count: Integer): TArray<TDisasmInstruction>;
   end;
 
+// Where THIS executable should look for Zydis.dll: next to itself first (how a
+// packaged install ships it), then the committed dev-build copy in the repo.
+// Every executable in this project that needs it -- the DAP adapter, the MCP
+// server, RunTests.exe, the DevTools probes -- sits exactly three directories
+// below the repo root (<dir>\Win64\<Config>\*.exe), so one relative path serves
+// all of them. Returns '' when neither exists, which ZydisTryLoad treats as
+// "use the normal Windows search order".
+//
+// DapServer.pas and McpServer.pas each still carry their own copy of this, from
+// before DebuggerCore needed one; they are deliberately independent executables
+// and collapsing them is a separate change from instruction stepping.
+function ResolveZydisDllPathForThisExe: string;
+
 implementation
+
+uses
+  System.IOUtils;
+
+function ResolveZydisDllPathForThisExe: string;
+begin
+  var ExeDir := ExtractFileDir(ParamStr(0));
+  var NextToExe := TPath.Combine(ExeDir, 'Zydis.dll');
+  if FileExists(NextToExe) then
+    Exit(NextToExe);
+  var RepoCopy := TPath.GetFullPath(TPath.Combine(ExeDir,
+    '..\..\..\ThirdParty\Zydis\bin\x64\Zydis.dll'));
+  if FileExists(RepoCopy) then
+    Exit(RepoCopy);
+  Result := '';
+end;
 
 const
   // ZYDIS_MAX_INSTRUCTION_LENGTH. A generous per-instruction read so the
