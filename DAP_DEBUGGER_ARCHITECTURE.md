@@ -377,6 +377,7 @@ nothing else:
 | `StackWalkMachineType` | `IMAGE_FILE_MACHINE_I386` |
 | `ReadThreadRegisters` | `Wow64GetThreadContext` |
 | `SetThreadPc` | `Wow64SetThreadContext` |
+| `SetRegisterByName` | `Wow64Get/SetThreadContext` by name; refuses `R8`..`R15` (ASSEMBLY_LEVEL_DEBUGGING.md increment 6) |
 | `SetThreadTrapFlag` | `Wow64SetThreadContext`, EFLAGS bit `$100` |
 | `ReadDebugRegisters` / `WriteDebugRegisters` | `Wow64Get/SetThreadContext` with `WOW64_CONTEXT_DEBUG_REGISTERS`; the registers are 32 bits wide, so the widening is the whole difference |
 | `FillStackWalkContext` | seeds `StackWalk64` from a WOW64 context |
@@ -1522,14 +1523,19 @@ Bitness note, measured not assumed
 target `TWin32Debugger.ReadThreadRegisters` (`WinDebuggerX86.pas`) reads
 `Wow64GetThreadContext` and never sets `R8`..`R15` (`TRegisterSnapshot` starts
 zeroed), so `get_registers` reports them as literal `"0x0"` — not fabricated,
-not omitted, exactly what the engine has. `SetRegisterByName` has NO WOW64
-override, though — it always calls the base (native `GetThreadContext`/
-`SetThreadContext`) implementation. `set_register` was verified end-to-end
-only on a native x64 target; whether a WOW64 write through the native context
-actually lands on the right logical 32-bit register was not measured for this
-increment and is not claimed. If it turns out not to, that is a
-`SetRegisterByName` engine defect shared identically by the pre-existing DAP
-`setVariable`-on-`Registers`-scope path, not something increment 4 introduced.
+not omitted, exactly what the engine has.
+
+`SetRegisterByName` originally had NO WOW64 override — resolved in
+`ASSEMBLY_LEVEL_DEBUGGING.md` increment 6, which is the authoritative writeup
+(what was measured, both outcomes considered, why Outcome 1 was taken even
+though the round-trip defect turned out not to reproduce at a real stop —
+only R8..R15 did). Summary: `TWin32Debugger.SetRegisterByName` now overrides
+the base with `Wow64Get/SetThreadContext`, using the same name vocabulary
+`ReadThreadRegisters` reports (`RIP`/`RSP`/`RBP`/`RAX`..`RDI`/`EFlags`), and
+refuses `R8`..`R15` outright (no logical register exists on x86 at that
+width). DAP's `setVariable`-on-`Registers`-scope path shares the identical
+fix, proven by a dedicated test file (`RegisterWriteDapTests.pas`) — the two
+surfaces do not diverge.
 
 **Instruction-granularity stepping** is a `granularity` argument
 (`"statement"`, default; `"instruction"`) on the EXISTING `step_over`/

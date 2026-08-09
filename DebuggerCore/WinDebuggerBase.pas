@@ -539,7 +539,13 @@ type
     function  ReadCodeMemoryAt(VA: UInt64; Buf: Pointer; Size: NativeUInt): NativeUInt;
     function  WriteMemoryAt(VA: UInt64; Buf: Pointer; Size: NativeUInt): Boolean;
     function  WriteMemoryPartial(VA: UInt64; Buf: Pointer; Size: NativeUInt): NativeUInt;
-    function  SetRegisterByName(const Name: string; Value: UInt64): Boolean;
+    // Writes a named register by ROLE name (RIP/RSP/RBP/RAX..RDI/R8..R15/
+    // EFlags -- the same vocabulary GetRegisters reports). VIRTUAL for the
+    // same reason the thread-context funnel above is: a 32-bit target needs
+    // Wow64Get/SetThreadContext and has no R8..R15 at all. This base
+    // implementation is the native x64 answer; the WOW64 override lives in
+    // WinDebuggerX86.pas.
+    function  SetRegisterByName(const Name: string; Value: UInt64): Boolean; virtual;
     // Sets a Delphi string variable in the debuggee. Allocates a new
     // immortal-literal buffer (refcount = -1) for the new value, then
     // hijacks the stopped thread to call System.@UStrAsg / @LStrAsg so the

@@ -386,6 +386,20 @@ type
     // deferred here -- the package is not loaded when it is set -- so this also
     // covers binding a breakpoint to a module that arrives later.
     [Test] procedure Win32_Bpl_BreakpointInPackage_FiresWithLocals;
+    // ASSEMBLY_LEVEL_DEBUGGING.md increment 6: SetRegisterByName had no WOW64
+    // override (unlike ReadThreadRegisters, which does) -- unverified, not
+    // provenly wrong. Measured (DevTools\Wow64RegWriteProbe.dpr): at a REAL
+    // breakpoint the native GetThreadContext/SetThreadContext pair the base
+    // class used actually aliases correctly with Wow64Get/SetThreadContext on
+    // this Windows build, so this is a regression guard (must still hold with
+    // the WOW64 override in place), not a RED control on its own --
+    // Win32_SetRegister_ExtendedRegister_Refused below is the real one.
+    [Test] procedure Win32_SetRegister_WritesAndReadsBack;
+    // R8..R15 do not exist on x86 at any width. Before the fix the base
+    // class's name matching accepted "R8" and reported success while writing
+    // a register that means nothing on x86 -- a real, reachable defect,
+    // confirmed RED without this fix.
+    [Test] procedure Win32_SetRegister_ExtendedRegister_Refused;
   end;
 
   [TestFixture]
@@ -6717,6 +6731,60 @@ begin
     'the x64 control did not stop inside the package: ' + Shape64);
   Assert.AreEqual(Shape64, Shape32,
     'the 32-bit BPL stop differs from the 64-bit one');
+end;
+
+function FindRegister(const Regs: TArray<TRegisterValue>; const Name: string;
+  out Value: UInt64): Boolean;
+begin
+  for var R in Regs do
+    if SameText(R.Name, Name) then begin
+      Value := R.Value;
+      Exit(True);
+    end;
+  Value := 0;
+  Result := False;
+end;
+
+// The WOW64-width sentinel matters: the real register is 32 bits wide on this
+// target, so a 64-bit sentinel would only prove the low half round-trips.
+// Re-reads via a FRESH GetRegisters call (not the write's own return value)
+// so the round trip is proven through the engine, exactly the shape
+// SetRegister_WritesAndReadsBack already proves on x64 in McpE2ETests.pas.
+procedure TWin32RunControlTests.Win32_SetRegister_WritesAndReadsBack;
+const
+  SENTINEL = UInt64($11223344);
+begin
+  var Line := MarkerLine(W32_SOURCE, W32_MARKER);
+  Assert.IsTrue(Line > 0, 'marker not found: ' + W32_MARKER);
+  var Session := OpenSessionAtMarker(Win32Exe, Win32Map, Win32Rsm, TargetDir,
+    W32_SOURCE, Line);
+  try
+    Assert.AreEqual(Ord(dsStopped), Ord(Session.State), 'did not stop');
+    Assert.IsTrue(Session.SetRegister('RAX', SENTINEL), 'SetRegister(RAX) refused');
+
+    var Value: UInt64;
+    Assert.IsTrue(FindRegister(Session.GetRegisters, 'RAX', Value), 'no RAX in GetRegisters');
+    Assert.AreEqual(SENTINEL, Value,
+      Format('a later, independent GetRegisters call does not see the write -- ' +
+             'got $%x, expected $%x', [Value, SENTINEL]));
+  finally
+    Session.Free;
+  end;
+end;
+
+procedure TWin32RunControlTests.Win32_SetRegister_ExtendedRegister_Refused;
+begin
+  var Line := MarkerLine(W32_SOURCE, W32_MARKER);
+  Assert.IsTrue(Line > 0, 'marker not found: ' + W32_MARKER);
+  var Session := OpenSessionAtMarker(Win32Exe, Win32Map, Win32Rsm, TargetDir,
+    W32_SOURCE, Line);
+  try
+    Assert.AreEqual(Ord(dsStopped), Ord(Session.State), 'did not stop');
+    Assert.IsFalse(Session.SetRegister('R8', 1),
+      'writing R8 (no such x86 register) must be refused, not silently accepted');
+  finally
+    Session.Free;
+  end;
 end;
 
 initialization

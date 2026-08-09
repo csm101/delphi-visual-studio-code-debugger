@@ -85,6 +85,22 @@ type
     [Test] procedure GetRegisters_RefusedBeforeLaunch;
     [Test] procedure SetRegister_WritesAndReadsBack;
     [Test] procedure SetRegister_UnknownName_Refused;
+    // ASSEMBLY_LEVEL_DEBUGGING.md increment 6: the write side of the same
+    // path had no WOW64 override (unlike GetRegisters/ReadThreadRegisters,
+    // which does) -- an unverified path, not a provenly-wrong one. Measured
+    // (DevTools\Wow64RegWriteProbe.dpr) at a REAL breakpoint the native
+    // GetThreadContext/SetThreadContext pair the base class used actually
+    // aliases correctly with Wow64Get/SetThreadContext on this Windows build,
+    // so this is a REGRESSION guard (the round trip must still hold with the
+    // WOW64 override in place), not a RED control -- it passes with or
+    // without the fix. SetRegister_Win32_ExtendedRegister_Refused below is
+    // the real RED control for this increment.
+    [Test] procedure SetRegister_Win32_WritesAndReadsBack;
+    // R8..R15 do not exist on x86 at any width. Before the fix the base
+    // class's name matching accepted "R8" and reported success while writing
+    // a register that means nothing on x86 -- a real, reachable defect,
+    // confirmed RED without this fix.
+    [Test] procedure SetRegister_Win32_ExtendedRegister_Refused;
 
     // ASSEMBLY_LEVEL_DEBUGGING.md increment 4: instruction-granularity
     // stepping over MCP. The ENGINE rules (call/rep/recursion, every refusal
@@ -2465,6 +2481,97 @@ begin
         'an unrecognised register name should be a tool error, never silently ignored: ' + R.ToJSON);
       Assert.IsTrue((R as TJSONString).Value.Contains('NOTAREGISTER'),
         'refusal does not name the unrecognised register: ' + (R as TJSONString).Value);
+    finally
+      R.Free;
+    end;
+
+    C.CallTool('terminate_debuggee', nil).Free;
+  finally
+    C.Free;
+  end;
+end;
+
+// ASSEMBLY_LEVEL_DEBUGGING.md increment 6. Same shape as
+// SetRegister_WritesAndReadsBack, on the 32-bit target: a WOW64-width
+// sentinel (the real register is 32 bits wide, so a 64-bit sentinel would
+// only prove the low half round-trips), re-read via a FRESH get_registers
+// call so the round trip is proven through the engine, not just echoed back
+// by set_register's own response.
+procedure TMcpE2ETests.SetRegister_Win32_WritesAndReadsBack;
+const
+  SENTINEL = '0x11223344';
+begin
+  var Line := MarkerLine(EVAL_SOURCE, EVAL_MARKER);
+  var C := TMcpTestClient.Start(McpExe);
+  try
+    C.Call('initialize', nil).Free;
+    var LaunchArgs := TJSONObject.Create;
+    LaunchArgs.AddPair('program', TargetExe32);
+    LaunchArgs.AddPair('sourceRoot', TargetDir);
+    C.CallTool('launch_debuggee', LaunchArgs).Free;
+    var BpArgs := TJSONObject.Create;
+    BpArgs.AddPair('sourceFile', EVAL_SOURCE);
+    BpArgs.AddPair('line', TJSONNumber.Create(Line));
+    C.CallTool('set_breakpoint', BpArgs).Free;
+    C.CallTool('continue_and_wait', nil).Free;
+
+    var SetArgs := TJSONObject.Create;
+    SetArgs.AddPair('name', 'RAX');
+    SetArgs.AddPair('value', SENTINEL);
+    var SetResult := C.CallTool('set_register', SetArgs);
+    try
+      Assert.IsTrue(SetResult is TJSONObject, 'set_register errored: ' + SetResult.ToJSON);
+    finally
+      SetResult.Free;
+    end;
+
+    var Regs := C.CallTool('get_registers', nil);
+    try
+      var Rax: TJSONObject;
+      Assert.IsTrue(McpFindRow(Regs as TJSONArray, 'RAX', Rax), 'no RAX in get_registers');
+      Assert.AreEqual(SENTINEL, Rax.GetValue<string>('value', ''),
+        'Win32: a later, independent get_registers call does not see the write');
+    finally
+      Regs.Free;
+    end;
+
+    C.CallTool('terminate_debuggee', nil).Free;
+  finally
+    C.Free;
+  end;
+end;
+
+// R8..R15 have no logical existence on x86. Before the fix, SetRegisterByName
+// happily matched the name and wrote a native Context.R8 field that reaches
+// nothing, then reported success -- exactly the "wrong register, no report"
+// defect this increment exists to close. After the fix this must be a real
+// refusal, never a silently-accepted no-op.
+procedure TMcpE2ETests.SetRegister_Win32_ExtendedRegister_Refused;
+begin
+  var Line := MarkerLine(EVAL_SOURCE, EVAL_MARKER);
+  var C := TMcpTestClient.Start(McpExe);
+  try
+    C.Call('initialize', nil).Free;
+    var LaunchArgs := TJSONObject.Create;
+    LaunchArgs.AddPair('program', TargetExe32);
+    LaunchArgs.AddPair('sourceRoot', TargetDir);
+    C.CallTool('launch_debuggee', LaunchArgs).Free;
+    var BpArgs := TJSONObject.Create;
+    BpArgs.AddPair('sourceFile', EVAL_SOURCE);
+    BpArgs.AddPair('line', TJSONNumber.Create(Line));
+    C.CallTool('set_breakpoint', BpArgs).Free;
+    C.CallTool('continue_and_wait', nil).Free;
+
+    var SetArgs := TJSONObject.Create;
+    SetArgs.AddPair('name', 'R8');
+    SetArgs.AddPair('value', '0x1');
+    var R := C.CallTool('set_register', SetArgs);
+    try
+      Assert.IsTrue(R is TJSONString,
+        'Win32: writing R8 (no such x86 register) should be a tool error, ' +
+        'never a silently-accepted no-op: ' + R.ToJSON);
+      Assert.IsTrue((R as TJSONString).Value.Contains('R8'),
+        'refusal does not name the register: ' + (R as TJSONString).Value);
     finally
       R.Free;
     end;

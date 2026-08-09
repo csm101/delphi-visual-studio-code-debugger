@@ -665,8 +665,8 @@ Debugger features:
   `launch`/`disassemble` round trip — both returned real decoded instructions,
   not a refusal. Full detail in `DISASSEMBLY_PLAN.md` "Verified in increment
   7" and `ThirdParty\Zydis\PROVENANCE.md`.
-- **Assembly-level debugging — increment 1 (the engine primitive) DONE; 2-5
-  open.** `IDebugTarget.StepInstruction(iskInto|iskOver|iskOut, ThreadId, out
+- **Assembly-level debugging — increments 1, 2, 3, 4 and 6 DONE; 5 open.**
+  `IDebugTarget.StepInstruction(iskInto|iskOver|iskOut, ThreadId, out
   RefusalReason)` and its `TDebugSession` facade step exactly ONE machine
   instruction, with no line table required and no DAP/MCP surface yet
   (increments 2 and 4). Step-over runs past a `call` with a one-shot at PC + the

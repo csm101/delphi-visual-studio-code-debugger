@@ -264,6 +264,21 @@ absurdly.
 
 ## Engine and language gotchas
 
+- **The WOW64 loader breakpoint (the process's FIRST stop, before `-rva` or a
+  planted `INT3`) is NOT a representative state for measuring native-vs-WOW64
+  context behaviour.** `DevTools\Wow64RegWriteProbe.dpr` measured a native
+  `GetThreadContext`/`SetThreadContext` register write as genuinely invisible
+  to `Wow64GetThreadContext` there (native `Rax` even read back as literal
+  zero before any write) — but at a REAL application breakpoint (an `INT3`
+  planted in already-running 32-bit code, exactly how every breakpoint in
+  this debugger works), the native and WOW64 views ALIASED EXACTLY for every
+  register tested, including `Rip`/`Rsp`/`Rbp`. A defect measured only at the
+  loader breakpoint may not be reachable through any state this debugger
+  actually reports to a user as "stopped" (`stopAtEntry` plants its OWN
+  breakpoint at the real entry point, never relying on the raw loader break).
+  Plant an `INT3` at real application code (`-rva`, same mechanism
+  `Wow64StackProbe.dpr` uses) before trusting a WOW64-context finding.
+  (ASSEMBLY_LEVEL_DEBUGGING.md increment 6.)
 - **Sample `DR6` BEFORE anything else touches the thread context.** On a WOW64
   target the slot bits were already gone by the time the pump had cleared the trap
   flag through `Wow64SetThreadContext`; on native x64 they survived, so the whole

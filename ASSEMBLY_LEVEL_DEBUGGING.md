@@ -1,6 +1,6 @@
 # Assembly-level debugging — plan
 
-Status: **increments 1, 2, 3 and 4 BUILT (2026-08-09); increment 5 designed, not
+Status: **increments 1, 2, 3, 4 and 6 BUILT (2026-08-09); increment 5 designed, not
 built.**
 Wanted in the next release.
 
@@ -310,22 +310,100 @@ implementation strategy, only its observable contract (never a false
   `HandleStepOut` test) are in `DAP_DEBUGGER_ARCHITECTURE.md`. Coverage:
   `TEST_CATALOG.md` "Q.".
 
-## Increment 6 — WOW64 register WRITES are unverified, and may be wrong
+## Increment 6 — WOW64 register writes — **BUILT** (2026-08-09)
 
 Added 2026-08-09, surfaced while building increment 4 rather than predicted.
+`SetRegisterByName` had **no WOW64 override**, unlike every other member of the
+thread-context funnel — it always used the native `GetThreadContext`/
+`SetThreadContext` pair. This predates the assembly work — DAP's own
+`setVariable` on the `Registers` scope shares the same path — so it was not a
+regression, but it was on a surface being shipped as a feature, unverified
+either way.
 
-`SetRegisterByName` has **no WOW64 override**, while the read path has one and is
-verified on both bitnesses. So writing a register on a 32-bit target may land on
-the wrong logical register, and nothing reports it. This predates the assembly
-work — DAP's own `setVariable` on the `Registers` scope shares the same path — so
-it is not a regression, but it is now on a surface being shipped as a feature.
+### What was actually measured, before deciding anything
 
-A write that silently hits the wrong register is precisely the class of defect
-this project refuses everywhere else. Two acceptable outcomes, in order of
-preference: give the write a WOW64 override mirroring the read path and prove it
-on both bitnesses; or REFUSE the write on a 32-bit target with the reason, until
-someone can. What is not acceptable is leaving it to be discovered by a user
-whose register write appeared to succeed.
+New probe `DevTools\Wow64RegWriteProbe.dpr`, modeled on `Wow64StackProbe.dpr`.
+It reproduces `SetRegisterByName`'s exact mechanism (read native `TContext`,
+mutate one field, write it back with native `SetThreadContext`) and then asks
+`Wow64GetThreadContext` whether the guest-visible register actually changed —
+first at the WOW64 loader breakpoint (the first stop a debugger sees, with no
+`-rva`), then, after that result turned out to be misleading, at a REAL
+application breakpoint (`-rva`, an `INT3` planted in running 32-bit code, the
+same mechanism every real breakpoint in this debugger uses).
+
+**First measurement — at the WOW64 loader breakpoint** — reproduced the
+suspected defect exactly: `SetThreadContext` reports success and a
+subsequent NATIVE `GetThreadContext` even reads back the sentinel, but
+`Wow64GetThreadContext` never changes, and a single step afterward resyncs the
+native side back to the true value (the sentinel is gone even there). A write
+that appears to succeed and touches nothing.
+
+**This result did not hold at a real breakpoint, and that gap mattered.**
+`TestTargetCore.TWidget.StepIntoProbe`'s entry (RVA `$E97C4` in the 32-bit
+`TestTarget.exe`) is a genuine, representative stop: an `INT3` planted in
+already-running application code, exactly how this debugger's own breakpoints
+work. There, `CompareAllFields` (dumping `Rip`/`Rsp`/`Rbp` and every
+general-purpose register both ways, unmodified) showed the native and WOW64
+views ALIASING EXACTLY, for every field, on this measured Windows build
+(Windows 11, build 26200) — and a native write of `Rbp` (the field
+specifically flagged as suspect) landed correctly through to
+`Wow64GetThreadContext`, stable across a subsequent single step. **The
+originally-suspected "silent wrong-register write" is not reproducible at any
+state this debugger actually reports to a user as stopped** — `stopAtEntry`
+plants its OWN breakpoint at the real entry point (`WinDebuggerBase.pas`,
+`HandleCreateProcess`), never relying on the raw WOW64 loader break, so a user
+never sees the anomalous transitional state where the defect is real.
+
+**R8..R15 remained a genuine, reachable defect independent of that finding.**
+They do not exist on x86 at any width; the unfixed base class's name matching
+accepted `"R8"`..`"R15"` and reported success while writing a native-context
+field that means nothing on a WOW64 target — never reproduced-as-fine, unlike
+the general-purpose case above.
+
+### Outcome taken, and why
+
+**Outcome 1** (WOW64 override, mirroring the read path) — taken anyway,
+despite the round-trip defect not reproducing at a real stop, because:
+
+- the write path was UNVERIFIED either way; replacing it with the
+  documented-correct `Wow64Get/SetThreadContext` API removes reliance on OS
+  aliasing behaviour that is an implementation detail, not a guaranteed
+  contract, and might not hold on a different Windows version;
+- it makes `SetRegisterByName` consistent with every other member of the
+  thread-context funnel, which already all have WOW64 overrides;
+- it is REQUIRED to fix the R8..R15 defect, which is real regardless of the
+  aliasing question.
+
+`TWin32Debugger.SetRegisterByName` (`WinDebuggerX86.pas`) now uses
+`Wow64Get/SetThreadContext` with the same name vocabulary
+`ReadThreadRegisters`/`GetRegisters` already use (`RIP`/`RSP`/`RBP`/
+`RAX`..`RDI`/`EFlags`, case-insensitive), and refuses `R8`..`R15` outright —
+no heuristics, no silent no-op: there is no logical register for the value to
+go to.
+
+### Tests, and what they actually prove
+
+Given the round-trip defect does not reproduce at a real stop, the
+round-trip tests (`Win32_SetRegister_WritesAndReadsBack` at three layers) are
+REGRESSION GUARDS, not RED controls — they pass with or without the fix on
+this measured Windows build. The R8..R15 refusal tests
+(`*_ExtendedRegister_Refused`, also at three layers) ARE the RED controls:
+confirmed failing without the fix (temporarily falling back to
+`inherited SetRegisterByName` in `TWin32Debugger.SetRegisterByName`), passing
+with it. Full detail, including which layer proves what and the exact RED
+failure text: `TEST_CATALOG.md` section S.
+
+DAP `setVariable` on the `Registers` scope and MCP `set_register` were
+confirmed to share the identical defect and the identical fix — both funnel
+through `TDebugSession.SetRegister` -> `IDebugTarget.SetRegisterByName`, and
+both are directly tested (`RegisterWriteDapTests.pas`, `McpE2ETests.pas`).
+They do not diverge.
+
+### Mechanism
+
+`DAP_DEBUGGER_ARCHITECTURE.md`, "Registers and instruction stepping (MCP) —
+increment 4" carried the "not measured" caveat this increment resolves; see
+that section (now updated) for the funnel's shape.
 
 ## Increment 5 — the placeholder document becomes useful
 
@@ -356,8 +434,9 @@ Keep separate, because they call for different answers:
 ## Order
 
 1, then 2 and 4 in either order (they are the two surfaces over the same
-primitive), then 3 — all now done — then 5. Increment 5 last on purpose: it is
-the only one whose content depends on everything above already working.
+primitive), then 3, then 6 — all now done — then 5. Increment 5 last on
+purpose: it is the only one whose content depends on everything above already
+working.
 
 ## Gate
 

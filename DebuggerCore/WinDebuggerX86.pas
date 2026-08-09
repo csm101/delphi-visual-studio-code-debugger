@@ -82,6 +82,7 @@ type
     // Public in the base class, so kept public here.
     function  TargetLayout: TTargetLayout; override;
     function  CurrentFrameParamHomeAddr(ParamIndex: Integer): UInt64; override;
+    function  SetRegisterByName(const Name: string; Value: UInt64): Boolean; override;
   end;
 
 implementation
@@ -153,6 +154,67 @@ begin
     Exit;
   Ctx.Eip := DWORD(VA);
   Result := Wow64SetThreadContext(TH, Ctx);
+end;
+
+// Overrides the base's native GetThreadContext/SetThreadContext pair with the
+// documented-correct Wow64Get/SetThreadContext one, replacing an UNVERIFIED
+// path with a verified one rather than a provenly-wrong one -- see
+// ASSEMBLY_LEVEL_DEBUGGING.md increment 6 for the full measurement writeup
+// (DevTools\Wow64RegWriteProbe.dpr). Measured, not assumed: at the WOW64
+// loader breakpoint (before the 32-bit environment finishes initialising) a
+// native write is genuinely invisible to Wow64GetThreadContext, but at a REAL
+// application breakpoint -- an INT3 planted in running 32-bit code, which is
+// every stop this debugger actually reports to a user -- the native and
+// WOW64 views alias exactly on this measured Windows build, for every
+// general-purpose AND control register (RIP/RSP/RBP included), and a native
+// write reaches the guest-visible register correctly. This override is kept
+// anyway: it matches the rest of the thread-context funnel, uses the
+// documented-correct API instead of relying on unspecified OS aliasing
+// behaviour that could differ across Windows versions, and is REQUIRED for
+// the one case that IS a clear-cut defect independent of any aliasing
+// question below.
+//
+// R8..R15 do not exist on x86 at any width, so the name is refused outright
+// rather than writing nothing while claiming success -- the same
+// no-heuristics rule GetRegisters already follows on the READ side (zero,
+// not fabricated) has no honest write-side analogue: there is nowhere for the
+// value to go. Before this override, the base's name matching accepted these
+// names and reported success while touching a register that means nothing on
+// x86 -- confirmed as a real, reachable defect (RED without this fix).
+function TWin32Debugger.SetRegisterByName(const Name: string;
+  Value: UInt64): Boolean;
+var
+  Ctx: TWow64Context;
+  TH:  THandle;
+  N:   string;
+begin
+  Result := False;
+  TH := ThreadHandle(GetStoppedThreadId);
+  if TH = 0 then
+    Exit;
+  N := LowerCase(Name);
+  for var ExtReg in ['r8', 'r9', 'r10', 'r11', 'r12', 'r13', 'r14', 'r15'] do
+    if N = ExtReg then
+      Exit(False);
+  Ctx := Default(TWow64Context);
+  Ctx.ContextFlags := WOW64_CONTEXT_FULL;
+  if not Wow64GetThreadContext(TH, Ctx) then
+    Exit;
+  Result := True;
+  if      N = 'rip' then Ctx.Eip := DWORD(Value)
+  else if N = 'rsp' then Ctx.Esp := DWORD(Value)
+  else if N = 'rbp' then Ctx.Ebp := DWORD(Value)
+  else if N = 'rax' then Ctx.Eax := DWORD(Value)
+  else if N = 'rbx' then Ctx.Ebx := DWORD(Value)
+  else if N = 'rcx' then Ctx.Ecx := DWORD(Value)
+  else if N = 'rdx' then Ctx.Edx := DWORD(Value)
+  else if N = 'rsi' then Ctx.Esi := DWORD(Value)
+  else if N = 'rdi' then Ctx.Edi := DWORD(Value)
+  else if N = 'eflags' then Ctx.EFlags := DWORD(Value)
+  else
+    Result := False;
+  if Result then
+    Result := Wow64SetThreadContext(TH, Ctx);
 end;
 
 function TWin32Debugger.SetThreadTrapFlag(TID: DWORD; Enable: Boolean): Boolean;

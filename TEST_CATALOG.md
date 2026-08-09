@@ -850,15 +850,9 @@ scope coverage; these tests prove the MCP TOOL surface (JSON shape, the
       message no longer names "stop").
 - [x] **An unrecognised register name is refused, naming the bad name**
       (`SetRegister_UnknownName_Refused`).
-- [ ] **`set_register` on a WOW64 target was not verified.**
-      `TWinDebugger.SetRegisterByName` has no WOW64 override (unlike
-      `ReadThreadRegisters`) — it always calls the native
-      `GetThreadContext`/`SetThreadContext` pair. Whether that correctly
-      reaches the logical 32-bit register on a WOW64 thread is unmeasured;
-      if it does not, that is a pre-existing `SetRegisterByName` engine gap
-      shared identically by DAP's `setVariable`-on-`Registers`-scope path,
-      not something this increment introduced. See
-      `DAP_DEBUGGER_ARCHITECTURE.md`.
+- [x] **`set_register` on a WOW64 target — resolved in increment 6.** See
+      section S below for the measurement and the fix
+      (`TWin32Debugger.SetRegisterByName`).
 
 **Instruction-granularity stepping** — the ENGINE rules (call/rep/recursion,
 every refusal reason) are `InstructionStepTests.pas`'s job (section O) and
@@ -1020,6 +1014,75 @@ correctly rather than as a silent success, and does a variable's
       away (`FieldAddr`/`ElemAddr`), the same mechanism proven for the
       top-level case, so the gap is coverage breadth, not a different
       mechanism.
+
+## S. Register writes on a WOW64 target (ASSEMBLY_LEVEL_DEBUGGING.md increment 6)
+
+`TWinDebugger.SetRegisterByName` had no WOW64 override, unlike every other
+member of the thread-context funnel (`ReadThreadRegisters`, `SetThreadPc`,
+`SetThreadTrapFlag`, `ReadDebugRegisters`/`WriteDebugRegisters`) — it always
+used the native `GetThreadContext`/`SetThreadContext` pair. **Measured**
+(`DevTools\Wow64RegWriteProbe.dpr`, both at the WOW64 loader breakpoint and at
+a real application breakpoint, on both bitnesses):
+
+- At the WOW64 loader breakpoint (before the 32-bit environment finishes
+  initialising) a native write is genuinely invisible to
+  `Wow64GetThreadContext` — reproduces the originally-suspected defect.
+- At a REAL application breakpoint — an `INT3` planted in running 32-bit
+  code, which is every stop this debugger actually reports to a user — the
+  native and WOW64 views alias exactly, on this measured Windows build, for
+  every field tested: `Rip`/`Rsp`/`Rbp` (control-flow registers) and every
+  general-purpose register (`Rax`/`Rbx`/`Rcx`/`Rdx`/`Rsi`/`Rdi`). A native
+  write reaches the guest-visible register correctly. The originally-assumed
+  "silent wrong-register write" is NOT reproducible at any state the debugger
+  actually presents to a user.
+- **R8..R15 do not exist on x86 at any width, and this WAS a real, reachable
+  defect independent of the aliasing question above**: the unfixed base
+  class's name matching accepted `"R8"`..`"R15"` and reported success while
+  writing a native-context field that means nothing on a WOW64 target.
+
+Given the write path was unverified either way, `TWin32Debugger.
+SetRegisterByName` (`WinDebuggerX86.pas`) was given a WOW64 override anyway
+(Outcome 1 of the increment's two acceptable outcomes) — using the
+documented-correct `Wow64Get/SetThreadContext` API instead of relying on
+OS aliasing behaviour that is not guaranteed to hold on every Windows
+version, matching the rest of the funnel, and closing the R8..R15 defect,
+which is real regardless of the aliasing finding. R8..R15 are refused
+outright (no logical register exists to write).
+
+DAP `setVariable` on the `Registers` scope and MCP `set_register` share the
+identical engine path (`TDebugSession.SetRegister` ->
+`IDebugTarget.SetRegisterByName`) — proven, not assumed, by driving BOTH
+surfaces:
+
+- [x] **`DebuggerTests\DebugSessionTests.pas`, `TWin32RunControlTests`**
+      (session/engine level, no DAP or MCP involved):
+      `Win32_SetRegister_WritesAndReadsBack` (regression guard — passes with
+      or without the fix, per the aliasing finding above) and
+      `Win32_SetRegister_ExtendedRegister_Refused` (the real RED control:
+      writing `R8` must be refused). RED control confirmed by temporarily
+      falling back to the unfixed base implementation
+      (`Result := inherited SetRegisterByName(...); Exit;`): the
+      `WritesAndReadsBack` test still passed, `ExtendedRegister_Refused`
+      failed with `Condition is True when False expected`.
+- [x] **`DebuggerTests\McpE2ETests.pas`**: `SetRegister_Win32_
+      WritesAndReadsBack` (regression guard) and `SetRegister_Win32_
+      ExtendedRegister_Refused` (RED control, same shape as the session-level
+      pair).
+- [x] **`DebuggerTests\RegisterWriteDapTests.pas`** (new file — no DAP-level
+      test of writing the Registers scope existed before this increment, on
+      either bitness): `X64_SetVariable_Register_WritesAndReadsBack` (x64
+      control), `Win32_SetVariable_Register_WritesAndReadsBack` (regression
+      guard), `Win32_SetVariable_Register_ExtendedRegister_Refused` (RED
+      control — asserts `success: false` and `body.error.format` names the
+      register).
+- [ ] **Not verified on any Windows version other than the one this was
+      measured on** (Windows 11, build 26200). The aliasing behaviour that
+      makes the round-trip tests pass even without the fix is an OS
+      implementation detail, not a documented Microsoft contract — the WOW64
+      override is kept specifically so correctness does not depend on it
+      holding elsewhere.
+- [ ] **The "while running" gate on `setVariable`/`set_register` is
+      unverified**, same racy-to-construct reason as sections M/R.
 
 ## What the suite does NOT prove (2026-08-08)
 
