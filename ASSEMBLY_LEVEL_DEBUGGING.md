@@ -1,0 +1,134 @@
+# Assembly-level debugging — plan
+
+Status: **designed, not built** (2026-08-09). Wanted in the next release.
+
+Debugging at the instruction level, in the Disassembly View and over MCP: plant a
+breakpoint on an instruction, step one instruction at a time, read and write
+registers, read and write memory. Everything below is the gap between that and
+what shipped with `DISASSEMBLY_PLAN.md`.
+
+## What already exists — verified, not assumed (2026-08-09)
+
+| capability | DAP | MCP |
+|---|---|---|
+| disassemble | yes (`disassemble`, `instructionPointerReference`) | yes (`disassemble`) |
+| breakpoint at an address | yes (`setInstructionBreakpoints`) | yes |
+| registers, read AND write | yes (a `Registers` scope, writable by name) | **no** |
+| read / write memory | **no** | yes (`read_memory`, `write_memory`) |
+| **step one instruction** | **no** | **no** |
+
+Two surfaces, each missing something the other has, and instruction stepping
+missing from both. The engine underneath is largely present: it already
+single-steps with the trap flag, and `TWinDebugger` already knows how to plant a
+one-shot breakpoint at a return address.
+
+## Increment 1 — the engine primitive
+
+A real single-instruction step, exposed rather than buried inside the line-step
+logic. Today stepping means "advance until the source line changes", which has no
+natural terminating condition in code that has no line table — which is exactly
+the code someone steps through instruction by instruction.
+
+The rules, and they are the substance of this plan:
+
+- **step-into = one trap-flag step.** Land wherever the instruction goes,
+  including into a callee. Nothing else to decide.
+- **step-over must not single-step through a `call`.** Decode the instruction at
+  the PC; if it is a call, plant a one-shot breakpoint at PC + length and run.
+  The length is exact — the disassembler just produced it — which makes this
+  *more* reliable than the source-level equivalent, not less. Everything that is
+  not a call is a single trap-flag step.
+- **step-over must survive a callee that re-enters.** The one-shot is thread-
+  scoped and must also compare the stack pointer, or a recursive callee hitting
+  the same address at a deeper level ends the step early. The existing
+  source-level step-over already faces this; reuse its answer rather than
+  inventing a second one.
+- **step-out at instruction granularity is the same problem already solved
+  twice**: the return address comes from `.pdata` on x64 and from `[EBP+4]` on
+  x86. Where neither is available — x64 code with no unwind data — it must
+  REFUSE rather than run to somewhere plausible.
+
+### Traps this touches, all of them already paid for once
+
+- **`rep`-prefixed instructions trap PER ITERATION.** A single trap-flag step
+  over `rep movsb` stops thousands of times, which reads as a hang. A
+  rep-prefixed instruction must be stepped like a call — one-shot at PC + length
+  — or the user watches a progress bar made of stops. This is the one genuinely
+  new hazard here.
+- **A watchpoint hit arrives as a single-step exception too.** `DR6`
+  disambiguation already exists (`DATA_BREAKPOINTS_PLAN.md`, increment 2) and the
+  new stepping MUST go through it. A watchpoint that fires during an instruction
+  step must not be reported as the step completing.
+- **On WOW64 a single step reports `STATUS_WX86_SINGLE_STEP` (`$4000001E`)**, not
+  `EXCEPTION_SINGLE_STEP`. Measured during the Win32 port.
+- **Stepping over an address that carries a planted `INT3`** must restore the
+  original byte, step, and re-plant — the engine already does this for source
+  stepping; the instruction path must not bypass it.
+- **On x86, the stack walk does not survive a still-planted breakpoint.** Also
+  measured during the Win32 port: restore the byte and rewind EIP before any walk
+  taken during an instruction step.
+
+## Increment 2 — DAP: stepping granularity
+
+- capability `supportsSteppingGranularity`;
+- `granularity: "instruction"` honoured on `next`, `stepIn` and `stepOut`. VS Code
+  sends it when the Disassembly View has focus, and today the adapter ignores the
+  field, so a step in that view behaves like a source step — which in code with
+  no line table is the least predictable thing it could do.
+
+## Increment 3 — DAP: memory
+
+- `readMemory` / `writeMemory` with `supportsReadMemoryRequest` /
+  `supportsWriteMemoryRequest`;
+- `memoryReference` on variables, so "View Binary Data" opens the memory
+  inspector on the right address.
+
+The engine work exists — MCP's `read_memory` / `write_memory` are built and
+tested. This is surface.
+
+## Increment 4 — MCP: registers and instruction stepping
+
+- `get_registers` / `set_register`. DAP has had a writable `Registers` scope for a
+  long time; the MCP surface never gained an equivalent, which means an agent
+  driving this debugger cannot see a register today.
+- instruction-granularity stepping, either as `step_instruction` or as a
+  granularity argument on the existing step tools. Match whatever shape reads
+  better against the existing surface rather than importing DAP's vocabulary.
+
+## Increment 5 — the placeholder document becomes useful
+
+MEASURED 2026-08-09, in VS Code, and it settles the question `KNOWN_UNKNOWNS.md`
+was holding open: **selecting a sourceless frame shows the adapter's placeholder
+document, not the Disassembly View.** The client opens what the adapter hands it,
+so the placeholder does not merely compete with disassembly — it precludes it.
+
+The placeholder is a virtual document served by the adapter, so its content is
+entirely ours to choose. Rather than deleting it and depending on client
+behaviour, fill it with what the reader actually wants:
+
+- a header naming the address, module and function, and why there is no source;
+- the disassembly around the frame's PC, annotated with symbol + offset, with the
+  current instruction marked;
+- a pointer to the real Disassembly View for interaction (gutter breakpoints,
+  scrolling) — **conditional on that view actually being reachable from the Call
+  Stack context menu, which must be confirmed before the sentence is written.**
+
+Keep separate, because they call for different answers:
+- **no line information at all** — disassembly is the only truth available;
+- **a line is known but the file is not on disk** — the actionable answer is the
+  file name and line, and how to fix the search path. Assembly there hides a
+  configuration problem behind what looks like a debugger limitation. Note that
+  the DAP disassembly output already carries `location.name` and `line` even when
+  the path cannot be resolved, so the two can be shown together.
+
+## Order
+
+1, then 2 and 4 in either order (they are the two surfaces over the same
+primitive), then 3, then 5. Increment 5 last on purpose: it is the only one whose
+content depends on everything above already working.
+
+## Gate
+
+Same as every other plan here: full suite green at each increment, every consumer
+rebuilt, each new test proven RED without its fix, both bitnesses where behaviour
+can differ. `TRAPS.md` applies in full.
