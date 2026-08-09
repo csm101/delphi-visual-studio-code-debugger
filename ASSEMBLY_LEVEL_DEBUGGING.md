@@ -404,6 +404,21 @@ They do not diverge.
 increment 4" carried the "not measured" caveat this increment resolves; see
 that section (now updated) for the funnel's shape.
 
+### Follow-up, measured 2026-08-09: leaving the frame with no source at all
+
+The obvious challenge to increment 5 is "why serve a fabricated page instead of
+letting the editor open its real Disassembly View?" The adapter cannot open that
+view — DAP has no request for it — so the only thing it can do is stop attaching
+a `source` and leave the client to its own devices. `noSourcePlaceholder: false`
+in `launch.json` does exactly that, and a paired launch configuration exists for
+the comparison.
+
+**Measured result: with no source attached, double-clicking a sourceless frame in
+VS Code does NOTHING.** No fallback view, no message. So the placeholder never
+displaced a better client behaviour; it replaced silence. Keep the flag — it is
+the instrument that produced this answer and the one that will re-produce it on
+another editor, where it may come out differently.
+
 ## Increment 5 — the placeholder document becomes useful — **BUILT** (2026-08-09)
 
 MEASURED 2026-08-09, in VS Code, and it settled the question `KNOWN_UNKNOWNS.md`

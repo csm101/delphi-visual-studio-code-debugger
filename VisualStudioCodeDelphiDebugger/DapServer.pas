@@ -260,6 +260,11 @@ type
     // POSITIONS on the stack, not a chain, and a user who has not asked for
     // them must never be shown them next to real frames.
     FRawStackScan: Boolean;
+    // `noSourcePlaceholder` in launch.json, default True. False attaches no
+    // source at all to a sourceless frame, so the client is left to its own
+    // handling. See ParseRawStackScan for why this is a switch and not a
+    // decision.
+    FNoSourcePlaceholder: Boolean;
     // True when the client declared `supportsInvalidatedEvent` in `initialize`.
     // The raw-stack toggle uses it to make the Call Stack redraw immediately; a
     // client without it still gets the toggle, its effect showing at the next stop.
@@ -509,7 +514,12 @@ type
     // document -- real decode around the frame's PC, not prose, using the same
     // mechanism HandleDisassemble uses. Falls back to naming the real reason
     // when the Zydis backend is unavailable; never blank.
-    function  BuildPlaceholderDisassembly(const F: TSessionFrame): string;
+    // AnyLineShown reports whether at least one listed instruction carried a
+    // source line, so the trailing note can talk about line numbers only when
+    // there are some. On a module with no line information at all that sentence
+    // is pure noise beside a listing that shows none.
+    function  BuildPlaceholderDisassembly(const F: TSessionFrame;
+                out AnyLineShown: Boolean): string;
     function  FormatPlaceholderInstruction(const Ins: TDisasmInstruction;
                 CurrentVA: UInt64): string;
     function  SyntheticSourceRef(const ALabel: string; const F: TSessionFrame): Integer;
@@ -1008,6 +1018,18 @@ begin
   FRawStackScan := (Args <> nil) and Args.GetValue<Boolean>('rawStackScan', False);
   if FRawStackScan then
     DapLog('rawStackScan = ON (raw sweep appended below the walked frames)');
+
+  // `noSourcePlaceholder` in launch.json, default TRUE. Setting it to false
+  // attaches NO source to a sourceless frame, which is the only way to observe
+  // what the client does when left to itself -- the adapter cannot open a
+  // Disassembly View, since DAP has no request for it, so "our document versus
+  // the client's own handling" is not a choice the adapter can make, only one
+  // it can get out of the way of. Kept as a switch rather than a decision
+  // because the answer differs per editor and has never been measured.
+  FNoSourcePlaceholder := (Args = nil) or
+    Args.GetValue<Boolean>('noSourcePlaceholder', True);
+  if not FNoSourcePlaceholder then
+    DapLog('noSourcePlaceholder = OFF (sourceless frames get no source at all)');
 end;
 
 // Flips the raw stack sweep mid-session, for the Call Stack title-bar toggle.
@@ -3024,11 +3046,13 @@ end;
 // not load, this names the REAL reason (Disasm.StatusText) and decodes
 // nothing -- never a guessed listing, and never a claim of failure the
 // backend did not actually report.
-function TDapServer.BuildPlaceholderDisassembly(const F: TSessionFrame): string;
+function TDapServer.BuildPlaceholderDisassembly(const F: TSessionFrame;
+  out AnyLineShown: Boolean): string;
 const
   INSTRS_BEFORE = 8;
   INSTRS_AFTER  = 16;   // includes the current instruction
 begin
+  AnyLineShown := False;
   if FDebugger = nil then
     Exit('Disassembly is unavailable: the debugger is not attached.');
 
@@ -3058,16 +3082,22 @@ begin
     HaveBoundary := FDebugger.NearestExportedEntryBefore(F.IP, BoundaryVA);
   if HaveBoundary then begin
     var Before := DisassembleBackward(Disasm, BoundaryVA, F.IP, INSTRS_BEFORE);
-    for var Ins in Before do
+    for var Ins in Before do begin
+      if Ins.SrcFile <> '' then
+        AnyLineShown := True;
       Lines := Lines + [FormatPlaceholderInstruction(Ins, F.IP)];
+    end;
   end;
 
   // Forward span starts exactly at the frame's own PC, so the current
   // instruction is always the first forward line (and always present when
   // anything at all was readable).
   var Forward := Disasm.Disassemble(F.IP, INSTRS_AFTER);
-  for var Ins in Forward do
+  for var Ins in Forward do begin
+    if Ins.SrcFile <> '' then
+      AnyLineShown := True;
     Lines := Lines + [FormatPlaceholderInstruction(Ins, F.IP)];
+  end;
 
   if Length(Lines) = 0 then
     Exit('No bytes could be read at this address; the memory here may be' +
@@ -3083,6 +3113,22 @@ end;
 // then shows the disassembly around the frame's PC -- real code, not just an
 // explanation of its absence (ASSEMBLY_LEVEL_DEBUGGING.md increment 5).
 function TDapServer.SyntheticSourceText(const F: TSessionFrame): string;
+const
+  // This document opens in a plain text editor with no word wrap, so a long
+  // line runs off the right edge and its end is never read. Prose is therefore
+  // hard-wrapped. The disassembly block is deliberately NOT wrapped: its lines
+  // are already short and column-aligned, and folding one would destroy the
+  // alignment that makes it readable.
+  PLACEHOLDER_WRAP_COL = 78;
+
+  // A paragraph, wrapped and followed by a blank line. TrimRight keeps the
+  // spacing independent of whether WrapText leaves a trailing break.
+  function Para(const S: string): string;
+  begin
+    Result := TrimRight(WrapText(S, PLACEHOLDER_WRAP_COL)) +
+      sLineBreak + sLineBreak;
+  end;
+
 begin
   var Reason: string;
   var Advice: string;
@@ -3116,20 +3162,32 @@ begin
   if F.FunctionName <> '' then
     Result := Result + Format('    Function: %s', [F.FunctionName]) + sLineBreak;
   Result := Result + sLineBreak +
-    'The debugger IS stopped here.' + sLineBreak + sLineBreak +
-    'Why there is no source: ' + Reason + '.' + sLineBreak + sLineBreak +
-    Advice + sLineBreak + sLineBreak +
-    'Selecting a frame further down the call stack will open real source if any' +
-    ' frame there has it.' + sLineBreak + sLineBreak +
+    Para('The debugger IS stopped here.') +
+    Para('Why there is no source: ' + Reason + '.') +
+    Para(Advice) +
+    Para('Selecting a frame further down the call stack will open real source' +
+      ' if any frame there has it.') +
     '------------------------------------------------------------------------' + sLineBreak +
     'Disassembly around the current instruction (=> marks it):' + sLineBreak +
-    '------------------------------------------------------------------------' + sLineBreak +
-    BuildPlaceholderDisassembly(F) + sLineBreak + sLineBreak +
-    'A line shown above came from this module''s own line table; where none is' +
-    ' shown, no line-number information exists for that instruction. An' +
-    ' editor''s own Disassembly View, where it offers one, can show more of' +
-    ' this routine than this snippet, with gutter breakpoints and scrolling.' +
-    sLineBreak;
+    '------------------------------------------------------------------------' + sLineBreak;
+
+  var AnyLineShown: Boolean;
+  Result := Result + BuildPlaceholderDisassembly(F, AnyLineShown) + sLineBreak;
+
+  // The line-table sentence is emitted ONLY when a line actually appeared. On a
+  // module with no line information -- which is most of the frames that reach
+  // this document -- explaining what the absent annotation would have meant is
+  // noise next to a listing that plainly has none.
+  if AnyLineShown then
+    Result := Result +
+      Para('A line shown above came from this module''s own line table; where' +
+        ' none is shown, no line-number information exists for that' +
+        ' instruction.');
+
+  Result := Result +
+    Para('An editor''s own Disassembly View, where it offers one, can show' +
+      ' more of this routine than this snippet, with gutter breakpoints and' +
+      ' scrolling.');
 end;
 
 // Gives a sourceless frame a `source` backed by a sourceReference instead of a
@@ -3137,6 +3195,13 @@ end;
 procedure TDapServer.AttachPlaceholderSource(FO: TJSONObject;
   const F: TSessionFrame; const ALabel: string);
 begin
+  // Opted out via launch.json: emit no `source` at all and let the client decide
+  // what a sourceless frame looks like. The stop may become invisible again --
+  // that is the behaviour this document was built to replace, and the only way
+  // to compare the two is to be able to turn it off.
+  if not FNoSourcePlaceholder then
+    Exit;
+
   var Src := TJSONObject.Create;
   Src.AddPair('name', ALabel);
   Src.AddPair('sourceReference', TJSONNumber.Create(SyntheticSourceRef(ALabel, F)));

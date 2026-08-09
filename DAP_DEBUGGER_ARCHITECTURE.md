@@ -1883,6 +1883,21 @@ placeholder suppress VS Code's own disassembly" question is answered by this
 one fact and the entry has been removed). So the document has to carry the
 weight on its own, and `SyntheticSourceText` (`DapServer.pas`) now does:
 
+**And the follow-up question — "then why not just get out of the way and let the
+client show its own disassembly?" — is also MEASURED, 2026-08-09, not argued.**
+The adapter cannot open a Disassembly View: DAP has no request for it, so the
+only levers are attaching a `source` or not. The launch flag
+`noSourcePlaceholder: false` was added to suppress the placeholder entirely and
+run exactly that comparison. Result, from the maintainer at the keyboard:
+**with no source attached, double-clicking a sourceless frame does NOTHING.**
+VS Code offers no fallback of its own. So the real choice was never "our
+document versus the client's disassembly view" — it was "our document versus
+silence", which is the condition this document was built to end.
+
+The flag stays, and not as a leftover: it is how that measurement was made, and
+it is how it gets re-made against a different editor or a future VS Code, where
+the answer may differ. Default is `true` — the placeholder is attached.
+
 1. The header, unchanged from before this increment: address, module,
    function, which of the four `TSymbolAvailability` reasons applies, and
    advice specific to that reason.

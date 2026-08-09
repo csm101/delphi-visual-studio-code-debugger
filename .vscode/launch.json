@@ -47,6 +47,22 @@
             // The other half of the same experiment: the fault lands in RTL code
             // linked into the exe, so the frame may resolve to a NAME from the
             // MAP while still having no source file to open.
+            // The A/B twin of the ntdll config above: identical, except the
+            // adapter attaches NO source to a sourceless frame. Use it to see
+            // what VS Code does when left to itself — the adapter cannot open
+            // a Disassembly View (DAP has no request for it), so the only
+            // comparison available is "our document" versus "nothing from us".
+            "name": "No-source stop (ntdll), NO placeholder — A/B comparison",
+            "type": "delphi-win64",
+            "request": "launch",
+            "program": "${workspaceFolder}/DebuggerTests/TestTarget/Win64/Debug/NoSourceStop.exe",
+            "args": ["-os"],
+            "sourceRoot": "${workspaceFolder}/DebuggerTests/TestTarget",
+            "stopAtEntry": false,
+            "noSourcePlaceholder": false,
+            "diagnosticLog": true
+        },
+        {
             "name": "No-source stop: fault inside the RTL (System.Move)",
             "type": "delphi-win64",
             "request": "launch",
