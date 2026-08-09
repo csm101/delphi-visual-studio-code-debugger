@@ -746,6 +746,71 @@ increment-1 report.
       thread id; both are guarded in `StepInstruction` and answered with a
       reason, but only by construction.
 
+## P. DAP stepping granularity (ASSEMBLY_LEVEL_DEBUGGING.md increment 2)
+
+`DebuggerTests\InstructionStepDapTests.pas`, driving the real adapter process
+over stdio (`TDapClient`) against the SAME `InstructionStepSample.exe`/`.map`/
+`.rsm` fixture increment 1 built — no new fixture needed. Scope: this file
+proves the DAP PLUMBING (does `granularity: "instruction"` reach
+`TDebugSession.StepInstruction` with the right `TInstructionStepKind`, does a
+refusal reach the client as a failed request, is the unchanged path truly
+unchanged); the ENGINE semantics (call/rep/recursion rules, every refusal
+reason) are InstructionStepTests.pas's job (section O) and are not
+re-proven here.
+
+- [x] **Capability advertised** (`Capability_SupportsSteppingGranularity_
+      IsAdvertised`): the `initialize` response carries
+      `supportsSteppingGranularity: true`.
+- [x] **`stepIn` with `granularity: "instruction"` stays on the source line**
+      (`*_StepIn_Instruction_AdvancesOneInstructionSameLine`, both bitnesses,
+      at the same `INSTR_MULTI` marker increment 1 uses): the line is
+      unchanged and the instruction pointer moved. RED control: comment out
+      the `WantsInstructionGranularity` dispatch in `HandleStepIn` — the
+      request falls through to the old `FSession.StepInto` path, which runs
+      to the NEXT source line, and the "line unchanged" assertion fails
+      (measured: line advanced from the marker line to the next statement).
+- [x] **`next` with `granularity: "instruction"` stays on the source line**
+      (`*_Next_Instruction_AdvancesOneInstructionSameLine`, both bitnesses,
+      same marker and mechanism). Same RED control, applied to `HandleNext`.
+- [x] **`stepOut` with `granularity: "instruction"` lands in the caller**
+      (`*_StepOut_Instruction_LandsInTheCaller`, both bitnesses, at
+      `INSTR_CALLEE_BODY`): the frame name changes from the callee to the
+      caller. RED control here is a Kind-mapping mutation rather than a
+      revert, and it has to be: in this NON-recursive scenario the pre-
+      existing source-level `stepOut` also lands correctly in the immediate
+      caller (it uses the same `FStepOverVA`/`FStepResumeSP` one-shot
+      machinery `iskOut` reuses), so disabling the dispatch alone does not
+      change the observable outcome — reverting it is not a valid negative
+      control here (see TRAPS.md, "Proving a fix"). Swapping the mapped kind
+      from `iskOut` to `iskInto` in `HandleStepOut` IS a valid control: the
+      step then stays inside the callee (one more instruction into the SAME
+      routine) and the "landed in caller" assertion fails.
+- [x] **Granularity absent / `"statement"` is BYTE-IDENTICAL to pre-increment-2
+      behaviour** (`X64_StepIn_GranularityAbsent_StillAdvancesToNewLine`,
+      `X64_StepIn_GranularityStatement_StillAdvancesToNewLine`,
+      `X64_Next_GranularityAbsent_StillAdvancesToNewLine`): the source line
+      DOES change at the same `INSTR_MULTI` marker where the instruction-
+      granularity tests above assert it stays put — the two are direct
+      opposites of each other, at the identical stop. Win64 only: this is
+      plain JSON-field parsing with no bitness-sensitive content, the same
+      scoping call already recorded for `setInstructionBreakpoints`'
+      DAP layer (section N).
+- [x] **A refusal reaches the client as a FAILED request, not a silent
+      success** (`Refused_WhenNotLaunched_ReachesClientAsFailedRequest`): an
+      instruction-granularity `stepIn` sent before `launch` comes back
+      `success: false` with a non-empty `message`. RED control: make
+      `HandleInstructionStep` send `success: true` unconditionally before
+      calling `StepInstruction` (the exact shape of the pre-existing
+      `HandleNext`/`HandleStepIn`/`HandleStepOut` handlers) — the assertion
+      that `success` is `False` fails.
+- [ ] The other two increment-1 refusal reasons ("thread is not live", "no
+      disassembler backend") are UNREACHABLE through the DAP wire protocol,
+      not merely untested: `StepThreadFromArgs` folds any unmatched
+      `threadId` back to 0 (the stopped thread, same fallback `stackTrace`
+      uses), and there is no launch-config knob that forces the Zydis
+      backend unavailable from outside the process. Both refusal MECHANISMS
+      are fully covered at the engine level (section O).
+
 ## What the suite does NOT prove (2026-08-08)
 
 Coverage-honesty notes. Each records a place where a green run is weaker evidence

@@ -1,6 +1,6 @@
 # Assembly-level debugging — plan
 
-Status: **increment 1 BUILT (2026-08-09); increments 2-5 designed, not built.**
+Status: **increments 1-2 BUILT (2026-08-09); increments 3-5 designed, not built.**
 Wanted in the next release.
 
 Debugging at the instruction level, in the Disassembly View and over MCP: plant a
@@ -110,13 +110,47 @@ already uses; nothing re-derives from raw bytes what the decoder was asked to
 produce. An instruction that does not decode is refused, never given a guessed
 length.
 
-## Increment 2 — DAP: stepping granularity
+## Increment 2 — DAP: stepping granularity — **BUILT**
 
 - capability `supportsSteppingGranularity`;
 - `granularity: "instruction"` honoured on `next`, `stepIn` and `stepOut`. VS Code
-  sends it when the Disassembly View has focus, and today the adapter ignores the
-  field, so a step in that view behaves like a source step — which in code with
-  no line table is the least predictable thing it could do.
+  sends it when the Disassembly View has focus, and before this increment the
+  adapter ignored the field, so a step in that view behaved like a source step —
+  the least predictable thing it could do in code with no line table.
+
+Mechanism: `DAP_DEBUGGER_ARCHITECTURE.md`, "Instruction granularity (DAP) —
+increment 2". Coverage: `TEST_CATALOG.md` "P.".
+
+Thin plumbing on purpose, and it stayed thin: `TDapServer.
+WantsInstructionGranularity` reads the field, `HandleInstructionStep` maps
+`next`/`stepIn`/`stepOut` to `iskOver`/`iskInto`/`iskOut` and calls
+`TDebugSession.StepInstruction` — increment 1's facade, unmodified. No new
+engine code. Two decisions worth recording because a plausible-looking
+alternative was available and wrong:
+
+1. **The decision has to happen BEFORE the response is sent, not after.** The
+   pre-existing `next`/`stepIn`/`stepOut` handlers send `success: true`
+   unconditionally, then fire the (always-accepted) source-level step as a
+   side effect. Instruction-granularity stepping can genuinely be refused, so
+   copying that shape would have meant either a refusal arriving as a silent
+   no-op (the client sees `success: true` and then nothing happens) or —
+   worse — a silent fallback to a source-level step, exactly the "quiet
+   substitution" the standing no-heuristics rule exists to prevent.
+   `HandleInstructionStep` calls `StepInstruction` FIRST and only then
+   answers, so a refusal is a real DAP error response (`success: false`,
+   `message: RefusalReason`).
+2. **Reachable refusals from a real DAP client are a strict subset of
+   increment 1's refusal set.** `StepThreadFromArgs` (pre-existing, built for
+   the source-level steppers) folds any `threadId` that does not match a live
+   thread back to 0 — "the stopped thread" — the same defensive fallback
+   `stackTrace` uses. That means a bogus DAP thread id can never reach the
+   engine's "thread is not live" refusal; it silently retargets instead, by a
+   design decision made before this increment, not a gap in it. Similarly,
+   there is no launch-config knob to force the Zydis backend unavailable from
+   outside the process — that seam (`SetInstructionDisassembler`) is
+   in-process only, used by `InstructionStepTests.pas`. The one refusal a real
+   client can trigger is "not running" (before `launch`), which is what the
+   new negative control proves.
 
 ## Increment 3 — DAP: memory
 

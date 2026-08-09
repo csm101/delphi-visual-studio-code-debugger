@@ -138,9 +138,17 @@ type
                   const AccessTypes: TArray<string> = nil): TJSONObject;
     function    ConfigDone: TJSONObject;
     function    Continue_(ThreadId: Integer = 1): TJSONObject;
-    function    StepIn(ThreadId: Integer = 1): TJSONObject;
-    function    StepOut(ThreadId: Integer = 1): TJSONObject;
-    function    StepOver(ThreadId: Integer = 1): TJSONObject;
+    // Granularity, when non-empty, is sent verbatim as the DAP `granularity`
+    // argument (ASSEMBLY_LEVEL_DEBUGGING.md increment 2) -- '' omits the field
+    // entirely, matching what a client that predates the capability sends.
+    function    StepIn(ThreadId: Integer = 1; const Granularity: string = ''): TJSONObject;
+    function    StepOut(ThreadId: Integer = 1; const Granularity: string = ''): TJSONObject;
+    function    StepOver(ThreadId: Integer = 1; const Granularity: string = ''): TJSONObject;
+    // Same requests, returning the FULL response (no raise on success:false) --
+    // for tests that expect an instruction-granularity step to be REFUSED.
+    function    StepInRaw(ThreadId: Integer; const Granularity: string): TJSONObject;
+    function    StepOutRaw(ThreadId: Integer; const Granularity: string): TJSONObject;
+    function    StepOverRaw(ThreadId: Integer; const Granularity: string): TJSONObject;
     function    SourceContent(SourceReference: Integer): TJSONObject;
     function    StackTrace(ThreadId: Integer = 1): TJSONObject;
     // DAP disassemble (DISASSEMBLY_PLAN.md increment 6). InstructionOffset
@@ -904,31 +912,44 @@ begin
   Result := WaitResp(SendCmd('continue', Args));
 end;
 
-function TDapClient.StepIn(ThreadId: Integer): TJSONObject;
-var
-  Args: TJSONObject;
+// Shared by the six Step*/Step*Raw methods below: `threadId` always sent,
+// `granularity` only when the caller asked for it.
+function BuildStepArgs(ThreadId: Integer; const Granularity: string): TJSONObject;
 begin
-  Args := TJSONObject.Create;
-  Args.AddPair('threadId', TJSONNumber.Create(ThreadId));
-  Result := WaitResp(SendCmd('stepIn', Args));
+  Result := TJSONObject.Create;
+  Result.AddPair('threadId', TJSONNumber.Create(ThreadId));
+  if Granularity <> '' then
+    Result.AddPair('granularity', Granularity);
 end;
 
-function TDapClient.StepOut(ThreadId: Integer): TJSONObject;
-var
-  Args: TJSONObject;
+function TDapClient.StepIn(ThreadId: Integer; const Granularity: string): TJSONObject;
 begin
-  Args := TJSONObject.Create;
-  Args.AddPair('threadId', TJSONNumber.Create(ThreadId));
-  Result := WaitResp(SendCmd('stepOut', Args));
+  Result := WaitResp(SendCmd('stepIn', BuildStepArgs(ThreadId, Granularity)));
 end;
 
-function TDapClient.StepOver(ThreadId: Integer): TJSONObject;
-var
-  Args: TJSONObject;
+function TDapClient.StepOut(ThreadId: Integer; const Granularity: string): TJSONObject;
 begin
-  Args := TJSONObject.Create;
-  Args.AddPair('threadId', TJSONNumber.Create(ThreadId));
-  Result := WaitResp(SendCmd('next', Args));
+  Result := WaitResp(SendCmd('stepOut', BuildStepArgs(ThreadId, Granularity)));
+end;
+
+function TDapClient.StepOver(ThreadId: Integer; const Granularity: string): TJSONObject;
+begin
+  Result := WaitResp(SendCmd('next', BuildStepArgs(ThreadId, Granularity)));
+end;
+
+function TDapClient.StepInRaw(ThreadId: Integer; const Granularity: string): TJSONObject;
+begin
+  Result := WaitRespRaw(SendCmd('stepIn', BuildStepArgs(ThreadId, Granularity)));
+end;
+
+function TDapClient.StepOutRaw(ThreadId: Integer; const Granularity: string): TJSONObject;
+begin
+  Result := WaitRespRaw(SendCmd('stepOut', BuildStepArgs(ThreadId, Granularity)));
+end;
+
+function TDapClient.StepOverRaw(ThreadId: Integer; const Granularity: string): TJSONObject;
+begin
+  Result := WaitRespRaw(SendCmd('next', BuildStepArgs(ThreadId, Granularity)));
 end;
 
 function TDapClient.StackTrace(ThreadId: Integer): TJSONObject;

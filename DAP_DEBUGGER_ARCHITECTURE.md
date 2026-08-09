@@ -1326,6 +1326,54 @@ without `BS` while `FStepMode <> smNone` is recorded and resumed, so a watchpoin
 firing inside a stepped-over call cannot be reported as the instruction step
 completing.
 
+### Instruction granularity (DAP) — increment 2
+
+`supportsSteppingGranularity: true` (`HandleInitialize`). `next` / `stepIn` /
+`stepOut` each check `arguments.granularity` first
+(`TDapServer.WantsInstructionGranularity`, an exact case-insensitive match on
+`"instruction"` — absent, `"statement"`, or `"line"` all take the untouched
+pre-increment-2 path). A match routes to `HandleInstructionStep`, which maps
+the command to the engine's `TInstructionStepKind` (`next` → `iskOver`,
+`stepIn` → `iskInto`, `stepOut` → `iskOut`) and calls
+`TDebugSession.StepInstruction` — the SAME facade `DebuggerTests\
+InstructionStepTests.pas` drives directly, increment 1's engine primitive,
+unmodified.
+
+**Threading stays exactly as increment 1 required.** `ProcessRequest` — and
+therefore every `Handle*` method, including `HandleInstructionStep` — runs on
+the adapter's single request-processing loop (`TDapServer.Run`), the same
+thread `HandleStackTrace` already calls dbghelp from. `TDebugSession.
+StepInstruction`'s decision phase (decode, refuse, or choose trap-flag vs
+one-shot) is synchronous and read-only, so it executes inline on that thread;
+only an ACCEPTED plan crosses to the Run thread (`ckStepInstruction`), exactly
+as increment 1 built it. No third thread was introduced.
+
+**A refusal reaches the client as a failed request, not a silent no-op.**
+This is the point of doing the call BEFORE answering, unlike the pre-existing
+`HandleNext`/`HandleStepIn`/`HandleStepOut`, which send `success: true`
+unconditionally and only THEN attempt the (fire-and-forget, always-succeeds)
+source-level step. `HandleInstructionStep` calls `StepInstruction` first; a
+`False` result sends `FIO.SendErrorResponse(Seq, Cmd, RefusalReason)`
+(`success: false`, `message: RefusalReason`) and returns without touching
+`FSession` state or emitting a `stopped` event. The one refusal reliably
+reachable from OUTSIDE the process (a real DAP client, not the engine test
+harness) is "not running" — `HandleInstructionStep` checks `FLaunched` itself,
+matching the idiom every other stop-dependent handler already uses
+(`HandleStackTrace`, `HandleDisassemble`, `HandleSetVariable`), before
+`TDebugSession.StepInstruction` would in any case refuse the same way with its
+own message (`FDebugger = nil`). The other two increment-1 refusal reasons
+are NOT reachable through the DAP wire protocol: `StepThreadFromArgs` folds
+any `threadId` that does not match a live thread back to 0 ("the currently
+stopped thread"), so a bogus DAP thread id can never reach the engine's
+"thread is not live" refusal; and there is no launch-config knob to force the
+Zydis backend unavailable from outside the process (only the in-process
+`SetInstructionDisassembler` seam `InstructionStepTests.pas` uses). Both
+remain fully covered at the engine level.
+
+Test coverage: `DebuggerTests\InstructionStepDapTests.pas` (mono fixture,
+`InstructionStepSample.exe`/`.map`/`.rsm` — the same fixture increment 1
+built). See `TEST_CATALOG.md`.
+
 ## Stack walking
 
 Uses `StackWalk64` with `dbghelp.dll`'s `SymFunctionTableAccess64` /
@@ -2423,6 +2471,7 @@ after the first instant.
 | `supportsDataBreakpoints`               | true  |
 | `supportsInstructionBreakpoints`        | true  |
 | `supportsDisassembleRequest`            | true  |
+| `supportsSteppingGranularity`            | true  |
 | `supportsProgressReporting`             | true  |
 
 Anything else is currently absent (function breakpoints, `readMemory` /

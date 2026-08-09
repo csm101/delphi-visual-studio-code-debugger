@@ -450,6 +450,20 @@ type
                 const Reason: string);
     procedure HandleContinue(Seq: Integer; Args: TJSONObject);
     function  StepThreadFromArgs(Args: TJSONObject): DWORD;
+    // ASSEMBLY_LEVEL_DEBUGGING.md increment 2: true only for the exact string
+    // "instruction". Absent, or any other value (VS Code also sends "line" and
+    // "statement"), takes the unchanged source-level path -- see
+    // DAP_DEBUGGER_ARCHITECTURE.md "Instruction granularity (DAP)".
+    function  WantsInstructionGranularity(Args: TJSONObject): Boolean;
+    // Shared by next/stepIn/stepOut when granularity="instruction". The
+    // engine's decision phase (TDebugSession.StepInstruction) is synchronous
+    // and runs on THIS thread -- the DAP request-processing thread, the same
+    // one HandleStackTrace already calls dbghelp from -- so a refusal is known
+    // BEFORE any response is sent: the request fails with success=false and
+    // the reason, never a silent no-op and never a quiet fallback to a
+    // source-level step.
+    procedure HandleInstructionStep(Seq: Integer; const Cmd: string;
+                Kind: TInstructionStepKind; Args: TJSONObject);
     procedure HandleNext(Seq: Integer; Args: TJSONObject);
     procedure HandleStepIn(Seq: Integer; Args: TJSONObject);
     procedure HandleStepOut(Seq: Integer; Args: TJSONObject);
@@ -1838,6 +1852,12 @@ begin
     // `instructionPointerReference` on every StackFrame (HandleStackTrace) is
     // what enables "Open Disassembly View" from the Call Stack.
     Caps.AddPair('supportsDisassembleRequest',       TJSONBool.Create(True));
+    // ASSEMBLY_LEVEL_DEBUGGING.md increment 2: `granularity: "instruction"` on
+    // next/stepIn/stepOut, routed to TDebugSession.StepInstruction (increment
+    // 1's engine primitive). VS Code sends the field only when the
+    // Disassembly View has focus, and only once this capability says the
+    // adapter understands it.
+    Caps.AddPair('supportsSteppingGranularity',      TJSONBool.Create(True));
     // NOTE: `supportsProgressReporting` is a CLIENT capability in the DAP spec
     // (InitializeRequestArguments), not an adapter one. VS Code ignores it in the
     // initialize response, so it does not gate whether progress toasts appear --
@@ -2847,8 +2867,41 @@ begin
       Exit(Requested);
 end;
 
+function TDapServer.WantsInstructionGranularity(Args: TJSONObject): Boolean;
+begin
+  Result := (Args <> nil) and
+    SameText(Args.GetValue<string>('granularity', ''), 'instruction');
+end;
+
+// The DECISION (decode, refuse, or choose trap-flag vs one-shot) happens
+// inside TDebugSession.StepInstruction, synchronously, before this procedure
+// answers the request. A True result has already POSTED the engine command
+// that runs the plan on the Run thread -- the same split ASSEMBLY_LEVEL_
+// DEBUGGING.md increment 1 built, just reached from the DAP thread instead of
+// a test harness.
+procedure TDapServer.HandleInstructionStep(Seq: Integer; const Cmd: string;
+  Kind: TInstructionStepKind; Args: TJSONObject);
+begin
+  if not FLaunched then begin
+    FIO.SendErrorResponse(Seq, Cmd, 'Not running');
+    Exit;
+  end;
+  ReloadGlobalRulesIfChanged;
+  var RefusalReason: string;
+  if not FSession.StepInstruction(Kind, StepThreadFromArgs(Args), RefusalReason) then begin
+    FIO.SendErrorResponse(Seq, Cmd, RefusalReason);
+    Exit;
+  end;
+  MarkBusy('Delphi debugger: step instruction...', True);
+  FIO.SendResponse(Seq, Cmd, True);
+end;
+
 procedure TDapServer.HandleNext(Seq: Integer; Args: TJSONObject);
 begin
+  if WantsInstructionGranularity(Args) then begin
+    HandleInstructionStep(Seq, 'next', iskOver, Args);
+    Exit;
+  end;
   FIO.SendResponse(Seq, 'next', True);
   if FLaunched then begin
     ReloadGlobalRulesIfChanged;
@@ -2859,6 +2912,10 @@ end;
 
 procedure TDapServer.HandleStepIn(Seq: Integer; Args: TJSONObject);
 begin
+  if WantsInstructionGranularity(Args) then begin
+    HandleInstructionStep(Seq, 'stepIn', iskInto, Args);
+    Exit;
+  end;
   FIO.SendResponse(Seq, 'stepIn', True);
   if FLaunched then begin
     ReloadGlobalRulesIfChanged;
@@ -2869,6 +2926,10 @@ end;
 
 procedure TDapServer.HandleStepOut(Seq: Integer; Args: TJSONObject);
 begin
+  if WantsInstructionGranularity(Args) then begin
+    HandleInstructionStep(Seq, 'stepOut', iskOut, Args);
+    Exit;
+  end;
   FIO.SendResponse(Seq, 'stepOut', True);
   if FLaunched then begin
     ReloadGlobalRulesIfChanged;

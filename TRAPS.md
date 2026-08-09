@@ -192,6 +192,14 @@ absurdly.
   value string (`$2A`, not `$2a`) follows it, so an assertion written in lowercase
   fails on a feature that works. Cost one full build+run round on the
   data-breakpoint description tests.
+- **`TDapIO.SendErrorResponse`'s reason lives at `body.error.format`, NOT a
+  top-level `message` field.** The DAP spec's `ErrorResponse` puts it there
+  (`DapProtocol.pas`); a test that reads `Resp.GetValue<string>('message', '')`
+  against a `*Raw` response reads a field that was never populated and always
+  gets `''`. Cost one full-suite run on
+  `Refused_WhenNotLaunched_ReachesClientAsFailedRequest`
+  (ASSEMBLY_LEVEL_DEBUGGING.md increment 2) before the assertion was fixed to
+  drill into `body.error.format`.
 
 ## What the suite cannot prove
 
