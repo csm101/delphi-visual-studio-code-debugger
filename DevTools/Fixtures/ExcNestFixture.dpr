@@ -26,11 +26,16 @@ program ExcNestFixture;
   fs:[0] chain can be mapped back to a source line and checked against the block
   it is supposed to be.
 
-  Usage: ExcNestFixture [-av] [-bare | -two]
-    (default)  raise Exception.Create  -> $0EEDFADE
-    -av        write through a nil pointer -> $C0000005
-    -bare      outer handler is a bare `except` with no `on` clause
-    -two       outer handler has two `on` clauses, the first not matching
+  Usage: ExcNestFixture [-av] [-bare | -two] [-nofinally]
+    (default)   raise Exception.Create  -> $0EEDFADE
+    -av         write through a nil pointer -> $C0000005
+    -bare       outer handler is a bare `except` with no `on` clause
+    -two        outer handler has two `on` clauses, the first not matching
+    -nofinally  skip Level2Finally, so the outer handler is the FIRST protected
+                frame the exception reaches. Without it every scenario lands in
+                the intervening try/finally first (which is the correct answer
+                for a debugger that stops at whichever handler runs first), and
+                the except variants are unreachable as a landing site.
 }
 
 uses
@@ -59,10 +64,22 @@ begin
   end;
 end;
 
-procedure Level1Except(UseAccessViolation: Boolean);
+// The single seam that decides whether the intervening try/finally is on the
+// stack. Without -nofinally every scenario lands in Level2Finally's finally,
+// because that is the handler the exception reaches first; with it, the outer
+// routine's own except block is the first protected frame.
+procedure RaiseInto(UseAccessViolation, SkipFinally: Boolean);
+begin
+  if SkipFinally then
+    Level3Raise(UseAccessViolation)
+  else
+    Level2Finally(UseAccessViolation);
+end;
+
+procedure Level1Except(UseAccessViolation, SkipFinally: Boolean);
 begin
   try
-    Level2Finally(UseAccessViolation);
+    RaiseInto(UseAccessViolation, SkipFinally);
   except
     on E: Exception do
       Inc(GSink, 100);                                // EXCEPT_BLOCK
@@ -72,10 +89,10 @@ end;
 // Same shape, but a bare `except` with no `on` clause -- the layout question is
 // whether the clause table degenerates to a count of zero and where the block
 // address then lives.
-procedure Level1BareExcept(UseAccessViolation: Boolean);
+procedure Level1BareExcept(UseAccessViolation, SkipFinally: Boolean);
 begin
   try
-    Level2Finally(UseAccessViolation);
+    RaiseInto(UseAccessViolation, SkipFinally);
   except
     Inc(GSink, 1000);                                 // BARE_EXCEPT_BLOCK
   end;
@@ -83,10 +100,10 @@ end;
 
 // Two `on` clauses, the FIRST of which does not match, so the table must carry
 // both and the debugger cannot simply take entry 0.
-procedure Level1TwoClauses(UseAccessViolation: Boolean);
+procedure Level1TwoClauses(UseAccessViolation, SkipFinally: Boolean);
 begin
   try
-    Level2Finally(UseAccessViolation);
+    RaiseInto(UseAccessViolation, SkipFinally);
   except
     on E: EAccessViolation do
       Inc(GSink, 10000);                              // AV_CLAUSE
@@ -97,11 +114,12 @@ end;
 
 begin
   var UseAv := FindCmdLineSwitch('av', ['-', '/'], True);
+  var SkipFinally := FindCmdLineSwitch('nofinally', ['-', '/'], True);
   if FindCmdLineSwitch('bare', ['-', '/'], True) then
-    Level1BareExcept(UseAv)
+    Level1BareExcept(UseAv, SkipFinally)
   else if FindCmdLineSwitch('two', ['-', '/'], True) then
-    Level1TwoClauses(UseAv)
+    Level1TwoClauses(UseAv, SkipFinally)
   else
-    Level1Except(UseAv);
+    Level1Except(UseAv, SkipFinally);
   ExitCode := GSink;
 end.

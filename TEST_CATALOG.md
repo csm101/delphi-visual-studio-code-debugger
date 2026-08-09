@@ -1213,12 +1213,120 @@ selected, and the locals of each of the first N frames selected in turn. That
 side-by-side view is what separates "the stack is wrong" from "the stack is
 right and the wrong frame answered".
 
+## V. Stepping at an exception stop
+
+Twelve tests in `DebuggerTests\ExceptionStepTests.pas`, a NEW fixture rather than
+an addition to `DebuggerTests.pas` / `DebugSessionTests.pas`. Debuggee:
+`DevTools\Fixtures\ExcNestFixture.dpr` (both bitnesses, built by
+`DevTools\build_exc_fixture.bat`, which `build_and_run.bat` and
+`build_target.bat` now call). It is REUSED rather than replaced by new scenarios
+in `TestTarget`, which would shift RSM import indices and marker ordering.
+
+The fixture gained one orthogonal switch for this work, `-nofinally`: without it
+every scenario lands in the intervening `try/finally`, because that is the
+handler the exception reaches first — which is the correct answer, and also
+makes the `except` variants unreachable as a landing site. Combined with
+`-bare` / `-two` / `-av` it gives every construct on both bitnesses.
+
+Each test is bitness-parameterised and COLLECTS its failures (both executables
+are called `ExcNestFixture.exe`, so a message built from the file name cannot
+identify the bitness).
+
+- [x] **`Win64_Step_LandsInTheFinallyThatRunsFirst`** — no switches: the step
+      lands on the `finally` funclet (`FINALLY_BLOCK`), not on the outer
+      `except`, because the finally receives the exception first.
+- [x] **`Win64_Step_LandsInTheOnClauseBlock`** — `-nofinally`, lands on the
+      `on E: Exception do` line.
+- [x] **`Win64_Step_LandsInTheBareExceptBlock`** — `-nofinally -bare`. The
+      landing line is the last line of the `try` body, which is what the line
+      table attributes that address to (`EH_FORMAT_NOTES.md`); asserting the
+      `except` statement's own line would fail on working behaviour.
+- [x] **`Win64_Step_LandsInTheMATCHINGClauseOfTwo`** — `-nofinally -two`, whose
+      FIRST clause is `on E: EAccessViolation` and does not match. Landing on
+      clause 0's line would mean the debugger took entry 0 of the table.
+- [x] **`Win64_Step_AccessViolation_LandsInTheFinally`** — `-av`, a hardware
+      fault: no Delphi exception object, a different code, and frame 0 IS the
+      faulting instruction.
+- [x] **`Win64_StepIntoAndStepOut_LandWhereStepOverDoes`** — all three kinds mean
+      the same thing at an exception stop.
+- [x] **`Win64_Step_DoesNotRefireTheSameException`** — the reported symptom
+      stated as a property. **Must use `-av`**: a Delphi `raise` is a software
+      `RaiseException` call, so swallowing it lets the call return and the step
+      wanders off instead of looping. Only a hardware fault re-executes.
+- [x] **`Win32_Step_LandsInTheOnClauseBlock`**, **`Win32_Step_LandsInTheMATCHINGClauseOfTwo`**
+      — the only x86 construct whose block address is derivable (the
+      `@HandleOnException` stub is followed by a clause table of absolute VAs).
+- [x] **`Win32_Step_TryFinally_RefusesAndNamesTheConstruct`**,
+      **`Win32_Step_BareExcept_RefusesAndNamesTheConstruct`** — the deliberate
+      negative half. Asserts the step is REFUSED and that the reason names the
+      construct (`try/FINALLY`, `bare \`except\``), the stub
+      (`HandleFinally` / `HandleAnyException`) and the words `not derivable`.
+- [x] **`Step_AtAnOrdinaryStop_IsStillFireAndForget`** — the routing must be
+      invisible at a plain breakpoint stop, on both bitnesses.
+
+**RED confirmed** by restoring the defect in two places at once —
+`TDebugSession.PostSourceStep`'s `StoppedOnUndeliveredException` routing disabled
+AND the three step handlers' `ReleasePendingEvent(ContStatus)` changed back to
+`ReleasePendingEvent(DBG_CONTINUE)` — then rebuilding the runner. **11 of 12 go
+red** (10 in one pass, plus `Win64_Step_DoesNotRefireTheSameException` once it
+was switched from a Delphi raise to `-av`; the twelfth is the no-regression
+surface test and is correctly unaffected):
+
+```
+Win64_Step_LandsInTheFinallyThatRunsFirst   landed outside the fixture source: (blank)
+Win64_Step_LandsInTheOnClauseBlock          landed outside the fixture source: (blank)
+Win64_Step_LandsInTheBareExceptBlock        landed outside the fixture source: (blank)
+Win64_Step_LandsInTheMATCHINGClauseOfTwo    landed outside the fixture source: (blank)
+Win64_Step_AccessViolation_LandsInTheFinally
+        the step did not report a step stop (reason 3) at ExcNestFixture.dpr:52
+Win64_StepIntoAndStepOut_LandWhereStepOverDoes   (both kinds, same as above)
+Win64_Step_DoesNotRefireTheSameException
+        Expected [0] but got [1] the step produced another EXCEPTION stop at
+        ExcNestFixture.dpr:52 instead of a landing (the exception was swallowed
+        and the faulting instruction re-executed)
+Win32_Step_LandsInTheOnClauseBlock          landed on line 56, expected 84
+Win32_Step_LandsInTheMATCHINGClauseOfTwo    landed on line 56, expected 110
+Win32_Step_TryFinally_RefusesAndNamesTheConstruct
+        the step was ACCEPTED and landed at ExcNestFixture.dpr:56 -- it was
+        expected to refuse, because the block address is not derivable here
+Win32_Step_BareExcept_RefusesAndNamesTheConstruct   (same)
+```
+
+`ExcNestFixture.dpr:52` is `AV_SITE` — the faulting instruction itself, reported
+again as an exception: the field-reported loop, reproduced. Line 56 is the `end;`
+of `Level3Raise`: a plausible-looking stop that is simply wrong, which is what
+the x86 refusals replace.
+
+Diagnostics: `DevTools\ExcHandlerProbe.exe <exe> [-args ...] [-plant] [-tf]` —
+see `EH_FORMAT_NOTES.md`.
+
 ## What the suite does NOT prove (2026-08-08)
 
 Coverage-honesty notes. Each records a place where a green run is weaker evidence
 than it looks, so that a future session does not read the suite as a guarantee it
 never gave. Recovered from `TASK_RESUME.md` when that file was cut back.
 
+- **The step-at-an-exception refusals are covered only for the cases the fixture
+  can produce.** Section V proves the two x86 constructs and the "all provable"
+  x64 paths. Three refusal branches have NO fixture: an x64 frame that CAN
+  receive the exception and declares a **non-Delphi** language handler while
+  still having a source line (every such frame in the fixtures is `ntdll` /
+  `kernelbase`, which has no source and is therefore skipped rather than refused
+  on); an x64 scope table that fails validation; and "no frame protects this code
+  at all" — Delphi's generated main block always installs an unconditional
+  `except`, so the walk always finds one. Those three are correct by
+  construction against `EH_FORMAT_NOTES.md`, not by test.
+- **The `smToHandler` re-fire guard is belt-and-braces and is not what the green
+  suite proves.** With the exception delivered the faulting instruction is not
+  re-executed, so the loop is structurally gone; the guard exists for the case
+  where the planted block is never reached and the same exception arrives again
+  (a loop in the debuggee's own code). No fixture produces it.
+- **A step whose planted block is never reached does not stop at all.** If the
+  first receiving frame's `on` clause does not match — possible only when a
+  frame's scope entry covers the PC but its clause table is exhaustive against
+  the raised class — the exception passes on to a frame the plan did not cover
+  and the step runs free until the next breakpoint or exit. It is not a WRONG
+  answer, but it is not a refusal either, and nothing in the suite exercises it.
 - **`Win32_RecordAndDynArrayExpansion_MatchWin64` asserts cross-bitness PARITY of
   the result, not that the live-RTTI path served it.** The record could have been
   expanded through TD32 members instead. The RTTI table-walk fixes

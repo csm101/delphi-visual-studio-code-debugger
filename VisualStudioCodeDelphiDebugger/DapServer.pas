@@ -476,6 +476,11 @@ type
     // source-level step.
     procedure HandleInstructionStep(Seq: Integer; const Cmd: string;
                 Kind: TInstructionStepKind; Args: TJSONObject);
+    // Shared body of next / stepIn / stepOut at source granularity. Kept in one
+    // place because the response ORDERING differs by stop kind, and three copies
+    // of that rule is exactly how one of them goes stale.
+    procedure HandleSourceStep(Seq: Integer; const Cmd: string;
+                Kind: TInstructionStepKind; Args: TJSONObject);
     procedure HandleNext(Seq: Integer; Args: TJSONObject);
     procedure HandleStepIn(Seq: Integer; Args: TJSONObject);
     procedure HandleStepOut(Seq: Integer; Args: TJSONObject);
@@ -2953,18 +2958,59 @@ begin
   FIO.SendResponse(Seq, Cmd, True);
 end;
 
+// A source-level step never refuses at an ordinary stop, so the response goes
+// out first and the step runs behind it -- the long-standing behaviour, kept.
+// At a first-chance EXCEPTION stop the step means "run to the handler that
+// receives this exception", which CAN refuse (no decodable handler; a 32-bit
+// try/finally or bare `except`, whose block address the registration record
+// does not carry). There the decision is synchronous, so the response has to
+// wait for it and a refusal reaches VS Code as a failed request carrying the
+// reason -- the same ordering HandleInstructionStep uses, for the same reason.
+procedure TDapServer.HandleSourceStep(Seq: Integer; const Cmd: string;
+  Kind: TInstructionStepKind; Args: TJSONObject);
+begin
+  if not FLaunched then begin
+    FIO.SendResponse(Seq, Cmd, True);
+    Exit;
+  end;
+  ReloadGlobalRulesIfChanged;
+  var Busy := 'Delphi debugger: step over...';
+  case Kind of
+    iskInto: Busy := 'Delphi debugger: step into...';
+    iskOut:  Busy := 'Delphi debugger: step out...';
+  end;
+  if FSession.StoppedOnUndeliveredException then begin
+    var RefusalReason: string;
+    var Ok := False;
+    case Kind of
+      iskOver: Ok := FSession.StepOver(StepThreadFromArgs(Args), RefusalReason);
+      iskInto: Ok := FSession.StepInto(StepThreadFromArgs(Args), RefusalReason);
+      iskOut:  Ok := FSession.StepOut (StepThreadFromArgs(Args), RefusalReason);
+    end;
+    if not Ok then begin
+      FIO.SendErrorResponse(Seq, Cmd, RefusalReason);
+      Exit;
+    end;
+    MarkBusy('Delphi debugger: running to the exception handler...', True);
+    FIO.SendResponse(Seq, Cmd, True);
+    Exit;
+  end;
+  FIO.SendResponse(Seq, Cmd, True);
+  MarkBusy(Busy, True);
+  case Kind of
+    iskOver: FSession.StepOver(StepThreadFromArgs(Args));
+    iskInto: FSession.StepInto(StepThreadFromArgs(Args));
+    iskOut:  FSession.StepOut (StepThreadFromArgs(Args));
+  end;
+end;
+
 procedure TDapServer.HandleNext(Seq: Integer; Args: TJSONObject);
 begin
   if WantsInstructionGranularity(Args) then begin
     HandleInstructionStep(Seq, 'next', iskOver, Args);
     Exit;
   end;
-  FIO.SendResponse(Seq, 'next', True);
-  if FLaunched then begin
-    ReloadGlobalRulesIfChanged;
-    MarkBusy('Delphi debugger: step over...', True);
-    FSession.StepOver(StepThreadFromArgs(Args));
-  end;
+  HandleSourceStep(Seq, 'next', iskOver, Args);
 end;
 
 procedure TDapServer.HandleStepIn(Seq: Integer; Args: TJSONObject);
@@ -2973,12 +3019,7 @@ begin
     HandleInstructionStep(Seq, 'stepIn', iskInto, Args);
     Exit;
   end;
-  FIO.SendResponse(Seq, 'stepIn', True);
-  if FLaunched then begin
-    ReloadGlobalRulesIfChanged;
-    MarkBusy('Delphi debugger: step into...', True);
-    FSession.StepInto(StepThreadFromArgs(Args));
-  end;
+  HandleSourceStep(Seq, 'stepIn', iskInto, Args);
 end;
 
 procedure TDapServer.HandleStepOut(Seq: Integer; Args: TJSONObject);
@@ -2987,12 +3028,7 @@ begin
     HandleInstructionStep(Seq, 'stepOut', iskOut, Args);
     Exit;
   end;
-  FIO.SendResponse(Seq, 'stepOut', True);
-  if FLaunched then begin
-    ReloadGlobalRulesIfChanged;
-    MarkBusy('Delphi debugger: step out...', True);
-    FSession.StepOut(StepThreadFromArgs(Args));
-  end;
+  HandleSourceStep(Seq, 'stepOut', iskOut, Args);
 end;
 
 procedure TDapServer.HandlePause(Seq: Integer; Args: TJSONObject);

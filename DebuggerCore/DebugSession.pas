@@ -1,4 +1,4 @@
-unit DebugSession;
+﻿unit DebugSession;
 
 // Frontend-neutral debugger core facade. Owns the debug engine (IDebugTarget),
 // the aggregate debug-info set + symbol readers, the source resolver, the
@@ -139,6 +139,10 @@ type
 
     function  Readers: TDelphiValueReader;
     procedure SetState(NewState: TDebugSessionState);
+    // Shared body of StepOver / StepInto / StepOut: posts the command, or
+    // routes to the run-to-handler path at an exception stop.
+    function  PostSourceStep(Kind: TCommandKind; ThreadId: DWORD;
+                out RefusalReason: string): Boolean;
     function  BuildAndWireDebugger(PreferredBase: UInt64): Boolean;
     procedure ApplyPendingBreakpoints;
     // Resolves a data-breakpoint expression to a live VA: a literal address
@@ -318,9 +322,26 @@ type
     // ThreadId selects the thread to step (0 = the currently-stopped thread).
     // While the step runs, every other thread is frozen so only this one
     // advances (per-thread stepping); run control afterwards targets it.
-    procedure StepOver(ThreadId: DWORD = 0);
-    procedure StepInto(ThreadId: DWORD = 0);
-    procedure StepOut(ThreadId: DWORD = 0);
+    //
+    // Two shapes, and the difference is only in how a refusal is delivered.
+    // A source-level step never refuses at an ORDINARY stop -- but at a
+    // first-chance EXCEPTION stop all three mean "run to the handler that
+    // receives this exception", and that can refuse (see
+    // IDebugTarget.StepToExceptionHandler). The `out RefusalReason` overloads
+    // report it; the parameterless ones discard it and are the long-standing
+    // fire-and-forget form.
+    function  StepOver(ThreadId: DWORD; out RefusalReason: string): Boolean; overload;
+    function  StepInto(ThreadId: DWORD; out RefusalReason: string): Boolean; overload;
+    function  StepOut (ThreadId: DWORD; out RefusalReason: string): Boolean; overload;
+    procedure StepOver(ThreadId: DWORD = 0); overload;
+    procedure StepInto(ThreadId: DWORD = 0); overload;
+    procedure StepOut (ThreadId: DWORD = 0); overload;
+    // True while the debuggee is stopped on an exception it has not been
+    // allowed to deliver yet. At such a stop the three steps above route to the
+    // run-to-handler path instead of their usual line-based behaviour.
+    function  StoppedOnUndeliveredException: Boolean;
+    // Why the last step abandoned itself, or '' when it completed normally.
+    function  LastStepNote: string;
     // One MACHINE INSTRUCTION rather than one source line
     // (ASSEMBLY_LEVEL_DEBUGGING.md increment 1). Unlike the three above it can
     // REFUSE -- there is no line table to fall back on in the code this exists
@@ -979,37 +1000,78 @@ begin
   SetState(dsRunning);
 end;
 
-procedure TDebugSession.StepOver(ThreadId: DWORD = 0);
+function TDebugSession.StoppedOnUndeliveredException: Boolean;
+begin
+  Result := (FDebugger <> nil) and FDebugger.StoppedOnUndeliveredException;
+end;
+
+function TDebugSession.LastStepNote: string;
 begin
   if FDebugger = nil then
+    Exit('');
+  Result := FDebugger.LastStepNote;
+end;
+
+// The one place the three source-level steps are decided. At an ordinary stop
+// this posts the command and follows the session into dsRunning, exactly as
+// before. At a first-chance exception stop there is no "next line" to step to,
+// so all three route to the run-to-handler path -- which decides SYNCHRONOUSLY
+// and may refuse, in which case the session stays stopped exactly where it was
+// rather than waiting for a stop that never comes.
+function TDebugSession.PostSourceStep(Kind: TCommandKind; ThreadId: DWORD;
+  out RefusalReason: string): Boolean;
+begin
+  RefusalReason := '';
+  if FDebugger = nil then
     raise Exception.Create('No active debuggee to step');
+  if FDebugger.StoppedOnUndeliveredException then begin
+    Result := FDebugger.StepToExceptionHandler(ThreadId, RefusalReason);
+    if Result then
+      SetState(dsRunning);
+    Exit;
+  end;
   var Cmd: TCommand;
-  Cmd.Kind     := ckStepOver;
+  Cmd.Kind     := Kind;
   Cmd.ThreadId := ThreadId;
   FDebugger.PostCommand(Cmd);
   SetState(dsRunning);
+  Result := True;
+end;
+
+function TDebugSession.StepOver(ThreadId: DWORD; out RefusalReason: string): Boolean;
+begin
+  Result := PostSourceStep(ckStepOver, ThreadId, RefusalReason);
+end;
+
+function TDebugSession.StepInto(ThreadId: DWORD; out RefusalReason: string): Boolean;
+begin
+  Result := PostSourceStep(ckStepInto, ThreadId, RefusalReason);
+end;
+
+function TDebugSession.StepOut(ThreadId: DWORD; out RefusalReason: string): Boolean;
+begin
+  Result := PostSourceStep(ckStepOut, ThreadId, RefusalReason);
+end;
+
+procedure TDebugSession.StepOver(ThreadId: DWORD = 0);
+var
+  Ignored: string;
+begin
+  PostSourceStep(ckStepOver, ThreadId, Ignored);
 end;
 
 procedure TDebugSession.StepInto(ThreadId: DWORD = 0);
+var
+  Ignored: string;
 begin
-  if FDebugger = nil then
-    raise Exception.Create('No active debuggee to step');
-  var Cmd: TCommand;
-  Cmd.Kind     := ckStepInto;
-  Cmd.ThreadId := ThreadId;
-  FDebugger.PostCommand(Cmd);
-  SetState(dsRunning);
+  PostSourceStep(ckStepInto, ThreadId, Ignored);
 end;
 
 procedure TDebugSession.StepOut(ThreadId: DWORD = 0);
+var
+  Ignored: string;
 begin
-  if FDebugger = nil then
-    raise Exception.Create('No active debuggee to step');
-  var Cmd: TCommand;
-  Cmd.Kind     := ckStepOut;
-  Cmd.ThreadId := ThreadId;
-  FDebugger.PostCommand(Cmd);
-  SetState(dsRunning);
+  PostSourceStep(ckStepOut, ThreadId, Ignored);
 end;
 
 function TDebugSession.StepInstruction(Kind: TInstructionStepKind;

@@ -60,6 +60,38 @@ type
     MinResumeSP: UInt64;
   end;
 
+  // A step taken at a FIRST-CHANCE EXCEPTION stop.
+  //
+  // At an exception there is no "next line": the faulting instruction is not
+  // going to complete, and the flow of control that continues from here is the
+  // SEH dispatch. So all three source-level step kinds mean the same thing
+  // there -- run to the first `except` or `finally` block up the stack that
+  // actually receives this exception, and stop in the user's own source.
+  //
+  // The trap flag cannot express that. Measured with DevTools\ExcHandlerProbe
+  // (EH_FORMAT_NOTES.md): armed at the stop and resumed with
+  // DBG_EXCEPTION_NOT_HANDLED, TF produces NO single-step event at all on
+  // native x64, and on WOW64 only for a software raise, landing inside
+  // ntdll32!KiUserExceptionDispatcher. A one-shot breakpoint planted at the
+  // handler block is the only mechanism that works.
+  //
+  // Decided on the requesting thread (a refusal has to be synchronous) and
+  // executed on the Run thread, exactly like TInstrStepPlan.
+  TExceptionStepPlan = record
+    // Every plantable block of the first frame that can receive the exception.
+    // More than one when that frame's `except` carries several `on` clauses:
+    // only the MATCHING clause's block ever executes, so planting all of them
+    // and letting the first hit win is exact, whereas re-deriving Delphi's
+    // class-matching rules here would be a second implementation of them.
+    HandlerVAs:  TArray<UInt64>;
+    // The thread whose exception this is. A hit on another thread is somebody
+    // else's exception passing through the same block and must not end the step.
+    ThreadId:    DWORD;
+    // What the landing is, for the log and for the stop's own description:
+    // "finally in Level2Finally (ExcNestFixture.dpr:58)".
+    Description: string;
+  end;
+
   // How one synthetic-call argument has to be materialised in the TARGET.
   //
   // This replaces a plain "is it a float" Boolean, which was sufficient on x64 --
@@ -279,7 +311,7 @@ type
 
   TCommandKind = (ckContinue, ckStepInto, ckStepOver, ckStepOut, ckPause,
     ckSetBreakpoints, ckSetDataBreakpoints, ckSetAddressBreakpoints,
-    ckStepInstruction);
+    ckStepInstruction, ckStepToHandler);
 
   TBpSpec = record
     SourceFile:    string;
@@ -314,6 +346,7 @@ type
     DataBpSpec: TDataBpArmSpec;
     AddrBpSpec: TAddrBpSpec;
     InstrStep:  TInstrStepPlan;   // ckStepInstruction only
+    ExcStep:    TExceptionStepPlan;  // ckStepToHandler only
   end;
 
   TOnStopped     = procedure(Reason: TStopReason; const SourceFile: string;
@@ -516,6 +549,28 @@ type
     // the source-level steps.
     function  StepInstruction(Kind: TInstructionStepKind; ThreadId: DWORD;
                 out RefusalReason: string): Boolean;
+
+    // --- Source-level stepping at a FIRST-CHANCE EXCEPTION stop ---------------
+    // True while the debuggee is stopped on an exception that has NOT been
+    // delivered yet, i.e. the pending debug event still has to be released with
+    // DBG_EXCEPTION_NOT_HANDLED so the program's own handler runs.
+    function  StoppedOnUndeliveredException: Boolean;
+    // Steps to the handler that will receive the pending exception: plants a
+    // one-shot at the block of the first frame that can receive it, delivers the
+    // exception, and reports the landing as srStep. All three source-level step
+    // kinds route here at such a stop -- see TExceptionStepPlan.
+    //
+    // Returns False WITHOUT resuming the debuggee and fills RefusalReason when
+    // the handler cannot be PROVEN: no decodable frame, a language handler that
+    // is not Delphi's, a scope table that does not decode, or (32-bit) a
+    // try/finally or bare `except`, whose block address the fs:[0] registration
+    // record simply does not carry. Refusing is the shipped behaviour; this
+    // project does not deliver an exception and hope.
+    function  StepToExceptionHandler(ThreadId: DWORD;
+                out RefusalReason: string): Boolean;
+    // Why the last step abandoned itself, or '' when it completed normally.
+    // Non-empty exactly when a stop was reported that the step did NOT reach.
+    function  LastStepNote: string;
     // Replaces the disassembler instruction stepping decodes with. Injection
     // seam: production leaves it unset and the engine builds a Zydis-backed one
     // on first use, while a test can supply a double (notably an unavailable

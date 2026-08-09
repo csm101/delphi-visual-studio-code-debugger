@@ -59,6 +59,13 @@ type
     function  WalkRawFrames(TH: THandle; SeedPc, SeedSp, SeedFp: UInt64;
                 MaxFrames: Integer): TArray<TRawStackFrame>; override;
     function  CallSiteVerdictAt(VA: UInt64): TCallSiteAnswer; override;
+    // x86 has no `.pdata`, so the base class's scope-table decode has nothing to
+    // read. The 32-bit answer lives in the fs:[0] registration chain, and only
+    // PART of it is derivable -- see the body.
+    function  PlanExceptionStep(Tid: DWORD; out Plan: TExceptionStepPlan;
+                out RefusalReason: string): Boolean; override;
+    // Base address of the 32-bit TEB of Tid, which is where fs:[0] points.
+    function  Teb32Base(Tid: DWORD; out Base: UInt64; out How: string): Boolean;
 
     function  ReadPrologInfo(EntryVA: UInt64; out ExtraPushBytes: UInt32;
                 out Recognised: Boolean): UInt32; override;
@@ -90,6 +97,16 @@ implementation
 uses
   System.SysUtils,
   DapProtocol;   // DapLog: why a candidate frame was refused
+
+// Reaching the 32-bit TEB of a WOW64 thread. Neither is in Winapi.Windows.
+function Wow64GetThreadSelectorEntry(hThread: THandle; dwSelector: DWORD;
+  var lpSelectorEntry: TLdtEntry): BOOL; stdcall;
+  external kernel32 name 'Wow64GetThreadSelectorEntry';
+
+function NtQueryInformationThread(ThreadHandle: THandle;
+  ThreadInformationClass: DWORD; ThreadInformation: Pointer;
+  ThreadInformationLength: ULONG; ReturnLength: PULONG): Integer; stdcall;
+  external 'ntdll.dll';
 
 { ------------------------------------------------------------ architecture -- }
 
@@ -752,6 +769,252 @@ function TWin32Debugger.ReadParentFramePointer(ChildRBP: UInt64;
   ChildFrameSize, ChildExtraPushBytes: UInt32): UInt64;
 begin
   Result := 0;
+end;
+
+{ ------------------------------------------ stepping at an exception stop -- }
+
+// The 32-bit TEB, which is what fs:[0] is relative to. Two routes, in the order
+// ExcHandlerProbe measured them:
+//   1. Wow64GetThreadSelectorEntry on the thread's own FS selector. Authoritative.
+//   2. TEB64 + $2000 (the fixed WOW64 layout), VERIFIED rather than assumed by
+//      reading TEB32+$18 (Self) back and requiring it to point at itself.
+// THREAD_BASIC_INFORMATION is exactly 48 bytes on x64; passing any other length
+// returns STATUS_INFO_LENGTH_MISMATCH and the fallback silently never works.
+function TWin32Debugger.Teb32Base(Tid: DWORD; out Base: UInt64;
+  out How: string): Boolean;
+var
+  Ctx: TWow64Context;
+  Ldt: TLdtEntry;
+begin
+  Base   := 0;
+  How    := '';
+  Result := False;
+  var TH := ThreadHandle(Tid);
+  if TH = 0 then begin
+    How := Format('thread %d could not be opened', [Tid]);
+    Exit;
+  end;
+  Ctx := Default(TWow64Context);
+  Ctx.ContextFlags := WOW64_CONTEXT_CONTROL or WOW64_CONTEXT_SEGMENTS or
+                      WOW64_CONTEXT_INTEGER;
+  if not Wow64GetThreadContext(TH, Ctx) then begin
+    How := Format('Wow64GetThreadContext failed (error %d)', [GetLastError]);
+    Exit;
+  end;
+  Ldt := Default(TLdtEntry);
+  if Wow64GetThreadSelectorEntry(TH, Ctx.SegFs, Ldt) then begin
+    Base := UInt64(Ldt.BaseLow) or (UInt64(Ldt.BaseMid) shl 16) or
+            (UInt64(Ldt.BaseHi) shl 24);
+    if Base <> 0 then begin
+      How := 'Wow64GetThreadSelectorEntry';
+      Exit(True);
+    end;
+  end;
+
+  var Info: array[0..5] of UInt64;   // THREAD_BASIC_INFORMATION, 48 bytes
+  FillChar(Info, SizeOf(Info), 0);
+  if NtQueryInformationThread(TH, 0, @Info[0], SizeOf(Info), nil) < 0 then begin
+    How := 'neither the FS selector nor NtQueryInformationThread could locate the ' +
+           '32-bit TEB';
+    Exit;
+  end;
+  var Teb32 := Info[1] + $2000;
+  var SelfPtr: UInt32 := 0;
+  if ReadProcessMemoryAt(Teb32 + $18, @SelfPtr, SizeOf(SelfPtr)) and
+     (UInt64(SelfPtr) = Teb32) then begin
+    Base := Teb32;
+    How  := 'TEB64+$2000 (Self field verified)';
+    Exit(True);
+  end;
+  How := 'the 32-bit TEB computed as TEB64+$2000 did not verify against its own ' +
+         'Self field';
+end;
+
+// x86, and the negative half of this is as load-bearing as the positive half.
+//
+// There is no `.pdata` on a 32-bit target, so nothing the base class decodes
+// exists. The dispatch data is the fs:[0] registration chain, walked innermost
+// first, and each record's Handler points at an `E9 rel32` stub INSIDE the
+// protected routine. The stub's target names the case (EH_FORMAT_NOTES.md):
+//
+//   @HandleOnException  -- an `except` with `on` clauses. A clause table follows
+//                          the stub at stub+5, holding ABSOLUTE VAs (not RVAs):
+//                          DWORD Count; Count x { ClassVmtVA; BlockVA }. Those
+//                          BlockVAs are the user's blocks and ARE plantable.
+//   @HandleFinally      -- a try/finally.  NO table follows.
+//   @HandleAnyException -- a bare `except`. NO table follows.
+//
+// For the last two the block address is simply NOT DERIVABLE from the record --
+// only the stub is, and a hit on the stub is the SEH SEARCH pass, i.e. it fires
+// before that frame is known to receive the exception and before the block runs.
+// Reporting "you are stopped in the finally" there would name the wrong
+// execution phase, so this refuses and says which construct it was. That is a
+// deliberate choice over the alternative (stop on the stub, whose address does
+// resolve to the `finally` line): a refusal that names what is missing is worth
+// more than a stop that looks right and is not.
+function TWin32Debugger.PlanExceptionStep(Tid: DWORD;
+  out Plan: TExceptionStepPlan; out RefusalReason: string): Boolean;
+const
+  MAX_RECORDS = 32;
+  MAX_CLAUSES = 64;
+var
+  Blocks:   TArray<UInt64>;
+  Describe: string;
+
+  function ReadU32At(VA: UInt64; out Value: UInt32): Boolean;
+  begin
+    Value  := 0;
+    Result := ReadProcessMemoryAt(VA, @Value, SizeOf(Value));
+  end;
+
+  // DWORD Count; Count x { DWORD ClassVmtVA; DWORD BlockVA }, absolute. Every
+  // clause's block is planted for the same reason as on x64: only the matching
+  // one runs, so the first hit is exact and no class matching is re-derived.
+  function DecodeClauseTable(TableVA: UInt64): Boolean;
+  begin
+    Result := False;
+    var Count: UInt32;
+    if not ReadU32At(TableVA, Count) then
+      Exit;
+    if (Count = 0) or (Count > MAX_CLAUSES) then
+      Exit;
+    for var I := 0 to Integer(Count) - 1 do begin
+      var Pair: array[0..1] of UInt32;
+      if not ReadProcessMemoryAt(TableVA + 4 + UInt64(I) * 8, @Pair[0], SizeOf(Pair)) then
+        Exit(False);
+      var Where: string;
+      if not DescribeUserCodeAt(Pair[1], Where) then
+        Exit(False);
+      var Known := False;
+      for var Existing in Blocks do
+        if Existing = Pair[1] then begin
+          Known := True;
+          Break;
+        end;
+      if not Known then begin
+        Blocks := Blocks + [Pair[1]];
+        if Describe = '' then
+          Describe := 'except in ' + Where
+        else
+          Describe := Describe + ', except in ' + Where;
+      end;
+      Result := True;
+    end;
+  end;
+
+begin
+  Plan          := Default(TExceptionStepPlan);
+  Plan.ThreadId := Tid;
+  RefusalReason := '';
+  Blocks        := nil;
+  Describe      := '';
+
+  var FsBase: UInt64;
+  var How: string;
+  if not Teb32Base(Tid, FsBase, How) then begin
+    RefusalReason := Format('the fs:[0] exception-registration chain of thread %d ' +
+      'could not be reached, so the handler this exception will run cannot be ' +
+      'identified: %s', [Tid, How]);
+    Exit(False);
+  end;
+
+  var Head: UInt32;
+  if not ReadU32At(FsBase, Head) then begin
+    RefusalReason := Format('fs:[0] of thread %d could not be read, so the handler ' +
+      'this exception will run cannot be identified', [Tid]);
+    Exit(False);
+  end;
+
+  var Rec: UInt64 := Head;
+  for var Index := 0 to MAX_RECORDS - 1 do begin
+    if (Rec = 0) or (Rec = $FFFFFFFF) then
+      Break;
+    var Pair: array[0..1] of UInt32;   // Next, Handler
+    if not ReadProcessMemoryAt(Rec, @Pair[0], SizeOf(Pair)) then
+      Break;
+    var HandlerVA: UInt64 := Pair[1];
+    var Next:      UInt64 := Pair[0];
+
+    // Records whose handler is not the user's own code -- the RTL's outermost
+    // @ExceptionHandler, ntdll's -- are skipped for the same reason x64 skips
+    // sourceless frames: the step exists to land in the user's source, and a
+    // refusal on every RTL record would make the feature unreachable.
+    var StubWhere: string;
+    if not DescribeUserCodeAt(HandlerVA, StubWhere) then begin
+      Rec := Next;
+      Continue;
+    end;
+
+    var Stub: array[0..4] of Byte;
+    if not ReadProcessMemoryAt(HandlerVA, @Stub[0], SizeOf(Stub)) then begin
+      RefusalReason := Format('a step at an exception stop runs to the handler that ' +
+        'receives it. The first frame that can receive this one -- %s -- has an ' +
+        'fs:[0] handler at $%x whose bytes could not be read.',
+        [StubWhere, HandlerVA]);
+      Exit(False);
+    end;
+    if Stub[0] <> $E9 then begin
+      RefusalReason := Format('a step at an exception stop runs to the handler that ' +
+        'receives it. The first frame that can receive this one -- %s -- has an ' +
+        'fs:[0] handler at $%x that is not a Delphi `jmp rel32` dispatch stub, so ' +
+        'which construct it protects, and where that block is, cannot be ' +
+        'determined. Refusing rather than guessing a landing site.',
+        [StubWhere, HandlerVA]);
+      Exit(False);
+    end;
+    var Target := UInt64(Int64(HandlerVA) + 5 + PInteger(@Stub[1])^);
+    var StubKind := FunctionNameAt(Target);
+
+    if Pos('HandleOnException', StubKind) > 0 then begin
+      if not DecodeClauseTable(HandlerVA + 5) then begin
+        RefusalReason := Format('a step at an exception stop runs to the handler ' +
+          'that receives it. The first frame that can receive this one -- %s -- ' +
+          'protects an `except` with `on` clauses, but the clause table at $%x did ' +
+          'not decode into block addresses that map to source lines.',
+          [StubWhere, HandlerVA + 5]);
+        Exit(False);
+      end;
+      Plan.HandlerVAs  := Blocks;
+      Plan.Description := Describe;
+      Exit(True);
+    end;
+
+    var Construct := '';
+    if Pos('HandleFinally', StubKind) > 0 then
+      Construct := 'a try/FINALLY'
+    else if Pos('HandleAnyException', StubKind) > 0 then
+      Construct := 'a bare `except` (no `on` clause)';
+
+    if Construct <> '' then begin
+      RefusalReason := Format('a step at an exception stop runs to the handler that ' +
+        'receives it, and on a 32-bit target that address cannot always be proven. ' +
+        'The first frame that receives this exception -- %s -- protects %s. Its ' +
+        'fs:[0] record points at a %s dispatch stub, which carries NO table, so the ' +
+        'address of the block itself is not derivable -- only the stub, and a hit ' +
+        'there is the SEH SEARCH pass, not the block running. Refusing rather than ' +
+        'reporting a stop in the wrong execution phase. Use continue, or set a ' +
+        'breakpoint on the handler line.',
+        [StubWhere, Construct, StubKind]);
+      Exit(False);
+    end;
+
+    var Named := StubKind;
+    if Named = '' then
+      Named := Format('an unnamed routine at $%x', [Target]);
+    RefusalReason := Format('a step at an exception stop runs to the handler that ' +
+      'receives it. The first frame that can receive this one -- %s -- has an ' +
+      'fs:[0] dispatch stub jumping to %s, which this debugger does not recognise ' +
+      'as one of Delphi''s (@HandleOnException / @HandleFinally / ' +
+      '@HandleAnyException). Refusing rather than guessing a landing site.',
+      [StubWhere, Named]);
+    Exit(False);
+  end;
+
+  RefusalReason := Format('no fs:[0] registration record of thread %d belongs to code ' +
+    'this debugger has symbols for, so there is no except or finally block to step ' +
+    'to. Continue instead: the exception is unhandled as far as the user''s code is ' +
+    'concerned.', [Tid]);
+  Result := False;
 end;
 
 { --------------------------------------------------------- prologue decode -- }

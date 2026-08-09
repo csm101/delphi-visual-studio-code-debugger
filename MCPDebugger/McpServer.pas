@@ -1102,10 +1102,20 @@ begin
     end;
   end
   else begin
+    // A source-level step is still fire-and-forget at an ordinary stop. At a
+    // first-chance EXCEPTION stop it means "run to the handler that receives
+    // this exception" and CAN refuse, so the refusal has to reach the caller as
+    // a real error rather than as a wait that never resolves.
+    var RefusalReason: string;
+    var Ok := True;
     case Kind of
-      iskOver: FSession.StepOver(ThreadId);
-      iskInto: FSession.StepInto(ThreadId);
-      iskOut:  FSession.StepOut(ThreadId);
+      iskOver: Ok := FSession.StepOver(ThreadId, RefusalReason);
+      iskInto: Ok := FSession.StepInto(ThreadId, RefusalReason);
+      iskOut:  Ok := FSession.StepOut (ThreadId, RefusalReason);
+    end;
+    if not Ok then begin
+      SendToolError(IdJson, RefusalReason);
+      Exit;
     end;
   end;
   ArmWait(IdJson, 30000);

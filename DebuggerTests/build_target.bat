@@ -65,7 +65,14 @@ if not exist Win32\Debug md Win32\Debug
 dcc32 -E.\Win32\Debug -NU.\Win32\Debug TestTarget.dpr 2>&1
 set TT32_ERR=%errorlevel%
 popd
+rem Exception-step debuggee, both bitnesses. It lives in DevTools\Fixtures (see
+rem build_and_run.bat) and is built by its own script because it needs full
+rem debug info; built here too so `build_target.bat` alone leaves every test
+rem debuggee present.
+call "%~dp0..\DevTools\build_exc_fixture.bat"
+set EXCFIX_ERR=%errorlevel%
 if not "%TT_ERR%"=="0" exit /b %TT_ERR%
+if not "%EXCFIX_ERR%"=="0" exit /b %EXCFIX_ERR%
 if not "%DLL_ERR%"=="0" exit /b %DLL_ERR%
 if not "%EXE_ERR%"=="0" exit /b %EXE_ERR%
 if not "%TDS_ERR%"=="0" exit /b %TDS_ERR%

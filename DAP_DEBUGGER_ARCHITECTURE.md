@@ -1348,6 +1348,116 @@ Three modes plus a none state:
   new-line test a few bytes into the same function and a failed step-out
   reported success.
 
+### Stepping at an exception stop
+
+At a first-chance exception stop there is no "next source line": the faulting
+instruction is not going to complete, and the flow of control that continues
+from here is SEH dispatch. So **all three source-level step kinds mean the same
+thing there** — run to the first `except` or `finally` block up the stack that
+actually receives the exception, and land in the USER's source. Mode
+`smToHandler`.
+
+**Why it was broken.** `HandleException` parks such a stop with
+`FPendingContinueStatus := DBG_EXCEPTION_NOT_HANDLED` so the program's own
+handler still runs — and the three step command handlers each overwrote it with
+`DBG_CONTINUE` before resuming. `ckContinue` consumed it correctly (which is why
+an unhandled AV still terminated the process as it should) while every STEP
+swallowed the exception. For a hardware fault that re-executes the faulting
+instruction, which faults again: the reported symptom was the same exception
+logged forever. The three handlers now **consume** the status the way
+`ckContinue` does, and a step at such a stop never reaches them anyway.
+
+**The mechanism is a one-shot breakpoint, and it has to be.** Measured with
+`DevTools\ExcHandlerProbe` (`EH_FORMAT_NOTES.md`): arming `EFLAGS.TF` at the stop
+and resuming with `DBG_EXCEPTION_NOT_HANDLED` produces NO single-step event at
+all on native x64, and on WOW64 only for a software raise, landing inside
+`ntdll32!KiUserExceptionDispatcher`. "Deliver it and see where we land" is not
+available, so the block address must be DERIVED.
+
+**The flow.**
+
+1. `TDebugSession.PostSourceStep` (the shared body of `StepOver`/`StepInto`/
+   `StepOut`) asks `IDebugTarget.StoppedOnUndeliveredException`. At an ordinary
+   stop it posts `ckStepOver`/`ckStepInto`/`ckStepOut` exactly as before; at an
+   exception stop it calls `StepToExceptionHandler` instead.
+2. `TWinDebugger.StepToExceptionHandler` decides SYNCHRONOUSLY on the requesting
+   thread — the same split `StepInstruction` uses, for the same reason: a
+   refusal must reach the caller as a failed request, not as a wait that never
+   resolves. `PlanExceptionStep` (virtual; x64 in `WinDebuggerBase`, x86
+   overridden in `WinDebuggerX86`) produces a `TExceptionStepPlan` or a reason.
+3. `ckStepToHandler` → `DoStepToHandler` on the Run thread plants a one-shot on
+   every block in the plan and releases the pending event with
+   **`DBG_EXCEPTION_NOT_HANDLED`**. Delivering the exception IS the mechanism.
+4. The block hit reports `srStep`.
+
+**Which blocks get planted, and why more than one.** Every clause block of every
+scope entry that covers the frame's PC. Only the MATCHING `on` clause ever
+executes, so letting the first hit win is exact — whereas re-deriving Delphi's
+class matching (ancestors, re-raise, interface clauses) here would be a second
+implementation of it, and a wrong match plants in a block that never runs, which
+reads as a step that hung. The same argument covers a routine that nests a `try`
+inside another `try`: both covering entries are planted and the innermost simply
+gets there first, so no assumption about the scope table's ordering is needed.
+`Win64_Step_LandsInTheMATCHINGClauseOfTwo` pins this against a fixture whose
+FIRST clause does not match.
+
+**Which frame.** The walk goes from frame 0 upward and stops at the first frame
+that can receive the exception. A frame whose PC does not map to a source line
+is SKIPPED whatever handler it declares: the step exists to put the user in
+their own source, and refusing on `kernelbase!RaiseException` (which every
+Delphi raise passes through, and which declares an MSVC
+`__C_specific_handler`) would make the whole feature unreachable.
+
+**What it refuses.** A refusal names what is missing and leaves the session
+stopped exactly where it was. This project prefers that to a confident wrong
+answer, so there is no fallback to a plausible stop point anywhere in this path.
+
+| case | outcome |
+|---|---|
+| x64 `try/finally` | lands on the finally funclet |
+| x64 bare `except` | lands on the block (`Handler` = 2, `Target` = the block) |
+| x64 `except` with `on` clauses | lands on the matching clause's block |
+| x64, first receiving frame declares a non-Delphi language handler | REFUSES, naming the handler |
+| x64, scope table does not decode | REFUSES, naming which part |
+| x86 `except` with `on` clauses | lands on the matching clause's block |
+| **x86 `try/finally`** | **REFUSES** |
+| **x86 bare `except`** | **REFUSES** |
+| no frame protects the code at all | REFUSES, and says to use continue |
+
+The two x86 refusals are a **decision**, not an omission. The `fs:[0]`
+registration record for those two constructs carries no table, so only the
+dispatch stub is derivable — and a hit on the stub is the SEH SEARCH pass, i.e.
+it fires before that frame is known to receive the exception and before the block
+runs. The stub's address does resolve to the `finally` line through the line
+table, which would make stopping there *look* right while naming the wrong
+execution phase. Refusing and saying so was chosen over that.
+
+**Threads are deliberately NOT frozen for this step.** Every other step in this
+engine advances a handful of instructions; this one runs the OS's exception
+dispatch and Delphi's unwind, which take the memory manager's locks — freezing a
+thread that holds one turns a step into a process-wide deadlock. The landing is
+kept thread-scoped by `ExcStepLandedAt` instead, and a hit from another thread
+goes through `RearmStepBpAfterForeignHit` like every other foreign step-BP hit.
+
+**The loop cannot come back.** Two independent reasons. The exception is now
+delivered, so the faulting instruction is not re-executed. And if the same
+exception code re-fires at the same address while an `smToHandler` step is in
+flight, the step ABANDONS itself, emits `[Step] the step to <landing> made no
+progress: ...` and records it in `LastStepNote`, which the session exposes, so
+one stop says what happened instead of the log filling up.
+
+**Landing lines.** Two line-table attributions look wrong and are not (measured,
+`EH_FORMAT_NOTES.md`): a clause block's first instruction is attributed to the
+`on` line rather than to the statement inside it, and a bare `except`'s block
+address is attributed to the last line of the `try` body.
+
+**DAP / MCP surface.** `next`/`stepIn`/`stepOut` keep sending their success
+response BEFORE stepping at an ordinary stop (unchanged). At an exception stop
+the decision is synchronous, so the response waits for it and a refusal reaches
+VS Code as a failed request whose reason is at `body.error.format`. The MCP
+`step_*` tools return the refusal through `SendToolError` instead of arming a
+wait that would never resolve.
+
 ### A rejected transient step breakpoint must be stepped OFF, not re-planted
 
 Both the `smOver` recursion guard and its `smInstr` twin can decide that a
@@ -2606,6 +2716,15 @@ at all — the DAP twin of the `McpJson.ReasonName` gap increment 5 fixed.
   has a shot.
 - Other first-chance exceptions: silently passed through.
 - Second-chance: always reported.
+
+While such a stop is live, `IDebugTarget.StoppedOnUndeliveredException` is True
+and the pending debug event still has to be released with
+`DBG_EXCEPTION_NOT_HANDLED`. Two consumers depend on that flag:
+`RunMethodCall` refuses to inject a synthetic call there (it would consume the
+event with `DBG_CONTINUE` and swallow the exception), and a source-level step
+routes to the run-to-handler path instead of its usual line-based behaviour —
+see "Stepping at an exception stop" under Stepping, and `EH_FORMAT_NOTES.md`
+for the dispatch-data layouts it reads.
 
 Which classes surface is governed by the `setExceptionBreakpoints` filters
 (`delphi` / `av` / `all` / `unhandled`). VS Code sends the enabled ids two

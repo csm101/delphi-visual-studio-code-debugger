@@ -1,4 +1,4 @@
-unit ValueReaderTests;
+﻿unit ValueReaderTests;
 
 // Pure unit tests for TDelphiValueReader.FormatLocalValue that need no live
 // debuggee: the integer-formatting path only touches the raw value + the type
@@ -154,6 +154,10 @@ type
     function  SetInstructionPointer(VA: UInt64): Boolean;
     function  StepInstruction(Kind: TInstructionStepKind; ThreadId: DWORD;
                 out RefusalReason: string): Boolean;
+    function  StoppedOnUndeliveredException: Boolean;
+    function  StepToExceptionHandler(ThreadId: DWORD;
+                out RefusalReason: string): Boolean;
+    function  LastStepNote: string;
     procedure SetInstructionDisassembler(const Disasm: IDisassembler);
     function  ArmHardwareWatchpoint(TID: DWORD; Slot: Integer; Address: UInt64;
                 SizeBytes: Integer; WriteOnly: Boolean): Boolean;
@@ -289,6 +293,16 @@ function  TFakeMemTarget.EvaluateGlobalName(const Name: string; out Value: TLoca
 function  TFakeMemTarget.SetRegisterByName(const Name: string; Value: UInt64): Boolean; begin Result := False; end;
 function  TFakeMemTarget.SetInstructionPointer(VA: UInt64): Boolean; begin Result := False; end;
 function  TFakeMemTarget.StepInstruction(Kind: TInstructionStepKind; ThreadId: DWORD;
+  out RefusalReason: string): Boolean;
+begin
+  RefusalReason := 'this fake target has no debuggee to step';
+  Result := False;
+end;
+
+function  TFakeMemTarget.StoppedOnUndeliveredException: Boolean; begin Result := False; end;
+function  TFakeMemTarget.LastStepNote: string; begin Result := ''; end;
+
+function  TFakeMemTarget.StepToExceptionHandler(ThreadId: DWORD;
   out RefusalReason: string): Boolean;
 begin
   RefusalReason := 'this fake target has no debuggee to step';

@@ -149,6 +149,10 @@ architecture and are maintained continuously alongside the code:
 - `RSM_FIELD_OFFSETS.md` — byte-level layout of each record.
 - `DAP_DEBUGGER_ARCHITECTURE.md` — modules, threading model, breakpoint /
   evaluate / setVariable flows, capability list.
+- `EH_FORMAT_NOTES.md` — where a Delphi binary records its exception-handling
+  scopes on each bitness (`.pdata` / `UNWIND_INFO` / scope + clause tables on
+  x64, the `fs:[0]` registration chain on x86), and which parts of it a debugger
+  can actually derive a handler address from.
 - `KNOWN_UNKNOWNS.md` — open questions that block or condition the work.
 - `TRAPS.md` — operational rules that prevent wasted work. Every entry is there
   because it already cost time once. Read it before an unfamiliar kind of change,

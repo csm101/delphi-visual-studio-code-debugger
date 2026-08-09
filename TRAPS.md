@@ -354,6 +354,41 @@ absurdly.
   stop ever arriving. `RearmStepBpAfterForeignHit` is the one place that does it
   correctly (leave unplanted, trap-step off, re-plant), and `FSteppingOffStepBp`
   marks that trap as deciding nothing so no step mode reads it as progress.
+- **`FPendingContinueStatus` is CONSUMED, never overwritten.** At a first-chance
+  exception stop it holds `DBG_EXCEPTION_NOT_HANDLED` so the program's own
+  handler runs. `ckContinue` read it correctly; `ckStepInto`, `ckStepOver` and
+  `ckStepOut` each assigned `DBG_CONTINUE` over it before resuming — five
+  `ReleasePendingEvent(DBG_CONTINUE)` call sites across the three. The intent was
+  written down in `HandleException` ("so ckContinue/step use the right status")
+  and then overwritten in three places. For a HARDWARE fault the effect is an
+  infinite loop: `DBG_CONTINUE` swallows the exception, the faulting instruction
+  re-executes, and it faults again. Reported from the field as "step at an
+  exception stop fills the log forever". A Delphi `raise` does NOT loop (it is a
+  software `RaiseException` call, so swallowing it merely lets the call return) —
+  so a repro must use an access violation, or it proves nothing.
+- **Never single-step out of an exception stop; there is nothing to step.**
+  Measured on both bitnesses (`DevTools\ExcHandlerProbe -tf`,
+  `EH_FORMAT_NOTES.md`): arming `EFLAGS.TF` and resuming with
+  `DBG_EXCEPTION_NOT_HANDLED` produces NO single-step event at all on native
+  x64, and on WOW64 only for a software raise, one instruction into
+  `ntdll32!KiUserExceptionDispatcher`. A one-shot breakpoint at a DERIVED handler
+  block is the only mechanism.
+- **Never decode a scope entry's `Handler` as a Delphi clause table before
+  checking the language handler is `_DelphiExceptionHandler`.** Under MSVC's
+  `__C_specific_handler` that field is a FILTER FUNCTION and the decode produces
+  confident nonsense. Every `ntdll` / `kernelbase` frame in any exception walk is
+  one of these.
+- **Never plant a breakpoint on a scope entry's `Handler` field.** When it is a
+  clause-table RVA the `$CC` overwrites the clause COUNT and derails dispatch.
+  Only DECODED BLOCK addresses are plantable. This already contaminated one probe
+  run.
+- **`PlantStepBp` silently does nothing when a breakpoint already occupies the
+  address**, so an address it was asked to plant may never appear in
+  `FStepBpVAs`. Any step whose LANDING is decided by membership of that list
+  therefore misses when the landing carries a user breakpoint. `smInstr` keeps
+  its resume address in `FStepOverVA` and `smToHandler` keeps its blocks in
+  `FExcStepVAs` for exactly this reason; both also answer from the PERSISTENT-BP
+  hit path, not only the one-shot path.
 - **Never name a Delphi method `Continue`** — it shadows the loop keyword. Use
   `ContinueExecution`.
 - **The main-exe module-name sentinel differs by layer.** `TWinDebugger`'s own

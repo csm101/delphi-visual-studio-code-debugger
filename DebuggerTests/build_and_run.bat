@@ -46,6 +46,15 @@ if errorlevel 1 ( popd & echo FAILED: TestTarget ^(Win32^) & exit /b 1 )
 popd
 
 echo.
+echo === Build ExcNestFixture (exception-step debuggee, both bitnesses) ===
+rem Lives in DevTools\Fixtures because ExcHandlerProbe was written against it
+rem first; ExceptionStepTests reuses that ONE fixture rather than adding
+rem exception scenarios to TestTarget, which would shift RSM import indices and
+rem marker ordering (TRAPS.md).
+call "%~dp0..\DevTools\build_exc_fixture.bat"
+if errorlevel 1 ( echo FAILED: ExcNestFixture & exit /b 1 )
+
+echo.
 echo === Generate TestTarget.jdbg (JCL sidecar; skipped if JCL absent) ===
 call "%~dp0build_jdbg.bat"
 if errorlevel 1 ( echo FAILED: TestTarget.jdbg & exit /b 1 )

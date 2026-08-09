@@ -1064,20 +1064,17 @@ on a native x64 target and on a WOW64 x86 target from the same 64-bit probe.
 | `-allscopes` | make every scope-table entry a candidate, not only the one covering the frame |
 | `-timeout MS` | `WaitForDebugEvent` timeout (default 20000) |
 
+**Everything this probe measured now lives in `EH_FORMAT_NOTES.md`** — the trap-flag
+result table, the x64 `.pdata` / `UNWIND_INFO` / scope-table / clause-table layout,
+the x86 `fs:[0]` stub classification, and the two traps. That document is the
+reference the shipped planner (`TWinDebugger.PlanExceptionStep` and its x86
+override) is written against; this section describes only how to RUN the probe.
+
 **Q1 — the trap flag.** `-tf` sets TF on the faulting thread, reads the context
 back to prove the write took, and resumes with the chosen status. `-cont
 handled` is the control: same stop, same thread, same arming code, only the
 continue status differs, so a step there and none with `notHandled` isolates the
-dispatch path rather than the arming. Measured, two runs each:
-
-| target | exception | resume | next event |
-|---|---|---|---|
-| x64 | Delphi raise | deliver | **none** — ran to exit |
-| x64 | Delphi raise | swallow (control) | single step at the stop RIP + 5 |
-| x64 | access violation | deliver | **none** |
-| x86 WOW64 | Delphi raise | deliver | **`STATUS_WX86_SINGLE_STEP` at `ntdll32!KiUserExceptionDispatcher+1`** |
-| x86 WOW64 | Delphi raise | swallow (control) | single step at the stop EIP + 4 |
-| x86 WOW64 | access violation | deliver | **none** |
+dispatch path rather than the arming.
 
 **Q2 — finding the user's block.** On x64 the probe walks the stack with
 `StackWalk64`, looks up each frame's `RUNTIME_FUNCTION` in that module's
@@ -1100,8 +1097,14 @@ run).
 `DevTools\Fixtures\ExcNestFixture.dpr` is the debuggee it was written against —
 a raise inside a `try/finally` inside a `try/except`, with `-bare` and `-two`
 variants for a clause-less `except` and for two `on` clauses of which the first
-does not match. Build it with `DevTools\build_exc_fixture.bat` (both bitnesses,
-`-$O- -V -VN -VR -GD`). It is a **GUI-subsystem** app with no output, and the
+does not match, and `-av` to fault instead of raising. `-nofinally` is
+orthogonal to all of them and drops the intervening `try/finally`, which is
+otherwise always the handler the exception reaches first — so it is what makes
+the three `except` shapes reachable as a landing site. Build it with
+`DevTools\build_exc_fixture.bat` (both bitnesses, `-$O- -V -VN -VR -GD`);
+`DebuggerTests\build_and_run.bat` and `build_target.bat` call that script too,
+because `DebuggerTests\ExceptionStepTests.pas` uses the same fixture rather than
+adding exception scenarios to `TestTarget`. It is a **GUI-subsystem** app with no output, and the
 probe launches it with `CREATE_NO_WINDOW` and all three standard handles
 redirected to `NUL`: a console debuggee pops a window that steals the keyboard
 focus on every one of the dozens of launches a measurement run makes. Those

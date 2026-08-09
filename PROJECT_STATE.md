@@ -1082,7 +1082,21 @@ Architecture / portability:
   handler runs. Stopping exceptions (AV, Delphi `$0EEDFADE`, second-chance)
   also store `DBG_EXCEPTION_NOT_HANDLED` in `FPendingContinueStatus` so that
   when the user presses Continue, the exception is passed to the program's
-  `try/except` handler rather than being silently swallowed.
+  `try/except` handler rather than being silently swallowed. That status is
+  **consumed**, never overwritten: the three step command handlers each assigned
+  `DBG_CONTINUE` over it, which swallowed the exception and (for a hardware
+  fault) re-executed the faulting instruction forever. See
+  `DAP_DEBUGGER_ARCHITECTURE.md` → "Stepping at an exception stop" and
+  `TRAPS.md`.
+- **Stepping at an exception stop — implemented.** All three source-level step
+  kinds run to the first `except` / `finally` block up the stack that actually
+  receives the exception, via a one-shot breakpoint at a handler address derived
+  from the binary (the trap flag does not survive exception dispatch — measured).
+  Where the block cannot be PROVEN it refuses with a reason that names what is
+  missing: on x86 that is every `try/finally` and every bare `except`, whose
+  `fs:[0]` registration record carries no table. Formats in `EH_FORMAT_NOTES.md`,
+  flow and refusal table in `DAP_DEBUGGER_ARCHITECTURE.md`, tests in
+  `TEST_CATALOG.md` section V.
   Common "noise" first-chance codes seen in large Delphi apps:
   `STATUS_GUARD_PAGE_VIOLATION` ($80000001, fires on every stack/heap page
   growth), C++ SEH probing, CLR internal exceptions.

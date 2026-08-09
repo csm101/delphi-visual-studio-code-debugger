@@ -52,7 +52,9 @@ uses
   InstructionStepDapTests in 'InstructionStepDapTests.pas',
   MemoryDapTests  in 'MemoryDapTests.pas',
   RegisterWriteDapTests in 'RegisterWriteDapTests.pas',
-  PlaceholderDisassemblyTests in 'PlaceholderDisassemblyTests.pas';
+  PlaceholderDisassemblyTests in 'PlaceholderDisassemblyTests.pas',
+  WinDebuggerX86  in '..\DebuggerCore\WinDebuggerX86.pas',
+  ExceptionStepTests in 'ExceptionStepTests.pas';
 
 const
   // Tests that cannot run while another RunTests worker is executing, because

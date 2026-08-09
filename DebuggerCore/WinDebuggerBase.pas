@@ -1,4 +1,4 @@
-unit WinDebuggerBase;
+﻿unit WinDebuggerBase;
 
 // TWinDebugger: the architecture-neutral half of the engine -- the debug event
 // loop, breakpoints, stepping, module handling and the synthetic-call pump --
@@ -94,7 +94,13 @@ type
     // 1) and is deliberately a MODE of its own rather than a flag on smInto /
     // smOver: those two terminate on a new SOURCE LINE, which is not a condition
     // that exists in the code instruction stepping is for.
-    FStepMode:     (smNone, smInto, smOver, smOut, smInstr);
+    // smToHandler is the step taken at a FIRST-CHANCE EXCEPTION stop: no source
+    // line is going to follow the faulting instruction, so the only meaningful
+    // destination is the `except` / `finally` block that receives the exception.
+    // It terminates on a one-shot breakpoint at a PROVEN handler block, never on
+    // a line change and never on the trap flag (which does not survive exception
+    // dispatch -- EH_FORMAT_NOTES.md).
+    FStepMode:     (smNone, smInto, smOver, smOut, smInstr, smToHandler);
     FStepOverVA:   UInt64;  // temp one-shot BP address for step-over/out
     // Range-based step-over: single-step inside the current function's RVA
     // range; when a CALL leaves the function (or recurses into it) run
@@ -128,6 +134,22 @@ type
     FInstrStepKind:     TInstructionStepKind;
     FInstrStepTid:      DWORD;      // the thread this instruction step belongs to
     FInstrStepTrapFlag: Boolean;    // True = one trap-flag step, False = run to FStepOverVA
+    // Step-to-handler state (smToHandler). The planted one-shots live in
+    // FStepBpVAs like every other transient step breakpoint, but the LANDING is
+    // decided against this list instead: PlantStepBp leaves an address that
+    // already carries a user breakpoint alone, and such an address would then
+    // never appear in FStepBpVAs even though it is exactly where the step ends.
+    FExcStepVAs:      TArray<UInt64>;
+    FExcStepTid:      DWORD;   // thread whose exception this step is following
+    FExcStepFromVA:   UInt64;  // ExceptionAddress of the stop the step started at
+    FExcStepFromCode: DWORD;   // its exception code
+    FExcStepDesc:     string;  // "finally in Level2Finally (Unit.pas:58)"
+    // Set when a step abandoned itself rather than completing -- today only by
+    // the re-fire guard. Surfaced with the stop so the same exception arriving
+    // again reads as "the step made no progress" instead of as a fresh event,
+    // which is what the field failure looked like: the same exception logged
+    // forever with nothing saying the step was the cause.
+    FLastStepNote:    string;
     // The decoder instruction stepping uses. Built lazily on first use (needs
     // the target's pointer width, which is only known once the process exists);
     // replaced wholesale by SetInstructionDisassembler. Symbolication is
@@ -238,6 +260,12 @@ type
     // and consumers need the difference: everything above a Delphi raise is RTL
     // plumbing by construction, while a fault's top frame IS the answer.
     FLastExcIsDelphiRaise: Boolean;
+    // Raw identity of the exception the current stop is on. Only the re-fire
+    // guard needs these: a step to a handler that produces the SAME code at the
+    // SAME address has made no progress, and saying so once beats logging the
+    // same exception forever, which is exactly how the defect was reported.
+    FLastExceptionAddr: UInt64;
+    FLastExceptionCode: DWORD;
     FDllBases:     TDictionary<string, UInt64>; // lowercase filename -> actual load base
     FDllSizes:     TDictionary<string, UInt64>; // lowercase filename -> SizeOfImage
     // lcase identifier -> DebugInfo revision at which it was confirmed absent
@@ -356,6 +384,30 @@ type
     // engine does not have on that architecture, and answering `csaNo` without
     // decoding would be a guess dressed as a proof. x86 overrides it.
     function  CallSiteVerdictAt(VA: UInt64): TCallSiteAnswer; virtual;
+    // Decides where a step taken at a first-chance exception stop must land:
+    // the block of the FIRST frame up the stack that can receive this
+    // exception. Runs on the REQUESTING thread and mutates nothing the debuggee
+    // can observe, so a refusal is synchronous (see TExceptionStepPlan).
+    //
+    // The base implementation is the x64 one and reads `.pdata` /
+    // `UNWIND_INFO` / Delphi's scope table. x86 has no `.pdata` at all and
+    // overrides it with the fs:[0] registration walk.
+    //
+    // Contract for both: return False with a reason that NAMES what is missing
+    // whenever the block address cannot be proven. Never fall back to a
+    // plausible-looking stop point.
+    function  PlanExceptionStep(Tid: DWORD; out Plan: TExceptionStepPlan;
+                out RefusalReason: string): Boolean; virtual;
+    // Shared by both architectures' planners: True when VA is an address in a
+    // module with symbols that maps to a real source line, which is what
+    // separates a user's own except/finally block from an RTL funclet or a
+    // piece of table data. Where fills in "Routine (Unit.pas:58)".
+    function  DescribeUserCodeAt(VA: UInt64; out Where: string): Boolean;
+    // Name of the routine containing VA, or '' when no provider owns it. The
+    // x86 planner classifies a Delphi SEH dispatch stub by the name its
+    // `jmp rel32` lands on (@HandleOnException / @HandleFinally /
+    // @HandleAnyException), which is the only thing that distinguishes them.
+    function  FunctionNameAt(VA: UInt64): string;
   private
     // Reads DR6 for TID, clears it, and reports WHY this #DB arrived. Cheap
     // no-op (FiredSlots = 0, TrapFlagStep = True) while no slot is armed, so
@@ -440,6 +492,17 @@ type
     // thread's business.
     function  InstrStepLandedAt(BpVA: UInt64; Tid: DWORD): Boolean;
     procedure EndInstructionStep;
+    // --- step at a first-chance exception stop -------------------------------
+    // Executes an already-decided plan. Runs on the Run thread, and is the ONE
+    // place that releases the pending event with DBG_EXCEPTION_NOT_HANDLED for a
+    // step -- delivering the exception is the whole mechanism.
+    procedure DoStepToHandler(const Cmd: TCommand);
+    // True when BpVA is one of the handler blocks the in-flight step is waiting
+    // on, whichever thread reached it.
+    function  ExcStepBlock(BpVA: UInt64): Boolean;
+    // True when a hit at BpVA on Tid is THIS step's landing.
+    function  ExcStepLandedAt(BpVA: UInt64; Tid: DWORD): Boolean;
+    procedure EndExceptionStep;
     procedure ApplyAllBreakpoints;
     // Moves a breakpoint that landed on a routine's ENTRY (a `begin` line) to
     // the first address of its body, where the parameters are actually spilled.
@@ -500,6 +563,15 @@ type
     // then posts the decided plan for the Run thread to execute.
     function  StepInstruction(Kind: TInstructionStepKind; ThreadId: DWORD;
                 out RefusalReason: string): Boolean;
+    // Stepping at a first-chance exception stop (IDebugTarget; see its
+    // declaration for the contract). Same split as StepInstruction: decided and
+    // refused synchronously here, executed on the Run thread.
+    function  StoppedOnUndeliveredException: Boolean;
+    function  StepToExceptionHandler(ThreadId: DWORD;
+                out RefusalReason: string): Boolean;
+    // Why the last step abandoned itself, or '' when the last step completed
+    // normally. Read by the host so a stop that a step did not reach can say so.
+    function  LastStepNote: string;
     procedure SetInstructionDisassembler(const Disasm: IDisassembler);
     // Thread enumeration (IDebugTarget).
     function  GetThreadIds: TArray<DWORD>;
@@ -679,6 +751,9 @@ function DropAddressCollisions(const Values: TArray<TLocalValue>;
 
 implementation
 
+uses
+  System.StrUtils;   // ContainsText, for the language-handler name check
+
 const
   // Shortest identifier that may be TAIL-MATCHED against unit-qualified global
   // names. Below this the match is a coincidence: a one- or two-character name
@@ -695,6 +770,14 @@ type
     Offset:  UInt64;
     Segment: Word;
     Mode:    DWORD;  // ADDRESS_MODE enum (AddrModeFlat = 3); Delphi inserts 2-byte pad before
+  end;
+
+  // One `.pdata` entry (IMAGE_RUNTIME_FUNCTION_ENTRY). Declared here rather
+  // than beside its first user because two unrelated features decode it: the
+  // prologue reader (frame size) and the exception-step planner (scope tables).
+  PRuntimeFunctionEntry = ^TRuntimeFunctionEntry;
+  TRuntimeFunctionEntry = packed record
+    BeginAddress, EndAddress, UnwindInfoAddress: UInt32;
   end;
 
   // Matches C STACKFRAME64 (264 bytes on x64)
@@ -2319,6 +2402,459 @@ begin
   FInstrStepTrapFlag := False;
 end;
 
+{ ---------------------------------------- stepping at an exception stop ---- }
+
+function TWinDebugger.DescribeUserCodeAt(VA: UInt64; out Where: string): Boolean;
+var
+  Loc: TSourceLocation;
+begin
+  Where  := '';
+  Result := False;
+  if (VA = 0) or (FDebugInfo = nil) then
+    Exit;
+  var Rva := VAToRva(VA);
+  if not FDebugInfo.RvaToSourceLine(Rva, Loc) then
+    Exit;
+  if Loc.Line <= 0 then
+    Exit;
+  var FuncName := '';
+  FDebugInfo.RvaToFunctionName(Rva, FuncName);
+  if FuncName <> '' then
+    Where := Format('%s (%s:%d)', [FuncName, ExtractFileName(Loc.SourceFile), Loc.Line])
+  else
+    Where := Format('%s:%d', [ExtractFileName(Loc.SourceFile), Loc.Line]);
+  Result := True;
+end;
+
+function TWinDebugger.FunctionNameAt(VA: UInt64): string;
+begin
+  Result := '';
+  if (VA = 0) or (FDebugInfo = nil) then
+    Exit;
+  if not FDebugInfo.RvaToFunctionName(VAToRva(VA), Result) then
+    Result := '';
+end;
+
+// x64. The handler address is derivable EXACTLY here, and the layout is
+// documented in EH_FORMAT_NOTES.md: RUNTIME_FUNCTION (dbghelp's own .pdata
+// lookup) -> UNWIND_INFO -> language handler -> Delphi's MSVC-shaped scope
+// table -> per-entry finally funclet / bare except block / `on` clause table.
+//
+// Two rules from that document are load-bearing and are enforced below rather
+// than assumed:
+//   * the scope table is decoded ONLY when the language handler really is
+//     Delphi's _DelphiExceptionHandler. Under MSVC's __C_specific_handler the
+//     same field is a FILTER FUNCTION and the decode yields confident nonsense;
+//   * a breakpoint is planted only on a decoded BLOCK address, never on a
+//     scope entry's Handler field -- when that field is a clause-table RVA an
+//     $CC written there overwrites the clause COUNT and derails dispatch.
+function TWinDebugger.PlanExceptionStep(Tid: DWORD;
+  out Plan: TExceptionStepPlan; out RefusalReason: string): Boolean;
+const
+  MAX_FRAMES          = 30;
+  UNW_FLAG_EHANDLER   = $01;
+  UNW_FLAG_UHANDLER   = $02;
+  UNW_FLAG_CHAININFO  = $04;
+  MAX_CHAIN_DEPTH     = 4;
+  MAX_SCOPE_ENTRIES   = 256;
+  MAX_CLAUSES         = 64;
+type
+  // What one frame turned out to be. `fvPassThrough` is the common case: the
+  // routine declares no handler covering its PC, so the exception cannot stop
+  // there and the walk continues. `fvOpaque` is a frame that CAN receive it but
+  // whose landing we cannot prove -- the walk stops and the step refuses.
+  TFrameVerdict = (fvPassThrough, fvHandles, fvOpaque);
+var
+  Blocks:   TArray<UInt64>;
+  Describe: string;
+  Why:      string;
+
+  function ReadU32At(VA: UInt64; out Value: UInt32): Boolean;
+  begin
+    Value  := 0;
+    Result := ReadProcessMemoryAt(VA, @Value, SizeOf(Value));
+  end;
+
+  procedure NoteBlock(VA: UInt64; const Kind, Where: string);
+  begin
+    for var Existing in Blocks do
+      if Existing = VA then
+        Exit;
+    Blocks := Blocks + [VA];
+    if Describe = '' then
+      Describe := Format('%s in %s', [Kind, Where])
+    else
+      Describe := Describe + Format(', %s in %s', [Kind, Where]);
+  end;
+
+  // DWORD Count; Count x { DWORD ClassVmtRva; DWORD BlockRva }. Every clause's
+  // block is planted, not just the matching one: only the matching clause ever
+  // executes, so letting the first hit win is exact, while re-deriving Delphi's
+  // class matching (ancestors, re-raise, interfaces) here would be a second
+  // implementation of it -- and a wrong match plants in a block that never runs,
+  // which reads as a step that hung.
+  function DecodeClauseTable(ModBase: UInt64; TableRva: UInt32): Boolean;
+  begin
+    Result := False;
+    var Count: UInt32;
+    if not ReadU32At(ModBase + TableRva, Count) then
+      Exit;
+    if (Count = 0) or (Count > MAX_CLAUSES) then
+      Exit;
+    for var I := 0 to Integer(Count) - 1 do begin
+      var Pair: array[0..1] of UInt32;
+      if not ReadProcessMemoryAt(ModBase + TableRva + 4 + UInt64(I) * 8,
+               @Pair[0], SizeOf(Pair)) then
+        Exit;
+      var Where: string;
+      if not DescribeUserCodeAt(ModBase + Pair[1], Where) then
+        Exit;
+      NoteBlock(ModBase + Pair[1], 'except', Where);
+      Result := True;
+    end;
+  end;
+
+  // The entries of ONE function's scope table that cover FrameRva. More than one
+  // covers it when the routine nests a try inside another try; every covering
+  // entry's block is planted and the innermost simply gets there first, so no
+  // assumption about the table's ordering is needed.
+  function DecodeScopeTable(ModBase: UInt64; TableRva: UInt32;
+    FuncBeginRva, FuncEndRva, FrameRva: UInt32): TFrameVerdict;
+  begin
+    var Count: UInt32;
+    if not ReadU32At(ModBase + TableRva, Count) then
+      Exit(fvOpaque);
+    if (Count = 0) or (Count > MAX_SCOPE_ENTRIES) then begin
+      Why := Format('its Delphi scope table at $%x declares an implausible entry ' +
+        'count (%d)', [ModBase + TableRva, Count]);
+      Exit(fvOpaque);
+    end;
+    Result := fvPassThrough;
+    for var I := 0 to Integer(Count) - 1 do begin
+      var E: array[0..3] of UInt32;    // Begin, End, Handler, Target
+      if not ReadProcessMemoryAt(ModBase + TableRva + 4 + UInt64(I) * 16,
+               @E[0], SizeOf(E)) then begin
+        Why := Format('entry %d of its Delphi scope table at $%x could not be read',
+          [I, ModBase + TableRva]);
+        Exit(fvOpaque);
+      end;
+      // A protected range must lie inside the function the unwind info belongs
+      // to. Anything else means this is not the table shape we think it is.
+      if (E[0] >= E[1]) or (E[0] < FuncBeginRva) or (E[1] > FuncEndRva) then begin
+        Why := Format('entry %d of its Delphi scope table at $%x is not a protected ' +
+          'range inside the routine ($%x..$%x)',
+          [I, ModBase + TableRva, E[0], E[1]]);
+        Exit(fvOpaque);
+      end;
+      if (FrameRva < E[0]) or (FrameRva >= E[1]) then
+        Continue;
+      var Where: string;
+      if E[2] = 0 then begin
+        // try/finally: Target is the finally funclet.
+        if not DescribeUserCodeAt(ModBase + E[3], Where) then begin
+          Why := Format('the finally funclet its scope table names ($%x) does not map ' +
+            'to a source line', [ModBase + E[3]]);
+          Exit(fvOpaque);
+        end;
+        NoteBlock(ModBase + E[3], 'finally', Where);
+        Result := fvHandles;
+      end
+      else if E[2] <= 2 then begin
+        // A bare `except` with no `on` clause: Handler is a flag, not an RVA,
+        // and Target is the block itself.
+        if not DescribeUserCodeAt(ModBase + E[3], Where) then begin
+          Why := Format('the except block its scope table names ($%x) does not map ' +
+            'to a source line', [ModBase + E[3]]);
+          Exit(fvOpaque);
+        end;
+        NoteBlock(ModBase + E[3], 'except', Where);
+        Result := fvHandles;
+      end
+      else begin
+        if not DecodeClauseTable(ModBase, E[2]) then begin
+          Why := Format('the `on`-clause table its scope table names ($%x) does not ' +
+            'decode into block addresses that map to source lines', [ModBase + E[2]]);
+          Exit(fvOpaque);
+        end;
+        // Some entries carry BOTH a clause table and a Target block.
+        if (E[3] <> 0) and DescribeUserCodeAt(ModBase + E[3], Where) then
+          NoteBlock(ModBase + E[3], 'except', Where);
+        Result := fvHandles;
+      end;
+    end;
+  end;
+
+  function DecodeUnwindInfo(ModBase: UInt64; UnwindRva, FuncBeginRva,
+    FuncEndRva, FrameRva: UInt32; Depth: Integer): TFrameVerdict;
+  begin
+    if Depth > MAX_CHAIN_DEPTH then begin
+      Why := 'its UNWIND_INFO chain is deeper than this debugger follows';
+      Exit(fvOpaque);
+    end;
+    var Hdr: array[0..3] of Byte;
+    if not ReadProcessMemoryAt(ModBase + UnwindRva, @Hdr[0], SizeOf(Hdr)) then begin
+      Why := Format('its UNWIND_INFO at $%x could not be read', [ModBase + UnwindRva]);
+      Exit(fvOpaque);
+    end;
+    var Version := Hdr[0] and 7;
+    if (Version <> 1) and (Version <> 2) then begin
+      Why := Format('its UNWIND_INFO at $%x declares version %d, which this debugger ' +
+        'does not decode', [ModBase + UnwindRva, Version]);
+      Exit(fvOpaque);
+    end;
+    var Flags := Hdr[0] shr 3;
+    // The UNWIND_CODE array is padded to an EVEN number of 2-byte slots; the
+    // handler RVA and its data follow it.
+    var Slots   := (Integer(Hdr[2]) + 1) and not 1;
+    var TailRva := UnwindRva + 4 + UInt32(Slots) * 2;
+
+    if (Flags and (UNW_FLAG_EHANDLER or UNW_FLAG_UHANDLER)) <> 0 then begin
+      var HandlerRva: UInt32;
+      if not ReadU32At(ModBase + TailRva, HandlerRva) then begin
+        Why := 'its language-handler RVA could not be read';
+        Exit(fvOpaque);
+      end;
+      var HandlerName := '';
+      if FDebugInfo <> nil then
+        FDebugInfo.RvaToFunctionName(VAToRva(ModBase + HandlerRva), HandlerName);
+      if not ContainsText(HandlerName, 'DelphiExceptionHandler') then begin
+        var Named := HandlerName;
+        if Named = '' then
+          Named := 'an unnamed routine';
+        Why := Format('its language handler at $%x is %s, not Delphi''s ' +
+          '_DelphiExceptionHandler, so the data after it is not a Delphi scope ' +
+          'table and decoding it would produce a confident wrong answer',
+          [ModBase + HandlerRva, Named]);
+        Exit(fvOpaque);
+      end;
+      Exit(DecodeScopeTable(ModBase, TailRva + 4, FuncBeginRva, FuncEndRva, FrameRva));
+    end;
+
+    if (Flags and UNW_FLAG_CHAININFO) <> 0 then begin
+      var Chained: TRuntimeFunctionEntry;
+      if not ReadProcessMemoryAt(ModBase + TailRva, @Chained, SizeOf(Chained)) then begin
+        Why := 'its chained RUNTIME_FUNCTION could not be read';
+        Exit(fvOpaque);
+      end;
+      Exit(DecodeUnwindInfo(ModBase, Chained.UnwindInfoAddress,
+        Chained.BeginAddress, Chained.EndAddress, FrameRva, Depth + 1));
+    end;
+
+    // No handler and no chain: this routine cannot receive the exception.
+    Result := fvPassThrough;
+  end;
+
+begin
+  Plan          := Default(TExceptionStepPlan);
+  Plan.ThreadId := Tid;
+  RefusalReason := '';
+  Blocks        := nil;
+  Describe      := '';
+  Why           := '';
+
+  var TH := ThreadHandle(Tid);
+  if TH = 0 then begin
+    RefusalReason := Format('thread %d could not be opened, so its stack cannot be ' +
+      'walked to find the handler this exception will reach', [Tid]);
+    Exit(False);
+  end;
+  EnsureSymInitialized;
+  var Ctx: TContext;
+  var SeedPc, SeedSp, SeedFp: UInt64;
+  if not FillStackWalkContext(TH, Ctx, SeedPc, SeedSp, SeedFp) then begin
+    RefusalReason := Format('the register context of thread %d could not be read, ' +
+      'so its stack cannot be walked to find the handler this exception will reach',
+      [Tid]);
+    Exit(False);
+  end;
+
+  var Walked := 0;
+  for var Raw in WalkRawFrames(TH, SeedPc, SeedSp, SeedFp, MAX_FRAMES) do begin
+    if Raw.PC = 0 then
+      Break;
+    Inc(Walked);
+    // A frame with no source line is never a landing site: the step exists to
+    // put the user in their own source, and an OS / RTL frame has none. Its own
+    // handler (typically MSVC's __C_specific_handler in ntdll or kernelbase) is
+    // therefore skipped rather than refused on -- refusing there would make the
+    // whole feature unreachable, since a Delphi raise always passes through
+    // kernelbase!RaiseException.
+    var FrameWhere: string;
+    if not DescribeUserCodeAt(Raw.PC, FrameWhere) then
+      Continue;
+    var RF: PRuntimeFunctionEntry := SymFunctionTableAccess64(FProcess, Raw.PC);
+    if RF = nil then
+      Continue;
+    var ModBase: UInt64 := SymGetModuleBase64(FProcess, Raw.PC);
+    if ModBase = 0 then
+      Continue;
+
+    Why := '';
+    // For frames above 0 the walker's PC is the RETURN address, which is the
+    // address the protected range has to cover -- the call it is about to
+    // return into is what sits inside the try.
+    var Verdict := DecodeUnwindInfo(ModBase, RF.UnwindInfoAddress,
+      RF.BeginAddress, RF.EndAddress, UInt32(Raw.PC - ModBase), 0);
+
+    if Verdict = fvPassThrough then
+      Continue;
+
+    if Verdict = fvOpaque then begin
+      if Why = '' then
+        Why := 'its exception-handling data could not be decoded';
+      RefusalReason := Format(
+        'a step at an exception stop runs to the handler that receives it. The first ' +
+        'frame that can receive this one -- %s at $%x -- cannot be decoded: %s. ' +
+        'Refusing rather than delivering the exception and guessing where it lands.',
+        [FrameWhere, Raw.PC, Why]);
+      Exit(False);
+    end;
+
+    Plan.HandlerVAs  := Blocks;
+    Plan.Description := Describe;
+    Exit(True);
+  end;
+
+  if Walked = 0 then
+    RefusalReason := Format('the stack of thread %d could not be walked, so the ' +
+      'handler this exception will reach cannot be found', [Tid])
+  else
+    RefusalReason := Format('no frame on the stack of thread %d protects the code ' +
+      'this exception came from, so there is no except or finally block to step to. ' +
+      'Continue instead: the exception is unhandled and the program''s own default ' +
+      'handling will run.', [Tid]);
+  Result := False;
+end;
+
+function TWinDebugger.StoppedOnUndeliveredException: Boolean;
+begin
+  Result := FIsStopped and (FPendingContinueStatus = DWORD(DBG_EXCEPTION_NOT_HANDLED));
+end;
+
+function TWinDebugger.LastStepNote: string;
+begin
+  Result := FLastStepNote;
+end;
+
+function TWinDebugger.StepToExceptionHandler(ThreadId: DWORD;
+  out RefusalReason: string): Boolean;
+begin
+  RefusalReason := '';
+  Result        := False;
+  if (FProcess = 0) or FHasExited then begin
+    RefusalReason := 'there is no live debuggee to step';
+    Exit;
+  end;
+  if not FIsStopped then begin
+    RefusalReason := 'the debuggee is running; stepping needs a stop';
+    Exit;
+  end;
+  if not StoppedOnUndeliveredException then begin
+    RefusalReason := 'the debuggee is not stopped on an undelivered exception';
+    Exit;
+  end;
+  var Tid := ThreadId;
+  if Tid = 0 then
+    Tid := FStoppedTid;
+  // The exception belongs to the thread that raised it, and only that thread's
+  // stack has a handler for it. Stepping "another thread" at an exception stop
+  // is not a thing that exists, so honour the request only when it names the
+  // faulting thread.
+  if (Tid <> 0) and (Tid <> FStoppedTid) then begin
+    RefusalReason := Format('the debuggee is stopped on an exception raised by thread ' +
+      '%d; a step at an exception stop follows THAT exception to its handler and ' +
+      'cannot be targeted at thread %d', [FStoppedTid, Tid]);
+    Exit;
+  end;
+  Tid := FStoppedTid;
+
+  var Plan: TExceptionStepPlan;
+  if not PlanExceptionStep(Tid, Plan, RefusalReason) then begin
+    DapLog('StepToExceptionHandler REFUSED: ' + RefusalReason);
+    Exit;
+  end;
+  if Length(Plan.HandlerVAs) = 0 then begin
+    RefusalReason := 'no handler block address could be proven for this exception';
+    DapLog('StepToExceptionHandler REFUSED: ' + RefusalReason);
+    Exit;
+  end;
+
+  var Cmd := Default(TCommand);
+  Cmd.Kind     := ckStepToHandler;
+  Cmd.ThreadId := Tid;
+  Cmd.ExcStep  := Plan;
+  PostCommand(Cmd);
+  Result := True;
+end;
+
+procedure TWinDebugger.DoStepToHandler(const Cmd: TCommand);
+begin
+  var Tid := Cmd.ThreadId;
+  if Tid = 0 then
+    Tid := FStoppedTid;
+  FIsStopped := False;
+  UnpatchBpAtRip(Tid);
+  ClearStepBps;
+
+  FStepMode        := smToHandler;
+  FExcStepVAs      := Cmd.ExcStep.HandlerVAs;
+  FExcStepTid      := Tid;
+  FExcStepFromVA   := FLastExceptionAddr;
+  FExcStepFromCode := FLastExceptionCode;
+  FExcStepDesc     := Cmd.ExcStep.Description;
+  FStepOverVA      := 0;
+  FStepResumeVA    := 0;
+  FStepResumeSP    := 0;
+  FStepRaiseArmed  := False;
+  FStepSafetyCount := 0;
+  FStepMinSP       := 0;
+  FStepHasFromLoc  := False;
+  FLastStepNote    := '';
+
+  for var VA in Cmd.ExcStep.HandlerVAs do
+    PlantStepBp(VA);
+
+  // Deliberately NOT FreezeThreadsForStep. Everything else this engine steps is
+  // a handful of instructions; this one runs the OS's exception dispatch and
+  // Delphi's unwind, which take the memory manager's locks. Freezing a thread
+  // that holds one turns a step into a process-wide deadlock. The landing is
+  // kept thread-scoped by ExcStepLandedAt instead, which is the same guard the
+  // recursion cases already use.
+  DapLog(Format('StepToExceptionHandler: tid=%d blocks=%d landing=%s',
+    [Tid, Length(Cmd.ExcStep.HandlerVAs), FExcStepDesc]));
+  // The whole mechanism: the exception has to be DELIVERED for the handler to
+  // run at all. Resuming with DBG_CONTINUE swallows it and re-executes the
+  // faulting instruction, which is the defect this step exists to fix.
+  FPendingContinueStatus := DBG_CONTINUE;
+  ReleasePendingEvent(DBG_EXCEPTION_NOT_HANDLED);
+end;
+
+function TWinDebugger.ExcStepBlock(BpVA: UInt64): Boolean;
+begin
+  Result := False;
+  if (FStepMode <> smToHandler) or (BpVA = 0) then
+    Exit;
+  for var VA in FExcStepVAs do
+    if VA = BpVA then
+      Exit(True);
+end;
+
+function TWinDebugger.ExcStepLandedAt(BpVA: UInt64; Tid: DWORD): Boolean;
+begin
+  Result := ExcStepBlock(BpVA) and (Tid = FExcStepTid);
+end;
+
+procedure TWinDebugger.EndExceptionStep;
+begin
+  ClearStepBps;
+  FStepMode        := smNone;
+  FExcStepVAs      := nil;
+  FExcStepTid      := 0;
+  FExcStepFromVA   := 0;
+  FExcStepFromCode := 0;
+  FExcStepDesc     := '';
+end;
+
 // Plant a one-shot BP at every source line of the function currently being
 // stepped over. Used only when a raise unwinds during a step-over: control
 // re-enters the function at its except/finally handler -- not at the call's
@@ -3089,9 +3625,13 @@ begin
           var ContStatus := FPendingContinueStatus;
           FIsStopped             := False;
           FPendingContinueStatus := DBG_CONTINUE;
+          FLastStepNote          := '';
           UnpatchBpAtRip;
           ReleasePendingEvent(ContStatus);
         end;
+      ckStepToHandler:
+        if FIsStopped then
+          DoStepToHandler(Cmd);
       ckStepInto: begin
         if not FIsStopped then
           Continue;
@@ -3100,8 +3640,16 @@ begin
         var StepTid := Cmd.ThreadId;
         if StepTid = 0 then
           StepTid := FStoppedTid;
+        // CONSUMED, not overwritten. A stop on an undelivered exception has this
+        // set to DBG_EXCEPTION_NOT_HANDLED, and forcing DBG_CONTINUE here
+        // SWALLOWS the exception and re-executes the faulting instruction, which
+        // raises it again -- the reported "step at an exception stop loops
+        // forever". Such a stop is routed to ckStepToHandler before it ever gets
+        // here; this keeps the invariant true for any path that does not.
+        var ContStatus := FPendingContinueStatus;
         FIsStopped             := False;
         FPendingContinueStatus := DBG_CONTINUE;
+        FLastStepNote          := '';
         UnpatchBpAtRip(StepTid);
         FStepMode        := smInto;
         FStepSafetyCount := 0;
@@ -3110,7 +3658,7 @@ begin
         FStepHasFromLoc  := FDebugInfo.RvaToSourceLine(FromRva, FStepFromLoc);
         SetTrapFlag(StepTid, True);
         FreezeThreadsForStep(StepTid);
-        ReleasePendingEvent(DBG_CONTINUE);
+        ReleasePendingEvent(ContStatus);
       end;
       ckStepOver: begin
         if not FIsStopped then
@@ -3121,8 +3669,11 @@ begin
         var StepTid := Cmd.ThreadId;
         if StepTid = 0 then
           StepTid := FStoppedTid;
+        // Consumed, not overwritten -- see ckStepInto.
+        var ContStatus := FPendingContinueStatus;
         FIsStopped             := False;
         FPendingContinueStatus := DBG_CONTINUE;
+        FLastStepNote          := '';
         UnpatchBpAtRip(StepTid);
         FreezeThreadsForStep(StepTid);
         var RIP := CurrentRIP(StepTid);
@@ -3163,7 +3714,7 @@ begin
             FStepSafetyCount := 0;
             FStepMinSP       := 0;
             SetTrapFlag(StepTid, True);
-            ReleasePendingEvent(DBG_CONTINUE);
+            ReleasePendingEvent(ContStatus);
             Exit;
           end;
         end;
@@ -3185,7 +3736,7 @@ begin
             PlantInt3(BP);
             FBreakpoints.Add(BP);
           end;
-          ReleasePendingEvent(DBG_CONTINUE);
+          ReleasePendingEvent(ContStatus);
           Exit;
         end;
 
@@ -3193,7 +3744,7 @@ begin
         FStepMode  := smInto;
         FStepMinSP := 0;
         SetTrapFlag(StepTid, True);
-        ReleasePendingEvent(DBG_CONTINUE);
+        ReleasePendingEvent(ContStatus);
       end;
       ckStepInstruction:
         // Already decided (and already refused, if it had to be) on the
@@ -3213,8 +3764,11 @@ begin
         var StepTid := Cmd.ThreadId;
         if StepTid = 0 then
           StepTid := FStoppedTid;
+        // Consumed, not overwritten -- see ckStepInto.
+        var ContStatus := FPendingContinueStatus;
         FIsStopped             := False;
         FPendingContinueStatus := DBG_CONTINUE;
+        FLastStepNote          := '';
         UnpatchBpAtRip(StepTid);
         FreezeThreadsForStep(StepTid);
         var RetAddr := CallerReturnAddress(StepTid);
@@ -3238,7 +3792,7 @@ begin
             PlantInt3(BP);
             FBreakpoints.Add(BP);
           end;
-          ReleasePendingEvent(DBG_CONTINUE);
+          ReleasePendingEvent(ContStatus);
           Exit;
         end;
         // Fallback: single-step out of the frame. Better than nothing when unwind
@@ -3253,7 +3807,7 @@ begin
         var FromRva      := VAToRva(CurrentRIP(StepTid));
         FStepHasFromLoc  := FDebugInfo.RvaToSourceLine(FromRva, FStepFromLoc);
         SetTrapFlag(StepTid, True);
-        ReleasePendingEvent(DBG_CONTINUE);
+        ReleasePendingEvent(ContStatus);
       end;
       ckPause:
         if (FProcess <> 0) and not FIsStopped then begin
@@ -3834,6 +4388,24 @@ begin
           ReportStopped(srStep, BpVA);
           Exit;
         end;
+        // Step at an exception stop: a one-shot planted on a PROVEN handler
+        // block fired, which means the exception really did reach that block.
+        // Nothing else can end this step -- it has no line condition and no
+        // trap flag.
+        if ExcStepBlock(BpVA) then begin
+          if not ExcStepLandedAt(BpVA, Ev.dwThreadId) then begin
+            // Another thread reached the same block with its own exception.
+            // Threads are deliberately NOT frozen for this step (the unwind
+            // takes the memory manager's locks), so this is reachable and must
+            // leave the step armed for the thread that owns it.
+            RearmStepBpAfterForeignHit(BpVA, Ev.dwThreadId);
+            ContinueDebugEvent(Ev.dwProcessId, Ev.dwThreadId, DBG_CONTINUE);
+            Exit;
+          end;
+          EndExceptionStep;
+          ReportStopped(srStep, BpVA);
+          Exit;
+        end;
         // Range-based step-over: a transient step BP fired.
         var IsStepBp := False;
         for var SV in FStepBpVAs do
@@ -3915,8 +4487,12 @@ begin
         // address, so PlantStepBp left it alone and the hit arrives here instead
         // of on the one-shot path. Same landing, same guards.
         var InstrStepLanded := InstrStepLandedAt(BpVA, Ev.dwThreadId);
+        // The same, for a step to an exception handler whose block already
+        // carried a user breakpoint: PlantStepBp leaves an occupied address
+        // alone, so the hit arrives here. The landing is the same one.
+        var ExcStepLanded := ExcStepLandedAt(BpVA, Ev.dwThreadId);
         var ShouldStop := True;
-        if Assigned(FOnBpHit) and not InstrStepLanded and not (
+        if Assigned(FOnBpHit) and not InstrStepLanded and not ExcStepLanded and not (
             (FStepMode in [smOver, smOut]) and (BpVA = FStepOverVA)) then
           ShouldStop := FOnBpHit(BP);
         if not ShouldStop then begin
@@ -3925,6 +4501,9 @@ begin
         end;
         if InstrStepLanded then begin
           EndInstructionStep;
+          ReportStopped(srStep, BpVA);
+        end else if ExcStepLanded then begin
+          EndExceptionStep;
           ReportStopped(srStep, BpVA);
         end else if (FStepMode in [smOver, smOut]) and (BpVA = FStepOverVA) then begin
           FStepOverVA := 0;
@@ -4315,6 +4894,25 @@ begin
         // address, its one-shot can only fire somewhere unrelated.
         if FStepMode = smInstr then
           EndInstructionStep;
+        // A step to the handler was in flight and an exception arrived instead
+        // of the handler block. Either way the step is over -- its one-shots
+        // must not survive into later execution. When it is the SAME exception
+        // at the SAME address, the step made NO progress, and saying so once is
+        // the whole difference between this and the reported symptom, where the
+        // same exception refired forever with nothing naming the cause.
+        if FStepMode = smToHandler then begin
+          if (Code = FExcStepFromCode) and (ExcAddr = FExcStepFromVA) then begin
+            FLastStepNote := Format('the step to %s made no progress: %s re-fired at ' +
+              'the same address ($%x). The step has been abandoned; the handler was ' +
+              'not reached.', [FExcStepDesc, ExcClass, ExcAddr]);
+            if Assigned(FOnOutput) then
+              FOnOutput('[Step] ' + FLastStepNote);
+            DapLog('StepToExceptionHandler ABANDONED: ' + FLastStepNote);
+          end;
+          EndExceptionStep;
+        end;
+        FLastExceptionAddr := ExcAddr;
+        FLastExceptionCode := Code;
         ReportStopped(srException, ExcAddr);
         // Keep the exception pending so the program's own try/except handles it.
         // FPendingContinueStatus is also set here so ckContinue/step use the right status.
@@ -5962,12 +6560,6 @@ begin
   if Result >= ExtraBytes then
     Dec(Result, ExtraBytes);
 end;
-
-type
-  PRuntimeFunctionEntry = ^TRuntimeFunctionEntry;
-  TRuntimeFunctionEntry = packed record
-    BeginAddress, EndAddress, UnwindInfoAddress: UInt32;
-  end;
 
 const
   // UNWIND_OPCODE values (winnt.h).
