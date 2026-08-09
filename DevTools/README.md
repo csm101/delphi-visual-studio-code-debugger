@@ -248,6 +248,31 @@ an unreadable link, an unrecognised thunk encoding, a gate that rejected the
 value, or a stale build — and printing each link tells them apart instead of
 leaving one guess per attempt.
 
+#### ExceptionStopProbe
+
+```bat
+rem The ordinary Delphi raise path
+DevTools\Win64\Debug\ExceptionStopProbe.exe ^
+  DebuggerTests\TestTarget\Win64\Debug\TestTarget.exe ^
+  DebuggerTests\TestTarget -args "--run-deep-nested-raise" -frames 4
+
+rem A hardware fault inside OS code (works against the Win32 build too)
+DevTools\Win64\Debug\ExceptionStopProbe.exe ^
+  DebuggerTests\TestTarget\Win32\Debug\NoSourceStop.exe ^
+  DebuggerTests\TestTarget -args "-os"
+```
+
+Drives a real `TDebugSession` to the FIRST exception stop and prints, side by
+side, the three answers a stop has to keep apart: the RAW walk (every frame the
+engine produced), the REPORTED stack (after the raise-plumbing trim), the locals
+served with no frame selected, and the locals of each of the first N frames when
+one IS selected.
+
+"The exception stopped on the wrong frame" and "the locals came from the wrong
+frame" look identical from a failing assertion and have different causes; this
+is the view that tells them apart. `-filters` takes the same wire names as the
+launch config (`delphi,av,all,unhandled`; default `delphi,av,unhandled`).
+
 #### Td32AliasProbe
 
 ```bat
@@ -985,14 +1010,95 @@ artefact of testing them differently. The adapter picks `TWinDebugger` or
 `TWin32Debugger` from the target's PE header, so the probe needs no switch of
 its own.
 
+#### ExcHandlerProbe
+
+```bat
+rem Q2: where would a one-shot breakpoint have to go to land in the user's handler?
+DevTools\Win64\Debug\ExcHandlerProbe.exe DevTools\Fixtures\Win64\Debug\ExcNestFixture.exe -plant
+DevTools\Win64\Debug\ExcHandlerProbe.exe DevTools\Fixtures\Win32\Debug\ExcNestFixture.exe -plant
+
+rem Q1: does EFLAGS.TF survive exception dispatch?  (-cont handled is the control)
+DevTools\Win64\Debug\ExcHandlerProbe.exe <target.exe> -tf -cont notHandled
+DevTools\Win64\Debug\ExcHandlerProbe.exe <target.exe> -tf -cont handled
+```
+
+Answers two questions about what a debugger can do at a **first-chance
+exception stop**, against a live debuggee through the raw Windows Debug API,
+on a native x64 target and on a WOW64 x86 target from the same 64-bit probe.
+
+| Flag | Meaning |
+|---|---|
+| `-args "<...>"` | command line handed to the debuggee |
+| `-map <file>` | explicit `.map` (default: the exe's sibling) |
+| `-code <hex>` | stop only on this exception code (default `$0EEDFADE` and `$C0000005`) |
+| `-skip N` | ignore the first N matching first-chance exceptions |
+| `-frames N` | x64 stack frames to analyse (default 12) |
+| `-tf` | arm `EFLAGS.TF` at the stop, read it back, and report the next debug event |
+| `-cont handled\|notHandled` | resume with `DBG_CONTINUE` or `DBG_EXCEPTION_NOT_HANDLED` (default) |
+| `-events N` | debug events to report after the resume (default 4) |
+| `-plant` | plant an `INT3` at every discovered candidate and report which is reached |
+| `-allscopes` | make every scope-table entry a candidate, not only the one covering the frame |
+| `-timeout MS` | `WaitForDebugEvent` timeout (default 20000) |
+
+**Q1 — the trap flag.** `-tf` sets TF on the faulting thread, reads the context
+back to prove the write took, and resumes with the chosen status. `-cont
+handled` is the control: same stop, same thread, same arming code, only the
+continue status differs, so a step there and none with `notHandled` isolates the
+dispatch path rather than the arming. Measured, two runs each:
+
+| target | exception | resume | next event |
+|---|---|---|---|
+| x64 | Delphi raise | deliver | **none** — ran to exit |
+| x64 | Delphi raise | swallow (control) | single step at the stop RIP + 5 |
+| x64 | access violation | deliver | **none** |
+| x86 WOW64 | Delphi raise | deliver | **`STATUS_WX86_SINGLE_STEP` at `ntdll32!KiUserExceptionDispatcher+1`** |
+| x86 WOW64 | Delphi raise | swallow (control) | single step at the stop EIP + 4 |
+| x86 WOW64 | access violation | deliver | **none** |
+
+**Q2 — finding the user's block.** On x64 the probe walks the stack with
+`StackWalk64`, looks up each frame's `RUNTIME_FUNCTION` in that module's
+`.pdata`, decodes `UNWIND_INFO`, and — when the language handler is Delphi's
+`_DelphiExceptionHandler` — decodes the scope table that follows the unwind
+codes. On x86 there is no `.pdata`, so it walks the `fs:[0]` registration chain
+(FS base from `Wow64GetThreadSelectorEntry`, falling back to `TEB64+$2000`
+verified through the 32-bit TEB's own `Self` field) and decodes the clause table
+that follows each `jmp @HandleOnException` stub. Every address that resolves to
+a source line through the engine's own TD32/MAP readers becomes a **candidate**;
+`-plant` then puts an `INT3` on each and reports which is actually reached,
+which is what proves the address is the user's block and not an RTL funclet.
+
+The clause-table decoding is deliberately gated on the language handler being
+Delphi's: under MSVC's `__C_specific_handler` the same field is a **filter
+function** RVA, and decoding one as the other produces confident nonsense. The
+probe prints `not decoded` for those frames (visible on the `ntdll` frame of any
+run).
+
+`DevTools\Fixtures\ExcNestFixture.dpr` is the debuggee it was written against —
+a raise inside a `try/finally` inside a `try/except`, with `-bare` and `-two`
+variants for a clause-less `except` and for two `on` clauses of which the first
+does not match. Build it with `DevTools\build_exc_fixture.bat` (both bitnesses,
+`-$O- -V -VN -VR -GD`). It is a **GUI-subsystem** app with no output, and the
+probe launches it with `CREATE_NO_WINDOW` and all three standard handles
+redirected to `NUL`: a console debuggee pops a window that steals the keyboard
+focus on every one of the dozens of launches a measurement run makes. Those
+flags are legitimate in a stand-alone probe and are **banned in the adapter** —
+an `SW_HIDE` in the adapter's own `CreateProcess` once hid the VCL main forms of
+the applications being debugged (`TRAPS.md`). Nothing in that block may be
+carried across into `DebuggerCore`.
+
+Nothing in the probe is fixture specific: every path, address and count comes
+from the command line, and it works against any executable of either bitness.
+
 ## Source layout
 
 | File | Purpose |
 |------|---------|
-| `<Tool>.dpr` | One self-contained entry point per tool; there are 45 of them and no shared units other than `RsmReader.pas` |
+| `<Tool>.dpr` | One self-contained entry point per tool; there are 48 of them and no shared units other than `RsmReader.pas` |
+| `Fixtures\*.dpr` | Debuggees, not tools. In a subfolder so `build_all.bat`'s `*.dpr` discovery does not pick them up, and built with their own script because they need full debug info |
 | `RsmReader.pas` | Standalone binary RSM analyzer, used only by `RsmAnalyzer` (separate from `DebuggerCore\RsmFileReader.pas`, which is the parser the adapter actually ships) |
 | `build_all.bat` | Builds every `*.dpr` in this folder |
 | `build_one.bat` | Builds a single tool, optionally into a private output directory |
+| `build_exc_fixture.bat` | Builds `Fixtures\ExcNestFixture.dpr` for both bitnesses with full debug info, for `ExcHandlerProbe` |
 | `build_wow64stackprobe.bat` | Builds only `Wow64StackProbe` (64-bit by construction: the probe *is* the 64-bit debugger side) |
 | `run_wow64probe.bat` | Runs `Wow64StackProbe` with its output tee'd to a log file |
 | `run_disasm_coverage.bat` | Runs `DisasmCoverage` with the Visual Studio toolset initialised first, so `dumpbin.exe` is on `PATH` |
