@@ -476,12 +476,16 @@ both cases. Measured, independently, twice (a DAP session and
 either scenario does **not** reach a sourceless frame at all — frame 0 resolves
 to the CALLING Delphi frame (real source, real line), not the true fault
 address, even though the exception EVENT's own `ExceptionAddress` is correct.
-Full writeup: `KNOWN_UNKNOWNS.md`, "An exception stop's frame 0 does not
-reliably resolve to the true faulting address in code with no debug info";
-`TRAPS.md` carries the operational warning. This is a pre-existing property of
-`TWinDebugger.GetStackFrames` for exception stops, unrelated to this increment
-and not fixed here — the root cause was not found within the time spent
-investigating it, and deciding whether/how to fix it is a separate task.
+
+**Resolved afterwards, in a separate task.** The stack walker was right the
+whole time: `TSourceResolver.TrimRaisePlumbing` was deleting every leading frame
+whose source could not be opened, and the trimmed array was assigned to
+`FLastFrames`, so the faulting frame was not hidden, it was gone.
+`NoSourceStop.exe -os` now reports the faulting `ntdll` frame at index 0 on both
+bitnesses. See `DAP_DEBUGGER_ARCHITECTURE.md`, "Frames versus the active frame",
+and the `TRAPS.md` entry that replaced the old warning. The paragraph below
+records what was true when increment 5 was written and why its tests were built
+the way they were; the constraint no longer applies.
 
 Because of this, the increment's tests use the ALREADY-PROVEN sourceless-frame
 path instead (`Test_SourcelessFrame_HasPlaceholderDocument`'s parked-worker-thread

@@ -31,6 +31,13 @@ uses
   SourceResolver,
   VariableExpander, BreakpointEval, ExceptionRules, ValueEncoders, DapProtocol;
 
+const
+  // Frame index meaning "the caller has no opinion -- use the session's default
+  // frame". Distinct from 0, which is a request for the TOP frame and is just as
+  // explicit as any other index. A frontend that received no frame from its
+  // client passes this; one that received a frame passes the frame.
+  DEFAULT_FRAME_INDEX = -1;
+
 type
   TSessionStoppedEvent = procedure(const Info: TStopInfo) of object;
   TSessionExitedEvent  = procedure(ExitCode: Integer) of object;
@@ -67,9 +74,14 @@ type
     FStoppedOnException: Boolean;
     FStopReason:         TStopReason;
     FStopTid:            Cardinal;
-    // True while a NON-top call-stack frame is explicitly selected (SelectFrame).
-    // Guards the exception-stop locals auto-retarget so an explicit selection wins.
+    // True while a call-stack frame is explicitly selected (SelectFrame).
+    // Guards the DEFAULT frame below, so an explicit selection always wins.
     FFrameSelected:      Boolean;
+    // Index into FLastFrames of the frame the session serves when the client has
+    // selected none. See DefaultFrameIndexFor for what decides it, and
+    // DAP_DEBUGGER_ARCHITECTURE.md "Frames versus the active frame" for why the
+    // set of frames and the frame locals come from are two different questions.
+    FDefaultFrameIndex:  Integer;
     FExePath:            string;
     FMapPath:            string;
     FRsmPath:            string;
@@ -166,6 +178,23 @@ type
     procedure ReleaseSymbolProviders;
     function  ResolveEffectiveStop(const SourceFile: string; SourceLine: Integer;
                 out EffFile: string; out EffLine: Integer): Boolean;
+    // The single place the reported-frame cache is replaced. The cache, the
+    // thread it belongs to and the DEFAULT frame index are one fact in three
+    // fields, and every path that re-walks the stack must leave all three
+    // agreeing -- an out-of-date default indexes a frame from a previous walk.
+    procedure SetLastFrames(const Frames: TArray<TStackFrame>; Tid: Cardinal);
+    // Which frame locals / evaluate resolve against when the client selected
+    // none. 0 for an ordinary stop: the stopped RIP IS the frame of interest.
+    // At an EXCEPTION stop it is the first frame that has a source file --
+    // the stopped RIP is then inside whatever raised or faulted (RTL raise
+    // plumbing, or OS code that took the fault), which has no user locals,
+    // while the frame that does is further down the same stack.
+    function  DefaultFrameIndexFor(const Frames: TArray<TStackFrame>): Integer;
+    // Points the engine at FLastFrames[FDefaultFrameIndex] without marking a
+    // selection, so a later explicit SelectFrame still wins. False when the
+    // default frame cannot carry locals (no frame pointer) -- the caller then
+    // leaves the engine on the raw stopped context rather than guessing.
+    function  ApplyDefaultFrame: Boolean;
     function  FrameToSession(const F: TStackFrame; Index: Integer): TSessionFrame;
     function  LocalToSession(const LV: TLocalValue): TSessionVariable;
     // Closure body support (increment B1b): when stopped inside an anonymous method
@@ -412,10 +441,16 @@ type
     function  GetStoppedThreadId: Cardinal;
 
     // Frame selection: re-root GetLocals/Evaluate/GetVariable on a caller frame.
-    // SelectFrame(0) or ClearFrame restores the stopped top frame. A selected
+    // ClearFrame drops the selection and restores the DEFAULT frame. A selected
     // frame MUST be cleared within the same request cycle -- the engine's active
     // frame is global and is cleared on the next stop, so leaving it set across a
     // resume silently reads the wrong frame's locals.
+    //
+    // Every index is an EXPLICIT selection, index 0 included, and an explicit
+    // selection always beats DefaultFrameIndex: a client that asks for the
+    // frame the fault happened in gets THAT frame -- empty locals and all --
+    // rather than a helpful substitute it did not ask for. Pass
+    // DEFAULT_FRAME_INDEX to mean "no opinion, use the session's default".
     procedure SelectFrame(Index: Integer); overload;
     // Select frame Index OF THREAD ThreadId. A frame index is only meaningful
     // together with its thread, so when ThreadId is not the thread the frame
@@ -423,6 +458,11 @@ type
     // "whatever the cache already holds" (the plain overload).
     procedure SelectFrame(Index: Integer; ThreadId: Cardinal); overload;
     procedure ClearFrame;
+    // Index into the frames GetCallStack last reported that locals / evaluate
+    // resolve against when no frame is explicitly selected. Always 0 except at
+    // an exception stop; a frontend can use it to show the user WHICH frame it
+    // answered for. Valid for the current stop only.
+    property  DefaultFrameIndex: Integer read FDefaultFrameIndex;
 
     // Registers (stopped thread).
     function  GetRegisters: TArray<TRegisterValue>;
@@ -1640,6 +1680,64 @@ begin
   FBpVerified.Clear;
 end;
 
+function TDebugSession.DefaultFrameIndexFor(
+  const Frames: TArray<TStackFrame>): Integer;
+begin
+  // An ordinary stop is where the user put it: the stopped RIP is the answer.
+  Result := 0;
+  if not FStoppedOnException then
+    Exit;
+  // An exception stop is not. The thread is parked wherever the exception was
+  // delivered -- inside the RTL's raise machinery for a Delphi `raise`, inside
+  // OS code for a hardware fault -- and none of that has user locals. The frame
+  // that does is the nearest one BELOW it with a source file, and "has a source
+  // file" is a property of the frame, not a guess about intent.
+  //
+  // Note what this deliberately does NOT do: it does not remove the frames above
+  // it. The fault frame stays in the call stack, because it is the one thing the
+  // user opened the debugger for; it simply is not where locals come from.
+  for var I := 0 to High(Frames) do
+    if Frames[I].SourceFile <> '' then
+      Exit(I);
+  // No frame has source at all. Answering with the top frame is honest -- it is
+  // the frame the thread is actually in -- and it is what an ordinary stop does.
+end;
+
+procedure TDebugSession.SetLastFrames(const Frames: TArray<TStackFrame>;
+  Tid: Cardinal);
+begin
+  FLastFrames    := Frames;
+  FLastFramesTid := Tid;
+  // A default frame only means anything for the STOPPED thread: it exists
+  // because that thread's top frame can be the raise/fault site rather than the
+  // code that has the locals. Another thread's walk has no such top frame, and
+  // its frame 0 is a perfectly ordinary frame.
+  if Tid = FStopTid then
+    FDefaultFrameIndex := DefaultFrameIndexFor(Frames)
+  else
+    FDefaultFrameIndex := 0;
+end;
+
+function TDebugSession.ApplyDefaultFrame: Boolean;
+begin
+  Result := False;
+  if FDebugger = nil then
+    Exit;
+  if Length(FLastFrames) = 0 then
+    GetCallStack;   // fills the cache AND recomputes the default index
+  var Idx := FDefaultFrameIndex;
+  if (Idx <= 0) or (Idx > High(FLastFrames)) then
+    Exit;           // index 0 needs no retarget: it IS the stopped context
+  // A frame with no frame pointer cannot have its locals decoded. Leaving the
+  // engine on the raw stopped context is a refusal; pointing it at a frame whose
+  // base is unknown would decode SOMETHING at a wrong address and present it.
+  if FLastFrames[Idx].FrameRBP = 0 then
+    Exit;
+  FDebugger.SetActiveFrame(FLastFrames[Idx].FrameRBP, FLastFrames[Idx].FuncEntryVA,
+    FLastFrames[Idx].FunctionName, FLastFrames[Idx].IP);
+  Result := True;
+end;
+
 function TDebugSession.ResolveEffectiveStop(const SourceFile: string;
   SourceLine: Integer; out EffFile: string; out EffLine: Integer): Boolean;
 begin
@@ -1650,8 +1748,7 @@ begin
     Exit;
   // Exception raised in RTL plumbing: walk to the first frame with source.
   var Frames := FResolver.TrimRaisePlumbing(FDebugger.GetStackFrames, FStoppedOnException);
-  FLastFrames    := Frames;
-  FLastFramesTid := FStopTid;
+  SetLastFrames(Frames, FStopTid);
   for var F in Frames do
     if F.SourceFile <> '' then begin
       EffFile := F.SourceFile;
@@ -1668,7 +1765,10 @@ begin
   if FDebugger <> nil then
     FDebugger.ClearActiveFrame;
   SetLength(FLastFrames, 0);
-  FLastFramesTid := 0;
+  FLastFramesTid     := 0;
+  // Recomputed by SetLastFrames as soon as this stop's stack is walked, which
+  // happens below in ResolveEffectiveStop or at the first GetCallStack.
+  FDefaultFrameIndex := 0;
   FExpander.Reset;             // expansion handles are valid only within a stop
   FStoppedOnException := Reason = srException;
   FStopReason := Reason;
@@ -1685,6 +1785,15 @@ begin
 
   SetState(dsStopped);
   Inc(FStopGeneration);
+
+  // Settle the DEFAULT frame here, at the stop, rather than letting each
+  // consumer work it out: DAP, MCP and the session API must all answer for the
+  // same frame, and a rule re-derived in three places is a rule that drifts.
+  // Only an exception stop can need it (see DefaultFrameIndexFor), and only
+  // when the stack has not already been walked above -- an ordinary stop pays
+  // nothing. GetCallStack refuses before dsStopped, so it goes after SetState.
+  if FStoppedOnException and (Length(FLastFrames) = 0) then
+    GetCallStack;
 
   // A stop is the only moment a stack can be read, so it is the only moment a
   // frame-scoped watchpoint can be found stale. Do it BEFORE the stop is
@@ -2186,8 +2295,7 @@ begin
   if NeedRefresh then
     Frames := FDebugger.GetStackFrames;
   Frames := FResolver.TrimRaisePlumbing(Frames, FStoppedOnException);
-  FLastFrames    := Frames;
-  FLastFramesTid := FStopTid;
+  SetLastFrames(Frames, FStopTid);
   SetLength(Result, Length(Frames));
   for var I := 0 to High(Frames) do
     Result[I] := FrameToSession(Frames[I], I);
@@ -2360,26 +2468,32 @@ procedure TDebugSession.SelectFrame(Index: Integer; ThreadId: Cardinal);
 begin
   if FDebugger = nil then
     Exit;
+  // "No opinion": drop any selection and fall back to the session's default.
+  // This is what a frontend passes when its client named no frame at all, and
+  // it is the ONLY way to ask for the default -- index 0 is a request for the
+  // top frame, not an absence of one.
+  if Index = DEFAULT_FRAME_INDEX then begin
+    ClearFrame;
+    Exit;
+  end;
   // The cache holds ONE thread's frames. The client can walk another thread's
   // stack (GetCallStack(tid) deliberately does not clobber the cache) and then
   // select one of ITS frames; pairing that index with the stopped thread's cache
   // read ANOTHER thread's RBP/entry, so the Variables panel showed a complete,
   // plausible set of locals belonging to a different thread. Re-walk on mismatch.
-  if (ThreadId <> 0) and (ThreadId <> FLastFramesTid) then begin
-    FLastFrames    := FDebugger.GetStackFrames(ThreadId);
-    FLastFramesTid := ThreadId;
-  end;
+  if (ThreadId <> 0) and (ThreadId <> FLastFramesTid) then
+    SetLastFrames(FDebugger.GetStackFrames(ThreadId), ThreadId);
   // Frame 0 of the STOPPED thread normally clears the selection (the stopped RIP
   // already is that frame). For any OTHER thread frame 0 is a real, distinct
   // frame that must be selected explicitly -- clearing would silently fall back
   // to the stopped thread's top frame.
   var ForeignThread := (FLastFramesTid <> 0) and (FLastFramesTid <> FStopTid);
-  // Index refers to the frames cached by the last GetCallStack. Frame 0 (the
-  // stopped top frame) and any frame lacking an RBP clear the selection.
-  // A non-top frame is always selected explicitly. Frame 0 normally CLEARS (the
-  // stopped RIP is the top frame) -- but at an EXCEPTION stop the stopped RIP is RTL
-  // raise-plumbing, so frame 0 (the trimmed user frame that raised) must be selected
-  // explicitly for its locals / evaluate to resolve (F11).
+  // Index refers to the frames cached by the last GetCallStack. A frame lacking
+  // an RBP cannot have its locals decoded, so it clears instead. Frame 0 of the
+  // stopped thread normally clears too -- the stopped RIP already IS that frame,
+  // so there is nothing to re-root -- except at an EXCEPTION stop, where the
+  // stopped RIP is the raise/fault site and frame 0 must be pointed at
+  // explicitly for the engine to answer for IT rather than for the default.
   var Selectable := (Index >= 0) and (Index < Length(FLastFrames)) and
                     (FLastFrames[Index].FrameRBP <> 0) and
                     ((Index > 0) or FStoppedOnException or ForeignThread);
@@ -2388,9 +2502,18 @@ begin
       FLastFrames[Index].FunctionName, FLastFrames[Index].IP)
   else
     FDebugger.ClearActiveFrame;
-  // Only a NON-top selection counts as user-chosen (guards GetLocals' auto-retarget).
-  // Any frame of a foreign thread counts, including its frame 0.
-  FFrameSelected := Selectable and ((Index > 0) or ForeignThread);
+  // EVERY index the caller named counts as user-chosen, index 0 included. It
+  // used to exclude frame 0, which was harmless only while the raise-plumbing
+  // trim guaranteed frame 0 was the user's own frame; now that the fault frame
+  // survives, "the client asked for frame 0" and "the client asked for nothing"
+  // have to stay distinguishable, or a user clicking the faulting frame silently
+  // gets a different frame's locals under its name.
+  //
+  // Named-a-real-frame, not Selectable: a frame whose locals cannot be decoded
+  // (no frame pointer -- typical of OS code) must answer "none", not fall
+  // through to a frame the caller never asked for. An index the cache cannot
+  // resolve at all is not a selection and leaves the default in charge.
+  FFrameSelected := (Index >= 0) and (Index < Length(FLastFrames));
 end;
 
 procedure TDebugSession.ClearFrame;
@@ -2613,11 +2736,25 @@ begin
   Frames := FResolver.TrimRaisePlumbing(Frames, FStoppedOnException);
   if Length(Frames) = 0 then
     Exit;
-  FnName  := Frames[0].FunctionName;
-  SrcFile := FResolver.Resolve(Frames[0].SourceFile);
+
+  // WHICH FRAMES EXIST and WHICH FRAME THE SESSION ANSWERS FOR are different
+  // questions, and conflating them is what made an access violation inside ntdll
+  // report the Delphi caller as the faulting frame. The stack keeps every frame,
+  // including the fault; the location reported for the stop is the DEFAULT
+  // frame's -- the same frame locals and evaluate use, by the same rule, so the
+  // three cannot disagree about where the debugger thinks it is.
+  //
+  // At an ordinary stop that is frame 0, unchanged. At an exception stop it is
+  // the first frame with source: on a Delphi `raise` the raise site, on a
+  // hardware fault the nearest calling code, while GetCallStack still shows the
+  // fault at index 0.
+  var Chosen := DefaultFrameIndexFor(Frames);
+
+  FnName  := Frames[Chosen].FunctionName;
+  SrcFile := FResolver.Resolve(Frames[Chosen].SourceFile);
   if SrcFile = '' then
-    SrcFile := Frames[0].SourceFile;
-  Line    := Frames[0].SourceLine;
+    SrcFile := Frames[Chosen].SourceFile;
+  Line    := Frames[Chosen].SourceLine;
   Result  := True;
 end;
 
@@ -2682,20 +2819,14 @@ begin
   if (FState <> dsStopped) or (FDebugger = nil) then
     Exit;
 
-  // At an exception stop the raw stopped RIP sits in RTL raise-plumbing (no user
-  // locals), while the reported top frame is the user frame that raised. When no
-  // frame is explicitly selected, resolve locals for that trimmed top user frame
-  // so a nested proc which raised still shows its locals (F11). ClearActiveFrame
-  // in the finally keeps run-control on the raw stopped context.
-  var Retarget := FStoppedOnException and not FFrameSelected;
-  if Retarget then begin
-    if Length(FLastFrames) = 0 then
-      GetCallStack;   // populate the trimmed frame cache
-    Retarget := (Length(FLastFrames) > 0) and (FLastFrames[0].FrameRBP <> 0);
-    if Retarget then
-      FDebugger.SetActiveFrame(FLastFrames[0].FrameRBP, FLastFrames[0].FuncEntryVA,
-        FLastFrames[0].FunctionName, FLastFrames[0].IP);
-  end;
+  // At an exception stop the raw stopped RIP sits wherever the exception was
+  // delivered -- RTL raise plumbing, or OS code that took a hardware fault --
+  // and neither has user locals. With no frame explicitly selected, answer for
+  // the session's DEFAULT frame instead, so a nested proc that raised still
+  // shows its locals (F11) and an access violation inside ntdll still shows the
+  // locals of the code that called it. ClearActiveFrame in the finally keeps
+  // run-control on the raw stopped context.
+  var Retarget := FStoppedOnException and (not FFrameSelected) and ApplyDefaultFrame;
   try
     var Locals := FDebugger.GetLocalValues;
     SetLength(Result, Length(Locals));
@@ -2966,10 +3097,11 @@ end;
 
 function TDebugSession.Evaluate(const Expr: string): TSessionEvalResult;
 begin
-  // Delegate to the rich frame-scoped path (top frame): a bare Evaluate then gets
-  // the same class/handle decoration (F8) AND the exception-stop frame retarget so
-  // a local in a nested proc that raised resolves (F11). ErrorText format preserved.
-  Result := EvaluateForFrame(Expr, 0);
+  // Delegate to the rich frame-scoped path so a bare Evaluate gets the same
+  // class/handle decoration (F8). No frame was named, so it resolves against the
+  // session's DEFAULT frame -- which at an exception stop is the frame that
+  // raised or called the faulting code, not the raise/fault site itself (F11).
+  Result := EvaluateForFrame(Expr, DEFAULT_FRAME_INDEX);
 end;
 
 // Frame-scoped rich evaluate: ExprEval + the full class/VMT/nil/variant-array
@@ -3005,7 +3137,17 @@ begin
   // the indexing matches what a client would have seen.
   if (Length(FLastFrames) = 0) and (FStoppedOnException or (FrameIndex > 0)) then
     GetCallStack;
-  SelectFrame(FrameIndex, ThreadId);
+  // DEFAULT_FRAME_INDEX means the caller named no frame, which is NOT the same
+  // as naming frame 0: clearing alone would evaluate against the raw stopped
+  // context, and at an exception stop that is the raise/fault site with no user
+  // locals in scope. Point the engine at the default frame without recording a
+  // selection, so this stays overridable by an explicit one.
+  if FrameIndex = DEFAULT_FRAME_INDEX then begin
+    ClearFrame;
+    ApplyDefaultFrame;
+  end
+  else
+    SelectFrame(FrameIndex, ThreadId);
   try
     var Val: TExprValue := Default(TExprValue);
     var Display: string;

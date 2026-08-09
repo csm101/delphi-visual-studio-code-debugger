@@ -518,6 +518,20 @@ type
     [Test] procedure ExceptionFilters_ParseNames;
     [Test] procedure DeepNested_LocalsResolveAtDepth2;
     [Test] procedure DeepNested_LocalsResolveAtExceptionStop;
+    // An access violation inside OS code must stop AT the faulting frame. The
+    // raise-plumbing trim used to drop every leading frame whose source could
+    // not be opened, which for a hardware fault meant discarding the fault
+    // itself and reporting the Delphi caller as frame 0 -- the debugger throwing
+    // away the one thing it was opened for. The trim is now by NAME, so a frame
+    // that is not plumbing stops it whether or not it has source.
+    [Test] procedure ExceptionInOsCode_TopFrameIsTheFaultingFrame;
+    // The other half of the same separation: keeping every frame decides what
+    // the STACK contains, not which frame the session ANSWERS FOR. With the
+    // plumbing frames no longer discarded, frame 0 at an exception stop is the
+    // raise/fault site, so locals and evaluate resolve against the session's
+    // DEFAULT frame (the first with source) instead -- unless the client names a
+    // frame, which always wins, even when the frame it names has no locals.
+    [Test] procedure ExceptionStop_DefaultFrameServesLocals_ExplicitSelectionWins;
     [Test] procedure MainModule_NoDebugInfo_ReportsDiagnostic;
     // F23: a nameless frame used to be reported blank, so "unknown address",
     // "module without debug info" and "index still building" were the same
@@ -2358,6 +2372,193 @@ end;
 // exception inside a 2-level nested proc, not a breakpoint. This drives the target's
 // --run-deep-nested-raise scenario and asserts the nested frame's locals still
 // resolve at the raise site.
+// An AV inside ntdll must be reported AT the fault. Both bitnesses are driven
+// here rather than in a Win32 mirror, and failures are COLLECTED rather than
+// asserted per case: both executables are called NoSourceStop.exe, so a message
+// built from the file name cannot say which one failed, and a first-failure
+// abort would hide the second (TRAPS.md, "Fixture design").
+procedure TDebugSessionTests.ExceptionInOsCode_TopFrameIsTheFaultingFrame;
+
+  function FaultFrameProblem(const ExePath: string): string;
+  begin
+    var Session := TDebugSession.Create;
+    try
+      var Opts: TLaunchOptions;
+      Opts             := Default(TLaunchOptions);
+      Opts.ExePath     := ExePath;
+      Opts.Args        := '-os';
+      Opts.SourceRoot  := TargetDir;
+      Opts.StopAtEntry := True;
+      if not Session.Launch(Opts) then
+        Exit('Launch returned False');
+
+      var D0 := GetTickCount64 + 30000;
+      while (Session.State <> dsStopped) and (not Session.HasExited) and (GetTickCount64 < D0) do
+        Session.Pump;
+      Session.ContinueExecution;
+      var Deadline := GetTickCount64 + 30000;
+      while (Session.State <> dsStopped) and (not Session.HasExited) and (GetTickCount64 < Deadline) do
+        Session.Pump;
+      if Session.State <> dsStopped then
+        Exit('did not stop on the access violation');
+
+      var Frames := Session.GetCallStack;
+      if Length(Frames) = 0 then
+        Exit('the exception stop produced no frames at all');
+
+      // The fault is in ntdll (RtlMoveMemory reading address $1), so frame 0
+      // must name ntdll and carry no source. Before the fix it was the Delphi
+      // caller in NoSourceStop.exe, with source.
+      if not Frames[0].ModuleName.ToLower.Contains('ntdll') then
+        Exit(Format('frame 0 is "%s" in %s (source "%s") -- the faulting ntdll' +
+          ' frame was trimmed away', [Frames[0].FunctionName,
+          Frames[0].ModuleName, Frames[0].SourceFile]));
+
+      // And the stack below it must still reach our own code, so the trim change
+      // did not simply stop producing a usable stack.
+      var SawOurCode := False;
+      for var F in Frames do
+        if SameText(ExtractFileName(F.SourceFile), 'NoSourceStop.dpr') then
+          SawOurCode := True;
+      if not SawOurCode then
+        Exit('no frame below the fault resolves to NoSourceStop.dpr');
+
+      Result := '';
+    finally
+      Session.Terminate;
+      Session.Free;
+    end;
+  end;
+
+begin
+  var Problems: TArray<string> := nil;
+  for var Bitness in ['Win64', 'Win32'] do begin
+    var Exe := TargetDir + Bitness + '\Debug\NoSourceStop.exe';
+    Assert.IsTrue(FileExists(Exe),
+      'fixture missing: ' + Exe + ' -- run build_target.bat');
+    var Problem := FaultFrameProblem(Exe);
+    if Problem <> '' then
+      Problems := Problems + [Bitness + ': ' + Problem];
+  end;
+  Assert.IsTrue(Length(Problems) = 0,
+    'exception stop did not report the faulting frame -- ' +
+    string.Join(' | ', Problems));
+end;
+
+// Pins the frames-versus-active-frame separation at an exception stop, using the
+// ordinary Delphi `raise` path (the common case, and the one that regressed when
+// the trim stopped discarding the plumbing):
+//
+//   * the call stack still holds the frames ABOVE the raise site -- nothing is
+//     removed to make the answer convenient;
+//   * with no frame selected, locals and evaluate answer for the raising
+//     procedure, not for the RTL/OS frame the thread is parked in;
+//   * naming frame 0 explicitly answers for frame 0, empty locals included. A
+//     client that asks for the frame the exception was delivered in must not be
+//     handed a different frame's variables under that frame's name.
+//
+// Both bitnesses, failures COLLECTED: both executables are called TestTarget.exe
+// so a message built from the path cannot say which one failed, and a
+// first-failure abort would hide the second (TRAPS.md, "Fixture design").
+procedure TDebugSessionTests.ExceptionStop_DefaultFrameServesLocals_ExplicitSelectionWins;
+
+  function HasLocal(const Locals: TArray<TSessionVariable>;
+    const Name: string): Boolean;
+  begin
+    Result := False;
+    for var L in Locals do
+      if SameText(L.Name, Name) then
+        Exit(True);
+  end;
+
+  function FrameSelectionProblem(const Bitness: string): string;
+  begin
+    var Dir := TargetDir + Bitness + '\Debug\';
+    var Session := TDebugSession.Create;
+    try
+      var Opts: TLaunchOptions;
+      Opts             := Default(TLaunchOptions);
+      Opts.ExePath     := Dir + 'TestTarget.exe';
+      Opts.Args        := '--run-deep-nested-raise';
+      Opts.MapPath     := Dir + 'TestTarget.map';
+      Opts.RsmPath     := Dir + 'TestTarget.rsm';
+      Opts.SourceRoot  := TargetDir;
+      Opts.StopAtEntry := True;
+      if not Session.Launch(Opts) then
+        Exit('Launch returned False');
+
+      var D0 := GetTickCount64 + 30000;
+      while (Session.State <> dsStopped) and (not Session.HasExited) and (GetTickCount64 < D0) do
+        Session.Pump;
+      Session.ContinueExecution;
+      var Deadline := GetTickCount64 + 30000;
+      while (Session.State <> dsStopped) and (not Session.HasExited) and (GetTickCount64 < Deadline) do
+        Session.Pump;
+      if Session.State <> dsStopped then
+        Exit('did not stop on the first-chance raise');
+
+      var Frames := Session.GetCallStack;
+      var RaiseIdx := -1;
+      for var F in Frames do
+        if SameText(F.FunctionName, 'RnInner') and
+           SameText(ExtractFileName(F.SourceFile), EVAL_SOURCE) then begin
+          RaiseIdx := F.Index;
+          Break;
+        end;
+      if RaiseIdx < 0 then
+        Exit('the raising procedure RnInner is not on the reported call stack');
+      // The whole point of the change: the RTL/OS frames the exception was
+      // delivered through are still there. If RnInner were index 0 again, the
+      // trim would be discarding frames once more and the fault-frame test above
+      // would be passing for the wrong reason.
+      if RaiseIdx = 0 then
+        Exit('RnInner is frame 0 -- the frames above the raise site were discarded');
+      if Session.DefaultFrameIndex <> RaiseIdx then
+        Exit(Format('DefaultFrameIndex is %d, expected %d (the raising frame)',
+          [Session.DefaultFrameIndex, RaiseIdx]));
+
+      if not HasLocal(Session.GetLocals, 'RnInnerVal') then
+        Exit('RnInnerVal missing with no frame selected -- locals did not come ' +
+          'from the default frame');
+      // Evaluate takes the same default. A local of the RAISING procedure, not
+      // an enclosing one: the x86 nested-proc static link reaches only one level
+      // up, so `RnOuter` would fail on Win32 for a reason that has nothing to do
+      // with frame selection.
+      var Inner := Session.Evaluate('RnInnerVal');
+      if not (Inner.Success and Inner.Value.Contains('277')) then
+        Exit('evaluate with no frame did not resolve RnInnerVal: ' + Inner.Value +
+          ' / ' + Inner.ErrorText);
+
+      // Explicit beats default: frame 0 is the RTL/OS frame the raise was
+      // delivered through and has no user locals of its own.
+      Session.SelectFrame(0);
+      if HasLocal(Session.GetLocals, 'RnInnerVal') then
+        Exit('selecting frame 0 still returned the default frame''s locals');
+      Session.ClearFrame;
+      if not HasLocal(Session.GetLocals, 'RnInnerVal') then
+        Exit('ClearFrame did not restore the default frame');
+
+      Result := '';
+    finally
+      Session.Terminate;
+      Session.Free;
+    end;
+  end;
+
+begin
+  var Problems: TArray<string> := nil;
+  for var Bitness in ['Win64', 'Win32'] do begin
+    var Exe := TargetDir + Bitness + '\Debug\TestTarget.exe';
+    Assert.IsTrue(FileExists(Exe),
+      'fixture missing: ' + Exe + ' -- run build_target.bat');
+    var Problem := FrameSelectionProblem(Bitness);
+    if Problem <> '' then
+      Problems := Problems + [Bitness + ': ' + Problem];
+  end;
+  Assert.IsTrue(Length(Problems) = 0,
+    'exception-stop frame selection is wrong -- ' + string.Join(' | ', Problems));
+end;
+
 procedure TDebugSessionTests.DeepNested_LocalsResolveAtExceptionStop;
 begin
   var Session := TDebugSession.Create;

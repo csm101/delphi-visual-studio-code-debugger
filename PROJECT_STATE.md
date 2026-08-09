@@ -455,12 +455,18 @@ Call stack:
   thread blocks on a lock held by a frozen thread, the step cannot complete.
   Covered by `DebugSessionTests.PerThreadStep_StepsOnlySelectedThread` (two
   spinner threads; stepping one advances only its counter, the other stays put).
-- On an exception stop the leading RTL raise-plumbing frames (no locally
-  resolvable source: `@RaiseExcept` / `@Assert` / `AssertErrorHandler` / ...)
-  are trimmed so the call stack starts at the raise/assert site in user code.
-  `TDapServer.TrimRaisePlumbingFrames`, gated by `FStoppedOnException`; keeps
-  `FLastFrames` aligned so frameId→frame mapping for scopes/evaluate stays
-  correct. Falls back to the full stack when no frame is navigable.
+- An exception stop keeps EVERY frame, including the one the exception was
+  delivered in, and reports locals/evaluate/location for a separate DEFAULT
+  frame — the first frame with a source file. `TSourceResolver.TrimRaisePlumbing`
+  drops only frames it can NAME as raise plumbing (`@RaiseExcept` / `@Assert` /
+  `AssertErrorHandler` / ...) and never the whole stack;
+  `TDebugSession.DefaultFrameIndex` (set once per stop in `HandleTargetStopped`)
+  decides which frame answers. `SelectFrame(Index)` is explicit for every index
+  including 0 and always beats the default; `DEFAULT_FRAME_INDEX` (-1) is how a
+  frontend says its client named no frame. Full rationale:
+  `DAP_DEBUGGER_ARCHITECTURE.md`, "Frames versus the active frame". This replaced
+  an earlier trim that deleted every leading frame whose source could not be
+  opened, which discarded the faulting frame of a hardware fault outright.
 
 ## Real-world production test target
 

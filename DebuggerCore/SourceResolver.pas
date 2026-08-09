@@ -40,11 +40,24 @@ type
     // trying the bare name then the common Delphi namespace prefixes.
     function ResolveUnitToSource(const UnitName: string): string;
 
-    // Trims leading exception-raise plumbing frames (System._RaiseExcept and the
-    // like) up to the first frame whose source resolves on disk. Only trims when
-    // StoppedOnException; otherwise returns the frames unchanged.
+    // Trims the leading frames that are RTL exception-raise plumbing, by NAME,
+    // so a `raise` lands on the raise site instead of on `@RaiseExcept`. Only
+    // trims when StoppedOnException; otherwise returns the frames unchanged.
+    //
+    // The criterion used to be "drop everything above the first frame whose
+    // source resolves on disk", which conflated two different things: a frame
+    // whose source cannot be shown, and a frame that is noise. They coincide for
+    // a Delphi `raise` and diverge completely for a hardware fault -- an access
+    // violation inside ntdll or a symbol-less package had EVERY faulting frame
+    // discarded, so the debugger threw away the one thing the user opened it
+    // for. Naming the plumbing is exact; "has no source" was a guess about
+    // intent that happened to be right in one case.
     function TrimRaisePlumbing(const Frames: TArray<TStackFrame>;
       StoppedOnException: Boolean): TArray<TStackFrame>;
+    // True when the frame's function name IS one of the known raise-plumbing
+    // routines. Exact match on the last name segment, never a substring: a user
+    // routine called AssertConfig must not read as `@Assert`.
+    class function IsRaisePlumbingFrame(const FunctionName: string): Boolean; static;
   end;
 
 implementation
@@ -274,18 +287,60 @@ begin
   Result := '';
 end;
 
+class function TSourceResolver.IsRaisePlumbingFrame(
+  const FunctionName: string): Boolean;
+const
+  // The RTL routines that stand between `raise` and the raise site, plus the two
+  // OS entry points that can appear above them. Compiler-generated names carry a
+  // leading '@'; the Itanium-mangled forms drop it, so both spellings are here.
+  PLUMBING: array[0..13] of string = (
+    '@RaiseExcept', '_RaiseExcept', 'RaiseExcept',
+    '@RaiseAtExcept', '@RaiseAgain',
+    '@HandleAnyException', '@HandleFinally', '@HandleOnException',
+    '@HandleAutoException',
+    '@Assert', 'AssertErrorHandler',
+    'RaiseException', 'RtlRaiseException', 'KiUserExceptionDispatcher');
+begin
+  Result := False;
+  if FunctionName = '' then
+    Exit;
+
+  // Strip a unit qualifier (System.@RaiseExcept -> @RaiseExcept) and any
+  // trailing offset the symbolication may have appended (name+0x1C -> name).
+  var Name := FunctionName;
+  var Plus := Pos('+', Name);
+  if Plus > 0 then
+    Name := Copy(Name, 1, Plus - 1);
+  var Dot := LastDelimiter('.', Name);
+  if Dot > 0 then
+    Name := Copy(Name, Dot + 1, Length(Name) - Dot);
+  Name := Trim(Name);
+
+  for var Candidate in PLUMBING do
+    if SameText(Name, Candidate) then
+      Exit(True);
+end;
+
 function TSourceResolver.TrimRaisePlumbing(const Frames: TArray<TStackFrame>;
   StoppedOnException: Boolean): TArray<TStackFrame>;
 begin
   Result := Frames;
   if not StoppedOnException then
     Exit;
-  for var I := 0 to High(Frames) do
-    if (Frames[I].SourceFile <> '') and (Resolve(Frames[I].SourceFile) <> '') then begin
-      if I > 0 then
-        Result := Copy(Frames, I, Length(Frames) - I);
-      Exit;
-    end;
+
+  // Drop leading frames only while they are NAMED plumbing. The first frame that
+  // is not stops the trim, whether or not its source can be shown -- on a
+  // hardware fault that frame is the fault itself, and it is the answer.
+  var I := 0;
+  while (I <= High(Frames)) and IsRaisePlumbingFrame(Frames[I].FunctionName) do
+    Inc(I);
+
+  // Never trim the whole stack: a stack made entirely of plumbing is a stack we
+  // do not understand, and showing all of it beats showing none of it.
+  if (I = 0) or (I > High(Frames)) then
+    Exit;
+
+  Result := Copy(Frames, I, Length(Frames) - I);
 end;
 
 function TSourceResolver.ResolveUnitToSource(const UnitName: string): string;

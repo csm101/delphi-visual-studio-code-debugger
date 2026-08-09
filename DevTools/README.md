@@ -273,6 +273,11 @@ frame" look identical from a failing assertion and have different causes; this
 is the view that tells them apart. `-filters` takes the same wire names as the
 launch config (`delphi,av,all,unhandled`; default `delphi,av,unhandled`).
 
+Not a duplicate of `ExcHandlerProbe`: that one measures where an exception is
+DISPATCHED to (scope tables, handler funclets, whether the trap flag survives
+delivery), this one measures what the session REPORTS at the stop — the stack,
+the default frame, and the locals each frame yields.
+
 #### Td32AliasProbe
 
 ```bat

@@ -264,24 +264,25 @@ absurdly.
 
 ## Engine and language gotchas
 
-- **An exception stop's frame 0 is not proven to equal the true faulting
-  address when the fault is in code with no debug info.** Measured twice
-  independently (a DAP session AND `DevTools\LiveSessionProbe` driving
-  `TDebugSession` directly, so not a wire/JSON artifact) against
-  `DebuggerTests\TestTarget\NoSourceStop.dpr`: the exception EVENT's own
-  `ExceptionAddress` is correct (confirmed by the `EAccessViolation` message
-  text built from it), but the STACK TRACE reported for that same stop
-  resolves frame 0 to the CALLING Delphi frame instead — real source, real
-  line, ~0x1FE00+ bytes away from the true fault. `TWinDebugger.
-  GetStackFrames` explicitly forces frame 0's IP to the freshly-read
-  `GetThreadContext` RIP, which by the code's own contract should make this
-  impossible; root cause NOT FOUND (see `KNOWN_UNKNOWNS.md`, "An exception
-  stop's frame 0..."). Do not trust a stack trace taken at an exception stop
-  in unsymbolicated code without re-verifying against the exception event's
-  own address first. Do not use `NoSourceStop.dpr`'s exception scenarios to
-  reach a sourceless placeholder frame — they don't; use the parked-worker
-  fixture (`Test_SourcelessFrame_HasPlaceholderDocument`,
-  `PlaceholderDisassemblyTests.pas`) instead.
+- **When a reported stop disagrees with the exception event's own address, suspect
+  the REPORTING layer before the stack walker.** An exception stop in code with no
+  debug info was reported at the CALLING Delphi frame — real source, real line,
+  ~0x1FE00 bytes from the true fault — while the exception event's own
+  `ExceptionAddress` was correct. That looked like a stack-walk defect, and
+  `TWinDebugger.GetStackFrames` (which forces frame 0's IP to the freshly-read
+  `GetThreadContext` RIP) was traced at length on that assumption. The walker was
+  right the whole time: `TSourceResolver.TrimRaisePlumbing` was dropping every
+  leading frame whose source could not be opened, and the trimmed array was
+  assigned to `FLastFrames`, so the frames were not hidden, they were gone. Read
+  what the layers ABOVE the measurement do to it before instrumenting the
+  measurement.
+- **`GetCallStack` keeps every frame; `DefaultFrameIndex` decides which one
+  answers.** These are separate on purpose (`DAP_DEBUGGER_ARCHITECTURE.md`,
+  "Frames versus the active frame"). Do not "fix" a wrong-frame answer by
+  removing frames from the stack — that is exactly the defect above. And a
+  frame index is only explicit if the CLIENT named it: `frameIndex: 0` and no
+  `frameIndex` at all mean different things at an exception stop, so test the
+  presence of the key (`Args.FindValue`), never its value.
 - **The WOW64 loader breakpoint (the process's FIRST stop, before `-rva` or a
   planted `INT3`) is NOT a representative state for measuring native-vs-WOW64
   context behaviour.** `DevTools\Wow64RegWriteProbe.dpr` measured a native

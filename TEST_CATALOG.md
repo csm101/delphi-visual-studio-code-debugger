@@ -1101,11 +1101,12 @@ sourceless frame — `TestTarget.exe
 --run-threads`, breakpoint at `THREADS_READY` (`TestTargetCore.pas`) on the
 main thread, then a `stackTrace` on the spawned worker thread, which is parked
 in `Sleep(INFINITE)` and therefore bottoms out inside ntdll/kernel32
-(`Symbols = saNoSymbols`). Deliberately NOT `NoSourceStop.dpr`: see
-`KNOWN_UNKNOWNS.md`, "An exception stop's frame 0 does not reliably resolve to
-the true faulting address..." — an exception stop on that fixture lands on a
-NAMED Delphi frame with real source, never reaching the placeholder at all, so
-it could not be used here.
+(`Symbols = saNoSymbols`). `NoSourceStop.dpr` was not used here because at the
+time an exception stop on it landed on a NAMED Delphi frame with real source,
+never reaching the placeholder — that was `TrimRaisePlumbing` discarding the
+faulting frame (fixed since; see section U and `DAP_DEBUGGER_ARCHITECTURE.md`,
+"Frames versus the active frame"), not a property of the fixture. It would work
+as a placeholder fixture today.
 
 - [x] **`Win64_WorkerParkedInNtdll_PlaceholderShowsDisassemblyWithCurrentMarker`**
       — the header still names the `saNoSymbols` reason; the disassembly
@@ -1132,16 +1133,17 @@ it could not be used here.
       a RED control.
 - [ ] **The `saLoaded` case (debug info loaded, this address not covered) runs
       through the identical `BuildPlaceholderDisassembly` code path but was
-      NOT exercised by an automated fixture** — see the `NoSourceStop.dpr`
-      finding above. Only the header's `Reason`/`Advice` text differs between
+      NOT exercised by an automated fixture** — no fixture parks a frame in a
+      module that HAS debug info at an address the info does not cover. Only the
+      header's `Reason`/`Advice` text differs between
       `saNoSymbols` and `saLoaded`, and that text is unchanged pre-increment-5
       code, unit-tested by construction of the existing `case F.Symbols of`
       branches, but the disassembly section specifically has not been observed
       rendering for a `saLoaded` frame.
 - [ ] **The per-instruction "line known, file not on disk" annotation
       (`FormatPlaceholderInstruction`'s `ResolveSourcePath` branch) is
-      implemented but not independently exercised by a test.** Neither
-      `NoSourceStop.dpr` scenario nor the parked-worker fixture surfaces a
+      implemented but not independently exercised by a test.** Neither the
+      `NoSourceStop.dpr` scenarios nor the parked-worker fixture surfaces a
       nearby instruction whose line IS known but whose file cannot be
       resolved — building a fixture for exactly that byte pattern was out of
       scope. The code path is the SAME one `disassemble`'s `BuildDapInstruction`
@@ -1157,6 +1159,59 @@ it could not be used here.
       Disasm.StatusText + '.');` is the first statement after constructing
       the disassembler, identical in shape to `HandleDisassemble`'s own
       (tested) refusal.
+
+## U. Exception stops: which frames exist vs which frame answers
+
+Three tests, covering the separation described in
+`DAP_DEBUGGER_ARCHITECTURE.md`, "Frames versus the active frame". They exist
+because one mechanism — `TSourceResolver.TrimRaisePlumbing` deleting the leading
+frames — was carrying three unrelated responsibilities at once (which frames
+exist, where the editor points, which frame locals come from), so fixing any one
+of them broke the others.
+
+- [x] **`ExceptionInOsCode_TopFrameIsTheFaultingFrame`**
+      (`DebugSessionTests.pas`) — `NoSourceStop.exe -os` faults inside ntdll's
+      `RtlMoveMemory` reading address `$1`. Frame 0 must name `ntdll` and carry
+      no source, AND the stack below it must still reach `NoSourceStop.dpr`.
+      Both bitnesses, failures collected. Before the fix frame 0 was the calling
+      Delphi frame, with source, and the ntdll frame was absent from the array
+      entirely.
+- [x] **`ExceptionStop_DefaultFrameServesLocals_ExplicitSelectionWins`**
+      (`DebugSessionTests.pas`) — the ordinary Delphi `raise` path
+      (`TestTarget --run-deep-nested-raise`), which is what regressed when the
+      trim stopped discarding plumbing. Asserts, per bitness: `RnInner` is on
+      the reported stack at an index **> 0** (the frames above the raise site
+      were not discarded); `DefaultFrameIndex` equals that index; `GetLocals`
+      with no selection returns `RnInnerVal`; a frame-less `Evaluate` resolves
+      `RnInnerVal`; `SelectFrame(0)` does NOT return it (explicit selection of
+      the RTL/OS frame wins); `ClearFrame` restores the default.
+      **RED confirmed**: `git stash push -- DebuggerCore/DebugSession.pas` (which
+      leaves the new by-name trim in `SourceResolver.pas` in place, reproducing
+      exactly the intermediate broken state) + rebuilt runner → fails with
+      `Win64: RnInnerVal missing with no frame selected -- locals did not come
+      from the default frame | Win32: <same>`. The `DefaultFrameIndex`
+      assertion has to be commented out for the control to compile, since the
+      property does not exist without the fix.
+      Note on the evaluate assertion: it reads a local of the RAISING procedure,
+      not of an enclosing one — the x86 nested-proc static link reaches only one
+      level up, so `RnOuter` fails on Win32 for a reason unrelated to frame
+      selection (measured; `DeepNested_LocalsResolveAtExceptionStop` asserts
+      `RnOuter` and is Win64-only for the same reason).
+- [x] **`Test_ExceptionStop_LocalsDefaultToRaisingFrame_ScopesFrameWins`**
+      (`DebuggerTests.pas`, runs in BOTH the mono and BPL fixtures) — the same
+      rule over the DAP wire. `variables` on the Locals scope BEFORE any
+      `scopes` request returns `RnInnerVal` (the default frame);
+      `scopes(frameId: 0)` then does NOT; `scopes(frameId: <RnInner's id>)`
+      does again. Also asserts `RnInner`'s frame id is > 0, so the test fails
+      rather than passing vacuously if the plumbing frames are ever discarded
+      again.
+
+Diagnostics: `DevTools\ExceptionStopProbe.exe <exe> <sourceRoot> [-args ...]
+[-filters ...] [-frames N]` drives a real `TDebugSession` to the first exception
+stop and prints the RAW walk, the REPORTED stack, the locals with no frame
+selected, and the locals of each of the first N frames selected in turn. That
+side-by-side view is what separates "the stack is wrong" from "the stack is
+right and the wrong frame answered".
 
 ## What the suite does NOT prove (2026-08-08)
 

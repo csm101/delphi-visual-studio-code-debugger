@@ -730,6 +730,12 @@ type
     [Test] procedure Test_ExceptionRule_Code_MatchesNativeOnly;
     [Test] procedure Test_ExceptionRule_Code_Decimal_BreaksOnNative;
     [Test] procedure Test_ExceptionLocal_ShowsExceptionObject;
+    // The frames-versus-active-frame separation, on the wire. At an exception
+    // stop the call stack keeps the RTL/OS frames the exception was delivered
+    // through, so `variables` on the Locals scope must answer for the session's
+    // DEFAULT frame when no `scopes` named one -- and must answer for whatever
+    // frame a `scopes` DID name, including frame 0, whose locals are empty.
+    [Test] procedure Test_ExceptionStop_LocalsDefaultToRaisingFrame_ScopesFrameWins;
     [Test] procedure Test_GlobalExceptionRules_FileApplied;
     [Test] procedure Test_GlobalExceptionRules_HotReloadOnResume;
 
@@ -6374,6 +6380,75 @@ begin
   finally
     EvalResp.Free;
   end;
+end;
+
+procedure TDebuggerTests.Test_ExceptionStop_LocalsDefaultToRaisingFrame_ScopesFrameWins;
+
+  // Index of the frame the raise came from, read off the wire the way a client
+  // reads it. The adapter emits `id` = index, so the id doubles as the frameId.
+  function RaisingFrameId: Integer;
+  begin
+    Result := -1;
+    var ST := FClient.StackTrace(1);
+    try
+      var Arr := ST.GetValue('stackFrames') as TJSONArray;
+      Assert.IsNotNull(Arr, 'stackTrace returned no frames');
+      for var I := 0 to Arr.Count - 1 do begin
+        var FO := Arr.Items[I] as TJSONObject;
+        if FO.GetValue<string>('name', '').Contains('RnInner') then
+          Exit(FO.GetValue<Integer>('id', -1));
+      end;
+    finally
+      ST.Free;
+    end;
+  end;
+
+  function LocalExists(const Name: string): Boolean;
+  begin
+    // 1000 = LOCALS_VAR_REF, the adapter's fixed reference for the Locals scope.
+    var V := FindLocalByName(FClient, 1000, Name);
+    Result := V <> nil;
+    V.Free;
+  end;
+
+begin
+  FClient := TDapClient.Create;
+  FClient.Start(AdapterExe);
+  FClient.Initialize.Free;
+  Assert.IsTrue(FClient.WaitForInitialized);
+  FClient.SetExceptionBreakpoints(['delphi', 'unhandled']).Free;
+  LaunchTarget(['--run-deep-nested-raise']).Free;
+  FClient.ConfigDone.Free;
+
+  var Stopped := FClient.WaitForStopped(30000);
+  try
+    Assert.AreEqual('exception', Stopped.GetValue<string>('reason', ''),
+      'expected the first-chance exception stop');
+  finally
+    Stopped.Free;
+  end;
+
+  var RaiseId := RaisingFrameId;
+  Assert.IsTrue(RaiseId > 0,
+    Format('RnInner should be below the raise plumbing, got frameId %d -- if it ' +
+      'is 0 the frames above the raise site are being discarded again', [RaiseId]));
+
+  // No `scopes` yet: the client has named no frame, so the adapter answers for
+  // the raising procedure rather than for the RTL/OS frame the thread is in.
+  Assert.IsTrue(LocalExists('RnInnerVal'),
+    'Locals with no frame selected must come from the default (raising) frame');
+
+  // Naming frame 0 is a request for frame 0. It is the frame the exception was
+  // delivered in, it has no user locals, and answering with the raising frame's
+  // would put one frame's variables under another frame's name.
+  FClient.Scopes(0).Free;
+  Assert.IsFalse(LocalExists('RnInnerVal'),
+    'scopes(frameId=0) must answer for frame 0, not for the default frame');
+
+  // And naming the raising frame brings them back.
+  FClient.Scopes(RaiseId).Free;
+  Assert.IsTrue(LocalExists('RnInnerVal'),
+    Format('scopes(frameId=%d) must answer for the raising frame', [RaiseId]));
 end;
 
 // Shared machine-wide rules: a rule loaded from the global JSON file (object

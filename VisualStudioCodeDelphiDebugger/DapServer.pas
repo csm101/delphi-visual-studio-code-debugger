@@ -3769,11 +3769,21 @@ procedure TDapServer.HandleScopes(Seq: Integer; Args: TJSONObject);
 begin
   // Select the requested call-stack frame so the Locals scope resolves against
   // IT, not always the stopped top frame. frameId indexes the frames cached by
-  // the last stackTrace (GetCallStack). frameId 0 (top) or a frame without an RBP
-  // clears the selection. The session clears the active frame again on the next
-  // stop, so it never leaks across a resume (set-then-clear discipline).
+  // the last stackTrace (GetCallStack). The session clears the active frame
+  // again on the next stop, so it never leaks across a resume (set-then-clear
+  // discipline).
+  //
+  // A frameId that IS present is an explicit selection whatever its value, index
+  // 0 included: at an exception stop frame 0 is the raise/fault site, and a
+  // client asking for it gets that frame's locals -- empty, when it is OS code
+  // with no frame pointer -- rather than a different frame's under its name. The
+  // spec makes frameId mandatory here, so the absent branch is only reachable
+  // from a non-conforming client; it means "no opinion" and takes the default.
   if Args <> nil then begin
-    FLastScopeFrameId := Args.GetValue<Integer>('frameId', 0);
+    if Args.FindValue('frameId') <> nil then
+      FLastScopeFrameId := Args.GetValue<Integer>('frameId', 0)
+    else
+      FLastScopeFrameId := DEFAULT_FRAME_INDEX;
     FSession.SelectFrame(FLastScopeFrameId, FLastStackTid);
   end;
   var Body     := TJSONObject.Create;
@@ -4159,8 +4169,14 @@ begin
     // SetActiveFrame/ClearActiveFrame is applied inside FSession.EvaluateForFrame(Fid);
     // here we only pick the frame id -- it is also used below for the warm-up PC
     // and the miss-cache key, both of which stay frontend.
-    var Fid := 0;
-    if Args <> nil then Fid := Args.GetValue<Integer>('frameId', 0);
+    // No frameId at all (a Debug Console expression typed with nothing selected)
+    // is NOT the same as frameId 0: the session's default frame answers the
+    // first, the top frame answers the second, and at an exception stop those
+    // are different frames. DEFAULT_FRAME_INDEX is negative, so it falls through
+    // every `Fid >= 0` / `Fid > 0` cache lookup below untouched.
+    var Fid := DEFAULT_FRAME_INDEX;
+    if (Args <> nil) and (Args.FindValue('frameId') <> nil) then
+      Fid := Args.GetValue<Integer>('frameId', 0);
 
     // O(1) negative-result index. A bare identifier that fully misses stays a
     // miss for the same function at the same provider revision (locals are

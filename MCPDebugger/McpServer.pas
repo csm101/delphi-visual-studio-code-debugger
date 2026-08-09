@@ -461,17 +461,26 @@ var
   // The engine's active frame is GLOBAL and survives until the next stop, so a
   // selection left behind would make the NEXT request silently read the wrong
   // frame. Every use is therefore paired with EndSelectedFrame in a finally.
+  // True when the caller actually named a frame. `frameIndex: 0` is a request
+  // for the top frame and must not read as "no frame given" -- at an exception
+  // stop the two now mean different things (the top frame is the raise/fault
+  // site; the session's default is the frame that has the locals), so the
+  // presence of the key is the question, not its value.
+  function FrameArgGiven: Boolean;
+  begin
+    Result := (Args <> nil) and (Args.FindValue('frameIndex') <> nil);
+  end;
+
   procedure BeginSelectedFrame;
   begin
-    var FrameIndex := ArgInt('frameIndex', 0);
     var ThreadId := Cardinal(ArgInt('threadId', 0));
-    if (FrameIndex <> 0) or (ThreadId <> 0) then
-      FSession.SelectFrame(FrameIndex, ThreadId);
+    if FrameArgGiven or (ThreadId <> 0) then
+      FSession.SelectFrame(ArgInt('frameIndex', 0), ThreadId);
   end;
 
   procedure EndSelectedFrame;
   begin
-    if (ArgInt('frameIndex', 0) <> 0) or (ArgInt('threadId', 0) <> 0) then
+    if FrameArgGiven or (ArgInt('threadId', 0) <> 0) then
       FSession.ClearFrame;
   end;
 
@@ -900,10 +909,15 @@ begin
       // including an expansion handle for a class/record/array -- so an object
       // result is drillable via expand_variable (F8). frameIndex/threadId let the
       // caller evaluate in a CALLER frame: after a pause the top frame is usually
-      // inside a system DLL, where nothing resolves (F18).
+      // inside a system DLL, where nothing resolves (F18). With no frameIndex at
+      // all the session picks its own default frame, which at an exception stop
+      // is the frame that raised rather than the raise site.
+      var EvalFrame := DEFAULT_FRAME_INDEX;
+      if FrameArgGiven then
+        EvalFrame := ArgInt('frameIndex', 0);
       SendToolJson(IdJson, McpJson.EvalResultToJson(
         FSession.EvaluateForFrame(ArgStr('expression'),
-          ArgInt('frameIndex', 0), Cardinal(ArgInt('threadId', 0)))));
+          EvalFrame, Cardinal(ArgInt('threadId', 0)))));
       Exit;
     end;
     if Name = 'get_exception_details' then begin

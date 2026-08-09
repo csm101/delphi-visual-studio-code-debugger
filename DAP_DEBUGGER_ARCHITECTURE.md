@@ -1822,6 +1822,74 @@ adding coverage lowers unknowns without raising broken spans, whereas a WRONG
 length desynchronises and raises them — which is how the VEX work was confirmed
 (6 528 → 6 502 broken).
 
+## Frames versus the active frame
+
+A stop answers two questions that look like one, and conflating them cost a
+real defect: **which frames exist** and **which frame the session answers for**.
+
+- `TDebugSession.GetCallStack` answers the first. It reports EVERY frame the
+  walk produced, including the one the exception was delivered in — an
+  `ntdll` frame that took an access violation is the whole reason the user
+  opened the debugger, and it stays at index 0.
+- `TDebugSession.DefaultFrameIndex` answers the second. It is the frame that
+  `GetLocals`, a frame-less `Evaluate`, and `GetCurrentLocation` resolve
+  against when the client has not selected one.
+
+`DefaultFrameIndexFor` computes it, and the rule has exactly two cases:
+
+| stop | default frame |
+|---|---|
+| ordinary (breakpoint, step, pause, data breakpoint) | 0 — the stopped RIP *is* the frame of interest |
+| exception | the first frame that has a source file |
+
+At an exception stop the thread is parked wherever the exception was
+*delivered*: inside the RTL's raise machinery for a Delphi `raise`, inside OS
+code for a hardware fault. Neither has user locals. The frame that does is the
+nearest one below it with a source file — and "has a source file" is a property
+of the frame, not an inference about intent. It is set once per stop, in
+`HandleTargetStopped`, so DAP, MCP and the session API cannot disagree about it,
+and recomputed by `SetLastFrames` on every re-walk so it can never index a frame
+from a previous walk. Frames of a NON-stopped thread always default to 0: that
+thread's top frame is an ordinary frame.
+
+### Why this is not the old trim
+
+`TSourceResolver.TrimRaisePlumbing` used to *delete* the leading frames — every
+frame, up to the first whose source resolved on disk — and the trimmed array was
+assigned to `FLastFrames`, so the frames were not hidden, they were gone. For a
+Delphi `raise` that produced the right answer for the wrong reason. For a
+hardware fault it discarded the fault. The trim now drops only frames it can
+NAME as raise plumbing (`IsRaisePlumbingFrame`, exact match on the last name
+segment), never the whole stack; everything else that used to depend on the trim
+depends on `DefaultFrameIndex` instead.
+
+### Explicit selection always wins
+
+`SelectFrame(Index)` is an explicit selection for **every** index, 0 included,
+and beats the default. A client that clicks the faulting frame gets that frame —
+empty locals and all — rather than a different frame's variables under its name.
+`ClearFrame` drops the selection and restores the default.
+
+"The client named frame 0" and "the client named no frame" therefore have to
+stay distinguishable, which is what `DEFAULT_FRAME_INDEX` (= -1) is for. Each
+frontend decides by the PRESENCE of the field, never its value:
+
+- DAP `scopes` / `evaluate`: `Args.FindValue('frameId') <> nil`. The spec makes
+  `frameId` mandatory on `scopes`, so in practice VS Code always names a frame
+  there; a `variables` request on the Locals scope that arrives before any
+  `scopes` takes the default.
+- MCP: `Args.FindValue('frameIndex') <> nil`. Omitting `frameIndex` takes the
+  default; passing `frameIndex: 0` asks for the top frame.
+
+A consequence worth stating plainly: at an exception stop VS Code auto-focuses
+frame 0 and issues `scopes(frameId: 0)`, so the Variables panel shows that
+frame's locals — empty for OS code, with `$exception` still present because it
+is frame-independent. Selecting the frame below it in the Call Stack shows the
+raising procedure's variables. This is the honest reading of the protocol: the
+adapter cannot distinguish the client's automatic focus from a user's click, and
+answering for a frame the client did not name is the failure mode this whole
+section exists to prevent.
+
 ## Frame symbol attribution
 
 Every `TSessionFrame` carries `ModuleName` and
@@ -1945,10 +2013,12 @@ case (debug info loaded, this address not covered by it) uses the identical
 `BuildPlaceholderDisassembly` code path — only the header's `Reason`/`Advice`
 text differs, which is unchanged pre-increment-5 code — but was not exercised
 by an automated fixture in this increment: `DebuggerTests\TestTarget\
-NoSourceStop.dpr` was built for exactly this, but an exception stop on it does
-not reach a sourceless frame at all (see the new TRAPS.md entry "An exception
-stop's frame 0 does not reliably resolve to the true faulting address in code
-with no debug info").
+NoSourceStop.dpr` was built for exactly this, but at the time an exception stop
+on it did not reach a sourceless frame at all. That was `TrimRaisePlumbing`
+discarding the faulting frame, not a property of the stop — see "Frames versus
+the active frame" above. `NoSourceStop.exe -os` now reports the faulting `ntdll`
+frame at index 0, so it IS usable as a sourceless-frame fixture; the `saLoaded`
+rendering still has no automated coverage.
 
 ## Local variable readout
 

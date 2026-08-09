@@ -25,91 +25,105 @@ longer true, delete it.
 
 ## Current task (2026-08-09)
 
-**`ASSEMBLY_LEVEL_DEBUGGING.md` increment 5 — the placeholder document for a
-sourceless frame becomes useful. DONE, not committed; left in the tree for
-review.** This was the last increment of the plan; the plan is now complete.
+**An exception stop must keep the faulting frame AND still answer with the right
+frame's locals. DONE, not committed; left in the tree for review.**
 
-`TDapServer.SyntheticSourceText` (`DapServer.pas`) appends a real disassembly
-section below the unchanged explanatory header: proven backward instructions
-(`NearestInstructionBoundaryBefore`/`NearestExportedEntryBefore` +
-`DisassembleBackward`) plus a forward decode from the frame's PC
-(`BuildPlaceholderDisassembly`/`FormatPlaceholderInstruction`), reusing the
-exact `disassemble`-request mechanism (increment 6): same `TZydisDisassembler`,
-same `ReadCodeMemoryAt` reader (restores planted `INT3` bytes), same
-symbol/line lookups. Current instruction marked `=>` plus a `<-- current
-instruction` suffix; per-instruction source file/line shown where the line
-table has one, with "(not found in the source path)" when the file cannot be
-resolved. Zydis-unavailable falls back to naming `Disasm.StatusText`, never a
-guess. The Disassembly View reference is hedged ("where it offers one") per
-the plan's own constraint — no claim that a Call Stack menu entry exists.
+The reported defect: an access violation inside OS code did not stop AT the
+fault — the debugger reported the calling Delphi frame and the ntdll frame was
+missing from the stack entirely. Cause (found, fixed):
+`TSourceResolver.TrimRaisePlumbing` dropped every leading frame whose source did
+not resolve on disk, and the trimmed array was assigned to `FLastFrames`, so the
+frames were not hidden, they were REMOVED.
 
-**A plan assumption did not hold, and I stopped to report it rather than
-routing around it silently (an explicit instruction for this task):**
-`NoSourceStop.dpr`'s `-rtl`/`-os` fixture, driven through a normal DAP
-exception stop, does NOT reach a sourceless placeholder frame — frame 0
-resolves to the CALLING Delphi frame (real source), not the true fault
-address, even though the exception event's own address is correct. Measured
-twice independently (DAP session + `DevTools\LiveSessionProbe` against the
-engine directly). Root cause NOT FOUND despite real investigation (traced
-through `TWinDebugger.GetStackFrames`/`WalkRawFrames`/`FillStackWalkContext`,
-which by their own code should make this impossible). Full writeup:
-`KNOWN_UNKNOWNS.md`, "An exception stop's frame 0 does not reliably resolve to
-the true faulting address..."; operational warning in `TRAPS.md`. Tests were
-built against the ALREADY-PROVEN sourceless-frame path instead (parked worker
-thread in ntdll, same fixture `Test_SourcelessFrame_HasPlaceholderDocument`
-uses) — this proves the `saNoSymbols` case end-to-end; the `saLoaded` case
-uses the identical code path but was not exercised by an automated fixture
-(see `TEST_CATALOG.md` "T." for exactly what is and is not covered).
+The trim was load-bearing for THREE things — which frames exist, where the editor
+points, and which frame locals come from. They are now separate:
 
-### Files changed
+- `TSourceResolver.TrimRaisePlumbing` trims by NAME only (`IsRaisePlumbingFrame`),
+  never the whole stack. `GetCallStack` keeps every frame.
+- `TDebugSession.DefaultFrameIndex` (new) decides which frame ANSWERS: 0 for an
+  ordinary stop, the first frame with a source file at an exception stop. Set
+  once per stop in `HandleTargetStopped`, recomputed by the new `SetLastFrames`
+  on every re-walk, applied by `GetLocals` / frame-less `Evaluate` /
+  `GetCurrentLocation` via `ApplyDefaultFrame`.
+- `SelectFrame(Index)` is now EXPLICIT for every index including 0 and always
+  beats the default. `DEFAULT_FRAME_INDEX` (= -1) is how a frontend says its
+  client named no frame; both frontends decide by the PRESENCE of the field
+  (`Args.FindValue('frameId'/'frameIndex')`), never its value.
 
-- `VisualStudioCodeDelphiDebugger\DapServer.pas` — `BuildPlaceholderDisassembly`,
-  `FormatPlaceholderInstruction` (new), `SyntheticSourceText` (appends the
-  disassembly section), a forward declaration for `ResolveZydisDllPath` (used
-  earlier in the file than its existing definition).
-- `DebuggerTests\PlaceholderDisassemblyTests.pas` (new, 2 tests) — registered
-  in `RunTests.dpr`.
-- Docs (same change set): `ASSEMBLY_LEVEL_DEBUGGING.md` (increment 5 writeup +
-  closing status — plan complete), `DAP_DEBUGGER_ARCHITECTURE.md` ("The
-  document's content — increment 5" + a `presentationHint` correction that was
-  stale independent of this increment), `KNOWN_UNKNOWNS.md` (placeholder
-  question removed — resolved; new exception-frame-0 entry added; a stale
-  "readMemory/writeMemory on DAP — deferred" entry corrected to DONE, noticed
-  while in this section), `TRAPS.md` (new entry), `TEST_CATALOG.md` (section
-  T), `PROJECT_STATE.md`, `README.md` (two new feature bullets), this file.
+Rationale and the full rule table: `DAP_DEBUGGER_ARCHITECTURE.md`, "Frames versus
+the active frame".
+
+### Files changed (all uncommitted)
+
+- `DebuggerCore/DebugSession.pas` — `DEFAULT_FRAME_INDEX`, `FDefaultFrameIndex` +
+  `DefaultFrameIndex` property, `DefaultFrameIndexFor`, `SetLastFrames`,
+  `ApplyDefaultFrame`; `HandleTargetStopped`, `GetCallStack`, `SelectFrame`,
+  `GetLocals`, `Evaluate`, `EvaluateForFrame`, `GetCurrentLocation` updated.
+- `DebuggerCore/SourceResolver.pas` — the by-name trim (was already in the tree
+  when this task started; unchanged by it).
+- `VisualStudioCodeDelphiDebugger/DapServer.pas` — `HandleScopes` and
+  `HandleEvaluate` distinguish an absent `frameId` from `frameId: 0`.
+- `MCPDebugger/McpServer.pas` — `FrameArgGiven`; `BeginSelectedFrame` /
+  `EndSelectedFrame` / `evaluate_expression` distinguish absent `frameIndex`
+  from `frameIndex: 0`.
+- `DebuggerTests/DebugSessionTests.pas` — new
+  `ExceptionStop_DefaultFrameServesLocals_ExplicitSelectionWins` (both
+  bitnesses, failures collected).
+- `DebuggerTests/DebuggerTests.pas` — new
+  `Test_ExceptionStop_LocalsDefaultToRaisingFrame_ScopesFrameWins` (DAP wire,
+  runs in both the mono and BPL fixtures).
+- `DevTools/ExceptionStopProbe.dpr` (new, untracked) — drives a session to the
+  first exception stop and prints the raw walk, the reported stack, the
+  no-selection locals and the per-frame locals side by side.
+- Docs: `DAP_DEBUGGER_ARCHITECTURE.md` (new section), `TRAPS.md` (old entry
+  replaced by two), `TEST_CATALOG.md` (new section U + three corrected
+  references), `KNOWN_UNKNOWNS.md` (the "exception stop's frame 0" entry
+  REMOVED — resolved), `PROJECT_STATE.md`, `ASSEMBLY_LEVEL_DEBUGGING.md`
+  (its "plan assumption that did not hold" now records the resolution),
+  `DevTools/README.md`, this file.
 
 ### Gates
 
-- **New tests RED confirmed**: `git stash` on `DapServer.pas` alone (increments
-  1-4/6 are already committed as separate commits, so this reverts exactly the
-  increment-5 diff), rebuilt the adapter, reran
-  `Win64_WorkerParkedInNtdll_PlaceholderShowsDisassemblyWithCurrentMarker` —
-  failed with `[placeholder must carry a disassembly section; got: No source
-  available for this stack frame. ... Selecting a frame further down the call
-  stack will open real source if any frame there has it.]` (the disassembly
-  section simply absent). `git stash pop` restored the fix; rebuilt; both new
-  tests green again.
-- Every consumer rebuilt: `build_dap.bat`, `DevTools\build_all.bat`,
-  `build_runner.bat` — all clean (only pre-existing hints).
-- **Full suite green**: 1182 found / 1178 passed / 0 failed / 0 errored / 4
-  ignored — baseline 1180/1176/0/0/4 plus exactly the 2 new tests, ignored
-  count unchanged. Both fixtures (mono + BPL) ran (`build_and_run.bat`).
-- **Not verified**: the `saLoaded` disassembly-section rendering (see above);
-  the per-instruction "line known, file missing" annotation (implemented,
-  reuses `disassemble`'s own tested `BuildDapInstruction` logic, but not
-  independently exercised — no fixture surfaces that exact byte pattern); the
-  Zydis-unavailable fallback at the DAP-process level (same limitation
-  increment 1 already recorded — no external knob to force it).
+- **Full suite green**: 1184 found / 1180 passed / 0 failed / 0 errored / 4
+  ignored (`build_and_run.bat`, both fixtures). Baseline before the task was
+  1182/1178/0/0/4 plus one in-tree test and one in-tree failure; +1 new session
+  test here, +1 new DAP test added after that run and verified filtered in both
+  fixtures.
+- **RED control**: `git stash push -- DebuggerCore/DebugSession.pas` leaves the
+  new by-name trim in place, reproducing exactly the broken intermediate state.
+  The new session test then fails with `Win64: RnInnerVal missing with no frame
+  selected -- locals did not come from the default frame | Win32: <same>`. The
+  `DefaultFrameIndex` assertion must be commented out for the control to
+  compile.
+- Every consumer rebuilt: `build_dap.bat`, `build_mcp.bat`,
+  `DevTools\build_all.bat`, `build_runner.bat`.
+
+### Open — a DESIGN DECISION deliberately NOT taken
+
+The by-name trim removes NOTHING from an ordinary Delphi `raise` stack: frame 0
+is a nameless `kernelbase.dll` frame (measured, both bitnesses), which stops the
+trim before it reaches `_RaiseExcept`. So VS Code's Call Stack at ANY Delphi
+exception now opens on that frame with the placeholder disassembly document,
+where it used to open on the raise site. Locals are correct either way (the
+default frame), but the focus is not.
+
+A deterministic fix exists and was not applied because it redesigns work the
+brief declared settled: **gate the trim on the exception KIND, which the engine
+already knows** (`FExceptionObjAddr` / `LastExceptionClass` distinguish a Delphi
+raise from a hardware fault). A Delphi raise trims to the raise site; a fault
+trims nothing, so frame 0 stays the fault. That satisfies both cases without a
+name list and without the frame-0 ambiguity. Decide before committing.
 
 ## State of the tree
 
-- `public-main`. Increments 1-4 and 6 are COMMITTED (separate commits,
-  `c805e85`..`7ae434b`). Increment 5 (this task) is UNCOMMITTED by
-  instruction — **DO NOT COMMIT.**
-- `DebuggerTests\RunTests.dpr` modified (registers the new test file);
-  `DebuggerTests\PlaceholderDisassemblyTests.pas` untracked.
-- Next: review + commit increment 5 if accepted. Separately worth picking up:
-  the exception-stop frame-0 finding in `KNOWN_UNKNOWNS.md` — it is a
-  correctness question (a stack trace at an exception stop in unsymbolicated
-  code cannot currently be trusted), independent of this plan, not chosen for
-  me to fix.
+- `public-main`, everything above UNCOMMITTED by instruction — **DO NOT COMMIT.**
+- **A concurrent session committed `58f5961` (`feat(devtools): ExcHandlerProbe`)
+  during this work.** It swept this task's `DevTools/README.md` section into its
+  own commit, and it DELETED `DevTools/ExceptionStopProbe.dpr` as "an earlier
+  draft ... never documented" — which was no longer true by then. The probe has
+  been restored (untracked again) and the README now says how it differs from
+  `ExcHandlerProbe`: that one measures where an exception is DISPATCHED to, this
+  one measures what the session REPORTS at the stop. If the maintainer still
+  wants only one, delete the probe AND its references in `DevTools/README.md`
+  and `TEST_CATALOG.md` section U together.
+- Next: review; then decide the trim-gating question above.
