@@ -57,6 +57,19 @@ if errorlevel 1 (
 )
 copy /Y "%~dp0register-mcp.ps1" "%STAGE%\register-mcp.ps1" >nul
 
+rem Disassembly backend (DISASSEMBLY_PLAN.md increment 7), staged next to
+rem Setup.exe: Install.exe (renamed Setup.exe) copies it from here alongside
+rem the MCP server exe into its per-user install location. Missing is a
+rem warning, not a build failure -- the adapter/MCP server still start and
+rem work for everything except disassemble/instructionPointerReference, which
+rem degrade to UNAVAILABLE without it.
+if exist "%~dp0ThirdParty\Zydis\bin\x64\Zydis.dll" (
+  copy /Y "%~dp0ThirdParty\Zydis\bin\x64\Zydis.dll" "%STAGE%\Zydis.dll" >nul
+  copy /Y "%~dp0ThirdParty\Zydis\LICENSE" "%STAGE%\Zydis-LICENSE.txt" >nul
+) else (
+  echo WARNING: ThirdParty\Zydis\bin\x64\Zydis.dll not found -- this zip's MCP server will report disassembly UNAVAILABLE.
+)
+
 echo.
 echo === [3/3] Compress to zip ===
 set VER=

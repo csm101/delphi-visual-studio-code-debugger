@@ -1,11 +1,14 @@
 # Disassembly and address breakpoints — plan
 
-Status: **all six functional increments landed, not committed** (2026-08-09).
-Increment 6 (DAP `disassemble` + `instructionPointerReference`) closes the
-functional plan; only increment 7 (packaging) remains. See "Functional plan
-closed" below for what works, what is refused and why, and what packaging
-still owes. This document is the agreed design; `PROJECT_STATE.md` carries
-only the one-line roadmap entry pointing here.
+Status: **all seven increments landed** (2026-08-09). Increments 1-6 are
+committed; increment 7 (packaging) is done and left UNCOMMITTED in the tree
+for review, per this session's instruction. Increment 7 closes this plan end
+to end: `Zydis.dll` now ships next to every installed adapter and MCP server,
+is a `/MT` build with no VC++ redistributable dependency, and the packaged
+result was verified live from outside the build tree over both frontends. See
+"Functional plan closed" below for what works end to end, and "Verified in
+increment 7" for the packaging detail. This document is the agreed design;
+`PROJECT_STATE.md` carries only the one-line roadmap entry pointing here.
 
 Two features that share one prerequisite and are therefore planned together:
 
@@ -59,12 +62,13 @@ than guessed:
   proven-boundary-only" and "Verified in increment 6" below for the full
   reasoning and the DAP spec text it rests on.
 
-What remains: **increment 7, packaging.** Every increment above works only
-inside this build tree, where `Zydis.dll` happens to be reachable at a
-repo-relative path. Until the DLL ships next to the installed adapter and
-MCP server (and the `/MD` vs `/MT` runtime-dependency question is decided),
-disassembly is a feature that passes every test here and reports
-`unavailable`/fails cleanly on every user machine. See increment 7 below.
+**Increment 7 (packaging) is also done.** `Zydis.dll` ships next to the
+installed adapter (`install\Install.exe`, both portable-zip and
+repository-mode staging) and the installed MCP server
+(`%LOCALAPPDATA%\DelphiWin64Debugger\`), is now a `/MT` build (no VC++
+redistributable dependency — see "Verified in increment 7"), and the packaged
+result was driven live, end to end, from a location with no relationship to
+this repository, over both DAP and MCP. See "Verified in increment 7" below.
 
 ## Why
 
@@ -457,7 +461,7 @@ flagged as likely STOP candidates:**
 
 ## Increments (each gated on a green suite before the next)
 
-1. **DONE, not committed (2026-08-08).** `ThirdParty\Zydis` layout, submodule
+1. **DONE (2026-08-08).** `ThirdParty\Zydis` layout, submodule
    pinned to `v4.1.1`, committed DLL, `ZydisApi.pas`, dynamic load + version
    check. No feature wired in yet — `DevTools\DisasmProbe.exe` proves the
    pipeline decodes real bytes from a real binary in both machine modes
@@ -466,10 +470,10 @@ flagged as likely STOP candidates:**
    run afterward: 1081 found / 1077 passed / 0 failed / 0 errored / 4 ignored —
    exact match to baseline, as expected since nothing new is wired into any
    existing consumer.
-2. **DONE, not committed (2026-08-08).** `IDisassembler` + Zydis backend +
+2. **DONE (2026-08-08).** `IDisassembler` + Zydis backend +
    symbolication of the output. `DevTools\Disasm.exe`. Full detail in
    "Verified in increment 2" below.
-3. **DONE, not committed (2026-08-08).** Two halves, both about honesty of
+3. **DONE (2026-08-08).** Two halves, both about honesty of
    coverage rather than new decoder features:
    - **Half A** closed the coverage hole increment 2 left: the positive
      (real-DLL) Zydis decode path and the call-target mnemonic whitelist had
@@ -488,32 +492,23 @@ flagged as likely STOP candidates:**
      it surfaced, in "Verified in increment 3 — Half B" below and
      `DevTools\README.md`'s `DisasmCoverage` entry.
    - Full suite after both halves: see "Verified in increment 3 — Half A".
-4. **DONE, not committed (2026-08-09).** MCP `disassemble`. Full detail,
+4. **DONE (2026-08-09).** MCP `disassemble`. Full detail,
    including the backward-disassembly decision and what it cost, in
    "Decision: backward disassembly is proven-boundary-only" and "Verified in
    increment 4" below.
-5. **DONE, not committed (2026-08-09).** Address breakpoints: engine + session
+5. **DONE (2026-08-09).** Address breakpoints: engine + session
    (module+RVA identity, deferred bind), the MCP tool
    (`set_breakpoint_at_address` / `remove_breakpoint_at_address`), and DAP
    `setInstructionBreakpoints` + `supportsInstructionBreakpoints`. Full detail,
    including a genuine bug the tests caught (not merely designed around), in
    "Verified in increment 5" below.
-6. **DONE, not committed (2026-08-09).** DAP `disassemble` +
+6. **DONE (2026-08-09).** DAP `disassemble` +
    `instructionPointerReference`. Full detail in "Verified in increment 6"
    below.
-7. **Packaging — and it decides whether any of this works on a user's machine.**
-   Until it is done, every increment above is a feature that reports UNAVAILABLE
-   in the field while passing every test here, because the tests run out of the
-   build tree where `Zydis.dll` happens to be reachable. Three parts:
-   * `install\Install.exe` and the extension folder ship the DLL next to
-     `VisualStudioCodeDelphiDebugger.exe`, and the MCP server build gets it too —
-     `disassemble` over MCP is useless without it.
-   * the MIT licence text ships with it.
-   * **decide `/MD` vs `/MT`.** The committed DLL is a `/MD` build, so it needs
-     the VC++ runtime installed. `/MT` removes that dependency at the cost of a
-     larger DLL. A user without the redistributable currently gets a correct but
-     permanently unavailable feature — which is the honest failure mode, but not
-     an acceptable default.
+7. **DONE (2026-08-09), not committed. Packaging — and it decides whether any
+   of this works on a user's machine.** Full detail, including the measured
+   `/MD` vs `/MT` numbers and exactly how the packaged result was verified, in
+   "Verified in increment 7" below.
 
 ## Traps
 
@@ -1175,6 +1170,133 @@ re-open an argument this document already settled.
   (`instructionOffset:-1, instructionCount:2`) and the entirely-below-zero
   refusal case (`instructionOffset:-3, instructionCount:5` at an address with
   no proof of anything).
+
+## Verified in increment 7
+
+**Part 1 — the DLL ships where each consumer looks for it.** Both
+`DapServer.pas`'s and `McpServer.pas`'s `ResolveZydisDllPath` already checked
+NEXT TO THE EXE's own directory first (before the repo-relative fallback) —
+that resolution logic needed no code change. What was missing was actually
+PLACING the DLL there in every path a user can install through:
+
+- `update-install.bat` (repository dev staging into `install\
+  local.delphi-win64-debug\`) now also copies `Zydis.dll` +
+  `ThirdParty\Zydis\LICENSE` (as `Zydis-LICENSE.txt`) into the extension
+  folder, right after the adapter exe. Missing source DLL is a printed NOTE,
+  not a build failure — a repo checkout without a built Zydis.dll still stages
+  a working extension, just without this one optional feature.
+- `install\Install.dpr` gained `ZydisDllSourcePath` / `ZydisLicenseSourcePath`
+  / `CopyZydisIfAvailable`, mirroring the existing "next to me, else
+  repo-relative" pattern the adapter/MCP server themselves use for consistency:
+  checked next to `Install.exe` first (covers the portable zip, where
+  `build_setup_zip.bat` now stages `Zydis.dll` at the zip root next to
+  `Setup.exe`), else `ThirdParty\Zydis\bin\x64\Zydis.dll` under `RepoRoot`
+  (covers running `Install.exe` straight from a repository checkout). Called
+  once for the extension `StageDir` (idempotent in portable mode, where the
+  zip already carries it) and once for `McpInstallDir`
+  (`%LOCALAPPDATA%\DelphiWin64Debugger\`) inside `RegisterMcp`, right after the
+  MCP exe copy. A missing DLL prints a NOTE and the install continues — never
+  a hard failure, per the constraint that a missing DLL degrades the feature
+  to UNAVAILABLE, never blocks a start or an install.
+- `build_setup_zip.bat` stages `Zydis.dll` + `Zydis-LICENSE.txt` at the zip
+  root, next to `Setup.exe`/`DelphiDebuggerMcp.exe`, mirroring how the MCP
+  server exe is already staged flat rather than in a subfolder. A missing
+  source DLL is a printed WARNING, not a failed zip build.
+- `install-dev.bat` / `build_dap.bat` / `build_mcp.bat` needed NO change: dev
+  mode points the installed extension's `program` straight at
+  `VisualStudioCodeDelphiDebugger\Win64\Debug\...exe`, which is three levels
+  below the repo root — exactly where `DefaultZydisDllPath`'s existing
+  repo-relative fallback (`..\..\..\ThirdParty\Zydis\bin\x64\Zydis.dll`)
+  already resolves, so the DLL was already reachable there without staging
+  anything. Confirmed by the whole existing `DisassemblerTests`/`McpE2ETests`/
+  `DebuggerTests` disassembly coverage passing throughout this increment,
+  unchanged.
+- The MIT licence text ships alongside the DLL at every destination
+  (`Zydis-LICENSE.txt`, copied from the single source of truth
+  `ThirdParty\Zydis\LICENSE` — never duplicated by hand).
+- No change to `.gitattributes` / `.gitignore`: the staged copies in
+  `install\local.delphi-win64-debug\` and `dist\` are build output, exactly
+  like the adapter exe that already lived there un-committed; only the ONE
+  canonical `ThirdParty\Zydis\bin\x64\Zydis.dll` is a tracked binary, per the
+  existing `!ThirdParty/Zydis/bin/x64/*.dll` gitignore exception and
+  `.gitattributes`' `*.dll binary` rule (untouched).
+
+**Part 2 — `/MD` vs `/MT`, decided: `/MT`.** Both built from the identical
+pinned commit (`a2278f1d254e492f6a6b39f6cb5d1f5d515659dc`), same CMake
+invocation except `CMAKE_MSVC_RUNTIME_LIBRARY`, measured on the build machine
+(2026-08-09):
+
+| runtime | size | `dumpbin /DEPENDENTS` |
+|---|---|---|
+| `/MD` (previous, CMake default) | 576,512 bytes | `VCRUNTIME140.dll`, `api-ms-win-crt-runtime-l1-1-0.dll`, `api-ms-win-crt-string-l1-1-0.dll`, `KERNEL32.dll` |
+| `/MT` (chosen) | 670,720 bytes | `KERNEL32.dll` only |
+
++94,208 bytes (+16.3%) buys removing the VC++ redistributable dependency
+entirely — `KERNEL32.dll` is present on every Windows install. For a single
+optional DLL behind an already-optional feature, that is a clear trade: a
+`/MD` DLL missing its runtime on a bare machine fails to `LoadLibrary` just
+like a missing DLL does (both land on the same fail-closed `UNAVAILABLE`
+path), but it is a strictly worse failure mode in practice — it looks
+installed and is not, and there is nothing the user did wrong to explain it.
+`dumpbin /EXPORTS` on the `/MT` build lists the identical 43 exports (same
+names, different offsets) — the CRT linkage change does not touch the API
+surface `ZydisApi.pas` imports. `build_zydis.bat` gained one line
+(`-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded`); the committed
+`bin\x64\Zydis.dll` and `bin\x64\Zydis.dll.sha256` were regenerated together
+from that changed script (new hash:
+`29a209ff95a2361e39a22e6d58aa16ada75e02d8c879363e5a9598ee9b93c34d`). Full
+measurement detail and the exact invocation are in
+`ThirdParty\Zydis\PROVENANCE.md`.
+
+Functional parity after the relink was checked, not assumed: rebuilt every
+DevTools consumer (`DevTools\build_all.bat`) and re-ran
+`DevTools\Win64\Debug\DisasmProbe.exe` against `TestTarget.exe`'s entry point
+(RVA `$167FC0`) through the new `/MT` DLL — byte-identical decode to the
+known-good `/MD` output recorded in increment 1/2 (`push rbp` / `push rbx` /
+`sub rsp, 0x98` / `mov rbp, rsp` / ... / `call 0x0000000000019F10` /
+`call 0x0000000000166D00`).
+
+**Part 3 — the packaged result was verified live, not assumed.** For BOTH
+frontends, independently: the built exe (adapter or MCP server) plus
+`Zydis.dll` were copied into a scratch directory on a different drive
+(`X:\Temp\...`) with NO relationship to this repository — confirmed before
+each run by checking that the exe's own repo-relative fallback path
+(`..\..\..\ThirdParty\Zydis\bin\x64\Zydis.dll`, resolved from the scratch
+directory) does not exist, so a pass could only mean the NEXT-TO-EXE
+resolution actually worked, not that the fallback silently saved it. Each was
+then launched from that directory and driven with a real client speaking the
+exe's own wire protocol (JSON-RPC over newline-delimited stdio for the MCP
+server, Content-Length-framed JSON for the DAP adapter — hand-rolled
+PowerShell clients, not `DapClient.pas`/`McpE2ETests.pas`, since those link
+against the in-tree build and would not exercise an out-of-tree install):
+`initialize` -> `launch`/`launch_debuggee` with `stopAtEntry` -> wait for the
+real stop -> `disassemble`/`stackTrace`+`disassemble` -> assert
+`available:true` (MCP) / a non-`invalid` first instruction (DAP) with REAL
+decoded bytes, not a refusal. Both passed:
+
+- MCP: `disassemble` returned `available:true` with 5 real instructions
+  starting `push rbp` at the stop address (`TestTarget.exe` entry,
+  `0x10A7FC0`), symbolicated (`"symbol":"Testtarget"`,
+  `"sourceFile":"TestTarget.dpr"`) — proving the copied server found
+  `Zydis.dll` next to itself, loaded it, and used the SAME symbolication path
+  production launches use.
+- DAP: `stackTrace`'s frame 0 carried a real `instructionPointerReference`
+  (`0x10A7FC0`); `disassemble` on it returned exactly 5 instructions, none
+  carrying `presentationHint:"invalid"`, the first being `push rbp` at the
+  exact `memoryReference` — proving both the packaging fix AND the DAP
+  protocol shape from increment 6 work together outside the tree, not just
+  inside it.
+
+This is the direct answer to "does this work on a user's machine" the whole
+increment exists to give — not inferred from the two frontends sharing
+identical `ResolveZydisDllPath` code (though they do), but demonstrated
+independently for each.
+
+**Full suite**: see `TASK_RESUME.md` for the exact counts from this session's
+run. A packaging-only change (no `DebuggerCore`/`DapServer.pas`/
+`McpServer.pas` code touched, no test added or removed) is expected to move
+the count by exactly zero from the increment-6 baseline
+(1118/1114/0/0/4) — checked, not assumed.
 
 ## Open, to verify before writing code
 

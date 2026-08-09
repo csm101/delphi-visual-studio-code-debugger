@@ -117,7 +117,11 @@ What happens, in order:
 3. refuses if a release or draft with that tag already exists;
 4. warns about unpushed commits;
 5. runs `build_setup_zip.bat` — which rebuilds the adapter, the MCP server, the
-   installer, and stages the extension;
+   installer, and stages the extension (including `Zydis.dll`, the optional
+   disassembly backend, and its MIT licence text — a missing
+   `ThirdParty\Zydis\bin\x64\Zydis.dll` at build time is a printed warning,
+   not a failed build, since disassembly degrades to unavailable without it
+   rather than blocking anything else);
 6. computes the zip's SHA-256;
 7. renders the template, substituting the version, the hash, the MCP tool count
    (read from `MCPDebugger\McpToolSchemas.pas`) and your "What's new";
@@ -141,7 +145,9 @@ The draft is visible only to people with write access. Open it from the
 
 - the "What's new" reads like something written for a user;
 - the version in the title matches the zip name;
-- the zip is attached and its size is plausible (about 4 MB).
+- the zip is attached and its size is plausible (about 4.5-5 MB, including
+  `Zydis.dll` staged twice — once inside the extension folder, once next to
+  `Setup.exe` for the MCP server install).
 
 Then publish:
 

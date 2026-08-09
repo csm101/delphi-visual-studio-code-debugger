@@ -591,7 +591,7 @@ Debugger features:
     variable, which is the failure the mechanism exists to prevent.
   Ranked above disassembly in diagnostic value: "who writes this variable" has no
   other answer.
-- **Disassembly + address breakpoints — DONE, all six functional increments
+- **Disassembly + address breakpoints — DONE, all seven increments
   (2026-08-09), not committed.** `IDisassembler` + Zydis backend +
   symbolication + `DevTools\Disasm.exe` (increment 2); measured coverage
   against an independent oracle (`DevTools\DisasmCoverage.exe` vs dumpbin,
@@ -651,11 +651,20 @@ Debugger features:
   backward-and-forward `instructionOffset` case is covered by construction,
   not by a dedicated test. Full detail in `DISASSEMBLY_PLAN.md` "Verified in
   increment 6" and `TEST_CATALOG.md` "M. Disassembly".
-  **Remaining: increment 7, packaging.** Every increment above works only
-  inside this build tree, where `Zydis.dll` happens to be reachable at a
-  repo-relative path — until it ships next to the installed adapter and MCP
-  server, disassembly reports UNAVAILABLE (or fails cleanly on DAP) on a
-  user's machine. See `DISASSEMBLY_PLAN.md` increment 7.
+  **Increment 7, packaging — DONE (2026-08-09).** `Zydis.dll` now ships next
+  to every installed adapter (`install\Install.exe`, both portable-zip and
+  repository-mode staging, plus `update-install.bat`/`build_setup_zip.bat`)
+  and MCP server install (`%LOCALAPPDATA%\DelphiWin64Debugger\`), with the
+  MIT licence text alongside it. The committed DLL was relinked `/MT` (static
+  CRT) — measured +16.3% size (576,512 -> 670,720 bytes) for dropping the
+  VC++ redistributable dependency entirely (`dumpbin /DEPENDENTS`:
+  `KERNEL32.dll` only). Verified live, not assumed: the built adapter and MCP
+  server exes were each copied with `Zydis.dll` into a scratch directory with
+  no relationship to this repository, launched from there, and driven with a
+  real client over each frontend's own wire protocol through a real
+  `launch`/`disassemble` round trip — both returned real decoded instructions,
+  not a refusal. Full detail in `DISASSEMBLY_PLAN.md` "Verified in increment
+  7" and `ThirdParty\Zydis\PROVENANCE.md`.
 - Win32 (32-bit) targets — **DONE**. Run control, locals, object expansion,
   evaluation and the multi-BPL case all work on a WOW64 target from the same
   64-bit adapter binary. See "Target architecture" under Implemented features

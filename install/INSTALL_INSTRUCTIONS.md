@@ -150,6 +150,11 @@ is searched automatically. You can add extra paths explicitly:
 - Object / record / dynamic-array expansion in the Variables tree
 - Watch / hover with a full Pascal expression evaluator
 - Exception filters and a per-exception rule engine (project and machine-wide)
+- Disassembly View (`instructionPointerReference` on stack frames) and
+  instruction breakpoints, backed by the bundled `Zydis.dll` (installed next
+  to the adapter automatically; MIT licence, `Zydis-LICENSE.txt`, ships
+  alongside it). If that DLL is ever missing, disassembly reports itself
+  unavailable rather than failing the session — everything else keeps working.
 
 ## Troubleshooting
 
@@ -166,3 +171,11 @@ Ensure the executable was compiled with `-V -VN -VR` flags and that the `.map` f
 
 **Variables show as unavailable**
 The `.rsm` file is missing or not found. Check the `rsmFile` setting in your launch configuration.
+
+**Disassembly / Disassembly View reports unavailable**
+`Zydis.dll` (the disassembly backend) is missing next to the adapter or MCP
+server executable. It is staged automatically by `Setup.exe`/`Install.exe`
+and `update-install.bat`; if it is absent, re-run the installer, or copy
+`Zydis.dll` from `ThirdParty\Zydis\bin\x64\` (in a source checkout) next to
+`VisualStudioCodeDelphiDebugger.exe`. Everything else in the debugger works
+without it — this is an optional feature by design.

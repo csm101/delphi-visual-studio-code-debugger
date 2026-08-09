@@ -25,102 +25,90 @@ longer true, delete it.
 
 ## Current task (2026-08-09)
 
-**`DISASSEMBLY_PLAN.md` increment 6 — DAP `disassemble` + `instructionPointerReference`.
-DONE, not committed; left in the tree for review.** This closes the FUNCTIONAL
-plan: increments 1-6 are all landed. Only increment 7 (packaging: ship
-`Zydis.dll` with the installed adapter/MCP server, decide `/MD` vs `/MT`)
-remains. Full detail (the DAP-spec-mandated refusal shape, every proof, every
-negative control) is in `DISASSEMBLY_PLAN.md` "Verified in increment 6" and
-"Functional plan closed" — this cursor is a pointer, not a repeat.
+**`DISASSEMBLY_PLAN.md` increment 7 — packaging. DONE, not committed; left in
+the tree for review.** This closes the disassembly plan end to end (all 7
+increments). Full detail in `DISASSEMBLY_PLAN.md` "Verified in increment 7"
+and `ThirdParty\Zydis\PROVENANCE.md` "Runtime library: /MD vs /MT" — this
+cursor is a pointer, not a repeat.
 
-### The one design question resolved without a maintainer STOP
+### What changed
 
-The task flagged "how a refusal reaches VS Code" as possibly ambiguous. It was
-not: the DAP spec ITSELF answers it. `DisassembleArguments.instructionCount`
-(`debugAdapterProtocol.json`) requires returning EXACTLY that many entries,
-"any unavailable instructions ... replaced with an implementation-defined
-'invalid instruction' value"; `DisassembledInstruction.presentationHint:
-'invalid'` is documented as exactly that mechanism ("filler ... cannot be
-reached by the program"). Confirmed by fetching the schema directly, not
-recalled from memory. `BuildInvalidDapInstruction` in `DapServer.pas`
-implements it: no `instructionBytes`, `instruction: '??'`, a synthetic filler
-`address` anchored on the nearest thing actually proven.
-
-### Files changed this session
-
-`VisualStudioCodeDelphiDebugger\DapServer.pas`: `supportsDisassembleRequest`
-capability; `instructionPointerReference` on every `StackFrame`
-(`HandleStackTrace`); `HandleDisassemble` (+ `BuildDapInstruction` /
-`BuildInvalidDapInstruction` / local `ResolveZydisDllPath`); dispatch wiring.
-Reuses `Disassembler.DisassembleBackward` +
-`IDebugTarget.NearestInstructionBoundaryBefore`/`NearestExportedEntryBefore`
-exactly as increment 4's decision required — no second backward mechanism.
-`DebuggerTests\DapClient.pas`: `Disassemble`/`DisassembleRaw` helpers.
-`DebuggerTests\DebuggerTests.pas`: `ParseHex64`/`TopInstructionPointerRef`
-helpers, 5 new `[Test]` methods (each runs under mono + BPL).
-Docs: `DISASSEMBLY_PLAN.md`, `DAP_DEBUGGER_ARCHITECTURE.md`, `TEST_CATALOG.md`,
-`PROJECT_STATE.md`, `KNOWN_UNKNOWNS.md` (removed the now-resolved
-"Disassembly view unimplemented" entry), `README.md`.
+- `ThirdParty\Zydis\build_zydis.bat`: added `-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded`.
+  Committed `bin\x64\Zydis.dll` + `.sha256` regenerated from it (`/MT`,
+  670,720 bytes, was 576,512 `/MD`; `dumpbin /DEPENDENTS` now shows
+  `KERNEL32.dll` only). `ThirdParty\Zydis\PROVENANCE.md` carries the measured
+  `/MD` vs `/MT` table and the decision reasoning.
+- `update-install.bat`: copies `Zydis.dll` + `LICENSE` (as
+  `Zydis-LICENSE.txt`) into `install\local.delphi-win64-debug\` right after
+  the adapter exe. Missing source DLL = printed NOTE, not a failure.
+- `install\Install.dpr`: new `ZydisDllSourcePath` / `ZydisLicenseSourcePath` /
+  `CopyZydisIfAvailable` (next-to-exe first, else repo-relative — same
+  pattern `ResolveZydisDllPath` already uses in `DapServer.pas`/
+  `McpServer.pas`, which needed NO code change). Called once for the
+  extension `StageDir`, once for `McpInstallDir`
+  (`%LOCALAPPDATA%\DelphiWin64Debugger\`) inside `RegisterMcp`.
+- `build_setup_zip.bat`: stages `Zydis.dll` + `Zydis-LICENSE.txt` at the zip
+  root, next to `Setup.exe`/`DelphiDebuggerMcp.exe`. Missing = WARNING, zip
+  build still succeeds.
+- Docs: `DISASSEMBLY_PLAN.md` (increment 7 status + "Verified in increment
+  7"), `ThirdParty\Zydis\PROVENANCE.md`, `PROJECT_STATE.md`,
+  `install\INSTALL_INSTRUCTIONS.md` (feature line + troubleshooting entry),
+  `HOW_TO_CREATE_A_NEW_RELEASE.md` (zip contents + size note).
+- No change needed: `install-dev.bat`/`build_dap.bat`/`build_mcp.bat` stay
+  Delphi-only — dev mode's build-output paths already sit exactly where
+  `DefaultZydisDllPath`'s existing repo-relative fallback resolves. No
+  `.gitattributes`/`.gitignore` change — staged DLL copies are build output,
+  same as the adapter exe that already lived un-committed in that folder.
 
 ### Proven, not just implemented
 
-All 5 new tests negative-controlled (revert the fix, rebuild the adapter,
-rerun via `RUNTESTS_ONLY`, confirm the intended failure text, revert back) —
-5 independent controls: capability flag forced False, the
-`instructionPointerReference` `AddPair` commented out, the `disassemble`
-dispatch line commented out, `HaveBoundary` forced False in the backward-slot
-builder, `presentationHint` omitted from the invalid-slot builder. Exact
-failure text for each in `DISASSEMBLY_PLAN.md` "Verified in increment 6".
+- `/MT` functional parity: rebuilt DevTools, ran `DisasmProbe.exe` against
+  `TestTarget.exe`'s entry (RVA `$167FC0`) through the new DLL —
+  byte-identical decode to the known-good `/MD` output from increments 1/2.
+- Packaged result verified LIVE, both frontends independently, from a scratch
+  directory on `X:\` with no relationship to the repo (confirmed the
+  repo-relative fallback path does not exist there before each run, so a pass
+  can only mean next-to-exe resolution worked): hand-rolled PowerShell
+  clients speaking each exe's own wire protocol (MCP: JSON-RPC over
+  newline-stdio; DAP: Content-Length-framed JSON) drove a real
+  `launch`/`launch_debuggee` -> stop -> `disassemble` round trip. Both
+  returned real decoded instructions (`push rbp` at the entry address,
+  symbolicated), not a refusal. Scripts left in
+  `X:\Temp\claude\...\scratchpad\verify_{mcp,dap}_disasm_packaged.ps1` for
+  reference (session-scratch, not part of the repo).
+- `build_setup_zip.bat` run end to end: `dist\delphi-win64-debugger-setup-
+  v0.3.0.zip` (4.59 MB) inspected directly — `Zydis.dll` (670,720 bytes,
+  matching the `/MT` rebuild) + `Zydis-LICENSE.txt` present BOTH inside
+  `local.delphi-win64-debug/` and at the zip root.
 
 ### Full suite
 
-Filtered runs (`RUNTESTS_ONLY`) during development: all green, 22/22 on the
-"Disassemble" substring, 2/2 on each of the two standalone tests, both before
-AND after each negative control's revert (i.e. both the RED and the
-re-GREEN were observed, not assumed).
+Run via the `test-runner` agent (`build_and_run.bat`): **1118 found / 1114
+passed / 0 failed / 0 errored / 4 ignored** — exact match to the increment-6
+baseline, as expected for a packaging-only change (no
+`DebuggerCore`/`DapServer.pas`/`McpServer.pas` code touched, no test
+added/removed). Gate satisfied.
 
-Full unfiltered suite via the `test-runner` agent (`build_and_run.bat`):
-**1118 found / 1114 passed / 0 failed / 0 errored / 4 ignored** — exact +10
-delta over the increment-5 baseline (1108/1104/0/0/4), matching the 5 new
-tests × 2 fixtures (mono + BPL). (First guess while writing this cursor was
-"6 new tests / +12" — miscounted; the actual test list only ever had 5
-`[Test]` declarations. Caught by the delta not matching the guess, not by
-re-reading the source — a live example of why this section states the
-MEASURED number, not the expected one.)
+### Not done / not verified
 
-### Not done, not blocking
-
-No test drives an actual VS Code Disassembly View — every assertion is at the
-DAP protocol layer (`DapClient.pas`). No DAP-layer Win32 coverage for
-`disassemble` (bitness proven at the MCP layer, same scoping choice increment
-5 made for `setInstructionBreakpoints`). The mixed
-backward-and-forward-straddling `instructionOffset` case is covered by
-construction (the `TrueNegCount`/`PosCount` split in `HandleDisassemble`
-handles it uniformly) but has no dedicated test. Full list in
-`DISASSEMBLY_PLAN.md` "Verified in increment 6".
-
-### Next action
-
-**Increment 7 — packaging** (`DISASSEMBLY_PLAN.md` "Increments", item 7). Not
-started. Three parts: ship `Zydis.dll` next to the installed adapter AND the
-MCP server build (`install\Install.exe`, the extension folder, `build_mcp.bat`
-output); ship the MIT licence text alongside it; decide `/MD` vs `/MT` for the
-committed DLL (currently `/MD`, needs the VC++ redistributable on the user's
-machine — the honest-but-not-acceptable-default failure mode the plan already
-names). Until increment 7 lands, disassembly/address-breakpoints pass every
-test in this build tree but report UNAVAILABLE (or fail cleanly on DAP) on an
-installed user's machine.
-
-## Standing constraint from the user
-
-**No heuristics.** A fix must be deterministic. A solution that patches the
-observed case and misleads elsewhere is worse than leaving the defect open and
-documented.
+- Ran `install\extension-tests\run.bat` for due diligence even though nothing
+  inside `install\local.delphi-win64-debug\` (the JS extension code itself)
+  was touched — all green (13+22+23+19+15+24+46+8+20 cases across every
+  suite), as expected.
+- Did not run `Setup.exe`/`Install.exe` interactively end-to-end (would touch
+  this machine's real VS Code extension state and `claude mcp add`
+  registration for no additional proof beyond what the direct protocol-level
+  verification above already gives — `BuildVsix` zips `StageDir` recursively,
+  already confirmed to contain `Zydis.dll`).
 
 ## State of the tree
 
-- `public-main`, with disassembly increments 1-6 (this session's increment 6
-  included) and the prior data-breakpoints increment (6/6) all uncommitted.
+- `public-main`. Disassembly increments 1-6 and the data-breakpoints
+  increment are already committed (`git log`: `af917fe` is increment 6,
+  HEAD at session start). This session's increment 7 (packaging) is
+  UNCOMMITTED by instruction — **DO NOT COMMIT**, left in the tree for
+  review. `git status --porcelain` at the end of this session: only the
+  files this session touched (see "What changed" above) plus `.gitignore`.
   Release **0.3.0 is committed but NOT tagged and NOT pushed**; no GitHub
   release exists.
 - Win32 support is functionally complete for `-$O-` targets. Debug-info format
@@ -128,6 +116,9 @@ documented.
 
 ## Traps
 
-`TRAPS.md` has full detail; no new entries were needed this session — every
-mechanism increment 6 relies on (`DisassembleBackward`, the boundary lookups,
-the main-exe module-name sentinel) was already documented from increments 2-5.
+`TRAPS.md` has full detail. New for this session, not yet promoted there:
+**`cmd /c "<batch file>"` from the Bash tool produced no output and no error
+in this session** (just a fresh cmd banner) — root cause not diagnosed, but
+`PowerShell`'s call operator (`& "<path>"`) ran every batch file correctly
+throughout. Prefer PowerShell for `.bat` invocation if Bash's `cmd /c`
+mysteriously no-ops again.

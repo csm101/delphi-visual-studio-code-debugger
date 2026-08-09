@@ -158,6 +158,43 @@ begin
   Writeln('Staged adapter into ' + StageDir);
 end;
 
+// ------------------------------- Zydis DLL -----------------------------------
+// Optional disassembly backend (DISASSEMBLY_PLAN.md increment 7). Both the
+// adapter and the MCP server already look for it NEXT TO THEIR OWN exe first
+// (DapServer.pas / McpServer.pas ResolveZydisDllPath), so staging only needs
+// to place the DLL (and its MIT licence text, "ships alongside" per the plan)
+// beside each installed executable. A missing DLL here is NOT an install
+// failure -- ZydisTryLoad fails closed and the feature reports UNAVAILABLE,
+// exactly like a missing DLL does inside the build tree.
+function ZydisDllSourcePath: string;
+begin
+  Result := TPath.Combine(ExeDir, 'Zydis.dll');   // bundled (portable zip: next to Setup.exe)
+  if TFile.Exists(Result) then
+    Exit;
+  Result := TPath.Combine(RepoRoot, 'ThirdParty\Zydis\bin\x64\Zydis.dll'); // repository
+end;
+
+function ZydisLicenseSourcePath: string;
+begin
+  Result := TPath.Combine(ExeDir, 'Zydis-LICENSE.txt');
+  if TFile.Exists(Result) then
+    Exit;
+  Result := TPath.Combine(RepoRoot, 'ThirdParty\Zydis\LICENSE');
+end;
+
+procedure CopyZydisIfAvailable(const DestDir: string);
+begin
+  var Dll := ZydisDllSourcePath;
+  if not TFile.Exists(Dll) then begin
+    Writeln('NOTE: Zydis.dll not found; disassembly will report UNAVAILABLE in this install (' + DestDir + ').');
+    Exit;
+  end;
+  TFile.Copy(Dll, TPath.Combine(DestDir, 'Zydis.dll'), True);
+  var Lic := ZydisLicenseSourcePath;
+  if TFile.Exists(Lic) then
+    TFile.Copy(Lic, TPath.Combine(DestDir, 'Zydis-LICENSE.txt'), True);
+end;
+
 // ------------------------------- MCP server ---------------------------------
 // The MCP server is a standalone stdio exe registered with Claude Code / VS Code
 // by ABSOLUTE path, so it is copied to a stable per-user location (surviving
@@ -227,6 +264,7 @@ begin
   var Dest := TPath.Combine(McpInstallDir, 'DelphiDebuggerMcp.exe');
   CopyOverExecutable(McpSourceExe, Dest);
   Writeln('Installed MCP server: ' + Dest);
+  CopyZydisIfAvailable(McpInstallDir);
 
   var Script := RegisterScriptPath;
   if not TFile.Exists(Script) then begin
@@ -525,6 +563,11 @@ begin
       EnsureAdapterBuilt;
       StageFiles;
     end;
+    // Idempotent either way: portable mode's StageDir already carries
+    // Zydis.dll from the zip (build_setup_zip.bat stages it into
+    // local.delphi-win64-debug before zipping); repository mode needs it
+    // copied here since StageFiles above only staged the adapter exe.
+    CopyZydisIfAvailable(StageDir);
     Writeln('');
 
     var Info := ReadVsixInfo;

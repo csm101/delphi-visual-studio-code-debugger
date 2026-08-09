@@ -80,3 +80,10 @@ MCP_LIVE_FINDINGS_TODO.md
 # The CMake scratch directory build_zydis.bat regenerates it into stays ignored.
 !ThirdParty/Zydis/bin/x64/*.dll
 ThirdParty/Zydis/build/
+
+# Staged copies of the Zydis MIT licence text (DISASSEMBLY_PLAN.md increment
+# 7): update-install.bat / install\Install.dpr / build_setup_zip.bat copy it
+# alongside the DLL next to each installed adapter/MCP server, from the one
+# tracked source ThirdParty/Zydis/LICENSE. The DLL copies are already covered
+# by the *.dll rule above; this is the same treatment for its licence file.
+Zydis-LICENSE.txt

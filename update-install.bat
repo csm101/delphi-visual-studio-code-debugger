@@ -30,6 +30,20 @@ if errorlevel 1 (
   exit /b 1
 )
 
+rem Optional disassembly backend (DISASSEMBLY_PLAN.md increment 7). Missing is
+rem NOT fatal here: the adapter loads Zydis.dll dynamically and degrades
+rem disassemble/instructionPointerReference to UNAVAILABLE without it, so a
+rem repo without ThirdParty\Zydis\bin\x64\Zydis.dll still stages a working
+rem extension -- just without that one optional feature.
+set ZYDIS_DLL=%REPO_ROOT%ThirdParty\Zydis\bin\x64\Zydis.dll
+if exist "%ZYDIS_DLL%" (
+  echo === Copying Zydis.dll ^(disassembly backend^) into install\ ===
+  copy /Y "%ZYDIS_DLL%" "%EXT_DIR%\Zydis.dll" >nul
+  copy /Y "%REPO_ROOT%ThirdParty\Zydis\LICENSE" "%EXT_DIR%\Zydis-LICENSE.txt" >nul
+) else (
+  echo NOTE: %ZYDIS_DLL% not found -- disassembly will report UNAVAILABLE in this staged extension.
+)
+
 for %%F in ("%EXT_DIR%\VisualStudioCodeDelphiDebugger.exe") do set FSIZE=%%~zF
 echo.
 echo Installed to: %EXT_DIR%\VisualStudioCodeDelphiDebugger.exe
