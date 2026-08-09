@@ -85,24 +85,33 @@ type
   //                               not depend on discovery order.
   //   RUNTESTS_SERIAL=exclude     skip the NOT_PARALLEL_SAFE tests (shards)
   //   RUNTESTS_SERIAL=only        run ONLY those tests (the serial tail)
+  //   RUNTESTS_NAMES=a;b;c        run only tests whose full name contains one of
+  //                               the `;`-separated needles. Used by the
+  //                               sequential re-check of a parallel run's
+  //                               failures, which needs to name an arbitrary SET
+  //                               of tests in one pass. It overrides sharding and
+  //                               the serial split, because a re-check must be
+  //                               able to reach a NOT_PARALLEL_SAFE test too.
   //
   // With none of them set the filter is empty and every test runs, which is
   // exactly the committed sequential behaviour.
   TSelectionFilter = class(TInterfacedObject, ITestFilter)
   private
     FNeedle:      string;
+    FNames:       TArray<string>;
     FShardIndex:  Integer;
     FShardCount:  Integer;
     FSerialMode:  string;
     function IsNotParallelSafe(const AFullName: string): Boolean;
+    function MatchesAnyName(const AFullName: string): Boolean;
   public
-    constructor Create(const ANeedle: string; AShardIndex, AShardCount: Integer;
-      const ASerialMode: string);
+    constructor Create(const ANeedle, ANames: string;
+      AShardIndex, AShardCount: Integer; const ASerialMode: string);
     function IsEmpty: Boolean;
     function Match(const Test: ITest): Boolean;
   end;
 
-constructor TSelectionFilter.Create(const ANeedle: string;
+constructor TSelectionFilter.Create(const ANeedle, ANames: string;
   AShardIndex, AShardCount: Integer; const ASerialMode: string);
 begin
   inherited Create;
@@ -110,11 +119,25 @@ begin
   FShardIndex := AShardIndex;
   FShardCount := AShardCount;
   FSerialMode := LowerCase(ASerialMode);
+
+  FNames := [];
+  for var Part in LowerCase(ANames).Split([';']) do
+    if Part.Trim <> '' then
+      FNames := FNames + [Part.Trim];
 end;
 
 function TSelectionFilter.IsEmpty: Boolean;
 begin
-  Result := (FNeedle = '') and (FShardCount <= 1) and (FSerialMode = '');
+  Result := (FNeedle = '') and (Length(FNames) = 0) and (FShardCount <= 1) and
+            (FSerialMode = '');
+end;
+
+function TSelectionFilter.MatchesAnyName(const AFullName: string): Boolean;
+begin
+  for var Name in FNames do
+    if Pos(Name, AFullName) > 0 then
+      Exit(True);
+  Result := False;
 end;
 
 function TSelectionFilter.IsNotParallelSafe(const AFullName: string): Boolean;
@@ -143,6 +166,12 @@ begin
 
   if (FNeedle <> '') and (Pos(FNeedle, FullName) = 0) then
     Exit(False);
+
+  // An explicit name set answers on its own: no shard, no serial split. This is
+  // the re-check pass, and it must be able to select exactly the tests that
+  // failed wherever they ran.
+  if Length(FNames) > 0 then
+    Exit(MatchesAnyName(FullName));
 
   if FSerialMode = 'only' then
     Exit(IsNotParallelSafe(FullName));
@@ -178,6 +207,7 @@ var
   Logger:  ITestLogger;
   XmlLog:  ITestLogger;
   OnlyNeedle: string;
+  NameSet:    string;
   ShardIndex, ShardCount: Integer;
   SerialMode: string;
   Selection:  ITestFilter;
@@ -195,14 +225,18 @@ begin
     Runner.AddLogger(XmlLog);
 
     OnlyNeedle := GetEnvironmentVariable('RUNTESTS_ONLY');
+    NameSet    := GetEnvironmentVariable('RUNTESTS_NAMES');
     SerialMode := LowerCase(GetEnvironmentVariable('RUNTESTS_SERIAL'));
     ParseShardSpec(GetEnvironmentVariable('RUNTESTS_SHARD'), ShardIndex, ShardCount);
 
-    Selection := TSelectionFilter.Create(OnlyNeedle, ShardIndex, ShardCount, SerialMode);
+    Selection := TSelectionFilter.Create(OnlyNeedle, NameSet, ShardIndex,
+      ShardCount, SerialMode);
     if not Selection.IsEmpty then begin
       TDUnitX.Filter := Selection;
       if OnlyNeedle <> '' then
         Writeln('FILTER: only tests matching "', OnlyNeedle, '"');
+      if NameSet <> '' then
+        Writeln('FILTER: named tests "', NameSet, '"');
       if ShardCount > 1 then
         Writeln(Format('FILTER: shard %d of %d', [ShardIndex, ShardCount]));
       if SerialMode <> '' then

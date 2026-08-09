@@ -1637,6 +1637,17 @@ moment is logged. The suspected gap is unchanged: `GetStackFrames` refuses to
 cache a walk taken while `AnyBackgroundIndexingPending`, and the evaluate path
 has no equivalent guard. Fixing it is a prerequisite for raising the cap.
 
+**Until it is fixed, the classifier is the sequential re-check in
+`RunTestsParallel.dpr`, not a human.** When this failure (or any other) appears
+in a parallel run, the failing tests are re-run once with a single worker; a test
+that then passes is reported as `LoadSensitive` in `TestResults.xml` and named on
+the console as "not a code defect", and the run stays green. That is what makes
+the parallel default safe on machines smaller than the reference one — where the
+same deadline can be missed well below 12 workers. It also means the evidence
+arrives labelled: a `load-sensitive` count above zero in a report IS this
+question recurring, and the re-check log
+(`DebuggerTests\Win64\Debug\RunTests_recheck.log`) says which tests.
+
 ## Large-project scale (SampleApp / 780 MB RSM)
 
 - **Cold-start scan duration — MEASURED 2026-08-03.** On

@@ -82,6 +82,33 @@ Throughput does **not** flatten at 8. The cap is set by correctness: at 12+,
 scheduling artefact. Default = `min(CPUs div 2, (availMB-1024) div 384, 8)`,
 overridable with `RUNTESTS_JOBS`; `1` is exactly today's sequential behaviour.
 
+### Sequential re-check (follow-up, same task)
+
+The worker count adapts; whether the machine can SUSTAIN it does not show until
+the run. On a smaller or busier machine the load-sensitive symbol lookup can miss
+its deadline well below 12 workers, and a stranger would read that as a broken
+project. So a parallel run that produces failures now re-runs **those tests
+only**, once, with one worker, and the sequential verdict is authoritative:
+
+- fails parallel AND alone → red, exit 1, `<failure>`, counted in `failures`.
+- fails parallel, passes alone → `result="LoadSensitive"`, `success="True"`,
+  `<reason>`, counted in `load-sensitive`; console says "NOT code defects" and
+  names them; **exit 0**.
+- passes everywhere → nothing.
+
+Root element also carries `workers` / `load-sensitive` /
+`recheck="performed|skipped-sequential|not-needed"` so the XML alone is
+sufficient. Green runs pay nothing; exactly one re-run, never a retry loop;
+`RUNTESTS_JOBS=1` skips it. `RUNTESTS_NAMES=a;b;c` (new, in `RunTests.dpr`)
+is what lets one pass name an arbitrary set, overriding shard and serial split.
+
+Verified with two temporary probes in `ProcessListJsonTests.pas` (added, used,
+reverted — the file is clean): one failing unconditionally → red with the
+"in parallel AND again on the re-check" heading, exit 1; one failing only when
+more than one `RunTests.exe` is alive → `LoadSensitive`, exit 0, warning printed.
+Also verified `--jobs 1` emits `recheck="skipped-sequential"` and spawns no
+re-check. Re-check cost on the real suite: ~0.2 s.
+
 ### Next if interrupted
 
 Nothing is half-done. Optional follow-ups, in value order:
@@ -99,9 +126,10 @@ Nothing is half-done. Optional follow-ups, in value order:
 
 ## State of the tree
 
-- `public-main`; everything above UNCOMMITTED by instruction — **DO NOT COMMIT.**
-- Rebuilt and green: `build_dap.bat`, `build_runner.bat`,
-  `build_parallel_runner.bat`, `DevTools\build_one.bat DapSessionTiming`.
-  `build_mcp.bat` and `DevTools\build_all.bat` were NOT re-run — no code they
-  own changed, but `DapServer.pas` did, so re-run `build_dap.bat` consumers
-  before committing.
+- `public-main`. The perf work is committed as `0539853`; the sequential
+  re-check on top of it is UNCOMMITTED by instruction — **DO NOT COMMIT.**
+  Uncommitted files: `DebuggerTests/RunTests.dpr`,
+  `DebuggerTests/RunTestsParallel.dpr`, plus the doc updates.
+- Rebuilt and green: `build_runner.bat`, `build_parallel_runner.bat`. Nothing in
+  `DebuggerCore`, the adapter or the MCP server changed in the re-check work, so
+  their binaries are current from `0539853`.

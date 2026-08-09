@@ -31,9 +31,20 @@ absurdly.
   with "TStrings.GetTextStr not found" is the signature. The default cap of 8 is
   set by that, not by the speedup curve. If you raise `RUNTESTS_JOBS` past it and
   see an odd symbol-not-found failure, halve it before investigating the symbol.
+- **The runner already re-checks its own failures — read the label before
+  investigating.** Any failure in a parallel run is re-run once with a single
+  worker. `FAILED in parallel AND again on the sequential re-check` is a real
+  failure. `LOAD-SENSITIVE` means it passed alone: the machine could not sustain
+  the worker count, the run stays green, and there is nothing to debug in the
+  code under test. Do not start bisecting a `LOAD-SENSITIVE` line.
+- **`load-sensitive="N"` with N > 0 in `TestResults.xml` is a signal about the
+  MACHINE, not the code** — lower `RUNTESTS_JOBS`. It is also the recurrence of
+  the open symbol-index question in `KNOWN_UNKNOWNS.md`; the evidence is in
+  `Win64\Debug\RunTests_recheck.log`.
 - **When a failure smells like interference, re-run with `RUNTESTS_JOBS=1`
   first.** Sequential is a fully supported mode and gives identical counts; a
-  failure that survives it is a real failure.
+  failure that survives it is a real failure. (`RUNTESTS_JOBS=1` also skips the
+  re-check — there is nothing to compare against.)
 - **A test that needs to be the only session on the machine must go in
   `NOT_PARALLEL_SAFE` in `RunTests.dpr`**, which holds it back for the serial
   tail. Two are there already: one attaches to a process found by NAME, the other

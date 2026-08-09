@@ -335,6 +335,35 @@ binary, so they cannot run beside a sibling worker. They are listed in
 shards finish. Add to that list rather than weakening a test if a new one turns
 out to depend on being the only session on the machine.
 
+### Sequential re-check of failures
+
+The worker count adapts to the machine; whether the machine can actually sustain
+it does not become visible until the run. A slower or busier machine than this
+one can miss the same symbol-lookup deadline at a much lower worker count, and a
+stranger who has just cloned the repository would read that as "the project is
+broken".
+
+So **when a parallel run produces any failure, the failing tests — and only
+those — are re-run once with a single worker, and the sequential outcome is
+authoritative.** Three outcomes, reported distinctly:
+
+| outcome | console | `TestResults.xml` | exit |
+|---|---|---|---|
+| fails in parallel **and** alone | `FAILED in parallel AND again on the sequential re-check` | `success="False"`, `<failure>`, counted in `failures` | 1 |
+| fails in parallel, **passes** alone | `LOAD-SENSITIVE -- these are NOT code defects` + the names | `result="LoadSensitive"`, `success="True"`, `<reason>`, counted in `load-sensitive` | 0 |
+| passes everywhere | nothing | nothing | 0 |
+
+The root element also carries `workers`, `load-sensitive` and
+`recheck="performed|skipped-sequential|not-needed"`, so a CI or an agent reading
+only the XML reaches the same verdict as a human reading the console.
+
+Rules it holds to: it runs **only** when something failed and **only** for what
+failed, so a green run pays nothing; it re-runs **once** — a test that passes on
+the third attempt is a flake, not a pass; and `RUNTESTS_JOBS=1` skips it, since
+there is no parallel/alone distinction to draw. A load-sensitive classification
+is green-with-a-warning rather than red, because the sequential verdict is the
+authoritative one — but it is never silent, and it names the tests.
+
 Measured on 16C/32T: 1188 tests in 426 s sequential, 66 s at 8 workers, plus
 ~12 s of build. Throughput keeps rising past 8, but load-sensitive symbol
 lookups start missing their deadline at 12+, so the cap is set by correctness

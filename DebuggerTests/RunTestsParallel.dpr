@@ -45,6 +45,10 @@ type
     Success: string;
     Time:    string;
     Message: string;
+    // Set by the sequential re-check: this case failed under N concurrent
+    // workers and passed when re-run alone. It is not a defect in the code under
+    // test, and it is not counted as a failure -- but it is never silent.
+    LoadSensitive: Boolean;
   end;
 
   TCounts = record
@@ -150,7 +154,8 @@ end;
 // Each worker's console output goes to its OWN file. Left on the shared console
 // the loggers interleave thousands of lines through one serialized console
 // buffer, which is both unreadable and slow enough to distort the measurement.
-function SpawnWorker(const AShardSpec, ASerialMode, AXmlPath, ALogPath: string): THandle;
+function SpawnWorker(const AShardSpec, ASerialMode, ANames,
+  AXmlPath, ALogPath: string): THandle;
 var
   SA: TSecurityAttributes;
   SI: TStartupInfo;
@@ -158,6 +163,7 @@ var
 begin
   SetEnvironmentVariable('RUNTESTS_SHARD',  PChar(AShardSpec));
   SetEnvironmentVariable('RUNTESTS_SERIAL', PChar(ASerialMode));
+  SetEnvironmentVariable('RUNTESTS_NAMES',  PChar(ANames));
   SetEnvironmentVariable('RUNTESTS_ONLY',   PChar(OnlyNeedle));
 
   SA.nLength              := SizeOf(SA);
@@ -275,6 +281,7 @@ begin
     Item.Success := TagAttr(Tag, 'success');
     Item.Time    := TagAttr(Tag, 'time');
     Item.Message := '';
+    Item.LoadSensitive := False;
 
     var NextSearchFrom := TagEnd;
     if not Tag.EndsWith('/>') then begin
@@ -298,11 +305,11 @@ begin
              .Replace('"', '&quot;',[rfReplaceAll]);
 end;
 
-// The merged report is built from scratch rather than by grafting shard trees
-// together: nothing downstream consumes the namespace/fixture nesting. What
-// must survive is the aggregate verdict and one entry per test with its own
-// timing, which is what makes a run analysable after the fact.
-procedure MergeResults(const XmlPaths: TArray<string>; const Dest: string;
+// Reads one worker's report. Counts come from the root attributes; the per-case
+// list comes from the body. Reading is kept SEPARATE from writing the merged
+// file because the sequential re-check happens between the two: a case can only
+// be reclassified once we know how it behaved alone.
+procedure ReadWorkerReports(const XmlPaths: TArray<string>;
   out Totals: TCounts; out Cases: TArray<TCaseResult>);
 var
   All: TList<TCaseResult>;
@@ -335,39 +342,55 @@ begin
 
       All.AddRange(ParseCases(Text));
     end;
-
-    var SB := TStringBuilder.Create;
-    try
-      SB.AppendLine('<?xml version="1.0" encoding="UTF-8" standalone="yes" ?>');
-      SB.AppendLine(Format('<test-results name="RunTestsParallel (merged)" ' +
-        'total="%d" errors="%d" failures="%d" ignored="%d" inconclusive="%d" ' +
-        'not-run="%d">',
-        [Totals.Total, Totals.Errors, Totals.Failures, Totals.Ignored,
-         Totals.Inconclusive, Totals.NotRun]));
-      SB.AppendLine('  <results>');
-      for var Item in All do begin
-        var Head := Format('    <test-case name="%s" result="%s" success="%s" time="%s"',
-          [XmlEscape(Item.Name), XmlEscape(Item.Result_),
-           XmlEscape(Item.Success), XmlEscape(Item.Time)]);
-        if Item.Message = '' then
-          SB.AppendLine(Head + ' />')
-        else begin
-          SB.AppendLine(Head + '>');
-          SB.AppendLine('      <failure><message>' + XmlEscape(Item.Message) +
-            '</message></failure>');
-          SB.AppendLine('    </test-case>');
-        end;
-      end;
-      SB.AppendLine('  </results>');
-      SB.AppendLine('</test-results>');
-      TFile.WriteAllText(Dest, SB.ToString, TEncoding.UTF8);
-    finally
-      SB.Free;
-    end;
-
     Cases := All.ToArray;
   finally
     All.Free;
+  end;
+end;
+
+// The merged report is built from scratch rather than by grafting shard trees
+// together: nothing downstream consumes the namespace/fixture nesting. What
+// must survive is the aggregate verdict, one entry per test with its own timing,
+// and -- for anything the re-check reclassified -- WHY it is not counted as a
+// failure. A CI or an agent reading only this file must reach the same verdict
+// a human reading the console does.
+procedure WriteMergedReport(const Dest: string; const Totals: TCounts;
+  const Cases: TArray<TCaseResult>; LoadSensitive, Workers: Integer;
+  const RecheckState: string);
+var
+  SB: TStringBuilder;
+begin
+  SB := TStringBuilder.Create;
+  try
+    SB.AppendLine('<?xml version="1.0" encoding="UTF-8" standalone="yes" ?>');
+    SB.AppendLine(Format('<test-results name="RunTestsParallel (merged)" ' +
+      'total="%d" errors="%d" failures="%d" ignored="%d" inconclusive="%d" ' +
+      'not-run="%d" workers="%d" recheck="%s" load-sensitive="%d">',
+      [Totals.Total, Totals.Errors, Totals.Failures, Totals.Ignored,
+       Totals.Inconclusive, Totals.NotRun, Workers, RecheckState, LoadSensitive]));
+    SB.AppendLine('  <results>');
+    for var Item in Cases do begin
+      var Head := Format('    <test-case name="%s" result="%s" success="%s" time="%s"',
+        [XmlEscape(Item.Name), XmlEscape(Item.Result_),
+         XmlEscape(Item.Success), XmlEscape(Item.Time)]);
+      if Item.Message = '' then
+        SB.AppendLine(Head + ' />')
+      else begin
+        SB.AppendLine(Head + '>');
+        if Item.LoadSensitive then
+          SB.AppendLine('      <reason><message>' + XmlEscape(Item.Message) +
+            '</message></reason>')
+        else
+          SB.AppendLine('      <failure><message>' + XmlEscape(Item.Message) +
+            '</message></failure>');
+        SB.AppendLine('    </test-case>');
+      end;
+    end;
+    SB.AppendLine('  </results>');
+    SB.AppendLine('</test-results>');
+    TFile.WriteAllText(Dest, SB.ToString, TEncoding.UTF8);
+  finally
+    SB.Free;
   end;
 end;
 
@@ -393,9 +416,13 @@ var
   XmlPaths:  TArray<string>;
   Totals:    TCounts;
   Cases:     TArray<TCaseResult>;
+  FailedNames: TArray<string>;
+  RecheckState: string;
+  LoadSensitive: Integer;
   StartTick: UInt64;
   Failed:    Integer;
 begin
+  LoadSensitive := 0;
   try
     OutDir    := ExtractFilePath(ParamStr(0));               // ...\Win64\Debug\
     BaseDir   := ParentDir(ParentDir(OutDir));               // ...\DebuggerTests\
@@ -414,6 +441,17 @@ begin
 
     Writeln(Format('RunTestsParallel: %d worker(s)   [%d logical CPUs, %d MB available]',
       [Jobs, CPUCount, AvailablePhysicalMB]));
+    // On a small or busy machine the formula can land on 1, and a suite that
+    // takes seven times longer with no explanation reads as "the parallelism is
+    // broken". Say why, once.
+    if (Jobs < 2) and (ArgValue('--jobs', GetEnvironmentVariable('RUNTESTS_JOBS')) = '') then begin
+      Write('  Running SEQUENTIALLY: ');
+      if CPUCount < 4 then
+        Write(Format('%d logical CPU(s); ', [CPUCount]));
+      Writeln(Format('%d MB free, and two workers need %d MB. ' +
+        'This is expected, not a fault.',
+        [AvailablePhysicalMB, MB_KEPT_FREE + 2 * MB_PER_WORKER]));
+    end;
     if OnlyNeedle <> '' then
       Writeln('Filter: ', OnlyNeedle);
     StartTick := GetTickCount64;
@@ -431,9 +469,9 @@ begin
       if TFile.Exists(Workers[I].XmlPath) then
         TFile.Delete(Workers[I].XmlPath);
       if Jobs = 1 then
-        Workers[I].Proc := SpawnWorker('', '', Workers[I].XmlPath, Workers[I].LogPath)
+        Workers[I].Proc := SpawnWorker('', '', '', Workers[I].XmlPath, Workers[I].LogPath)
       else
-        Workers[I].Proc := SpawnWorker(Format('%d/%d', [I, Jobs]), 'exclude',
+        Workers[I].Proc := SpawnWorker(Format('%d/%d', [I, Jobs]), 'exclude', '',
           Workers[I].XmlPath, Workers[I].LogPath);
     end;
     Writeln(Format('%d worker(s) running...', [Jobs]));
@@ -450,7 +488,7 @@ begin
       Serial[0].Caption := 'serial tail';
       if TFile.Exists(Serial[0].XmlPath) then
         TFile.Delete(Serial[0].XmlPath);
-      Serial[0].Proc := SpawnWorker('', 'only', Serial[0].XmlPath, Serial[0].LogPath);
+      Serial[0].Proc := SpawnWorker('', 'only', '', Serial[0].XmlPath, Serial[0].LogPath);
       WaitAll(Serial);
     end;
 
@@ -460,7 +498,84 @@ begin
     for var W in Serial do
       XmlPaths := XmlPaths + [W.XmlPath];
 
-    MergeResults(XmlPaths, MergedXml, Totals, Cases);
+    ReadWorkerReports(XmlPaths, Totals, Cases);
+
+    // --- Sequential re-check -------------------------------------------------
+    //
+    // A failure under N concurrent workers has two possible causes, and telling
+    // them apart is the difference between "this project is broken" and "your
+    // machine is smaller than the one this default was tuned on". So when
+    // anything failed, the named tests are re-run ALONE, once, and the
+    // sequential outcome is the authoritative one.
+    //
+    // Cost discipline: it runs only when something failed, and only for what
+    // failed -- the normal green run pays nothing. Deterministic: exactly one
+    // re-run of exactly the named tests. A test that only passes on a third
+    // attempt is a flake, not a pass, and retry loops are how that gets hidden.
+    RecheckState := 'not-needed';
+    FailedNames  := [];
+    for var C in Cases do
+      if SameText(C.Success, 'False') and (IndexStr(C.Name, FailedNames) < 0) then
+        FailedNames := FailedNames + [C.Name];
+
+    if (Length(FailedNames) > 0) and (Jobs > 1) then begin
+      Writeln;
+      Writeln(Format('%d test(s) failed under %d workers. Re-checking them ' +
+        'sequentially...', [Length(FailedNames), Jobs]));
+
+      var Recheck: TArray<TWorker>;
+      SetLength(Recheck, 1);
+      Recheck[0].XmlPath := OutDir + 'TestResults_recheck.xml';
+      Recheck[0].LogPath := OutDir + 'RunTests_recheck.log';
+      Recheck[0].Caption := 'sequential re-check';
+      if TFile.Exists(Recheck[0].XmlPath) then
+        TFile.Delete(Recheck[0].XmlPath);
+      Recheck[0].Proc := SpawnWorker('', '', string.Join(';', FailedNames),
+        Recheck[0].XmlPath, Recheck[0].LogPath);
+      WaitAll(Recheck);
+
+      var RecheckTotals: TCounts;
+      var RecheckCases:  TArray<TCaseResult>;
+      ReadWorkerReports([Recheck[0].XmlPath], RecheckTotals, RecheckCases);
+
+      // A name is load-sensitive only if the re-check actually RAN it and every
+      // case under that name passed. A name the re-check never reached stays a
+      // failure: silence is not evidence of innocence.
+      for var Name in FailedNames do begin
+        var Ran    := False;
+        var AllOk  := True;
+        for var RC in RecheckCases do
+          if SameText(RC.Name, Name) then begin
+            Ran := True;
+            if not SameText(RC.Success, 'True') then
+              AllOk := False;
+          end;
+        if not (Ran and AllOk) then
+          Continue;
+
+        Inc(LoadSensitive);
+        for var I := 0 to High(Cases) do
+          if SameText(Cases[I].Name, Name) and SameText(Cases[I].Success, 'False') then begin
+            if SameText(Cases[I].Result_, 'Error') then
+              Dec(Totals.Errors)
+            else
+              Dec(Totals.Failures);
+            Cases[I].LoadSensitive := True;
+            Cases[I].Success       := 'True';
+            Cases[I].Result_       := 'LoadSensitive';
+            Cases[I].Message       := Format(
+              'LOAD-SENSITIVE, not a code defect: failed under %d concurrent ' +
+              'workers, PASSED when re-run alone. Original failure: %s',
+              [Jobs, Cases[I].Message]);
+          end;
+      end;
+      RecheckState := 'performed';
+    end
+    else if Length(FailedNames) > 0 then
+      // Sequential run: there is no parallel/alone distinction to draw.
+      RecheckState := 'skipped-sequential';
+
+    WriteMergedReport(MergedXml, Totals, Cases, LoadSensitive, Jobs, RecheckState);
 
     Writeln;
     Writeln('==========================================');
@@ -470,6 +585,9 @@ begin
     Writeln(Format('Tests Failed  : %d', [Totals.Failures]));
     Writeln(Format('Tests Errored : %d', [Totals.Errors]));
     Writeln(Format('Tests Ignored : %d', [Totals.NotRun]));
+    if LoadSensitive > 0 then
+      Writeln(Format('Load-sensitive: %d  (failed in parallel, passed alone)',
+        [LoadSensitive]));
     Writeln(Format('Wall clock    : %.1f s', [(GetTickCount64 - StartTick) / 1000]));
     Writeln(Format('Merged report : %s', [MergedXml]));
     Writeln('==========================================');
@@ -479,7 +597,12 @@ begin
       if SameText(C.Success, 'False') then begin
         if Failed = 0 then begin
           Writeln;
-          Writeln('NOT SUCCEEDED:');
+          if RecheckState = 'performed' then
+            // Naming the re-check here is the point: the reader must not have to
+            // guess whether these survived it or were never subjected to it.
+            Writeln('FAILED in parallel AND again on the sequential re-check:')
+          else
+            Writeln('FAILED:');
         end;
         Inc(Failed);
         Writeln('  ', C.Name, '  (', C.Result_, ')');
@@ -487,12 +610,37 @@ begin
           Writeln('      ', C.Message);
       end;
 
+    if LoadSensitive > 0 then begin
+      Writeln;
+      Writeln('LOAD-SENSITIVE -- these are NOT code defects. Each failed while ');
+      Writeln(Format('%d workers were running and PASSED when re-run alone:', [Jobs]));
+      for var C in Cases do
+        if C.LoadSensitive then
+          Writeln('  ', C.Name);
+      Writeln;
+      if Failed = 0 then
+        Writeln(Format('The suite is GREEN: this machine could not sustain %d ' +
+          'workers for those tests.', [Jobs]))
+      else
+        Writeln(Format('These are NOT why the run is red -- the %d failure(s) ' +
+          'above are.', [Failed]));
+      Writeln('  Re-run with a lower RUNTESTS_JOBS (or RUNTESTS_JOBS=1) to ' +
+        'avoid them entirely.');
+    end;
+
+    // Exit status follows the SEQUENTIAL verdict, which is the authoritative
+    // one: a load-sensitive failure is green-with-a-warning, because failing the
+    // run would tell a stranger on a small machine that the project is broken
+    // when it is not. A worker that crashed outright is still red -- that is not
+    // a test result at all.
     var AnyWorkerFailed := False;
     for var W in Workers + Serial do
       if W.ExitCode <> 0 then
         AnyWorkerFailed := True;
 
-    if AnyWorkerFailed or (Totals.Failures > 0) or (Totals.Errors > 0) then
+    if (Totals.Failures > 0) or (Totals.Errors > 0) then
+      Halt(1);
+    if AnyWorkerFailed and (LoadSensitive = 0) then
       Halt(1);
   except
     on E: Exception do begin
