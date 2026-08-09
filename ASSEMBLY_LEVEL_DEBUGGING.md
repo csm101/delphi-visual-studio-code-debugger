@@ -1,6 +1,7 @@
 # Assembly-level debugging — plan
 
-Status: **increments 1-2 BUILT (2026-08-09); increments 3-5 designed, not built.**
+Status: **increments 1-2 and 4 BUILT (2026-08-09); increments 3 and 5 designed, not
+built.**
 Wanted in the next release.
 
 Debugging at the instruction level, in the Disassembly View and over MCP: plant a
@@ -8,20 +9,22 @@ breakpoint on an instruction, step one instruction at a time, read and write
 registers, read and write memory. Everything below is the gap between that and
 what shipped with `DISASSEMBLY_PLAN.md`.
 
-## What already exists — verified, not assumed (2026-08-09)
+## What already exists — verified, not assumed (2026-08-09, MCP columns updated 2026-08-09)
 
 | capability | DAP | MCP |
 |---|---|---|
 | disassemble | yes (`disassemble`, `instructionPointerReference`) | yes (`disassemble`) |
 | breakpoint at an address | yes (`setInstructionBreakpoints`) | yes |
-| registers, read AND write | yes (a `Registers` scope, writable by name) | **no** |
+| registers, read AND write | yes (a `Registers` scope, writable by name) | yes (`get_registers`, `set_register`) |
 | read / write memory | **no** | yes (`read_memory`, `write_memory`) |
-| **step one instruction** | **no** | **no** |
+| step one instruction | yes (`granularity: "instruction"` on `next`/`stepIn`/`stepOut`) | yes (`granularity: "instruction"` on `step_over`/`step_into`/`step_out`) |
 
-Two surfaces, each missing something the other has, and instruction stepping
-missing from both. The engine underneath is largely present: it already
-single-steps with the trap flag, and `TWinDebugger` already knows how to plant a
-one-shot breakpoint at a return address.
+Two surfaces, each missing something the other has when this table was first
+measured, and instruction stepping missing from both. The engine underneath was
+largely present already: it already single-steps with the trap flag, and
+`TWinDebugger` already knew how to plant a one-shot breakpoint at a return
+address. Increment 4 closed the last two MCP gaps by exposing that engine
+surface; increment 3 (below) still owes DAP `readMemory`/`writeMemory`.
 
 ## Increment 1 — the engine primitive — **BUILT**
 
@@ -162,14 +165,59 @@ alternative was available and wrong:
 The engine work exists — MCP's `read_memory` / `write_memory` are built and
 tested. This is surface.
 
-## Increment 4 — MCP: registers and instruction stepping
+## Increment 4 — MCP: registers and instruction stepping — **BUILT**
 
-- `get_registers` / `set_register`. DAP has had a writable `Registers` scope for a
-  long time; the MCP surface never gained an equivalent, which means an agent
-  driving this debugger cannot see a register today.
-- instruction-granularity stepping, either as `step_instruction` or as a
-  granularity argument on the existing step tools. Match whatever shape reads
-  better against the existing surface rather than importing DAP's vocabulary.
+- `get_registers` / `set_register`, going through the SAME session-level path
+  DAP's `Registers` scope has used for a long time
+  (`TDebugSession.GetRegisters` / `SetRegister`, backed by
+  `TWinDebugger`/`TWin32Debugger`'s `GetRegisters`/`SetRegisterByName`) — no
+  second mechanism. `get_registers` returns the 18 rows DAP's scope emits
+  (RIP, RSP, RBP, RAX..RDI, R8..R15, EFlags), each as `{name, value, size}`
+  with `value` a variable-width hex string (`"0x..."`, never a bare JSON
+  number — a 64-bit register does not fit an IEEE double without loss), the
+  same convention `disassemble`/`read_memory`/`set_breakpoint_at_address`
+  already use. On a WOW64 (32-bit) target `R8..R15` read back as literal
+  `"0x0"` (`ReadThreadRegisters` in `WinDebuggerX86.pas` never sets them) —
+  proven, not assumed, by `GetRegisters_Win32_MatchesRipAndZeroExtendsUpperRegisters`.
+  `set_register` writes by name (case-insensitive, same names `get_registers`
+  returns) and returns the register RE-READ from the thread context rather
+  than echoing the request back, so the response proves the write instead of
+  merely restating the ask; an unrecognised name is refused (`isError:true`),
+  never silently ignored. Both require the session to be stopped, gated the
+  same way every other stop-only MCP tool is (`get_call_stack`, `get_locals`,
+  ...), even though the underlying `TDebugSession.GetRegisters` degrades
+  quietly to an empty array instead of refusing on its own.
+
+- Instruction-granularity stepping is a `granularity` argument on the
+  EXISTING `step_over`/`step_into`/`step_out` tools (`"statement"`, the
+  default, or `"instruction"`), not a fourth `step_instruction` tool. The
+  three tool names already name the exact three kinds the engine's
+  `TInstructionStepKind` distinguishes (`iskOver`/`iskInto`/`iskOut`), one to
+  one; a `step_instruction` tool would have had to reintroduce that same
+  three-way choice as a `kind` argument, duplicating a distinction the
+  surface already makes by which tool is called, for no offsetting gain. This
+  independently lands on the same shape DAP's increment 2 uses
+  (`granularity` on `next`/`stepIn`/`stepOut`) because it is the same
+  primitive underneath and the same three verbs on top — not because DAP
+  happens to use that word.
+
+  `TMcpServer.HandleStepTool` (`McpServer.pas`) is the single dispatch point
+  all three tools funnel through. `"instruction"` calls
+  `TDebugSession.StepInstruction` FIRST and only arms the async wait when it
+  is ACCEPTED — the exact ordering increment 2's DAP `HandleInstructionStep`
+  uses, and for the same reason: MCP tool calls are otherwise
+  fire-and-forget (`step_over`/`step_into`/`step_out` never used to refuse),
+  so a refusal has to be surfaced explicitly (`isError:true` with the reason)
+  rather than either a silent no-op or a wait that never resolves. An
+  unrecognised `granularity` value is refused the same way, never silently
+  treated as `"statement"`. `"statement"` (default, or explicit) is the
+  pre-existing fire-and-forget path, byte-for-byte unchanged.
+
+  Mechanism, refusal-routing detail and both RED controls (Kind-mapping
+  swap for `step_out`, following the same non-obvious-negative-control
+  reasoning increment 2's `TASK_RESUME.md` already recorded for its own
+  `HandleStepOut` test) are in `DAP_DEBUGGER_ARCHITECTURE.md`. Coverage:
+  `TEST_CATALOG.md` "Q.".
 
 ## Increment 5 — the placeholder document becomes useful
 
@@ -200,8 +248,8 @@ Keep separate, because they call for different answers:
 ## Order
 
 1, then 2 and 4 in either order (they are the two surfaces over the same
-primitive), then 3, then 5. Increment 5 last on purpose: it is the only one whose
-content depends on everything above already working.
+primitive) — both now done — then 3, then 5. Increment 5 last on purpose: it is
+the only one whose content depends on everything above already working.
 
 ## Gate
 

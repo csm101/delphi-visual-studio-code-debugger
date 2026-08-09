@@ -222,19 +222,65 @@ begin
   Result.Add(MakeTool('step_over',
     'Step over one source line, then wait for the stop. By default the stopped thread; ' +
     'pass threadId (from get_threads) to step another thread -- only that thread advances ' +
-    '(the rest stay frozen), and run control afterwards targets it. Returns a snapshot.',
+    '(the rest stay frozen), and run control afterwards targets it. Pass ' +
+    'granularity="instruction" to step exactly one machine instruction instead (landing on ' +
+    'a `call` runs to the return address rather than entering it, same as the default -- see ' +
+    'that granularity''s notes on step_into). Returns a snapshot -- UNLESS the instruction ' +
+    'step is refused (disassembler unavailable, undecodable bytes), which comes back as ' +
+    'isError:true with the reason instead of a snapshot, and nothing moves.',
     [Prop('threadId', 'integer',
-      'OS thread id to step (from get_threads). Omit for the current stopped thread.', False)]));
+      'OS thread id to step (from get_threads). Omit for the current stopped thread.', False),
+     Prop('granularity', 'string',
+      '"statement" (default) or "instruction". At instruction granularity a `rep`-prefixed ' +
+      'string instruction still completes as a whole, not one iteration at a time.', False)]));
   Result.Add(MakeTool('step_into',
     'Step into a call on the current source line, then wait for the stop. By default the ' +
-    'stopped thread; pass threadId (from get_threads) to step another thread. Returns a snapshot.',
+    'stopped thread; pass threadId (from get_threads) to step another thread. Pass ' +
+    'granularity="instruction" to step exactly ONE machine instruction instead of one source ' +
+    'line -- lands wherever that instruction goes, including inside a callee. Useful in code ' +
+    'with no line table (a runtime package built without debug info), where a source-level ' +
+    'step has no terminating condition. Returns a snapshot -- UNLESS the instruction step is ' +
+    'refused: no fallback decoder exists in this project, so an unavailable disassembler ' +
+    'backend or bytes that do not decode come back as isError:true with the reason, and ' +
+    'nothing moves (not even a partial step).',
     [Prop('threadId', 'integer',
-      'OS thread id to step (from get_threads). Omit for the current stopped thread.', False)]));
+      'OS thread id to step (from get_threads). Omit for the current stopped thread.', False),
+     Prop('granularity', 'string',
+      '"statement" (default) or "instruction". At instruction granularity a `rep`-prefixed ' +
+      'string instruction still completes as a whole (it retires one iteration per CPU trap; ' +
+      'stepping "into" it one iteration at a time would take one stop per byte moved).', False)]));
   Result.Add(MakeTool('step_out',
     'Run until the current function returns, then wait for the stop. By default the stopped ' +
-    'thread; pass threadId (from get_threads) to step another thread. Returns a snapshot.',
+    'thread; pass threadId (from get_threads) to step another thread. Pass ' +
+    'granularity="instruction" for the same run-to-return but PROVEN at the instruction level ' +
+    '(.pdata unwind info on x64, [EBP+4] on x86) -- when no return address can be proven ' +
+    '(x64 code with no unwind data) it REFUSES (isError:true with the reason) rather than run ' +
+    'to somewhere plausible; unlike the default statement-level step-out it never falls back ' +
+    'to single-stepping, which has no terminating condition without a line table. Returns a ' +
+    'snapshot on success.',
     [Prop('threadId', 'integer',
-      'OS thread id to step (from get_threads). Omit for the current stopped thread.', False)]));
+      'OS thread id to step (from get_threads). Omit for the current stopped thread.', False),
+     Prop('granularity', 'string',
+      '"statement" (default) or "instruction".', False)]));
+
+  // ---- Registers ----
+  Result.Add(MakeTool('get_registers',
+    'Return the general-purpose registers and flags of the currently stopped thread: RIP, ' +
+    'RSP, RBP, RAX..RDI, R8..R15, EFlags. Always 64-bit register NAMES even on a 32-bit ' +
+    'target -- on a WOW64 (32-bit) process the value already holds the 32-bit register ' +
+    'zero-extended and R8..R15 read as 0 (there is no such register at that width). Each ' +
+    '`value` is a hex string ("0x..."), never a bare number -- a register does not fit an ' +
+    'IEEE double without loss. `size` is 8 for the 64-bit registers, 4 for EFlags. Requires ' +
+    'the session to be stopped.', []));
+
+  Result.Add(MakeTool('set_register',
+    'Write one register of the currently stopped thread by name (the same names ' +
+    'get_registers returns, case-insensitive). Returns the register''s new value, re-read ' +
+    'from the thread so the response proves the write rather than echoing back what was ' +
+    'asked for. An unrecognised name is refused (isError:true), never silently ignored. ' +
+    'Requires the session to be stopped.',
+    [Prop('name', 'string', 'Register name, e.g. "RAX", "RIP", "EFlags" (case-insensitive).', True),
+     Prop('value', 'string', 'New value, decimal or 0x-hex.', True)]));
 
   Result.Add(MakeTool('pause_execution',
     'Pause a running debuggee. Returns a snapshot once it stops.', []));

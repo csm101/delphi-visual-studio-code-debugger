@@ -1374,6 +1374,86 @@ Test coverage: `DebuggerTests\InstructionStepDapTests.pas` (mono fixture,
 `InstructionStepSample.exe`/`.map`/`.rsm` — the same fixture increment 1
 built). See `TEST_CATALOG.md`.
 
+### Registers and instruction stepping (MCP) — increment 4
+
+**Registers.** `TMcpServer` (`MCPDebugger\McpServer.pas`) adds `get_registers`
+and `set_register`, going through the exact session-level path DAP's
+`Registers` scope (`REGISTERS_VAR_REF` in `DapServer.pas`) has used for a long
+time — `TDebugSession.GetRegisters` / `SetRegister`, which themselves call
+`IDebugTarget.GetRegisters` / `SetRegisterByName`. No second read/write
+mechanism was introduced; the MCP tools are a thin JSON frontend over the same
+facade, gated on `FSession.State = dsStopped` the same way every other
+stop-only MCP tool is (`get_call_stack`, `get_locals`, ...) even though the
+underlying session call degrades quietly (an empty array) rather than refusing
+on its own — the explicit gate is what turns that into a readable refusal
+instead of an empty, ambiguous result.
+
+`McpJson.RegisterToJson`/`RegisterListToJson` format each register as
+`{name, value, size}`, `value` a variable-width hex string (`'0x' +
+IntToHex(Value, 1)`), the same convention `DisasmInstructionToJson` and
+`DataBreakpointToJson` already use for addresses — never a bare JSON number,
+since a 64-bit register does not fit an IEEE double without loss. `size` is 8
+for the 64-bit registers, 4 for `EFlags`. `set_register` parses its `value`
+argument with the MCP-local `ParseAddress` helper (the same `"0x.."`/`"$.."`/
+decimal parsing `read_memory`/`write_memory`/`disassemble`/
+`set_breakpoint_at_address` already share — a plain string, not
+`DebuggerCore`'s `TryStrToUInt64Lit` DAP happens to use for the same job, so
+no cross-project dependency was added for it), then calls
+`FSession.SetRegister` and re-reads the register from a fresh
+`FSession.GetRegisters` call to build the response, so the response proves the
+write reached the thread context instead of merely echoing the request back.
+An unrecognised name is refused (`isError:true`, `"Unknown register
+\"<name>\"."`), never silently ignored — matching `TWinDebugger.
+SetRegisterByName`'s own case-insensitive name set (`RIP`, `RSP`, `RBP`,
+`RAX`..`RDI`, `R8`..`R15`, `EFlags`).
+
+Bitness note, measured not assumed
+(`GetRegisters_Win32_MatchesRipAndZeroExtendsUpperRegisters`): on a WOW64
+target `TWin32Debugger.ReadThreadRegisters` (`WinDebuggerX86.pas`) reads
+`Wow64GetThreadContext` and never sets `R8`..`R15` (`TRegisterSnapshot` starts
+zeroed), so `get_registers` reports them as literal `"0x0"` — not fabricated,
+not omitted, exactly what the engine has. `SetRegisterByName` has NO WOW64
+override, though — it always calls the base (native `GetThreadContext`/
+`SetThreadContext`) implementation. `set_register` was verified end-to-end
+only on a native x64 target; whether a WOW64 write through the native context
+actually lands on the right logical 32-bit register was not measured for this
+increment and is not claimed. If it turns out not to, that is a
+`SetRegisterByName` engine defect shared identically by the pre-existing DAP
+`setVariable`-on-`Registers`-scope path, not something increment 4 introduced.
+
+**Instruction-granularity stepping** is a `granularity` argument
+(`"statement"`, default; `"instruction"`) on the EXISTING `step_over`/
+`step_into`/`step_out` MCP tools, not a fourth `step_instruction` tool — see
+`ASSEMBLY_LEVEL_DEBUGGING.md` increment 4 for why that shape was chosen over a
+separate tool. `TMcpServer.HandleStepTool` is the single dispatch point all
+three funnel through: an unrecognised `granularity` value is refused
+(`isError:true`) before anything else runs; `"instruction"` calls
+`TDebugSession.StepInstruction` (Kind = `iskOver`/`iskInto`/`iskOut` per
+tool, the SAME 1:1 mapping increment 2's `HandleInstructionStep` uses) and
+only arms the async wait (`ArmWait`) when it returns `True` — exactly
+increment 2's "decide before answering" ordering, and for the analogous
+reason: `step_over`/`step_into`/`step_out` were fire-and-forget before this
+(they always succeed at the source-level), so a refusal has to be surfaced
+explicitly rather than read as a wait that silently never resolves.
+`"statement"` (default or explicit) is the pre-existing fire-and-forget
+`FSession.StepOver`/`StepInto`/`StepOut` call, untouched.
+
+**RED control that mattered**: the naive negative control for the `step_out`
+Kind mapping — reverting the dispatch so `granularity` is never read — does
+NOT fail `StepOut_Instruction_LandsInTheCaller`, for the identical reason
+`TASK_RESUME.md` already recorded for the DAP version of this same test in
+increment 2: in this non-recursive fixture scenario the pre-existing
+STATEMENT-level `step_out` also lands correctly in the immediate caller (same
+`FStepOverVA`/`FStepResumeSP` one-shot machinery `iskOut` reuses), so
+disabling the granularity check alone changes nothing observable. The valid
+control, proven instead: swap the `Kind` passed to `HandleStepTool` for the
+`step_out` tool from `iskOut` to `iskInto` — the step then stays inside the
+callee, and the "landed in caller" assertion fails on both bitnesses.
+
+Test coverage: `DebuggerTests\McpE2ETests.pas` (registers + stepping
+sections), reusing increment 1's `InstructionStepSample.exe`/`.map`/`.rsm`
+fixture for the stepping tests. See `TEST_CATALOG.md`, section Q.
+
 ## Stack walking
 
 Uses `StackWalk64` with `dbghelp.dll`'s `SymFunctionTableAccess64` /

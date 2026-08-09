@@ -145,10 +145,40 @@ watched expression, the old and new values, and the THREAD that wrote it
 (also in the snapshot's own `thread` field) in one string, since which thread
 did it is frequently the whole answer.
 
+### Registers (`ASSEMBLY_LEVEL_DEBUGGING.md` increment 4)
+The MCP equivalent of DAP's long-standing writable `Registers` scope — same
+`TDebugSession.GetRegisters`/`SetRegister` path, no second mechanism. Requires
+the session to be stopped.
+- `get_registers` — RIP, RSP, RBP, RAX..RDI, R8..R15, EFlags (18 rows) of the
+  currently stopped thread. Each row is `{name, value, size}`; `value` is a
+  hex string (`"0x..."`, never a bare number — a 64-bit register does not fit
+  a JSON/IEEE double without loss); `size` is 8 for the 64-bit registers, 4
+  for `EFlags`. On a WOW64 (32-bit) target the value already holds the
+  32-bit register zero-extended, and `R8`..`R15` read as literal `"0x0"` —
+  there is no such register at that width.
+- `set_register` — `name` (case-insensitive, the same names `get_registers`
+  returns) and `value` (decimal or `0x`-hex). Returns the register's NEW
+  value, RE-READ from the thread so the response proves the write rather than
+  echoing the request back. An unrecognised name is refused (`isError:true`),
+  never silently ignored.
+
 ### Execution (event-driven — the stop is folded into the response, no sleeps)
 - `continue_and_wait` (optional `timeoutMs`), `step_over`, `step_into`,
   `step_out`, `pause_execution`, `wait_until_stopped`. Each returns a compact
   snapshot of the new state.
+- `step_over`/`step_into`/`step_out` take an optional `granularity`:
+  `"statement"` (default) is the pre-existing source-level step; `"instruction"`
+  (`ASSEMBLY_LEVEL_DEBUGGING.md` increment 4) steps exactly ONE machine
+  instruction instead — landing wherever it goes for `step_into`, running to
+  PC + the decoded length without single-stepping a `call` or a `rep`-prefixed
+  string instruction for `step_over`, and running to a PROVEN return address
+  (`.pdata` on x64, `[EBP+4]` on x86) for `step_out`. Unlike the statement-level
+  step (which always succeeds), an instruction-granularity step CAN BE REFUSED
+  — no disassembler backend available, bytes that do not decode, or (for
+  `step_out`) no provable return address — and a refusal comes back as
+  `isError:true` with the reason instead of a snapshot; nothing moves. Useful
+  in code with no line table (a runtime package built without debug info),
+  where a source-level step has no terminating condition.
 
 ### Inspection (valid while stopped)
 - `get_compact_debug_snapshot` — state, stop reason, thread, current location,

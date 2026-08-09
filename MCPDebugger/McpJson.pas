@@ -37,6 +37,14 @@ function DataBreakpointToJson(const Bp: TSessionDataBreakpoint; const OwnId: str
 function DataBreakpointListToJson(const Bps: TArray<TSessionDataBreakpoint>;
   const OwnIds: TArray<string>): TJSONArray;
 
+// ASSEMBLY_LEVEL_DEBUGGING.md increment 4: the MCP equivalent of the DAP
+// Registers scope. `value` is a variable-width hex string (never a bare JSON
+// number -- a 64-bit register does not fit an IEEE double without loss), same
+// convention DisasmInstructionToJson/DataBreakpointToJson already use for
+// addresses. `size` is 8 for the 64-bit registers, 4 for EFlags.
+function RegisterToJson(const R: TRegisterValue): TJSONObject;
+function RegisterListToJson(const Regs: TArray<TRegisterValue>): TJSONArray;
+
 // One disassembled instruction: address (same '0x' + hex spelling frames use,
 // so it feeds straight back into `disassemble`), raw bytes, Intel-syntax
 // text, whether Zydis decoded it (False -> Text is 'db XX', never a guessed
@@ -451,6 +459,21 @@ begin
   Result := TJSONArray.Create;
   for var Ins in Insns do
     Result.Add(DisasmInstructionToJson(Ins));
+end;
+
+function RegisterToJson(const R: TRegisterValue): TJSONObject;
+begin
+  Result := TJSONObject.Create;
+  Result.AddPair('name', R.Name);
+  Result.AddPair('value', '0x' + IntToHex(R.Value, 1));
+  Result.AddPair('size', TJSONNumber.Create(R.Size));
+end;
+
+function RegisterListToJson(const Regs: TArray<TRegisterValue>): TJSONArray;
+begin
+  Result := TJSONArray.Create;
+  for var R in Regs do
+    Result.Add(RegisterToJson(R));
 end;
 
 end.

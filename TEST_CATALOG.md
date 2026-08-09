@@ -811,6 +811,122 @@ re-proven here.
       backend unavailable from outside the process. Both refusal MECHANISMS
       are fully covered at the engine level (section O).
 
+## Q. MCP registers and instruction stepping (ASSEMBLY_LEVEL_DEBUGGING.md increment 4)
+
+`DebuggerTests\McpE2ETests.pas`, driving the real `DelphiDebuggerMcp.exe`
+process over stdio (`TMcpTestClient`). Registers use the mono `TestTarget`
+fixture (`EVAL_SOURCE`/`EVAL_MARKER`, shared with the rest of this file);
+stepping reuses increment 1's own fixture,
+`TestTarget\InstructionStepSample.dpr` — no new fixture built for this
+increment. Unlike DAP (in-process, `InstructionStepDapTests.pas`), MCP is a
+separate exe, which makes the disassembler-unavailable refusal reachable from
+OUTSIDE the process too (the same scratch-directory isolation trick
+`Disassemble_ReportsUnavailable_WhenZydisDllNotFound` uses), not just at the
+engine level.
+
+**Registers** — the ENGINE values are already proven by DAP's own Registers
+scope coverage; these tests prove the MCP TOOL surface (JSON shape, the
+"must be stopped" gate, an unrecognised-name refusal):
+
+- [x] **`get_registers`' RIP agrees with the call stack's own address for the
+      SAME stop** (`GetRegisters_MatchesCallStackRip`) — a plain string
+      comparison, since `RegisterToJson` and `FrameListToJson` use the
+      identical `'0x' + hex` format. Also asserts the row count (18) and
+      that RSP is non-zero and EFlags reports `size: 4`. RED control: rename
+      the `get_registers` dispatch string so it falls through to "Unknown
+      tool" — the test errors with an invalid class typecast (an array was
+      expected, got the plain-text error wrapped as a JSON string).
+- [x] **On a WOW64 (32-bit) target, `R8`..`R15` read back as literal `"0x0"`**
+      (`GetRegisters_Win32_MatchesRipAndZeroExtendsUpperRegisters`) — the one
+      genuinely bitness-sensitive assertion here:
+      `TWin32Debugger.ReadThreadRegisters` never sets them.
+- [x] **Refused before any launch, with a reason** (`GetRegisters_RefusedBeforeLaunch`).
+- [x] **`set_register` writes, and a LATER, independent `get_registers` call
+      still sees it** (`SetRegister_WritesAndReadsBack`) — writes RAX to a
+      16-hex-digit sentinel, checks the immediate response, then re-reads.
+      RED control: same rename trick as `get_registers` — 3 of the 5
+      register tests fail (`SetRegister_WritesAndReadsBack`,
+      `SetRegister_UnknownName_Refused`, `GetRegisters_RefusedBeforeLaunch`'s
+      message no longer names "stop").
+- [x] **An unrecognised register name is refused, naming the bad name**
+      (`SetRegister_UnknownName_Refused`).
+- [ ] **`set_register` on a WOW64 target was not verified.**
+      `TWinDebugger.SetRegisterByName` has no WOW64 override (unlike
+      `ReadThreadRegisters`) — it always calls the native
+      `GetThreadContext`/`SetThreadContext` pair. Whether that correctly
+      reaches the logical 32-bit register on a WOW64 thread is unmeasured;
+      if it does not, that is a pre-existing `SetRegisterByName` engine gap
+      shared identically by DAP's `setVariable`-on-`Registers`-scope path,
+      not something this increment introduced. See
+      `DAP_DEBUGGER_ARCHITECTURE.md`.
+
+**Instruction-granularity stepping** — the ENGINE rules (call/rep/recursion,
+every refusal reason) are `InstructionStepTests.pas`'s job (section O) and
+are not re-proven here; this proves `granularity:"instruction"` reaches
+`TDebugSession.StepInstruction` with the right `TInstructionStepKind`, that a
+refusal surfaces as `isError:true` (never a silent no-op or an unresolved
+wait), and that `"statement"` (default) is untouched. MCP had NO coverage of
+plain `step_over`/`step_into`/`step_out` before this increment, so the
+granularity-absent tests below are also the first coverage of those tools at
+all:
+
+- [x] **`step_into` at instruction granularity advances exactly one
+      instruction, same source line** (`StepInto_Instruction_
+      AdvancesOneInstructionSameLine`, both bitnesses, at the same
+      `INSTR_MULTI` marker increment 1/2 use). RED control: force the
+      granularity check to always take the `"statement"` branch — both
+      bitness cases fail (`Expected [63] but got [64]`, i.e. it ran to the
+      next line), plus the disassembler-unavailable refusal test below (a
+      statement-level step never refuses, so it silently accepted where it
+      should have errored). NOT a valid control for
+      `StepInto_Instruction_RefusedBeforeLaunch`: the statement-level
+      fallback ALSO refuses before launch (`FSession.StepInto` raises "No
+      active debuggee to step" for its own, unrelated reason), so that one
+      test cannot distinguish the two code paths — recorded rather than
+      silently claimed as proof.
+- [x] **`step_over` at instruction granularity does the same, Win64 only**
+      (`StepOver_Instruction_AdvancesOneInstructionSameLine`) — the
+      call/rep-avoidance rules are already both-bitness-proven at the engine
+      and DAP layers; this only needs to prove the Kind mapping reaches the
+      engine, which is bitness-insensitive JSON glue.
+- [x] **`step_out` at instruction granularity lands in the caller** (`StepOut_
+      Instruction_LandsInTheCaller`, both bitnesses, at `INSTR_CALLEE_BODY`).
+      RED control here needed the SAME non-obvious mutation increment 2's DAP
+      test needed, not a plain revert: disabling the granularity dispatch
+      does NOT fail this test, because the pre-existing STATEMENT-level
+      `step_out` also lands correctly in the immediate caller in this
+      non-recursive scenario (same `FStepOverVA`/`FStepResumeSP` machinery
+      `iskOut` reuses) — measured, not assumed, before settling on the valid
+      control: swap the `Kind` passed to `HandleStepTool` for the `step_out`
+      tool from `iskOut` to `iskInto`. That fails both bitness cases
+      (`landed in "InstrStepCallee", not in the caller`).
+- [x] **Granularity absent, and explicit `"statement"`, are BYTE-IDENTICAL to
+      pre-increment-4 behaviour** (`StepInto_GranularityAbsentOrStatement_
+      StillAdvancesToNewLine`) — the source line DOES change at the same stop
+      where the instruction-granularity test above asserts it stays put.
+- [x] **An unrecognised `granularity` value is refused, never silently
+      treated as `"statement"`** (`StepOver_UnknownGranularity_Refused`) —
+      also asserts nothing moved (`get_debug_session_status` still reports
+      the pre-call line). RED control: disable the validation branch — the
+      call SUCCEEDS and the program counter visibly advances (`stopReason:
+      "step"`, a new line), instead of being refused.
+- [x] **Refused before any launch** (`StepInto_Instruction_RefusedBeforeLaunch`)
+      — mirrors the DAP `Refused_WhenNotLaunched_...` control, but is a
+      WEAKER control here (see above): both the instruction- and
+      statement-level paths refuse before launch, for different reasons.
+- [x] **Refused when the disassembler backend is unavailable, reached from
+      OUTSIDE the process** (`StepInto_Instruction_
+      RefusedWhenDisassemblerUnavailable`) — unlike DAP (where this refusal
+      is only reachable in-process, via `SetInstructionDisassembler`), MCP
+      is a separate exe: copying it to a scratch directory neither its
+      own-directory Zydis.dll check nor its repo-relative fallback can
+      resolve leaves nothing for `ZydisTryLoad`'s bare-name search to find,
+      reproducing "unavailable" from a real external client. Also asserts
+      nothing moved.
+- [ ] The `iskOut` "no provable return address" refusal has no MCP fixture,
+      for the same reason section O records at the engine level: it needs
+      x64 code with no unwind data, and dbghelp knows every test module.
+
 ## What the suite does NOT prove (2026-08-08)
 
 Coverage-honesty notes. Each records a place where a green run is weaker evidence

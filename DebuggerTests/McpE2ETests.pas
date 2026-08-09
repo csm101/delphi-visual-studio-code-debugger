@@ -73,6 +73,43 @@ type
     [Test] procedure SetBreakpointAtAddress_Win32_StopsAgain;
     [Test] procedure SetBreakpointAtAddress_RefusedWhenNotInAnyLoadedModule;
     [Test] procedure RemoveBreakpointAtAddress_UnplantsAndDoesNotStopAgain;
+
+    // ASSEMBLY_LEVEL_DEBUGGING.md increment 4: registers. The MCP equivalent
+    // of DAP's writable Registers scope -- same TDebugSession.GetRegisters /
+    // SetRegister path, so these prove the TOOL surface (JSON shape, the
+    // "must be stopped" gate, an unrecognised-name refusal); the register
+    // VALUES themselves already come from the same engine call the DAP
+    // Registers scope has used for a long time.
+    [Test] procedure GetRegisters_MatchesCallStackRip;
+    [Test] procedure GetRegisters_Win32_MatchesRipAndZeroExtendsUpperRegisters;
+    [Test] procedure GetRegisters_RefusedBeforeLaunch;
+    [Test] procedure SetRegister_WritesAndReadsBack;
+    [Test] procedure SetRegister_UnknownName_Refused;
+
+    // ASSEMBLY_LEVEL_DEBUGGING.md increment 4: instruction-granularity
+    // stepping over MCP. The ENGINE rules (call/rep/recursion, every refusal
+    // reason) are InstructionStepTests.pas's job and are not re-proven here;
+    // this proves granularity:"instruction" reaches TDebugSession.
+    // StepInstruction with the right TInstructionStepKind, that a refusal
+    // surfaces as isError:true (never a silent no-op or an unresolved wait),
+    // and that "statement" (default) is untouched. Reuses increment 1's own
+    // fixture, InstructionStepSample.exe -- MCP has never driven step_over/
+    // step_into/step_out at all before this increment, so these are also the
+    // first coverage of those tools' plain (statement) behaviour.
+    [Test] procedure StepInto_Instruction_AdvancesOneInstructionSameLine;
+    [Test] procedure StepInto_Instruction_Win32_AdvancesOneInstructionSameLine;
+    [Test] procedure StepOver_Instruction_AdvancesOneInstructionSameLine;
+    [Test] procedure StepOut_Instruction_LandsInTheCaller;
+    [Test] procedure StepOut_Instruction_Win32_LandsInTheCaller;
+    [Test] procedure StepInto_GranularityAbsentOrStatement_StillAdvancesToNewLine;
+    [Test] procedure StepOver_UnknownGranularity_Refused;
+    [Test] procedure StepInto_Instruction_RefusedBeforeLaunch;
+    // Unlike the DAP surface (InstructionStepDapTests.pas), MCP is a separate
+    // PROCESS: copying it to a scratch directory outside the repo (the same
+    // technique Disassemble_ReportsUnavailable_WhenZydisDllNotFound uses)
+    // makes the disassembler-unavailable refusal reachable from OUTSIDE the
+    // process too, not just at the engine level.
+    [Test] procedure StepInto_Instruction_RefusedWhenDisassemblerUnavailable;
   end;
 
 implementation
@@ -290,6 +327,18 @@ end;
 function TMcpE2ETests.HostExe: string;
 begin
   Result := RepoRoot + 'DebuggerTests\TestHost\Win64\Debug\TestHost.exe';
+end;
+
+// ASSEMBLY_LEVEL_DEBUGGING.md increment 1's own fixture -- a separate target
+// on purpose (TRAPS.md: adding scenarios to TestTarget shifts RSM import
+// indices and marker ordering). mapFile/rsmFile are left to launch_debuggee's
+// default (exe path with .map/.rsm), same as every other launch in this file.
+const
+  INSTR_SAMPLE_SOURCE = 'InstructionStepSample.dpr';
+
+function InstrSampleExe(const RootDir, Bitness: string): string;
+begin
+  Result := RootDir + Bitness + '\Debug\InstructionStepSample.exe';
 end;
 
 function TMcpE2ETests.MarkerLine(const SourceBaseName, Marker: string): Integer;
@@ -2201,6 +2250,584 @@ begin
     end;
   finally
     C.Free;
+  end;
+end;
+
+{ ---------------------------------------------------- registers (increment 4) - }
+
+// The value must be the SAME address the call stack already reports for the
+// stop -- RegisterToJson and FrameListToJson use the identical '0x' + hex
+// format, so this is a plain string comparison, not a numeric one.
+procedure TMcpE2ETests.GetRegisters_MatchesCallStackRip;
+begin
+  var Line := MarkerLine(EVAL_SOURCE, EVAL_MARKER);
+  var C := TMcpTestClient.Start(McpExe);
+  try
+    C.Call('initialize', nil).Free;
+    var LaunchArgs := TJSONObject.Create;
+    LaunchArgs.AddPair('program', TargetExe);
+    LaunchArgs.AddPair('sourceRoot', TargetDir);
+    C.CallTool('launch_debuggee', LaunchArgs).Free;
+    var BpArgs := TJSONObject.Create;
+    BpArgs.AddPair('sourceFile', EVAL_SOURCE);
+    BpArgs.AddPair('line', TJSONNumber.Create(Line));
+    C.CallTool('set_breakpoint', BpArgs).Free;
+
+    var ExpectedRip := '';
+    var Snap := C.CallTool('continue_and_wait', nil);
+    try
+      var S := TJSONObject(Snap);
+      Assert.AreEqual('stopped', S.GetValue<string>('state', ''), 'did not stop: ' + S.ToJSON);
+      ExpectedRip := ((S.GetValue('frames') as TJSONArray).Items[0] as TJSONObject)
+        .GetValue<string>('address', '');
+      Assert.IsTrue(ExpectedRip <> '', 'snapshot frame has no address');
+    finally
+      Snap.Free;
+    end;
+
+    var Regs := C.CallTool('get_registers', nil);
+    try
+      var Arr := Regs as TJSONArray;
+      // RIP, RSP, RBP, RAX..RDI (6), R8..R15 (8), EFlags.
+      Assert.AreEqual(18, Arr.Count, 'unexpected register count: ' + Arr.ToJSON);
+      var Rip: TJSONObject;
+      Assert.IsTrue(McpFindRow(Arr, 'RIP', Rip), 'no RIP in get_registers: ' + Arr.ToJSON);
+      Assert.AreEqual(ExpectedRip, Rip.GetValue<string>('value', ''),
+        'get_registers RIP disagrees with the call stack''s own address for the same stop');
+      Assert.AreEqual(8, Rip.GetValue<Integer>('size', -1), 'RIP size should be 8');
+      var Rsp: TJSONObject;
+      Assert.IsTrue(McpFindRow(Arr, 'RSP', Rsp), 'no RSP in get_registers: ' + Arr.ToJSON);
+      Assert.AreNotEqual('0x0', Rsp.GetValue<string>('value', ''), 'RSP should not be zero while stopped');
+      var Flags: TJSONObject;
+      Assert.IsTrue(McpFindRow(Arr, 'EFlags', Flags), 'no EFlags in get_registers: ' + Arr.ToJSON);
+      Assert.AreEqual(4, Flags.GetValue<Integer>('size', -1), 'EFlags size should be 4');
+    finally
+      Regs.Free;
+    end;
+
+    C.CallTool('terminate_debuggee', nil).Free;
+  finally
+    C.Free;
+  end;
+end;
+
+// The genuinely bitness-sensitive half: on a WOW64 (32-bit) target
+// ReadThreadRegisters (WinDebuggerX86.pas) reads Wow64GetThreadContext and
+// never sets R8..R15 (TRegisterSnapshot starts zeroed), so they must read
+// back as literal zero -- proving the MCP surface passes through what the
+// engine actually reports rather than fabricating a 64-register file.
+procedure TMcpE2ETests.GetRegisters_Win32_MatchesRipAndZeroExtendsUpperRegisters;
+begin
+  var Line := MarkerLine(EVAL_SOURCE, EVAL_MARKER);
+  var C := TMcpTestClient.Start(McpExe);
+  try
+    C.Call('initialize', nil).Free;
+    var LaunchArgs := TJSONObject.Create;
+    LaunchArgs.AddPair('program', TargetExe32);
+    LaunchArgs.AddPair('sourceRoot', TargetDir);
+    C.CallTool('launch_debuggee', LaunchArgs).Free;
+    var BpArgs := TJSONObject.Create;
+    BpArgs.AddPair('sourceFile', EVAL_SOURCE);
+    BpArgs.AddPair('line', TJSONNumber.Create(Line));
+    C.CallTool('set_breakpoint', BpArgs).Free;
+
+    var ExpectedRip := '';
+    var Snap := C.CallTool('continue_and_wait', nil);
+    try
+      var S := TJSONObject(Snap);
+      Assert.AreEqual('stopped', S.GetValue<string>('state', ''), 'did not stop: ' + S.ToJSON);
+      ExpectedRip := ((S.GetValue('frames') as TJSONArray).Items[0] as TJSONObject)
+        .GetValue<string>('address', '');
+    finally
+      Snap.Free;
+    end;
+
+    var Regs := C.CallTool('get_registers', nil);
+    try
+      var Arr := Regs as TJSONArray;
+      var Rip: TJSONObject;
+      Assert.IsTrue(McpFindRow(Arr, 'RIP', Rip), 'no RIP in get_registers: ' + Arr.ToJSON);
+      Assert.AreEqual(ExpectedRip, Rip.GetValue<string>('value', ''),
+        'Win32: get_registers RIP disagrees with the call stack''s own address');
+      // A 32-bit address must fit in 8 hex digits -- proves this really read the
+      // WOW64 32-bit context, not a stale/garbage 64-bit one.
+      Assert.IsTrue(ExpectedRip.Length - 2 <= 8, 'RIP does not look like a 32-bit VA: ' + ExpectedRip);
+      for var RegName in ['R8', 'R9', 'R10', 'R11', 'R12', 'R13', 'R14', 'R15'] do begin
+        var R: TJSONObject;
+        Assert.IsTrue(McpFindRow(Arr, RegName, R), 'no ' + RegName + ' in get_registers: ' + Arr.ToJSON);
+        Assert.AreEqual('0x0', R.GetValue<string>('value', ''),
+          Format('Win32: %s should read as zero (no such register at this width), got %s',
+            [RegName, R.GetValue<string>('value', '')]));
+      end;
+    finally
+      Regs.Free;
+    end;
+
+    C.CallTool('terminate_debuggee', nil).Free;
+  finally
+    C.Free;
+  end;
+end;
+
+procedure TMcpE2ETests.GetRegisters_RefusedBeforeLaunch;
+begin
+  var C := TMcpTestClient.Start(McpExe);
+  try
+    C.Call('initialize', nil).Free;
+    var R := C.CallTool('get_registers', nil);
+    try
+      Assert.IsTrue(R is TJSONString,
+        'get_registers before launch should be a tool error, not a (possibly empty) array: ' + R.ToJSON);
+      Assert.IsTrue((R as TJSONString).Value.ToLower.Contains('stop'),
+        'refusal does not explain that the session must be stopped: ' + (R as TJSONString).Value);
+    finally
+      R.Free;
+    end;
+  finally
+    C.Free;
+  end;
+end;
+
+// Re-reads via a FRESH get_registers call afterwards (not just the set_register
+// response) so the round trip is proven twice: the write reached the thread
+// context, and it is still there on a later, independent read.
+procedure TMcpE2ETests.SetRegister_WritesAndReadsBack;
+const
+  SENTINEL = '0x1122334455667788';
+begin
+  var Line := MarkerLine(EVAL_SOURCE, EVAL_MARKER);
+  var C := TMcpTestClient.Start(McpExe);
+  try
+    C.Call('initialize', nil).Free;
+    var LaunchArgs := TJSONObject.Create;
+    LaunchArgs.AddPair('program', TargetExe);
+    LaunchArgs.AddPair('sourceRoot', TargetDir);
+    C.CallTool('launch_debuggee', LaunchArgs).Free;
+    var BpArgs := TJSONObject.Create;
+    BpArgs.AddPair('sourceFile', EVAL_SOURCE);
+    BpArgs.AddPair('line', TJSONNumber.Create(Line));
+    C.CallTool('set_breakpoint', BpArgs).Free;
+    C.CallTool('continue_and_wait', nil).Free;
+
+    var SetArgs := TJSONObject.Create;
+    SetArgs.AddPair('name', 'RAX');
+    SetArgs.AddPair('value', SENTINEL);
+    var SetResult := C.CallTool('set_register', SetArgs);
+    try
+      Assert.IsTrue(SetResult is TJSONObject, 'set_register errored: ' + SetResult.ToJSON);
+      var O := TJSONObject(SetResult);
+      Assert.AreEqual('RAX', O.GetValue<string>('name', ''), 'wrong register echoed back');
+      Assert.AreEqual(SENTINEL, O.GetValue<string>('value', ''),
+        'set_register''s own response does not show the new value');
+      Assert.AreEqual(8, O.GetValue<Integer>('size', -1), 'RAX size should be 8');
+    finally
+      SetResult.Free;
+    end;
+
+    var Regs := C.CallTool('get_registers', nil);
+    try
+      var Rax: TJSONObject;
+      Assert.IsTrue(McpFindRow(Regs as TJSONArray, 'RAX', Rax), 'no RAX in get_registers');
+      Assert.AreEqual(SENTINEL, Rax.GetValue<string>('value', ''),
+        'a later, independent get_registers call does not see the write');
+    finally
+      Regs.Free;
+    end;
+
+    C.CallTool('terminate_debuggee', nil).Free;
+  finally
+    C.Free;
+  end;
+end;
+
+procedure TMcpE2ETests.SetRegister_UnknownName_Refused;
+begin
+  var Line := MarkerLine(EVAL_SOURCE, EVAL_MARKER);
+  var C := TMcpTestClient.Start(McpExe);
+  try
+    C.Call('initialize', nil).Free;
+    var LaunchArgs := TJSONObject.Create;
+    LaunchArgs.AddPair('program', TargetExe);
+    LaunchArgs.AddPair('sourceRoot', TargetDir);
+    C.CallTool('launch_debuggee', LaunchArgs).Free;
+    var BpArgs := TJSONObject.Create;
+    BpArgs.AddPair('sourceFile', EVAL_SOURCE);
+    BpArgs.AddPair('line', TJSONNumber.Create(Line));
+    C.CallTool('set_breakpoint', BpArgs).Free;
+    C.CallTool('continue_and_wait', nil).Free;
+
+    var SetArgs := TJSONObject.Create;
+    SetArgs.AddPair('name', 'NOTAREGISTER');
+    SetArgs.AddPair('value', '0x1');
+    var R := C.CallTool('set_register', SetArgs);
+    try
+      Assert.IsTrue(R is TJSONString,
+        'an unrecognised register name should be a tool error, never silently ignored: ' + R.ToJSON);
+      Assert.IsTrue((R as TJSONString).Value.Contains('NOTAREGISTER'),
+        'refusal does not name the unrecognised register: ' + (R as TJSONString).Value);
+    finally
+      R.Free;
+    end;
+
+    C.CallTool('terminate_debuggee', nil).Free;
+  finally
+    C.Free;
+  end;
+end;
+
+{ -------------------------------------------- instruction stepping (increment 4) - }
+
+function McpExePath(const RootDir: string): string;
+begin
+  Result := RootDir + 'MCPDebugger\Win64\Debug\DelphiDebuggerMcp.exe';
+end;
+
+procedure OpenInstrSampleAt(C: TMcpTestClient; const RootDir, Bitness, Marker: string);
+begin
+  var Lines := TStringList.Create;
+  try
+    Lines.LoadFromFile(RootDir + INSTR_SAMPLE_SOURCE);
+    var Tag := '{BP:' + Marker + '}';
+    var Line := 0;
+    for var I := 0 to Lines.Count - 1 do
+      if Lines[I].Contains(Tag) then begin
+        Line := I + 1;
+        Break;
+      end;
+    Assert.IsTrue(Line > 0, 'marker ' + Marker + ' not found in ' + INSTR_SAMPLE_SOURCE);
+
+    var LaunchArgs := TJSONObject.Create;
+    LaunchArgs.AddPair('program', InstrSampleExe(RootDir, Bitness));
+    LaunchArgs.AddPair('sourceRoot', RootDir);
+    C.CallTool('launch_debuggee', LaunchArgs).Free;
+
+    var BpArgs := TJSONObject.Create;
+    BpArgs.AddPair('sourceFile', INSTR_SAMPLE_SOURCE);
+    BpArgs.AddPair('line', TJSONNumber.Create(Line));
+    C.CallTool('set_breakpoint', BpArgs).Free;
+
+    var Snap := C.CallTool('continue_and_wait', nil);
+    try
+      Assert.AreEqual('stopped', TJSONObject(Snap).GetValue<string>('state', ''),
+        Format('%s: did not stop at %s (line %d): %s', [Bitness, Marker, Line, Snap.ToJSON]));
+    finally
+      Snap.Free;
+    end;
+  finally
+    Lines.Free;
+  end;
+end;
+
+function SnapshotLine(Snap: TJSONValue): Integer;
+begin
+  Result := ((Snap as TJSONObject).GetValue('location') as TJSONObject).GetValue<Integer>('line', -1);
+end;
+
+function SnapshotFunction(Snap: TJSONValue): string;
+begin
+  Result := ((Snap as TJSONObject).GetValue('location') as TJSONObject).GetValue<string>('function', '');
+end;
+
+function SnapshotIp(Snap: TJSONValue): string;
+begin
+  Result := (((Snap as TJSONObject).GetValue('frames') as TJSONArray).Items[0] as TJSONObject)
+    .GetValue<string>('address', '');
+end;
+
+procedure RunStepIntoInstructionAdvancesOneInstructionSameLine(const RootDir, Bitness: string);
+begin
+  var C := TMcpTestClient.Start(McpExePath(RootDir));
+  try
+    C.Call('initialize', nil).Free;
+    OpenInstrSampleAt(C, RootDir + 'DebuggerTests\TestTarget\', Bitness, 'INSTR_MULTI');
+
+    var Before := C.CallTool('get_compact_debug_snapshot', nil);
+    var LineBefore := SnapshotLine(Before);
+    var IpBefore := SnapshotIp(Before);
+    Before.Free;
+
+    var StepArgs := TJSONObject.Create;
+    StepArgs.AddPair('granularity', 'instruction');
+    var After := C.CallTool('step_into', StepArgs);
+    try
+      Assert.AreEqual('stopped', (After as TJSONObject).GetValue<string>('state', ''),
+        Format('%s: instruction-granularity step_into did not stop: %s', [Bitness, After.ToJSON]));
+      Assert.AreEqual(LineBefore, SnapshotLine(After),
+        Format('%s: an instruction-granularity step_into left the source line -- that is a ' +
+               'statement-granularity step, not an instruction one', [Bitness]));
+      Assert.AreNotEqual(IpBefore, SnapshotIp(After),
+        Format('%s: the instruction pointer did not move at all', [Bitness]));
+    finally
+      After.Free;
+    end;
+
+    C.CallTool('terminate_debuggee', nil).Free;
+  finally
+    C.Free;
+  end;
+end;
+
+procedure TMcpE2ETests.StepInto_Instruction_AdvancesOneInstructionSameLine;
+begin
+  RunStepIntoInstructionAdvancesOneInstructionSameLine(RepoRoot, 'Win64');
+end;
+
+procedure TMcpE2ETests.StepInto_Instruction_Win32_AdvancesOneInstructionSameLine;
+begin
+  RunStepIntoInstructionAdvancesOneInstructionSameLine(RepoRoot, 'Win32');
+end;
+
+procedure TMcpE2ETests.StepOver_Instruction_AdvancesOneInstructionSameLine;
+begin
+  var C := TMcpTestClient.Start(McpExe);
+  try
+    C.Call('initialize', nil).Free;
+    OpenInstrSampleAt(C, TargetDir, 'Win64', 'INSTR_MULTI');
+
+    var Before := C.CallTool('get_compact_debug_snapshot', nil);
+    var LineBefore := SnapshotLine(Before);
+    var IpBefore := SnapshotIp(Before);
+    Before.Free;
+
+    var StepArgs := TJSONObject.Create;
+    StepArgs.AddPair('granularity', 'instruction');
+    var After := C.CallTool('step_over', StepArgs);
+    try
+      Assert.AreEqual('stopped', (After as TJSONObject).GetValue<string>('state', ''),
+        'instruction-granularity step_over did not stop: ' + After.ToJSON);
+      Assert.AreEqual(LineBefore, SnapshotLine(After),
+        'an instruction-granularity step_over left the source line');
+      Assert.AreNotEqual(IpBefore, SnapshotIp(After), 'the instruction pointer did not move at all');
+    finally
+      After.Free;
+    end;
+
+    C.CallTool('terminate_debuggee', nil).Free;
+  finally
+    C.Free;
+  end;
+end;
+
+procedure RunStepOutInstructionLandsInTheCaller(const RootDir, Bitness: string);
+begin
+  var C := TMcpTestClient.Start(McpExePath(RootDir));
+  try
+    C.Call('initialize', nil).Free;
+    OpenInstrSampleAt(C, RootDir + 'DebuggerTests\TestTarget\', Bitness, 'INSTR_CALLEE_BODY');
+
+    var Before := C.CallTool('get_compact_debug_snapshot', nil);
+    var FnBefore := SnapshotFunction(Before);
+    Before.Free;
+    Assert.IsTrue(FnBefore.ToLower.Contains('instrstepcallee'),
+      Format('%s: did not stop inside the callee, got "%s"', [Bitness, FnBefore]));
+
+    var StepArgs := TJSONObject.Create;
+    StepArgs.AddPair('granularity', 'instruction');
+    var After := C.CallTool('step_out', StepArgs);
+    try
+      Assert.AreEqual('stopped', (After as TJSONObject).GetValue<string>('state', ''),
+        Format('%s: instruction-granularity step_out did not stop: %s', [Bitness, After.ToJSON]));
+      var FnAfter := SnapshotFunction(After);
+      Assert.IsTrue(FnAfter.ToLower.Contains('instrstepcallscenario'),
+        Format('%s: instruction-granularity step_out landed in "%s", not in the caller',
+          [Bitness, FnAfter]));
+    finally
+      After.Free;
+    end;
+
+    C.CallTool('terminate_debuggee', nil).Free;
+  finally
+    C.Free;
+  end;
+end;
+
+procedure TMcpE2ETests.StepOut_Instruction_LandsInTheCaller;
+begin
+  RunStepOutInstructionLandsInTheCaller(RepoRoot, 'Win64');
+end;
+
+procedure TMcpE2ETests.StepOut_Instruction_Win32_LandsInTheCaller;
+begin
+  RunStepOutInstructionLandsInTheCaller(RepoRoot, 'Win32');
+end;
+
+// The FIRST MCP coverage of plain (statement-level) step_into at all -- proves
+// granularity absent, and granularity="statement" explicitly, both still run
+// to the NEXT SOURCE LINE (the pre-existing, untouched behaviour), unlike the
+// instruction-granularity tests above which stay on the same line.
+procedure TMcpE2ETests.StepInto_GranularityAbsentOrStatement_StillAdvancesToNewLine;
+begin
+  var C := TMcpTestClient.Start(McpExe);
+  try
+    C.Call('initialize', nil).Free;
+    OpenInstrSampleAt(C, TargetDir, 'Win64', 'INSTR_MULTI');
+
+    var Snap0 := C.CallTool('get_compact_debug_snapshot', nil);
+    var Line0 := SnapshotLine(Snap0);
+    Snap0.Free;
+
+    // No "granularity" argument at all.
+    var After1 := C.CallTool('step_into', nil);
+    var Line1 := -1;
+    try
+      Assert.AreEqual('stopped', (After1 as TJSONObject).GetValue<string>('state', ''),
+        'granularity-absent step_into did not stop: ' + After1.ToJSON);
+      Line1 := SnapshotLine(After1);
+      Assert.AreNotEqual(Line0, Line1,
+        'granularity-absent step_into did not advance to a new source line -- this is a ' +
+        'regression in the EXISTING (statement-level) behaviour');
+    finally
+      After1.Free;
+    end;
+
+    // Explicit granularity="statement".
+    var StepArgs := TJSONObject.Create;
+    StepArgs.AddPair('granularity', 'statement');
+    var After2 := C.CallTool('step_into', StepArgs);
+    try
+      Assert.AreEqual('stopped', (After2 as TJSONObject).GetValue<string>('state', ''),
+        'granularity="statement" step_into did not stop: ' + After2.ToJSON);
+      Assert.AreNotEqual(Line1, SnapshotLine(After2),
+        'granularity="statement" step_into did not advance to a new source line -- this is a ' +
+        'regression in the EXISTING (statement-level) behaviour');
+    finally
+      After2.Free;
+    end;
+
+    C.CallTool('terminate_debuggee', nil).Free;
+  finally
+    C.Free;
+  end;
+end;
+
+procedure TMcpE2ETests.StepOver_UnknownGranularity_Refused;
+begin
+  var C := TMcpTestClient.Start(McpExe);
+  try
+    C.Call('initialize', nil).Free;
+    OpenInstrSampleAt(C, TargetDir, 'Win64', 'INSTR_MULTI');
+
+    var Before := C.CallTool('get_compact_debug_snapshot', nil);
+    var LineBefore := SnapshotLine(Before);
+    Before.Free;
+
+    var StepArgs := TJSONObject.Create;
+    StepArgs.AddPair('granularity', 'bogus');
+    var R := C.CallTool('step_over', StepArgs);
+    try
+      Assert.IsTrue(R is TJSONString,
+        'an unknown granularity should be a tool error, never silently treated as "statement": ' +
+        R.ToJSON);
+      Assert.IsTrue((R as TJSONString).Value.ToLower.Contains('granularity'),
+        'refusal does not name the bad argument: ' + (R as TJSONString).Value);
+    finally
+      R.Free;
+    end;
+
+    // Nothing must have moved: no wait was armed, so the session is still
+    // sitting exactly where it stopped.
+    var Status := C.CallTool('get_debug_session_status', nil);
+    try
+      var S := TJSONObject(Status);
+      Assert.AreEqual('stopped', S.GetValue<string>('state', ''), 'a refused step must not resume: ' + S.ToJSON);
+      Assert.AreEqual(LineBefore,
+        (S.GetValue('location') as TJSONObject).GetValue<Integer>('line', -1),
+        'a refused step must not move the program counter');
+    finally
+      Status.Free;
+    end;
+
+    C.CallTool('terminate_debuggee', nil).Free;
+  finally
+    C.Free;
+  end;
+end;
+
+// The one refusal reliably reachable without launching anything: there is
+// nothing to step before a target exists. Mirrors
+// InstructionStepDapTests.Refused_WhenNotLaunched_ReachesClientAsFailedRequest.
+procedure TMcpE2ETests.StepInto_Instruction_RefusedBeforeLaunch;
+begin
+  var C := TMcpTestClient.Start(McpExe);
+  try
+    C.Call('initialize', nil).Free;
+    var StepArgs := TJSONObject.Create;
+    StepArgs.AddPair('granularity', 'instruction');
+    var R := C.CallTool('step_into', StepArgs);
+    try
+      Assert.IsTrue(R is TJSONString,
+        'an instruction-granularity step_into before launch was accepted -- there is nothing to step: ' +
+        R.ToJSON);
+      Assert.IsTrue((R as TJSONString).Value.ToLower.Contains('debuggee'),
+        'refusal does not say there is no active debuggee: ' + (R as TJSONString).Value);
+    finally
+      R.Free;
+    end;
+  finally
+    C.Free;
+  end;
+end;
+
+// The disassembler-unavailable refusal, reached from OUTSIDE the process (MCP
+// is a separate exe, unlike the DAP adapter InstructionStepDapTests drives in-
+// process) -- same isolation trick as Disassemble_ReportsUnavailable_
+// WhenZydisDllNotFound: copy the MCP exe to a scratch directory neither its
+// own-directory Zydis.dll check nor its repo-relative fallback can resolve,
+// leaving ZydisTryLoad's bare-name search (this exe's directory, then PATH) as
+// the only path left, which finds nothing on an ordinary machine.
+procedure TMcpE2ETests.StepInto_Instruction_RefusedWhenDisassemblerUnavailable;
+begin
+  var ScratchDir := TPath.Combine(TPath.GetTempPath, 'mcp_no_zydis_step_test');
+  TDirectory.CreateDirectory(ScratchDir);
+  var IsolatedExe := TPath.Combine(ScratchDir, 'DelphiDebuggerMcp.exe');
+  TFile.Copy(McpExe, IsolatedExe, True);
+  try
+    var Line := MarkerLine(EVAL_SOURCE, EVAL_MARKER);
+    var C := TMcpTestClient.Start(IsolatedExe);
+    try
+      C.Call('initialize', nil).Free;
+
+      var LaunchArgs := TJSONObject.Create;
+      LaunchArgs.AddPair('program', TargetExe);
+      LaunchArgs.AddPair('sourceRoot', TargetDir);
+      C.CallTool('launch_debuggee', LaunchArgs).Free;
+
+      var BpArgs := TJSONObject.Create;
+      BpArgs.AddPair('sourceFile', EVAL_SOURCE);
+      BpArgs.AddPair('line', TJSONNumber.Create(Line));
+      C.CallTool('set_breakpoint', BpArgs).Free;
+      C.CallTool('continue_and_wait', nil).Free;
+
+      var StepArgs := TJSONObject.Create;
+      StepArgs.AddPair('granularity', 'instruction');
+      var R := C.CallTool('step_into', StepArgs);
+      try
+        Assert.IsTrue(R is TJSONString,
+          'instruction step with no Zydis reachable was ACCEPTED -- this project has no fallback ' +
+          'decoder and must never guess an instruction length: ' + R.ToJSON);
+        Assert.IsTrue((R as TJSONString).Value.ToLower.Contains('disassembler'),
+          'the refusal does not say what is missing: ' + (R as TJSONString).Value);
+      finally
+        R.Free;
+      end;
+
+      var Status := C.CallTool('get_debug_session_status', nil);
+      try
+        var S := TJSONObject(Status);
+        Assert.AreEqual('stopped', S.GetValue<string>('state', ''), 'a refused step must not resume: ' + S.ToJSON);
+        Assert.AreEqual(Line,
+          (S.GetValue('location') as TJSONObject).GetValue<Integer>('line', -1),
+          'a refused step must not move the program counter');
+      finally
+        Status.Free;
+      end;
+
+      C.CallTool('terminate_debuggee', nil).Free;
+    finally
+      C.Free;
+    end;
+  finally
+    TDirectory.Delete(ScratchDir, True);
   end;
 end;
 

@@ -92,6 +92,15 @@ type
     // read_memory/disassemble parse theirs (ParseAddress: "0x..", "$..", decimal).
     procedure HandleSetBreakpointAtAddress(const IdJson, AddrStr,
                 Condition, HitCondition, LogMessage: string);
+    // ASSEMBLY_LEVEL_DEBUGGING.md increment 4: step_over/step_into/step_out all
+    // funnel through this so "granularity" is handled once. Kind is the
+    // pre-existing 1:1 mapping each tool already implies (step_over -> iskOver,
+    // etc); the SAME facade increment 2's DAP plumbing calls
+    // (TDebugSession.StepInstruction), decided BEFORE the wait is armed so a
+    // refusal reaches the caller as isError:true instead of a wait that never
+    // resolves.
+    procedure HandleStepTool(const IdJson: string; Kind: TInstructionStepKind;
+                const Granularity: string; ThreadId: Cardinal);
 
     // Tool-result envelopes.
     procedure SendToolJson(const IdJson: string; Payload: TJSONValue);
@@ -123,6 +132,12 @@ begin
   except
   end;
 end;
+
+// Forward: implemented below (near HandleReadMemory), used earlier by
+// DispatchToolsCall's set_register handling -- same "0x..", "$..", decimal
+// parsing read_memory/write_memory/disassemble/set_breakpoint_at_address
+// already share.
+function ParseAddress(const S: string; out Addr: UInt64): Boolean; forward;
 
 { TMcpIO }
 
@@ -728,13 +743,16 @@ begin
       Exit;
     end;
     if Name = 'step_over' then begin
-      FSession.StepOver(Cardinal(ArgInt('threadId', 0)));  ArmWait(IdJson, 30000); Exit;
+      HandleStepTool(IdJson, iskOver, ArgStr('granularity'), Cardinal(ArgInt('threadId', 0)));
+      Exit;
     end;
     if Name = 'step_into' then begin
-      FSession.StepInto(Cardinal(ArgInt('threadId', 0)));  ArmWait(IdJson, 30000); Exit;
+      HandleStepTool(IdJson, iskInto, ArgStr('granularity'), Cardinal(ArgInt('threadId', 0)));
+      Exit;
     end;
     if Name = 'step_out' then begin
-      FSession.StepOut(Cardinal(ArgInt('threadId', 0)));   ArmWait(IdJson, 30000); Exit;
+      HandleStepTool(IdJson, iskOut, ArgStr('granularity'), Cardinal(ArgInt('threadId', 0)));
+      Exit;
     end;
     if Name = 'pause_execution' then begin
       FSession.Pause;     ArmWait(IdJson, 30000); Exit;
@@ -904,6 +922,50 @@ begin
       SendToolJson(IdJson, McpJson.StringListToJson(FSession.DrainDebuggerOutput));
       Exit;
     end;
+    // ASSEMBLY_LEVEL_DEBUGGING.md increment 4: the MCP equivalent of DAP's
+    // writable Registers scope (REGISTERS_VAR_REF in DapServer.pas). Both go
+    // through the SAME session-level path -- FSession.GetRegisters /
+    // FSession.SetRegister, backed by TDebugTarget.GetRegisters /
+    // SetRegisterByName -- no second mechanism.
+    if Name = 'get_registers' then begin
+      if not Stopped then begin
+        SendToolError(IdJson, 'Cannot read registers while the debuggee is running. Pause or wait for a stop first.');
+        Exit;
+      end;
+      SendToolJson(IdJson, McpJson.RegisterListToJson(FSession.GetRegisters));
+      Exit;
+    end;
+    if Name = 'set_register' then begin
+      if not Stopped then begin
+        SendToolError(IdJson, 'Cannot write a register while the debuggee is running. Pause or wait for a stop first.');
+        Exit;
+      end;
+      var RegName := ArgStr('name');
+      var RawVal: UInt64;
+      if not ParseAddress(ArgStr('value'), RawVal) then begin
+        SendToolError(IdJson, 'invalid value: ' + ArgStr('value'));
+        Exit;
+      end;
+      if not FSession.SetRegister(RegName, RawVal) then begin
+        SendToolError(IdJson, Format('Unknown register "%s".', [RegName]));
+        Exit;
+      end;
+      // Re-read rather than echo the request back -- the response proves the
+      // write reached the thread context instead of merely restating the ask.
+      var Written: TRegisterValue;
+      var Found := False;
+      for var R in FSession.GetRegisters do
+        if SameText(R.Name, RegName) then begin
+          Written := R;
+          Found := True;
+          Break;
+        end;
+      if Found then
+        SendToolJson(IdJson, McpJson.RegisterToJson(Written))
+      else
+        SendToolError(IdJson, Format('"%s" was written but does not appear in get_registers.', [RegName]));
+      Exit;
+    end;
     if Name = 'read_memory' then begin
       HandleReadMemory(IdJson, ArgStr('address'), ArgInt('count'));
       Exit;
@@ -1000,6 +1062,39 @@ begin
   Obj.AddPair('address', Format('0x%x', [Addr]));
   Obj.AddPair('written', TJSONNumber.Create(Length(Buf)));
   SendToolJson(IdJson, Obj);
+end;
+
+// ASSEMBLY_LEVEL_DEBUGGING.md increment 4. "statement" (default, or omitted)
+// keeps the pre-existing fire-and-forget behaviour (the source-level step
+// never refuses). "instruction" calls TDebugSession.StepInstruction FIRST and
+// only arms the wait when it is ACCEPTED -- exactly the ordering increment 2's
+// DAP HandleInstructionStep uses and for the same reason: a refusal must reach
+// the caller as a real error, not a silent no-op or a wait that never resolves.
+procedure TMcpServer.HandleStepTool(const IdJson: string; Kind: TInstructionStepKind;
+  const Granularity: string; ThreadId: Cardinal);
+begin
+  if (Granularity <> '') and not SameText(Granularity, 'statement') and
+     not SameText(Granularity, 'instruction') then begin
+    SendToolError(IdJson, Format(
+      'unknown granularity "%s" -- use "statement" (default) or "instruction".',
+      [Granularity]));
+    Exit;
+  end;
+  if SameText(Granularity, 'instruction') then begin
+    var RefusalReason: string;
+    if not FSession.StepInstruction(Kind, ThreadId, RefusalReason) then begin
+      SendToolError(IdJson, RefusalReason);
+      Exit;
+    end;
+  end
+  else begin
+    case Kind of
+      iskOver: FSession.StepOver(ThreadId);
+      iskInto: FSession.StepInto(ThreadId);
+      iskOut:  FSession.StepOut(ThreadId);
+    end;
+  end;
+  ArmWait(IdJson, 30000);
 end;
 
 procedure TMcpServer.HandleSetBreakpointAtAddress(const IdJson, AddrStr,
