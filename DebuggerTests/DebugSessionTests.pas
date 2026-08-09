@@ -2507,12 +2507,19 @@ procedure TDebugSessionTests.ExceptionStop_DefaultFrameServesLocals_ExplicitSele
         end;
       if RaiseIdx < 0 then
         Exit('the raising procedure RnInner is not on the reported call stack');
-      // The whole point of the change: the RTL/OS frames the exception was
-      // delivered through are still there. If RnInner were index 0 again, the
-      // trim would be discarding frames once more and the fault-frame test above
-      // would be passing for the wrong reason.
-      if RaiseIdx = 0 then
-        Exit('RnInner is frame 0 -- the frames above the raise site were discarded');
+      // At a DELPHI RAISE the plumbing above the raise site IS trimmed, so the
+      // raising procedure must be frame 0. That is the decided behaviour: above
+      // a `raise` every frame is RTL/OS plumbing by construction, so nothing of
+      // value is lost, and the maintainer wants the Call Stack to open there.
+      //
+      // The opposite case -- a HARDWARE FAULT, where frame 0 must be the fault
+      // itself and nothing may be trimmed -- is pinned separately by
+      // ExceptionInOsCode_TopFrameIsTheFaultingFrame. The two together are what
+      // prove the gate is on the exception KIND rather than on whether a frame
+      // happens to have source.
+      if RaiseIdx <> 0 then
+        Exit(Format('RnInner is frame %d -- at a Delphi raise the plumbing above' +
+          ' the raise site should have been trimmed', [RaiseIdx]));
       if Session.DefaultFrameIndex <> RaiseIdx then
         Exit(Format('DefaultFrameIndex is %d, expected %d (the raising frame)',
           [Session.DefaultFrameIndex, RaiseIdx]));
@@ -2529,11 +2536,16 @@ procedure TDebugSessionTests.ExceptionStop_DefaultFrameServesLocals_ExplicitSele
         Exit('evaluate with no frame did not resolve RnInnerVal: ' + Inner.Value +
           ' / ' + Inner.ErrorText);
 
-      // Explicit beats default: frame 0 is the RTL/OS frame the raise was
-      // delivered through and has no user locals of its own.
-      Session.SelectFrame(0);
-      if HasLocal(Session.GetLocals, 'RnInnerVal') then
-        Exit('selecting frame 0 still returned the default frame''s locals');
+      // Explicit beats default. It has to be pinned on a frame that DIFFERS
+      // from the default, and at a Delphi raise the default IS frame 0 -- so
+      // selecting 0 here would prove nothing. Frame 1 is RnMiddle, whose own
+      // local is RnMid and which must NOT show the raising frame's RnInnerVal.
+      Session.SelectFrame(1);
+      var MidLocals := Session.GetLocals;
+      if HasLocal(MidLocals, 'RnInnerVal') then
+        Exit('selecting frame 1 still returned the default frame''s locals');
+      if not HasLocal(MidLocals, 'RnMid') then
+        Exit('frame 1 did not yield its own local RnMid');
       Session.ClearFrame;
       if not HasLocal(Session.GetLocals, 'RnInnerVal') then
         Exit('ClearFrame did not restore the default frame');

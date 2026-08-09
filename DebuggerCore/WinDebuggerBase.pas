@@ -233,6 +233,11 @@ type
     FLastExceptionClass:   string;  // raised class name alone (DAP exceptionInfo.exceptionId)
     FLastExceptionMessage: string;  // Exception.Message text alone
     FExceptionObjAddr:     UInt64;  // VA of the live Delphi exception object (0 = none / AV)
+    // Was the last reported exception a Delphi `raise` ($0EEDFADE)? The class
+    // name cannot answer it -- a hardware AV is named EAccessViolation too --
+    // and consumers need the difference: everything above a Delphi raise is RTL
+    // plumbing by construction, while a fault's top frame IS the answer.
+    FLastExcIsDelphiRaise: Boolean;
     FDllBases:     TDictionary<string, UInt64>; // lowercase filename -> actual load base
     FDllSizes:     TDictionary<string, UInt64>; // lowercase filename -> SizeOfImage
     // lcase identifier -> DebugInfo revision at which it was confirmed absent
@@ -654,6 +659,7 @@ type
     function  HasExited:         Boolean;
     function  LastExceptionDesc: string;
     function  LastExceptionClass:   string;
+    function  LastExceptionIsDelphiRaise: Boolean;
     function  LastExceptionMessage: string;
     function  CurrentExceptionObject: UInt64;
     procedure SetExceptionRules(const Rules: TArray<TExceptionRule>);
@@ -4246,8 +4252,9 @@ begin
           ExcMessage := Format('Access violation at $%x', [ExcAddr]);
       end else if IsSecondChance then
         ExcClass := Format('Second-chance exception 0x%.8x', [Code]);
-      FLastExceptionClass   := ExcClass;
-      FLastExceptionMessage := ExcMessage;
+      FLastExceptionClass    := ExcClass;
+      FLastExceptionMessage  := ExcMessage;
+      FLastExcIsDelphiRaise  := IsDelphiRaise;
       // Combined summary for the stop UI: "Class: Message" when a message exists.
       var ExcDesc := ExcClass;
       if ExcMessage <> '' then
@@ -5913,6 +5920,7 @@ function TWinDebugger.LastExceptionDesc: string;     begin Result := FLastExcept
 function TWinDebugger.LastExceptionClass: string;    begin Result := FLastExceptionClass;    end;
 function TWinDebugger.LastExceptionMessage: string;  begin Result := FLastExceptionMessage;  end;
 function TWinDebugger.CurrentExceptionObject: UInt64; begin Result := FExceptionObjAddr;       end;
+function TWinDebugger.LastExceptionIsDelphiRaise: Boolean; begin Result := FLastExcIsDelphiRaise; end;
 
 function TWinDebugger.GetSourceLocation(out SourceFile: string;
   out Line: Integer): Boolean;

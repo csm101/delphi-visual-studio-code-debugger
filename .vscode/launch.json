@@ -47,6 +47,21 @@
             // The other half of the same experiment: the fault lands in RTL code
             // linked into the exe, so the frame may resolve to a NAME from the
             // MAP while still having no source file to open.
+            // The other half of the exception-kind gate: a Delphi `raise`, two
+            // nested procedures deep. Here the plumbing above the raise site IS
+            // trimmed, so the Call Stack must open ON the raise (RnInner,
+            // TestTargetCore.pas) — the opposite of the ntdll fault above,
+            // where frame 0 must be the fault itself.
+            "name": "Delphi raise: deep nested (TestTarget)",
+            "type": "delphi-win64",
+            "request": "launch",
+            "program": "${workspaceFolder}/DebuggerTests/TestTarget/Win64/Debug/TestTarget.exe",
+            "args": ["--run-deep-nested-raise"],
+            "sourceRoot": "${workspaceFolder}/DebuggerTests/TestTarget",
+            "stopAtEntry": false,
+            "diagnosticLog": true
+        },
+        {
             // The A/B twin of the ntdll config above: identical, except the
             // adapter attaches NO source to a sourceless frame. Use it to see
             // what VS Code does when left to itself — the adapter cannot open

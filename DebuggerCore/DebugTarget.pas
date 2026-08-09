@@ -336,6 +336,14 @@ type
     function  LastExceptionDesc: string;
     function  LastExceptionClass: string;
     function  LastExceptionMessage: string;
+    // True when the last reported exception was a Delphi `raise` ($0EEDFADE),
+    // False for a hardware fault (access violation, divide by zero, ...).
+    // The CLASS NAME cannot answer this: the RTL names a hardware AV
+    // EAccessViolation too, so only the raw exception code separates them.
+    // Callers need the distinction because everything above a Delphi raise is
+    // RTL plumbing BY CONSTRUCTION, while the top frame of a hardware fault is
+    // the fault itself and is the answer.
+    function  LastExceptionIsDelphiRaise: Boolean;
     // VA of the live Delphi exception object at the current exception stop
     // (0 when not stopped on a Delphi raise). Surfaced as the `$exception`
     // pseudo-local so the object is inspectable in the Variables panel.

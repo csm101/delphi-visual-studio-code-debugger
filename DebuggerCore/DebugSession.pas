@@ -190,6 +190,11 @@ type
     // plumbing, or OS code that took the fault), which has no user locals,
     // while the frame that does is further down the same stack.
     function  DefaultFrameIndexFor(const Frames: TArray<TStackFrame>): Integer;
+    // True only when the current stop is an exception stop AND that exception
+    // was a Delphi `raise`. Gates the raise-plumbing trim: above a raise the
+    // leading frames are RTL plumbing by construction, above a hardware fault
+    // the top frame IS the fault and must survive.
+    function  StoppedOnDelphiRaise: Boolean;
     // Points the engine at FLastFrames[FDefaultFrameIndex] without marking a
     // selection, so a later explicit SelectFrame still wins. False when the
     // default frame cannot carry locals (no frame pointer) -- the caller then
@@ -463,6 +468,11 @@ type
     // an exception stop; a frontend can use it to show the user WHICH frame it
     // answered for. Valid for the current stop only.
     property  DefaultFrameIndex: Integer read FDefaultFrameIndex;
+    // Why the target is stopped. Already carried inside the stop snapshot; also
+    // exposed on its own because a caller often needs just this one fact -- e.g.
+    // to tell "not stopped on an exception at all" from "stopped on one whose
+    // Delphi object does not exist yet".
+    property  StopReason: TStopReason read FStopReason;
 
     // Registers (stopped thread).
     function  GetRegisters: TArray<TRegisterValue>;
@@ -1726,8 +1736,14 @@ begin
   if Length(FLastFrames) = 0 then
     GetCallStack;   // fills the cache AND recomputes the default index
   var Idx := FDefaultFrameIndex;
-  if (Idx <= 0) or (Idx > High(FLastFrames)) then
-    Exit;           // index 0 needs no retarget: it IS the stopped context
+  if (Idx < 0) or (Idx > High(FLastFrames)) then
+    Exit;
+  // Index 0 STILL needs the retarget when the reported stack was TRIMMED, which
+  // is exactly the case at a Delphi raise: reported frame 0 is the raise site,
+  // several frames above the raw stopped context. This used to exit early on
+  // Idx = 0 -- correct only while nothing was ever trimmed, and it served NO
+  // locals at all the moment trimming came back, because the engine stayed on
+  // the raw context: a nameless kernelbase frame with nothing to decode.
   // A frame with no frame pointer cannot have its locals decoded. Leaving the
   // engine on the raw stopped context is a refusal; pointing it at a frame whose
   // base is unknown would decode SOMETHING at a wrong address and present it.
@@ -1736,6 +1752,12 @@ begin
   FDebugger.SetActiveFrame(FLastFrames[Idx].FrameRBP, FLastFrames[Idx].FuncEntryVA,
     FLastFrames[Idx].FunctionName, FLastFrames[Idx].IP);
   Result := True;
+end;
+
+function TDebugSession.StoppedOnDelphiRaise: Boolean;
+begin
+  Result := FStoppedOnException and (FDebugger <> nil) and
+    FDebugger.LastExceptionIsDelphiRaise;
 end;
 
 function TDebugSession.ResolveEffectiveStop(const SourceFile: string;
@@ -1747,7 +1769,7 @@ begin
   if Result or (FDebugger = nil) then
     Exit;
   // Exception raised in RTL plumbing: walk to the first frame with source.
-  var Frames := FResolver.TrimRaisePlumbing(FDebugger.GetStackFrames, FStoppedOnException);
+  var Frames := FResolver.TrimRaisePlumbing(FDebugger.GetStackFrames, StoppedOnDelphiRaise);
   SetLastFrames(Frames, FStopTid);
   for var F in Frames do
     if F.SourceFile <> '' then begin
@@ -2294,7 +2316,7 @@ begin
     end;
   if NeedRefresh then
     Frames := FDebugger.GetStackFrames;
-  Frames := FResolver.TrimRaisePlumbing(Frames, FStoppedOnException);
+  Frames := FResolver.TrimRaisePlumbing(Frames, StoppedOnDelphiRaise);
   SetLastFrames(Frames, FStopTid);
   SetLength(Result, Length(Frames));
   for var I := 0 to High(Frames) do
@@ -2733,7 +2755,7 @@ begin
     FLoader.EnsureModuleForPC(Frames[0].IP);
     Frames := FDebugger.GetStackFrames;
   end;
-  Frames := FResolver.TrimRaisePlumbing(Frames, FStoppedOnException);
+  Frames := FResolver.TrimRaisePlumbing(Frames, StoppedOnDelphiRaise);
   if Length(Frames) = 0 then
     Exit;
 

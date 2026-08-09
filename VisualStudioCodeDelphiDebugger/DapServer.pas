@@ -4157,7 +4157,21 @@ begin
         if ObjAddr <> 0 then
           Body.AddPair('memoryReference', '0x' + IntToHex(ObjAddr, 1));
       end else begin
-        Body.AddPair('result', '<no current exception>');
+        // Two very different situations reached this branch with one message,
+        // and the difference matters to whoever is reading it. `$exception` is
+        // the Delphi exception OBJECT; at a first-chance HARDWARE fault that
+        // object does not exist yet -- the RTL creates EAccessViolation and
+        // friends only when its handler converts the SEH exception. Saying "no
+        // current exception" there reads as "nothing happened" while the
+        // debugger is stopped on precisely that exception.
+        var NoExcText := '<no current exception>';
+        if (FSession <> nil) and (FSession.StopReason = srException) and
+           (FDebugger <> nil) and (not FDebugger.LastExceptionIsDelphiRaise) then
+          NoExcText := '<hardware fault: no Delphi exception object exists yet --' +
+            ' the RTL creates one only when it converts the fault. The fault''s' +
+            ' class, address and message are in the stop reason and the Debug' +
+            ' Console.>';
+        Body.AddPair('result', NoExcText);
         Body.AddPair('variablesReference', TJSONNumber.Create(0));
       end;
       FIO.SendResponse(Seq, 'evaluate', True, Body);

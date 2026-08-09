@@ -730,6 +730,10 @@ type
     [Test] procedure Test_ExceptionRule_Code_MatchesNativeOnly;
     [Test] procedure Test_ExceptionRule_Code_Decimal_BreaksOnNative;
     [Test] procedure Test_ExceptionLocal_ShowsExceptionObject;
+    // The same pseudo-variable at a HARDWARE fault, where no Delphi exception
+    // object exists yet: the refusal must say why rather than claim there is no
+    // exception at all.
+    [Test] procedure Test_ExceptionDollarVar_HardwareFault_SaysWhyThereIsNoObject;
     // The frames-versus-active-frame separation, on the wire. At an exception
     // stop the call stack keeps the RTL/OS frames the exception was delivered
     // through, so `variables` on the Locals scope must answer for the session's
@@ -6382,6 +6386,46 @@ begin
   end;
 end;
 
+// At a first-chance HARDWARE fault there is no Delphi exception object yet --
+// the RTL creates EAccessViolation only when its handler converts the SEH
+// exception -- so `$exception` has nothing to return. That is correct. What was
+// wrong is what it SAID: "<no current exception>" reads as "nothing happened"
+// while the debugger is stopped on precisely that fault. The message must
+// distinguish the two, or a user reasonably concludes the debugger lost the
+// exception it is sitting on.
+procedure TDebuggerTests.Test_ExceptionDollarVar_HardwareFault_SaysWhyThereIsNoObject;
+var
+  Stopped, EvalResp: TJSONObject;
+begin
+  FClient := TDapClient.Create;
+  FClient.Start(AdapterExe);
+  FClient.Initialize.Free;
+  Assert.IsTrue(FClient.WaitForInitialized);
+  FClient.SetExceptionBreakpoints(['av', 'unhandled']).Free;
+  LaunchTarget(['--run-av']).Free;
+  FClient.ConfigDone.Free;
+
+  Stopped := FClient.WaitForStopped(15000);
+  try
+    Assert.AreEqual('exception', Stopped.GetValue<string>('reason', ''),
+      'expected the first-chance access-violation stop');
+  finally
+    Stopped.Free;
+  end;
+
+  EvalResp := FClient.Evaluate('$exception', 0, 'watch');
+  try
+    var Res := EvalResp.GetValue<string>('result', '');
+    Assert.AreNotEqual('<no current exception>', Res,
+      'at a hardware fault $exception must not claim there is no exception -- ' +
+      'the debugger is stopped on one');
+    Assert.IsTrue(Res.ToLower.Contains('hardware fault'),
+      'the refusal must say WHY there is no object, got: ' + Res);
+  finally
+    EvalResp.Free;
+  end;
+end;
+
 procedure TDebuggerTests.Test_ExceptionStop_LocalsDefaultToRaisingFrame_ScopesFrameWins;
 
   // Index of the frame the raise came from, read off the wire the way a client
@@ -6428,22 +6472,33 @@ begin
     Stopped.Free;
   end;
 
+  // This is a DELPHI RAISE, so the plumbing above the raise site is trimmed and
+  // the raising procedure IS frame 0. Everything above a `raise` is RTL and OS
+  // plumbing by construction, so nothing of value is discarded -- unlike a
+  // HARDWARE FAULT, where frame 0 must be the fault itself and nothing may be
+  // trimmed (pinned by ExceptionInOsCode_TopFrameIsTheFaultingFrame). The gate
+  // is the exception KIND; these two tests together are what prove it.
+  //
+  // This assertion previously demanded RaiseId > 0, which pinned the opposite
+  // behaviour -- correct only during the brief window when the trim was keyed on
+  // frame NAMES and therefore never fired at a raise, because frame 0 there is a
+  // NAMELESS kernelbase frame with nothing to match.
   var RaiseId := RaisingFrameId;
-  Assert.IsTrue(RaiseId > 0,
-    Format('RnInner should be below the raise plumbing, got frameId %d -- if it ' +
-      'is 0 the frames above the raise site are being discarded again', [RaiseId]));
+  Assert.AreEqual(0, RaiseId,
+    Format('at a Delphi raise the raising frame should be frame 0, got %d', [RaiseId]));
 
-  // No `scopes` yet: the client has named no frame, so the adapter answers for
-  // the raising procedure rather than for the RTL/OS frame the thread is in.
+  // No `scopes` yet: the client has named no frame, so the adapter answers from
+  // the default frame -- which here is the raising procedure.
   Assert.IsTrue(LocalExists('RnInnerVal'),
     'Locals with no frame selected must come from the default (raising) frame');
 
-  // Naming frame 0 is a request for frame 0. It is the frame the exception was
-  // delivered in, it has no user locals, and answering with the raising frame's
-  // would put one frame's variables under another frame's name.
-  FClient.Scopes(0).Free;
+  // Explicit selection must beat the default, and proving that needs a frame
+  // that DIFFERS from the default. At a raise the default is 0, so naming 0
+  // would prove nothing; frame 1 is RnMiddle, which has its own local and must
+  // not show the raising frame's.
+  FClient.Scopes(1).Free;
   Assert.IsFalse(LocalExists('RnInnerVal'),
-    'scopes(frameId=0) must answer for frame 0, not for the default frame');
+    'scopes(frameId=1) must answer for frame 1, not for the default frame');
 
   // And naming the raising frame brings them back.
   FClient.Scopes(RaiseId).Free;

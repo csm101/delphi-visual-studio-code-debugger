@@ -127,6 +127,7 @@ type
     function  HasExited: Boolean;
     function  LastExceptionDesc: string;
     function  LastExceptionClass: string;
+    function  LastExceptionIsDelphiRaise: Boolean;
     function  LastExceptionMessage: string;
     function  CurrentExceptionObject: UInt64;
     function  WriteMemoryAt(VA: UInt64; Buf: Pointer; Size: NativeUInt): Boolean;
@@ -261,6 +262,8 @@ function  TFakeMemTarget.ImageBase: UInt64; begin Result := 0; end;
 function  TFakeMemTarget.HasExited: Boolean; begin Result := False; end;
 function  TFakeMemTarget.LastExceptionDesc: string; begin Result := ''; end;
 function  TFakeMemTarget.LastExceptionClass: string; begin Result := ''; end;
+// No live process, so no exception ever reported: False is the only honest answer.
+function  TFakeMemTarget.LastExceptionIsDelphiRaise: Boolean; begin Result := False; end;
 function  TFakeMemTarget.LastExceptionMessage: string; begin Result := ''; end;
 function  TFakeMemTarget.CurrentExceptionObject: UInt64; begin Result := 0; end;
 function  TFakeMemTarget.WriteMemoryAt(VA: UInt64; Buf: Pointer; Size: NativeUInt): Boolean; begin Result := False; end;

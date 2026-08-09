@@ -40,20 +40,14 @@ type
     // trying the bare name then the common Delphi namespace prefixes.
     function ResolveUnitToSource(const UnitName: string): string;
 
-    // Trims the leading frames that are RTL exception-raise plumbing, by NAME,
-    // so a `raise` lands on the raise site instead of on `@RaiseExcept`. Only
-    // trims when StoppedOnException; otherwise returns the frames unchanged.
-    //
-    // The criterion used to be "drop everything above the first frame whose
-    // source resolves on disk", which conflated two different things: a frame
-    // whose source cannot be shown, and a frame that is noise. They coincide for
-    // a Delphi `raise` and diverge completely for a hardware fault -- an access
-    // violation inside ntdll or a symbol-less package had EVERY faulting frame
-    // discarded, so the debugger threw away the one thing the user opened it
-    // for. Naming the plumbing is exact; "has no source" was a guess about
-    // intent that happened to be right in one case.
+    // Trims the leading RTL exception-raise plumbing so a `raise` lands on the
+    // raise site instead of inside the RTL. GATED ON THE EXCEPTION KIND: it
+    // trims for a Delphi `raise` and returns the frames untouched for a
+    // hardware fault, whose top frame is the fault itself. Pass
+    // IDebugTarget.LastExceptionIsDelphiRaise; pass False when not stopped on an
+    // exception at all.
     function TrimRaisePlumbing(const Frames: TArray<TStackFrame>;
-      StoppedOnException: Boolean): TArray<TStackFrame>;
+      IsDelphiRaise: Boolean): TArray<TStackFrame>;
     // True when the frame's function name IS one of the known raise-plumbing
     // routines. Exact match on the last name segment, never a substring: a user
     // routine called AssertConfig must not read as `@Assert`.
@@ -287,6 +281,11 @@ begin
   Result := '';
 end;
 
+// KEPT, though TrimRaisePlumbing no longer calls it: the names are measured and
+// a caller that needs to recognise plumbing frames individually (a stack
+// annotator, a future step-to-handler) should use this rather than re-deriving
+// the list. It is NOT sufficient for trimming, and that is the point worth
+// remembering -- see TrimRaisePlumbing.
 class function TSourceResolver.IsRaisePlumbingFrame(
   const FunctionName: string): Boolean;
 const
@@ -322,25 +321,32 @@ begin
 end;
 
 function TSourceResolver.TrimRaisePlumbing(const Frames: TArray<TStackFrame>;
-  StoppedOnException: Boolean): TArray<TStackFrame>;
+  IsDelphiRaise: Boolean): TArray<TStackFrame>;
 begin
   Result := Frames;
-  if not StoppedOnException then
+
+  // THE GATE IS THE EXCEPTION KIND, and it is a fact rather than an inference.
+  //
+  // For a Delphi `raise` ($0EEDFADE) everything above the raise site is RTL and
+  // OS plumbing BY CONSTRUCTION -- the raise came from user code, so the frames
+  // between it and here cannot be anything else. Trimming to the first frame
+  // with resolvable source is therefore exact for this kind.
+  //
+  // For a hardware fault the top frame IS the fault, and trimming it discards
+  // the one thing the debugger was opened for.
+  //
+  // A by-NAME criterion was tried first and MEASURED not to work: at a Delphi
+  // raise frame 0 is a NAMELESS kernelbase frame, so a name list halts the trim
+  // immediately and never reaches @RaiseExcept. There is nothing there to name.
+  if not IsDelphiRaise then
     Exit;
 
-  // Drop leading frames only while they are NAMED plumbing. The first frame that
-  // is not stops the trim, whether or not its source can be shown -- on a
-  // hardware fault that frame is the fault itself, and it is the answer.
-  var I := 0;
-  while (I <= High(Frames)) and IsRaisePlumbingFrame(Frames[I].FunctionName) do
-    Inc(I);
-
-  // Never trim the whole stack: a stack made entirely of plumbing is a stack we
-  // do not understand, and showing all of it beats showing none of it.
-  if (I = 0) or (I > High(Frames)) then
-    Exit;
-
-  Result := Copy(Frames, I, Length(Frames) - I);
+  for var I := 0 to High(Frames) do
+    if (Frames[I].SourceFile <> '') and (Resolve(Frames[I].SourceFile) <> '') then begin
+      if I > 0 then
+        Result := Copy(Frames, I, Length(Frames) - I);
+      Exit;
+    end;
 end;
 
 function TSourceResolver.ResolveUnitToSource(const UnitName: string): string;
