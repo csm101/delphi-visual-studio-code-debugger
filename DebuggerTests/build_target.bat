@@ -32,6 +32,16 @@ dcc64 -$O- -V -VN -E.\Win64\Debug -NU.\Win64\Debug NestedEnumSample.dpr 2>&1
 set NESTED64_ERR=%errorlevel%
 dcc32 -$O- -V -VN -E.\Win32\Debug -NU.\Win32\Debug NestedEnumSample.dpr 2>&1
 set NESTED32_ERR=%errorlevel%
+rem No-source-stop fixture: faults inside the RTL (-rtl) or inside kernel32 (-os)
+rem so a stop can be observed where the top frame has no source to open. Used to
+rem settle, by measurement rather than assumption, whether VS Code opens the
+rem Disassembly View by itself and whether our placeholder source suppresses it
+rem (see KNOWN_UNKNOWNS.md). Separate target for the usual reason: adding
+rem scenarios to TestTarget shifts RSM import indices and marker ordering.
+dcc64 -$O- -V -VN -E.\Win64\Debug -NU.\Win64\Debug NoSourceStop.dpr 2>&1
+set NOSRC64_ERR=%errorlevel%
+dcc32 -$O- -V -VN -E.\Win32\Debug -NU.\Win32\Debug NoSourceStop.dpr 2>&1
+set NOSRC32_ERR=%errorlevel%
 rem External-TDS target (-VT): debug info in a standalone .tds, no embedded .debug.
 dcc64 -$O- -VT -VN -E.\Win64\Debug -NU.\Win64\Debug TdsSample.dpr 2>&1
 set TDS_ERR=%errorlevel%
@@ -52,4 +62,6 @@ if not "%MAPONLY64_ERR%"=="0" exit /b %MAPONLY64_ERR%
 if not "%MAPONLY32_ERR%"=="0" exit /b %MAPONLY32_ERR%
 if not "%NESTED64_ERR%"=="0" exit /b %NESTED64_ERR%
 if not "%NESTED32_ERR%"=="0" exit /b %NESTED32_ERR%
+if not "%NOSRC64_ERR%"=="0" exit /b %NOSRC64_ERR%
+if not "%NOSRC32_ERR%"=="0" exit /b %NOSRC32_ERR%
 exit /b %TT32_ERR%

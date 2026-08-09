@@ -1714,8 +1714,10 @@ begin
     Msg := Msg + '    ' + Info.ExceptionDescription + sLineBreak;
   Msg := Msg +
     '    No frame in this call stack carries debug info the adapter can read,' + sLineBreak +
-    '    so there is no line to open. The target IS stopped: use the CALL STACK' + sLineBreak +
-    '    view, or select a frame to open its placeholder description.' + sLineBreak;
+    '    so there is no line to open. The target IS stopped. There is still' + sLineBreak +
+    '    plenty to look at: open the DISASSEMBLY VIEW on a frame to see the' + sLineBreak +
+    '    instructions at the stop, use the CALL STACK view, or select a frame' + sLineBreak +
+    '    to open its placeholder description.' + sLineBreak;
   SendOutputEvent(Msg, 'important');
 end;
 

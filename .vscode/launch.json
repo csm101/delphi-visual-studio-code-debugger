@@ -27,6 +27,34 @@
                     "map": "${workspaceFolder}/Win64/Debug/TestPlugin.map"
                 }
             ]
+        },
+        {
+            // Stops with NO SOURCE at the top frame: an access violation inside
+            // ntdll, where there is no debug info at all -- exports only.
+            // Used to observe what VS Code does by itself now that the adapter
+            // declares supportsDisassembleRequest and every frame carries
+            // instructionPointerReference. See KNOWN_UNKNOWNS.md.
+            "name": "No-source stop: fault inside OS code (ntdll)",
+            "type": "delphi-win64",
+            "request": "launch",
+            "program": "${workspaceFolder}/DebuggerTests/TestTarget/Win64/Debug/NoSourceStop.exe",
+            "args": ["-os"],
+            "sourceRoot": "${workspaceFolder}/DebuggerTests/TestTarget",
+            "stopAtEntry": false,
+            "diagnosticLog": true
+        },
+        {
+            // The other half of the same experiment: the fault lands in RTL code
+            // linked into the exe, so the frame may resolve to a NAME from the
+            // MAP while still having no source file to open.
+            "name": "No-source stop: fault inside the RTL (System.Move)",
+            "type": "delphi-win64",
+            "request": "launch",
+            "program": "${workspaceFolder}/DebuggerTests/TestTarget/Win64/Debug/NoSourceStop.exe",
+            "args": ["-rtl"],
+            "sourceRoot": "${workspaceFolder}/DebuggerTests/TestTarget",
+            "stopAtEntry": false,
+            "diagnosticLog": true
         }
     ]
 }

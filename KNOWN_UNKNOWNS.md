@@ -1776,3 +1776,67 @@ standing first explanation for any future "types missing for package X" report.
 Without it, a BPL whose RSM has zero locals for a function — while its TD32 has
 them — shows empty locals and `Self: not found`. Regression test:
 `Test_Bpl_Td32Only_LocalsVisible`.
+
+## Does the placeholder source SUPPRESS VS Code's own disassembly? (open, 2026-08-09)
+
+When a stop has no source, the adapter fabricates a placeholder document and
+attaches it to the frame as `source`, because without a `source` VS Code opened
+nothing at all and the target simply went quiet. That behaviour predates
+disassembly.
+
+Since 2026-08-09 the adapter declares `supportsDisassembleRequest` and every
+frame carries `instructionPointerReference`. **The open question: does VS Code
+open the Disassembly View by itself when a frame has no source — and does our
+placeholder prevent it, by making the frame look as though source exists?**
+
+If it does, the placeholder now suppresses the better answer it was invented to
+approximate.
+
+### The experiment, and it needs a human in front of VS Code
+
+Two ready launch configurations, both in `.vscode/launch.json`:
+
+- **"No-source stop: fault inside OS code (ntdll)"** — an access violation inside
+  `ntdll`, where there is no debug info at all. This is the pure case.
+- **"No-source stop: fault inside the RTL (System.Move)"** — the fault lands in
+  RTL code linked into the exe, so the top frame may resolve to a NAME from the
+  MAP while still having no source file. This is the mixed case.
+
+Fixture: `DebuggerTests\TestTarget\NoSourceStop.dpr`, built for both bitnesses by
+`build_target.bat`. Both modes were verified under `LiveSessionProbe` to fault
+where intended (`EAccessViolation in module ntdll.dll` and an AV at an RTL RVA
+inside the exe respectively).
+
+MEASURED WHILE BUILDING THE FIXTURE, and the reason it does not use `lstrlenW`:
+`lstrlenW` is SEH-wrapped inside kernel32 on current Windows and returns 0 for a
+bogus pointer, so the first version never faulted at all. `RtlMoveMemory` from
+`ntdll` carries no such guard.
+
+What to record when running it:
+
+1. does an editor open by itself, and is it the Disassembly View, the placeholder
+   document, or nothing?
+2. does the `>>> DEBUGGER STOPPED` line appear in the Debug Console?
+3. is "Open Disassembly View" offered in the Call Stack context menu, and does it
+   land on the faulting instruction?
+4. does `debug.disassemblyView.showSourceCode` or any related setting change the
+   answer?
+
+### The three outcomes and what each implies
+
+- **VS Code opens disassembly by itself** → suppress the placeholder when the
+  frame has an `instructionPointerReference` AND the client declared
+  `supportsDisassembleRequest`; keep it otherwise.
+- **It does not** → the placeholder stays; only its text changes (already done —
+  it now names the Disassembly View).
+- **It depends on a user setting** → neither default is safe to assume, so the
+  choice becomes explicit configuration in `launch.json`.
+
+### Do not conflate the two reasons a source can be missing
+
+- **No line information at all** (OS code, a package built without debug info):
+  disassembly is the only truth available.
+- **A line IS known but the FILE is not on disk**: the actionable answer is the
+  file name and line, and how to fix the search path. Showing assembly there
+  hides a configuration problem behind what looks like a limitation of the
+  debugger. Any change made after this experiment must keep these apart.
