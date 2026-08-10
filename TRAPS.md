@@ -96,6 +96,16 @@ absurdly.
   `build_all.bat` flags.
 - **`build_and_run.bat` must call `build_runner.bat`**, never keep its own copy of
   the compile line — it silently went stale when search paths moved.
+- **After touching ANY test-target source, rebuild with `build_and_run.bat`, not
+  `build_target.bat` + `run_tests_parallel.bat`.** `build_target.bat` does not
+  build the package/host fixtures, and a stale one fails as *"Timeout waiting for
+  stopped event"* across a whole test class — which reads exactly like a
+  regression in the code under test, and sends the next hour in the wrong
+  direction. Editing even a COMMENT counts as touching it: it shifts the
+  `{BP:MARKER}` lines away from the compiled binary's line table.
+- **Killing a suite mid-run leaves the adapter and `TestHost` alive**, holding the
+  adapter exe open; the next build fails with `F2039 Could not create output
+  file`. Kill them and move on — there is nothing to investigate.
 - **`DevTools\build_all.bat` discovers `*.dpr`; keep the `%~xF` extension guard**,
   or cmd's wildcard also matches `*.dproj` through 8.3 short names.
 - **Batch quoting**: `-E"%~dp0"` breaks (the trailing backslash escapes the quote).

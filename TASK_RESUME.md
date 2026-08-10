@@ -32,7 +32,7 @@ Suite green at the cursor: **1204 found / 1200 passed / 0 failed / 0 errored /
 4 ignored**, 65 s at 8 workers. Last commit `8af8c82`. Nothing pushed yet
 (~37 local commits on `public-main`).
 
-### Fixed so far in this pass
+### Landed in this pass
 
 - `e4e2b35` — `setVariable` on a register answered with an EMPTY body, so VS Code
   blanked the row it was showing (name left standing, no value). The write itself
@@ -43,6 +43,16 @@ Suite green at the cursor: **1204 found / 1200 passed / 0 failed / 0 errored /
   spellings stay accepted on either bitness (`SameRegisterName`, `DebugTarget.pas`);
   `TDebugSession.TryGetRegister` is the shared lookup both frontends answer writes
   with.
+- `f069b1b` — `Win64DebuggerProj` renamed to `DelphiDebuggerProj` (`.groupproj` +
+  `.code-workspace`); the diagnostic launch configurations removed from
+  `.vscode/launch.json`, where they sat ABOVE the two the Delphi IDE plugin writes
+  into the workspace file and therefore decided what ran by default.
+- `35c4f36` — watchpoints on a COMPUTED address: `Arr[High(Arr)]`, `@Rec.Buf[0]`,
+  and VS Code's "Add Data Breakpoint at Address" (`supportsDataBreakpointBytes`).
+  An unnamed width is now chosen to fit the address instead of defaulting to a
+  pointer and refusing. Three `ExprEval` defects fixed on the way (`@` dropped its
+  suffix chain; a static array field was not "indexable"; `High`/`Low`/`Length`
+  did not know static arrays).
 
 ### Still to verify (the user does this in VS Code; nothing here is blocked on code)
 
@@ -57,7 +67,9 @@ Suite green at the cursor: **1204 found / 1200 passed / 0 failed / 0 errored /
 4. **Step at an exception** (`5b932c3`) — `F10` at an exception stop lands on the
    `except`/`finally` that receives it; on x86 `try/finally` it must REFUSE with a
    visible reason (the refusal is the correct behaviour, not a bug).
-5. **Data breakpoints** — "Break on Value Change" on a real variable, both bitnesses.
+5. **Data breakpoints** — "Break on Value Change" on a real variable, both
+   bitnesses; and **Breakpoints panel -> "Add Data Breakpoint at Address"**, which
+   only appeared with `35c4f36` and has never been driven by hand.
 6. **Hydra2** — breakpoint in a BPL loaded after startup, locals, evaluate. The only
    core use case the suite does not reproduce.
 
@@ -80,3 +92,12 @@ Suite green at the cursor: **1204 found / 1200 passed / 0 failed / 0 errored /
 - Every `DebuggerCore` consumer needs rebuilding: adapter (`build_dap.bat`), MCP
   (`build_mcp.bat`), runner (`build_runner.bat`). A stale MCP binary silently
   passes the DAP tests.
+- After touching ANY test-target source, run `build_and_run.bat`, not
+  `build_target.bat` + `run_tests_parallel.bat`. `build_target.bat` does not build
+  the package/host fixtures, and a stale one fails as
+  "Timeout waiting for stopped event" across a whole test class — which reads
+  exactly like a regression in the code under test. Editing even a COMMENT in a
+  target source shifts the `{BP:MARKER}` lines away from the compiled binary, so
+  it counts as touching it.
+- Killing a suite mid-run leaves the adapter and `TestHost` alive holding the
+  adapter exe; the next build fails with `F2039`. Kill them, do not investigate.
