@@ -1238,7 +1238,7 @@ DevTools\Win64\Debug\TestRsmParser.exe Win64\Debug\Debugme.rsm
 ```
 
 VS Code:
-- Open `Win64DebuggerProj.code-workspace`, not the folder.
+- Open `DelphiDebuggerProj.code-workspace`, not the folder.
 - Local extension lives in
   `%USERPROFILE%\.vscode\extensions\local.delphi-win64-debug\`.
 

@@ -422,15 +422,15 @@ Compiler flags for debug targets:
 
 `Debugme.cfg` contains direct command-line compiler options, one per line, without leading `-`.
 `Debugme.delphilsp.json` contains LSP-driven compiler options in `dccOptions`.
-In this workspace it is already wired through `delphiLsp.settingsFile` in `Win64DebuggerProj.code-workspace`.
+In this workspace it is already wired through `delphiLsp.settingsFile` in `DelphiDebuggerProj.code-workspace`.
 
 # VS Code setup
 
-Open `Win64DebuggerProj.code-workspace`, not the folder directly.
+Open `DelphiDebuggerProj.code-workspace`, not the folder directly.
 
 Relevant files:
 
-- `Win64DebuggerProj.code-workspace`
+- `DelphiDebuggerProj.code-workspace`
 - `Debugme.delphilsp.json`
 - `.vscode/launch.json`
 - `install\local.delphi-win64-debug\package.json` (the single canonical extension manifest)

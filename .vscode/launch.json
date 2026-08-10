@@ -1,4 +1,15 @@
-﻿{
+{
+    // Launch configurations for THIS repository's own sample target.
+    //
+    // The Delphi IDE plugin writes its own configurations into the
+    // `launch` section of the .code-workspace file, honouring the project's
+    // ACTIVE platform -- so a project built for Win32 gets a Win32 launch
+    // config there. Those appear in the dropdown tagged "(workspace)"; the
+    // ones below are tagged with the folder name. Do not add diagnostic or
+    // one-off experiment configurations here: they crowd out the plugin's
+    // entries, and VS Code offers the FIRST configuration in the list until
+    // the user picks one explicitly (the selection lives in workspace state,
+    // not in any file, so nothing here can set it).
     "version": "0.2.0",
     "configurations": [
         {
@@ -29,60 +40,17 @@
             ]
         },
         {
-            // Stops with NO SOURCE at the top frame: an access violation inside
-            // ntdll, where there is no debug info at all -- exports only.
-            // Used to observe what VS Code does by itself now that the adapter
-            // declares supportsDisassembleRequest and every frame carries
-            // instructionPointerReference. See KNOWN_UNKNOWNS.md.
-            "name": "No-source stop: fault inside OS code (ntdll)",
-            "type": "delphi-win64",
-            "request": "launch",
-            "program": "${workspaceFolder}/DebuggerTests/TestTarget/Win64/Debug/NoSourceStop.exe",
-            "args": ["-os"],
-            "sourceRoot": "${workspaceFolder}/DebuggerTests/TestTarget",
-            "stopAtEntry": false,
-            "diagnosticLog": true
-        },
-        {
-            // The other half of the same experiment: the fault lands in RTL code
-            // linked into the exe, so the frame may resolve to a NAME from the
-            // MAP while still having no source file to open.
-            // The other half of the exception-kind gate: a Delphi `raise`, two
-            // nested procedures deep. Here the plumbing above the raise site IS
-            // trimmed, so the Call Stack must open ON the raise (RnInner,
-            // TestTargetCore.pas) — the opposite of the ntdll fault above,
-            // where frame 0 must be the fault itself.
+            // Kept only until the exception-kind gate has been confirmed by
+            // hand in the GUI (TASK_RESUME.md, verification item 3): a Delphi
+            // `raise` two nested procedures deep, where the plumbing above the
+            // raise site IS trimmed, so the Call Stack must open ON the raise
+            // (RnInner, TestTargetCore.pas). Delete once confirmed -- the
+            // behaviour itself is covered by the suite.
             "name": "Delphi raise: deep nested (TestTarget)",
             "type": "delphi-win64",
             "request": "launch",
             "program": "${workspaceFolder}/DebuggerTests/TestTarget/Win64/Debug/TestTarget.exe",
             "args": ["--run-deep-nested-raise"],
-            "sourceRoot": "${workspaceFolder}/DebuggerTests/TestTarget",
-            "stopAtEntry": false,
-            "diagnosticLog": true
-        },
-        {
-            // The A/B twin of the ntdll config above: identical, except the
-            // adapter attaches NO source to a sourceless frame. Use it to see
-            // what VS Code does when left to itself — the adapter cannot open
-            // a Disassembly View (DAP has no request for it), so the only
-            // comparison available is "our document" versus "nothing from us".
-            "name": "No-source stop (ntdll), NO placeholder — A/B comparison",
-            "type": "delphi-win64",
-            "request": "launch",
-            "program": "${workspaceFolder}/DebuggerTests/TestTarget/Win64/Debug/NoSourceStop.exe",
-            "args": ["-os"],
-            "sourceRoot": "${workspaceFolder}/DebuggerTests/TestTarget",
-            "stopAtEntry": false,
-            "noSourcePlaceholder": false,
-            "diagnosticLog": true
-        },
-        {
-            "name": "No-source stop: fault inside the RTL (System.Move)",
-            "type": "delphi-win64",
-            "request": "launch",
-            "program": "${workspaceFolder}/DebuggerTests/TestTarget/Win64/Debug/NoSourceStop.exe",
-            "args": ["-rtl"],
             "sourceRoot": "${workspaceFolder}/DebuggerTests/TestTarget",
             "stopAtEntry": false,
             "diagnosticLog": true

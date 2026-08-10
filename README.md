@@ -134,7 +134,7 @@ Now open the project and start a session:
 
 1. If VS Code prompts to install the recommended **DelphiLSP** extension
    (`embarcaderotechnologies.delphilsp`, from `.vscode/extensions.json`), accept.
-2. Open **`Win64DebuggerProj.code-workspace`** — open the *workspace file*, not
+2. Open **`DelphiDebuggerProj.code-workspace`** — open the *workspace file*, not
    the folder; it wires up DelphiLSP and the compiler settings.
 3. Reload the window (`Ctrl+Shift+P` → *Developer: Reload Window*).
 4. In **Run and Debug** (`Ctrl+Shift+D`) pick **"Debug Debugme (Delphi DAP)"**
