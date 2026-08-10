@@ -124,9 +124,14 @@ read-or-written — there is no read-only watchpoint on x86/x64). Only 4 slots
 exist, shared by the whole process; the 5th request is refused by name (what
 already holds the slots), never silently dropped. The session must be
 `stopped` to set or remove one (arming touches live thread contexts).
-- `set_data_breakpoint` — `expression` (a literal address like `"0x1234"` or a
-  global/unit variable name — locals are refused with a reason, their address
-  is only valid for the frame's lifetime), `size` (1/2/4/8, address must
+- `set_data_breakpoint` — `expression` (a literal address like `"0x1234"`, a
+  global/unit variable name — locals named bare are refused with a reason, their
+  address is only valid for the frame's lifetime — or an EXPRESSION, resolved by
+  one rule: a bare identifier is watched at its own storage, `@X` is already an
+  address, anything else is watched where IT lives. So `Arr[High(Arr)]` watches
+  the last element and `@Rec.Buf[0]` the first byte of a buffer: the targets a
+  "who writes past my array" hunt needs, which belong to no variable at all),
+  `size` (1/2/4/8, address must
   already be aligned), `access` (`"write"`, or `"readWrite"` to also catch
   reads — it ALSO fires on writes, it does not filter them out; `"read"`
   alone is refused outright, never silently downgraded). Returns the new

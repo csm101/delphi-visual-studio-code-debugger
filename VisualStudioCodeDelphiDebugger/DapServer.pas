@@ -1897,6 +1897,12 @@ begin
     // whole set. Only `write` and `readWrite` are ever offered -- x86/x64 has no
     // read-only watchpoint (see HandleDataBreakpointInfo).
     Caps.AddPair('supportsDataBreakpoints',          TJSONBool.Create(True));
+    // Turns on VS Code's "Add Data Breakpoint at Address" entry in the
+    // Breakpoints panel -- the only place in the UI where a watch target can be
+    // TYPED rather than picked off a Variables row. Without it there is no way
+    // to watch the byte just past the end of a buffer, which is most of what
+    // watchpoints are wanted for.
+    Caps.AddPair('supportsDataBreakpointBytes',      TJSONBool.Create(True));
     // Address breakpoints (DISASSEMBLY_PLAN.md increment 5): VS Code's own
     // address-breakpoint channel, and what the Disassembly View gutter uses to
     // let a click plant one. `setInstructionBreakpoints` behind it replaces the
@@ -2569,14 +2575,20 @@ begin
       Result := Format('%s|l|%d|%s|%d|%x|%x|%x|%s',
         [DATA_ID_PREFIX, Info.SizeBytes, FDataBpNonce, Info.Frame.ThreadId,
          Info.Frame.FrameBase, Info.Frame.FuncEntryVA, Info.Address, Info.DisplayName]);
-  else
+  else begin
     // module+RVA when the address falls inside a known image, a bare VA
-    // otherwise -- same reasoning as an address breakpoint.
+    // otherwise -- same reasoning as an address breakpoint. The DISPLAY NAME
+    // travels with it: a target that came from an expression must keep reading
+    // as that expression at every hit, not as the hex address it resolved to.
+    // '|' is the field separator, so it cannot survive inside a name.
+    var Shown := StringReplace(Info.DisplayName, '|', '/', [rfReplaceAll]);
     if Info.ModuleName <> '' then
-      Result := Format('%s|a|%d|%s|%x', [DATA_ID_PREFIX, Info.SizeBytes,
-        Info.ModuleName, Info.Rva])
+      Result := Format('%s|a|%d|%s|%x|%s', [DATA_ID_PREFIX, Info.SizeBytes,
+        Info.ModuleName, Info.Rva, Shown])
     else
-      Result := Format('%s|a|%d||%x', [DATA_ID_PREFIX, Info.SizeBytes, Info.Address]);
+      Result := Format('%s|a|%d||%x|%s', [DATA_ID_PREFIX, Info.SizeBytes,
+        Info.Address, Shown]);
+  end;
   end;
 end;
 
@@ -2634,8 +2646,13 @@ begin
         Exit;
       end;
     end;
+    // The address is re-resolved from module+RVA, so the EXPRESSION handed to
+    // the engine stays a literal -- an expression cannot be re-evaluated in a
+    // frame that no longer exists. Only the name shown to the user survives.
     Spec.Expression  := Format('$%x', [Addr]);
     Spec.DisplayName := Spec.Expression;
+    if (Length(P) >= 6) and (P[5] <> '') then
+      Spec.DisplayName := P[5];
     Exit(True);
   end;
 
@@ -2710,11 +2727,18 @@ begin
   var Name    := '';
   var VarsRef := 0;
   var FrameId := -1;
+  var AsAddress := False;
+  var Bytes     := 0;
   if Args <> nil then begin
     Name    := Args.GetValue<string>('name', '');
     VarsRef := Args.GetValue<Integer>('variablesReference', 0);
     if Args.FindValue('frameId') <> nil then
       FrameId := Args.GetValue<Integer>('frameId', 0);
+    // DAP 1.66: the client asks for a watch on an ADDRESS it lets the user
+    // type, with an explicit byte count. VS Code sends these only because the
+    // adapter advertises supportsDataBreakpointBytes.
+    AsAddress := Args.GetValue<Boolean>('asAddress', False);
+    Bytes     := Args.GetValue<Integer>('bytes', 0);
   end;
 
   if not FLaunched or (FDebugger = nil) then begin
@@ -2722,15 +2746,22 @@ begin
     Exit;
   end;
 
+  if AsAddress and (Bytes > 0) and not (Bytes in [1, 2, 4, 8]) then begin
+    Answer('', Format('%d bytes is not a width the debug registers can watch ' +
+      '(1, 2, 4 or 8)', [Bytes]), False, False);
+    Exit;
+  end;
+
   // A register genuinely has no address, and an expansion handle (an object /
   // record child) does not carry one either -- the expander answers in values,
   // not addresses. Say which, instead of returning an address that is not the
-  // variable's.
-  if VarsRef = REGISTERS_VAR_REF then begin
+  // variable's. Neither applies to the address form: it carries no
+  // variablesReference at all, only text the user typed.
+  if (not AsAddress) and (VarsRef = REGISTERS_VAR_REF) then begin
     Answer('', 'a CPU register has no memory address to watch', False, False);
     Exit;
   end;
-  if (VarsRef <> 0) and (VarsRef <> LOCALS_VAR_REF) then begin
+  if (not AsAddress) and (VarsRef <> 0) and (VarsRef <> LOCALS_VAR_REF) then begin
     Answer('', 'watching a field of an expanded object or record is not supported ' +
       'yet -- the expansion handle carries no address. Watch the variable itself, ' +
       'or a global, instead', False, False);
@@ -2745,7 +2776,8 @@ begin
   if EffFrame < 0 then
     EffFrame := 0;
 
-  var Info := FSession.GetDataBreakpointInfo(Name, EffFrame, FLastStackTid);
+  var Info := FSession.GetDataBreakpointInfo(Name, EffFrame, FLastStackTid,
+                AsAddress, Bytes);
   // GetDataBreakpointInfo selects the frame it resolves in and clears the
   // selection afterwards. HandleScopes deliberately LEAVES a frame selected, so
   // restore it: without this the next `variables` request on the Locals scope

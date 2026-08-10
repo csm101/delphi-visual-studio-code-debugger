@@ -2399,6 +2399,29 @@ A bare name is resolved in this order, matching Delphi scope rules:
 5. Data global / public symbol (`EvaluateGlobalName` → `NameToRva`).
 6. Named constant (`$25` RSM records), then enum literal, then type name.
 
+#### The suffix chain belongs to the operand of `@`
+
+`@` is parsed as `'@' ApplySuffixes(ParsePrimary)`, not `'@' ParsePrimary`:
+`@Rec.Field`, `@Arr[I]` and `@(expr)` name the address of what the WHOLE chain
+denotes. Parsing only the primary left the parser sitting on the rest of the
+expression and reporting it as an unexpected token, which made every "address of
+an element" spelling unusable — including the ones watchpoints on a computed
+address depend on (`DATA_BREAKPOINTS_PLAN.md`, case 4).
+
+#### Static arrays are indexable, and have bounds
+
+Two gaps found the same way, both about `array[a..b] of T`:
+
+- `Rec.Buf[1]` fell through to accessor-call dispatch and answered
+  `<Buf not found>` — for a member that had resolved, one step earlier, AS an
+  array. The `.Ident[...]` disambiguation lists the indexable type shapes
+  (string, `TArray<>`, `array of`, `^Elem`) and static arrays were missing from
+  it, so the `[...]` was read as an indexed property's arguments.
+- `High` / `Low` / `Length` did not know them either, although
+  `ParseStaticArrayDims` already existed for indexing and the bounds are IN the
+  type — no target read is needed at all. `High(Arr)` is how a user names the
+  last element without hard-coding an index the next edit invalidates.
+
 #### A member lookup stays scoped to its receiver
 
 `ApplyDot`'s step 4 resolves a nested-proc parent local (`ComputeNested.X`) by
@@ -2692,9 +2715,30 @@ resolves against. The session tries a literal address, then a LOCAL of that
 frame, then a global, derives the watch width from the declared type, and
 returns either a `dataId` or a refusal with the reason in `description`.
 Refused (never guessed): a register-allocated local, a frame with no frame
-pointer, a type with no 1/2/4/8 width, a misaligned address, the Registers
-scope, and an expansion handle (an object/record field — the expander answers
-in values, not addresses).
+pointer, a type with no 1/2/4/8 width, a misaligned address against a width the
+CALLER named, the Registers scope, and an expansion handle (an object/record
+field — the expander answers in values, not addresses).
+
+When none of those match, the name is treated as an EXPRESSION, by one rule
+shared with MCP: a bare identifier is a symbol (watched at its own storage);
+`@X` is already an address; anything else is watched where it lives, via
+`@(...)`. An unknown bare NAME stays "unresolved symbol" rather than being
+reinterpreted as arithmetic. This is what makes `Arr[High(Arr)]` and
+`@Rec.Buf[0]` watchable — the targets a buffer-overrun hunt needs, which belong
+to no variable a user could right-click.
+
+The adapter also advertises **`supportsDataBreakpointBytes`**, which is what
+makes VS Code offer "Add Data Breakpoint at Address" — the only place in its UI
+where a watch target can be TYPED rather than picked off a Variables row. That
+form sends `asAddress: true` plus `bytes`, and no `variablesReference`, so the
+container guards above do not apply to it: the request carries nothing but text
+the user wrote. `bytes` outside 1/2/4/8 is refused naming the widths that exist.
+
+A width the caller did NOT name is chosen by `WidthFittingAddress` — the widest
+of 1/2/4/8 the address is naturally aligned to — so an unspecified width never
+produces a refusal. Before this, a literal address always took the pointer width
+and was then refused unless 8-aligned, which rejected the byte after a buffer
+almost every time: the main case the feature exists for.
 
 `accessTypes` is `["write","readWrite"]` and never contains `read`: x86/x64 has
 no read-only watchpoint, so listing one would advertise a filter that cannot be
@@ -2705,8 +2749,13 @@ applied. `canPersist` is `false` for a frame-scoped local and `true` otherwise.
 persists data breakpoints across sessions:
 
 - `d1|g|<size>|<name>` — a global by NAME, re-resolved at set time;
-- `d1|a|<size>|<module>|<rva>` — an address as module+RVA (bare VA outside every
-  image), so it survives a rebased package;
+- `d1|a|<size>|<module>|<rva>|<name>` — an address as module+RVA (bare VA outside
+  every image), so it survives a rebased package. `<name>` is what to CALL it at
+  a hit: a target that came from an expression must keep reading as that
+  expression rather than as the hex address it resolved to. The expression itself
+  is deliberately NOT stored — it cannot be re-evaluated in a frame that no
+  longer exists — so only the display name travels. An id written before this
+  field existed has five fields and still decodes;
 - `d1|l|<size>|<nonce>|<tid>|<base>|<entry>|<addr>|<name>` — a frame-scoped
   local, stamped with a per-run nonce so an id from a previous process is
   refused by name instead of re-armed at whatever now lives at that address.

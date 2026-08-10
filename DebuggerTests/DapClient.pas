@@ -139,6 +139,13 @@ type
                   VariablesReference: Integer; FrameId: Integer = -1): TJSONObject;
     // DAP setDataBreakpoints: whole-set replace. AccessTypes must be the same
     // length as DataIds (or empty, meaning `write` for every entry).
+    // The address form (DAP 1.66, gated on supportsDataBreakpointBytes): `name`
+    // is an expression evaluated as an ADDRESS, with an explicit byte count.
+    // This is what VS Code's "Add Data Breakpoint at Address" sends, and the
+    // only path by which a watch target can be typed rather than picked off a
+    // Variables row.
+    function    DataBreakpointInfoAtAddress(const Expr: string; Bytes: Integer;
+                  FrameId: Integer = -1): TJSONObject;
     function    SetDataBreakpoints(const DataIds: TArray<string>;
                   const AccessTypes: TArray<string> = nil): TJSONObject;
     function    ConfigDone: TJSONObject;
@@ -873,6 +880,21 @@ begin
   Args := TJSONObject.Create;
   Args.AddPair('name', Name);
   Args.AddPair('variablesReference', TJSONNumber.Create(VariablesReference));
+  if FrameId >= 0 then
+    Args.AddPair('frameId', TJSONNumber.Create(FrameId));
+  Result := WaitResp(SendCmd('dataBreakpointInfo', Args));
+end;
+
+function TDapClient.DataBreakpointInfoAtAddress(const Expr: string; Bytes: Integer;
+  FrameId: Integer): TJSONObject;
+var
+  Args: TJSONObject;
+begin
+  Args := TJSONObject.Create;
+  Args.AddPair('name', Expr);
+  Args.AddPair('asAddress', TJSONBool.Create(True));
+  if Bytes > 0 then
+    Args.AddPair('bytes', TJSONNumber.Create(Bytes));
   if FrameId >= 0 then
     Args.AddPair('frameId', TJSONNumber.Create(FrameId));
   Result := WaitResp(SendCmd('dataBreakpointInfo', Args));

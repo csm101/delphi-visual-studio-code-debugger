@@ -1322,6 +1322,59 @@ the x86 refusals replace.
 Diagnostics: `DevTools\ExcHandlerProbe.exe <exe> [-args ...] [-plant] [-tf]` —
 see `EH_FORMAT_NOTES.md`.
 
+## W. Watchpoints on a computed address (DATA_BREAKPOINTS_PLAN.md, case 4)
+
+`DebuggerTests\DataBpExpressionTests.pas` — new file. A watch target used to have
+to be a NAME (a variable to right-click) or a literal address a caller already
+knew. That covers "who changes this variable" and misses what watchpoints are
+mostly reached for: *who is writing past the end of my array*, where the
+interesting byte belongs to no variable at all.
+
+Fixture: `TestTarget --run-databp-buffer` (`RunDataBpBufferFixture`).
+`GDataBpBuffer` is a `TDataBpGuardedBuffer` record — `Before`, `Data[0..7]`,
+`After` — because only a record guarantees the guard bytes sit either side of the
+buffer; the linker orders separate globals as it pleases. `DataBpBufferWriter`
+writes `Data[0]`, then `Data[High(Data)]` (correct), then `After` (the overrun).
+
+- [x] **`supportsDataBreakpointBytes` is advertised**
+      (`Capability_DataBreakpointBytes_IsAdvertised`). Without it VS Code never
+      offers "Add Data Breakpoint at Address", and the whole path is unreachable
+      from the GUI however well it works underneath.
+- [x] **An expression naming a cell no variable names arms and fires**
+      (`Expression_LastArrayElement_ArmsAndFires`):
+      `GDataBpBuffer.Data[High(GDataBpBuffer.Data)]`. Also asserts the width came
+      from the ELEMENT type (1 byte, not the pointer width a bare address would
+      have defaulted to) and that the stop names the EXPRESSION, not the hex
+      address it resolved to.
+- [x] **The overrun, through the address form**
+      (`AddressForm_ByteAfterTheBuffer_ArmsAndFires`): `asAddress` +
+      `bytes: 1`, exactly what the VS Code panel sends. Asserts old -> new and
+      that the stop names the writing thread.
+- [x] **A width the hardware lacks is refused by name**
+      (`AddressForm_UnsupportedWidth_Refused`): 3 bytes is not rounded up to 4 —
+      the hardware ignores the low address bits, so a widened watch silently
+      covers a neighbouring cell.
+- [x] **An odd address is no longer refused for alignment nobody asked for**
+      (`OddAddress_ChoosesAFittingWidth_InsteadOfRefusing`). RED before
+      `WidthFittingAddress`: a literal always took the pointer width and was then
+      refused unless 8-aligned.
+- [x] **...but an explicitly requested width is honoured strictly**
+      (`OddAddress_WithExplicitWiderWidth_Refused`): 8 bytes at an address that
+      cannot be 8-aligned is refused, never narrowed behind the caller's back.
+- [x] **An unknown bare NAME stays "unresolved symbol"**
+      (`UnknownBareName_StillRefusedAsASymbol`) — never reinterpreted as
+      arithmetic that happens to evaluate to something.
+
+Three evaluator defects were found by these tests and fixed in `ExprEval`, so
+`evaluate` and every watch expression gained them too: `@` parsed only a bare
+`Primary` (so `@Rec.F`, `@Arr[I]`, `@(expr)` all failed); a STATIC array field
+was missing from the "is this value indexable" test, so `Rec.Buf[1]` was reported
+as `<Buf not found>` after `Rec.Buf` had just resolved as an array; and
+`High`/`Low`/`Length` did not know static arrays, whose bounds are in the type.
+The probe that established all three, before any of them were fixed, was a
+throwaway test that evaluated nine spellings and failed with the results — worth
+repeating rather than guessing at a parser from the outside.
+
 ## What the suite does NOT prove (2026-08-08)
 
 Coverage-honesty notes. Each records a place where a green run is weaker evidence

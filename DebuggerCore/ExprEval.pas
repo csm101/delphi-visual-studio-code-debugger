@@ -2839,6 +2839,11 @@ begin
                 SameText(DotResult.TypeHint, 'Variant') or
                 DotResult.TypeHint.StartsWith('TArray<', True) or
                 DotResult.TypeHint.StartsWith('array of ', True) or
+                // A STATIC array field (`array[0..7] of Byte`) is indexable too.
+                // Without this it fell through to accessor-call dispatch and
+                // `Rec.Buf[1]` was reported as `<Buf not found>` -- a member that
+                // had in fact resolved, one line earlier, as an array.
+                IsStaticArrayHint(DotResult.TypeHint) or
                 // TD32 types a dyn-array property as `^Element`; index the result.
                 DotResult.TypeHint.StartsWith('^', True)) then
               Result := DotResult
@@ -3336,6 +3341,15 @@ function TExprEvaluator.ApplyIntrinsic(const Name: string;
       if not UseMax then Exit(MakeInt64(1));
       Exit(StringLength(A));
     end;
+    // Static arrays carry their bounds IN the type, so this needs no target
+    // read at all -- and `High(Arr)` is how a user names the last element
+    // without hard-coding an index that a later edit invalidates.
+    var Los, His: TArray<Integer>;
+    var ElemType: string;
+    if ParseStaticArrayDims(A.TypeHint, Los, His, ElemType) and (Length(Los) > 0) then begin
+      if UseMax then Exit(MakeInt64(His[0]));
+      Exit(MakeInt64(Los[0]));
+    end;
     var OpName: string;
     if UseMax then OpName := 'High' else OpName := 'Low';
     Result := InvalidValue(Format('<%s for "%s" not supported>',
@@ -3354,6 +3368,12 @@ begin
     // runtime length still lives at [data-ptr - 8].
     if Args[0].TypeHint.StartsWith('^', True) then
       Exit(DynArrayLength(Args[0]));
+    // A static array's length is its declared extent, known without reading the
+    // target -- and the three intrinsics must agree about what an array is.
+    var SLos, SHis: TArray<Integer>;
+    var SElem: string;
+    if ParseStaticArrayDims(Args[0].TypeHint, SLos, SHis, SElem) and (Length(SLos) > 0) then
+      Exit(MakeInt64(Int64(SHis[0]) - Int64(SLos[0]) + 1));
     Exit(InvalidValue(Format('<Length: type "%s" unsupported>', [Args[0].TypeHint])));
   end;
   if SameText(Name, 'SizeOf') then begin
@@ -3694,7 +3714,13 @@ begin
   SkipWS;
   // @ expr  ->  address-of
   if MatchChar('@') then begin
-    Inner := ParsePrimary;
+    // The SUFFIX CHAIN belongs to the operand: `@Rec.Field`, `@Arr[I]` and
+    // `@(expr)` all name the address of what the whole chain denotes, not the
+    // address of the identifier it starts with. Without ApplySuffixes here the
+    // parser stopped after the first identifier and reported the rest as an
+    // unexpected token -- which made every "watch the address of an array
+    // element" expression unusable.
+    Inner := ApplySuffixes(ParsePrimary);
     if not Inner.IsValid then
       Exit(Inner);
     Result          := Default(TExprValue);

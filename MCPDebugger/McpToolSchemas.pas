@@ -189,8 +189,12 @@ begin
     'expression, the old and new values, and the THREAD that wrote it -- frequently the whole ' +
     'answer to "who did this".',
     [Prop('expression', 'string',
-       'A literal address ("0x1234", "$1234" or a plain decimal) or a global/unit variable name. ' +
-       'Local variables are refused, not silently accepted as a stale address.', True),
+       'A literal address ("0x1234", "$1234" or a plain decimal), a global/unit variable name, ' +
+       'or an EXPRESSION. A bare name is watched at its own storage; any other expression is ' +
+       'resolved by one rule: "@X" is already an address, anything else is watched where IT ' +
+       'lives -- so "Arr[High(Arr)]" watches the last element and "PByte(@Arr[0]) - 1" watches ' +
+       'the byte just before the buffer, which is how you find who writes past an array. ' +
+       'Local variables named bare are refused, not silently accepted as a stale address.', True),
      Prop('size', 'integer',
        'Width in bytes: 1, 2, 4 or 8. The address must already be aligned to this width; a ' +
        'misaligned or other-width request is refused, never rounded.', True),

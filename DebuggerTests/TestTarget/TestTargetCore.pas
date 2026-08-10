@@ -108,6 +108,22 @@ type
     function    RaiseBoom:   Integer;
   end;
 
+  // A buffer with a guard byte on either side, for the watchpoint-on-a-computed-
+  // address fixture. The guards exist to be hit by an off-by-one: writing
+  // Data[High(Data)] is correct, writing After is the overrun.
+  // Named rather than written inline. This was first done on the theory that an
+  // anonymous member type would not resolve -- it made no difference, and the
+  // real defect was in the evaluator (a static array was missing from its
+  // "indexable" test). Kept because a named type is the ordinary spelling, not
+  // because anything here depends on it.
+  TDataBpBufferBytes = array[0..7] of Byte;
+
+  TDataBpGuardedBuffer = record
+    Before: Byte;
+    Data:   TDataBpBufferBytes;
+    After:  Byte;
+  end;
+
   // Indexed (array) property sampler.
   TIndexedBag = class
   private
@@ -456,6 +472,13 @@ var
   // requires, and the reason not to make it a Boolean or an Int64.
   GDataBpWatched: Integer;
   GDataBpOther:   Integer;
+  // Buffer-overrun fixture (see RunDataBpBufferFixture). A record, not three
+  // separate globals: only a record guarantees that Before and After really do
+  // sit immediately either side of Data, which is the whole point -- the linker
+  // is free to order globals however it likes. Bytes, so every interesting
+  // address is odd as often as not, which is exactly what used to be refused
+  // for "not aligned to 8 bytes".
+  GDataBpBuffer: TDataBpGuardedBuffer;
   // Per-thread watchpoint replication fixture (see RunDataBpThreadFixture).
   // GDataBpThreadWatched is written by a worker thread ALIVE before the
   // watchpoint is armed (proves replication onto every live thread);
@@ -1977,6 +2000,34 @@ begin
   GSink.Use(['databp local done ', GDataBpOther]);      // {BP:DATABPLOCAL_DONE}
 end;
 
+// The case a watchpoint on a COMPUTED address exists for: a routine that writes
+// its buffer correctly, then writes one byte past the end. Neither write names
+// a variable a user could right-click -- the target has to be reached by an
+// expression (`GDataBpBuffer.Data[High(...)]`, or the address just past it).
+//
+// Each write is a separate statement with its own marker so a test can arm
+// between them, and none of them is the routine's first statement (same reason
+// as DataBpWriteWatched: the arm must happen while the routine is already
+// running).
+procedure DataBpBufferWriter;
+begin
+  GDataBpBuffer.Data[0] := 1;                                 // {BP:DATABP_BUF_ARM}
+  GDataBpBuffer.Data[High(GDataBpBuffer.Data)] := 2;          // {BP:DATABP_BUF_LAST}
+  GDataBpBuffer.After := 3;                                   // {BP:DATABP_BUF_OVERRUN}
+  GSink.Use(['databp buffer end ', GDataBpBuffer.After]);     // {BP:DATABP_BUF_END}
+end;
+
+procedure RunDataBpBufferFixture;
+begin
+  GDataBpBuffer.Before := 0;
+  GDataBpBuffer.After  := 0;
+  for var I := Low(GDataBpBuffer.Data) to High(GDataBpBuffer.Data) do
+    GDataBpBuffer.Data[I] := 0;
+  GSink.Use(['databp buffer ready']);                         // {BP:DATABP_BUF_READY}
+  DataBpBufferWriter;
+  GSink.Use(['databp buffer done ', GDataBpBuffer.Data[0]]);  // {BP:DATABP_BUF_DONE}
+end;
+
 procedure RunBpTests;
 var
   I, Acc: Integer;
@@ -2078,6 +2129,9 @@ begin
 
   if FindCmdLineSwitch('run-databp-local') or FindCmdLineSwitch('-run-databp-local') then
     RunDataBpLocalFixture;
+
+  if FindCmdLineSwitch('run-databp-buffer') or FindCmdLineSwitch('-run-databp-buffer') then
+    RunDataBpBufferFixture;
 
   if FindCmdLineSwitch('run-av') or FindCmdLineSwitch('-run-av') then
     RunAccessViolation;

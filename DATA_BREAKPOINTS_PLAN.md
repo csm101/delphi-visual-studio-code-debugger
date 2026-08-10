@@ -164,7 +164,9 @@ breakpoint, not at process creation.
 
 ## Scoping an address: what the user actually names
 
-Three inputs, decreasing order of safety:
+Four inputs, decreasing order of safety. The fourth was added on 2026-08-10,
+after the first three turned out to miss the question watchpoints are mostly
+reached for — see "A computed address" below.
 
 1. **A literal address** (from `disassemble`, a frame, or a previous evaluation).
    Unambiguous. Stored as module+RVA where it falls inside a known module, for the
@@ -180,9 +182,55 @@ Three inputs, decreasing order of safety:
    the current stack), so the honest behaviour is: mark it STALE at the first stop
    where the frame is gone, remove it, and TELL the user. Not silently.
 
+4. **A computed address** — `Arr[High(Arr)]`, `@Rec.Buf[0]`, or an address typed
+   straight into VS Code's "Add Data Breakpoint at Address" panel. The target
+   belongs to no variable, which is exactly why it matters: *"who is writing past
+   the end of my array"* is the question a watchpoint is most often reached for,
+   and the interesting byte is one outside the variable that has a name.
+
+   One rule decides what an expression means, and it is the same at every
+   surface:
+
+   | written | watched |
+   |---|---|
+   | `GCounter` (a bare identifier) | the symbol's own storage |
+   | `@X` | the address `@X` yields |
+   | anything else (`Arr[3]`, `Rec.F`) | where that expression LIVES, via `@(...)` |
+
+   A bare identifier that resolves to nothing stays "unresolved symbol" — an
+   unknown NAME is never reinterpreted as arithmetic that happens to evaluate.
+
 Size comes from the type when the symbol is known, and must be one of 1/2/4/8 with
 a correctly aligned address. Anything else is refused with the reason, not rounded
 into a watchpoint on a neighbouring byte.
+
+**A width the caller did not name is CHOSEN, not defaulted.** A literal address
+originally took the pointer width and was then refused unless 8-aligned, which
+rejected almost every byte-sized target — including the byte after a buffer, odd
+as often as not. `WidthFittingAddress` now picks the widest of 1/2/4/8 the address
+is naturally aligned to, so an unspecified width never produces a refusal. A width
+the caller DID name is honoured strictly: a misalignment against it is refused
+rather than narrowed behind the caller's back, because the hardware ignores the
+low address bits and a silently widened watch covers a neighbouring cell.
+
+### What this needed from the evaluator
+
+Three gaps surfaced when the resolver started handing it real expressions. All
+three were in `ExprEval` and are fixed there, so `evaluate` and every watch
+expression gained them too:
+
+- `@` parsed only a bare `Primary`, so `@Rec.Field`, `@Arr[I]` and `@(expr)` all
+  stopped after the first identifier and reported the rest as an unexpected
+  token. The suffix chain belongs to the operand: `@` now takes
+  `ApplySuffixes(ParsePrimary)`.
+- `Rec.Buf[1]`, where `Buf` is a STATIC array field, fell through to
+  accessor-call dispatch and was reported as `<Buf not found>` — a member that
+  had resolved, one step earlier, as an array. The "is this value indexable"
+  test listed strings, `TArray<>`, `array of` and `^Elem`, but not static arrays.
+- `High` / `Low` / `Length` did not know static arrays, whose bounds are IN the
+  type and need no target read at all (`ParseStaticArrayDims` already existed for
+  indexing). `High(Arr)` is how a user names the last element without hard-coding
+  an index that the next edit invalidates.
 
 ## Reporting a hit
 
@@ -547,6 +595,17 @@ menu appears once the capabilities are declared):
    * disable the arm-time liveness test -> all four stale tests failed with
      "re-arming a dead frame must be refused", confirming the client's next
      whole-set replace would indeed re-arm it.
+
+7. **DONE (2026-08-10).** Watchpoints on a COMPUTED address — case 4 of "Scoping
+   an address" above. `GetDataBreakpointInfo` gained `AsAddress` and
+   `RequestedBytes`; `ResolveDataBpAddress` gained the same expression rule, so
+   MCP and the re-arm path do not diverge from DAP; `WidthFittingAddress` chooses
+   an unspecified width instead of defaulting to a pointer and refusing;
+   `supportsDataBreakpointBytes` turns on VS Code's "Add Data Breakpoint at
+   Address"; and the address-kind `dataId` carries a display name so a hit keeps
+   reading as the expression the user wrote. Three evaluator defects fixed on the
+   way (see above). Tests: `DataBpExpressionTests.pas`, seven cases,
+   `TEST_CATALOG.md` section W.
 
 ## Tests to write (both bitnesses, mono and BPL fixtures)
 

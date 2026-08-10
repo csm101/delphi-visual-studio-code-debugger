@@ -177,6 +177,31 @@ type
     // a REFUSAL (never a rounded guess -- the hardware ignores the low address
     // bits, so a wrong width watches a neighbouring cell).
     function  WatchWidthForType(const TypeHint: string; TypeKind: Byte): Integer;
+    // Widest of the four hardware widths (capped at Preferred) that Addr is
+    // naturally aligned to. Used ONLY when the caller did not name a width: a
+    // width the caller DID name is honoured strictly, and a misaligned one is
+    // refused rather than quietly narrowed. Without this, watching the byte just
+    // past the end of an array -- an odd address, more often than not -- was
+    // refused for "not aligned to 8 bytes", which is the exact case the feature
+    // exists for.
+    function  WidthFittingAddress(Addr: UInt64; Preferred: Integer): Integer;
+    // True when Expr is a single identifier and therefore names a SYMBOL whose
+    // storage is the watch target. Anything else is an expression, and the two
+    // are resolved differently -- see AddressExpressionFor.
+    function  IsBareIdentifier(const Expr: string): Boolean;
+    // The expression whose VALUE is the address to watch:
+    //
+    //   `@Arr[High(Arr)]`  -> itself      (a leading @ already names an address)
+    //   `Arr[High(Arr)]`   -> `@(...)`    (watch that element's own storage)
+    //
+    // so a user who writes the address gets the address, and a user who writes
+    // the thing gets the thing's storage. A bare identifier never reaches here.
+    function  AddressExpressionFor(const Expr: string): string;
+    // Evaluate an address-valued expression in a frame, with target calls
+    // disabled: an address to watch must not be produced by running code in the
+    // debuggee. False with a reason that names the expression.
+    function  TryEvaluateAddress(const Expr: string; FrameIndex: Integer;
+                ThreadId: Cardinal; out Addr: UInt64; out ErrMsg: string): Boolean;
     // Free + recreate-empty the symbol infrastructure so its memory-mapped files
     // (target .exe TD32 section, .rsm, BPL .dcp) are released on terminate/detach.
     procedure ReleaseSymbolProviders;
@@ -410,8 +435,21 @@ type
     // Everything that cannot be justified is REFUSED with a Reason: a
     // register-allocated local (no address at all), a type whose width is not
     // 1/2/4/8, a misaligned address, an unknown name. Never a rounded guess.
+    // Resolve a watch target. Name is a bare symbol (local or global, whose
+    // STORAGE is watched), a literal address, or an expression -- `Arr[High(Arr)]`
+    // watches that element, `@Arr[High(Arr)]` watches the address it yields, and
+    // pointer arithmetic reaches the bytes on either side of a buffer, which is
+    // what a "who is corrupting my array" hunt actually needs.
+    //
+    // AsAddress makes the expression an ADDRESS unconditionally (DAP's
+    // `dataBreakpointInfo.asAddress`, which is how VS Code's "Add data
+    // breakpoint at address" panel asks). RequestedBytes is the width the caller
+    // NAMED: honoured strictly, and refused when the address is not aligned to
+    // it. 0 means "choose one", and the choice never refuses -- see
+    // WidthFittingAddress.
     function  GetDataBreakpointInfo(const Name: string; FrameIndex: Integer;
-                ThreadId: Cardinal = 0): TDataBpTargetInfo;
+                ThreadId: Cardinal = 0; AsAddress: Boolean = False;
+                RequestedBytes: Integer = 0): TDataBpTargetInfo;
 
     // Introspection (valid only when State = dsStopped).
     function  GetCallStack: TArray<TSessionFrame>; overload;
@@ -1250,6 +1288,19 @@ begin
       'tied to the stack frame (dataBreakpointInfo, increment 6); watch the ' +
       'containing global, or pass a literal address, instead';
     Exit(False);
+  end else if not IsBareIdentifier(Expr) then begin
+    // An expression, resolved by the same rule GetDataBreakpointInfo uses:
+    // `@X` is an address, anything else is watched at its own storage. A bare
+    // identifier never reaches here -- an unknown NAME must stay "unresolved
+    // symbol" rather than be reinterpreted as arithmetic.
+    var EvalErr: string;
+    if not TryEvaluateAddress(AddressExpressionFor(Expr), DEFAULT_FRAME_INDEX, 0,
+             V, EvalErr) then begin
+      RejectReason := EvalErr;
+      Exit(False);
+    end;
+    Addr   := V;
+    Result := True;
   end else begin
     RejectReason := 'unresolved symbol: ' + Expr;
     Exit(False);
@@ -1481,6 +1532,57 @@ begin
   end;
 end;
 
+function TDebugSession.WidthFittingAddress(Addr: UInt64; Preferred: Integer): Integer;
+begin
+  if not (Preferred in [1, 2, 4, 8]) then
+    Preferred := 8;
+  Result := Preferred;
+  while (Result > 1) and ((Addr mod UInt64(Result)) <> 0) do
+    Result := Result div 2;
+end;
+
+function TDebugSession.IsBareIdentifier(const Expr: string): Boolean;
+begin
+  var S := Trim(Expr);
+  if S = '' then
+    Exit(False);
+  if not CharInSet(S[1], ['A'..'Z', 'a'..'z', '_']) then
+    Exit(False);
+  for var I := 2 to Length(S) do
+    if not CharInSet(S[I], ['A'..'Z', 'a'..'z', '0'..'9', '_']) then
+      Exit(False);
+  Result := True;
+end;
+
+function TDebugSession.AddressExpressionFor(const Expr: string): string;
+begin
+  var S := Trim(Expr);
+  if (S <> '') and (S[1] = '@') then
+    Result := S
+  else
+    Result := '@(' + S + ')';
+end;
+
+function TDebugSession.TryEvaluateAddress(const Expr: string; FrameIndex: Integer;
+  ThreadId: Cardinal; out Addr: UInt64; out ErrMsg: string): Boolean;
+begin
+  Addr   := 0;
+  ErrMsg := '';
+  var Ev := EvaluateForFrame(Expr, FrameIndex, ThreadId, {AllowCalls} False);
+  if not (Ev.Success and Ev.IsValid) then begin
+    ErrMsg := Format('%s could not be evaluated to an address', [Expr]);
+    if Ev.ErrorText <> '' then
+      ErrMsg := ErrMsg + ' -- ' + Ev.ErrorText;
+    Exit(False);
+  end;
+  if Ev.RawValue = 0 then begin
+    ErrMsg := Format('%s evaluates to nil, which is not an address to watch', [Expr]);
+    Exit(False);
+  end;
+  Addr   := Ev.RawValue;
+  Result := True;
+end;
+
 function TDebugSession.WatchWidthForType(const TypeHint: string;
   TypeKind: Byte): Integer;
 const
@@ -1542,7 +1644,7 @@ begin
 end;
 
 function TDebugSession.GetDataBreakpointInfo(const Name: string; FrameIndex: Integer;
-  ThreadId: Cardinal): TDataBpTargetInfo;
+  ThreadId: Cardinal; AsAddress: Boolean; RequestedBytes: Integer): TDataBpTargetInfo;
 var
   Tid: Cardinal;
 
@@ -1575,6 +1677,35 @@ var
       end;
   end;
 
+  // Shared tail for every target that resolved to a plain address: the caller's
+  // width if it named one (refusing a misalignment rather than narrowing behind
+  // its back), otherwise the widest one that fits the address.
+  procedure AcceptAddress(Addr: UInt64; TypeWidth: Integer;
+    const Shown, How: string);
+  begin
+    var Width := RequestedBytes;
+    if Width in [1, 2, 4, 8] then begin
+      if (Addr mod UInt64(Width)) <> 0 then begin
+        Refuse(Format('$%x is not aligned to the %d bytes requested', [Addr, Width]));
+        Exit;
+      end;
+    end
+    else begin
+      var Preferred := TypeWidth;
+      if not (Preferred in [1, 2, 4, 8]) then
+        Preferred := FDebugger.TargetLayout.PointerSize;
+      Width := WidthFittingAddress(Addr, Preferred);
+    end;
+
+    Result.CanWatch    := True;
+    Result.Kind        := dbsAddress;
+    Result.Address     := Addr;
+    Result.SizeBytes   := Width;
+    Result.DisplayName := Shown;
+    FillModule(Addr);
+    Result.Description := Format('%s: %d bytes at $%x (%s)', [Shown, Width, Addr, How]);
+  end;
+
 begin
   Result := Default(TDataBpTargetInfo);
   // The access types that genuinely exist on this CPU. `read` is absent on
@@ -1602,19 +1733,20 @@ begin
   // A literal address is unambiguous and needs no frame at all.
   var LitAddr: UInt64;
   if TryParseLiteral(Expr, LitAddr) then begin
-    var LitSize := FDebugger.TargetLayout.PointerSize;
-    if (LitAddr mod UInt64(LitSize)) <> 0 then begin
-      Refuse(Format('address $%x is not aligned to %d bytes', [LitAddr, LitSize]));
+    AcceptAddress(LitAddr, 0, Format('$%x', [LitAddr]), 'literal address');
+    Exit;
+  end;
+
+  // The caller says this expression IS an address (DAP's asAddress). Its VALUE
+  // is the target, whatever it looks like -- no symbol lookup, no @ rewriting.
+  if AsAddress then begin
+    var EvAddr: UInt64;
+    var EvErr:  string;
+    if not TryEvaluateAddress(Expr, FrameIndex, Tid, EvAddr, EvErr) then begin
+      Refuse(EvErr);
       Exit;
     end;
-    Result.CanWatch    := True;
-    Result.Kind        := dbsAddress;
-    Result.Address     := LitAddr;
-    Result.SizeBytes   := LitSize;
-    Result.DisplayName := Format('$%x', [LitAddr]);
-    FillModule(LitAddr);
-    Result.Description := Format('$%x, %d bytes (default width for a literal address)',
-      [LitAddr, LitSize]);
+    AcceptAddress(EvAddr, 0, Expr, 'computed address');
     Exit;
   end;
 
@@ -1719,7 +1851,36 @@ begin
       Exit;
     end;
 
-    Refuse('unresolved symbol: ' + Expr);
+    // Not a symbol. If it is a bare identifier there is nothing left to try --
+    // an unknown name must not be silently reinterpreted as arithmetic. Anything
+    // else is an expression, and its own storage (or the address it yields) is
+    // a legitimate watch target: `Arr[High(Arr)]` for the last element,
+    // `@Arr[0]` for the buffer's first byte, `PByte(@Arr[0]) - 1` for the byte
+    // BEFORE it -- the classic "who is writing past my array" hunt.
+    if IsBareIdentifier(Expr) then begin
+      Refuse('unresolved symbol: ' + Expr);
+      Exit;
+    end;
+
+    var ExprAddr: UInt64;
+    var ExprErr:  string;
+    if not TryEvaluateAddress(AddressExpressionFor(Expr), FrameIndex, Tid,
+             ExprAddr, ExprErr) then begin
+      Refuse(ExprErr);
+      Exit;
+    end;
+
+    // The width comes from what the expression DENOTES, when that is known: for
+    // `Arr[I]` the element type, so watching one element does not spill into the
+    // next. An address the user spelled with @ denotes no storage of its own,
+    // so it falls through to the address-fitted width.
+    var TypeWidth := 0;
+    if not ((Expr <> '') and (Trim(Expr)[1] = '@')) then begin
+      var Denoted := EvaluateForFrame(Expr, FrameIndex, Tid, {AllowCalls} False);
+      if Denoted.Success and Denoted.IsValid then
+        TypeWidth := WatchWidthForType(Denoted.TypeName, 0);
+    end;
+    AcceptAddress(ExprAddr, TypeWidth, Expr, 'expression');
   finally
     ClearFrame;
   end;
