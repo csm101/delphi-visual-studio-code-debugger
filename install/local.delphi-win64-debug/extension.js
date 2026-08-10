@@ -464,6 +464,51 @@ async function checkForUpdate(context, deps) {
     await state.update(UPDATE_SKIPPED_KEY, latest.version);
 }
 
+// The adapter answers `readMemory` / `writeMemory` and puts a `memoryReference`
+// on every variable that has an address -- but the view that USES them, the
+// "View Binary Data" entry and the hex pane behind it, is not part of the
+// editor: it comes from the Hex Editor extension. Without it the entry is simply
+// absent from the menu, which reads as "this debugger cannot inspect memory"
+// rather than as a missing companion extension. Measured on a real profile: the
+// capability was advertised, the memoryReference was there, and the menu entry
+// was nowhere.
+//
+// Offered, not enforced. Memory inspection is an addition, not a prerequisite,
+// so this must never be an `extensionDependencies` entry: that would make a
+// marketplace that cannot be reached block the debugger itself over an optional
+// view. Shown at most once per installation -- a prompt that returns every
+// session is a nuisance, and the answer "no" is a legitimate answer.
+const MEMORY_INSPECTOR_ID = 'ms-vscode.hexeditor';
+const MEMORY_INSPECTOR_PROMPTED_KEY = 'delphi-win64.memoryInspectorPrompted';
+
+async function offerMemoryInspectorOnce(context) {
+  if (context.globalState.get(MEMORY_INSPECTOR_PROMPTED_KEY)) return;
+  if (vscode.extensions.getExtension(MEMORY_INSPECTOR_ID)) return;
+
+  const INSTALL = 'Install';
+  const NEVER = "Don't ask again";
+  const choice = await vscode.window.showInformationMessage(
+    'Delphi Debugger: "View Binary Data" on a variable needs the Hex Editor ' +
+    'extension. Everything else works without it.',
+    INSTALL, NEVER);
+
+  if (choice === INSTALL) {
+    try {
+      await vscode.commands.executeCommand(
+        'workbench.extensions.installExtension', MEMORY_INSPECTOR_ID);
+      vscode.window.showInformationMessage(
+        'Hex Editor installed. "View Binary Data" is available on any variable ' +
+        'the debugger has an address for.');
+    } catch (err) {
+      vscode.window.showWarningMessage(
+        'Could not install ' + MEMORY_INSPECTOR_ID + ': ' +
+        (err && err.message ? err.message : String(err)));
+      return;   // leave the prompt armed: nothing was decided, and nothing installed
+    }
+  }
+  await context.globalState.update(MEMORY_INSPECTOR_PROMPTED_KEY, true);
+}
+
 function activate(context) {
   const progress = new ProgressStatusBar();
   context.subscriptions.push(progress);
@@ -492,6 +537,8 @@ function activate(context) {
   // failure here is not the user's problem. Any error is swallowed for the same
   // reason -- an update check that reports its own troubles is a nuisance.
   checkForUpdate(context).catch(() => {});
+
+  offerMemoryInspectorOnce(context).catch(() => {});
 
   // Raw stack sweep, from the Call Stack title bar. It used to be a launch-time
   // flag only, which meant editing launch.json and restarting for something you

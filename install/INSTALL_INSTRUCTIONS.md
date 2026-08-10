@@ -33,9 +33,31 @@ If you received the `delphi-win64-debugger-setup-*.zip`:
    > instead: `build_setup_zip.bat` produces this exact zip.
 2. Run `Setup.exe`. It packages the extension into a `.vsix` and installs it
    through the VS Code CLI (`code --install-extension`), which registers it
-   properly and updates any previous version in place. It then offers to install
-   and register the **MCP debug server** (see below).
+   properly and updates any previous version in place. It also installs the
+   **Hex Editor** extension (see below). It then offers to install and register
+   the **MCP debug server** (see below).
 3. Reload VS Code (Ctrl+Shift+P -> "Developer: Reload Window").
+
+### Memory inspection needs the Hex Editor extension
+
+The debugger reads and writes debuggee memory and gives every variable with an
+address a `memoryReference`, but the VIEW that uses them — the **View Binary
+Data** entry on a variable, and the hex pane it opens — is contributed by
+Microsoft's Hex Editor extension, not by VS Code itself. Without it, the menu
+entry is simply absent, which looks like a missing debugger feature rather than
+a missing companion extension.
+
+The installer installs it for you. If it could not (no marketplace access, an
+editor whose CLI was not on PATH), do it by hand:
+
+```
+code --install-extension ms-vscode.hexeditor
+```
+
+It is deliberately NOT declared as a hard dependency of the extension: memory
+inspection is an addition, and a marketplace that cannot be reached must not
+block the debugger itself over an optional view. The extension asks once, with
+an Install button, if it starts up and finds it missing.
 
 No repository, Delphi toolchain, or build step is required — the adapter is
 already compiled and bundled inside the zip.

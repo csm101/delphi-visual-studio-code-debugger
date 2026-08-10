@@ -439,6 +439,15 @@ Required extension:
 
 - `embarcaderotechnologies.delphilsp`
 
+Optional, for memory inspection only:
+
+- `ms-vscode.hexeditor` — VS Code's "View Binary Data" entry and the hex pane
+  behind it come from this extension, not from the editor. Without it the entry
+  is absent however correctly the adapter answers `readMemory` / `writeMemory`
+  and attaches `memoryReference`. Do not turn it into an `extensionDependencies`
+  entry: an unreachable marketplace would then block the debugger over an
+  optional view.
+
 Local debugger extension folder:
 
 ```text

@@ -459,6 +459,31 @@ begin
     Writeln(Format('Installed via %s CLI.', [ACli]));
 end;
 
+// VS Code's memory inspector -- the "View Binary Data" entry on a variable, and
+// the hex view behind it -- is not part of the editor: it is contributed by the
+// Hex Editor extension. Without it the adapter's readMemory / writeMemory and
+// every variable's memoryReference are answered by nobody, and the feature looks
+// missing rather than uninstalled.
+//
+// Installed best-effort, never fatally: it is an ADDITION to what this debugger
+// does, not a prerequisite for it, and an editor with no marketplace reachable
+// must still end up with a working debugger. Deliberately NOT declared as an
+// `extensionDependencies` entry in package.json for the same reason -- that
+// would make a failed marketplace lookup block the whole extension over an
+// optional view.
+procedure InstallMemoryInspector(const ACli: string);
+begin
+  Writeln('Installing the Hex Editor extension (memory inspection)...');
+  if RunAndWait(Format('cmd.exe /c %s --install-extension ms-vscode.hexeditor --force',
+       [ACli])) = 0 then
+    Writeln('Hex Editor present.')
+  else begin
+    Writeln('Could not install ms-vscode.hexeditor. Everything else works;');
+    Writeln('"View Binary Data" on a variable will be missing until you run:');
+    Writeln(Format('  %s --install-extension ms-vscode.hexeditor', [ACli]));
+  end;
+end;
+
 // Removes a legacy folder-copy install (an un-versioned
 // "local.delphi-win64-debug" directory) from one editor's extensions dir. A
 // real VSIX install creates a version-suffixed folder instead, and a leftover
@@ -537,8 +562,10 @@ procedure InstallForEditor(const Target: TEditorTarget; const AVsixPath: string)
 begin
   Writeln('--- ' + Target.DisplayName + ' ---');
   if CommandOnPath(Target.Cli) then begin
-    if InstallViaCli(Target.Cli, AVsixPath) then
-      RemoveStaleFolderInstall(EditorExtensionsDir(Target))
+    if InstallViaCli(Target.Cli, AVsixPath) then begin
+      RemoveStaleFolderInstall(EditorExtensionsDir(Target));
+      InstallMemoryInspector(Target.Cli);
+    end
     else
       Writeln('CLI install failed for ' + Target.DisplayName + '.');
     Exit;
