@@ -3941,6 +3941,22 @@ begin
 end;
 
 
+// The single formatting of a register row, shared by the `variables` listing and
+// by the `setVariable` response. They must agree: VS Code replaces the row it
+// already shows with whatever the setVariable response carries, so a response
+// formatted differently -- or omitted -- rewrites the row into something else.
+procedure DescribeRegister(const Reg: TRegisterValue; out AValue, AType: string);
+begin
+  if Reg.Size = 4 then begin
+    AValue := Format('0x%.8x', [Reg.Value]);
+    AType  := 'UInt32';
+  end
+  else begin
+    AValue := Format('0x%.16x  (%d)', [Reg.Value, Reg.Value]);
+    AType  := 'UInt64';
+  end;
+end;
+
 procedure TDapServer.HandleVariables(Seq: Integer; Args: TJSONObject);
 var
   Body:    TJSONObject;
@@ -3978,16 +3994,12 @@ begin
           // order; keep the DAP formatting (16-hex + decimal for 64-bit,
           // 8-hex for the 32-bit EFlags) and the leaf variablesReference of 0.
           for var Reg in FSession.GetRegisters do begin
+            var RegValue, RegType: string;
+            DescribeRegister(Reg, RegValue, RegType);
             var Item := TJSONObject.Create;
             Item.AddPair('name', Reg.Name);
-            if Reg.Size = 4 then begin
-              Item.AddPair('value', Format('0x%.8x', [Reg.Value]));
-              Item.AddPair('type',  'UInt32');
-            end
-            else begin
-              Item.AddPair('value', Format('0x%.16x  (%d)', [Reg.Value, Reg.Value]));
-              Item.AddPair('type',  'UInt64');
-            end;
+            Item.AddPair('value', RegValue);
+            Item.AddPair('type',  RegType);
             Item.AddPair('variablesReference', TJSONNumber.Create(0));
             VarArr.AddElement(Item);
           end;
@@ -4359,6 +4371,17 @@ begin
           Format('Unknown register "%s"', [Name]));
         Exit;
       end;
+      // Re-read rather than echo Raw: on a 32-bit target the register is
+      // narrower than the value that was parsed, so what landed there is the
+      // only truthful thing to show.
+      for var Reg in FSession.GetRegisters do
+        if SameText(Reg.Name, Name) then begin
+          var RegValue, RegType: string;
+          DescribeRegister(Reg, RegValue, RegType);
+          Body.AddPair('value', RegValue);
+          Body.AddPair('type',  RegType);
+          Break;
+        end;
       FIO.SendResponse(Seq, 'setVariable', True, Body);
       Exit;
     end;

@@ -48,6 +48,14 @@ type
     // successful edit. Must be a real DAP error response instead. The real
     // RED control for this increment.
     [Test] procedure Win32_SetVariable_Register_ExtendedRegister_Refused;
+    // The write reached the register, but the RESPONSE carried an empty body.
+    // DAP says a successful setVariable answers with the new `value`, and VS
+    // Code takes that literally: it replaces the row it is showing with the
+    // response, so an absent `value` blanks the register in the Variables view
+    // -- the name is left standing with nothing after it. Reported from the
+    // GUI; neither bitness had a test that looked at the response at all.
+    [Test] procedure X64_SetVariable_Register_ResponseCarriesNewValue;
+    [Test] procedure Win32_SetVariable_Register_ResponseCarriesNewValue;
   end;
 
 implementation
@@ -229,6 +237,53 @@ begin
   finally
     Resp.Free;
   end;
+end;
+
+// RED without the fix on both bitnesses: the response body was created empty
+// and sent as-is. The assertion is not just "non-empty" but "identical to what
+// the Registers scope reports for the same register", because the response is
+// what the client displays until the next variables request -- if the two
+// disagree the row shows one thing and means another.
+procedure TRegisterWriteDapTests.X64_SetVariable_Register_ResponseCarriesNewValue;
+const
+  SENTINEL = '0x1122334455667788';
+begin
+  OpenSampleAt('Win64', MARKER);
+  var RegistersRef := FindRegistersRef;
+
+  var Echoed: string;
+  var SetResp := FClient.SetVariable(RegistersRef, 'RAX', SENTINEL);
+  try
+    Echoed := SetResp.GetValue<string>('value', '');
+    Assert.IsTrue(Echoed <> '',
+      'Win64: setVariable answered without a `value`; VS Code blanks the row: ' + SetResp.ToJSON);
+  finally
+    SetResp.Free;
+  end;
+
+  Assert.AreEqual(RegisterValue(RegistersRef, 'RAX'), Echoed,
+    'Win64: the setVariable response and the Registers scope disagree about RAX');
+end;
+
+procedure TRegisterWriteDapTests.Win32_SetVariable_Register_ResponseCarriesNewValue;
+const
+  SENTINEL = '0x11223344';
+begin
+  OpenSampleAt('Win32', MARKER);
+  var RegistersRef := FindRegistersRef;
+
+  var Echoed: string;
+  var SetResp := FClient.SetVariable(RegistersRef, 'RAX', SENTINEL);
+  try
+    Echoed := SetResp.GetValue<string>('value', '');
+    Assert.IsTrue(Echoed <> '',
+      'Win32: setVariable answered without a `value`; VS Code blanks the row: ' + SetResp.ToJSON);
+  finally
+    SetResp.Free;
+  end;
+
+  Assert.AreEqual(RegisterValue(RegistersRef, 'RAX'), Echoed,
+    'Win32: the setVariable response and the Registers scope disagree about RAX');
 end;
 
 initialization
