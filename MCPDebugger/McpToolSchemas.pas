@@ -265,21 +265,23 @@ begin
 
   // ---- Registers ----
   Result.Add(MakeTool('get_registers',
-    'Return the general-purpose registers and flags of the currently stopped thread: RIP, ' +
-    'RSP, RBP, RAX..RDI, R8..R15, EFlags. Always 64-bit register NAMES even on a 32-bit ' +
-    'target -- on a WOW64 (32-bit) process the value already holds the 32-bit register ' +
-    'zero-extended and R8..R15 read as 0 (there is no such register at that width). Each ' +
-    '`value` is a hex string ("0x..."), never a bare number -- a register does not fit an ' +
-    'IEEE double without loss. `size` is 8 for the 64-bit registers, 4 for EFlags. Requires ' +
-    'the session to be stopped.', []));
+    'Return the general-purpose registers and flags of the currently stopped thread. The ' +
+    'NAMES follow the TARGET''s bitness: a 64-bit debuggee reports RIP, RSP, RBP, RAX..RDI, ' +
+    'R8..R15, EFlags (`size` 8, except 4 for EFlags); a 32-bit one reports EIP, ESP, EBP, ' +
+    'EAX..EDI, EFlags (`size` 4) and NO R8..R15, because those registers do not exist at ' +
+    'that width. Each `value` is a hex string ("0x..."), never a bare number -- a register ' +
+    'does not fit an IEEE double without loss. Requires the session to be stopped.', []));
 
   Result.Add(MakeTool('set_register',
-    'Write one register of the currently stopped thread by name (the same names ' +
-    'get_registers returns, case-insensitive). Returns the register''s new value, re-read ' +
-    'from the thread so the response proves the write rather than echoing back what was ' +
-    'asked for. An unrecognised name is refused (isError:true), never silently ignored. ' +
-    'Requires the session to be stopped.',
-    [Prop('name', 'string', 'Register name, e.g. "RAX", "RIP", "EFlags" (case-insensitive).', True),
+    'Write one register of the currently stopped thread by name. Either spelling is ' +
+    'accepted on either bitness ("EAX" and "RAX" name the same register, case-insensitive); ' +
+    'on a 64-bit target an E-name writes the low 32 bits and zero-extends, as the hardware ' +
+    'does. Returns the register''s new value, re-read from the thread so the response proves ' +
+    'the write rather than echoing back what was asked for -- on a 32-bit target that is ' +
+    'also how you see the value truncated to the real register width. A name the target has ' +
+    'no such register for is refused (isError:true), never silently ignored: writing R8..R15 ' +
+    'on a 32-bit target is an error. Requires the session to be stopped.',
+    [Prop('name', 'string', 'Register name, e.g. "RAX" / "EAX", "RIP" / "EIP", "EFlags" (case-insensitive).', True),
      Prop('value', 'string', 'New value, decimal or 0x-hex.', True)]));
 
   Result.Add(MakeTool('pause_execution',

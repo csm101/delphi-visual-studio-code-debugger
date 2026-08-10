@@ -967,14 +967,7 @@ begin
       // Re-read rather than echo the request back -- the response proves the
       // write reached the thread context instead of merely restating the ask.
       var Written: TRegisterValue;
-      var Found := False;
-      for var R in FSession.GetRegisters do
-        if SameText(R.Name, RegName) then begin
-          Written := R;
-          Found := True;
-          Break;
-        end;
-      if Found then
+      if FSession.TryGetRegister(RegName, Written) then
         SendToolJson(IdJson, McpJson.RegisterToJson(Written))
       else
         SendToolError(IdJson, Format('"%s" was written but does not appear in get_registers.', [RegName]));

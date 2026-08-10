@@ -218,15 +218,17 @@ begin
   if not Wow64GetThreadContext(TH, Ctx) then
     Exit;
   Result := True;
-  if      N = 'rip' then Ctx.Eip := DWORD(Value)
-  else if N = 'rsp' then Ctx.Esp := DWORD(Value)
-  else if N = 'rbp' then Ctx.Ebp := DWORD(Value)
-  else if N = 'rax' then Ctx.Eax := DWORD(Value)
-  else if N = 'rbx' then Ctx.Ebx := DWORD(Value)
-  else if N = 'rcx' then Ctx.Ecx := DWORD(Value)
-  else if N = 'rdx' then Ctx.Edx := DWORD(Value)
-  else if N = 'rsi' then Ctx.Esi := DWORD(Value)
-  else if N = 'rdi' then Ctx.Edi := DWORD(Value)
+  // Either spelling: the rows this target reports are E-named, but a caller
+  // carrying 64-bit names over from another session must still land here.
+  if      SameRegisterName(N, 'eip') then Ctx.Eip := DWORD(Value)
+  else if SameRegisterName(N, 'esp') then Ctx.Esp := DWORD(Value)
+  else if SameRegisterName(N, 'ebp') then Ctx.Ebp := DWORD(Value)
+  else if SameRegisterName(N, 'eax') then Ctx.Eax := DWORD(Value)
+  else if SameRegisterName(N, 'ebx') then Ctx.Ebx := DWORD(Value)
+  else if SameRegisterName(N, 'ecx') then Ctx.Ecx := DWORD(Value)
+  else if SameRegisterName(N, 'edx') then Ctx.Edx := DWORD(Value)
+  else if SameRegisterName(N, 'esi') then Ctx.Esi := DWORD(Value)
+  else if SameRegisterName(N, 'edi') then Ctx.Edi := DWORD(Value)
   else if N = 'eflags' then Ctx.EFlags := DWORD(Value)
   else
     Result := False;

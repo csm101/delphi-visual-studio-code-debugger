@@ -1,4 +1,4 @@
-﻿unit WinDebuggerBase;
+unit WinDebuggerBase;
 
 // TWinDebugger: the architecture-neutral half of the engine -- the debug event
 // loop, breakpoints, stepping, module handling and the synthetic-call pump --
@@ -6244,16 +6244,22 @@ begin
   Ctx.ContextFlags := CONTEXT_FULL;
   if not GetThreadContext(TH, Ctx) then Exit;
   N := LowerCase(Name);
+  // A 3-letter E-spelling on a 64-bit target names the LOW HALF of the
+  // register, and a 32-bit write zero-extends into the full 64-bit register on
+  // real hardware -- so narrow the value first and then write the whole thing.
+  // ("EFlags" is 6 letters and is genuinely 32 bits wide; it is not affected.)
+  if (Length(N) = 3) and (N[1] = 'e') then
+    Value := DWORD(Value);
   Result := True;
-  if      N = 'rip' then Ctx.Rip := Value
-  else if N = 'rsp' then Ctx.Rsp := Value
-  else if N = 'rbp' then Ctx.Rbp := Value
-  else if N = 'rax' then Ctx.Rax := Value
-  else if N = 'rbx' then Ctx.Rbx := Value
-  else if N = 'rcx' then Ctx.Rcx := Value
-  else if N = 'rdx' then Ctx.Rdx := Value
-  else if N = 'rsi' then Ctx.Rsi := Value
-  else if N = 'rdi' then Ctx.Rdi := Value
+  if      SameRegisterName(N, 'rip') then Ctx.Rip := Value
+  else if SameRegisterName(N, 'rsp') then Ctx.Rsp := Value
+  else if SameRegisterName(N, 'rbp') then Ctx.Rbp := Value
+  else if SameRegisterName(N, 'rax') then Ctx.Rax := Value
+  else if SameRegisterName(N, 'rbx') then Ctx.Rbx := Value
+  else if SameRegisterName(N, 'rcx') then Ctx.Rcx := Value
+  else if SameRegisterName(N, 'rdx') then Ctx.Rdx := Value
+  else if SameRegisterName(N, 'rsi') then Ctx.Rsi := Value
+  else if SameRegisterName(N, 'rdi') then Ctx.Rdi := Value
   else if N = 'r8'  then Ctx.R8  := Value
   else if N = 'r9'  then Ctx.R9  := Value
   else if N = 'r10' then Ctx.R10 := Value

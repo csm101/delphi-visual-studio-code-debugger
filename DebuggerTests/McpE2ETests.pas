@@ -81,7 +81,7 @@ type
     // VALUES themselves already come from the same engine call the DAP
     // Registers scope has used for a long time.
     [Test] procedure GetRegisters_MatchesCallStackRip;
-    [Test] procedure GetRegisters_Win32_MatchesRipAndZeroExtendsUpperRegisters;
+    [Test] procedure GetRegisters_Win32_ReportsAnX86RegisterFile;
     [Test] procedure GetRegisters_RefusedBeforeLaunch;
     [Test] procedure SetRegister_WritesAndReadsBack;
     [Test] procedure SetRegister_UnknownName_Refused;
@@ -2333,12 +2333,16 @@ begin
   end;
 end;
 
-// The genuinely bitness-sensitive half: on a WOW64 (32-bit) target
-// ReadThreadRegisters (WinDebuggerX86.pas) reads Wow64GetThreadContext and
-// never sets R8..R15 (TRegisterSnapshot starts zeroed), so they must read
-// back as literal zero -- proving the MCP surface passes through what the
-// engine actually reports rather than fabricating a 64-register file.
-procedure TMcpE2ETests.GetRegisters_Win32_MatchesRipAndZeroExtendsUpperRegisters;
+// The genuinely bitness-sensitive half: on a WOW64 (32-bit) target the register
+// file IS an x86 one, and get_registers must describe that machine -- E-named
+// rows, size 4, and no R8..R15 at all.
+//
+// It used to report the 64-bit superset TRegisterSnapshot is built on, with
+// R8..R15 reading zero, and this test asserted exactly that. Zero was not a
+// measurement: those registers do not exist at this width, and listing them
+// beside a "RAX" holding a zero-extended EAX described a machine the debuggee
+// was not running on.
+procedure TMcpE2ETests.GetRegisters_Win32_ReportsAnX86RegisterFile;
 begin
   var Line := MarkerLine(EVAL_SOURCE, EVAL_MARKER);
   var C := TMcpTestClient.Start(McpExe);
@@ -2353,12 +2357,12 @@ begin
     BpArgs.AddPair('line', TJSONNumber.Create(Line));
     C.CallTool('set_breakpoint', BpArgs).Free;
 
-    var ExpectedRip := '';
+    var ExpectedEip := '';
     var Snap := C.CallTool('continue_and_wait', nil);
     try
       var S := TJSONObject(Snap);
       Assert.AreEqual('stopped', S.GetValue<string>('state', ''), 'did not stop: ' + S.ToJSON);
-      ExpectedRip := ((S.GetValue('frames') as TJSONArray).Items[0] as TJSONObject)
+      ExpectedEip := ((S.GetValue('frames') as TJSONArray).Items[0] as TJSONObject)
         .GetValue<string>('address', '');
     finally
       Snap.Free;
@@ -2367,19 +2371,22 @@ begin
     var Regs := C.CallTool('get_registers', nil);
     try
       var Arr := Regs as TJSONArray;
-      var Rip: TJSONObject;
-      Assert.IsTrue(McpFindRow(Arr, 'RIP', Rip), 'no RIP in get_registers: ' + Arr.ToJSON);
-      Assert.AreEqual(ExpectedRip, Rip.GetValue<string>('value', ''),
-        'Win32: get_registers RIP disagrees with the call stack''s own address');
+      var Eip: TJSONObject;
+      Assert.IsTrue(McpFindRow(Arr, 'EIP', Eip), 'no EIP in get_registers: ' + Arr.ToJSON);
+      Assert.AreEqual(ExpectedEip, Eip.GetValue<string>('value', ''),
+        'Win32: get_registers EIP disagrees with the call stack''s own address');
       // A 32-bit address must fit in 8 hex digits -- proves this really read the
       // WOW64 32-bit context, not a stale/garbage 64-bit one.
-      Assert.IsTrue(ExpectedRip.Length - 2 <= 8, 'RIP does not look like a 32-bit VA: ' + ExpectedRip);
-      for var RegName in ['R8', 'R9', 'R10', 'R11', 'R12', 'R13', 'R14', 'R15'] do begin
+      Assert.IsTrue(ExpectedEip.Length - 2 <= 8, 'EIP does not look like a 32-bit VA: ' + ExpectedEip);
+      for var RegName in ['R8', 'R9', 'R15', 'RIP', 'RAX'] do begin
         var R: TJSONObject;
-        Assert.IsTrue(McpFindRow(Arr, RegName, R), 'no ' + RegName + ' in get_registers: ' + Arr.ToJSON);
-        Assert.AreEqual('0x0', R.GetValue<string>('value', ''),
-          Format('Win32: %s should read as zero (no such register at this width), got %s',
-            [RegName, R.GetValue<string>('value', '')]));
+        Assert.IsFalse(McpFindRow(Arr, RegName, R),
+          Format('Win32: %s is not a register this target has: %s', [RegName, Arr.ToJSON]));
+      end;
+      for var I := 0 to Arr.Count - 1 do begin
+        var Row := Arr.Items[I] as TJSONObject;
+        Assert.AreEqual(4, Row.GetValue<Integer>('size', 0),
+          'Win32: every register of a 32-bit target is 4 bytes wide: ' + Row.ToJSON);
       end;
     finally
       Regs.Free;
@@ -2533,9 +2540,11 @@ begin
 
     var Regs := C.CallTool('get_registers', nil);
     try
-      var Rax: TJSONObject;
-      Assert.IsTrue(McpFindRow(Regs as TJSONArray, 'RAX', Rax), 'no RAX in get_registers');
-      Assert.AreEqual(SENTINEL, Rax.GetValue<string>('value', ''),
+      // Written above as RAX, read back as EAX: register names follow the
+      // target's bitness, and both spellings reach the same register.
+      var Eax: TJSONObject;
+      Assert.IsTrue(McpFindRow(Regs as TJSONArray, 'EAX', Eax), 'no EAX in get_registers');
+      Assert.AreEqual(SENTINEL, Eax.GetValue<string>('value', ''),
         'Win32: a later, independent get_registers call does not see the write');
     finally
       Regs.Free;

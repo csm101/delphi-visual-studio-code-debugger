@@ -687,7 +687,33 @@ type
 
 function FrameOriginName(Origin: TFrameOrigin): string;
 
+// True when two register names denote the same physical register regardless of
+// the width prefix -- "EAX" and "RAX", "EIP" and "RIP". Register rows are named
+// for the target's bitness, so a caller that learnt one spelling keeps working
+// against a target of the other width. R8..R15 have no 32-bit spelling and
+// match only themselves, which is what keeps a write to "R8" on a 32-bit target
+// a refusal rather than an accidental alias of some other register.
+function SameRegisterName(const A, B: string): Boolean;
+
 implementation
+
+function SameRegisterName(const A, B: string): Boolean;
+
+  // "rax" -> "ax", "eip" -> "ip". Anything else is returned lowercased but
+  // otherwise untouched, so "r8" and "eflags" compare literally.
+  function WithoutWidthPrefix(const Name: string): string;
+  begin
+    Result := LowerCase(Name);
+    if (Length(Result) <> 3) or not CharInSet(Result[1], ['r', 'e']) then
+      Exit;
+    for var Core in ['ax', 'bx', 'cx', 'dx', 'si', 'di', 'sp', 'bp', 'ip'] do
+      if Copy(Result, 2, 2) = Core then
+        Exit(Core);
+  end;
+
+begin
+  Result := WithoutWidthPrefix(A) = WithoutWidthPrefix(B);
+end;
 
 function FrameOriginName(Origin: TFrameOrigin): string;
 const

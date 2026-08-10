@@ -149,18 +149,22 @@ did it is frequently the whole answer.
 The MCP equivalent of DAP's long-standing writable `Registers` scope — same
 `TDebugSession.GetRegisters`/`SetRegister` path, no second mechanism. Requires
 the session to be stopped.
-- `get_registers` — RIP, RSP, RBP, RAX..RDI, R8..R15, EFlags (18 rows) of the
-  currently stopped thread. Each row is `{name, value, size}`; `value` is a
-  hex string (`"0x..."`, never a bare number — a 64-bit register does not fit
-  a JSON/IEEE double without loss); `size` is 8 for the 64-bit registers, 4
-  for `EFlags`. On a WOW64 (32-bit) target the value already holds the
-  32-bit register zero-extended, and `R8`..`R15` read as literal `"0x0"` —
-  there is no such register at that width.
-- `set_register` — `name` (case-insensitive, the same names `get_registers`
-  returns) and `value` (decimal or `0x`-hex). Returns the register's NEW
-  value, RE-READ from the thread so the response proves the write rather than
-  echoing the request back. An unrecognised name is refused (`isError:true`),
-  never silently ignored.
+- `get_registers` — the general-purpose registers of the currently stopped
+  thread, NAMED for the target's bitness: RIP, RSP, RBP, RAX..RDI, R8..R15,
+  EFlags (18 rows, `size` 8 except 4 for `EFlags`) on a 64-bit target; EIP,
+  ESP, EBP, EAX..EDI, EFlags (10 rows, `size` 4) on a 32-bit one, with no
+  `R8`..`R15` at all — there is no such register at that width. Each row is
+  `{name, value, size}`; `value` is a hex string (`"0x..."`, never a bare
+  number — a 64-bit register does not fit a JSON/IEEE double without loss).
+- `set_register` — `name` (case-insensitive; either spelling works on either
+  bitness, so `EAX` and `RAX` name the same register, and on a 64-bit target
+  an `E`-name writes the low 32 bits and zero-extends as the hardware does)
+  and `value` (decimal or `0x`-hex). Returns the register's NEW value, RE-READ
+  from the thread so the response proves the write rather than echoing the
+  request back — which is also how a value truncated to a 32-bit register
+  becomes visible. A name the target has no such register for is refused
+  (`isError:true`), never silently ignored: `R8`..`R15` on a 32-bit target are
+  an error, not an alias.
 
 ### Execution (event-driven — the stop is folded into the response, no sleeps)
 - `continue_and_wait` (optional `timeoutMs`), `step_over`, `step_into`,

@@ -56,12 +56,19 @@ type
     // GUI; neither bitness had a test that looked at the response at all.
     [Test] procedure X64_SetVariable_Register_ResponseCarriesNewValue;
     [Test] procedure Win32_SetVariable_Register_ResponseCarriesNewValue;
+    // Register names follow the TARGET's bitness. The Registers scope used to
+    // report the 64-bit superset the snapshot record is built on, whatever the
+    // target was, so a 32-bit session showed RAX (zero-extended, 16 hex digits)
+    // and eight R8..R15 rows reading 0 for registers the CPU does not have.
+    [Test] procedure Win32_Registers_UseX86Names;
+    // ...and the rename does not strand a caller holding the other spelling.
+    [Test] procedure Win32_SetVariable_Register_AcceptsEitherSpelling;
   end;
 
 implementation
 
 uses
-  System.SysUtils, System.JSON;
+  System.SysUtils, System.Classes, System.JSON;
 
 const
   SAMPLE_SOURCE = 'InstructionStepSample.dpr';
@@ -201,8 +208,9 @@ end;
 
 // Same shape as the x64 control, but the sentinel fits the real 32-bit
 // register width -- the write goes through TWin32Debugger.SetRegisterByName's
-// Wow64Get/SetThreadContext pair, and GetRegisters zero-extends whatever that
-// pair actually holds into the 64-bit row DAP displays.
+// Wow64Get/SetThreadContext pair. The row is named EAX here: register names
+// follow the target's bitness. Writing it by its 64-bit spelling is the point
+// of Win32_SetVariable_Register_AcceptsEitherSpelling below.
 procedure TRegisterWriteDapTests.Win32_SetVariable_Register_WritesAndReadsBack;
 const
   SENTINEL = '0x11223344';
@@ -210,10 +218,10 @@ begin
   OpenSampleAt('Win32', MARKER);
   var RegistersRef := FindRegistersRef;
 
-  var SetResp := FClient.SetVariable(RegistersRef, 'RAX', SENTINEL);
+  var SetResp := FClient.SetVariable(RegistersRef, 'EAX', SENTINEL);
   SetResp.Free;
 
-  var Value := RegisterValue(RegistersRef, 'RAX');
+  var Value := RegisterValue(RegistersRef, 'EAX');
   Assert.IsTrue(Value.Contains('11223344'),
     Format('Win32: a later, independent variables request does not see the write -- got "%s"',
       [Value]));
@@ -273,7 +281,7 @@ begin
   var RegistersRef := FindRegistersRef;
 
   var Echoed: string;
-  var SetResp := FClient.SetVariable(RegistersRef, 'RAX', SENTINEL);
+  var SetResp := FClient.SetVariable(RegistersRef, 'EAX', SENTINEL);
   try
     Echoed := SetResp.GetValue<string>('value', '');
     Assert.IsTrue(Echoed <> '',
@@ -282,8 +290,73 @@ begin
     SetResp.Free;
   end;
 
-  Assert.AreEqual(RegisterValue(RegistersRef, 'RAX'), Echoed,
-    'Win32: the setVariable response and the Registers scope disagree about RAX');
+  Assert.AreEqual(RegisterValue(RegistersRef, 'EAX'), Echoed,
+    'Win32: the setVariable response and the Registers scope disagree about EAX');
+end;
+
+// The Registers scope on a 32-bit target must describe a 32-bit machine: E-named
+// rows, 8 hex digits, and no R8..R15 at all. Before this, every target reported
+// the 64-bit superset the register SNAPSHOT is built on -- so a WOW64 session
+// showed "RAX" holding a zero-extended EAX in 16 hex digits, and eight extended
+// registers reading 0 that the CPU does not have at that width.
+procedure TRegisterWriteDapTests.Win32_Registers_UseX86Names;
+begin
+  OpenSampleAt('Win32', MARKER);
+  var RegistersRef := FindRegistersRef;
+
+  var Names := TStringList.Create;
+  try
+    var RegsResp := FClient.Variables(RegistersRef);
+    try
+      var Arr := RegsResp.GetValue('variables') as TJSONArray;
+      Assert.IsTrue((Arr <> nil) and (Arr.Count > 0), 'Registers scope returned no rows');
+      for var I := 0 to Arr.Count - 1 do
+        Names.Add((Arr[I] as TJSONObject).GetValue<string>('name', ''));
+    finally
+      RegsResp.Free;
+    end;
+
+    for var Expected in ['EIP', 'ESP', 'EBP', 'EAX', 'EBX', 'ECX', 'EDX', 'ESI', 'EDI'] do
+      Assert.IsTrue(Names.IndexOf(Expected) >= 0,
+        Format('Win32: no %s row; got %s', [Expected, Names.CommaText]));
+    for var Absent in ['RIP', 'RAX', 'R8', 'R15'] do
+      Assert.IsTrue(Names.IndexOf(Absent) < 0,
+        Format('Win32: %s is not a register of a 32-bit target; got %s',
+          [Absent, Names.CommaText]));
+  finally
+    Names.Free;
+  end;
+
+  // Width follows the name. The 64-bit rendering is '0x' + 16 hex digits with
+  // the decimal in parentheses after it; the 32-bit one is '0x' + 8 and nothing
+  // else, so the length alone separates them without depending on the value.
+  var Eax := RegisterValue(RegistersRef, 'EAX');
+  Assert.AreEqual(10, Length(Eax),
+    'Win32: EAX is not rendered at 32-bit width: ' + Eax);
+end;
+
+// The rename must not break a caller that learnt the 64-bit spelling: "RAX"
+// still reaches EAX on a 32-bit target. What is REPORTED back is the name the
+// target owns, so the response says EAX even though the request said RAX.
+procedure TRegisterWriteDapTests.Win32_SetVariable_Register_AcceptsEitherSpelling;
+const
+  SENTINEL = '0x55667788';
+begin
+  OpenSampleAt('Win32', MARKER);
+  var RegistersRef := FindRegistersRef;
+
+  var Resp := FClient.SetVariableRaw(RegistersRef, 'RAX', SENTINEL);
+  try
+    Assert.IsTrue(Resp.GetValue<Boolean>('success', False),
+      'Win32: the 64-bit spelling of a register the target has should still be writable: '
+      + Resp.ToJSON);
+  finally
+    Resp.Free;
+  end;
+
+  var Value := RegisterValue(RegistersRef, 'EAX');
+  Assert.IsTrue(Value.Contains('55667788'),
+    Format('Win32: a write named RAX did not reach EAX -- got "%s"', [Value]));
 end;
 
 initialization

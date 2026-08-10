@@ -836,10 +836,13 @@ scope coverage; these tests prove the MCP TOOL surface (JSON shape, the
       the `get_registers` dispatch string so it falls through to "Unknown
       tool" — the test errors with an invalid class typecast (an array was
       expected, got the plain-text error wrapped as a JSON string).
-- [x] **On a WOW64 (32-bit) target, `R8`..`R15` read back as literal `"0x0"`**
-      (`GetRegisters_Win32_MatchesRipAndZeroExtendsUpperRegisters`) — the one
-      genuinely bitness-sensitive assertion here:
-      `TWin32Debugger.ReadThreadRegisters` never sets them.
+- [x] **On a WOW64 (32-bit) target, `get_registers` describes an x86 register
+      file** (`GetRegisters_Win32_ReportsAnX86RegisterFile`) — the one
+      genuinely bitness-sensitive assertion here: `EIP` agrees with the call
+      stack's own address, every row is `size: 4`, and `R8`/`R9`/`R15`/`RIP`/
+      `RAX` are ABSENT. It previously asserted the opposite (`R8`..`R15`
+      present, reading `"0x0"`), which was the shape of `TRegisterSnapshot`
+      rather than a measurement of the target.
 - [x] **Refused before any launch, with a reason** (`GetRegisters_RefusedBeforeLaunch`).
 - [x] **`set_register` writes, and a LATER, independent `get_registers` call
       still sees it** (`SetRegister_WritesAndReadsBack`) — writes RAX to a
@@ -1075,6 +1078,25 @@ surfaces:
       guard), `Win32_SetVariable_Register_ExtendedRegister_Refused` (RED
       control — asserts `success: false` and `body.error.format` names the
       register).
+- [x] **A successful `setVariable` on a register answers with the new value**
+      (`X64_`/`Win32_SetVariable_Register_ResponseCarriesNewValue`). Reported
+      from the GUI: the write reached the register, but the response body went
+      out empty, and VS Code — which replaces the displayed row with whatever
+      the response carries — blanked the register, leaving the name with
+      nothing after it. Both assert the response value is IDENTICAL to what
+      the `Registers` scope reports for the same register, not merely
+      non-empty. RED without the fix on both bitnesses, with the failure
+      message carrying the literal `{}` that caused it.
+- [x] **A 32-bit target reports a 32-bit register file**
+      (`Win32_Registers_UseX86Names`): `EIP`/`ESP`/`EBP`/`EAX`..`EDI` present,
+      `RIP`/`RAX`/`R8`/`R15` absent, and `EAX` rendered at 32-bit width
+      (asserted by rendered LENGTH, so it holds whatever the register happens
+      to contain — an earlier spelling of this check compared against a
+      leading-zeros prefix and failed whenever `EAX` was legitimately small).
+- [x] **The rename strands no caller**
+      (`Win32_SetVariable_Register_AcceptsEitherSpelling`): a write named
+      `RAX` still reaches `EAX` on a 32-bit target, while the row keeps the
+      name the target owns.
 - [ ] **Not verified on any Windows version other than the one this was
       measured on** (Windows 11, build 26200). The aliasing behaviour that
       makes the round-trip tests pass even without the fix is an OS

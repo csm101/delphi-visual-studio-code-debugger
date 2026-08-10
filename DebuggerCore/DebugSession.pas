@@ -1,4 +1,4 @@
-﻿unit DebugSession;
+unit DebugSession;
 
 // Frontend-neutral debugger core facade. Owns the debug engine (IDebugTarget),
 // the aggregate debug-info set + symbol readers, the source resolver, the
@@ -495,9 +495,21 @@ type
     // Delphi object does not exist yet".
     property  StopReason: TStopReason read FStopReason;
 
-    // Registers (stopped thread).
+    // Registers (stopped thread). The NAMES follow the target's bitness: a
+    // 32-bit debuggee reports EIP/ESP/EBP/EAX..EDI (4 bytes each) and no
+    // R8..R15 at all, because those registers do not exist at that width --
+    // listing them, zero, next to a 16-hex EAX told the user something false
+    // about the machine being debugged.
     function  GetRegisters: TArray<TRegisterValue>;
+    // Both spellings are accepted wherever a register is named, on either
+    // bitness, so a caller that learnt "RAX" from a 64-bit session keeps
+    // working against a 32-bit one (and vice versa). What is REPORTED is
+    // always the name that belongs to the target.
     function  SetRegister(const Name: string; Value: UInt64): Boolean;
+    // The register row as it is reported now, found by either spelling.
+    // Callers use it to answer a write with what actually landed in the
+    // thread context rather than with what was asked for.
+    function  TryGetRegister(const Name: string; out Reg: TRegisterValue): Boolean;
 
     // Write paths (setVariable). Encode ValueStr at the target's TRUE storage
     // width, write it into the debuggee, then re-read for the refreshed display.
@@ -2625,6 +2637,17 @@ begin
   var Regs := FDebugger.GetRegisters;
   if not Regs.Valid then
     Exit;
+  // The snapshot is a 64-bit superset of both register files: a 32-bit target
+  // fills the low half of each field and leaves R8..R15 zero. Report what the
+  // target actually HAS -- 32-bit names, 32-bit width, and no extended
+  // registers -- instead of the superset's shape.
+  if not FDebugger.TargetLayout.Is64Bit then begin
+    Emit('EIP', Regs.Rip, 4);  Emit('ESP', Regs.Rsp, 4);  Emit('EBP', Regs.Rbp, 4);
+    Emit('EAX', Regs.Rax, 4);  Emit('EBX', Regs.Rbx, 4);  Emit('ECX', Regs.Rcx, 4);
+    Emit('EDX', Regs.Rdx, 4);  Emit('ESI', Regs.Rsi, 4);  Emit('EDI', Regs.Rdi, 4);
+    Emit('EFlags', Regs.EFlags, 4);
+    Exit;
+  end;
   Emit('RIP', Regs.Rip, 8);  Emit('RSP', Regs.Rsp, 8);  Emit('RBP', Regs.Rbp, 8);
   Emit('RAX', Regs.Rax, 8);  Emit('RBX', Regs.Rbx, 8);  Emit('RCX', Regs.Rcx, 8);
   Emit('RDX', Regs.Rdx, 8);  Emit('RSI', Regs.Rsi, 8);  Emit('RDI', Regs.Rdi, 8);
@@ -2632,6 +2655,18 @@ begin
   Emit('R11', Regs.R11, 8);  Emit('R12', Regs.R12, 8);  Emit('R13', Regs.R13, 8);
   Emit('R14', Regs.R14, 8);  Emit('R15', Regs.R15, 8);
   Emit('EFlags', Regs.EFlags, 4);
+end;
+
+function TDebugSession.TryGetRegister(const Name: string;
+  out Reg: TRegisterValue): Boolean;
+begin
+  Reg := Default(TRegisterValue);
+  for var R in GetRegisters do
+    if SameRegisterName(R.Name, Name) then begin
+      Reg := R;
+      Exit(True);
+    end;
+  Result := False;
 end;
 
 function TDebugSession.SetRegister(const Name: string; Value: UInt64): Boolean;

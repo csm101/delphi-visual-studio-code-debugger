@@ -261,19 +261,30 @@ implementation strategy, only its observable contract (never a false
   DAP's `Registers` scope has used for a long time
   (`TDebugSession.GetRegisters` / `SetRegister`, backed by
   `TWinDebugger`/`TWin32Debugger`'s `GetRegisters`/`SetRegisterByName`) — no
-  second mechanism. `get_registers` returns the 18 rows DAP's scope emits
-  (RIP, RSP, RBP, RAX..RDI, R8..R15, EFlags), each as `{name, value, size}`
+  second mechanism. `get_registers` returns the same rows DAP's scope emits —
+  18 on a 64-bit target (RIP, RSP, RBP, RAX..RDI, R8..R15, EFlags), 10 on a
+  32-bit one (EIP, ESP, EBP, EAX..EDI, EFlags) — each as `{name, value, size}`
   with `value` a variable-width hex string (`"0x..."`, never a bare JSON
   number — a 64-bit register does not fit an IEEE double without loss), the
   same convention `disassemble`/`read_memory`/`set_breakpoint_at_address`
-  already use. On a WOW64 (32-bit) target `R8..R15` read back as literal
-  `"0x0"` (`ReadThreadRegisters` in `WinDebuggerX86.pas` never sets them) —
-  proven, not assumed, by `GetRegisters_Win32_MatchesRipAndZeroExtendsUpperRegisters`.
-  `set_register` writes by name (case-insensitive, same names `get_registers`
-  returns) and returns the register RE-READ from the thread context rather
-  than echoing the request back, so the response proves the write instead of
-  merely restating the ask; an unrecognised name is refused (`isError:true`),
-  never silently ignored. Both require the session to be stopped, gated the
+  already use. The register NAMES follow the target's bitness: a 32-bit
+  debuggee reports `EIP`, `ESP`, `EBP`, `EAX`..`EDI`, `EFlags`, all `size: 4`,
+  and no `R8`..`R15` at all — those registers do not exist at that width, and
+  reporting them as `"0x0"` beside a `RAX` holding a zero-extended `EAX`
+  described a machine the debuggee was not running on. Asserted by
+  `GetRegisters_Win32_ReportsAnX86RegisterFile` (MCP) and
+  `Win32_Registers_UseX86Names` (DAP).
+  `set_register` writes by name and returns the register RE-READ from the
+  thread context rather than echoing the request back, so the response proves
+  the write instead of merely restating the ask — and, on a 32-bit target, is
+  also where the value becomes visible truncated to the real register width.
+  Either spelling is accepted on either bitness (`SameRegisterName` in
+  `DebugTarget.pas`: `EAX` and `RAX` name the same register), so a caller that
+  learnt the 64-bit names keeps working against a 32-bit target; on a 64-bit
+  target an `E`-name writes the low 32 bits and zero-extends, as the hardware
+  does. A name the target has no such register for is refused
+  (`isError:true`), never silently ignored — `R8` on a 32-bit target is an
+  error, not an alias. Both require the session to be stopped, gated the
   same way every other stop-only MCP tool is (`get_call_stack`, `get_locals`,
   ...), even though the underlying `TDebugSession.GetRegisters` degrades
   quietly to an empty array instead of refusing on its own.

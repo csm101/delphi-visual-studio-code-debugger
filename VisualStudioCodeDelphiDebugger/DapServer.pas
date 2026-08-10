@@ -4374,14 +4374,13 @@ begin
       // Re-read rather than echo Raw: on a 32-bit target the register is
       // narrower than the value that was parsed, so what landed there is the
       // only truthful thing to show.
-      for var Reg in FSession.GetRegisters do
-        if SameText(Reg.Name, Name) then begin
-          var RegValue, RegType: string;
-          DescribeRegister(Reg, RegValue, RegType);
-          Body.AddPair('value', RegValue);
-          Body.AddPair('type',  RegType);
-          Break;
-        end;
+      var Written: TRegisterValue;
+      if FSession.TryGetRegister(Name, Written) then begin
+        var RegValue, RegType: string;
+        DescribeRegister(Written, RegValue, RegType);
+        Body.AddPair('value', RegValue);
+        Body.AddPair('type',  RegType);
+      end;
       FIO.SendResponse(Seq, 'setVariable', True, Body);
       Exit;
     end;

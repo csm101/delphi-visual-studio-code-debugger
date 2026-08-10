@@ -6976,10 +6976,13 @@ begin
     W32_SOURCE, Line);
   try
     Assert.AreEqual(Ord(dsStopped), Ord(Session.State), 'did not stop');
+    // Written by its 64-bit spelling on purpose: both spellings must reach the
+    // same register. Read back by the name the target actually owns -- a 32-bit
+    // session reports EAX, not RAX.
     Assert.IsTrue(Session.SetRegister('RAX', SENTINEL), 'SetRegister(RAX) refused');
 
     var Value: UInt64;
-    Assert.IsTrue(FindRegister(Session.GetRegisters, 'RAX', Value), 'no RAX in GetRegisters');
+    Assert.IsTrue(FindRegister(Session.GetRegisters, 'EAX', Value), 'no EAX in GetRegisters');
     Assert.AreEqual(SENTINEL, Value,
       Format('a later, independent GetRegisters call does not see the write -- ' +
              'got $%x, expected $%x', [Value, SENTINEL]));

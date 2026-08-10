@@ -600,8 +600,11 @@ target fills the same fields from EIP/ESP/EBP and leaves R8..R15 zero. That is
 why the role accessors `Pc` / `StackPtr` / `FramePtr` exist: a consumer asking
 for a role gets a correct answer on both bitnesses, while one reading a physical
 64-bit name gets a meaningless one on x86. Physical register names are
-legitimate in exactly two places — the x64 implementation itself, and the DAP
-Registers view.
+legitimate in exactly two places — the x64 implementation itself, and the
+register views (DAP's `Registers` scope and MCP's `get_registers`), which do
+not pass the superset through: `TDebugSession.GetRegisters` renames and
+narrows the rows to the target's own register file, so an x86 target is
+described as an x86 machine rather than as a 64-bit record with holes in it.
 
 ### WOW64 debug events
 
@@ -1628,24 +1631,54 @@ An unrecognised name is refused (`isError:true`, `"Unknown register
 SetRegisterByName`'s own case-insensitive name set (`RIP`, `RSP`, `RBP`,
 `RAX`..`RDI`, `R8`..`R15`, `EFlags`).
 
-Bitness note, measured not assumed
-(`GetRegisters_Win32_MatchesRipAndZeroExtendsUpperRegisters`): on a WOW64
-target `TWin32Debugger.ReadThreadRegisters` (`WinDebuggerX86.pas`) reads
-`Wow64GetThreadContext` and never sets `R8`..`R15` (`TRegisterSnapshot` starts
-zeroed), so `get_registers` reports them as literal `"0x0"` — not fabricated,
-not omitted, exactly what the engine has.
+Register names follow the TARGET's bitness. `TDebugSession.GetRegisters`
+reports `EIP`, `ESP`, `EBP`, `EAX`..`EDI`, `EFlags` (`Size` 4) and no
+`R8`..`R15` when `TargetLayout.Is64Bit` is False. `TRegisterSnapshot` is a
+64-bit superset of both register files — a 32-bit target fills the low half of
+each field and leaves the extended registers zero — and the session used to
+hand that superset straight out whatever the target was, so a WOW64 session
+showed a `RAX` holding a zero-extended `EAX` in 16 hex digits next to eight
+registers reading `0` that the CPU does not have at that width. Zero was the
+shape of the record, not a measurement.
+
+Both spellings are accepted wherever a register is NAMED — `SameRegisterName`
+(`DebugTarget.pas`) compares them with the width prefix stripped, so `EAX` and
+`RAX` are the same register on either bitness and a caller that learnt one set
+of names is not stranded. What is REPORTED back is always the name the target
+owns. `R8`..`R15` have no 32-bit spelling and match only themselves, which is
+what keeps writing `R8` on a 32-bit target a refusal rather than an accidental
+alias. On a 64-bit target an `E`-spelling narrows the value to 32 bits before
+the write and lets it zero-extend into the full register, which is what the
+hardware does.
+
+`TDebugSession.TryGetRegister` is that lookup, and both frontends use it to
+build the response to a write, so neither re-implements the name matching:
+`setVariable` on the DAP `Registers` scope and MCP's `set_register` answer
+with the row as it reads NOW.
 
 `SetRegisterByName` originally had NO WOW64 override — resolved in
 `ASSEMBLY_LEVEL_DEBUGGING.md` increment 6, which is the authoritative writeup
 (what was measured, both outcomes considered, why Outcome 1 was taken even
 though the round-trip defect turned out not to reproduce at a real stop —
 only R8..R15 did). Summary: `TWin32Debugger.SetRegisterByName` now overrides
-the base with `Wow64Get/SetThreadContext`, using the same name vocabulary
-`ReadThreadRegisters` reports (`RIP`/`RSP`/`RBP`/`RAX`..`RDI`/`EFlags`), and
-refuses `R8`..`R15` outright (no logical register exists on x86 at that
-width). DAP's `setVariable`-on-`Registers`-scope path shares the identical
-fix, proven by a dedicated test file (`RegisterWriteDapTests.pas`) — the two
-surfaces do not diverge.
+the base with `Wow64Get/SetThreadContext`, accepts either spelling of the
+registers a 32-bit target has (`EIP`/`ESP`/`EBP`/`EAX`..`EDI`/`EFlags`, and
+their `R`-named equivalents), and refuses `R8`..`R15` outright (no logical
+register exists on x86 at that width). DAP's
+`setVariable`-on-`Registers`-scope path shares the identical fix, proven by a
+dedicated test file (`RegisterWriteDapTests.pas`) — the two surfaces do not
+diverge.
+
+A successful `setVariable` on the `Registers` scope answers with the new
+`value` and `type`, formatted by `DescribeRegister` — the SAME formatter the
+`variables` listing uses, because the two must agree: VS Code replaces the row
+it is displaying with whatever the response carries and keeps it until the next
+`variables` request. The response body used to go out empty, which is not a
+cosmetic omission — the client blanked the register, leaving the name standing
+with no value after it, while the write itself had succeeded. Guarded per
+bitness by `X64_/Win32_SetVariable_Register_ResponseCarriesNewValue`, which
+assert the response and the scope agree rather than merely that something was
+sent.
 
 **Instruction-granularity stepping** is a `granularity` argument
 (`"statement"`, default; `"instruction"`) on the EXISTING `step_over`/
