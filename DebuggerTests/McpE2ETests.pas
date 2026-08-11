@@ -131,7 +131,8 @@ type
 implementation
 
 uses
-  Winapi.Windows, System.SysUtils, System.Classes, System.JSON, System.IOUtils;
+  Winapi.Windows, System.SysUtils, System.Classes, System.JSON, System.IOUtils,
+  TestTempDirs;
 
 const
   EVAL_MARKER = 'EVAL_BODY';
@@ -200,6 +201,12 @@ begin
   if FOutRead <> 0 then CloseHandle(FOutRead);
   if FProc.hProcess <> 0 then begin
     TerminateProcess(FProc.hProcess, 0);
+    // TerminateProcess only ASKS. Until the process is actually gone its image
+    // section stays mapped, and the tests that run an isolated COPY of the MCP
+    // exe from a scratch directory then cannot delete that directory -- which is
+    // how ~90 copies of a 5.6 MB exe accumulated in TEMP. Waiting here is the
+    // fix; the retry in TestTempDirs is only the backstop.
+    WaitForSingleObject(FProc.hProcess, 5000);
     CloseHandle(FProc.hThread);
     CloseHandle(FProc.hProcess);
   end;
@@ -1965,11 +1972,11 @@ end;
 // which finds nothing on an ordinary machine with no Zydis.dll on PATH.
 procedure TMcpE2ETests.Disassemble_ReportsUnavailable_WhenZydisDllNotFound;
 begin
-  // Pid-scoped: the directory holds a private copy of the MCP exe, and a second
-  // concurrent worker copying over it would race this one's process launch.
-  var ScratchDir := TPath.Combine(TPath.GetTempPath,
-    Format('mcp_no_zydis_test_%d', [GetCurrentProcessId]));
-  TDirectory.CreateDirectory(ScratchDir);
+  // A private copy of the MCP exe, under the suite's single scratch root and
+  // unique per worker: a second concurrent worker copying over it would race
+  // this one's process launch (see TestTempDirs).
+  PurgeLeftoverTempDirs('mcp_no_zydis_test_');
+  var ScratchDir := MakeTestScratchDir('mcp_no_zydis_test_');
   var IsolatedExe := TPath.Combine(ScratchDir, 'DelphiDebuggerMcp.exe');
   TFile.Copy(McpExe, IsolatedExe, True);
   try
@@ -2010,7 +2017,10 @@ begin
       C.Free;
     end;
   finally
-    TDirectory.Delete(ScratchDir, True);
+    // The MCP process launched FROM this copy has just gone; its image section
+    // outlives it by a moment, so an immediate delete loses the race and leaves
+    // the directory behind for good.
+    DeleteTempDirWithRetry(ScratchDir);
   end;
 end;
 
@@ -2899,10 +2909,9 @@ end;
 // the only path left, which finds nothing on an ordinary machine.
 procedure TMcpE2ETests.StepInto_Instruction_RefusedWhenDisassemblerUnavailable;
 begin
-  // Pid-scoped: see Disassemble_ReportsUnavailable_WhenZydisDllNotFound.
-  var ScratchDir := TPath.Combine(TPath.GetTempPath,
-    Format('mcp_no_zydis_step_test_%d', [GetCurrentProcessId]));
-  TDirectory.CreateDirectory(ScratchDir);
+  // See Disassemble_ReportsUnavailable_WhenZydisDllNotFound.
+  PurgeLeftoverTempDirs('mcp_no_zydis_step_test_');
+  var ScratchDir := MakeTestScratchDir('mcp_no_zydis_step_test_');
   var IsolatedExe := TPath.Combine(ScratchDir, 'DelphiDebuggerMcp.exe');
   TFile.Copy(McpExe, IsolatedExe, True);
   try
@@ -2951,7 +2960,7 @@ begin
       C.Free;
     end;
   finally
-    TDirectory.Delete(ScratchDir, True);
+    DeleteTempDirWithRetry(ScratchDir);
   end;
 end;
 

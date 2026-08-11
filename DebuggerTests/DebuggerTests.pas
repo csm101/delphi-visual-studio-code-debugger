@@ -977,7 +977,7 @@ type
 implementation
 
 uses
-  System.SysUtils, System.Classes, System.IOUtils, Winapi.Windows;
+  System.SysUtils, System.Classes, System.IOUtils, Winapi.Windows, TestTempDirs;
 
 // Defined further down (type-sampler section) but used earlier by the
 // BPL class-expand test -- forward-declare so call order is irrelevant.
@@ -7770,6 +7770,11 @@ begin
   finally V.Free; end;
 end;
 
+const
+  // Prefix of the throwaway target copies Test_StaleRsm_IgnoredFallsBackToTd32
+  // makes. Named once so the creator and the sweeper cannot disagree.
+  STALE_RSM_TEMP_PREFIX = 'dbg_stale_rsm_';
+
 procedure TDebuggerTests.Test_StaleRsm_IgnoredFallsBackToTd32;
 // Regression for the original stale-.rsm concern: a .rsm OLDER than the exe must
 // be IGNORED (not loaded) so its outdated symbols cannot silently mis-type
@@ -7784,11 +7789,10 @@ var
   Stopped, V: TJSONObject;
 begin
   SkipIfBpl('main-exe .rsm staleness is a monolithic concern; a BPL is described by its own .dcp');
-  // Pid AND tick scoped: the tick alone can collide between two RunTests workers
-  // that reach this test in the same millisecond.
-  TmpDir := TPath.Combine(TPath.GetTempPath,
-    Format('dbg_stale_rsm_%d_%d', [GetCurrentProcessId, GetTickCount]));
-  TDirectory.CreateDirectory(TmpDir);
+  // Anything an earlier run could not delete, then a fresh directory under the
+  // suite's single scratch root (see TestTempDirs).
+  PurgeLeftoverTempDirs(STALE_RSM_TEMP_PREFIX);
+  TmpDir := MakeTestScratchDir(STALE_RSM_TEMP_PREFIX);
   try
     TmpExe := TPath.Combine(TmpDir, 'TestTarget.exe');
     TmpMap := TPath.Combine(TmpDir, 'TestTarget.map');
@@ -7830,7 +7834,14 @@ begin
       V.Free;
     end;
   finally
-    TDirectory.Delete(TmpDir, True);
+    // The debuggee is RUNNING from TmpExe and the adapter has it mapped, so the
+    // directory cannot go until both are gone: the old unconditional delete
+    // removed what it could, failed on the exe, and left the directory behind
+    // every single run. End the session first, then retry briefly -- Windows
+    // releases the image section shortly after the process exits, not at the
+    // moment it does.
+    EndSession;
+    DeleteTempDirWithRetry(TmpDir);
   end;
 end;
 

@@ -21,38 +21,19 @@ call "%~dp0build_package.bat"
 if errorlevel 1 ( echo FAILED: TestPackage & exit /b 1 )
 
 echo.
-echo === Build TestTarget ===
-pushd TestTarget
-if not exist Win64\Debug md Win64\Debug
-dcc64 TestTarget.dpr 2>&1
-if errorlevel 1 ( popd & echo FAILED: TestTarget & exit /b 1 )
-rem No-debug DLL + EXE (built WITHOUT -V/-VR/-VN, debug switches off) so the
-rem adapter sees modules with no symbols in any format -- exercises the
-rem "no debug info" diagnostic and unverified-breakpoint handling.
-dcc64 -$D- -$L- -$Y- -E.\Win64\Debug -NU.\Win64\Debug NoDebugLib.dpr 2>&1
-if errorlevel 1 ( popd & echo FAILED: NoDebugLib & exit /b 1 )
-dcc64 -$D- -$L- -$Y- -E.\Win64\Debug -NU.\Win64\Debug NoDebugExe.dpr 2>&1
-if errorlevel 1 ( popd & echo FAILED: NoDebugExe & exit /b 1 )
-rem External-TDS target: -VT emits debug info to a standalone .tds (no embedded
-rem .debug section) so TD32ReaderTests can exercise LoadFromTdsFile.
-dcc64 -$O- -VT -VN -E.\Win64\Debug -NU.\Win64\Debug TdsSample.dpr 2>&1
-if errorlevel 1 ( popd & echo FAILED: TdsSample & exit /b 1 )
-rem 32-bit build of the SAME sources for the Win32 target-support tests. The
-rem .cfg hardcodes -E/-NU to Win64\Debug and dcc lets the command line win, so
-rem these overrides redirect the output without forking the .cfg.
-if not exist Win32\Debug md Win32\Debug
-dcc32 -E.\Win32\Debug -NU.\Win32\Debug TestTarget.dpr 2>&1
-if errorlevel 1 ( popd & echo FAILED: TestTarget ^(Win32^) & exit /b 1 )
-popd
-
-echo.
-echo === Build ExcNestFixture (exception-step debuggee, both bitnesses) ===
-rem Lives in DevTools\Fixtures because ExcHandlerProbe was written against it
-rem first; ExceptionStepTests reuses that ONE fixture rather than adding
-rem exception scenarios to TestTarget, which would shift RSM import indices and
-rem marker ordering (TRAPS.md).
-call "%~dp0..\DevTools\build_exc_fixture.bat"
-if errorlevel 1 ( echo FAILED: ExcNestFixture & exit /b 1 )
+echo === Build TestTarget (every debuggee fixture, both bitnesses) ===
+rem Delegate to build_target.bat rather than repeating the dcc lines here. This
+rem block WAS a copy, and it went stale exactly the way the RunTests copy did:
+rem it built TestTarget, the two no-debug modules and TdsSample, and silently
+rem skipped MapOnlyGlobals, NestedEnumSample, NoSourceStop and
+rem InstructionStepSample. A fixture that is never rebuilt fails as "Timeout
+rem waiting for stopped event" -- the breakpoint line no longer matches the
+rem compiled binary -- which reads as a defect in the debugger rather than a
+rem stale exe (TRAPS.md, the stale-fixture trap).
+rem build_target.bat also builds the ExcNestFixture debuggee (DevTools\Fixtures),
+rem so it is not invoked separately here.
+call "%~dp0build_target.bat"
+if errorlevel 1 ( echo FAILED: TestTarget & exit /b 1 )
 
 echo.
 echo === Generate TestTarget.jdbg (JCL sidecar; skipped if JCL absent) ===

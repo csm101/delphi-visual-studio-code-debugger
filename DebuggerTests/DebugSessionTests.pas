@@ -507,6 +507,11 @@ type
     // firing again with NO second SetAddressBreakpoint call.
     [Test] procedure AddrBp_Bpl_UnloadReload_Rebinds;
     [Test] procedure EvaluateForFrame_ClassIsExpandable_ScalarIsLeaf;
+    // Naming frame 0 must answer exactly like naming no frame at all. A client
+    // that HAS a selected frame sends its index -- VS Code's watch always does
+    // -- and a main-block inline var then reported "<name: not found>" while
+    // the same expression resolved with no frameId, in the same stop.
+    [Test] procedure EvaluateForFrame_ExplicitFrameZero_AnswersLikeTheDefaultFrame;
     // Step-5 write path (setVariable delegated onto the session core).
     [Test] procedure SetLocalVariable_Integer_ReadsBackChanged;
     [Test] procedure SetLocalVariable_EnumByName_ReadsBackChanged;
@@ -558,7 +563,7 @@ implementation
 uses
   Winapi.Windows, System.SysUtils, System.Classes, System.IOUtils,
   DebugSession, DebugSessionTypes, DebugInfoTypes, DebugTarget, LaunchConfig,
-  ModuleSymbolLoader;
+  ModuleSymbolLoader, TestTempDirs;
 
 const
   EVAL_MARKER = 'EVAL_BODY';
@@ -3477,6 +3482,46 @@ begin
   end;
 end;
 
+// Naming frame 0 and naming no frame must give the SAME answer at an ordinary
+// stop: they describe the same frame. They did not. Selecting frame 0 of the
+// stopped thread CLEARED the active frame -- on the reasoning that the stopped
+// RIP already is that frame -- while the no-frame path SET it from the cached
+// frame record, which carries the function's NAME and entry address. Main-block
+// inline variables are keyed by procedure name, so with the name absent they
+// resolved through one path and reported `<name: not found>` through the other.
+//
+// Measured in a real session on Debugme.dpr: `evaluate localdata` answered
+// 46245.498774 with no frameId and `<localdata: not found>` with frameId 0, ten
+// milliseconds apart. VS Code's watch always sends the selected frame, so the
+// watch said "not found" about a variable the Variables view was displaying.
+procedure TDebugSessionTests.EvaluateForFrame_ExplicitFrameZero_AnswersLikeTheDefaultFrame;
+begin
+  var Line := MarkerLine('TestTarget.dpr', 'MAIN_GCOUNTER');
+  Assert.IsTrue(Line > 0, 'MAIN_GCOUNTER marker not found');
+  var Session := OpenSessionAtMarker(TargetExe, TargetMap, TargetRsm, TargetDir,
+    'TestTarget.dpr', Line);
+  try
+    // A main-block inline var: the case that exposed it, because the RSM keys
+    // these by the program's procedure name and nothing else can supply it.
+    var Default_ := Session.EvaluateForFrame('TheWidget', DEFAULT_FRAME_INDEX);
+    Assert.IsTrue(Default_.Success,
+      'precondition: TheWidget must resolve with no frame named: ' + Default_.Value);
+
+    var Frame0 := Session.EvaluateForFrame('TheWidget', 0);
+    Assert.IsTrue(Frame0.Success,
+      'naming frame 0 must resolve what naming no frame resolves; got: ' + Frame0.Value);
+    Assert.AreEqual(Default_.Value, Frame0.Value,
+      'frame 0 and the default frame described the same frame differently');
+
+    // And the address that backs it, which is what a memory view opens on.
+    Assert.AreEqual(Default_.Address, Frame0.Address,
+      'the two paths must agree on where the variable lives');
+  finally
+    Session.Terminate;
+    Session.Free;
+  end;
+end;
+
 // A plain Integer local written through the session: the refreshed NewValue
 // reflects the write, and a follow-up Evaluate confirms it stuck in debuggee
 // memory. EDGE2_BODY exposes `SetLocal: Integer` for exactly this purpose.
@@ -3699,8 +3744,10 @@ procedure TDebugSessionTests.Tds_StaleTds_Ignored;
 begin
   if not TFile.Exists(TdsSampleExe) then
     Assert.Fail('TdsSample.exe not found -- run build_target.bat first');
-  var Dir := TPath.Combine(TPath.GetTempPath, 'tdsstale_' + IntToStr(GetCurrentProcessId));
-  TDirectory.CreateDirectory(Dir);
+  // Sweep what earlier runs could not delete, then work under the suite's single
+  // scratch root (see TestTempDirs).
+  PurgeLeftoverTempDirs('tdsstale_');
+  var Dir := MakeTestScratchDir('tdsstale_');
   var Exe := TPath.Combine(Dir, 'TdsSample.exe');
   var Tds := TPath.Combine(Dir, 'TdsSample.tds');
   try
@@ -3731,7 +3778,9 @@ begin
       Session.Free;
     end;
   finally
-    TDirectory.Delete(Dir, True);
+    // The session above has been terminated, but the image section it mapped
+    // from the copied exe outlives the process object by a moment.
+    DeleteTempDirWithRetry(Dir);
   end;
 end;
 
