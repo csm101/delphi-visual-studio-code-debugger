@@ -265,6 +265,32 @@ absurdly.
 - **The live-attach test is gated by `HaveDebugPrivilege` and silently SKIPS when
   not elevated.** A green run does not prove attach was exercised.
 
+## Cleanup that silently never happens
+
+- **A test that LAUNCHES a copied exe cannot delete its directory in the same
+  breath.** Windows releases the image section shortly AFTER the process object
+  goes, so the delete removes the small files, fails on the exe, and leaves the
+  directory — every run, silently, because a cleanup failure is not a test
+  failure. Measured: 438 directories / 1.28 GB in a TEMP that is a RAMDISK. Use
+  `TestTempDirs`: one scratch root, `MakeTestScratchDir`, end the session first,
+  `DeleteTempDirWithRetry`, and `PurgeLeftoverTempDirs` on the way in.
+- **`TerminateProcess` only ASKS.** Closing the handle right after it leaves the
+  process (and its mapped exe) alive for a while. Wait on the handle when
+  anything downstream depends on the process being gone — deleting its exe does.
+- **A per-PROCESS quota on a file opened for APPEND is not a cap.** The adapter
+  log had a 256 MB "cap" counted per adapter run and reached 1.5 GB: every
+  session restarted the count on top of what was already there. Measure the
+  FILE. (`DapProtocol`: cap + one rotation, `DAP_LOG_MAX_MB`.)
+- **A new adapter command-line switch must be registered in
+  `ProcessListJson.UnrecognizedSwitch` too.** The `.dpr` rejects an unknown
+  switch before the DAP loop starts, deliberately — so a switch the DAP layer
+  understands but that guard does not makes the adapter exit at startup, which
+  the client reports as "timeout waiting for response to seq=1".
+- **Never keep a second copy of a build list.** `build_and_run.bat` had its own
+  inline TestTarget block; it went stale and stopped building four fixtures, and
+  a stale fixture fails as "Timeout waiting for stopped event" — which reads as a
+  debugger defect. It calls `build_target.bat` now.
+
 ## Symbol providers and concurrency
 
 - **Any provider the adapter queries is hit from two threads and runs under

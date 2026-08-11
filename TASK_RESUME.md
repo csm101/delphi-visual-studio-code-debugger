@@ -23,81 +23,72 @@ longer true, delete it.
 
 ---
 
-## Current task (2026-08-10)
+## Current task (2026-08-11)
 
-**Pre-release verification pass, driven by the user in VS Code.** Each defect they
-report is fixed here, with a test that is RED without the fix, before moving on.
+**Post-0.4.0 verification pass, driven by the user in VS Code.** They exercise the
+debugger, report what is wrong, and each defect is fixed here with a test that is
+RED without the fix before moving on.
 
-Suite green at the cursor: **1204 found / 1200 passed / 0 failed / 0 errored /
-4 ignored**, 65 s at 8 workers. Last commit `8af8c82`. Nothing pushed yet
-(~37 local commits on `public-main`).
+Suite green at the cursor: **1229 found / 1225 passed / 0 failed / 0 errored /
+4 ignored**, 69 s at 8 workers. 0.4.0 is published; everything below is
+UNCOMMITTED work on top of `1a78954`.
 
-### Landed in this pass
+### Uncommitted, all green
 
-- `e4e2b35` — `setVariable` on a register answered with an EMPTY body, so VS Code
-  blanked the row it was showing (name left standing, no value). The write itself
-  had always worked. Response now re-reads the register and formats it through
-  `DescribeRegister`, shared with the `variables` listing.
-- `8af8c82` — a 32-bit target now reports EIP/ESP/EBP/EAX..EDI/EFlags at size 4
-  and no R8..R15, instead of the 64-bit shape of `TRegisterSnapshot`. Both
-  spellings stay accepted on either bitness (`SameRegisterName`, `DebugTarget.pas`);
-  `TDebugSession.TryGetRegister` is the shared lookup both frontends answer writes
-  with.
-- `f069b1b` — `Win64DebuggerProj` renamed to `DelphiDebuggerProj` (`.groupproj` +
-  `.code-workspace`); the diagnostic launch configurations removed from
-  `.vscode/launch.json`, where they sat ABOVE the two the Delphi IDE plugin writes
-  into the workspace file and therefore decided what ran by default.
-- `35c4f36` — watchpoints on a COMPUTED address: `Arr[High(Arr)]`, `@Rec.Buf[0]`,
-  and VS Code's "Add Data Breakpoint at Address" (`supportsDataBreakpointBytes`).
-  An unnamed width is now chosen to fit the address instead of defaulting to a
-  pointer and refusing. Three `ExprEval` defects fixed on the way (`@` dropped its
-  suffix chain; a static array field was not "indexable"; `High`/`Low`/`Length`
-  did not know static arrays).
+The memory-inspection work, which is most of this pass, is described where it
+belongs: `PROJECT_STATE.md` -> "Memory inspection" and
+`DAP_DEBUGGER_ARCHITECTURE.md` -> "Memory views". In one line: the extension has
+its own memory view, the adapter tells it where a value lives and how big it is,
+and the editor's built-in pane is withdrawn.
 
-### Still to verify (the user does this in VS Code; nothing here is blocked on code)
+Also landed, each with its test:
 
-1. **Disassembly View** — whether "Open Disassembly View" appears in the Call Stack
-   context menu or only in the command palette. One sentence of the no-source
-   placeholder text is conditioned on this answer. Then: `F10`/`F11` stepping one
-   INSTRUCTION inside the view, and a gutter breakpoint in it.
-2. **Memory inspector** — "View Binary Data" on a variable; a byte write.
-3. **Exception-kind gate, case B** — launch config "Delphi raise: deep nested
-   (TestTarget)": frame 0 must be `RnInner` in `TestTargetCore.pas`, `RnInnerVal`
-   = 277. Case A (ntdll fault) already confirmed.
-4. **Step at an exception** (`5b932c3`) — `F10` at an exception stop lands on the
-   `except`/`finally` that receives it; on x86 `try/finally` it must REFUSE with a
-   visible reason (the refusal is the correct behaviour, not a bug).
-5. **Data breakpoints** — "Break on Value Change" on a real variable, both
-   bitnesses; and **Breakpoints panel -> "Add Data Breakpoint at Address"**, which
-   only appeared with `35c4f36` and has never been driven by hand.
-6. **Hydra2** — breakpoint in a BPL loaded after startup, locals, evaluate. The only
-   core use case the suite does not reproduce.
+- `SelectFrame(0)` no longer clears the active frame (`frameId: 0` answered
+  `<name: not found>` for what no-frameId resolved). See
+  `DAP_DEBUGGER_ARCHITECTURE.md` -> "Frames versus the active frame".
+- The diagnostic log is capped per FILE with one rotation (`DAP_LOG_MAX_MB`,
+  default 64 MB) — `DapLogTests.pas`.
+- Test scratch directories live under one root and are actually removed —
+  `TestTempDirs.pas`; the reasons are in `TRAPS.md` -> "Cleanup that silently
+  never happens".
+- `build_and_run.bat` calls `build_target.bat` instead of keeping a stale copy of
+  the fixture build.
+- The no-source placeholder names "Open Disassembly View" and F10/F11 instruction
+  stepping, both confirmed by hand.
 
-### Then, to release
+### Still to verify (the user does this in VS Code; nothing is blocked on code)
 
-- Rewrite the release notes: they still describe 0.3.0, from before disassembly,
-  assembly-level debugging, data breakpoints, the exception-stop work and the
-  suite rewrite.
-- Version: 0.4.0 recommended.
-- Push.
+1. **Memory view** — the payload behaviour on a string / dynamic array in both
+   panels, a byte WRITE through the `edit` toggle, and whether the changed-byte
+   highlight now survives (it was being wiped by the pane's own re-measure).
+2. **Step at an exception** (`5b932c3`) — `F10` at an exception stop lands on the
+   `except`/`finally` that receives it; on x86 `try/finally` it must REFUSE with
+   a visible reason (the refusal is the correct behaviour, not a bug).
+3. **Data breakpoints** — "Break on Value Change" on a real variable, both
+   bitnesses; and **Breakpoints panel -> "Add Data Breakpoint at Address"**,
+   which has never been driven by hand.
+4. **Hydra2** — breakpoint in a BPL loaded after startup, locals, evaluate. The
+   only core use case the suite does not reproduce.
 
-### Traps that already cost time in this pass
+### Then
 
-- The `Edit` tool can write a whole Delphi file back as LF. Check and normalize to
-  CRLF before committing (project rule; `git status` will not always show it as a
-  content change).
-- Asserting a 32-bit register rendering by a leading-zeros prefix is wrong: `EAX`
-  is legitimately small and `0x00000000` contains `0x0000000`. Assert the rendered
-  LENGTH (10 for 32-bit, longer for the 64-bit form with its decimal suffix).
+- Commit this pass (it is several independent changes; separate commits).
+- Two extension folders are registered (`0.2.3` and `0.3.0`) while the repository
+  stages `0.4.0`: run `install\Install.exe` once to re-register and drop the
+  duplicate.
+
+### Traps that already cost time in THIS pass
+
+- The `Edit` tool can write a whole Delphi file back as LF, and a backtick in a
+  comment inside a JS template literal ends the literal. Check both before
+  building; `git status` does not always show the line-ending change.
 - Every `DebuggerCore` consumer needs rebuilding: adapter (`build_dap.bat`), MCP
   (`build_mcp.bat`), runner (`build_runner.bat`). A stale MCP binary silently
   passes the DAP tests.
-- After touching ANY test-target source, run `build_and_run.bat`, not
-  `build_target.bat` + `run_tests_parallel.bat`. `build_target.bat` does not build
-  the package/host fixtures, and a stale one fails as
-  "Timeout waiting for stopped event" across a whole test class — which reads
-  exactly like a regression in the code under test. Editing even a COMMENT in a
-  target source shifts the `{BP:MARKER}` lines away from the compiled binary, so
-  it counts as touching it.
-- Killing a suite mid-run leaves the adapter and `TestHost` alive holding the
-  adapter exe; the next build fails with `F2039`. Kill them, do not investigate.
+- After touching ANY test-target source, run `build_and_run.bat`. Editing even a
+  COMMENT shifts the `{BP:MARKER}` lines away from the compiled binary.
+- An extension change needs `install-dev.bat` AND a window reload; the adapter
+  alone needs neither. Several "still broken" reports were an unreloaded window.
+- Killing a suite mid-run leaves the adapter, `TestHost` and the MCP servers
+  holding their exes; the next build fails with `F2039`. Kill them, do not
+  investigate.

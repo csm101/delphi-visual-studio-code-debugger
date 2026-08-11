@@ -211,12 +211,14 @@ begin
   // so explicitly rather than leave a blank column.
   Assert.IsTrue(Content.Contains('(no symbol)'),
     'an instruction with no known symbol must say so, not render blank; got: ' + Content);
-  // Constraint: never claim the Call Stack context menu offers "Open
-  // Disassembly View" -- that was never confirmed to exist.
-  Assert.IsFalse(Content.Contains('Open Disassembly View'),
-    'must not instruct the reader to click a menu item nobody confirmed exists; got: ' + Content);
-  Assert.IsTrue(Content.Contains('where it offers one'),
-    'the Disassembly View reference must be phrased conditionally; got: ' + Content);
+  // Confirmed by hand in VS Code (2026-08-10): the Call Stack frame DOES offer
+  // "Open Disassembly View", and F10/F11 step one instruction inside it. The
+  // placeholder may therefore name the action -- but only for VS Code, and the
+  // conditional phrasing stays for clients that offer no such view.
+  Assert.IsTrue(Content.Contains('Open Disassembly View'),
+    'the placeholder must name the confirmed VS Code action; got: ' + Content);
+  Assert.IsTrue(Content.Contains('Where the editor offers one'),
+    'the Disassembly View reference must stay conditional for non-VS-Code clients; got: ' + Content);
 end;
 
 procedure TPlaceholderDisassemblyTests.Win64_WorkerParkedInNtdll_HeaderStillNamesAddressAndStoppedState;
