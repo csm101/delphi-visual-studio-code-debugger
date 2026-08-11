@@ -39,6 +39,15 @@ uses
 
 const
   ProcessListSwitch = '--list-processes';
+  // Withdraws `supportsReadMemoryRequest` / `supportsWriteMemoryRequest` from
+  // the `initialize` response, which is what removes the EDITOR's built-in
+  // memory pane; the requests themselves keep being served. Passed by the VS
+  // Code extension, which ships its own memory view. A command-line switch
+  // because `initialize` is answered before any launch configuration exists.
+  // Declared here, beside the other one, because this is the unit that decides
+  // which switches this program understands -- a switch known to the DAP layer
+  // but not to that check is rejected as unknown before the DAP layer ever runs.
+  NoStockMemoryViewSwitch = '--no-stock-memory-view';
 
 // True when these arguments ask for the listing. NameFilter is the optional
 // value that follows the switch; '' means every process.
@@ -103,7 +112,8 @@ begin
   for var Index := 0 to High(Args) do begin
     if not Args[Index].StartsWith('-') then
       Continue;
-    if SameText(Args[Index], ProcessListSwitch) then
+    if SameText(Args[Index], ProcessListSwitch) or
+       SameText(Args[Index], NoStockMemoryViewSwitch) then
       Continue;
     // A negative number is a value, not a switch; the only operand this program
     // takes is the listing's name filter, and that never starts with '-'.

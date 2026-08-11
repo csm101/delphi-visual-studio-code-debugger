@@ -28,11 +28,17 @@ type
   TMemoryDapTests = class
   private
     FClient: TDapClient;
-    procedure OpenSampleAt(const Bitness, Marker: string);
+    procedure OpenSampleAt(const Bitness, Marker: string;
+                ClientSupportsMemoryEvent: Boolean = True);
   public
     [TearDown] procedure TearDown;
 
     [Test] procedure Capability_SupportsReadWriteMemoryRequest_IsAdvertised;
+    // The switch the VS Code extension passes because it ships its own memory
+    // view: it withdraws the two CAPABILITIES (which is what removes the
+    // editor's built-in pane) without disabling the REQUESTS, which the
+    // extension reaches through customRequest.
+    [Test] procedure NoStockMemoryView_WithdrawsCapabilities_ButServesTheRequests;
 
     [Test] procedure X64_ReadMemory_LocalVariable_MatchesDisplayedValue;
     [Test] procedure Win32_ReadMemory_LocalVariable_MatchesDisplayedValue;
@@ -40,6 +46,33 @@ type
     [Test] procedure Win32_WriteMemory_LocalVariable_ChangesVisibleValue;
 
     [Test] procedure Variables_LocalCarriesMemoryReference_RegistersScopeDoesNot;
+
+    // "View Binary Data" on anything with a derivable address: a reference-typed
+    // variable must point at its PAYLOAD (the characters, the elements), and a
+    // watch row must carry a memoryReference at all -- until this increment only
+    // the Variables view had one, so a string could be dumped from Locals and
+    // not from Watch, and what it dumped was the pointer.
+    [Test] procedure Variables_StringLocal_MemoryReferencePointsAtCharacters;
+    [Test] procedure Variables_DynArrayLocal_MemoryReferencePointsAtElements;
+    [Test] procedure Evaluate_StringWatch_CarriesSameMemoryReferenceAsLocals;
+    [Test] procedure Evaluate_Rvalue_CarriesNoMemoryReference;
+
+    // An open hex pane goes stale silently: nothing in DAP tells a client that
+    // target MEMORY changed except the `memory` event, so without these the view
+    // keeps showing the bytes it read when it was opened -- through a resume, a
+    // stop, and a value the user typed into the Variables panel.
+    [Test] procedure MemoryEvent_AfterResumeAndStop_NamesTheOpenView;
+    [Test] procedure MemoryEvent_AfterSetVariable_NamesTheOpenView;
+    [Test] procedure MemoryEvent_NotSentWhenClientDidNotDeclareIt;
+
+    // `delphiMemoryExtent` (custom): what a memoryReference refers to, so the
+    // extension's memory view can mark where the value starts and ends. No
+    // standard DAP request carries a value's byte extent.
+    [Test] procedure MemoryExtent_IntegerLocal_ReportsItsDeclaredWidth;
+    [Test] procedure MemoryExtent_StringLocal_ReportsTheCharacterBytes;
+    [Test] procedure MemoryExtent_UnknownReference_SaysSoInsteadOfGuessing;
+    [Test] procedure MemoryExtent_ExtendedLocal_UsesTheLanguageWidthNotTheTypeTable;
+    [Test] procedure MemoryExtent_NilClassLocal_ReportsThePointerSlot;
 
     [Test] procedure ReadMemory_UnmappedAddress_ReportsUnreadableBytesNotFailure;
     [Test] procedure ReadMemory_InvalidMemoryReference_Refused;
@@ -103,7 +136,8 @@ end;
 
 { ------------------------------------------------------------------ setup -- }
 
-procedure TMemoryDapTests.OpenSampleAt(const Bitness, Marker: string);
+procedure TMemoryDapTests.OpenSampleAt(const Bitness, Marker: string;
+  ClientSupportsMemoryEvent: Boolean = True);
 begin
   var Line := FindBpLine(SamplePath, Marker);
   Assert.IsTrue(Line > 0, 'marker ' + Marker + ' not found in ' + SAMPLE_SOURCE);
@@ -112,7 +146,7 @@ begin
 
   FClient := TDapClient.Create;
   FClient.Start(AdapterExe);
-  FClient.Initialize.Free;
+  FClient.Initialize(ClientSupportsMemoryEvent).Free;
   Assert.IsTrue(FClient.WaitForInitialized, 'adapter did not send initialized event');
 
   FClient.SetBreakpoints(SamplePath, [Line]).Free;
@@ -300,6 +334,321 @@ begin
     end;
   finally
     RegsResp.Free;
+  end;
+end;
+
+{ ------------------------- memoryReference on reference-typed values ------- }
+
+// Reads Count bytes at MemRef and returns them, asserting the read was whole.
+function ReadBytesAt(Client: TDapClient; const MemRef: string;
+  Count: Integer; const Whose: string): TBytes;
+begin
+  Assert.IsTrue(MemRef <> '', Whose + ': no memoryReference');
+  var Resp := Client.ReadMemory(MemRef, Count);
+  try
+    Assert.AreEqual(0, Resp.GetValue<Integer>('unreadableBytes', 0),
+      Whose + ': the payload address was not fully readable');
+    Result := TNetEncoding.Base64String.DecodeStringToBytes(
+                Resp.GetValue<string>('data', ''));
+  finally
+    Resp.Free;
+  end;
+  Assert.AreEqual(Count, Integer(Length(Result)), Whose + ': short read');
+end;
+
+function MemRefOfLocal(Client: TDapClient; const Name: string): string;
+begin
+  var V := Client.FindVar(Client.GetLocalsRef(Client.GetFrameId), Name);
+  Assert.IsTrue(V <> nil, '"' + Name + '" not found in Locals');
+  try
+    Result := V.GetValue<string>('memoryReference', '');
+  finally
+    V.Free;
+  end;
+end;
+
+// A `string` local occupies one POINTER. Dumping the slot shows that pointer;
+// what the user asked for is the text. RED before this increment: the
+// memoryReference was the slot, so these six bytes came back as the low half of
+// an address instead of 'Hex' in UTF-16.
+procedure TMemoryDapTests.Variables_StringLocal_MemoryReferencePointsAtCharacters;
+begin
+  OpenSampleAt('Win64', 'INSTR_MEMREF');
+  var Bytes := ReadBytesAt(FClient, MemRefOfLocal(FClient, 'Text'), 6, 'string local "Text"');
+  Assert.AreEqual('H', Char(Bytes[0]), 'first character');
+  Assert.AreEqual(#0,  Char(Bytes[1]), 'UTF-16: the high byte of an ASCII character is 0');
+  Assert.AreEqual('e', Char(Bytes[2]), 'second character');
+  Assert.AreEqual('x', Char(Bytes[4]), 'third character');
+end;
+
+// Same rule for a dynamic array: the slot is a pointer to the ELEMENTS, and the
+// elements are what a memory view exists to show.
+procedure TMemoryDapTests.Variables_DynArrayLocal_MemoryReferencePointsAtElements;
+begin
+  OpenSampleAt('Win64', 'INSTR_MEMREF');
+  var Bytes := ReadBytesAt(FClient, MemRefOfLocal(FClient, 'Buf'), 4, 'TBytes local "Buf"');
+  Assert.AreEqual($11, Integer(Bytes[0]), 'element 0');
+  Assert.AreEqual($22, Integer(Bytes[1]), 'element 1');
+  Assert.AreEqual($33, Integer(Bytes[2]), 'element 2');
+  Assert.AreEqual($44, Integer(Bytes[3]), 'element 3');
+end;
+
+// The watch panel is where a debugger user actually looks at a value they went
+// hunting for, and until this increment an `evaluate` response carried no
+// memoryReference at all -- so VS Code offered no memory view there. It must
+// resolve to the SAME address the Locals row resolves to: two panes showing one
+// variable must not disagree about where it lives.
+procedure TMemoryDapTests.Evaluate_StringWatch_CarriesSameMemoryReferenceAsLocals;
+begin
+  OpenSampleAt('Win64', 'INSTR_MEMREF');
+  var FromLocals := MemRefOfLocal(FClient, 'Text');
+  Assert.IsTrue(FromLocals <> '', 'Locals row for "Text" carries no memoryReference');
+
+  var Resp := FClient.Evaluate('Text', FClient.GetFrameId, 'watch');
+  try
+    Assert.AreEqual(FromLocals, Resp.GetValue<string>('memoryReference', ''),
+      'the watch row and the Locals row must name the same address');
+  finally
+    Resp.Free;
+  end;
+end;
+
+// An rvalue has no storage anywhere in the debuggee. Offering a memory view on
+// it would open one on whatever number the arithmetic produced -- the omission
+// side of the rule, and the reason the address is not simply "the value".
+procedure TMemoryDapTests.Evaluate_Rvalue_CarriesNoMemoryReference;
+begin
+  OpenSampleAt('Win64', 'INSTR_MEMREF');
+  var Resp := FClient.Evaluate('Length(Text) + 1', FClient.GetFrameId, 'watch');
+  try
+    // The integer rendering carries the hex form too ('4  (0x4)'), which is the
+    // Variables view's own format -- assert it STARTS with the value rather
+    // than pinning the decoration, which is not what this test is about.
+    Assert.IsTrue(Resp.GetValue<string>('result', '').StartsWith('4'),
+      'precondition: the expression itself must evaluate, got: ' +
+      Resp.GetValue<string>('result', ''));
+    Assert.IsTrue(Resp.FindValue('memoryReference') = nil,
+      'a computed value has no address and must carry no memoryReference');
+  finally
+    Resp.Free;
+  end;
+end;
+
+{ ------------------------------- memory events for an open hex pane -------- }
+
+// Opens a view the way a client does -- by reading through the variable's
+// memoryReference -- and returns that reference.
+function OpenMemoryViewOnLocalX(Client: TDapClient): string;
+begin
+  var XVar := FindLocalX(Client);
+  try
+    Result := XVar.GetValue<string>('memoryReference', '');
+  finally
+    XVar.Free;
+  end;
+  Assert.IsTrue(Result <> '', 'local "X" carries no memoryReference');
+  Client.ReadMemory(Result, 4).Free;
+end;
+
+// Resume, stop again: the target ran, so anything an open pane is showing may
+// have changed. RED before this increment -- no `memory` event existed at all,
+// and the pane in VS Code kept its original bytes on screen.
+procedure TMemoryDapTests.MemoryEvent_AfterResumeAndStop_NamesTheOpenView;
+begin
+  OpenSampleAt('Win64', 'INSTR_MULTI');
+  var MemRef := OpenMemoryViewOnLocalX(FClient);
+
+  // Move the breakpoint further down the SAME routine, so X's frame -- and
+  // therefore the address the view is open on -- is still alive at the next stop.
+  var NextLine := FindBpLine(SamplePath, 'INSTR_CALLSITE_NEXT');
+  Assert.IsTrue(NextLine > 0, 'marker INSTR_CALLSITE_NEXT not found');
+  FClient.SetBreakpoints(SamplePath, [NextLine]).Free;
+  FClient.Continue_.Free;
+  FClient.WaitForStopped.Free;
+
+  var Body: TJSONObject;
+  Assert.IsTrue(FClient.TryWaitForEvent('memory', 8000, Body),
+    'no memory event after the resume/stop -- an open view would never refresh');
+  try
+    Assert.AreEqual(MemRef, Body.GetValue<string>('memoryReference', ''),
+      'the event must name the reference the view was opened on');
+    Assert.IsTrue(Body.GetValue<Integer>('count', 0) >= 4,
+      'the event must cover at least the bytes that were read');
+  finally
+    Body.Free;
+  end;
+end;
+
+// A write the DEBUGGER performed: nothing in the debuggee ran, so a client has
+// no other reason to suspect the bytes moved.
+procedure TMemoryDapTests.MemoryEvent_AfterSetVariable_NamesTheOpenView;
+begin
+  OpenSampleAt('Win64', 'INSTR_MULTI');
+  var MemRef := OpenMemoryViewOnLocalX(FClient);
+
+  var LocalsRef := FClient.GetLocalsRef(FClient.GetFrameId);
+  FClient.SetVariable(LocalsRef, 'X', '99').Free;
+
+  var Body: TJSONObject;
+  Assert.IsTrue(FClient.TryWaitForEvent('memory', 8000, Body),
+    'no memory event after setVariable -- the pane keeps showing the old value');
+  try
+    Assert.AreEqual(MemRef, Body.GetValue<string>('memoryReference', ''),
+      'the event must name the reference the view was opened on');
+  finally
+    Body.Free;
+  end;
+end;
+
+// The gate. A client that never declared `supportsMemoryEvent` must not be sent
+// one -- the spec lets it treat an undeclared event as a protocol error, and
+// "we only ever tested it with a client that declares everything" is how an
+// adapter ends up broken against a real one.
+procedure TMemoryDapTests.MemoryEvent_NotSentWhenClientDidNotDeclareIt;
+begin
+  OpenSampleAt('Win64', 'INSTR_MULTI', {ClientSupportsMemoryEvent=}False);
+  OpenMemoryViewOnLocalX(FClient);
+
+  var LocalsRef := FClient.GetLocalsRef(FClient.GetFrameId);
+  FClient.SetVariable(LocalsRef, 'X', '99').Free;
+
+  var Body: TJSONObject;
+  Assert.IsFalse(FClient.TryWaitForEvent('memory', 1500, Body),
+    'a memory event was sent to a client that never declared supportsMemoryEvent');
+  if Body <> nil then
+    Body.Free;
+end;
+
+// The editor's built-in memory pane is driven purely by these two capabilities,
+// so withdrawing them is what makes its inline icon go away. What must NOT go
+// away is the ability to read and write memory: the extension's own view uses
+// the same requests through customRequest, which no capability gates.
+procedure TMemoryDapTests.NoStockMemoryView_WithdrawsCapabilities_ButServesTheRequests;
+begin
+  FClient := TDapClient.Create;
+  FClient.Start(AdapterExe, '--no-stock-memory-view');
+  var InitResp := FClient.Initialize;
+  try
+    Assert.IsFalse(InitResp.GetValue<Boolean>('supportsReadMemoryRequest', False),
+      'the switch must withdraw supportsReadMemoryRequest');
+    Assert.IsFalse(InitResp.GetValue<Boolean>('supportsWriteMemoryRequest', False),
+      'the switch must withdraw supportsWriteMemoryRequest');
+    // Everything else stays: withdrawing the pane must not cost the Disassembly
+    // View or the watchpoint menu entries.
+    Assert.IsTrue(InitResp.GetValue<Boolean>('supportsDisassembleRequest', False),
+      'unrelated capabilities must be untouched');
+  finally
+    InitResp.Free;
+  end;
+
+  var Line := FindBpLine(SamplePath, 'INSTR_MULTI');
+  FClient.SetBreakpoints(SamplePath, [Line]).Free;
+  FClient.SetExceptionBreakpoints([]).Free;
+  FClient.Launch(SampleExe('Win64'), SampleMap('Win64'), SampleRsm('Win64'), TargetDir).Free;
+  FClient.ConfigDone.Free;
+  FClient.WaitForStopped.Free;
+
+  // The row still carries its address, and the request behind the view still
+  // answers -- the capability is about the EDITOR's pane, not about the engine.
+  var MemRef := MemRefOfLocal(FClient, 'X');
+  Assert.IsTrue(MemRef <> '', 'a variable must still carry its memoryReference');
+  var Bytes := ReadBytesAt(FClient, MemRef, 4, 'local "X" with the stock view withdrawn');
+  Assert.AreEqual(7, Integer(Bytes[0]), 'X is 7 at this marker');
+end;
+
+{ ------------------------------------ delphiMemoryExtent (custom request) -- }
+
+function ExtentOf(Client: TDapClient; const MemRef: string): TJSONObject;
+begin
+  var Seq := Client.SendRequest('delphiMemoryExtent',
+               Format('{"memoryReference":"%s"}', [MemRef]));
+  var Resp := Client.WaitRawResponse(Seq);
+  try
+    Assert.IsTrue(Resp.GetValue<Boolean>('success', False),
+      'delphiMemoryExtent failed for ' + MemRef);
+    Result := TJSONObject.ParseJSONValue(
+                (Resp.GetValue('body') as TJSONObject).ToJSON) as TJSONObject;
+  finally
+    Resp.Free;
+  end;
+end;
+
+// A plain Integer: four bytes, from the declared type. This is the size the
+// view draws as the variable's extent, so it must come from the type table
+// rather than from how many bytes anyone happened to read.
+procedure TMemoryDapTests.MemoryExtent_IntegerLocal_ReportsItsDeclaredWidth;
+begin
+  OpenSampleAt('Win64', 'INSTR_MULTI');
+  var Body := ExtentOf(FClient, MemRefOfLocal(FClient, 'X'));
+  try
+    Assert.AreEqual(4, Body.GetValue<Integer>('size', 0),
+      'an Integer local occupies four bytes');
+    Assert.AreEqual('X', Body.GetValue<string>('name', ''), 'the extent names the variable');
+  finally
+    Body.Free;
+  end;
+end;
+
+// A string: the extent is the CHARACTERS, read from the string header
+// (Length * ElemSize), not the pointer slot's width and not the header itself.
+// 'Hex' is three UTF-16 characters, so six bytes.
+procedure TMemoryDapTests.MemoryExtent_StringLocal_ReportsTheCharacterBytes;
+begin
+  OpenSampleAt('Win64', 'INSTR_MEMREF');
+  var Body := ExtentOf(FClient, MemRefOfLocal(FClient, 'Text'));
+  try
+    Assert.AreEqual(6, Body.GetValue<Integer>('size', 0),
+      '''Hex'' is 3 characters of 2 bytes each');
+  finally
+    Body.Free;
+  end;
+end;
+
+// A reference the adapter never handed out. Answering with a size would be an
+// invention; the request says so instead, and the view then highlights nothing.
+procedure TMemoryDapTests.MemoryExtent_UnknownReference_SaysSoInsteadOfGuessing;
+begin
+  OpenSampleAt('Win64', 'INSTR_MULTI');
+  var Body := ExtentOf(FClient, '0xDEADBEEF');
+  try
+    Assert.IsTrue(Body.GetValue<Boolean>('unknownReference', False),
+      'an unknown reference must be reported as unknown, not given a size');
+    Assert.IsTrue(Body.FindValue('size') = nil,
+      'an unknown reference must carry no size at all');
+  finally
+    Body.Free;
+  end;
+end;
+
+// `Extended` is 8 bytes on Win64 (an alias for Double) and 10 on Win32, so the
+// LANGUAGE answers it and the per-unit type table is not asked. Measured
+// motivation: a real session reported an Extended local as 121 bytes, which a
+// memory view would have drawn as 121 bytes of the variable -- most of them
+// belonging to whatever sits next to it on the stack.
+procedure TMemoryDapTests.MemoryExtent_ExtendedLocal_UsesTheLanguageWidthNotTheTypeTable;
+begin
+  OpenSampleAt('Win64', 'INSTR_MEMREF');
+  var Body := ExtentOf(FClient, MemRefOfLocal(FClient, 'Wide'));
+  try
+    Assert.AreEqual(8, Body.GetValue<Integer>('size', 0),
+      'Extended is a Double on Win64');
+  finally
+    Body.Free;
+  end;
+end;
+
+// A nil class reference has no instance to measure, but the variable is still a
+// pointer-wide slot and that slot is exactly what the view is opened on.
+// Reporting "unknown" there left the commonest row in the panel unhighlighted.
+procedure TMemoryDapTests.MemoryExtent_NilClassLocal_ReportsThePointerSlot;
+begin
+  OpenSampleAt('Win64', 'INSTR_MEMREF');
+  var Body := ExtentOf(FClient, MemRefOfLocal(FClient, 'Obj'));
+  try
+    Assert.AreEqual(8, Body.GetValue<Integer>('size', 0),
+      'a nil object reference occupies one 64-bit pointer');
+  finally
+    Body.Free;
   end;
 end;
 

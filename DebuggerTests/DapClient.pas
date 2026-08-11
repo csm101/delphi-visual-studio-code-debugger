@@ -60,11 +60,18 @@ type
     destructor  Destroy; override;
 
     // Lifecycle
-    procedure   Start(const AdapterExe: string);
+    // ExtraArgs goes on the adapter's command line verbatim. The adapter has one
+    // switch (`--no-stock-memory-view`) that only a command line can carry:
+    // `initialize` is answered before any launch configuration exists.
+    procedure   Start(const AdapterExe: string; const ExtraArgs: string = '');
     procedure   Stop;
 
     // DAP requests — all return the response body (or raise EDapError on failure)
-    function    Initialize: TJSONObject;
+    // SupportsMemoryEvent mirrors the client capability of the same name. It is
+    // a parameter rather than a constant because the adapter GATES the `memory`
+    // event on it, and a gate is only proven by a client that does not declare
+    // it (real VS Code does).
+    function    Initialize(SupportsMemoryEvent: Boolean = True): TJSONObject;
     function    Launch(const TargetExe, MapFile, RsmFile, SourceRoot: string;
                   StopAtEntry: Boolean = False;
                   const Args: TArray<string> = nil): TJSONObject; overload;
@@ -229,6 +236,11 @@ type
     function    WaitForInitialized(TimeoutMs: Integer = 8000): Boolean;
     function    WaitForStopped(TimeoutMs: Integer = 15000): TJSONObject;
     function    WaitForTerminated(TimeoutMs: Integer = 8000): Boolean;
+    // Any event, by name. Returns False on timeout instead of raising, so a test
+    // can assert an event did NOT arrive as readily as that it did. Body is the
+    // event's `body` object (caller frees) and nil when it carried none.
+    function    TryWaitForEvent(const EventName: string; TimeoutMs: Integer;
+                  out Body: TJSONObject): Boolean;
 
     // High-level helpers
     function    GetFrameId: Integer;
@@ -301,7 +313,7 @@ begin
   inherited;
 end;
 
-procedure TDapClient.Start(const AdapterExe: string);
+procedure TDapClient.Start(const AdapterExe: string; const ExtraArgs: string);
 var
   SA:  TSecurityAttributes;
   SI:  TStartupInfo;
@@ -333,6 +345,8 @@ begin
   SI.hStdError   := StdoutW;
 
   var CmdLine := '"' + AdapterExe + '"';
+  if ExtraArgs <> '' then
+    CmdLine := CmdLine + ' ' + ExtraArgs;
   Win32Check(CreateProcess(nil, PChar(CmdLine), nil, nil, True,
     CREATE_NO_WINDOW, nil, nil, SI, PI));
 
@@ -575,7 +589,7 @@ end;
 
 { DAP requests }
 
-function TDapClient.Initialize: TJSONObject;
+function TDapClient.Initialize(SupportsMemoryEvent: Boolean): TJSONObject;
 var
   Args: TJSONObject;
   Seq:  Integer;
@@ -598,6 +612,11 @@ begin
   // does the pre-existing `instructionPointerReference`), but a test client
   // that stayed silent here would not mirror what a real client sends.
   Args.AddPair('supportsMemoryReferences', TJSONBool.Create(True));
+  // What lets the adapter tell an open memory view that its bytes changed --
+  // at a stop, or after a write it performed itself. Gated: an adapter must not
+  // send an event to a client that never declared it.
+  if SupportsMemoryEvent then
+    Args.AddPair('supportsMemoryEvent', TJSONBool.Create(True));
   Seq    := SendCmd('initialize', Args);
   Result := WaitResp(Seq);
 end;
@@ -1283,6 +1302,27 @@ begin
     Result := TJSONObject.ParseJSONValue(Body.ToJSON) as TJSONObject
   else
     Result := TJSONObject.Create;
+  Msg.Free;
+end;
+
+function TDapClient.TryWaitForEvent(const EventName: string; TimeoutMs: Integer;
+  out Body: TJSONObject): Boolean;
+var
+  Msg: TJSONObject;
+begin
+  Body := nil;
+  var Wanted := EventName;
+  Result := Dequeue(
+    function(O: TJSONObject): Boolean
+    begin
+      Result := (O.GetValue<string>('type', '') = 'event') and
+                (O.GetValue<string>('event', '') = Wanted);
+    end, TimeoutMs, Msg);
+  if not Result then
+    Exit;
+  var B := Msg.GetValue('body') as TJSONObject;
+  if B <> nil then
+    Body := TJSONObject.ParseJSONValue(B.ToJSON) as TJSONObject;
   Msg.Free;
 end;
 

@@ -1978,6 +1978,17 @@ real defect: **which frames exist** and **which frame the session answers for**.
   `GetLocals`, a frame-less `Evaluate`, and `GetCurrentLocation` resolve
   against when the client has not selected one.
 
+Naming frame 0 and naming no frame must produce the SAME answer at an ordinary
+stop, because they describe the same frame — and for a long time they did not.
+`SelectFrame(0)` CLEARED the active frame, on the reasoning that the stopped RIP
+already is frame 0. True about the code location, false about what the engine
+then knows: the cached frame record also carries the function's NAME and entry
+address, and the no-frame path (`ApplyDefaultFrame`) SETS both. A main-block
+inline variable is keyed by the program procedure's name, so the same expression
+resolved with no `frameId` and answered `<name: not found>` with `frameId: 0`,
+which is what VS Code's watch always sends. `SelectFrame` now selects index 0
+like any other index; only a frame with no frame pointer still clears.
+
 `DefaultFrameIndexFor` computes it, and the rule has exactly two cases:
 
 | stop | default frame |
@@ -2575,6 +2586,52 @@ booleans, sized integers. Strings hand off to
 Var/reference parameters: write through the dereferenced address
 (`V.RawValue`) so the caller's variable is modified rather than the
 parameter slot.
+
+## Memory views
+
+Three questions a memory view asks, and where each is answered.
+
+**Which address holds the value.** `memoryReference` is emitted on a variable
+row (`EmitVar`) and on an `evaluate` result, from `TSessionVariable.Address` —
+except for a REFERENCE-typed value, where `DataAddress` wins. A `string`, a
+dynamic array, a class instance, an interface and a var-parameter pointee all
+occupy one pointer, so dumping the slot shows the pointer and never the
+characters or the elements. `TDebugSession.PayloadAddress` owns that rule; a
+plain typed pointer is deliberately NOT in it, because there the pointer IS the
+value and `P^` is how Pascal asks for the pointee. An rvalue (`A + 1`, a call's
+result) has no address and gets no reference at all.
+
+**How many bytes belong to it.** `TSessionVariable.ValueSize`, from
+`TDebugSession.ValueByteSize`, and answered from EVIDENCE rather than from the
+declared kind — TD32 leaves a plain `string` local's kind at 0, so a
+kind-only rule silently reported "unknown" for the commonest case. In order: a
+dynamic array's already-validated expansion (element size × count), the string
+header (`Length × ElemSize`, same shape on both bitnesses), the object's
+`InstanceSize` from its VMT, then the declared type size. Anything else stays 0,
+which the view renders as "extent unknown" and highlights nothing — an invented
+range would claim a neighbouring variable's bytes.
+
+The extension reads it through the custom request **`delphiMemoryExtent`**
+(`{memoryReference}` → `{address, name, type, size | sizeUnknown |
+unknownReference}`). It is custom because no standard DAP request carries a
+value's byte extent. `FMemoryExtents` records it where the reference is minted,
+which is the only moment the name, the type and the size are all in hand.
+
+**When the bytes on screen went stale.** DAP's `invalidated` event covers stacks
+and variables, not memory, so an open pane keeps showing what it read once. The
+adapter emits the standard **`memory`** event at every stop, after `setVariable`
+(local and field), after `writeMemory` and after Set Next Statement, gated on
+the client's `supportsMemoryEvent`. Which panes are open is inferred from the
+`readMemory` requests themselves (`FMemoryViews`: one entry per reference,
+widest span, capped at 32, cleared at launch) — DAP has no "a pane was opened"
+message, and none for closing one either, so a stale entry costs one re-read.
+
+VS Code's own hex pane is a file abstraction in which the reference IS byte 0:
+it cannot scroll before the value, mark the value's extent, or show what
+changed. Those three are why the extension carries its own view
+(`install/local.delphi-win64-debug/memoryView.js`), which reads through the same
+`readMemory` — with NEGATIVE offsets, which the adapter has always accepted and
+no client ever asked for.
 
 ## Synthetic remote call
 

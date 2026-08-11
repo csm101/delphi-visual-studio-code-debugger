@@ -294,6 +294,27 @@ Symbol / source resolution:
 - DAP emits `invalidated(stacks)` when prefetched symbols register while
   stopped, so a stack drawn with nameless frames refills without user action.
 
+Memory inspection:
+- **A memory view of the extension's own** (`install\local.delphi-win64-debug\
+  memoryView.js`, command `View Memory (Delphi)`, an inline icon on a Variables
+  or Watch row). It exists because the editor's built-in pane is a file
+  abstraction in which the `memoryReference` IS byte 0: it cannot scroll before
+  the value, mark which bytes belong to it, or show what changed. This one reads
+  through the adapter's own `readMemory` with NEGATIVE offsets, sizes its rows to
+  the pane, takes any row width (a 2D array reads as one at its own width),
+  marks the value's extent and its first byte, flashes the bytes that changed
+  since the last stop anywhere in the block, and writes a byte behind an explicit
+  toggle. No hex-editor extension needed. The built-in pane is withdrawn by
+  `--no-stock-memory-view` (the extension passes it; setting
+  `delphi-win64.stockMemoryView` brings it back), which drops the two
+  capabilities WITHOUT disabling the requests.
+- Supporting adapter work, all in `DAP_DEBUGGER_ARCHITECTURE.md` -> "Memory
+  views": `memoryReference` on variables AND on `evaluate` results, pointing at
+  the PAYLOAD for reference types; `TSessionVariable.ValueSize` (evidence-driven,
+  0 when not established); the custom request `delphiMemoryExtent`; and the
+  standard `memory` event, emitted at every stop and after any write the adapter
+  performs, so an open pane refreshes.
+
 Variable inspection (RSM-driven):
 - Local variables for the current procedure.
 - Parent-procedure locals visible from inside nested procedures (walks

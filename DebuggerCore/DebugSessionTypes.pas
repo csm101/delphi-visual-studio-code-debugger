@@ -114,6 +114,22 @@ type
     // every producer of a TSessionVariable follows the same convention
     // established locals already use (LV.Address <> 0 means addressable).
     Address:      UInt64;
+    // Where the value's BYTES live, when that is NOT the variable's own
+    // storage. A `string`, a dynamic array, a class instance and an interface
+    // all occupy one pointer; dumping that pointer's bytes shows the pointer,
+    // never the text or the elements -- which is precisely what someone asking
+    // to see a variable's binary data wants. 0 means "the value is its own
+    // storage" (an Integer, a record, a static array) and the caller uses
+    // Address. A frontend that has to pick ONE address -- DAP's
+    // `memoryReference` -- prefers this one when it is set.
+    DataAddress:  UInt64;
+    // How many bytes the value occupies at whichever of the two addresses above
+    // is its own -- the string's characters, the array's elements, the object's
+    // instance, the record's declared size. 0 means "not established", and it
+    // stays 0 rather than being guessed: a memory view draws this range as the
+    // variable's extent, and a wrong one would claim a neighbouring variable's
+    // bytes belong to this one.
+    ValueSize:    UInt64;
   end;
 
   TSessionScope = record
@@ -142,6 +158,15 @@ type
     // decoded pointer/integer (post VMT double-deref rewrite when applicable).
     IsValid:    Boolean;
     RawValue:   UInt64;
+    // Same pair, and the same meaning, as TSessionVariable's: where the
+    // expression's storage is (0 for an rvalue -- a computed sum, a value a
+    // method call returned) and where its BYTES are when those are not the same
+    // place. A watch on a string or a dynamic array is the case that motivated
+    // carrying them here: without an address a watch row cannot offer "View
+    // Binary Data" at all, and with the WRONG one it dumps a pointer.
+    Address:     UInt64;
+    DataAddress: UInt64;
+    ValueSize:   UInt64;   // as TSessionVariable.ValueSize; 0 = not established
   end;
 
   // TBreakpointKind (bkSource / bkAddress) is DebugTarget's, reused verbatim so

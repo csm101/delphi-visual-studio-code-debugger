@@ -136,11 +136,32 @@ begin
   GSink := GSink + 1;                      // {BP:INSTR_WATCH_NEXT}
 end;
 
+{ ------------------------- reference-typed locals for the memory-view tests - }
+
+// A `string` and a dynamic array are the two shapes whose SLOT holds a pointer
+// and whose bytes live elsewhere, which is what a memory view has to resolve
+// correctly. Both values are chosen so their bytes are unambiguous when read
+// back: 'Hex' is three ASCII characters (six bytes of UTF-16), and the array is
+// four bytes no other buffer in this program would produce.
+procedure InstrStepMemRefScenario;
+begin
+  var Text: string := 'Hex';
+  var Buf: TBytes := [$11, $22, $33, $44];
+  // Two extents the type table cannot be trusted for on its own: `Extended` is
+  // the one float whose width is target-dependent (8 on Win64, 10 on Win32),
+  // and a NIL class reference has no instance to measure -- the variable is
+  // still one pointer of storage, which is what the view is open on.
+  var Wide: Extended := 1.5;
+  var Obj: TObject := nil;
+  GSink := Length(Text) + Length(Buf) + Trunc(Wide) + Ord(Obj <> nil);  // {BP:INSTR_MEMREF}
+end;
+
 begin
   InstrStepCallScenario;
   InstrStepRecursionScenario;
   InstrStepRepScenario;
   InstrStepWatchScenario;
+  InstrStepMemRefScenario;
   // Keeps every global live so no store above is elided (TRAPS.md: "a local
   // nothing ever reads gets its store ELIDED even under -$O-").
   if (GSink = MaxInt) and (GDepthSum = MaxInt) and (GInstrWatched = MaxInt) then

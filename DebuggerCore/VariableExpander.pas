@@ -143,6 +143,11 @@ type
     procedure Reset;
     // Read the child rows of a previously-minted expandable value.
     function  GetChildren(Handle: TVarHandle): TArray<TSessionVariable>;
+    // The expansion behind a handle, for a caller that needs its SHAPE rather
+    // than its children: a dynamic array's element size and count were already
+    // measured (and sanity-checked) when the expansion was minted, so asking how
+    // many BYTES the value occupies is a lookup rather than a second decode.
+    function  TryGetExpansion(Handle: TVarHandle; out Exp: TSessionExpansion): Boolean;
     // Attach an expansion handle to an already-formatted local, if it is a
     // class / Variant-array / dyn-array / record value. The caller fills V's
     // Name/Value/TypeName/EvaluateName first.
@@ -1301,6 +1306,12 @@ begin
   Result := 0;
   if TryMakeVariantArray(VariantAddr, EvalName, Exp) then
     Result := MintHandle(Exp);
+end;
+
+function TVariableExpander.TryGetExpansion(Handle: TVarHandle;
+  out Exp: TSessionExpansion): Boolean;
+begin
+  Result := FByHandle.TryGetValue(Handle, Exp);
 end;
 
 function TVariableExpander.GetChildren(Handle: TVarHandle): TArray<TSessionVariable>;

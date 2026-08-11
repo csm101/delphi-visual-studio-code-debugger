@@ -15,6 +15,9 @@ uses
   MapFileReader, TD32FileReader, RsmFileReader, WinDebuggerBase, DelphiRtti, DebugSourceIndex,
   DelphiValueReaders, SourceResolver, DebugSessionTypes, DebugSession, VariableExpander,
   BreakpointEval, PeSymbolSupport, ModuleSymbolLoader,
+  // For NoStockMemoryViewSwitch: the unit that owns which command-line switches
+  // this program recognises also owns their spelling.
+  ProcessListJson,
   ExprEval, ValueEncoders, Disassembler, ZydisDisassembler;
 
 // Full definition lives in the disassemble section further down (it is the
@@ -170,6 +173,18 @@ begin
 end;
 
 
+// Whether to advertise `supportsReadMemoryRequest` / `supportsWriteMemoryRequest`.
+// A command-line switch rather than a launch-config field, because `initialize`
+// -- where capabilities are answered -- arrives BEFORE any launch configuration
+// the client might carry an option in.
+function StockMemoryViewEnabled: Boolean;
+begin
+  Result := True;
+  for var I := 1 to ParamCount do
+    if SameText(ParamStr(I), NoStockMemoryViewSwitch) then
+      Exit(False);
+end;
+
 function NormalizeModuleName(const Name: string): string;
 begin
   // Extract the basename robustly across separator styles. ExtractFileName only
@@ -232,6 +247,28 @@ type
   end;
 
 type
+  // One memory view the client currently has open, learned from the readMemory
+  // requests it issues -- DAP has no "the user opened a memory pane" request, and
+  // the client never says when it closes one either, so this is the only evidence
+  // there is. Offset/EndOff bound the widest span read through this reference, so
+  // one `memory` event can invalidate everything the pane has shown.
+  TMemoryView = record
+    MemRef: string;
+    Offset: Int64;   // lowest byte offset read through MemRef
+    EndOff: Int64;   // exclusive upper bound of the bytes read
+  end;
+
+  // What a memoryReference the adapter handed out actually refers to. The
+  // client's memory view knows only an address; this is how it learns WHICH
+  // bytes belong to the variable it was opened on, so it can mark the value's
+  // formal extent instead of drawing an undifferentiated dump.
+  TMemoryExtent = record
+    Address:  UInt64;
+    Size:     UInt64;   // 0 = the adapter could not establish it (never guessed)
+    Name:     string;
+    TypeName: string;
+  end;
+
   // Background symbol-loader work item. A VALUE copy of the fields the parse
   TDapServer = class
   private
@@ -269,6 +306,22 @@ type
     // The raw-stack toggle uses it to make the Call Stack redraw immediately; a
     // client without it still gets the toggle, its effect showing at the next stop.
     FClientSupportsInvalidated: Boolean;
+    // True when the client declared `supportsMemoryEvent` in `initialize`. VS Code
+    // does. Without the event a hex pane shows whatever it read when it opened and
+    // never refreshes -- not after a resume/stop, not after a setVariable write --
+    // because nothing else in DAP tells a client that target MEMORY changed
+    // (`invalidated` covers stacks/variables, not memory).
+    FClientSupportsMemoryEvent: Boolean;
+    // Memory views the client has open, one entry per memoryReference. Bounded:
+    // the client is free to open a view on every variable it ever showed, and
+    // nothing says when one closes, so old entries are evicted rather than kept
+    // forever. A stale entry costs one re-read the client throws away.
+    FMemoryViews: TArray<TMemoryView>;
+    // Every memoryReference handed out this session, and what it refers to.
+    // Written where the reference is minted (the variables and evaluate paths),
+    // because that is the only moment the variable's name, type and size are in
+    // hand; read by the `delphiMemoryExtent` request the memory view issues.
+    FMemoryExtents: TDictionary<string, TMemoryExtent>;
     // Where the DEBUGGER's own diagnostics go. True (default) sends them as
     // `delphiLog` custom events for the extension's "Delphi Debug" output
     // channel; False keeps the old behaviour and prints them in the Debug
@@ -501,6 +554,20 @@ type
     // unreadableBytes/allowPartial contract.
     procedure HandleReadMemory(Seq: Integer; Args: TJSONObject);
     procedure HandleWriteMemory(Seq: Integer; Args: TJSONObject);
+    // Remembers a span the client actually read, widening the entry it already
+    // has for that memoryReference (FMemoryViews).
+    procedure TrackMemoryView(const MemRef: string; Offset, Count: Int64);
+    // Records what a reference refers to, at the moment it is handed out.
+    procedure RememberMemoryExtent(const MemRef: string; Address, Size: UInt64;
+                const Name, TypeName: string);
+    // Custom request `delphiMemoryExtent`: answers what a reference refers to,
+    // for the extension's memory view. Deliberately NOT part of the DAP surface
+    // -- no standard request carries a value's byte extent.
+    procedure HandleMemoryExtent(Seq: Integer; Args: TJSONObject);
+    // Tells the client every tracked view may have changed. Called wherever the
+    // debuggee's memory can have moved under an open pane: at each stop, and
+    // after a write this adapter itself performed.
+    procedure EmitMemoryChanged;
     // A slot this backend actually decoded: real bytes, real text, and
     // symbol/source location when a provider knows one.
     function  BuildDapInstruction(const Ins: TDisasmInstruction;
@@ -678,6 +745,9 @@ begin
   FDataBpNonce  := Format('%x%x', [GetCurrentProcessId, GetTickCount64]);
   FRefToHandle := TDictionary<Integer, TVarHandle>.Create;
   FHandleToRef := TDictionary<TVarHandle, Integer>.Create;
+  // Keyed by the reference STRING exactly as it went out on the wire, so the
+  // lookup cannot disagree with what the client sends back.
+  FMemoryExtents := TDictionary<string, TMemoryExtent>.Create;
   FEvalMissCache   := TDictionary<string, string>.Create;
   FSynthSourceRefs    := TDictionary<string, Integer>.Create;
   FSynthSourceTexts   := TDictionary<Integer, string>.Create;
@@ -787,6 +857,7 @@ begin
   FSession.Free;
   FRefToHandle.Free;
   FHandleToRef.Free;
+  FMemoryExtents.Free;
   FEvalMissCache.Free;
   FSynthSourceRefs.Free;
   FSynthSourceTexts.Free;
@@ -1715,6 +1786,10 @@ begin
       Body.AddPair('line', TJSONNumber.Create(EffSourceLine));
     end;
     FIO.SendEvent('stopped', Body);
+    // Everything the target ran since the last stop could have rewritten what an
+    // open hex pane is showing. The client re-reads variables at a stop on its
+    // own; memory it does not, without being told.
+    EmitMemoryChanged;
     // Belt and braces for the case the user actually complained about: a stop
     // where nothing on the stack has real source. Whether the client opens the
     // placeholder document is the client's choice; this is not.
@@ -1865,8 +1940,13 @@ begin
   // Recorded here rather than assumed: the raw-stack toggle needs it to make the
   // Call Stack redraw, and a client without it must get the toggle anyway (its
   // effect simply shows at the next stop).
-  if Args <> nil then
+  if Args <> nil then begin
     FClientSupportsInvalidated := Args.GetValue<Boolean>('supportsInvalidatedEvent', False);
+    // Gate for the `memory` event. A client that never declared it would be sent
+    // an event it does not understand, which the spec leaves it free to treat as
+    // a protocol error.
+    FClientSupportsMemoryEvent := Args.GetValue<Boolean>('supportsMemoryEvent', False);
+  end;
 
   Caps := TJSONObject.Create;
   try
@@ -1918,8 +1998,20 @@ begin
     // what backs VS Code's "View Binary Data" memory inspector. Same engine
     // primitives (IDebugTarget.ReadCodeMemoryAt / WriteMemoryPartial) the MCP
     // `read_memory`/`write_memory` tools already use -- not a second path.
-    Caps.AddPair('supportsReadMemoryRequest',        TJSONBool.Create(True));
-    Caps.AddPair('supportsWriteMemoryRequest',       TJSONBool.Create(True));
+    //
+    // Advertised by DEFAULT, because a client with no Delphi extension (another
+    // editor, a bare DAP client) has no other way to inspect memory at all.
+    // `--no-stock-memory-view` withdraws the two capabilities WITHOUT disabling
+    // the requests: the VS Code extension passes it because it ships its own
+    // memory view, and the editor's built-in pane -- which cannot scroll before
+    // the value, mark its extent, or show what changed -- is then redundant
+    // clutter on every variable row. The requests keep working, and the
+    // extension's view reaches them through `customRequest`, which is not gated
+    // on an advertised capability.
+    if StockMemoryViewEnabled then begin
+      Caps.AddPair('supportsReadMemoryRequest',      TJSONBool.Create(True));
+      Caps.AddPair('supportsWriteMemoryRequest',     TJSONBool.Create(True));
+    end;
     // ASSEMBLY_LEVEL_DEBUGGING.md increment 2: `granularity: "instruction"` on
     // next/stepIn/stepOut, routed to TDebugSession.StepInstruction (increment
     // 1's engine primitive). VS Code sends the field only when the
@@ -2183,6 +2275,9 @@ begin
     end;
   end;
   FLaunched := True;
+  // Addresses from a previous run mean nothing in this one (a fresh process,
+  // rebased modules, a different stack), so no view carries over.
+  SetLength(FMemoryViews, 0);
   FStartupDllCount := 0;
   FStartupMapCount := 0;
   FStartupTick     := GetTickCount64;
@@ -2277,6 +2372,9 @@ begin
   end;
   DapLog('Launch succeeded');
   FLaunched := True;
+  // Addresses from a previous run mean nothing in this one (a fresh process,
+  // rebased modules, a different stack), so no view carries over.
+  SetLength(FMemoryViews, 0);
   FStartupDllCount := 0;
   FStartupMapCount := 0;
   FStartupTick     := GetTickCount64;
@@ -3253,9 +3351,16 @@ begin
         ' instruction.');
 
   Result := Result +
-    Para('An editor''s own Disassembly View, where it offers one, can show' +
-      ' more of this routine than this snippet, with gutter breakpoints and' +
-      ' scrolling.');
+    // Confirmed by hand in VS Code (2026-08-10): "Open Disassembly View" is
+    // offered on the Call Stack frame as well as in the Command Palette, and
+    // F10/F11 inside it step a single instruction. Naming it is therefore
+    // accurate rather than a guess -- but the hedge stays for clients that are
+    // not VS Code or a fork of it.
+    Para('Where the editor offers one -- in VS Code, "Open Disassembly View" on' +
+      ' this frame in the Call Stack, or the same entry in the Command Palette' +
+      ' -- its Disassembly View shows more of this routine than this snippet,' +
+      ' with gutter breakpoints, scrolling, and F10/F11 stepping one' +
+      ' instruction at a time.');
 end;
 
 // Gives a sourceless frame a `source` backed by a sourceReference instead of a
@@ -3735,10 +3840,100 @@ begin
         Body.AddPair('data', TNetEncoding.Base64String.EncodeBytesToString(Copy(Buf, 0, Got)));
       if UInt64(Got) < UInt64(Count) then
         Body.AddPair('unreadableBytes', TJSONNumber.Create(Count - Int64(Got)));
+      // The request itself is how we learn a pane is open on this reference:
+      // there is no DAP message for "the user opened a memory view".
+      TrackMemoryView(MemRef, ByteOffset, Count);
     end;
     FIO.SendResponse(Seq, 'readMemory', True, Body);
   finally
     Body.Free;
+  end;
+end;
+
+procedure TDapServer.TrackMemoryView(const MemRef: string; Offset, Count: Int64);
+const
+  // A hex pane reads its reference in chunks as the user scrolls, so entries are
+  // per REFERENCE, not per chunk -- but a session that inspects many variables
+  // would still grow this without a bound. Oldest out first.
+  MAX_TRACKED_VIEWS = 32;
+begin
+  if (MemRef = '') or (Count <= 0) then
+    Exit;
+  for var I := 0 to High(FMemoryViews) do
+    if SameText(FMemoryViews[I].MemRef, MemRef) then begin
+      if Offset < FMemoryViews[I].Offset then
+        FMemoryViews[I].Offset := Offset;
+      if Offset + Count > FMemoryViews[I].EndOff then
+        FMemoryViews[I].EndOff := Offset + Count;
+      Exit;
+    end;
+
+  var V: TMemoryView;
+  V.MemRef := MemRef;
+  V.Offset := Offset;
+  V.EndOff := Offset + Count;
+  FMemoryViews := FMemoryViews + [V];
+  if Length(FMemoryViews) > MAX_TRACKED_VIEWS then
+    Delete(FMemoryViews, 0, Length(FMemoryViews) - MAX_TRACKED_VIEWS);
+end;
+
+procedure TDapServer.RememberMemoryExtent(const MemRef: string;
+  Address, Size: UInt64; const Name, TypeName: string);
+begin
+  if MemRef = '' then
+    Exit;
+  var E: TMemoryExtent;
+  E.Address  := Address;
+  E.Size     := Size;
+  E.Name     := Name;
+  E.TypeName := TypeName;
+  FMemoryExtents.AddOrSetValue(MemRef, E);
+end;
+
+procedure TDapServer.HandleMemoryExtent(Seq: Integer; Args: TJSONObject);
+begin
+  var MemRef := '';
+  if Args <> nil then
+    MemRef := Trim(Args.GetValue<string>('memoryReference', ''));
+
+  var Body := TJSONObject.Create;
+  try
+    var E: TMemoryExtent;
+    if (MemRef <> '') and FMemoryExtents.TryGetValue(MemRef, E) then begin
+      Body.AddPair('memoryReference', MemRef);
+      Body.AddPair('address', '0x' + IntToHex(E.Address, 1));
+      Body.AddPair('name',    E.Name);
+      Body.AddPair('type',    E.TypeName);
+      // `size` is present only when it was established. A view that draws an
+      // extent must be able to tell "this value is 4 bytes" from "nobody
+      // knows", and a 0 it has to interpret is not that distinction.
+      if E.Size > 0 then
+        Body.AddPair('size', TJSONNumber.Create(Int64(E.Size)))
+      else
+        Body.AddPair('sizeUnknown', TJSONBool.Create(True));
+    end
+    else
+      Body.AddPair('unknownReference', TJSONBool.Create(True));
+    FIO.SendResponse(Seq, 'delphiMemoryExtent', True, Body);
+  finally
+    Body.Free;
+  end;
+end;
+
+procedure TDapServer.EmitMemoryChanged;
+begin
+  if not FClientSupportsMemoryEvent then
+    Exit;
+  for var V in FMemoryViews do begin
+    var Body := TJSONObject.Create;
+    try
+      Body.AddPair('memoryReference', V.MemRef);
+      Body.AddPair('offset', TJSONNumber.Create(V.Offset));
+      Body.AddPair('count',  TJSONNumber.Create(V.EndOff - V.Offset));
+      FIO.SendEvent('memory', Body);
+    finally
+      Body.Free;
+    end;
   end;
 end;
 
@@ -3824,6 +4019,10 @@ begin
   finally
     Body.Free;
   end;
+  // The bytes under an open pane just changed, and this adapter is the only one
+  // who knows -- the write went straight into the debuggee.
+  TrackMemoryView(MemRef, ByteOffset, Length(Buf));
+  EmitMemoryChanged;
 end;
 
 procedure TDapServer.HandleScopes(Seq: Integer; Args: TJSONObject);
@@ -3912,8 +4111,20 @@ begin
   // carries V.Address = 0 and gets no reference. Omitted, never fabricated:
   // a wrong memoryReference opens VS Code's "View Binary Data" on a location
   // that has nothing to do with the value shown.
-  if V.Address <> 0 then
-    Item.AddPair('memoryReference', '0x' + IntToHex(V.Address, 1));
+  //
+  // DataAddress wins where it is set: a string, a dynamic array, a class
+  // instance and an interface all occupy one POINTER, and a memory view opened
+  // on that slot shows eight bytes of pointer rather than the characters or the
+  // elements the user meant. See TDebugSession.PayloadAddress for which types
+  // that covers and why a plain typed pointer is deliberately not among them.
+  var MemRef := V.Address;
+  if V.DataAddress <> 0 then
+    MemRef := V.DataAddress;
+  if MemRef <> 0 then begin
+    var RefStr := '0x' + IntToHex(MemRef, 1);
+    Item.AddPair('memoryReference', RefStr);
+    RememberMemoryExtent(RefStr, MemRef, V.ValueSize, V.Name, V.TypeName);
+  end;
   Arr.AddElement(Item);
 end;
 
@@ -4352,6 +4563,19 @@ begin
     Body.AddPair('result', R.Value);
     if R.TypeName <> '' then
       Body.AddPair('type', R.TypeName);
+    // `memoryReference` on a WATCH row, by the same rule the Variables view
+    // follows (EmitVar): the payload address when the value is a reference,
+    // the expression's own storage otherwise, and nothing at all for an rvalue.
+    // Without it VS Code offers no "View Binary Data" on a watch, so the only
+    // way to dump a string or an array was to find it in the Locals tree.
+    var MemRef := R.Address;
+    if R.DataAddress <> 0 then
+      MemRef := R.DataAddress;
+    if MemRef <> 0 then begin
+      var RefStr := '0x' + IntToHex(MemRef, 1);
+      Body.AddPair('memoryReference', RefStr);
+      RememberMemoryExtent(RefStr, MemRef, R.ValueSize, Expr, R.TypeName);
+    end;
     // The Handle was minted on the session's shared expander; map it to a DAP
     // int-ref via the same bimap the locals path uses (0 -> non-expandable).
     Body.AddPair('variablesReference', TJSONNumber.Create(RefForHandle(R.Handle)));
@@ -4432,6 +4656,9 @@ begin
         if NewType <> '' then
           Body.AddPair('type', NewType);
         FIO.SendResponse(Seq, 'setVariable', True, Body);
+        // The write landed in the debuggee; a pane open on those bytes is now
+        // showing the old ones.
+        EmitMemoryChanged;
       end
       else
         FIO.SendErrorResponse(Seq, 'setVariable', NewValue);
@@ -4445,6 +4672,7 @@ begin
       if NewType <> '' then
         Body.AddPair('type', NewType);
       FIO.SendResponse(Seq, 'setVariable', True, Body);
+      EmitMemoryChanged;
     end
     else
       FIO.SendErrorResponse(Seq, 'setVariable', NewValue);
@@ -4564,6 +4792,10 @@ begin
   StopBody.AddPair('threadId',          TJSONNumber.Create(Int64(GotoTid)));
   StopBody.AddPair('allThreadsStopped', TJSONBool.Create(True));
   FIO.SendEvent('stopped', StopBody);
+  // Set Next Statement does not itself write memory, but the client redraws
+  // everything at this stop and a pane opened on a frame-local address is now
+  // showing bytes from before the jump.
+  EmitMemoryChanged;
 end;
 
 procedure TDapServer.ProcessRequest(Msg: TJSONObject);
@@ -4621,6 +4853,7 @@ begin
     else if Cmd = 'goto'              then HandleGoto(Seq, Args)
     else if Cmd = 'disconnect'        then HandleDisconnect(Seq)
     else if Cmd = 'delphiSetRawStackScan' then HandleSetRawStackScan(Seq, Args)
+    else if Cmd = 'delphiMemoryExtent'    then HandleMemoryExtent(Seq, Args)
     else
       // Unknown command: send empty success response to avoid VS Code hanging
       FIO.SendResponse(Seq, Cmd, True);
