@@ -439,14 +439,17 @@ Required extension:
 
 - `embarcaderotechnologies.delphilsp`
 
-Optional, for memory inspection only:
+Optional, and no longer needed for memory inspection:
 
-- `ms-vscode.hexeditor` — VS Code's "View Binary Data" entry and the hex pane
-  behind it come from this extension, not from the editor. Without it the entry
-  is absent however correctly the adapter answers `readMemory` / `writeMemory`
-  and attaches `memoryReference`. Do not turn it into an `extensionDependencies`
-  entry: an unreachable marketplace would then block the debugger over an
-  optional view.
+- `ms-vscode.hexeditor` — backs VS Code's OWN "View Binary Data" pane (an inline
+  icon on a Variables row, not a context-menu item: hexeditor 1.11.1 no longer
+  contributes to `debug/variables/context`). That pane treats the
+  `memoryReference` as byte 0 of a file, so it cannot scroll before the value,
+  mark the value's extent, or show what changed — which is why the extension
+  ships its own view (`View Memory (Delphi)`, `memoryView.js`), and that one
+  needs no other extension at all. Keep hexeditor only if you want the stock
+  pane as well. Never make it an `extensionDependencies` entry: an unreachable
+  marketplace would then block the debugger over an optional view.
 
 Local debugger extension folder:
 

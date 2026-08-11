@@ -42,6 +42,7 @@ const vscode = require('vscode');
 const { openExceptionRulesEditor } = require('./exceptionRulesEditor');
 const wizard = require('./exceptionRuleWizard');
 const processPicker = require('./processPicker');
+const memoryView = require('./memoryView');
 
 const DEBUG_TYPE = 'delphi-win64';
 const PROGRESS_EVENT = 'delphiProgress';
@@ -478,35 +479,43 @@ async function checkForUpdate(context, deps) {
 // marketplace that cannot be reached block the debugger itself over an optional
 // view. Shown at most once per installation -- a prompt that returns every
 // session is a nuisance, and the answer "no" is a legitimate answer.
-const MEMORY_INSPECTOR_ID = 'ms-vscode.hexeditor';
-const MEMORY_INSPECTOR_PROMPTED_KEY = 'delphi-win64.memoryInspectorPrompted';
+// The editor's built-in memory pane is a file abstraction in which the
+// memoryReference IS byte 0: it cannot scroll before the value, mark which bytes
+// belong to it, or show what changed between two stops. This extension ships its
+// own view (memoryView.js), so the built-in one is redundant -- and it is not
+// silent about being there: it puts an inline icon on every variable row that
+// has an address.
+//
+// Withdrawing the two capabilities is what removes it. The REQUESTS stay: the
+// adapter still serves readMemory/writeMemory, and the view reaches them through
+// customRequest, which is not gated on an advertised capability. A client with
+// no Delphi extension keeps the capabilities and its own pane, which is why the
+// switch is passed here rather than defaulted in the adapter.
+const STOCK_MEMORY_VIEW_SETTING = 'delphi-win64.stockMemoryView';
 
-async function offerMemoryInspectorOnce(context) {
-  if (context.globalState.get(MEMORY_INSPECTOR_PROMPTED_KEY)) return;
-  if (vscode.extensions.getExtension(MEMORY_INSPECTOR_ID)) return;
+function adapterArguments() {
+  const enabled = vscode.workspace.getConfiguration()
+    .get(STOCK_MEMORY_VIEW_SETTING, false);
+  return enabled ? [] : ['--no-stock-memory-view'];
+}
 
-  const INSTALL = 'Install';
-  const NEVER = "Don't ask again";
-  const choice = await vscode.window.showInformationMessage(
-    'Delphi Debugger: "View Binary Data" on a variable needs the Hex Editor ' +
-    'extension. Everything else works without it.',
-    INSTALL, NEVER);
-
-  if (choice === INSTALL) {
-    try {
-      await vscode.commands.executeCommand(
-        'workbench.extensions.installExtension', MEMORY_INSPECTOR_ID);
-      vscode.window.showInformationMessage(
-        'Hex Editor installed. "View Binary Data" is available on any variable ' +
-        'the debugger has an address for.');
-    } catch (err) {
-      vscode.window.showWarningMessage(
-        'Could not install ' + MEMORY_INSPECTOR_ID + ': ' +
-        (err && err.message ? err.message : String(err)));
-      return;   // leave the prompt armed: nothing was decided, and nothing installed
-    }
+// Where the adapter exe is, taken from the manifest rather than assumed: the
+// dev-loop script (install-dev.ps1) REWRITES `program` to point at the compiler
+// build output, and hardcoding the extension-relative copy here would silently
+// run yesterday's adapter in a dev session.
+function adapterExecutablePath(context) {
+  const path = require('path');
+  let program = './VisualStudioCodeDelphiDebugger.exe';
+  try {
+    const manifest = require(path.join(context.extensionPath, 'package.json'));
+    const debuggers = (manifest.contributes && manifest.contributes.debuggers) || [];
+    const entry = debuggers.find((d) => d && d.type === DEBUG_TYPE);
+    if (entry && entry.program) program = entry.program;
+  } catch (err) {
+    // Fall through to the relative default: an unreadable manifest is not a
+    // reason to fail to start a debug session.
   }
-  await context.globalState.update(MEMORY_INSPECTOR_PROMPTED_KEY, true);
+  return path.isAbsolute(program) ? program : path.join(context.extensionPath, program);
 }
 
 function activate(context) {
@@ -538,7 +547,19 @@ function activate(context) {
   // reason -- an update check that reports its own troubles is a nuisance.
   checkForUpdate(context).catch(() => {});
 
-  offerMemoryInspectorOnce(context).catch(() => {});
+  // Launching the adapter ourselves is the only way to pass it a command-line
+  // switch: the manifest's `program` takes no arguments. Guarded like the hover
+  // provider -- if an editor of the VS Code family lacks this API, an unguarded
+  // call would throw out of activate() and take the debug-type registration with
+  // it, trading a redundant memory pane for a debugger that cannot start.
+  if (vscode.debug.registerDebugAdapterDescriptorFactory && vscode.DebugAdapterExecutable) {
+    context.subscriptions.push(
+      vscode.debug.registerDebugAdapterDescriptorFactory(DEBUG_TYPE, {
+        createDebugAdapterDescriptor: () =>
+          new vscode.DebugAdapterExecutable(adapterExecutablePath(context), adapterArguments())
+      })
+    );
+  }
 
   // Raw stack sweep, from the Call Stack title bar. It used to be a launch-time
   // flag only, which meant editing launch.json and restarting for something you
@@ -596,9 +617,20 @@ function activate(context) {
       createDebugAdapterTracker(session) {
         return {
           onWillReceiveMessage: (message) => exceptionStops.handleClientMessage(session.id, message),
-          onDidSendMessage: (message) => exceptionStops.handleAdapterMessage(session.id, message),
-          onWillStopSession: () => exceptionStops.endSession(session.id),
-          onExit: () => exceptionStops.endSession(session.id)
+          onDidSendMessage: (message) => {
+            exceptionStops.handleAdapterMessage(session.id, message);
+            // Both are "the bytes on screen may be from before": a stop means
+            // the target ran, and `memory` is the adapter reporting a write it
+            // performed itself (setVariable, writeMemory).
+            if (message && message.type === 'event' &&
+                (message.event === 'stopped' || message.event === 'memory')) {
+              memoryView.refreshSession(session.id);
+            }
+          },
+          onWillStopSession: () => { exceptionStops.endSession(session.id);
+                                     memoryView.closeSession(session.id); },
+          onExit: () => { exceptionStops.endSession(session.id);
+                          memoryView.closeSession(session.id); }
         };
       }
     })
@@ -617,6 +649,11 @@ function activate(context) {
       progress.clearSession(session.id);
       exceptionStops.endSession(session.id);
     })
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand('delphi-win64.viewMemory',
+      (commandArgument) => memoryView.openMemoryView(context, commandArgument))
   );
 
   context.subscriptions.push(

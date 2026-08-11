@@ -81,7 +81,14 @@ test('every menu entry points at a declared command', () => {
  * bundle registers (verified in workbench.desktop.main.js:
  * `{key:"debug/toolBar",id:P.DebugToolBar,...}`).
  */
-const KNOWN_MENU_IDS = ['commandPalette', 'view/title', 'debug/toolBar'];
+const KNOWN_MENU_IDS = [
+  'commandPalette', 'view/title', 'debug/toolBar',
+  // Both verified the same way, in workbench.desktop.main.js, before the memory
+  // view contributed to them: `debug/variables/context` (a Variables row) and
+  // `debug/watch/context` (a Watch row). Group "inline" renders the entry as an
+  // icon on the row rather than as a context-menu item.
+  'debug/variables/context', 'debug/watch/context'
+];
 
 test('every menu id is one VS Code actually registers', () => {
   Object.keys(contributes.menus || {}).forEach((menu) => {

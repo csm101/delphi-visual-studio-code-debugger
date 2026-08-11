@@ -2,7 +2,7 @@
   "name": "delphi-win64-debug",
   "displayName": "Delphi Debugger (Win32 and Win64)",
   "description": "Debug Delphi Win32 and Win64 applications in VS Code - breakpoints, stepping, call stacks, watches and exception rules, without the Embarcadero IDE. The debug adapter is always a 64-bit process, so a 32-bit target is debugged without the address-space ceiling a 32-bit debugger works under.",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "publisher": "local",
   "license": "MIT",
   "author": "Carlo Sirna",
@@ -60,6 +60,12 @@
         "command": "delphi-win64.pickProcess",
         "title": "Pick a Process to Attach To",
         "category": "Delphi Debugger"
+      },
+      {
+        "command": "delphi-win64.viewMemory",
+        "title": "View Memory (Delphi)",
+        "category": "Delphi Debugger",
+        "icon": "$(file-binary)"
       }
     ],
     "menus": {
@@ -78,6 +84,24 @@
         {
           "command": "delphi-win64.toggleRawStackScan",
           "when": "debugType == 'delphi-win64'"
+        },
+        {
+          "command": "delphi-win64.viewMemory",
+          "when": "debugType == 'delphi-win64'"
+        }
+      ],
+      "debug/variables/context": [
+        {
+          "command": "delphi-win64.viewMemory",
+          "when": "debugType == 'delphi-win64'",
+          "group": "inline"
+        }
+      ],
+      "debug/watch/context": [
+        {
+          "command": "delphi-win64.viewMemory",
+          "when": "debugType == 'delphi-win64'",
+          "group": "inline"
         }
       ],
       "view/title": [
@@ -108,6 +132,11 @@
     "configuration": {
       "title": "Delphi Debugger",
       "properties": {
+        "delphi-win64.stockMemoryView": {
+          "type": "boolean",
+          "default": false,
+          "description": "Also offer the editor's built-in memory pane (\"View Binary Data\", the inline icon on a variable row). Off by default because this extension ships its own memory view — \"View Memory (Delphi)\" — which the built-in one cannot match: it scrolls before the value, marks the bytes that formally belong to it, and highlights what changed since the last stop. Turning this on re-advertises the readMemory/writeMemory capabilities to the editor; the requests themselves are always served either way."
+        },
         "delphi-win64.checkForUpdates": {
           "type": "boolean",
           "default": true,
