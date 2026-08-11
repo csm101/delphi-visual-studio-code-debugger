@@ -554,6 +554,18 @@ type
     // unreadableBytes/allowPartial contract.
     procedure HandleReadMemory(Seq: Integer; Args: TJSONObject);
     procedure HandleWriteMemory(Seq: Integer; Args: TJSONObject);
+    // DAP `modules`: which images are loaded, and what the debugger knows about
+    // each. The question it answers -- "does THIS module have symbols, and from
+    // which file" -- has no other answer today short of reading the diagnostic
+    // log, and on a multi-package application it is the first thing anyone asks
+    // when a breakpoint stays unverified.
+    procedure HandleModules(Seq: Integer; Args: TJSONObject);
+    // Tells a client the module table changed, so a view of it can refresh
+    // without waiting for the next stop -- a package loaded while the target is
+    // RUNNING is exactly the case worth watching. Custom: DAP's own `module`
+    // event describes one module at a time and would need per-module bookkeeping
+    // to stay accurate across reloads; this says only "ask again".
+    procedure EmitModulesChanged;
     // Remembers a span the client actually read, widening the entry it already
     // has for that memoryReference (FMemoryViews).
     procedure TrackMemoryView(const MemRef: string; Offset, Count: Int64);
@@ -1337,6 +1349,10 @@ end;
 
 procedure TDapServer.SessionSymbolsArrived(Sender: TObject);
 begin
+  // A module that had no symbols a moment ago may have them now, which changes
+  // what a modules view should be showing -- and unlike the stack redraw below,
+  // that is worth saying whether or not a stack has been served yet.
+  EmitModulesChanged;
   if FLastStackTid = 0 then
     Exit;   // no stack has been served yet: nothing on screen to invalidate
   var Body := TJSONObject.Create;
@@ -1386,6 +1402,11 @@ var
   Module: TDllModule;
   CfgIdx: Integer;
 begin
+  // A module arrived: any view of the table is now out of date, and this is the
+  // case worth telling a client about -- a package loaded while the target is
+  // RUNNING would otherwise not show until the next stop.
+  EmitModulesChanged;
+
   Module := FindLiveModule(Name, Base);
   if Module = nil then
     Exit;
@@ -2017,6 +2038,10 @@ begin
     // 1's engine primitive). VS Code sends the field only when the
     // Disassembly View has focus, and only once this capability says the
     // adapter understands it.
+    // `modules`: which images are loaded and what debug info each has. VS Code
+    // has no built-in view for it, so the extension draws one -- but the request
+    // is the standard one, because any DAP client can then ask.
+    Caps.AddPair('supportsModulesRequest',           TJSONBool.Create(True));
     Caps.AddPair('supportsSteppingGranularity',      TJSONBool.Create(True));
     // NOTE: `supportsProgressReporting` is a CLIENT capability in the DAP spec
     // (InitializeRequestArguments), not an adapter one. VS Code ignores it in the
@@ -3877,6 +3902,92 @@ begin
     Delete(FMemoryViews, 0, Length(FMemoryViews) - MAX_TRACKED_VIEWS);
 end;
 
+// Human-readable answer to "what does the debugger have for this module".
+// Names the FORMATS rather than saying yes/no: "TD32" and "MAP only" are
+// different situations -- the second has no types and no locals -- and a view
+// that flattened them to "symbols" would hide the reason a variable is missing.
+function SymbolStatusText(const M: TSessionModule): string;
+begin
+  if Length(M.Formats) = 0 then begin
+    // "still indexing" and "there is nothing" look identical in a list and mean
+    // opposite things -- one is worth waiting for.
+    if M.Symbols = saIndexing then
+      Exit('indexing');
+    Exit('no debug information');
+  end;
+  Result := '';
+  for var F in M.Formats do begin
+    if Result <> '' then
+      Result := Result + ', ';
+    // Spelled as the file extension a user would look for on disk, except TD32,
+    // which is a section INSIDE the binary and has no file of its own.
+    if SameText(F, 'td32') then Result := Result + 'TD32 (embedded)'
+    else                        Result := Result + '.' + LowerCase(F);
+  end;
+end;
+
+procedure TDapServer.HandleModules(Seq: Integer; Args: TJSONObject);
+begin
+  var Modules := FSession.GetModules;
+
+  // DAP paging. A client may ask for a window; omitting both is "everything",
+  // which is what every client this adapter has met actually does.
+  var Start := 0;
+  var Count := Length(Modules);
+  if Args <> nil then begin
+    Start := Args.GetValue<Integer>('startModule', 0);
+    var Requested := Args.GetValue<Integer>('moduleCount', 0);
+    if Requested > 0 then
+      Count := Requested;
+  end;
+  if Start < 0 then
+    Start := 0;
+  if Start + Count > Length(Modules) then
+    Count := Length(Modules) - Start;
+  if Count < 0 then
+    Count := 0;
+
+  var Arr := TJSONArray.Create;
+  for var I := Start to Start + Count - 1 do begin
+    var M := Modules[I];
+    var O := TJSONObject.Create;
+    // The name IS the identity here: the engine keys its module table by
+    // lowercase file name, and a client that acts on a row (setting a module
+    // breakpoint, opening its debug info) has to name the same thing.
+    O.AddPair('id',   M.Name);
+    O.AddPair('name', M.Name);
+    if M.Path <> '' then
+      O.AddPair('path', M.Path);
+    O.AddPair('symbolStatus', SymbolStatusText(M));
+    O.AddPair('addressRange', '0x' + IntToHex(M.Base, 1));
+    // Beyond the spec, because the spec has no field for them and they are the
+    // point of the view: WHICH formats, whether this is the executable itself,
+    // and how big the image is.
+    var Formats := TJSONArray.Create;
+    for var F in M.Formats do
+      Formats.Add(LowerCase(F));
+    O.AddPair('delphiFormats', Formats);
+    O.AddPair('delphiIsMain', TJSONBool.Create(M.IsMain));
+    if M.Size > 0 then
+      O.AddPair('delphiImageSize', TJSONNumber.Create(Int64(M.Size)));
+    Arr.AddElement(O);
+  end;
+
+  var Body := TJSONObject.Create;
+  try
+    Body.AddPair('modules', Arr);
+    Body.AddPair('totalModules', TJSONNumber.Create(Length(Modules)));
+    FIO.SendResponse(Seq, 'modules', True, Body);
+  finally
+    Body.Free;
+  end;
+end;
+
+procedure TDapServer.EmitModulesChanged;
+begin
+  FIO.SendEvent('delphiModulesChanged');
+end;
+
 procedure TDapServer.RememberMemoryExtent(const MemRef: string;
   Address, Size: UInt64; const Name, TypeName: string);
 begin
@@ -4852,6 +4963,7 @@ begin
     else if Cmd = 'gotoTargets'       then HandleGotoTargets(Seq, Args)
     else if Cmd = 'goto'              then HandleGoto(Seq, Args)
     else if Cmd = 'disconnect'        then HandleDisconnect(Seq)
+    else if Cmd = 'modules'           then HandleModules(Seq, Args)
     else if Cmd = 'delphiSetRawStackScan' then HandleSetRawStackScan(Seq, Args)
     else if Cmd = 'delphiMemoryExtent'    then HandleMemoryExtent(Seq, Args)
     else

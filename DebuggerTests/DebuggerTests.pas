@@ -833,6 +833,10 @@ type
     [Test] procedure Test_Types_TrickyOne_NotMisDecodedAsVariant;
     [Test] procedure Test_Types_ZeroInt_DisplaysZeroNotEmpty;
     [Test] procedure Test_Types_GenericList_EnumeratesElements;
+    // DAP `modules`: which images are loaded, and what debug info each has.
+    // Runs in BOTH scenarios, and the BPL one is the point -- the runtime-loaded
+    // package must appear, with the formats that were actually registered.
+    [Test] procedure Test_Modules_ListsTheMainImageAndItsSymbolFormats;
     [Test] procedure Test_Types_TDateTime_Local_NotPlainFloat;
     [Test] procedure Test_Types_TDate_Local_RendersAsDate;
     [Test] procedure Test_Types_TTime_Local_RendersAsTime;
@@ -7724,6 +7728,64 @@ begin
     Assert.IsTrue(V.GetValue<string>('value', '').Contains('True'),
       'BB1 must display as True, got: ' + V.GetValue<string>('value', ''));
   finally V.Free; end;
+end;
+
+// DAP `modules`. The question it answers -- "does THIS image have debug
+// information, and from which format" -- had no answer in the UI at all: it
+// could be read out of a diagnostic log that is off by default, or inferred
+// from a breakpoint refusing to verify.
+//
+// The BPL scenario is the one that matters: a package loaded at RUNTIME must
+// appear in the list with the formats that were actually registered for it, not
+// merely be present as a name.
+procedure TDebuggerTests.Test_Modules_ListsTheMainImageAndItsSymbolFormats;
+var
+  FrameId, LocalsRef: Integer;
+begin
+  StartSession('EVAL_BODY', FrameId, LocalsRef);
+
+  var Resp := FClient.WaitRawResponse(FClient.SendRequest('modules', '{}'));
+  try
+    Assert.IsTrue(Resp.GetValue<Boolean>('success', False),
+      'modules request failed: ' + Resp.ToJSON);
+    var Body := Resp.GetValue('body') as TJSONObject;
+    var Arr  := Body.GetValue('modules') as TJSONArray;
+    Assert.IsTrue((Arr <> nil) and (Arr.Count > 0), 'no modules reported');
+    Assert.AreEqual(Arr.Count, Body.GetValue<Integer>('totalModules', -1),
+      'totalModules must match what was returned when no paging was asked for');
+
+    // The executable itself: exactly one module is the main image, and it has
+    // debug information -- these fixtures are built with -V.
+    var MainCount := 0;
+    var MainFormats := 0;
+    var SubjectFormats := -1;
+    for var V in Arr do begin
+      var O := V as TJSONObject;
+      Assert.IsTrue(O.GetValue<string>('name', '') <> '', 'a module with no name: ' + O.ToJSON);
+      Assert.IsTrue(O.GetValue<string>('symbolStatus', '') <> '',
+        'every module must state its symbol status: ' + O.ToJSON);
+      var Formats := O.GetValue('delphiFormats') as TJSONArray;
+      if O.GetValue<Boolean>('delphiIsMain', False) then begin
+        Inc(MainCount);
+        MainFormats := Formats.Count;
+      end;
+      // The runtime-loaded package, in the BPL scenario.
+      if SameText(O.GetValue<string>('name', ''), 'testsubject.bpl') then
+        SubjectFormats := Formats.Count;
+    end;
+    Assert.AreEqual(1, MainCount, 'exactly one module is the main image');
+    Assert.IsTrue(MainFormats > 0,
+      'the main image is built with -V, so it must report at least one format');
+
+    if Scenario = tsBpl then begin
+      Assert.IsTrue(SubjectFormats >= 0,
+        'the runtime-loaded TestSubject.bpl must appear in the module list');
+      Assert.IsTrue(SubjectFormats > 0,
+        'the BPL stopped in must report the formats registered for it, not an empty list');
+    end;
+  finally
+    Resp.Free;
+  end;
 end;
 
 procedure TDebuggerTests.Test_Types_TDateTime_Local_NotPlainFloat;

@@ -52,12 +52,24 @@ const vscodeStub = {
     showWarningMessage() {},
     showInformationMessage() {},
     showTextDocument: async () => ({ revealRange() {} }),
-    createWebviewPanel() { throw new Error('not used by these tests'); }
+    createWebviewPanel() { throw new Error('not used by these tests'); },
+    registerTreeDataProvider() { return { dispose() {} }; }
   },
+  // The modules tree registers a TreeDataProvider and an EventEmitter at
+  // activate(); these tests do not exercise it, but its ABSENCE from the stub
+  // would make activate() throw and take every assertion below with it.
+  EventEmitter: class {
+    constructor() { this.listeners = []; }
+    get event() { return (fn) => { this.listeners.push(fn); return { dispose() {} }; }; }
+    fire(value) { this.listeners.forEach((fn) => fn(value)); }
+  },
+  env: { clipboard: { writeText: async () => {} } },
   debug: {
     activeDebugSession: undefined,
     onDidReceiveDebugSessionCustomEvent: makeEvent(),
     onDidTerminateDebugSession: makeEvent(),
+    onDidStartDebugSession: makeEvent(),
+    onDidChangeActiveDebugSession: makeEvent(),
     registerDebugAdapterTrackerFactory() { return { dispose() {} }; },
     registerDebugConfigurationProvider(type, provider) {
       configurationProviders.push({ type: type, provider: provider });

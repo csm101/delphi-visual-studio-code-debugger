@@ -66,8 +66,29 @@
         "title": "View Memory (Delphi)",
         "category": "Delphi Debugger",
         "icon": "$(file-binary)"
+      },
+      {
+        "command": "delphi-win64.refreshModules",
+        "title": "Refresh Modules",
+        "category": "Delphi Debugger",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "delphi-win64.copyModulePath",
+        "title": "Copy Path",
+        "category": "Delphi Debugger",
+        "icon": "$(copy)"
       }
     ],
+    "views": {
+      "debug": [
+        {
+          "id": "delphiModules",
+          "name": "Delphi Modules",
+          "when": "debugType == 'delphi-win64'"
+        }
+      ]
+    },
     "menus": {
       "commandPalette": [
         {
@@ -88,6 +109,21 @@
         {
           "command": "delphi-win64.viewMemory",
           "when": "debugType == 'delphi-win64'"
+        },
+        {
+          "command": "delphi-win64.refreshModules",
+          "when": "debugType == 'delphi-win64'"
+        },
+        {
+          "command": "delphi-win64.copyModulePath",
+          "when": "false"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "delphi-win64.copyModulePath",
+          "when": "view == delphiModules && viewItem =~ /delphiModule/",
+          "group": "inline"
         }
       ],
       "debug/variables/context": [
@@ -119,6 +155,11 @@
           "command": "delphi-win64.toggleRawStackScan",
           "when": "view == workbench.debug.callStackView && debugType == 'delphi-win64'",
           "group": "navigation@98"
+        },
+        {
+          "command": "delphi-win64.refreshModules",
+          "when": "view == delphiModules",
+          "group": "navigation@1"
         }
       ],
       "debug/toolBar": [

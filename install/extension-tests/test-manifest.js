@@ -87,7 +87,10 @@ const KNOWN_MENU_IDS = [
   // view contributed to them: `debug/variables/context` (a Variables row) and
   // `debug/watch/context` (a Watch row). Group "inline" renders the entry as an
   // icon on the row rather than as a context-menu item.
-  'debug/variables/context', 'debug/watch/context'
+  'debug/variables/context', 'debug/watch/context',
+  // Verified the same way, for rows of the extension's OWN tree views (the
+  // modules tree). `viewItem` matches whatever the provider set as contextValue.
+  'view/item/context'
 ];
 
 test('every menu id is one VS Code actually registers', () => {

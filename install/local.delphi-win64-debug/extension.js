@@ -43,6 +43,7 @@ const { openExceptionRulesEditor } = require('./exceptionRulesEditor');
 const wizard = require('./exceptionRuleWizard');
 const processPicker = require('./processPicker');
 const memoryView = require('./memoryView');
+const modulesView = require('./modulesView');
 
 const DEBUG_TYPE = 'delphi-win64';
 const PROGRESS_EVENT = 'delphiProgress';
@@ -626,6 +627,12 @@ function activate(context) {
                 (message.event === 'stopped' || message.event === 'memory')) {
               memoryView.refreshSession(session.id);
             }
+            // The module table changed, or a stop makes it worth re-reading:
+            // symbols are commonly registered by the time the target stops.
+            if (message && message.type === 'event' &&
+                (message.event === 'delphiModulesChanged' || message.event === 'stopped')) {
+              modules.refresh();
+            }
           },
           onWillStopSession: () => { exceptionStops.endSession(session.id);
                                      memoryView.closeSession(session.id); },
@@ -655,6 +662,8 @@ function activate(context) {
     vscode.commands.registerCommand('delphi-win64.viewMemory',
       (commandArgument) => memoryView.openMemoryView(context, commandArgument))
   );
+
+  const modules = modulesView.register(context);
 
   context.subscriptions.push(
     vscode.commands.registerCommand('delphi-win64.editExceptionRules', () =>

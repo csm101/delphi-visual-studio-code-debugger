@@ -27,14 +27,35 @@ function createWebviewPanel() {
   return panel;
 }
 
+class TreeItem {
+  constructor(label, collapsibleState) {
+    this.label = label;
+    this.collapsibleState = collapsibleState;
+  }
+}
+class ThemeIcon {
+  constructor(id) { this.id = id; }
+}
+class EventEmitter {
+  constructor() { this.listeners = []; }
+  get event() { return (fn) => { this.listeners.push(fn); return { dispose() {} }; }; }
+  fire(value) { this.listeners.forEach((fn) => fn(value)); }
+}
+
 module.exports = {
   Range: Range,
   EvaluatableExpression: EvaluatableExpression,
+  TreeItem: TreeItem,
+  ThemeIcon: ThemeIcon,
+  EventEmitter: EventEmitter,
+  TreeItemCollapsibleState: { None: 0, Collapsed: 1, Expanded: 2 },
   ViewColumn: { Beside: -2 },
+  env: { clipboard: { writeText: () => Promise.resolve() } },
   window: {
     activeTextEditor: undefined,
     createStatusBarItem: () => ({ dispose() {} }),
     createWebviewPanel: createWebviewPanel,
+    registerTreeDataProvider: () => ({ dispose() {} }),
     showInformationMessage: () => Promise.resolve(undefined),
     showWarningMessage: () => Promise.resolve(undefined),
     showInputBox: () => Promise.resolve(undefined)
@@ -42,9 +63,12 @@ module.exports = {
   workspace: { getConfiguration: () => ({ get: (_k, d) => d }) },
   languages: { registerEvaluatableExpressionProvider: () => ({ dispose() {} }) },
   debug: {
+    activeDebugSession: undefined,
     registerDebugAdapterTrackerFactory: () => ({ dispose() {} }),
     onDidReceiveDebugSessionCustomEvent: () => ({ dispose() {} }),
-    onDidTerminateDebugSession: () => ({ dispose() {} })
+    onDidTerminateDebugSession: () => ({ dispose() {} }),
+    onDidStartDebugSession: () => ({ dispose() {} }),
+    onDidChangeActiveDebugSession: () => ({ dispose() {} })
   },
   commands: { registerCommand: () => ({ dispose() {} }), executeCommand: () => {} },
   StatusBarAlignment: { Left: 1, Right: 2 },

@@ -62,6 +62,14 @@ const vscodeStub = {
   StatusBarAlignment: { Left: 1, Right: 2 },
   ViewColumn: { Active: -1, Beside: -2 },
   TextEditorRevealType: { InCenter: 2 },
+  // Registered by the modules tree at activate(). Not exercised here, but an
+  // activate() that throws would take every assertion below with it.
+  EventEmitter: class {
+    constructor() { this.listeners = []; }
+    get event() { return (fn) => { this.listeners.push(fn); return { dispose() {} }; }; }
+    fire(value) { this.listeners.forEach((fn) => fn(value)); }
+  },
+  env: { clipboard: { writeText: async () => {} } },
   Uri: {
     file: (fsPath) => ({ scheme: 'file', fsPath: fsPath, path: String(fsPath).replace(/\\/g, '/') }),
     joinPath: (base, ...parts) => ({
@@ -96,6 +104,7 @@ const vscodeStub = {
     showWarningMessage: (message) => recorded.warnings.push(message),
     showErrorMessage: (message) => recorded.errors.push(message),
     showTextDocument: async () => ({ revealRange() {} }),
+    registerTreeDataProvider: () => ({ dispose() {} }),
     createWebviewPanel: (id, title) => {
       const panel = {
         id: id,
@@ -118,6 +127,8 @@ const vscodeStub = {
     activeStackItem: undefined,
     onDidReceiveDebugSessionCustomEvent: makeEvent(),
     onDidTerminateDebugSession: makeEvent(),
+    onDidStartDebugSession: makeEvent(),
+    onDidChangeActiveDebugSession: makeEvent(),
     registerDebugAdapterTrackerFactory(type, factory) {
       vscodeStub.debug.trackerFactory = { type: type, factory: factory };
       return { dispose() {} };

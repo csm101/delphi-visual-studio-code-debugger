@@ -48,6 +48,9 @@ echo.
 echo === memory view: what the pane does across a stop ===
 node ..\local.delphi-win64-debug\test\memoryPane.test.js || set FAILED=1
 echo.
+echo === modules tree: ordering, status and details ===
+node ..\local.delphi-win64-debug\test\modulesView.test.js || set FAILED=1
+echo.
 
 if "%FAILED%"=="1" (
   echo EXTENSION TESTS FAILED
