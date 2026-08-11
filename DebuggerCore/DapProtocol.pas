@@ -14,6 +14,17 @@ procedure DapLog(const S: string);
 // appear in the file unless logging is enabled by env var.
 procedure SetDapLogEnabled(Enable: Boolean);
 
+// Redirect the log. Closes the current file, so the next line reopens at the
+// new path and re-reads its size. Exists for the tests -- a size cap and a
+// rotation are only provable against a file the test owns -- and for any
+// consumer that wants its own log rather than the shared `%TEMP%` one.
+procedure SetDapLogPath(const Path: string);
+
+// The log file currently in use, and the one previous generation kept beside
+// it (`dap_adapter.log` / `dap_adapter.1.log` in `%TEMP%` by default).
+function DapLogPath: string;
+function DapLogPreviousPath: string;
+
 type
   TDapIO = class
   private
@@ -39,18 +50,107 @@ var
   GLogPath:    string;
   GLogEnabled: Boolean = False;
   GLogHandle:  THandle = INVALID_HANDLE_VALUE;
-  // Safety cap: a runaway (e.g. an infinite resolution loop calling DapLog)
-  // once grew dap_adapter.log to 7.3 GB and filled the disk. Stop writing past
-  // this many bytes per adapter process; a single marker line records the cap.
+  // Bytes in the log FILE, not bytes written by this process. The distinction
+  // is the whole point: the cap used to count only what the running adapter
+  // had written and the file is opened for APPEND, so every new debug session
+  // started the count at zero on top of whatever was already there. The file
+  // was measured at 1.5 GB on a normal working machine -- the cap had never
+  // once been reached, because no single session writes 256 MB.
   GLogBytes:   Int64   = 0;
-  GLogCapped:  Boolean = False;
+  // The cap in bytes, resolved from the environment on first use. -1 = not yet
+  // read. See LogCapBytes.
+  GLogCapBytes: Int64  = -1;
 
 const
-  DAP_LOG_CAP_BYTES = Int64(256) * 1024 * 1024;  // 256 MB / process
+  // Per FILE, and rotated rather than truncated: one previous log is kept, so
+  // the worst case on disk is twice this and the session before last is still
+  // readable. 64 MB is minutes of verbose tracing at adapter speeds.
+  DAP_LOG_DEFAULT_MB = 64;
 
 procedure SetDapLogEnabled(Enable: Boolean);
 begin
   GLogEnabled := Enable;
+end;
+
+function DapLogPath: string;
+begin
+  Result := GLogPath;
+end;
+
+// One naming rule, used by the rotation and by anyone looking for the previous
+// generation, so the two cannot disagree about the file's name.
+function PreviousPathFor(const Path: string): string;
+begin
+  Result := ChangeFileExt(Path, '.1' + ExtractFileExt(Path));
+end;
+
+function DapLogPreviousPath: string;
+begin
+  Result := PreviousPathFor(GLogPath);
+end;
+
+procedure SetDapLogPath(const Path: string);
+begin
+  EnterCriticalSection(GLogLock);
+  try
+    if GLogHandle <> INVALID_HANDLE_VALUE then begin
+      CloseHandle(GLogHandle);
+      GLogHandle := INVALID_HANDLE_VALUE;
+    end;
+    GLogPath     := Path;
+    GLogBytes    := 0;    // re-read from the new file when it is opened
+    GLogCapBytes := -1;   // and re-read the cap: a test sets it per case
+  finally
+    LeaveCriticalSection(GLogLock);
+  end;
+end;
+
+// Open the log file once and keep the handle. Per-line AssignFile/Append/
+// CloseFile cost milliseconds each (Defender scans every open of a %TEMP%
+// file), so on a SampleApp-scale expand that logs hundreds of lines it alone
+// added seconds. FILE_APPEND_DATA lets the OS append atomically without a
+// seek; FILE_SHARE_READ keeps the file tailable while open. Must hold
+// GLogLock.
+// The cap, in bytes. `DAP_LOG_MAX_MB` overrides it; 0 disables the cap for
+// someone who really is chasing a rare event and has the disk for it.
+//
+// Read ONCE. This is consulted on every logged line, and a GetEnvironmentVariable
+// per line is a syscall on the hot path of the very thing being diagnosed --
+// exactly the kind of cost that made per-line file opens worth removing here in
+// the first place. `SetDapLogPath` clears the cache, which is what lets a test
+// change the cap between cases.
+function LogCapBytes: Int64;
+begin
+  if GLogCapBytes < 0 then begin
+    var Mb := DAP_LOG_DEFAULT_MB;
+    var Env := GetEnvironmentVariable('DAP_LOG_MAX_MB');
+    if Env <> '' then begin
+      var Parsed: Integer;
+      if TryStrToInt(Trim(Env), Parsed) and (Parsed >= 0) then
+        Mb := Parsed;
+    end;
+    GLogCapBytes := Int64(Mb) * 1024 * 1024;
+  end;
+  Result := GLogCapBytes;
+end;
+
+function LogFileSize(const Path: string): Int64;
+begin
+  Result := 0;
+  var Data: TWin32FileAttributeData;
+  if GetFileAttributesEx(PChar(Path), GetFileExInfoStandard, @Data) then
+    Result := (Int64(Data.nFileSizeHigh) shl 32) or Data.nFileSizeLow;
+end;
+
+// Renames the current log aside, keeping ONE generation. Rotation rather than
+// truncation because the interesting lines are usually the ones just before
+// the moment you went looking, and a session that has just rolled over would
+// otherwise have nothing behind it. Must hold GLogLock, with the log closed.
+procedure RotateLog;
+begin
+  var Previous := PreviousPathFor(GLogPath);
+  DeleteFile(PChar(Previous));
+  MoveFile(PChar(GLogPath), PChar(Previous));
 end;
 
 // Open the log file once and keep the handle. Per-line AssignFile/Append/
@@ -62,9 +162,37 @@ end;
 procedure EnsureLogOpen;
 begin
   if GLogHandle <> INVALID_HANDLE_VALUE then Exit;
+  // Start from what is ALREADY in the file. Appending to a file whose size we
+  // never looked at is how a 64 MB-per-session cap produced a 1.5 GB file.
+  GLogBytes := LogFileSize(GLogPath);
+  var Cap := LogCapBytes;
+  if (Cap > 0) and (GLogBytes >= Cap) then begin
+    RotateLog;
+    GLogBytes := 0;
+  end;
   GLogHandle := CreateFile(PChar(GLogPath), FILE_APPEND_DATA,
     FILE_SHARE_READ or FILE_SHARE_WRITE, nil, OPEN_ALWAYS,
     FILE_ATTRIBUTE_NORMAL, 0);
+end;
+
+// Rolls over mid-session once the file reaches the cap. Must hold GLogLock.
+procedure RollOverIfFull;
+begin
+  var Cap := LogCapBytes;
+  if (Cap <= 0) or (GLogBytes < Cap) then
+    Exit;
+  if GLogHandle <> INVALID_HANDLE_VALUE then begin
+    var Bytes := TEncoding.UTF8.GetBytes(
+      Format('=== continues in a new file; this one reached the %d MB cap ' +
+             '(DAP_LOG_MAX_MB) ===' + #13#10, [Cap div (1024 * 1024)]));
+    var Written: DWORD;
+    WriteFile(GLogHandle, Bytes[0], Length(Bytes), Written, nil);
+    CloseHandle(GLogHandle);
+    GLogHandle := INVALID_HANDLE_VALUE;
+  end;
+  RotateLog;
+  GLogBytes := 0;
+  EnsureLogOpen;
 end;
 
 procedure DapLog(const S: string);
@@ -76,17 +204,8 @@ begin
   EnterCriticalSection(GLogLock);
   try
     EnsureLogOpen;
+    RollOverIfFull;
     if GLogHandle = INVALID_HANDLE_VALUE then Exit;
-    if GLogBytes >= DAP_LOG_CAP_BYTES then begin
-      if not GLogCapped then begin
-        GLogCapped := True;
-        Bytes := TEncoding.UTF8.GetBytes(
-          '=== dap_adapter.log capped at 256 MB; further lines suppressed '
-          + '(possible runaway loop) ==='#13#10);
-        WriteFile(GLogHandle, Bytes[0], Length(Bytes), Written, nil);
-      end;
-      Exit;
-    end;
     Bytes := TEncoding.UTF8.GetBytes(
       FormatDateTime('hh:nn:ss.zzz', Now) + ' ' + S + #13#10);
     WriteFile(GLogHandle, Bytes[0], Length(Bytes), Written, nil);

@@ -51,6 +51,8 @@ uses
   InstructionStepTests in 'InstructionStepTests.pas',
   InstructionStepDapTests in 'InstructionStepDapTests.pas',
   MemoryDapTests  in 'MemoryDapTests.pas',
+  DapLogTests     in 'DapLogTests.pas',
+  TestTempDirs    in 'TestTempDirs.pas',
   RegisterWriteDapTests in 'RegisterWriteDapTests.pas',
   PlaceholderDisassemblyTests in 'PlaceholderDisassemblyTests.pas',
   WinDebuggerX86  in '..\DebuggerCore\WinDebuggerX86.pas',
