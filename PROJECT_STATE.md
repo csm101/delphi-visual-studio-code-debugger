@@ -1026,6 +1026,14 @@ Architecture / portability:
   - **`.dcp` is the same format as `.rsm`** (both read by `TRsmFile`) and is NOT
     gated. A BPL target is fully served by its `.dcp` + TD32 -- it never needed
     `.rsm`. Only a monolithic exe (no `.dcp`) ever used `.rsm`.
+  - **Where the `.dcp` IS** (`ModuleSymbolLoader.ProbeDcpPath`): beside the
+    package, and failing that in Delphi's installed layout, where `Bpl` and
+    `Dcp` are SIBLING trees under the platform folder
+    (`...\Studio\23.0\Bpl\Win64\libFoo.bpl` <-> `...\Dcp\Win64\libFoo.dcp`).
+    Probing only beside the package -- which is what it did -- meant that for
+    every IDE-installed package, i.e. most of a real application's, the `.dcp`
+    was never found and the five capabilities below were silently lost.
+    Measured on Hydra2: a `TDateTime` local read as a bare `Double`.
   - **5 capabilities remain RSM-format-only** -- available on a BPL (via `.dcp`)
     or a mono exe with a fresh `.rsm`, lost only for a mono exe WITHOUT `.rsm`:
     `.dpr` program-main-block inline-var locals; date/time alias fidelity

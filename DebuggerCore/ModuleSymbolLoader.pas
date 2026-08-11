@@ -204,6 +204,12 @@ type
 // green. Set SYMBOL_PREFETCH=1, or call SetSymbolPrefetchEnabled(True), to
 // turn the prefetcher on for further investigation.
 procedure SetSymbolPrefetchEnabled(Value: Boolean);
+
+// Where a package's `.dcp` is, given the package itself: beside it, or in
+// Delphi's installed layout, where Bpl and Dcp are SIBLING trees. Exposed
+// because the prefetch worker probes the same thing off the dispatch thread,
+// and because the rule deserves a test that needs no debuggee.
+function ProbeDcpPath(const ModulePath: string): string;
 function  SymbolPrefetchEnabled: Boolean;
 
 type
@@ -369,7 +375,7 @@ type
 implementation
 
 uses
-  Winapi.Windows, PeSymbolSupport;
+  Winapi.Windows, System.IOUtils, PeSymbolSupport;
 
 var
   // -1 = not yet resolved from the environment, 0 = off, 1 = on.
@@ -388,6 +394,36 @@ begin
   if GPrefetchEnabled < 0 then
     SetSymbolPrefetchEnabled(GetEnvironmentVariable('SYMBOL_PREFETCH') = '1');
   Result := GPrefetchEnabled = 1;
+end;
+
+function ProbeDcpPath(const ModulePath: string): string;
+begin
+  // Beside the package first: that is where a project's own output lands, and a
+  // launch config that names the .dcp explicitly never reaches here at all.
+  Result := ChangeFileExt(ModulePath, '.dcp');
+  if FileExists(Result) then
+    Exit;
+  // Then Delphi's own installed layout, which puts the two in SIBLING trees:
+  //   ...\Studio\23.0\Bpl\Win64\libFoo.bpl
+  //   ...\Studio\23.0\Dcp\Win64\libFoo.dcp
+  // Probing only beside the package meant that for every IDE-installed package
+  // -- which is most of a real application's packages -- the .dcp was never
+  // found, and with it went the five capabilities only the RSM format carries:
+  // date/time alias fidelity (a TDateTime local read as a bare Double),
+  // cross-unit uses-scope resolution, unit-scoped consts, and the rest.
+  // Measured on Hydra2: `date: TDateTime` reported as `Double`.
+  //
+  // Matched as a whole path SEGMENT, so a package that merely has "bpl" in its
+  // name or sits under a directory called "bpldata" is left alone.
+  var Dir := ExcludeTrailingPathDelimiter(ExtractFilePath(ModulePath));
+  var Parent := ExtractFilePath(ExcludeTrailingPathDelimiter(ExtractFilePath(Dir)));
+  var BplDir := ExtractFileName(ExcludeTrailingPathDelimiter(ExtractFilePath(Dir)));
+  if not SameText(BplDir, 'Bpl') then
+    Exit;
+  var Candidate := TPath.Combine(TPath.Combine(Parent + 'Dcp', ExtractFileName(Dir)),
+                     ChangeFileExt(ExtractFileName(ModulePath), '.dcp'));
+  if FileExists(Candidate) then
+    Result := Candidate;
 end;
 
 { TPrefetchOutcome }
@@ -533,7 +569,7 @@ begin
   // --- DCP (the package's rich unit debug info) ---
   var DcpPath := Req.DcpPath;
   if (DcpPath = '') or not FileExists(DcpPath) then
-    DcpPath := ChangeFileExt(Req.FullPath, '.dcp');
+    DcpPath := ProbeDcpPath(Req.FullPath);
   if FileExists(DcpPath) then begin
     Outcome.DcpPathUsed := DcpPath;
     var DcpObj := TRsmFile.Create;
@@ -1077,7 +1113,7 @@ begin
   Result.ImageSize := AImageSize;
   Result.MapPath   := ChangeFileExt(AFullPath, '.map');
   Result.RsmPath   := ChangeFileExt(AFullPath, '.rsm');
-  Result.DcpPath   := ChangeFileExt(AFullPath, '.dcp');
+  Result.DcpPath   := ProbeDcpPath(AFullPath);
   Result.TdsPath   := ChangeFileExt(AFullPath, '.tds');
   FModules.Add(Result);
 end;
@@ -1263,7 +1299,7 @@ begin
   Module.DcpTried := True;
   var DcpPath := Module.DcpPath;
   if (DcpPath = '') or not FileExists(DcpPath) then
-    DcpPath := ChangeFileExt(Module.FullPath, '.dcp');
+    DcpPath := ProbeDcpPath(Module.FullPath);
   if not FileExists(DcpPath) then
     Exit;
   Module.DcpPath := DcpPath;

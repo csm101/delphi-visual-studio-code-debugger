@@ -34,11 +34,29 @@ type
     [Test] procedure CapOfZero_DisablesRotation;
   end;
 
+  // Where a package's .dcp is looked for. Not a log concern, but the same
+  // shape of test -- a rule about paths, provable against files a test makes
+  // itself, with no debuggee involved.
+  [TestFixture]
+  TDcpProbeTests = class
+  private
+    FRoot: string;
+    function  Touch(const RelPath: string): string;
+  public
+    [Setup]    procedure Setup;
+    [TearDown] procedure TearDown;
+
+    [Test] procedure BesideThePackage_IsFoundFirst;
+    [Test] procedure DelphiInstalledLayout_FindsTheSiblingDcpTree;
+    [Test] procedure NoDcpAnywhere_ReturnsTheBesideCandidate;
+    [Test] procedure ADirectoryMerelyNamedLikeBpl_IsNotRewritten;
+  end;
+
 implementation
 
 uses
   System.SysUtils, System.Classes, System.IOUtils, Winapi.Windows, DapProtocol,
-  TestTempDirs;
+  ModuleSymbolLoader, TestTempDirs;
 
 const
   // One megabyte, so a test writes its way past the cap in a fraction of a
@@ -153,7 +171,67 @@ begin
     'with the cap disabled nothing should be rotated');
 end;
 
+{ TDcpProbeTests }
+
+procedure TDcpProbeTests.Setup;
+begin
+  PurgeLeftoverTempDirs('DcpProbe_');
+  FRoot := MakeTestScratchDir('DcpProbe_');
+end;
+
+procedure TDcpProbeTests.TearDown;
+begin
+  DeleteTempDirWithRetry(FRoot);
+end;
+
+function TDcpProbeTests.Touch(const RelPath: string): string;
+begin
+  Result := TPath.Combine(FRoot, RelPath);
+  TDirectory.CreateDirectory(ExtractFilePath(Result));
+  TFile.WriteAllText(Result, 'not a real package');
+end;
+
+// A project's own output: everything in one directory.
+procedure TDcpProbeTests.BesideThePackage_IsFoundFirst;
+begin
+  var Bpl := Touch('out\libFoo.bpl');
+  var Dcp := Touch('out\libFoo.dcp');
+  Assert.AreEqual(Dcp, ProbeDcpPath(Bpl));
+end;
+
+// Delphi's INSTALLED layout, which is where a real application's packages live:
+// Bpl and Dcp are sibling trees under the same platform folder. Probing only
+// beside the package meant the .dcp was never found for any of them -- and with
+// it went every capability only the RSM format carries (a TDateTime local read
+// as a bare Double, measured on Hydra2).
+procedure TDcpProbeTests.DelphiInstalledLayout_FindsTheSiblingDcpTree;
+begin
+  var Bpl := Touch('Studio\23.0\Bpl\Win64\libFoo.bpl');
+  var Dcp := Touch('Studio\23.0\Dcp\Win64\libFoo.dcp');
+  Assert.AreEqual(Dcp, ProbeDcpPath(Bpl));
+end;
+
+// Nothing to find: the beside-the-package candidate comes back, so the caller's
+// existing FileExists check does the refusing. Never an empty string, which a
+// caller would have to special-case.
+procedure TDcpProbeTests.NoDcpAnywhere_ReturnsTheBesideCandidate;
+begin
+  var Bpl := Touch('Studio\23.0\Bpl\Win64\libFoo.bpl');
+  Assert.AreEqual(ChangeFileExt(Bpl, '.dcp'), ProbeDcpPath(Bpl));
+end;
+
+// The rewrite matches a whole path SEGMENT. A directory that merely starts with
+// "bpl" is not one, and rewriting it would point at a directory that has
+// nothing to do with this package.
+procedure TDcpProbeTests.ADirectoryMerelyNamedLikeBpl_IsNotRewritten;
+begin
+  var Bpl := Touch('Studio\23.0\BplArchive\Win64\libFoo.bpl');
+  Touch('Studio\23.0\DcpArchive\Win64\libFoo.dcp');
+  Assert.AreEqual(ChangeFileExt(Bpl, '.dcp'), ProbeDcpPath(Bpl));
+end;
+
 initialization
   TDUnitX.RegisterTestFixture(TDapLogTests);
+  TDUnitX.RegisterTestFixture(TDcpProbeTests);
 
 end.
