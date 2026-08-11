@@ -33,31 +33,28 @@ If you received the `delphi-win64-debugger-setup-*.zip`:
    > instead: `build_setup_zip.bat` produces this exact zip.
 2. Run `Setup.exe`. It packages the extension into a `.vsix` and installs it
    through the VS Code CLI (`code --install-extension`), which registers it
-   properly and updates any previous version in place. It also installs the
-   **Hex Editor** extension (see below). It then offers to install and register
-   the **MCP debug server** (see below).
+   properly and updates any previous version in place. It then offers to install
+   and register the **MCP debug server** (see below).
 3. Reload VS Code (Ctrl+Shift+P -> "Developer: Reload Window").
 
-### Memory inspection needs the Hex Editor extension
+### Memory inspection needs nothing else
 
-The debugger reads and writes debuggee memory and gives every variable with an
-address a `memoryReference`, but the VIEW that uses them — the **View Binary
-Data** entry on a variable, and the hex pane it opens — is contributed by
-Microsoft's Hex Editor extension, not by VS Code itself. Without it, the menu
-entry is simply absent, which looks like a missing debugger feature rather than
-a missing companion extension.
+Right-click a variable — in **Variables** or in **Watch** — and use the memory
+icon on the row. The view is part of this extension: it reads the debuggee
+through the adapter and draws the bytes itself.
 
-The installer installs it for you. If it could not (no marketplace access, an
-editor whose CLI was not on PATH), do it by hand:
+Earlier versions relied on Microsoft's Hex Editor extension, because VS Code's
+own **View Binary Data** pane comes from there. That pane treats the variable's
+address as byte 0 of a file, so it cannot scroll to what lies before the value,
+mark which bytes belong to it, or show what changed since the last stop — which
+is why this view exists, and why the built-in one is switched off by default.
+
+To have the built-in pane back, set `"delphi-win64.stockMemoryView": true` and
+install `ms-vscode.hexeditor` yourself:
 
 ```
 code --install-extension ms-vscode.hexeditor
 ```
-
-It is deliberately NOT declared as a hard dependency of the extension: memory
-inspection is an addition, and a marketplace that cannot be reached must not
-block the debugger itself over an optional view. The extension asks once, with
-an Install button, if it starts up and finds it missing.
 
 No repository, Delphi toolchain, or build step is required — the adapter is
 already compiled and bundled inside the zip.

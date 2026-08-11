@@ -88,7 +88,7 @@ The three front ends are thin.
 | **VS Code** | The editor the extension plugs into |
 | **[Delphi IDE plugin](https://github.com/csm101/EditInVsCodeDelphiPlugin)** | Generates the workspace and launch configuration from a Delphi project. Not strictly required, but see the note above |
 | **DelphiLSP extension** (`embarcaderotechnologies.delphilsp`) | Delphi language support in VS Code (syntax, autocomplete). A separate Embarcadero extension; this one only debugs |
-| **Hex Editor extension** (`ms-vscode.hexeditor`, optional) | Memory inspection only. The debugger reads and writes debuggee memory and gives every addressed variable a `memoryReference`, but the **View Binary Data** entry and the hex pane behind it come from this Microsoft extension, not from VS Code — without it the entry is simply absent. The installer installs it; by hand, `code --install-extension ms-vscode.hexeditor`. Not a hard dependency: everything else works without it |
+| **Hex Editor extension** (`ms-vscode.hexeditor`, no longer needed) | Only if you want VS Code's own **View Binary Data** pane back — set `"delphi-win64.stockMemoryView": true` as well. Memory inspection is otherwise part of this extension: the memory icon on a Variables or Watch row opens a view that scrolls before the value, marks the bytes belonging to it and highlights what changed since the last stop, none of which the built-in pane can do |
 | **JCL sources** (optional) | Only for the default JCL debug-info support; build with `JCL_DEBUG_OFF` to omit it — see [Optional: JCL debug-info support](#optional-jcl-debug-info-support) |
 
 ---
