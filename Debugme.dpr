@@ -1,4 +1,4 @@
-program Debugme;
+﻿program Debugme;
 
 {$APPTYPE CONSOLE}
 
