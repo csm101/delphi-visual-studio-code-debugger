@@ -860,26 +860,20 @@ Evaluate / expression grammar:
 Project / packaging:
 - Publish the VS Code extension instead of manual local install.
 
-Rich VS Code GUI extension (future):
-- Today the extension is a pure debug-type contribution: no `main`, no
-  `extension.js`, just the `delphi-win64` launch-config schema pointing
-  at the external DAP adapter. Standard DAP UI only.
-- Goal: add a real activated extension (TS/JS with `main` +
-  `activationEvents`) alongside the adapter to surface Delphi-specific
-  views the standard debug UI cannot show.
-- Bridge: the adapter already speaks DAP. Add custom DAP events/requests
-  (e.g. `event: "delphiModulesChanged"`) that the extension consumes via
-  `registerDebugAdapterTrackerFactory`, then renders.
-- Candidate views: loaded modules / BPL map, RSM + TD32 symbol/type
-  explorer, memory hex viewer, register grid, thread/stack dashboard,
-  richer watch tables, inline value decorations.
-- Build order: start cheap — one TreeView (`contributes.views`) fed by a
-  custom modules/BPL DAP event. Proves the adapter↔extension custom-message
-  channel before committing to webview complexity. Escalate to webview
-  panels only where native TreeViews fall short.
-- Cost: adds a real TS/JS build step, webview message protocol, and
-  ongoing maintenance. Defer until core inspection (locals / globals /
-  BPL frames) is solid.
+Rich VS Code GUI extension (partly built):
+- The extension is no longer a bare debug-type contribution. It has a `main`,
+  activation events, commands (exception-rules editor, rule wizard, raw-stack
+  toggle, process picker, update check), a `DebugAdapterTrackerFactory`, a
+  `DebugAdapterDescriptorFactory`, two webviews (the exception-rules editor and
+  the memory view) and its own node test suite (`install\extension-tests\run.bat`,
+  no bundler and no `node_modules` — plain CommonJS, deliberately).
+- Both channels to the adapter are in use: custom REQUESTS
+  (`delphiSetRawStackScan`, `delphiMemoryExtent`) and custom EVENTS
+  (`delphiProgress`, `delphiLog`), plus the standard ones the tracker watches.
+- Still unbuilt, in rough order of value: a loaded-modules / BPL tree (the
+  first natural TreeView, and the one that answers "which module has symbols"),
+  a thread/stack dashboard, a register grid, an RSM + TD32 symbol/type
+  explorer, inline value decorations.
 - Related: ties into the status-bar / progress-cue UI-feedback item.
 
 Diagnostic logging:
