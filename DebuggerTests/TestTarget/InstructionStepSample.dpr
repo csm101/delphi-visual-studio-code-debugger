@@ -143,17 +143,38 @@ end;
 // correctly. Both values are chosen so their bytes are unambiguous when read
 // back: 'Hex' is three ASCII characters (six bytes of UTF-16), and the array is
 // four bytes no other buffer in this program would produce.
+type
+  // An object with a string FIELD: the case where the row a memory view is
+  // opened on is a CHILD of an expansion rather than a local. Its slot holds a
+  // pointer exactly like a local string's does.
+  TMemRefHolder = class
+  public
+    FText: string;
+    constructor Create(const AText: string);
+  end;
+
+constructor TMemRefHolder.Create(const AText: string);
+begin
+  inherited Create;
+  FText := AText;
+end;
+
 procedure InstrStepMemRefScenario;
 begin
   var Text: string := 'Hex';
   var Buf: TBytes := [$11, $22, $33, $44];
+  var Holder := TMemRefHolder.Create('Chars');
   // Two extents the type table cannot be trusted for on its own: `Extended` is
   // the one float whose width is target-dependent (8 on Win64, 10 on Win32),
   // and a NIL class reference has no instance to measure -- the variable is
   // still one pointer of storage, which is what the view is open on.
   var Wide: Extended := 1.5;
   var Obj: TObject := nil;
-  GSink := Length(Text) + Length(Buf) + Trunc(Wide) + Ord(Obj <> nil);  // {BP:INSTR_MEMREF}
+  // One line, and the marker on it: a breakpoint set on the CONTINUATION line of
+  // a split statement has no line-table entry to bind to, and the test then
+  // fails as "Timeout waiting for stopped event".
+  GSink := Length(Text) + Length(Buf) + Trunc(Wide) + Ord(Obj <> nil) + Length(Holder.FText);  // {BP:INSTR_MEMREF}
+  Holder.Free;
 end;
 
 begin

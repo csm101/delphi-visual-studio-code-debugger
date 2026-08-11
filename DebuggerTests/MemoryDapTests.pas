@@ -56,6 +56,11 @@ type
     [Test] procedure Variables_DynArrayLocal_MemoryReferencePointsAtElements;
     [Test] procedure Evaluate_StringWatch_CarriesSameMemoryReferenceAsLocals;
     [Test] procedure Evaluate_Rvalue_CarriesNoMemoryReference;
+    // A row that is a CHILD of an expansion -- a field of an object, an element
+    // of an array -- follows the same rule as a local. It did not: the payload
+    // rule was applied where locals are built and nowhere else, so expanding an
+    // object and opening its string field showed the pointer.
+    [Test] procedure Variables_StringFieldOfObject_PointsAtItsCharacters;
 
     // An open hex pane goes stale silently: nothing in DAP tells a client that
     // target MEMORY changed except the `memory` event, so without these the view
@@ -647,6 +652,50 @@ begin
   try
     Assert.AreEqual(8, Body.GetValue<Integer>('size', 0),
       'a nil object reference occupies one 64-bit pointer');
+  finally
+    Body.Free;
+  end;
+end;
+
+// Holder is a live object whose FText field holds 'Chars'. Expanding it and
+// asking for the field's memory must reach the five characters, not the eight
+// bytes of pointer that refer to them -- and the extent must say 10, which the
+// string header reports rather than what the field slot measures. The payload
+// rule used to be applied where LOCALS are built and nowhere else, so every
+// row inside an expansion pointed at its pointer.
+procedure TMemoryDapTests.Variables_StringFieldOfObject_PointsAtItsCharacters;
+begin
+  OpenSampleAt('Win64', 'INSTR_MEMREF');
+
+  var HolderVar := FClient.FindVar(FClient.GetLocalsRef(FClient.GetFrameId), 'Holder');
+  Assert.IsTrue(HolderVar <> nil, '"Holder" not found in Locals');
+  var ChildrenRef := 0;
+  try
+    ChildrenRef := HolderVar.GetValue<Integer>('variablesReference', 0);
+  finally
+    HolderVar.Free;
+  end;
+  Assert.IsTrue(ChildrenRef > 0, 'Holder should be expandable');
+
+  var Field := FClient.FindVar(ChildrenRef, 'FText');
+  Assert.IsTrue(Field <> nil, 'FText not found among Holder''s members');
+  var MemRef: string;
+  try
+    MemRef := Field.GetValue<string>('memoryReference', '');
+  finally
+    Field.Free;
+  end;
+
+  var Bytes := ReadBytesAt(FClient, MemRef, 10, 'string field "FText"');
+  Assert.AreEqual('C', Char(Bytes[0]), 'first character');
+  Assert.AreEqual(#0,  Char(Bytes[1]), 'UTF-16 high byte');
+  Assert.AreEqual('h', Char(Bytes[2]), 'second character');
+  Assert.AreEqual('s', Char(Bytes[8]), 'fifth character');
+
+  var Body := ExtentOf(FClient, MemRef);
+  try
+    Assert.AreEqual(10, Body.GetValue<Integer>('size', 0),
+      '''Chars'' is 5 characters of 2 bytes each');
   finally
     Body.Free;
   end;

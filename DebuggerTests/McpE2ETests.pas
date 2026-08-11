@@ -28,6 +28,10 @@ type
     [Test] procedure Evaluate_AfterStop;
     [Test] procedure ExpandVariable_ObjectFields;
     [Test] procedure ExpandVariable_PropertyGetter;
+    // Every addressable row says WHERE it is, so an agent can go straight to
+    // read_memory / write_memory / set_data_breakpoint -- and a reference type
+    // points at its payload, not at the pointer that holds it.
+    [Test] procedure Locals_CarryTheirAddress_AndAFieldPointsAtItsPayload;
     [Test] procedure ConditionalBreakpoint_Stops;
     [Test] procedure Logpoint_EmitsToDebuggerOutput;
     [Test] procedure Bpl_Breakpoint_Stops;
@@ -798,6 +802,92 @@ begin
       O := V as TJSONObject;
       Exit(True);
     end;
+end;
+
+// An agent could see a variable's value but never its ADDRESS, so reaching
+// read_memory / write_memory / set_data_breakpoint meant re-deriving one from
+// the rendered text -- or not doing it at all. Every addressable row now says
+// where it is, and for a reference type that is the PAYLOAD: the characters of
+// a string, not the eight bytes of pointer holding them. The field case was
+// wrong the longest, because the payload rule was applied where LOCALS are
+// built and nowhere else.
+procedure TMcpE2ETests.Locals_CarryTheirAddress_AndAFieldPointsAtItsPayload;
+begin
+  var Line := MarkerLine(EVAL_SOURCE, EVAL_MARKER);
+  var C := TMcpTestClient.Start(McpExe);
+  try
+    C.Call('initialize', nil).Free;
+    var LaunchArgs := TJSONObject.Create;
+    LaunchArgs.AddPair('program', TargetExe);
+    LaunchArgs.AddPair('sourceRoot', TargetDir);
+    C.CallTool('launch_debuggee', LaunchArgs).Free;
+    var BpArgs := TJSONObject.Create;
+    BpArgs.AddPair('sourceFile', EVAL_SOURCE);
+    BpArgs.AddPair('line', TJSONNumber.Create(Line));
+    C.CallTool('set_breakpoint', BpArgs).Free;
+    C.CallTool('continue_and_wait', nil).Free;
+
+    var Handle := '';
+    var Locals := C.CallTool('get_locals', nil);
+    try
+      var Row: TJSONObject;
+      Assert.IsTrue(McpFindRow(Locals as TJSONArray, 'W', Row), 'W not in get_locals');
+      // W holds a TWidget: `address` is the INSTANCE -- what read_memory should
+      // be pointed at -- and `storageAddress` is the slot holding the reference.
+      // Two different things, both useful, so both are reported.
+      Assert.IsTrue(Row.GetValue<string>('address', '') <> '',
+        'a class local must carry its address: ' + Row.ToJSON);
+      Assert.IsTrue(Row.GetValue<string>('storageAddress', '') <> '',
+        'a reference-typed row must also say where the reference lives: ' + Row.ToJSON);
+      Assert.IsTrue(Row.GetValue<Integer>('sizeBytes', 0) > 0,
+        'a live object knows its InstanceSize: ' + Row.ToJSON);
+      Handle := Row.GetValue<string>('handle', '');
+    finally
+      Locals.Free;
+    end;
+    Assert.IsTrue(Handle <> '', 'no expansion handle for W');
+
+    var FieldAddress := '';
+    var Groups := McpExpand(C, Handle);
+    try
+      var GroupRow: TJSONObject;
+      Assert.IsTrue(McpFindRow(Groups as TJSONArray, 'fields', GroupRow),
+        'no "fields" group: ' + Groups.ToJSON);
+      var Fields := McpExpand(C, GroupRow.GetValue<string>('handle', ''));
+      try
+        var FieldRow: TJSONObject;
+        Assert.IsTrue(McpFindRow(Fields as TJSONArray, 'FName', FieldRow),
+          'FName not among the fields: ' + Fields.ToJSON);
+        FieldAddress := FieldRow.GetValue<string>('address', '');
+        Assert.IsTrue(FieldAddress <> '',
+          'a string field must carry an address: ' + FieldRow.ToJSON);
+        Assert.AreEqual(10, FieldRow.GetValue<Integer>('sizeBytes', 0),
+          '''hello'' is 5 characters of 2 bytes each: ' + FieldRow.ToJSON);
+      finally
+        Fields.Free;
+      end;
+    finally
+      Groups.Free;
+    end;
+
+    // The proof that it is the payload and not the slot: the bytes there ARE
+    // the text. The slot would have held a pointer.
+    var MemArgs := TJSONObject.Create;
+    MemArgs.AddPair('address', FieldAddress);
+    MemArgs.AddPair('count', TJSONNumber.Create(10));
+    var Mem := C.CallTool('read_memory', MemArgs);
+    try
+      Assert.AreEqual('680065006C006C006F00',
+        (Mem as TJSONObject).GetValue<string>('hex', '').ToUpper,
+        'the bytes at a string field must be "hello" in UTF-16: ' + Mem.ToJSON);
+    finally
+      Mem.Free;
+    end;
+
+    C.CallTool('terminate_debuggee', nil).Free;
+  finally
+    C.Free;
+  end;
 end;
 
 // Getter-backed property over MCP: W -> 'properties' group -> 'Score' deferred

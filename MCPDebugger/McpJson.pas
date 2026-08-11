@@ -260,6 +260,29 @@ begin
   // expand_variable to read the children of a class/record/array/group value.
   if V.Expandable and (V.Handle <> 0) then
     Result.AddPair('handle', UInt64(V.Handle).ToString);
+  // WHERE the value is, so an agent can reach read_memory / write_memory /
+  // set_data_breakpoint without first re-deriving an address from the value
+  // text. `address` is what a memory view would open on: the PAYLOAD for a
+  // reference type (a string's characters, an array's elements, an object's
+  // instance) and the variable's own storage otherwise -- dumping the slot of a
+  // string shows a pointer, never the text. `storageAddress` is the slot
+  // itself, which is what a WRITE to the variable targets, and it is emitted
+  // only when the two differ, so the common case stays one field.
+  //
+  // Both are omitted rather than zeroed when the value has no address at all: a
+  // register-resident local, a synthetic group row, a value a getter call
+  // produced. `sizeBytes` likewise appears only when it was established, never
+  // guessed -- see TVariableExpander.ValueByteSize.
+  var Addr := V.Address;
+  if V.DataAddress <> 0 then
+    Addr := V.DataAddress;
+  if Addr <> 0 then begin
+    Result.AddPair('address', '0x' + IntToHex(Addr, 1));
+    if (V.DataAddress <> 0) and (V.Address <> 0) and (V.Address <> V.DataAddress) then
+      Result.AddPair('storageAddress', '0x' + IntToHex(V.Address, 1));
+    if V.ValueSize > 0 then
+      Result.AddPair('sizeBytes', TJSONNumber.Create(Int64(V.ValueSize)));
+  end;
 end;
 
 function VarListToJson(const Vars: TArray<TSessionVariable>): TJSONArray;
@@ -282,6 +305,19 @@ begin
     Result.AddPair('expandable', TJSONBool.Create(R.Expandable));
     if R.Expandable and (R.Handle <> 0) then
       Result.AddPair('handle', UInt64(R.Handle).ToString);
+    // Same fields, same meaning, as VarToJson: an expression that names storage
+    // can be read, written or watched by address. An rvalue -- an arithmetic
+    // result, a value a call returned -- exists nowhere and carries none.
+    var Addr := R.Address;
+    if R.DataAddress <> 0 then
+      Addr := R.DataAddress;
+    if Addr <> 0 then begin
+      Result.AddPair('address', '0x' + IntToHex(Addr, 1));
+      if (R.DataAddress <> 0) and (R.Address <> 0) and (R.Address <> R.DataAddress) then
+        Result.AddPair('storageAddress', '0x' + IntToHex(R.Address, 1));
+      if R.ValueSize > 0 then
+        Result.AddPair('sizeBytes', TJSONNumber.Create(Int64(R.ValueSize)));
+    end;
   end
   else
     Result.AddPair('error', R.ErrorText);

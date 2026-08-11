@@ -1611,204 +1611,30 @@ begin
   Result := True;
 end;
 
+// The three rules below live in TVariableExpander, which has every dependency
+// they need -- the debuggee, the runtime RTTI, the type tables and the
+// expansion table -- and which builds the rows that most need them: a field of
+// an expanded object, an element of an array. Answering them here as well would
+// mean two implementations of "where are this value's bytes", and the two would
+// drift. These are the session's face on them; SyncExpander has already pointed
+// the expander at the current debugger and providers.
 function TDebugSession.PayloadAddress(TypeKind: Byte; const TypeHint: string;
   RawValue: UInt64; ForceReference: Boolean = False): UInt64;
-const
-  // The Delphi TTypeKind ordinals whose storage is a REFERENCE to the value.
-  // Same list WatchWidthForType treats as pointer-width, minus the two whose
-  // pointee is not the user's data: a class REFERENCE points at a VMT, and a
-  // plain typed pointer's own value is what the user asked to see (`P` in the
-  // watch means the pointer; `P^` is how Pascal says "the pointee", and that
-  // expression resolves to its own address here).
-  TK_LSTRING   = 10;
-  TK_WSTRING   = 11;
-  TK_CLASS_    = 7;
-  TK_INTERFACE_= 15;
-  TK_DYNARRAY  = 17;
-  TK_USTRING   = 18;
-
-  // Below this, an address is not a user-space allocation on either bitness --
-  // it is a nil reference or a small ordinal sharing the slot's spelling.
-  MIN_PLAUSIBLE_ADDR = 65536;
-
-  function TypeNameIsReference: Boolean;
-  begin
-    // TD32 does not always resolve a kind (0), and the name is then the only
-    // evidence there is. Restricted to the spellings that can ONLY be a managed
-    // reference -- never `Pointer` or `PChar`, whose value is the answer.
-    for var Nm in ['string', 'UnicodeString', 'AnsiString', 'WideString', 'RawByteString',
-                   'UTF8String', 'TBytes'] do
-      if SameText(Trim(TypeHint), Nm) then
-        Exit(True);
-    Result := False;
-  end;
-
 begin
-  Result := 0;
-  if RawValue < MIN_PLAUSIBLE_ADDR then
-    Exit;
-  if not (ForceReference or
-          (TypeKind in [TK_LSTRING, TK_WSTRING, TK_CLASS_, TK_INTERFACE_,
-                        TK_DYNARRAY, TK_USTRING]) or
-          ((TypeKind = 0) and TypeNameIsReference)) then
-    Exit;
-  // Readable, or it is not an address worth handing to a memory view.
-  if FDebugger = nil then
-    Exit;
-  var Probe: Byte := 0;
-  if not FDebugger.ReadProcessMemoryAt(RawValue, @Probe, 1) then
-    Exit;
-  Result := RawValue;
+  SyncExpander;
+  Result := FExpander.PayloadAddress(TypeKind, TypeHint, RawValue, ForceReference);
 end;
 
-// Byte width of a type the LANGUAGE fixes, or 0 when the name is not one of
-// them. Shared by the watchpoint-width rule and the memory-extent rule, which
-// asked the same question and would otherwise answer it from two lists that
-// drift apart. PtrSize is the TARGET's, never the adapter's -- `string` and
-// `Pointer` are 4 bytes in a 32-bit debuggee.
 function TDebugSession.NamedTypeByteSize(const TypeName: string; PtrSize: Integer): Integer;
 begin
-  var N := Trim(TypeName);
-  for var Nm in ['Byte', 'ShortInt', 'Boolean', 'ByteBool', 'AnsiChar', 'UInt8', 'Int8'] do
-    if SameText(N, Nm) then Exit(1);
-  for var Nm in ['Word', 'SmallInt', 'WordBool', 'Char', 'WideChar', 'UInt16', 'Int16'] do
-    if SameText(N, Nm) then Exit(2);
-  for var Nm in ['Integer', 'LongInt', 'Cardinal', 'LongWord', 'LongBool', 'Single',
-                 'UInt32', 'Int32', 'FixedInt', 'FixedUInt'] do
-    if SameText(N, Nm) then Exit(4);
-  for var Nm in ['Int64', 'UInt64', 'Double', 'Currency', 'TDateTime', 'TDate',
-                 'TTime', 'Comp', 'Real'] do
-    if SameText(N, Nm) then Exit(8);
-  for var Nm in ['Pointer', 'NativeInt', 'NativeUInt', 'THandle', 'string',
-                 'UnicodeString', 'AnsiString', 'WideString', 'PChar', 'PAnsiChar',
-                 'PWideChar'] do
-    if SameText(N, Nm) then Exit(PtrSize);
-  // The wide floats. WideFloatByteSize reports only the widths that DIFFER
-  // from the eight-byte value slot -- it answers 0 for `Extended` on Win64,
-  // where the type is a plain Double -- so 0 here means "eight", not "unknown".
-  // Taking its 0 at face value is what reported a Win64 `Extended` local as
-  // having no measurable extent at all.
-  for var Nm in ['Extended', 'Extended80', 'Real48'] do
-    if SameText(N, Nm) then begin
-      var Wide := WideFloatByteSize(N, PtrSize);
-      if Wide > 0 then
-        Exit(Wide);
-      Exit(8);
-    end;
-  Result := 0;
+  Result := FExpander.NamedTypeByteSize(TypeName, PtrSize);
 end;
 
 function TDebugSession.ValueByteSize(TypeKind: Byte; const TypeHint: string;
   Address, DataAddress: UInt64; Handle: TVarHandle): UInt64;
-const
-  TK_CLASS_    = 7;
-  TK_LSTRING   = 10;
-  TK_WSTRING   = 11;
-  TK_DYNARRAY  = 17;
-  TK_USTRING   = 18;
-  // A value bigger than this is not something a memory view highlights as one
-  // variable's extent; it is a decode that went wrong.
-  MAX_EXTENT   = 16 * 1024 * 1024;
-
-  // Delphi's string header is the same shape on both bitnesses:
-  // CodePage(2) ElemSize(2) RefCnt(4) Length(4) then the characters. So the
-  // byte length is Length * ElemSize, both read from the header rather than
-  // assumed from the type name -- an AnsiString and a UnicodeString differ by
-  // exactly that factor.
-  function StringPayloadBytes(Payload: UInt64): UInt64;
-  begin
-    Result := 0;
-    if (Payload < 65536) or (FDebugger = nil) then
-      Exit;
-    var ElemSize: UInt16 := 0;
-    var Len: Int32 := 0;
-    if not FDebugger.ReadProcessMemoryAt(Payload - 10, @ElemSize, 2) then
-      Exit;
-    if not FDebugger.ReadProcessMemoryAt(Payload - 4, @Len, 4) then
-      Exit;
-    if (Len <= 0) or (ElemSize = 0) or (ElemSize > 4) then
-      Exit;
-    if Int64(Len) * ElemSize > MAX_EXTENT then
-      Exit;
-    Result := UInt64(Len) * ElemSize;
-  end;
-
-  // The kind is not always resolved -- TD32 leaves a plain `string` local at 0 --
-  // so the name answers where it can only mean a managed string. Same list, and
-  // the same reason, as PayloadAddress's own fallback.
-  function TypeNameIsString: Boolean;
-  begin
-    for var Nm in ['string', 'UnicodeString', 'AnsiString', 'WideString',
-                   'RawByteString', 'UTF8String'] do
-      if SameText(Trim(TypeHint), Nm) then
-        Exit(True);
-    Result := False;
-  end;
-
 begin
-  Result := 0;
-  if DataAddress <> 0 then begin
-    // The dynamic-array expansion FIRST, and regardless of the declared kind:
-    // it is measured EVIDENCE (a validated length/refcount header plus a known
-    // element size), where the kind is only a claim the type table makes.
-    if (Handle <> 0) and (FExpander <> nil) then begin
-      var Exp: TSessionExpansion;
-      if FExpander.TryGetExpansion(Handle, Exp) and (Exp.Kind = exDynArray) and
-         (Exp.ElemSize > 0) and (Exp.ElemCount > 0) then begin
-        var Total := UInt64(Exp.ElemSize) * UInt64(Exp.ElemCount);
-        if Total <= MAX_EXTENT then
-          Exit(Total);
-      end;
-    end;
-    if (TypeKind in [TK_LSTRING, TK_WSTRING, TK_USTRING]) or TypeNameIsString then
-      Exit(StringPayloadBytes(DataAddress));
-    // A live object answers for itself: its VMT carries InstanceSize. Accepted
-    // on the runtime evidence rather than only on a declared TK_CLASS, for the
-    // same reason as the array above.
-    if (FRtti <> nil) and ((TypeKind = TK_CLASS_) or FRtti.IsClassInstance(DataAddress)) then begin
-      var InstSize := FRtti.GetInstanceSize(DataAddress);
-      if (InstSize > 0) and (InstSize <= MAX_EXTENT) then
-        Exit(UInt64(InstSize));
-      Exit(0);
-    end;
-    // A payload whose length nothing here can establish (an interface, a
-    // reference type this build does not decode): no extent rather than a
-    // plausible one.
-    Exit(0);
-  end;
-
-  if Address = 0 then
-    Exit;
-
-  var PtrSize := 8;
-  if FDebugger <> nil then
-    PtrSize := FDebugger.TargetLayout.PointerSize;
-
-  // The NAME first, for the primitives whose width is fixed by the language.
-  // The type table is consulted only for what the name cannot answer: it
-  // resolves type ids per unit, and a mis-resolved id yields a size that is
-  // wrong without looking wrong -- an `Extended` local was reported as 121
-  // bytes that way, and a memory view would have drawn 121 bytes of neighbours
-  // as part of the variable.
-  var Named := NamedTypeByteSize(TypeHint, PtrSize);
-  if Named > 0 then
-    Exit(UInt64(Named));
-
-  if (TypeHint <> '') and (FDebugInfo <> nil) then begin
-    var Sz: Integer;
-    if FDebugInfo.GetTypeSize(TypeHint, Sz) and (Sz > 0) and (Sz <= MAX_EXTENT) then
-      Exit(UInt64(Sz));
-  end;
-
-  // A reference-typed variable with no payload to point at -- a nil object, an
-  // empty string, an unassigned interface. The variable itself is still a
-  // pointer-wide slot, and that slot IS what the view is open on.
-  if TypeKind in [TK_LSTRING, TK_WSTRING, TK_USTRING, TK_CLASS_, TK_DYNARRAY] then
-    Exit(UInt64(PtrSize));
-  if (FDebugInfo <> nil) and (TypeHint <> '') and
-     (FDebugInfo.LookupTypeKind(TypeHint) in [TK_CLASS_, TK_DYNARRAY,
-                                              TK_LSTRING, TK_WSTRING, TK_USTRING]) then
-    Exit(UInt64(PtrSize));
+  SyncExpander;
+  Result := FExpander.ValueByteSize(TypeKind, TypeHint, Address, DataAddress, Handle);
 end;
 
 function TDebugSession.WatchWidthForType(const TypeHint: string;

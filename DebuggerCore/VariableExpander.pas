@@ -148,6 +148,39 @@ type
     // measured (and sanity-checked) when the expansion was minted, so asking how
     // many BYTES the value occupies is a lookup rather than a second decode.
     function  TryGetExpansion(Handle: TVarHandle; out Exp: TSessionExpansion): Boolean;
+
+    // WHERE a value's bytes are, and HOW MANY of them there are. They live here
+    // rather than in TDebugSession because the answer needs the debuggee, the
+    // runtime RTTI, the type tables AND the expansion table -- and because the
+    // rows that most need them are the ones this class builds: a field of an
+    // expanded object, an element of an array. TDebugSession delegates.
+    //
+    // Delphi's reference types -- string, dynamic array, class instance,
+    // interface -- store one pointer and keep the value elsewhere, so the slot's
+    // bytes are the pointer and nothing anyone wants to look at. PayloadAddress
+    // returns where the value really is for those, and 0 for a value type, whose
+    // own storage already IS its bytes. A plain typed pointer is deliberately
+    // NOT among them: there the pointer is the value, and `P^` is how Pascal
+    // asks for the pointee. ForceReference says "this slot holds a pointer to
+    // the value whatever its type spells" -- true of a var/out parameter.
+    function  PayloadAddress(TypeKind: Byte; const TypeHint: string;
+                RawValue: UInt64; ForceReference: Boolean = False): UInt64;
+    // Byte width of a type whose size the LANGUAGE fixes (0 = not one of them).
+    // Consulted before the type table, which resolves ids per unit: a
+    // mis-resolved id gives a size that is wrong without looking wrong.
+    function  NamedTypeByteSize(const TypeName: string; PtrSize: Integer): Integer;
+    // How many bytes the value occupies, measured where it can be measured and
+    // 0 where it cannot -- a memory view draws this as the value's extent, so an
+    // unjustified number here would claim a neighbour's storage.
+    function  ValueByteSize(TypeKind: Byte; const TypeHint: string;
+                Address, DataAddress: UInt64; Handle: TVarHandle): UInt64;
+    // Fills DataAddress and ValueSize on a row that already knows its Address,
+    // its TypeName and (if it has one) its expansion handle. RawValue is the
+    // pointer-sized word AT that address, which is what a reference type stores.
+    // One call, so every producer of a row answers "where are its bytes" the
+    // same way.
+    procedure DescribeStorage(var V: TSessionVariable; TypeKind: Byte;
+                RawValue: UInt64; ForceReference: Boolean = False);
     // Attach an expansion handle to an already-formatted local, if it is a
     // class / Variant-array / dyn-array / record value. The caller fills V's
     // Name/Value/TypeName/EvaluateName first.
@@ -577,6 +610,9 @@ begin
     Result.Expandable := True;
     Result.Handle     := MintHandle(ChildExp);
     if ChildExp.IsRecord then Result.Kind := vkRecord else Result.Kind := vkClass;
+    // After the handle: a dynamic array's extent comes from the expansion that
+    // was just minted, which already measured its element size and count.
+    DescribeStorage(Result, TypeKind, PtrVal);
     Exit;
   end;
 
@@ -599,6 +635,7 @@ begin
         Result.TypeName := RF.TypeName;
       Break;
     end;
+  DescribeStorage(Result, TypeKind, PtrVal);
 end;
 
 function TVariableExpander.TryMakeRttiFieldExpansion(const RF: TRttiFieldInfo;
@@ -704,6 +741,12 @@ begin
         else Child.Kind := vkClass;
       end;
     end;
+    // Where this field's bytes are. A string field holds a pointer, so the row
+    // must point a memory view at the characters rather than at the slot.
+    var FieldPtr: UInt64 := 0;
+    if Debugger <> nil then
+      Debugger.ReadProcessMemoryAt(F.FieldAddr, @FieldPtr, Debugger.TargetLayout.PointerSize);
+    DescribeStorage(Child, F.TypeKind, FieldPtr);
     Result[N] := Child;
     Inc(N);
   end;
@@ -891,6 +934,10 @@ begin
           Child.Handle     := MintHandle(ChildExp);
           if ChildExp.IsRecord then Child.Kind := vkRecord else Child.Kind := vkClass;
         end;
+        // A field-backed property has the backing field's storage. The
+        // getter-backed branch below deliberately gets none: a value a getter
+        // CALL produced exists nowhere to point at.
+        DescribeStorage(Child, TypeKind, PtrVal);
       end
       else begin
         // Getter-backed: defer; the getter runs only on expand.
@@ -1080,6 +1127,15 @@ begin
         var LV := SyntheticLocal('', Exp.ElemTypeName, ElemAddr);
         Child.Value := Readers.FormatLocalValue(LV);
       end;
+      // An element of an array of strings or of objects holds a pointer like
+      // any other slot; the row points at what it refers to.
+      var ElemPtr: UInt64 := 0;
+      Debugger.ReadProcessMemoryAt(ElemAddr, @ElemPtr, Debugger.TargetLayout.PointerSize);
+      DescribeStorage(Child, ElemKind, ElemPtr);
+      // The element's own width is known exactly here -- it is what the stride
+      // was computed from -- so it beats anything derived from the type name.
+      if Child.DataAddress = 0 then
+        Child.ValueSize := Exp.ElemSize;
       List.Add(Child);
     end;
     Result := List.ToArray;
@@ -1240,6 +1296,9 @@ begin
       Child.Kind    := vkVariant;
       Child.Value   := FormatVariantElement(ElemAddr, Exp.VarBaseType, ElemSize);
       Child.Address := ElemAddr;   // real element slot in the VarArray's data buffer
+      // A VarArray cell is a value in place, of exactly the stride the array was
+      // created with -- no pointer to follow, and no type name to ask.
+      Child.ValueSize := ElemSize;
       if Exp.EvaluateName <> '' then
         Child.EvaluateName := Exp.EvaluateName + Nm;
       List.Add(Child);
@@ -1312,6 +1371,180 @@ function TVariableExpander.TryGetExpansion(Handle: TVarHandle;
   out Exp: TSessionExpansion): Boolean;
 begin
   Result := FByHandle.TryGetValue(Handle, Exp);
+end;
+
+function TVariableExpander.PayloadAddress(TypeKind: Byte; const TypeHint: string;
+  RawValue: UInt64; ForceReference: Boolean): UInt64;
+const
+  // Below this, an address is not a user-space allocation on either bitness --
+  // it is a nil reference, or a small ordinal sharing the slot's spelling.
+  MIN_PLAUSIBLE_ADDR = 65536;
+
+  function TypeNameIsReference: Boolean;
+  begin
+    // TD32 does not always resolve a kind (0), and the name is then the only
+    // evidence there is. Restricted to spellings that can ONLY be a managed
+    // reference -- never `Pointer` or `PChar`, whose value is the answer.
+    for var Nm in ['string', 'UnicodeString', 'AnsiString', 'WideString', 'RawByteString',
+                   'UTF8String', 'TBytes'] do
+      if SameText(Trim(TypeHint), Nm) then
+        Exit(True);
+    Result := False;
+  end;
+
+begin
+  Result := 0;
+  if (RawValue < MIN_PLAUSIBLE_ADDR) or (Debugger = nil) then
+    Exit;
+  if not (ForceReference or
+          (TypeKind in [TK_LSTRING, TK_WSTRING, TK_CLASS, TK_INTERFACE,
+                        TK_DYNARRAY, TK_USTRING]) or
+          ((TypeKind = TK_UNKNOWN) and TypeNameIsReference)) then
+    Exit;
+  // Readable, or it is not an address worth handing to a memory view.
+  var Probe: Byte := 0;
+  if not Debugger.ReadProcessMemoryAt(RawValue, @Probe, 1) then
+    Exit;
+  Result := RawValue;
+end;
+
+function TVariableExpander.NamedTypeByteSize(const TypeName: string;
+  PtrSize: Integer): Integer;
+begin
+  var N := Trim(TypeName);
+  for var Nm in ['Byte', 'ShortInt', 'Boolean', 'ByteBool', 'AnsiChar', 'UInt8', 'Int8'] do
+    if SameText(N, Nm) then Exit(1);
+  for var Nm in ['Word', 'SmallInt', 'WordBool', 'Char', 'WideChar', 'UInt16', 'Int16'] do
+    if SameText(N, Nm) then Exit(2);
+  for var Nm in ['Integer', 'LongInt', 'Cardinal', 'LongWord', 'LongBool', 'Single',
+                 'UInt32', 'Int32', 'FixedInt', 'FixedUInt'] do
+    if SameText(N, Nm) then Exit(4);
+  for var Nm in ['Int64', 'UInt64', 'Double', 'Currency', 'TDateTime', 'TDate',
+                 'TTime', 'Comp', 'Real'] do
+    if SameText(N, Nm) then Exit(8);
+  for var Nm in ['Pointer', 'NativeInt', 'NativeUInt', 'THandle', 'string',
+                 'UnicodeString', 'AnsiString', 'WideString', 'PChar', 'PAnsiChar',
+                 'PWideChar'] do
+    if SameText(N, Nm) then Exit(PtrSize);
+  // The wide floats. WideFloatByteSize reports only the widths that DIFFER from
+  // the eight-byte value slot -- it answers 0 for `Extended` on Win64, where the
+  // type IS a plain Double -- so 0 there means "eight", not "unknown". Taking
+  // that 0 at face value reported a Win64 Extended local as having no
+  // measurable extent at all.
+  for var Nm in ['Extended', 'Extended80', 'Real48'] do
+    if SameText(N, Nm) then begin
+      var Wide := WideFloatByteSize(N, PtrSize);
+      if Wide > 0 then
+        Exit(Wide);
+      Exit(8);
+    end;
+  Result := 0;
+end;
+
+function TVariableExpander.ValueByteSize(TypeKind: Byte; const TypeHint: string;
+  Address, DataAddress: UInt64; Handle: TVarHandle): UInt64;
+const
+  // A value bigger than this is not a variable's extent; it is a decode that
+  // went wrong.
+  MAX_EXTENT = 16 * 1024 * 1024;
+
+  // Delphi's string header is the same shape on both bitnesses:
+  // CodePage(2) ElemSize(2) RefCnt(4) Length(4), then the characters. The byte
+  // length is Length * ElemSize, both READ from the header rather than assumed
+  // from the type name -- an AnsiString and a UnicodeString differ by exactly
+  // that factor.
+  function StringPayloadBytes(Payload: UInt64): UInt64;
+  begin
+    Result := 0;
+    if (Payload < 65536) or (Debugger = nil) then
+      Exit;
+    var ElemSize: UInt16 := 0;
+    var Len: Int32 := 0;
+    if not Debugger.ReadProcessMemoryAt(Payload - 10, @ElemSize, 2) then
+      Exit;
+    if not Debugger.ReadProcessMemoryAt(Payload - 4, @Len, 4) then
+      Exit;
+    if (Len <= 0) or (ElemSize = 0) or (ElemSize > 4) then
+      Exit;
+    if Int64(Len) * ElemSize > MAX_EXTENT then
+      Exit;
+    Result := UInt64(Len) * ElemSize;
+  end;
+
+  function TypeNameIsString: Boolean;
+  begin
+    for var Nm in ['string', 'UnicodeString', 'AnsiString', 'WideString',
+                   'RawByteString', 'UTF8String'] do
+      if SameText(Trim(TypeHint), Nm) then
+        Exit(True);
+    Result := False;
+  end;
+
+begin
+  Result := 0;
+  if DataAddress <> 0 then begin
+    // The dynamic-array expansion FIRST, and regardless of the declared kind:
+    // it is measured EVIDENCE (a validated length/refcount header plus a known
+    // element size), where the kind is only a claim the type table makes.
+    if Handle <> 0 then begin
+      var Exp: TSessionExpansion;
+      if TryGetExpansion(Handle, Exp) and (Exp.Kind = exDynArray) and
+         (Exp.ElemSize > 0) and (Exp.ElemCount > 0) then begin
+        var Total := UInt64(Exp.ElemSize) * UInt64(Exp.ElemCount);
+        if Total <= MAX_EXTENT then
+          Exit(Total);
+      end;
+    end;
+    if (TypeKind in [TK_LSTRING, TK_WSTRING, TK_USTRING]) or TypeNameIsString then
+      Exit(StringPayloadBytes(DataAddress));
+    // A live object answers for itself: its VMT carries InstanceSize. Accepted
+    // on the runtime evidence rather than only on a declared TK_CLASS, for the
+    // same reason as the array above.
+    if (Rtti <> nil) and ((TypeKind = TK_CLASS) or Rtti.IsClassInstance(DataAddress)) then begin
+      var InstSize := Rtti.GetInstanceSize(DataAddress);
+      if (InstSize > 0) and (InstSize <= MAX_EXTENT) then
+        Exit(UInt64(InstSize));
+      Exit(0);
+    end;
+    // A payload whose length nothing here can establish (an interface, a
+    // reference type this build does not decode): no extent rather than a
+    // plausible one.
+    Exit(0);
+  end;
+
+  if Address = 0 then
+    Exit;
+
+  var PtrSize := 8;
+  if Debugger <> nil then
+    PtrSize := Debugger.TargetLayout.PointerSize;
+
+  var Named := NamedTypeByteSize(TypeHint, PtrSize);
+  if Named > 0 then
+    Exit(UInt64(Named));
+
+  if (TypeHint <> '') and (DebugInfo <> nil) then begin
+    var Sz: Integer;
+    if DebugInfo.GetTypeSize(TypeHint, Sz) and (Sz > 0) and (Sz <= MAX_EXTENT) then
+      Exit(UInt64(Sz));
+  end;
+
+  // A reference-typed row with no payload to point at -- a nil object, an empty
+  // string, an unassigned interface. It is still a pointer-wide slot, and that
+  // slot IS what a view opened on it shows.
+  if TypeKind in [TK_LSTRING, TK_WSTRING, TK_USTRING, TK_CLASS, TK_DYNARRAY] then
+    Exit(UInt64(PtrSize));
+  if (DebugInfo <> nil) and (TypeHint <> '') and
+     (DebugInfo.LookupTypeKind(TypeHint) in [TK_CLASS, TK_DYNARRAY,
+                                             TK_LSTRING, TK_WSTRING, TK_USTRING]) then
+    Exit(UInt64(PtrSize));
+end;
+
+procedure TVariableExpander.DescribeStorage(var V: TSessionVariable;
+  TypeKind: Byte; RawValue: UInt64; ForceReference: Boolean);
+begin
+  V.DataAddress := PayloadAddress(TypeKind, V.TypeName, RawValue, ForceReference);
+  V.ValueSize   := ValueByteSize(TypeKind, V.TypeName, V.Address, V.DataAddress, V.Handle);
 end;
 
 function TVariableExpander.GetChildren(Handle: TVarHandle): TArray<TSessionVariable>;
