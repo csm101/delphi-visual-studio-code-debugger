@@ -23,7 +23,37 @@ longer true, delete it.
 
 ---
 
-## Current task (2026-08-11)
+## Current task (2026-08-12)
+
+**0.5.0 draft is on GitHub, awaiting the user's review and publish**
+(`gh release edit v0.5.0 --draft=false`). Everything below it is pushed
+(`52d81a3`). Suite at the draft: 1237 / 1233 / 0 / 0 / 4. One flaky full-run
+failure (`Test_RtlStringGetter_VarOutFromPropertyType`, machine under load,
+159 s shards) passed 2/2 isolated and the rerun was green — matches the open
+KNOWN_UNKNOWNS flake entry.
+
+**Correction on 0.4.1** (the `52d81a3` commit message is WRONG about this):
+0.4.1 HAD been published by the user. It was deleted in error on a stale
+"still a draft" assumption, then restored 1:1 the same day — same tag (which
+had survived, and is what proved the publication), byte-identical zip
+(SHA `6DDA0377…` matches the published notes), original notes, Latest pointer
+put back. Trap recorded in `TRAPS.md`. The 0.5.0 notes now split "New in
+0.5.0" from "Shipped in 0.4.1".
+
+**Next feature agreed with the user: the safe-getter whitelist** (auto-evaluate
+side-effect-free getters instead of "expand to evaluate"). Design discussed and
+settled 2026-08-12; increments, in order: (1) SafeCallPolicy engine + manual
+archive + VS Code add/deny UI — no AI; (2) shorter budget for AUTO calls +
+entry-byte hook sniff (E9/FF25 -> defer); (3) AI-agent contract + JSON schema +
+lint probe, then the agent and a distributed RTL archive; (4) optional machine
+screening for the hover tier. Key decisions: lookup key = SYMBOLICATED address
+of the RESOLVED target (concrete-class VMT — covers virtuals/interfaces);
+verdicts are categories (pure / mayRaise / lazyInit / conditional+dependsOn /
+unsafe), lazyInit never auto (TWinControl.Handle creates the window); layered
+JSON archives deny > user > project > shipped; runtime guards stay on always
+(raise/AV abort + the existing 8 s watchdog, `REMOTE_CALL_TIMEOUT_MS`).
+
+## Previous task (2026-08-11)
 
 **Post-0.4.0 verification pass, driven by the user in VS Code.** They exercise the
 debugger, report what is wrong, and each defect is fixed here with a test that is

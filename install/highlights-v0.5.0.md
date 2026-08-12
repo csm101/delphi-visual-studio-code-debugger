@@ -1,10 +1,16 @@
 ## What's new
 
-- **A memory view of our own** — scrolls *before* a value as well as after it, marks the bytes that formally belong to it, and highlights what changed since the last stop. No Hex Editor extension needed any more.
+New in 0.5.0:
+
 - **A Delphi Modules tree** — every loaded BPL/DLL with the debug-info formats actually found for it, filterable, so "why can I see nothing in this package" is answered at a glance instead of from a log.
-- Memory can be inspected from the **Watch** panel too, and inspecting a `string`, an array or an object shows **its data**, not the pointer that holds it — including fields inside an expanded object.
 - MCP: every addressable variable now carries its **address and size**, so an agent can go straight to `read_memory` / `set_data_breakpoint`.
 - Fixed: a package's `.dcp` was only looked for **beside the `.bpl`** — never found for IDE-installed packages, so a `TDateTime` local in a runtime-loaded BPL read as a bare `Double`.
+- Memory inspection follows the data one level deeper: a `string` field **inside an expanded object** shows its text, not the pointer that holds it.
+
+Shipped in 0.4.1, and included here:
+
+- **A memory view of our own** — scrolls *before* a value as well as after it, marks the bytes that formally belong to it, and highlights what changed since the last stop. No Hex Editor extension needed any more.
+- Memory can be inspected from the **Watch** panel too, and a `string`, an array or an object shows **its data**, not the pointer that holds it.
 - Fixed: a watch on a main-block variable said `<name: not found>` while the Variables view was displaying it.
 - Fixed: `%TEMP%\dap_adapter.log` could grow without limit — 1.5 GB was measured. Now capped and rotated.
 

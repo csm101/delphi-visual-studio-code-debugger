@@ -291,6 +291,21 @@ absurdly.
   a stale fixture fails as "Timeout waiting for stopped event" — which reads as a
   debugger defect. It calls `build_target.bat` now.
 
+## Releases
+
+- **`gh release delete` deletes a PUBLISHED release as readily as a draft, and
+  prints nothing that tells them apart.** Check `isDraft` (`gh release view
+  <tag> --json isDraft`) before any delete. This was learned by deleting a
+  release the user had published hours earlier, on a stale "it is still my
+  draft" assumption.
+- **The remote tag is the proof of publication.** A draft has no tag; publishing
+  creates one; `gh release delete` (without `--cleanup-tag`) leaves it behind.
+  `git ls-remote --tags origin` therefore settles "was this ever published"
+  even after the release page is gone — and the surviving tag plus the zip in
+  `dist\` (verify its SHA-256 against the published notes) is what makes a
+  byte-identical restore possible: `gh release create <tag> --verify-tag
+  --latest=false --notes-file <notes> <zip>`, then `--latest` if it was latest.
+
 ## Symbol providers and concurrency
 
 - **Any provider the adapter queries is hit from two threads and runs under
