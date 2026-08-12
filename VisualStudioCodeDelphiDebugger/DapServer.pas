@@ -18,6 +18,8 @@ uses
   // For NoStockMemoryViewSwitch: the unit that owns which command-line switches
   // this program recognises also owns their spelling.
   ProcessListJson,
+  // For DefaultSafelistUserDir (the safelist responses name the user file).
+  SafeCallPolicy,
   ExprEval, ValueEncoders, Disassembler, ZydisDisassembler;
 
 // Full definition lives in the disassemble section further down (it is the
@@ -576,6 +578,13 @@ type
     // for the extension's memory view. Deliberately NOT part of the DAP surface
     // -- no standard request carries a value's byte extent.
     procedure HandleMemoryExtent(Seq: Integer; Args: TJSONObject);
+    // Custom requests `delphiSafelistAdd` / `delphiSafelistRemove` /
+    // `delphiSafelistReload`: the safe-getter user file, written through the
+    // adapter because the adapter owns the paths and the reload. After a
+    // mutation an `invalidated(variables)` follows, so the panel re-renders
+    // with the row now evaluated (or deferred again) without waiting for the
+    // next stop.
+    procedure HandleSafelist(Seq: Integer; const Cmd: string; Args: TJSONObject);
     // Tells the client every tracked view may have changed. Called wherever the
     // debuggee's memory can have moved under an open pane: at each stop, and
     // after a write this adapter itself performed.
@@ -4031,6 +4040,52 @@ begin
   end;
 end;
 
+procedure TDapServer.HandleSafelist(Seq: Integer; const Cmd: string;
+  Args: TJSONObject);
+begin
+  var Key := '';
+  if Args <> nil then
+    Key := Trim(Args.GetValue<string>('key', ''));
+
+  if SameText(Cmd, 'delphiSafelistReload') then
+    FSession.SafelistReload
+  else begin
+    if Key = '' then begin
+      FIO.SendErrorResponse(Seq, Cmd, 'missing "key"');
+      Exit;
+    end;
+    if SameText(Cmd, 'delphiSafelistAdd') then
+      FSession.SafelistAdd(Key, Args.GetValue<string>('verdict', '') = 'deny')
+    else if SameText(Cmd, 'delphiSafelistRemove') then
+      FSession.SafelistRemove(Key)
+    else begin
+      FIO.SendErrorResponse(Seq, Cmd, 'unknown safelist command');
+      Exit;
+    end;
+  end;
+
+  var Body := TJSONObject.Create;
+  try
+    Body.AddPair('userFile',
+      TPath.Combine(DefaultSafelistUserDir, 'user.safelist.json'));
+    FIO.SendResponse(Seq, Cmd, True, Body);
+  finally
+    Body.Free;
+  end;
+
+  // The decision changed while stopped: make the panel re-ask instead of
+  // showing yesterday's deferral until the next stop.
+  if FClientSupportsInvalidated and (FSession.State = dsStopped) then begin
+    var Inv := TJSONObject.Create;
+    try
+      Inv.AddPair('areas', TJSONArray.Create(TJSONString.Create('variables')));
+      FIO.SendEvent('invalidated', Inv);
+    finally
+      Inv.Free;
+    end;
+  end;
+end;
+
 procedure TDapServer.EmitMemoryChanged;
 begin
   if not FClientSupportsMemoryEvent then
@@ -4236,6 +4291,10 @@ begin
     Item.AddPair('memoryReference', RefStr);
     RememberMemoryExtent(RefStr, MemRef, V.ValueSize, V.Name, V.TypeName);
   end;
+  // Getter-backed property rows carry the safelist spelling, so the frontend's
+  // "always evaluate" / "never" actions name exactly the member this row is.
+  if V.SafelistKey <> '' then
+    Item.AddPair('delphiSafelistKey', V.SafelistKey);
   Arr.AddElement(Item);
 end;
 
@@ -4966,6 +5025,7 @@ begin
     else if Cmd = 'modules'           then HandleModules(Seq, Args)
     else if Cmd = 'delphiSetRawStackScan' then HandleSetRawStackScan(Seq, Args)
     else if Cmd = 'delphiMemoryExtent'    then HandleMemoryExtent(Seq, Args)
+    else if Cmd.StartsWith('delphiSafelist') then HandleSafelist(Seq, Cmd, Args)
     else
       // Unknown command: send empty success response to avoid VS Code hanging
       FIO.SendResponse(Seq, Cmd, True);

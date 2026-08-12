@@ -130,6 +130,13 @@ type
     // variable's extent, and a wrong one would claim a neighbouring variable's
     // bytes belong to this one.
     ValueSize:    UInt64;
+    // Set ONLY on a getter-backed property row: the spelling a safelist entry
+    // for this member would use (e.g. 'TWidget.DoCalcScore', falling back to
+    // 'TWidget.Score' when the getter's name is unknown). It is what the
+    // frontend's "always evaluate this" / "never" actions write, so the row
+    // and the archive cannot disagree about the member's identity. Empty
+    // everywhere else.
+    SafelistKey:  string;
   end;
 
   TSessionScope = record

@@ -663,6 +663,43 @@ function activate(context) {
       (commandArgument) => memoryView.openMemoryView(context, commandArgument))
   );
 
+  // The safe-getter safelist. A getter-backed property row defers as "(expand
+  // to evaluate)"; these two actions write the user's decision through the
+  // adapter (which owns the file and the reload), and the panel re-renders at
+  // once via the invalidated event the adapter sends back. The row names its
+  // own safelist entry (delphiSafelistKey), so what the user clicked and what
+  // the file says cannot disagree.
+  function safelistAction(verdict) {
+    return async (commandArgument) => {
+      const session = vscode.debug.activeDebugSession;
+      if (!session || session.type !== DEBUG_TYPE) return;
+      const variable = commandArgument && (commandArgument.variable || commandArgument);
+      const key = variable && variable.delphiSafelistKey;
+      if (!key) {
+        vscode.window.showInformationMessage(
+          'Only getter-backed property rows can be added to the safelist — ' +
+          'this row is read directly and needs no permission.');
+        return;
+      }
+      try {
+        const reply = await session.customRequest('delphiSafelistAdd',
+          { key: key, verdict: verdict });
+        vscode.window.setStatusBarMessage(
+          verdict === 'deny'
+            ? 'Delphi: "' + key + '" will never auto-evaluate'
+            : 'Delphi: "' + key + '" will auto-evaluate from now on',
+          6000);
+        void reply;
+      } catch (err) {
+        vscode.window.showWarningMessage(
+          'Safelist update failed: ' + (err && err.message ? err.message : String(err)));
+      }
+    };
+  }
+  context.subscriptions.push(
+    vscode.commands.registerCommand('delphi-win64.safelistAllow', safelistAction('allow')),
+    vscode.commands.registerCommand('delphi-win64.safelistDeny', safelistAction('deny')));
+
   const modules = modulesView.register(context);
 
   context.subscriptions.push(

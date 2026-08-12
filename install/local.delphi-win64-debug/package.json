@@ -91,6 +91,18 @@
         "title": "Clear Module Filter",
         "category": "Delphi Debugger",
         "icon": "$(clear-all)"
+      },
+      {
+        "command": "delphi-win64.safelistAllow",
+        "title": "Always Evaluate This Property (Delphi)",
+        "category": "Delphi Debugger",
+        "icon": "$(eye)"
+      },
+      {
+        "command": "delphi-win64.safelistDeny",
+        "title": "Never Auto-Evaluate This Property (Delphi)",
+        "category": "Delphi Debugger",
+        "icon": "$(eye-closed)"
       }
     ],
     "views": {
@@ -136,6 +148,14 @@
           "when": "debugType == 'delphi-win64'"
         },
         {
+          "command": "delphi-win64.safelistAllow",
+          "when": "false"
+        },
+        {
+          "command": "delphi-win64.safelistDeny",
+          "when": "false"
+        },
+        {
           "command": "delphi-win64.copyModulePath",
           "when": "false"
         }
@@ -152,6 +172,16 @@
           "command": "delphi-win64.viewMemory",
           "when": "debugType == 'delphi-win64'",
           "group": "inline"
+        },
+        {
+          "command": "delphi-win64.safelistAllow",
+          "when": "debugType == 'delphi-win64'",
+          "group": "2_delphi@1"
+        },
+        {
+          "command": "delphi-win64.safelistDeny",
+          "when": "debugType == 'delphi-win64'",
+          "group": "2_delphi@2"
         }
       ],
       "debug/watch/context": [
@@ -159,6 +189,16 @@
           "command": "delphi-win64.viewMemory",
           "when": "debugType == 'delphi-win64'",
           "group": "inline"
+        },
+        {
+          "command": "delphi-win64.safelistAllow",
+          "when": "debugType == 'delphi-win64'",
+          "group": "2_delphi@1"
+        },
+        {
+          "command": "delphi-win64.safelistDeny",
+          "when": "debugType == 'delphi-win64'",
+          "group": "2_delphi@2"
         }
       ],
       "view/title": [

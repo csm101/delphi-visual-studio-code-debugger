@@ -17,7 +17,7 @@ uses
   System.SysUtils, System.Classes, System.Generics.Collections, System.Variants,
   System.Math, Winapi.Windows,
   DebugSessionTypes, DebugTarget, DebugInfoTypes, DebugInfoSet,
-  TD32FileReader, DelphiRtti, DelphiValueReaders, ExprEval;
+  TD32FileReader, DelphiRtti, DelphiValueReaders, ExprEval, SafeCallPolicy;
 
 type
   // A pending nested-expansion node, addressed by an opaque TVarHandle. Minted
@@ -71,6 +71,9 @@ type
     TD32:      TTD32FileReader;
     Rtti:      TDelphiRtti;
     Readers:   TDelphiValueReader;
+    // Which getters may be called WITHOUT an explicit request. nil = none may:
+    // every getter-backed property defers, which is the historical behaviour.
+    Policy:    TSafeCallPolicy;
   private
     FByHandle:   TDictionary<TVarHandle, TSessionExpansion>;
     FNextHandle: TVarHandle;
@@ -125,6 +128,21 @@ type
                 WantEvents: Boolean): Boolean;
     function  PropertyBackingFieldOffset(const Members: TArray<TClassMember>;
                 const Prop: TClassMember; out Offset: Integer): Boolean;
+    // The spellings a safelist entry for this property could use, most specific
+    // first: the declaring class + the getter METHOD where TD32 names it (the
+    // verdict is about the code that runs), then class + property name (all an
+    // RSM-sourced member can offer). SafelistKeyFor is the single spelling the
+    // row carries for the frontend's add/deny actions.
+    function  SafelistKeysFor(const OwnerClass: string;
+                const P: TClassMember): TArray<string>;
+    function  SafelistKeyFor(const OwnerClass: string;
+                const P: TClassMember): string;
+    // Runs the getter NOW and fills the row with the result -- the exact call
+    // clicking "expand to evaluate" would have made, value formatting and
+    // drill-down handle included. On failure the row carries the error text,
+    // which for a mayRaise member is the intended outcome, not a defect.
+    procedure EvaluateGetterInto(var Child: TSessionVariable;
+                const PropExpr, DeclaredTypeName: string);
     function  ExpandViaMembers(const Exp: TSessionExpansion): TArray<TSessionVariable>;
     function  ExpandDynArray(const Exp: TSessionExpansion): TArray<TSessionVariable>;
     function  ExpandProperties(const Exp: TSessionExpansion): TArray<TSessionVariable>;
@@ -940,20 +958,32 @@ begin
         DescribeStorage(Child, TypeKind, PtrVal);
       end
       else begin
-        // Getter-backed: defer; the getter runs only on expand.
+        // Getter-backed: deferred by default -- calling code the user did not
+        // ask to run is how a debugger mutates the state it is showing. The
+        // safelist lifts the deferral for members someone vouched for, and
+        // what it authorises is EXACTLY the call clicking "expand to evaluate"
+        // would have made: same resolution, same guards, no new call path.
+        Child.SafelistKey := SafelistKeyFor(Exp.TypeName, P);
         if PropExpr <> '' then begin
-          var GetExp := Default(TSessionExpansion);
-          GetExp.Kind         := exPropertyGetter;
-          GetExp.BaseAddr     := Exp.BaseAddr;
-          GetExp.TypeName     := P.TypeName;
-          GetExp.EvaluateName := PropExpr;
-          Child.Value      := '(expand to evaluate)';
-          Child.Expandable := True;
-          Child.Handle     := MintHandle(GetExp);
+          if (Policy <> nil) and
+             TSafeCallPolicy.AllowsAutoCall(
+               Policy.Resolve(SafelistKeysFor(Exp.TypeName, P))) then begin
+            EvaluateGetterInto(Child, PropExpr, P.TypeName);
+          end
+          else begin
+            var GetExp := Default(TSessionExpansion);
+            GetExp.Kind         := exPropertyGetter;
+            GetExp.BaseAddr     := Exp.BaseAddr;
+            GetExp.TypeName     := P.TypeName;
+            GetExp.EvaluateName := PropExpr;
+            Child.Value      := '(expand to evaluate)';
+            Child.Expandable := True;
+            Child.Handle     := MintHandle(GetExp);
+          end;
         end
         else
           Child.Value := '(getter)';
-        if P.TypeName <> '' then
+        if (Child.TypeName = '') and (P.TypeName <> '') then
           Child.TypeName := P.TypeName;
       end;
       List.Add(Child);
@@ -962,6 +992,87 @@ begin
   finally
     List.Free;
     Seen.Free;
+  end;
+end;
+
+function TVariableExpander.SafelistKeysFor(const OwnerClass: string;
+  const P: TClassMember): TArray<string>;
+
+  procedure Add(const Cls, Member: string);
+  begin
+    if (Cls = '') or (Member = '') then
+      Exit;
+    var K := LowerCase(Cls + '.' + Member);
+    for var Existing in Result do
+      if Existing = K then
+        Exit;
+    Result := Result + [K];
+  end;
+
+begin
+  Result := nil;
+  // Getter-method spellings first: the verdict is a claim about the CODE that
+  // runs, and the method name is the closest thing to it these records carry.
+  Add(P.DeclClass, P.GetterName);
+  Add(OwnerClass,  P.GetterName);
+  // Property spellings: what an RSM-sourced member (no GetterName) can offer,
+  // and the friendlier spelling for hand-written entries.
+  Add(P.DeclClass, P.Name);
+  Add(OwnerClass,  P.Name);
+end;
+
+function TVariableExpander.SafelistKeyFor(const OwnerClass: string;
+  const P: TClassMember): string;
+begin
+  var Keys := SafelistKeysFor(OwnerClass, P);
+  if Length(Keys) = 0 then
+    Exit('');
+  Result := Keys[0];
+end;
+
+procedure TVariableExpander.EvaluateGetterInto(var Child: TSessionVariable;
+  const PropExpr, DeclaredTypeName: string);
+begin
+  if Debugger = nil then
+    Exit;
+  Debugger.ClearActiveFrame;
+  var Eval := TExprEvaluator.Create(Debugger, Rtti, DebugInfo);
+  var Val: TExprValue;
+  var OK: Boolean;
+  try
+    OK := Eval.Evaluate(PropExpr, Val);
+  finally
+    Eval.Free;
+  end;
+
+  if not OK then begin
+    // The raise/AV/watchdog abort inside the synthetic call turned into an
+    // error string. Showing it IS the contract for a mayRaise member.
+    Child.Value := Val.TypeHint;
+    if DeclaredTypeName <> '' then
+      Child.TypeName := DeclaredTypeName;
+    Exit;
+  end;
+
+  Child.Value := FormatExprValue(Val);
+  if Val.TypeHint <> '' then
+    Child.TypeName := Val.TypeHint
+  else if DeclaredTypeName <> '' then
+    Child.TypeName := DeclaredTypeName;
+
+  // Same drill-down the deferred path's expansion would have offered: a class
+  // or record result gets a members handle; the value row replaces only the
+  // '(expand to evaluate)' placeholder, never the ability to descend.
+  var IsClassInst := (Rtti <> nil) and (Val.RawValue >= 65536) and
+                     Rtti.IsClassInstance(Val.RawValue);
+  var DrillAddr: UInt64;
+  if IsClassInst then DrillAddr := Val.RawValue else DrillAddr := Val.Address;
+  var ChildExp: TSessionExpansion;
+  if (DrillAddr >= 65536) and
+     TryClassifyChild(Child.TypeName, PropExpr, Val.Address, Val.RawValue, ChildExp) then begin
+    Child.Expandable := True;
+    Child.Handle     := MintHandle(ChildExp);
+    if ChildExp.IsRecord then Child.Kind := vkRecord else Child.Kind := vkClass;
   end;
 end;
 

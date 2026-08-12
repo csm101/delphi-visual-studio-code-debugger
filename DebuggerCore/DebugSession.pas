@@ -28,7 +28,7 @@ uses
   DebugSessionTypes, DebugTarget, DebugInfoTypes, DebugInfoSet,
   MapFileReader, RsmFileReader, TD32FileReader, ModuleSymbolLoader,
   DelphiRtti, DelphiValueReaders, ExprEval, WinDebuggerBase, WinDebuggerX86,
-  SourceResolver,
+  SourceResolver, SafeCallPolicy,
   VariableExpander, BreakpointEval, ExceptionRules, ValueEncoders, DapProtocol;
 
 const
@@ -122,6 +122,10 @@ type
 
     // Conditional / hit-count / logpoint breakpoint evaluation (shared engine).
     FBpEval:     TBpEvaluator;
+
+    // Which getters may be auto-evaluated (SafeCallPolicy.pas). Owned here,
+    // handed to the expander by SyncExpander like every other dependency.
+    FSafePolicy: TSafeCallPolicy;
 
     // Output ring buffers (MCP has no async channel -> drained on demand).
     FDebuggeeOutput: TList<string>;   // program stdout
@@ -438,6 +442,15 @@ type
     // has that Id.
     function  RemoveAddressBreakpoint(const Id: string): Boolean;
 
+    // The safe-getter policy's user file (SafeCallPolicy.pas): what the
+    // frontend's "always evaluate this property" / "never" actions write.
+    // Key spelling comes from TSessionVariable.SafelistKey, so the row and the
+    // archive cannot disagree. Reload also drops every cached verdict, which
+    // is what makes an external hand-edit take effect without a relaunch.
+    procedure SafelistAdd(const Key: string; Deny: Boolean);
+    procedure SafelistRemove(const Key: string);
+    procedure SafelistReload;
+
     // Data breakpoints (watchpoints; increment 4 of DATA_BREAKPOINTS_PLAN.md).
     // Mirrors the source-breakpoint API's shape, but SetDataBreakpoints
     // replaces the WHOLE set on every call (no per-file grouping exists for an
@@ -738,6 +751,11 @@ begin
   FDebuggerOutput := TList<string>.Create;
   FExpander    := TVariableExpander.Create;
   FBpEval      := TBpEvaluator.Create;
+  // The safe-getter policy: user dir (env-overridable, which is how the tests
+  // keep their hands off the real user file) + the adapter's own directory for
+  // the shipped archives. Source dirs arrive at Launch/Attach.
+  FSafePolicy  := TSafeCallPolicy.Create(DefaultSafelistUserDir,
+                    ExtractFilePath(ParamStr(0)));
   FRsmDisabled := GetEnvironmentVariable('NO_RSM') = '1';
   FLoader      := TModuleSymbolLoader.Create;
   FLoader.DebugInfo       := FDebugInfo;
@@ -775,6 +793,7 @@ begin
   FRtti.Free;
   FExpander.Free;        // frees only its handle table; reader refs not owned
   FBpEval.Free;          // owns nothing; reader/rtti refs not owned
+  FSafePolicy.Free;
   FDebuggerOutput.Free;
   FDebuggeeOutput.Free;
   FLoader.Free;          // removes its module providers from FDebugInfo, frees
@@ -930,6 +949,9 @@ begin
   if Opts.RsmPath <> '' then FRsmPath := Opts.RsmPath
   else                       FRsmPath := ChangeFileExt(FExePath, '.rsm');
   FResolver.Configure(Opts.SourceRoot, FExePath, Opts.ExtraSourcePaths);
+  // The safelist containment rule anchors on source directories; these are the
+  // ones the launch configuration knows about.
+  FSafePolicy.RegisterSourceDirs([Opts.SourceRoot] + Opts.ExtraSourcePaths);
 
   FModulesConfig := Opts.Modules;
   FLoader.LoadMainModule(FExePath, FMapPath, FRsmPath);
@@ -972,6 +994,9 @@ begin
   if Opts.RsmPath <> '' then FRsmPath := Opts.RsmPath
   else                       FRsmPath := ChangeFileExt(FExePath, '.rsm');
   FResolver.Configure(Opts.SourceRoot, FExePath, Opts.ExtraSourcePaths);
+  // The safelist containment rule anchors on source directories; these are the
+  // ones the launch configuration knows about.
+  FSafePolicy.RegisterSourceDirs([Opts.SourceRoot] + Opts.ExtraSourcePaths);
 
   FModulesConfig := Opts.Modules;
   FLoader.LoadMainModule(FExePath, FMapPath, FRsmPath);
@@ -3074,6 +3099,21 @@ end;
 // Pushes the current symbol/reader/rtti references into the shared expander just
 // before use. FRtti and FReaders are created lazily on the first stop, so the
 // expander must pick up whatever exists at point of use, not at construction.
+procedure TDebugSession.SafelistAdd(const Key: string; Deny: Boolean);
+begin
+  FSafePolicy.AddUser(Key, Deny);
+end;
+
+procedure TDebugSession.SafelistRemove(const Key: string);
+begin
+  FSafePolicy.RemoveUser(Key);
+end;
+
+procedure TDebugSession.SafelistReload;
+begin
+  FSafePolicy.Reload;
+end;
+
 procedure TDebugSession.SyncExpander;
 begin
   FExpander.Debugger  := FDebugger;
@@ -3081,6 +3121,7 @@ begin
   FExpander.TD32      := FLoader.MainTD32;
   FExpander.Rtti      := FRtti;
   FExpander.Readers   := Readers;
+  FExpander.Policy    := FSafePolicy;
 end;
 
 function TDebugSession.LocalToSession(const LV: TLocalValue): TSessionVariable;

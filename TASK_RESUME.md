@@ -40,18 +40,31 @@ had survived, and is what proved the publication), byte-identical zip
 put back. Trap recorded in `TRAPS.md`. The 0.5.0 notes now split "New in
 0.5.0" from "Shipped in 0.4.1".
 
-**Next feature agreed with the user: the safe-getter whitelist** (auto-evaluate
-side-effect-free getters instead of "expand to evaluate"). Design discussed and
-settled 2026-08-12; increments, in order: (1) SafeCallPolicy engine + manual
-archive + VS Code add/deny UI — no AI; (2) shorter budget for AUTO calls +
-entry-byte hook sniff (E9/FF25 -> defer); (3) AI-agent contract + JSON schema +
-lint probe, then the agent and a distributed RTL archive; (4) optional machine
-screening for the hover tier. Key decisions: lookup key = SYMBOLICATED address
-of the RESOLVED target (concrete-class VMT — covers virtuals/interfaces);
-verdicts are categories (pure / mayRaise / lazyInit / conditional+dependsOn /
-unsafe), lazyInit never auto (TWinControl.Handle creates the window); layered
-JSON archives deny > user > project > shipped; runtime guards stay on always
-(raise/AV abort + the existing 8 s watchdog, `REMOTE_CALL_TIMEOUT_MS`).
+**Safe-getter whitelist: increment 1 is BUILT and green** (uncommitted). What
+exists: `DebuggerCore\SafeCallPolicy.pas` (5 discovery tiers with precedence —
+user.safelist.json > source-anchored ancestor walk > source-path pool >
+user-global generated > shipped; category verdicts with the tier policy in
+`AllowsAutoCall`: pure/trusted/mayRaise auto, lazyInit/conditional/unsafe/deny
+never; lazy per-archive parse mtime-validated; atomic sorted user-file writes;
+env override `DELPHI_DEBUGGER_SAFELIST_DIR` for tests). The expander's
+getter-backed branch consults it and, when allowed, runs EXACTLY the call the
+"expand to evaluate" click would have made (`EvaluateGetterInto`) — no new call
+path; rows carry `SafelistKey` (declclass.gettername, fallback class.prop);
+indexed properties stay excluded. DAP: `delphiSafelistAdd/Remove/Reload` +
+`invalidated(variables)` so the panel re-renders at once; rows carry
+`delphiSafelistKey`. VS Code: context-menu Always/Never on Variables and Watch
+rows. Tests: SafeCallPolicyTests (9) + SafelistDapTests (2, user file
+redirected to scratch). Suite 1248/1244/0/0/4. Trap fixed on the way:
+PurgeLeftoverTempDirs deleted LIVE sibling workers' scratch dirs (only file
+locks had been saving the older fixtures) — now age-gated at 10 minutes.
+
+**Remaining increments** (design settled 2026-08-12, discovery rules in this
+conversation and PROJECT_STATE once committed): (2) shorter watchdog budget for
+AUTO calls + entry-byte hook sniff (E9/FF25 -> defer); (3) AI-agent contract +
+JSON schema + SafelistProbe lint, then the agent (`DevTools\safelist\`) and a
+distributed RTL archive — dependsOn resolution (direct cross-library + virtual
+via concrete-class VMT) lands here; (4) optional machine screening (Zydis) for
+the hover tier. Hover stays call-free until then.
 
 ## Previous task (2026-08-11)
 
