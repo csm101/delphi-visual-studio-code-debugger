@@ -46,8 +46,13 @@ console.log('manifest');
 test('package.json parses and keeps its identity', () => {
   assert.strictEqual(manifest.main, './extension.js');
   assert.ok(manifest.version);
+  // The two debug-type events are what make the extension exist at all. The
+  // view event is what lets the modules tree populate when it is opened with no
+  // session running -- without it the view renders and stays permanently empty,
+  // because nothing has activated the extension that provides its data.
   assert.deepStrictEqual(manifest.activationEvents,
-    ['onDebugResolve:delphi-win64', 'onDebugDynamicConfigurations:delphi-win64']);
+    ['onDebugResolve:delphi-win64', 'onDebugDynamicConfigurations:delphi-win64',
+     'onView:delphiModules']);
 });
 
 test('every command used by the extension is declared', () => {

@@ -104,6 +104,7 @@ const vscodeStub = {
     showWarningMessage: (message) => recorded.warnings.push(message),
     showErrorMessage: (message) => recorded.errors.push(message),
     showTextDocument: async () => ({ revealRange() {} }),
+    createTreeView: () => ({ message: '', dispose() {} }),
     registerTreeDataProvider: () => ({ dispose() {} }),
     createWebviewPanel: (id, title) => {
       const panel = {

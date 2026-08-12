@@ -51,6 +51,35 @@ eq('modules with symbols come last', sorted[3], 'libtabautomezzid29.bpl');
 eq('sorting does not mutate the caller\'s array',
    mv.sortModules([bare, main])[0] !== undefined, true);
 
+/* -------------------------------------------------------------- filter --- */
+
+const many = [main, withDcp, bare, indexing];
+
+// A blank filter is "no filter", not "match nothing": an empty box must not
+// empty a view of 150 modules.
+eq('an empty filter shows everything', mv.filterModules(many, '').length, 4);
+eq('whitespace is still empty', mv.filterModules(many, '   ').length, 4);
+eq('a missing filter is empty too', mv.filterModules(many, undefined).length, 4);
+
+eq('matches by name, case-insensitively',
+   mv.filterModules(many, 'NTDLL').map((m) => m.name), ['ntdll.dll']);
+// The path matters: on a machine where every package is libSomething, the
+// directory is often what tells them apart.
+eq('matches by path too',
+   mv.filterModules(many, 'C:\\Bpl').map((m) => m.name), ['libtabautomezzid29.bpl']);
+// Words are AND-ed, so two remembered fragments beat one exact spelling.
+eq('space-separated words are all required',
+   mv.filterModules(many, 'tab d29').map((m) => m.name), ['libtabautomezzid29.bpl']);
+eq('a word that matches nothing rules the module out',
+   mv.filterModules(many, 'tab zzz').length, 0);
+
+eq('the summary counts modules when unfiltered', mv.filterSummary(150, 150, ''), '150 modules');
+eq('one module is not "modules"', mv.filterSummary(1, 1, ''), '1 module');
+// "7 of 150" is the difference between a filter that worked and one that
+// silently matched nothing.
+eq('the summary shows what was filtered away',
+   mv.filterSummary(150, 7, 'qbf'), '7 of 150 — filter: qbf');
+
 /* --------------------------------------------------------------- status -- */
 
 eq('a module with formats has symbols', mv.hasSymbols(withDcp), true);

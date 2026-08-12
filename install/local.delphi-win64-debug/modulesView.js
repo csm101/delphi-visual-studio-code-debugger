@@ -51,6 +51,31 @@ function moduleDescription(module) {
   return parts.join('  ·  ');
 }
 
+// Substring match over the NAME and the PATH, case-insensitive. The path is
+// included on purpose: on a machine where every package is called libSomething,
+// "hydra_2" or "Bpl\Win64" is often what tells them apart. A blank needle is
+// "no filter" rather than "match nothing" -- an empty filter box must not empty
+// the view.
+//
+// Space-separated words are AND-ed, so "qbf 29" finds libQbfD29 without
+// requiring the exact spelling: with 150 modules loaded, the whole point is to
+// type two fragments you remember rather than one string you do not.
+function filterModules(modules, needle) {
+  const words = String(needle || '').toLowerCase().split(/\s+/).filter((w) => w.length > 0);
+  if (words.length === 0) return (modules || []).slice();
+  return (modules || []).filter((m) => {
+    const haystack = ((m.name || '') + ' ' + (m.path || '')).toLowerCase();
+    return words.every((w) => haystack.indexOf(w) !== -1);
+  });
+}
+
+// What the view says above the list. With 150 modules loaded, "7 of 150" is the
+// difference between a filter that worked and one that silently matched nothing.
+function filterSummary(total, shown, needle) {
+  if (!needle) return total + (total === 1 ? ' module' : ' modules');
+  return shown + ' of ' + total + ' — filter: ' + needle;
+}
+
 function formatSize(bytes) {
   if (!(bytes > 0)) return '';
   if (bytes >= 1024 * 1024) return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
@@ -92,7 +117,28 @@ class DelphiModulesProvider {
     this._emitter = new vscode.EventEmitter();
     this.onDidChangeTreeData = this._emitter.event;
     this.modules = [];
+    this.filter = '';
     this.error = '';
+    // Set by register(); used to show the count and the active filter above the
+    // list, which is where a filter that matched nothing is visible.
+    this.view = null;
+  }
+
+  visibleModules() {
+    return filterModules(this.modules, this.filter);
+  }
+
+  setFilter(text) {
+    this.filter = String(text || '').trim();
+    vscode.commands.executeCommand('setContext', 'delphiModulesFiltered', this.filter !== '');
+    this._emitter.fire();
+    this.updateSummary();
+  }
+
+  updateSummary() {
+    if (!this.view) return;
+    this.view.message = this.error ? '' :
+      filterSummary(this.modules.length, this.visibleModules().length, this.filter);
   }
 
   refresh() {
@@ -108,6 +154,7 @@ class DelphiModulesProvider {
         this.modules = sortModules(reply && reply.modules);
         this.error = '';
         this._emitter.fire();
+        this.updateSummary();
       },
       (err) => {
         // Reported in the tree rather than as a toast: a failure to list
@@ -116,6 +163,7 @@ class DelphiModulesProvider {
         this.modules = [];
         this.error = err && err.message ? err.message : String(err);
         this._emitter.fire();
+        this.updateSummary();
       });
   }
 
@@ -154,7 +202,14 @@ class DelphiModulesProvider {
         return [{ kind: 'message', label: 'Could not list modules: ' + this.error }];
       if (this.modules.length === 0)
         return [{ kind: 'message', label: 'No modules — start a Delphi debug session.' }];
-      return this.modules.map((m) => ({ kind: 'module', module: m }));
+      const visible = this.visibleModules();
+      // A filter that matches nothing says so, and says what it is filtering by.
+      // An empty tree alone reads as "the session has no modules", which would
+      // be a lie about the debuggee.
+      if (visible.length === 0)
+        return [{ kind: 'message',
+                  label: 'No module matches "' + this.filter + '" (' + this.modules.length + ' loaded)' }];
+      return visible.map((m) => ({ kind: 'module', module: m }));
     }
     if (node.kind === 'module')
       return moduleDetails(node.module).map((d) =>
@@ -165,11 +220,30 @@ class DelphiModulesProvider {
 
 function register(context) {
   const provider = new DelphiModulesProvider();
-  context.subscriptions.push(
-    vscode.window.registerTreeDataProvider('delphiModules', provider));
+  // createTreeView rather than registerTreeDataProvider: it hands back the view,
+  // and the view is what can carry the count and the active filter above the
+  // list -- which is where "the filter matched nothing" becomes visible.
+  const view = vscode.window.createTreeView('delphiModules', { treeDataProvider: provider });
+  provider.view = view;
+  context.subscriptions.push(view);
 
   context.subscriptions.push(
     vscode.commands.registerCommand('delphi-win64.refreshModules', () => provider.refresh()));
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand('delphi-win64.filterModules', async () => {
+      const answer = await vscode.window.showInputBox({
+        prompt: 'Show only modules whose name or path contains all of these words',
+        placeHolder: 'e.g. qbf   ·   tabautomezzi   ·   bpl win64',
+        value: provider.filter
+      });
+      if (answer === undefined) return;   // dismissed: leave the filter alone
+      provider.setFilter(answer);
+    }));
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand('delphi-win64.clearModulesFilter',
+      () => provider.setFilter('')));
 
   context.subscriptions.push(
     vscode.commands.registerCommand('delphi-win64.copyModulePath', (node) => {
@@ -195,6 +269,8 @@ module.exports = {
   // Exported for the unit tests: the shaping is where a defect would be silent
   // (a module sorted out of sight, a status that reads as "fine" when it is not).
   sortModules: sortModules,
+  filterModules: filterModules,
+  filterSummary: filterSummary,
   hasSymbols: hasSymbols,
   moduleDescription: moduleDescription,
   moduleDetails: moduleDetails,

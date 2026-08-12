@@ -53,6 +53,7 @@ const vscodeStub = {
     showInformationMessage() {},
     showTextDocument: async () => ({ revealRange() {} }),
     createWebviewPanel() { throw new Error('not used by these tests'); },
+    createTreeView: () => ({ message: '', dispose() {} }),
     registerTreeDataProvider() { return { dispose() {} }; }
   },
   // The modules tree registers a TreeDataProvider and an EventEmitter at

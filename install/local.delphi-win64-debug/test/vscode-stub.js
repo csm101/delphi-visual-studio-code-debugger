@@ -56,6 +56,7 @@ module.exports = {
     createStatusBarItem: () => ({ dispose() {} }),
     createWebviewPanel: createWebviewPanel,
     registerTreeDataProvider: () => ({ dispose() {} }),
+    createTreeView: () => ({ message: '', dispose() {} }),
     showInformationMessage: () => Promise.resolve(undefined),
     showWarningMessage: () => Promise.resolve(undefined),
     showInputBox: () => Promise.resolve(undefined)

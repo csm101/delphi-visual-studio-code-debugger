@@ -34,7 +34,8 @@
   "main": "./extension.js",
   "activationEvents": [
     "onDebugResolve:delphi-win64",
-    "onDebugDynamicConfigurations:delphi-win64"
+    "onDebugDynamicConfigurations:delphi-win64",
+    "onView:delphiModules"
   ],
   "contributes": {
     "commands": [
@@ -78,6 +79,18 @@
         "title": "Copy Path",
         "category": "Delphi Debugger",
         "icon": "$(copy)"
+      },
+      {
+        "command": "delphi-win64.filterModules",
+        "title": "Filter Modules...",
+        "category": "Delphi Debugger",
+        "icon": "$(filter)"
+      },
+      {
+        "command": "delphi-win64.clearModulesFilter",
+        "title": "Clear Module Filter",
+        "category": "Delphi Debugger",
+        "icon": "$(clear-all)"
       }
     ],
     "views": {
@@ -112,6 +125,14 @@
         },
         {
           "command": "delphi-win64.refreshModules",
+          "when": "debugType == 'delphi-win64'"
+        },
+        {
+          "command": "delphi-win64.filterModules",
+          "when": "debugType == 'delphi-win64'"
+        },
+        {
+          "command": "delphi-win64.clearModulesFilter",
           "when": "debugType == 'delphi-win64'"
         },
         {
@@ -157,9 +178,19 @@
           "group": "navigation@98"
         },
         {
-          "command": "delphi-win64.refreshModules",
+          "command": "delphi-win64.filterModules",
           "when": "view == delphiModules",
           "group": "navigation@1"
+        },
+        {
+          "command": "delphi-win64.clearModulesFilter",
+          "when": "view == delphiModules && delphiModulesFiltered",
+          "group": "navigation@2"
+        },
+        {
+          "command": "delphi-win64.refreshModules",
+          "when": "view == delphiModules",
+          "group": "navigation@3"
         }
       ],
       "debug/toolBar": [
