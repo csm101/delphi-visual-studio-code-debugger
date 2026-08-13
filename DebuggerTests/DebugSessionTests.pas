@@ -519,6 +519,7 @@ type
     [Test] procedure SetFieldVariable_ViaClassHandle_WritesField;
     [Test] procedure Terminate_ReapsDebuggeeProcess;
     [Test] procedure Terminate_ReleasesSymbolFileLock;
+    [Test] procedure NaturalExit_ReleasesTheImageFileLock;
     [Test] procedure Pause_RetargetsToUserThread;
     [Test] procedure ExceptionFilters_ParseNames;
     [Test] procedure DeepNested_LocalsResolveAtDepth2;
@@ -2338,6 +2339,83 @@ begin
       'exe still locked after Terminate -- the session did not release its symbol files (F17)');
   finally
     Session.Free;
+  end;
+end;
+
+// Sibling of the one above, on the path the user actually hit: the target exits
+// ON ITS OWN and NOTHING calls Terminate. A held handle to the exited process
+// pins its image section and locks the .exe until the debugger process dies; on
+// an attach the session routinely outlives the target, so this is the difference
+// between "rebuild works" and "rebuild fails until you close the editor". The
+// session is deliberately still alive at the assert -- Terminate/Destroy would
+// close the handles and hide the bug -- so HandleExitProcess must release them
+// by itself. Uses a private COPY so a sibling worker's lock on the shared target
+// cannot masquerade as this leak.
+procedure TDebugSessionTests.NaturalExit_ReleasesTheImageFileLock;
+
+  function CanOpenExclusive(const Path: string): Boolean;
+  begin
+    Result := False;
+    try
+      var FS := TFileStream.Create(Path, fmOpenReadWrite or fmShareExclusive);
+      FS.Free;
+      Result := True;
+    except
+      // still locked
+    end;
+  end;
+
+begin
+  var Scratch := MakeTestScratchDir('ExitLock_');
+  try
+    var ProbeExe := TPath.Combine(Scratch, 'ExitLockProbe.exe');
+    TFile.Copy(TargetExe, ProbeExe);
+    TFile.Copy(TargetMap, TPath.ChangeExtension(ProbeExe, '.map'));
+    TFile.Copy(TargetRsm, TPath.ChangeExtension(ProbeExe, '.rsm'));
+
+    var Session := TDebugSession.Create;
+    try
+      var Opts         := Default(TLaunchOptions);
+      Opts.ExePath     := ProbeExe;
+      Opts.MapPath     := TPath.ChangeExtension(ProbeExe, '.map');
+      Opts.RsmPath     := TPath.ChangeExtension(ProbeExe, '.rsm');
+      Opts.SourceRoot  := TargetDir;
+      Opts.StopAtEntry := False;
+      Assert.IsTrue(Session.Launch(Opts), 'Launch returned False');
+
+      // Precondition, so the post-exit assert has teeth: a live, image-mapped
+      // debuggee locks its own .exe. If this is already open, the later "it
+      // unlocked" would prove nothing.
+      Assert.IsFalse(CanOpenExclusive(ProbeExe),
+        'the freshly launched target should lock its own .exe');
+
+      // No breakpoints: the target runs every scenario and returns from its main
+      // block on its own. Pump until it does.
+      var Deadline := GetTickCount64 + 60000;
+      while (not Session.HasExited) and (GetTickCount64 < Deadline) do
+        Session.Pump;
+      Assert.IsTrue(Session.HasExited, 'target did not exit on its own within 60 s');
+
+      // The moment of truth: the session is STILL ALIVE and no one called
+      // Terminate. If the exit handler released the process handle, the zombie is
+      // gone and the file is free -- allow a short window for the OS to drop the
+      // image lock.
+      // The moment of truth: the session is STILL ALIVE and no one called
+      // Terminate. The exit handler must have released the embedded-TD32
+      // mapping, so the file is free for a rebuild -- allow a short window for
+      // the OS to drop the image lock behind the exited process.
+      var LockDeadline := GetTickCount64 + 5000;
+      while (not CanOpenExclusive(ProbeExe)) and (GetTickCount64 < LockDeadline) do
+        Sleep(30);
+      Assert.IsTrue(CanOpenExclusive(ProbeExe),
+        'the .exe is still locked after the target exited on its own -- the ' +
+        'debugger is still holding the embedded-TD32 memory mapping');
+    finally
+      Session.Terminate;
+      Session.Free;
+    end;
+  finally
+    DeleteTempDirWithRetry(Scratch);
   end;
 end;
 

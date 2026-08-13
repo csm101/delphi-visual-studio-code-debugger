@@ -343,6 +343,22 @@ absurdly.
 - **`DapLog` needs `GLogPath` set in unit initialization**, not in `TDapIO.Create`,
   or every non-DAP consumer (probes, tests, MCP) logs nowhere even with
   `DAP_LOG=1`.
+- **Embedded TD32 keeps the debuggee's own binary memory-mapped for the loader's
+  whole life** (`TTD32FileReader.OpenMappedFile`, `FILE_SHARE_READ`, no write/delete
+  share). TD32 lives INSIDE the `.exe`/`.bpl`, so the binary is locked on disk while
+  the reader is alive. On a LAUNCH that is invisible — the session ends with the
+  target and frees the reader — but on an ATTACH the session outlives the target, so
+  the file stays locked and a rebuild fails until the server exits. Released now in
+  `TModuleSymbolLoader.ReleaseMainSymbolMapping`, called from
+  `TDebugSession.HandleTargetExited`; the next launch/attach reloads a fresh reader.
+  Do NOT try to fix this by closing the debuggee PROCESS handle or `DebugActiveProcessStop`
+  — both were tried and the file stayed locked; the mapping is the lock, not the
+  zombie. Adding write/delete share is also insufficient: a held mapping blocks the
+  linker's truncate (`ERROR_USER_MAPPED_FILE`) regardless. Regression:
+  `TDebugSessionTests.NaturalExit_ReleasesTheImageFileLock`. STILL OPEN: runtime BPL
+  module readers (`TModuleSymbols.Td32`) keep the same lock on each `.bpl`; releasing
+  those safely needs the symbol worker quiesced first (it, not the main thread, owns
+  module readers).
 
 ## Engine and language gotchas
 
