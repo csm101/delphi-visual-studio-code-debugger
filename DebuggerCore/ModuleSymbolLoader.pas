@@ -341,6 +341,16 @@ type
     // (fired on every launch/attach) reloads a fresh reader; RSM/MAP/JCL are
     // latched and untouched.
     procedure ReleaseMainSymbolMapping;
+    // The runtime-module counterpart: every loaded BPL/DLL keeps its own binary
+    // mapped (embedded TD32) exactly like the main exe, so each stays locked on
+    // disk while its reader lives. A process exit delivers EXIT_PROCESS, not a
+    // per-DLL UNLOAD, so nothing releases them -- on an attach they lock every
+    // package until the server exits. Quiesces the prefetch worker first (no-op
+    // when prefetch is off, the default) so no module reader is mid-parse, then
+    // detaches every module's providers and clears the registry; the readers are
+    // ARC-freed and unmap their files. Re-attach re-registers modules from fresh
+    // DLL-load events. Dispatch-thread only, like the rest of the registry.
+    procedure ReleaseModuleSymbolMappings;
 
     // --- Runtime-module registry ---
     function  RegisterModuleRecord(const AName, AFullPath: string;
@@ -1143,6 +1153,33 @@ begin
     Exit;
   ReleaseOne(FMainTD32, 'td32');
   ReleaseOne(FMainTds, 'tds');
+end;
+
+procedure TModuleSymbolLoader.ReleaseModuleSymbolMappings;
+begin
+  if FDebugInfo = nil then
+    Exit;
+  // Stop the worker before freeing any reader. It parses module readers off the
+  // dispatch thread; it only ever holds NOT-yet-registered readers, but shutting
+  // it down also discards anything in flight so a post-exit DrainPrefetch cannot
+  // re-register -- and re-lock -- a package for the now-dead process. No-op when
+  // prefetch was never started (the default).
+  ShutdownPrefetch;
+  if FModules = nil then
+    Exit;
+  for var I := FModules.Count - 1 downto 0 do begin
+    var M := FModules[I];
+    if M.MapIface  <> nil then FDebugInfo.RemoveProvider(M.MapIface);
+    if M.RsmIface  <> nil then FDebugInfo.RemoveProvider(M.RsmIface);
+    if M.Td32Iface <> nil then FDebugInfo.RemoveProvider(M.Td32Iface);
+    if M.DcpIface  <> nil then FDebugInfo.RemoveProvider(M.DcpIface);
+    if M.JclIface  <> nil then FDebugInfo.RemoveProvider(M.JclIface);
+    if M.TdsIface  <> nil then FDebugInfo.RemoveProvider(M.TdsIface);
+  end;
+  // Clearing the list frees each TModuleSymbols; its interface fields release,
+  // dropping the last ref to each reader (RemoveProvider above dropped
+  // FDebugInfo's), so the readers destroy and unmap their binaries here.
+  FModules.Clear;
 end;
 
 { Registry }

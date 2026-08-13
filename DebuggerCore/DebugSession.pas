@@ -2152,12 +2152,15 @@ begin
   Inc(FStopGeneration);
   if Assigned(FOnExited) then
     FOnExited(ExitCode);
-  // The main exe's embedded TD32 stays memory-mapped for the loader's whole
-  // life. On an attach the session outlives the target, so that mapping would
-  // lock the .exe on disk and block a rebuild until the server exits. Release it
-  // now that the process is gone; a later launch/attach reloads a fresh reader.
-  if FLoader <> nil then
+  // The main exe AND every runtime BPL keep their own binary memory-mapped for
+  // the loader's whole life (embedded TD32). On an attach the session outlives
+  // the target, so those mappings lock each file on disk and block a rebuild
+  // until the server exits. Release them now that the process is gone; a later
+  // launch/attach reloads fresh readers from the new module-load events.
+  if FLoader <> nil then begin
     FLoader.ReleaseMainSymbolMapping;
+    FLoader.ReleaseModuleSymbolMappings;
+  end;
 end;
 
 procedure TDebugSession.HandleTargetOutput(const Text: string);

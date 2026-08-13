@@ -520,6 +520,7 @@ type
     [Test] procedure Terminate_ReapsDebuggeeProcess;
     [Test] procedure Terminate_ReleasesSymbolFileLock;
     [Test] procedure NaturalExit_ReleasesTheImageFileLock;
+    [Test] procedure NaturalExit_ReleasesTheBplFileLock;
     [Test] procedure Pause_RetargetsToUserThread;
     [Test] procedure ExceptionFilters_ParseNames;
     [Test] procedure DeepNested_LocalsResolveAtDepth2;
@@ -2419,6 +2420,97 @@ begin
   end;
 end;
 
+// The BPL counterpart: a runtime package the debugger loaded symbols for must
+// not stay locked after the host exits either. Private copies of host AND
+// package -- LoadPackage resolves the package beside the host, i.e. the copy --
+// so a sibling worker's lock on the shared ones cannot masquerade as this leak.
+procedure TDebugSessionTests.NaturalExit_ReleasesTheBplFileLock;
+
+  function CanOpenExclusive(const Path: string): Boolean;
+  begin
+    Result := False;
+    try
+      var FS := TFileStream.Create(Path, fmOpenReadWrite or fmShareExclusive);
+      FS.Free;
+      Result := True;
+    except
+      // still locked
+    end;
+  end;
+
+  procedure CopyIfExists(const Src, Dst: string);
+  begin
+    if TFile.Exists(Src) then
+      TFile.Copy(Src, Dst);
+  end;
+
+begin
+  var Scratch := MakeTestScratchDir('BplLock_');
+  try
+    var HostCopy := TPath.Combine(Scratch, 'TestHost.exe');
+    var BplCopy  := TPath.Combine(Scratch, 'TestSubject.bpl');
+    TFile.Copy(HostExe, HostCopy);
+    CopyIfExists(HostMap, TPath.ChangeExtension(HostCopy, '.map'));
+    CopyIfExists(HostRsm, TPath.ChangeExtension(HostCopy, '.rsm'));
+    var BplSrc := ExtractFilePath(HostExe) + 'TestSubject.bpl';
+    Assert.IsTrue(TFile.Exists(BplSrc), 'TestSubject.bpl not built beside TestHost.exe');
+    TFile.Copy(BplSrc, BplCopy);
+    CopyIfExists(TPath.ChangeExtension(BplSrc, '.map'), TPath.ChangeExtension(BplCopy, '.map'));
+    CopyIfExists(TPath.ChangeExtension(BplSrc, '.rsm'), TPath.ChangeExtension(BplCopy, '.rsm'));
+
+    var Line := MarkerLine(EVAL_SOURCE, EVAL_MARKER);
+    Assert.IsTrue(Line > 0, EVAL_MARKER + ' marker not found');
+
+    var Session := TDebugSession.Create;
+    try
+      var Opts         := Default(TLaunchOptions);
+      Opts.ExePath     := HostCopy;
+      Opts.MapPath     := TPath.ChangeExtension(HostCopy, '.map');
+      Opts.RsmPath     := TPath.ChangeExtension(HostCopy, '.rsm');
+      Opts.SourceRoot  := TargetDir;
+      Opts.StopAtEntry := False;
+      Assert.IsTrue(Session.Launch(Opts), 'Launch returned False');
+
+      var Spec: TBpLineSpec;
+      Spec      := Default(TBpLineSpec);
+      Spec.Line := Line;
+      Session.SetBreakpoints(EVAL_SOURCE, [Spec]);
+
+      // Run until the host has LoadPackage'd the copy and stopped inside it --
+      // that is when the package's embedded TD32 is mapped, i.e. the .bpl locked.
+      var Deadline := GetTickCount64 + 60000;
+      while (Session.State <> dsStopped) and (not Session.HasExited) and
+            (GetTickCount64 < Deadline) do
+        Session.Pump;
+      Assert.AreEqual(Ord(dsStopped), Ord(Session.State),
+        'did not stop inside the runtime package');
+      Assert.IsFalse(CanOpenExclusive(BplCopy),
+        'precondition: a package the debugger loaded symbols for locks its .bpl');
+
+      // Let the host run to its own exit.
+      Session.ContinueExecution;
+      var ExitDeadline := GetTickCount64 + 60000;
+      while (not Session.HasExited) and (GetTickCount64 < ExitDeadline) do
+        Session.Pump;
+      Assert.IsTrue(Session.HasExited, 'host did not exit on its own within 60 s');
+
+      // Session still alive, no Terminate: the exit handler must have released
+      // the package mapping too.
+      var LockDeadline := GetTickCount64 + 5000;
+      while (not CanOpenExclusive(BplCopy)) and (GetTickCount64 < LockDeadline) do
+        Sleep(30);
+      Assert.IsTrue(CanOpenExclusive(BplCopy),
+        'the .bpl is still locked after the host exited -- the debugger is still ' +
+        'holding the package''s embedded-TD32 memory mapping');
+    finally
+      Session.Terminate;
+      Session.Free;
+    end;
+  finally
+    DeleteTempDirWithRetry(Scratch);
+  end;
+end;
+
 // F11 repro attempt: a breakpoint inside a TWO-level nested proc (Inner in Middle in
 // Outer) -- the shape of SampleApp's ParseLiteralDate. The innermost frame must expose
 // its OWN local and, via the scope chain, the enclosing procs' locals.
@@ -3865,17 +3957,19 @@ end;
 procedure TDebugSessionTests.Prefetch_NoBreakpoints_LoadsRuntimePackageSymbols;
 // THE "when" REGRESSION TEST.
 //
-// With no breakpoints set, TDebugSession.HandleDllLoaded's eager gate never fires,
-// so before the background prefetcher NOTHING was parsed for any runtime-loaded
-// module: the first stop that touched one paid its whole TD32 parse synchronously,
-// and until that finished its frames had no names. Here the target runtime-loads
-// two packages and no breakpoint exists anywhere; both packages' symbols must
-// still become available.
+// No breakpoint touches EITHER runtime package, so TDebugSession.HandleDllLoaded's
+// eager gate never fires for them and nothing loads their symbols synchronously:
+// only the background prefetcher can. The target runtime-loads two packages, and
+// both must still become available. The single breakpoint used here is in the MAIN
+// exe (EVAL_BODY, which runs after both LoadPackage calls) purely to give a live
+// stop to observe at.
 //
 // DrainPrefetch is called explicitly because publication is deliberately confined
-// to moments when the debuggee is not executing (see TDebugSession.Pump). In a
-// real session that moment is the stop; here, where there is no breakpoint to stop
-// at, the test provides it.
+// to moments when the debuggee is not executing (see TDebugSession.Pump); the
+// main-exe stop is that moment. Draining after PROCESS EXIT -- what this test used
+// to do -- is gone on purpose: a debuggee exit now releases module symbol mappings
+// so the .bpl unlocks for a rebuild, which is the opposite of parsing a dead
+// process's file (see NaturalExit_ReleasesTheBplFileLock).
 begin
   // The prefetcher ships DISABLED (see SetSymbolPrefetchEnabled); this test is
   // what exercises it, so it turns it on for its own scope.
@@ -3896,26 +3990,38 @@ begin
     var Pkg1 := saUnknownModule;
     var Pkg2 := saUnknownModule;
 
-    // Entry stop first, then run on. No breakpoints are ever set.
+    // Entry stop first: the packages load AFTER entry, so neither is present yet.
     while (Session.State <> dsStopped) and (not Session.HasExited) and
           (GetTickCount64 < Deadline) do
       Session.Pump;
     Assert.AreEqual(Ord(dsStopped), Ord(Session.State), 'did not stop at entry');
     Assert.AreEqual(Ord(saUnknownModule), Ord(Session.ModuleSymbolState('testpackage.bpl')),
       'the package must not be loaded yet at the entry stop');
+
+    // A single breakpoint in the MAIN exe (EVAL_BODY runs after both LoadPackage
+    // calls) and NONE in either package: nothing loads the packages' symbols
+    // synchronously, so only the prefetcher can. It gives a LIVE, non-executing
+    // moment to observe publication at -- draining after PROCESS EXIT is no longer
+    // an option now that a debuggee exit releases module symbols so the .bpl
+    // unlocks for a rebuild (NaturalExit_ReleasesTheBplFileLock).
+    var Line := MarkerLine(EVAL_SOURCE, EVAL_MARKER);
+    Assert.IsTrue(Line > 0, EVAL_MARKER + ' marker not found');
+    var Spec: TBpLineSpec;
+    Spec      := Default(TBpLineSpec);
+    Spec.Line := Line;
+    Session.SetBreakpoints(EVAL_SOURCE, [Spec]);
     Session.ContinueExecution;
 
-    // The debuggee is short-lived, so keep draining for a grace period after it
-    // exits: the point under test is that the prefetcher parses and publishes a
-    // module nobody set a breakpoint in, not how fast it does so. The module
-    // records survive process exit (no UNLOAD_DLL burst), so publication still
-    // finds them.
-    var Grace: UInt64 := 0;
-    while GetTickCount64 < Deadline do begin
-      if not Session.HasExited then
-        Session.Pump
-      else if Grace = 0 then
-        Grace := GetTickCount64 + 10000;
+    while (Session.State <> dsStopped) and (not Session.HasExited) and
+          (GetTickCount64 < Deadline) do
+      Session.Pump;
+    Assert.AreEqual(Ord(dsStopped), Ord(Session.State),
+      'did not reach the main-exe EVAL_BODY stop with the packages mapped');
+
+    // Stopped, so the debuggee is not executing and publication is allowed. The
+    // prefetch worker keeps parsing while the target is paused; drain in a loop
+    // until both packages -- which no breakpoint touches -- become available.
+    while (GetTickCount64 < Deadline) do begin
       Session.Loader.DrainPrefetch;
       if Pkg1 = saUnknownModule then begin
         var S1 := Session.ModuleSymbolState('testpackage.bpl');
@@ -3927,15 +4033,12 @@ begin
       end;
       if (Pkg1 <> saUnknownModule) and (Pkg2 <> saUnknownModule) then
         Break;
-      if (Grace <> 0) and (GetTickCount64 > Grace) then
-        Break;
-      if Session.HasExited then
-        Sleep(5);
+      Sleep(5);
     end;
 
     Assert.IsTrue(Pkg1 in [saLoaded, saIndexing],
       'TestPackage.bpl symbols were never loaded although the package was mapped ' +
-      '(prefetch did not run: with no breakpoint set nothing else loads a module)');
+      '(prefetch did not run: no breakpoint touches the package)');
     var Dump := '';
     for var M in Session.Loader.Modules do
       if M.PrefetchRequested then

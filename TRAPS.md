@@ -354,11 +354,18 @@ absurdly.
   Do NOT try to fix this by closing the debuggee PROCESS handle or `DebugActiveProcessStop`
   — both were tried and the file stayed locked; the mapping is the lock, not the
   zombie. Adding write/delete share is also insufficient: a held mapping blocks the
-  linker's truncate (`ERROR_USER_MAPPED_FILE`) regardless. Regression:
-  `TDebugSessionTests.NaturalExit_ReleasesTheImageFileLock`. STILL OPEN: runtime BPL
-  module readers (`TModuleSymbols.Td32`) keep the same lock on each `.bpl`; releasing
-  those safely needs the symbol worker quiesced first (it, not the main thread, owns
-  module readers).
+  linker's truncate (`ERROR_USER_MAPPED_FILE`) regardless. Runtime BPL readers
+  (`TModuleSymbols.Td32`) hold the identical lock on each `.bpl`; they are released the
+  same way in `ReleaseModuleSymbolMappings`, which FIRST calls `ShutdownPrefetch` — the
+  worker, not the dispatch thread, owns module readers, so freeing one it is mid-parse
+  would crash. Both releases are ARC-driven: the readers are owned solely by their
+  provider ref in `FDebugInfo` (freeing the raw object is a double-free — see
+  `TModuleSymbolLoader.Destroy`), so `RemoveProvider` (main) / `RemoveProvider` +
+  `FModules.Clear` (modules) drops the last ref and the destructor unmaps. Regressions:
+  `TDebugSessionTests.NaturalExit_ReleasesThe{Image,Bpl}FileLock`. A side effect worth
+  knowing: `ShutdownPrefetch` on exit disables prefetch for the rest of THAT session, so
+  a re-attach in the same session loads module symbols synchronously (slower first stop,
+  still correct); no-op when prefetch is off, which is the default.
 
 ## Engine and language gotchas
 
