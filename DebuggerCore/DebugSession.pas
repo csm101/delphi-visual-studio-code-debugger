@@ -450,6 +450,14 @@ type
     procedure SafelistAdd(const Key: string; Deny: Boolean);
     procedure SafelistRemove(const Key: string);
     procedure SafelistReload;
+    // The safelist key for a property EXPRESSION (`Application.ComponentCount`),
+    // built the same way the expansion builds it: evaluate the owner, take its
+    // runtime class, join `class.property`. VS Code does not propagate a
+    // variable's custom fields into a context-menu command, only standard ones
+    // like evaluateName -- so the frontend cannot pass the key the row carried
+    // and must pass the expression instead. '' when it does not name a
+    // getter-backed property (nothing to permit).
+    function  SafelistKeyForExpression(const Expr: string): string;
 
     // Data breakpoints (watchpoints; increment 4 of DATA_BREAKPOINTS_PLAN.md).
     // Mirrors the source-breakpoint API's shape, but SetDataBreakpoints
@@ -3099,6 +3107,38 @@ end;
 // Pushes the current symbol/reader/rtti references into the shared expander just
 // before use. FRtti and FReaders are created lazily on the first stop, so the
 // expander must pick up whatever exists at point of use, not at construction.
+function TDebugSession.SafelistKeyForExpression(const Expr: string): string;
+begin
+  Result := '';
+  var Dotted := Trim(Expr);
+  var LastDot := Dotted.LastIndexOf('.');
+  if LastDot <= 0 then
+    Exit;   // no `owner.member`: nothing to key a property on
+  var OwnerExpr := Dotted.Substring(0, LastDot).Trim;
+  var Member    := Dotted.Substring(LastDot + 1).Trim;
+  if (OwnerExpr = '') or (Member = '') then
+    Exit;
+  // An index or a call in the member half is not a plain property name.
+  if (Member.IndexOfAny(['[', ']', '(', ')']) >= 0) then
+    Exit;
+
+  // Evaluate the OWNER for its runtime class -- the same class the expansion
+  // would key on, so the key written here matches the key the row looks up.
+  // Calls are disabled: naming a property must not run one to find its owner.
+  var Owner := EvaluateForFrame(OwnerExpr, DEFAULT_FRAME_INDEX, 0, {AllowCalls=}False);
+  if (not Owner.Success) or (Owner.TypeName = '') then
+    Exit;
+  // Strip any decoration the type carries; the class name is the bare leading
+  // identifier (e.g. 'TApplication' out of 'TApplication').
+  var Cls := Owner.TypeName.Trim;
+  var Sp := Cls.IndexOf(' ');
+  if Sp > 0 then
+    Cls := Cls.Substring(0, Sp);
+  if Cls = '' then
+    Exit;
+  Result := LowerCase(Cls + '.' + Member);
+end;
+
 procedure TDebugSession.SafelistAdd(const Key: string; Deny: Boolean);
 begin
   FSafePolicy.AddUser(Key, Deny);
@@ -3516,6 +3556,16 @@ begin
     var Val: TExprValue := Default(TExprValue);
     var Display: string;
     var Eval := TExprEvaluator.Create(FDebugger, FRtti, FDebugInfo, AllowCalls);
+    // A denied getter is refused even in a watch / Debug Console, where calls
+    // are otherwise allowed because the user typed the expression. Only DENY
+    // bites here -- auto-evaluation of an allowed getter still needs no help, a
+    // typed watch already consented. nil when there is no policy.
+    if FSafePolicy <> nil then
+      Eval.CallVetoed :=
+        function(MethodKey: string): Boolean
+        begin
+          Result := FSafePolicy.Resolve([MethodKey]) = svDeny;
+        end;
     try
       if Eval.Evaluate(Expr, Val) then
         Display := FormatExprValue(Val)

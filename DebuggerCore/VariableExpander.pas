@@ -1011,14 +1011,18 @@ function TVariableExpander.SafelistKeysFor(const OwnerClass: string;
 
 begin
   Result := nil;
-  // Getter-method spellings first: the verdict is a claim about the CODE that
-  // runs, and the method name is the closest thing to it these records carry.
+  // Property spellings FIRST, so SafelistKeyFor (the one the UI writes for a
+  // deny/allow) is `class.property`. That is the only form a hand-typed watch
+  // -- `Self.Score` -- can reconstruct, so a deny written here also bites in the
+  // Debug Console, not just in the expansion tree. It is also the readable form
+  // for a hand-edited file.
+  Add(OwnerClass,  P.Name);
+  Add(P.DeclClass, P.Name);
+  // Getter-METHOD spellings after: an analysis archive keys the verdict by the
+  // code that runs, so the expansion lookup must still find `TStrings.GetTextStr`
+  // -- it just is not the spelling a click writes.
   Add(P.DeclClass, P.GetterName);
   Add(OwnerClass,  P.GetterName);
-  // Property spellings: what an RSM-sourced member (no GetterName) can offer,
-  // and the friendlier spelling for hand-written entries.
-  Add(P.DeclClass, P.Name);
-  Add(OwnerClass,  P.Name);
 end;
 
 function TVariableExpander.SafelistKeyFor(const OwnerClass: string;

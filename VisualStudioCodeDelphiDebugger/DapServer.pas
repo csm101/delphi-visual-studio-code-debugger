@@ -4043,25 +4043,47 @@ end;
 procedure TDapServer.HandleSafelist(Seq: Integer; const Cmd: string;
   Args: TJSONObject);
 begin
-  var Key := '';
-  if Args <> nil then
-    Key := Trim(Args.GetValue<string>('key', ''));
+  if SameText(Cmd, 'delphiSafelistReload') then begin
+    FSession.SafelistReload;
+    FIO.SendResponse(Seq, Cmd, True);
+    Exit;
+  end;
 
-  if SameText(Cmd, 'delphiSafelistReload') then
-    FSession.SafelistReload
-  else begin
+  // The key comes EITHER pre-built (a row that carried it) OR as an
+  // `expression`, which is how the VS Code context menu reaches here: VS Code
+  // propagates a variable's standard fields (evaluateName) into the command but
+  // NOT custom ones, so the frontend cannot hand back the key the row carried.
+  // The session rebuilds it from the expression the same way the expansion does.
+  var Key := '';
+  if Args <> nil then begin
+    Key := Trim(Args.GetValue<string>('key', ''));
     if Key = '' then begin
-      FIO.SendErrorResponse(Seq, Cmd, 'missing "key"');
-      Exit;
+      var Expr := Trim(Args.GetValue<string>('expression', ''));
+      if Expr <> '' then
+        Key := FSession.SafelistKeyForExpression(Expr);
     end;
-    if SameText(Cmd, 'delphiSafelistAdd') then
-      FSession.SafelistAdd(Key, Args.GetValue<string>('verdict', '') = 'deny')
-    else if SameText(Cmd, 'delphiSafelistRemove') then
-      FSession.SafelistRemove(Key)
-    else begin
-      FIO.SendErrorResponse(Seq, Cmd, 'unknown safelist command');
-      Exit;
+  end;
+
+  if Key = '' then begin
+    // Not a getter-backed property -- a field read needs no permission. Report
+    // it as an unremarkable outcome, not an error the panel would surface.
+    var B := TJSONObject.Create;
+    try
+      B.AddPair('applicable', TJSONBool.Create(False));
+      FIO.SendResponse(Seq, Cmd, True, B);
+    finally
+      B.Free;
     end;
+    Exit;
+  end;
+
+  if SameText(Cmd, 'delphiSafelistAdd') then
+    FSession.SafelistAdd(Key, Args.GetValue<string>('verdict', '') = 'deny')
+  else if SameText(Cmd, 'delphiSafelistRemove') then
+    FSession.SafelistRemove(Key)
+  else begin
+    FIO.SendErrorResponse(Seq, Cmd, 'unknown safelist command');
+    Exit;
   end;
 
   var Body := TJSONObject.Create;

@@ -673,23 +673,29 @@ function activate(context) {
     return async (commandArgument) => {
       const session = vscode.debug.activeDebugSession;
       if (!session || session.type !== DEBUG_TYPE) return;
+      // evaluateName, NOT a custom field: VS Code propagates a variable's
+      // standard DAP fields into a context-menu command but drops the ones the
+      // adapter added, so delphiSafelistKey never arrives here. The expression
+      // does, and the adapter rebuilds the key from it exactly as the expansion
+      // does. A row without one (a synthetic group, a scope) names nothing.
       const variable = commandArgument && (commandArgument.variable || commandArgument);
-      const key = variable && variable.delphiSafelistKey;
-      if (!key) {
-        vscode.window.showInformationMessage(
-          'Only getter-backed property rows can be added to the safelist — ' +
-          'this row is read directly and needs no permission.');
-        return;
-      }
+      const expression = variable &&
+        (variable.evaluateName || (typeof variable.name === 'string' ? variable.name : ''));
+      if (!expression) return;
       try {
         const reply = await session.customRequest('delphiSafelistAdd',
-          { key: key, verdict: verdict });
+          { expression: expression, verdict: verdict });
+        if (reply && reply.applicable === false) {
+          vscode.window.showInformationMessage(
+            '"' + expression + '" is read directly (not through a getter), so it ' +
+            'needs no permission — it is always shown.');
+          return;
+        }
         vscode.window.setStatusBarMessage(
           verdict === 'deny'
-            ? 'Delphi: "' + key + '" will never auto-evaluate'
-            : 'Delphi: "' + key + '" will auto-evaluate from now on',
+            ? 'Delphi: "' + expression + '" will never auto-evaluate'
+            : 'Delphi: "' + expression + '" will auto-evaluate from now on',
           6000);
-        void reply;
       } catch (err) {
         vscode.window.showWarningMessage(
           'Safelist update failed: ' + (err && err.message ? err.message : String(err)));

@@ -75,6 +75,13 @@ type
     // effect. Reads of memory are unaffected -- a field, a local, a global and
     // a field-backed property all still resolve.
     FAllowCalls: Boolean;
+    // Optional veto over a specific method call, by the method's SYMBOL name.
+    // Set by the session so a getter the user DENIED in the safelist is refused
+    // even in a watch or Debug Console -- the one deliberate exception to
+    // "you typed it, so you consented". Returns True to forbid; nil = allow all
+    // (the historical behaviour). ExprEval knows nothing of archives; the
+    // session that owns the policy answers this.
+    FCallVetoed: TFunc<string, Boolean>;
     FExpr:      string;
     FPos:       Integer;
     // Guards the interface-to-object fallback in ApplyDot against re-entering
@@ -260,6 +267,10 @@ type
                        DebugInfo: TDebugInfoSet = nil;
                        AllowCalls: Boolean = True);
     function Evaluate(const Expr: string; out Val: TExprValue): Boolean;
+    // Set after Create when a denied-method veto applies (a watch / Debug
+    // Console evaluation, where calls are allowed but a safelist deny still
+    // wins). Left nil for a hover, which forbids all calls anyway.
+    property CallVetoed: TFunc<string, Boolean> read FCallVetoed write FCallVetoed;
   end;
 
 implementation
@@ -2235,6 +2246,16 @@ function TExprEvaluator.ApplyDot(const Base: TExprValue; const Field: string): T
   begin
     if not P.HasGetter then
       Exit(InvalidValue(Format('<property %s has no read accessor>', [P.Name])));
+    // A getter the user DENIED is refused even here, where calls are allowed --
+    // the one deliberate exception to "you typed it, so you consented". Keyed
+    // by the object's runtime class + the property name, the same spelling the
+    // deny was written with. Field-backed accessors never reach this, so a deny
+    // never blocks a plain read.
+    if (P.GetKind <> akField) and Assigned(FCallVetoed) and (FRtti <> nil) then begin
+      var Cls := FRtti.GetInstanceClassName(ObjAddr);
+      if (Cls <> '') and FCallVetoed(LowerCase(Cls + '.' + P.Name)) then
+        Exit(InvalidValue(Format('<%s.%s: denied in the safelist>', [Cls, P.Name])));
+    end;
     case P.GetKind of
       akField:
         Exit(ReadFieldBackedProp(ObjAddr, P.GetValue, P));

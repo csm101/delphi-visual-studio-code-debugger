@@ -30,6 +30,13 @@ type
 
     [Test] procedure DeferredGetter_CarriesItsSafelistKey;
     [Test] procedure Allow_EvaluatesTheGetterOnTheNextLook_DenyDefersAgain;
+    // The reported bug: an "always evaluate" driven by the property EXPRESSION
+    // (which is all VS Code hands a context-menu command -- it drops custom
+    // fields like delphiSafelistKey) must land, persist, and take effect.
+    [Test] procedure AllowByExpression_LikeTheContextMenu_TakesEffect;
+    // A denied getter is refused even in a WATCH, where calls are otherwise
+    // allowed because the user typed the expression.
+    [Test] procedure DenyByExpression_BlocksTheGetterInAWatch;
   end;
 
 implementation
@@ -198,6 +205,64 @@ begin
       'a denied getter must defer again');
   finally
     Row3.Free;
+  end;
+end;
+
+procedure TSafelistDapTests.AllowByExpression_LikeTheContextMenu_TakesEffect;
+begin
+  // What the reported bug hit: the frontend has only the expression (VS Code
+  // drops the row's custom key), and the getter's name (DoCalcScore) differs
+  // from the property (Score), so the key MUST be rebuilt from `W.Score` and
+  // land on `twidget.score` -- the spelling the expansion looks up. If those
+  // two disagree, the allow is written but never found, and the row stays
+  // deferred forever, exactly as reported for Application.ComponentCount.
+  var Seq := FClient.SendRequest('delphiSafelistAdd',
+    '{"expression":"W.Score","verdict":"allow"}');
+  var Resp := FClient.WaitRawResponse(Seq);
+  try
+    Assert.IsTrue(Resp.GetValue<Boolean>('success', False), 'add failed: ' + Resp.ToJSON);
+    var Body := Resp.GetValue('body') as TJSONObject;
+    Assert.IsFalse(Body.GetValue<Boolean>('applicable', True) = False,
+      'W.Score is a getter-backed property; it must be applicable: ' + Resp.ToJSON);
+  finally
+    Resp.Free;
+  end;
+
+  var Row := ScoreRow;
+  try
+    Assert.IsTrue(Row.GetValue<string>('value', '').Contains('84'),
+      'allowing by expression must make the getter render its value: ' +
+      Row.GetValue<string>('value', ''));
+  finally
+    Row.Free;
+  end;
+end;
+
+procedure TSafelistDapTests.DenyByExpression_BlocksTheGetterInAWatch;
+begin
+  // A watch normally runs a getter without asking -- the user typed it. A DENY
+  // is the one exception, and it must bite HERE too, not only in the expansion
+  // tree. Precondition: the watch works before the deny.
+  var Before := FClient.Evaluate('W.Score', FClient.GetFrameId, 'watch');
+  try
+    Assert.IsTrue(Before.GetValue<string>('result', '').Contains('84'),
+      'precondition: W.Score evaluates in a watch: ' + Before.ToJSON);
+  finally
+    Before.Free;
+  end;
+
+  var Seq := FClient.SendRequest('delphiSafelistAdd',
+    '{"expression":"W.Score","verdict":"deny"}');
+  FClient.WaitRawResponse(Seq).Free;
+
+  var After := FClient.Evaluate('W.Score', FClient.GetFrameId, 'watch');
+  try
+    Assert.IsFalse(After.GetValue<string>('result', '').Contains('84'),
+      'a denied getter must NOT run in a watch: ' + After.ToJSON);
+    Assert.IsTrue(After.GetValue<string>('result', '').ToLower.Contains('denied'),
+      'the watch must say WHY it did not evaluate: ' + After.ToJSON);
+  finally
+    After.Free;
   end;
 end;
 
