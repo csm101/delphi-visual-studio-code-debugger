@@ -23,6 +23,11 @@ type
     function MarkerLine(const SourceBaseName, Marker: string): Integer;
   public
     [Test] procedure Initialize_And_ListTools;
+    // A JSON-Schema array property without "items" is rejected outright by the
+    // clients that validate tool schemas -- VS Code / Copilot refused
+    // set_exception_filters with "tool parameters array type must have items",
+    // which loses the whole tool, not just the property.
+    [Test] procedure ToolSchemas_EveryArrayProperty_DeclaresItems;
     [Test] procedure ListProcesses_ReturnsEntries;
     [Test] procedure Launch_Breakpoint_Continue_Snapshot;
     [Test] procedure Evaluate_AfterStop;
@@ -409,6 +414,49 @@ begin
       Assert.IsTrue(Names.Contains('launch_debuggee'), 'launch_debuggee missing');
       Assert.IsTrue(Names.Contains('continue_and_wait'), 'continue_and_wait missing');
       Assert.IsTrue(Names.Contains('attach_to_process'), 'attach_to_process missing');
+    finally
+      Tools.Free;
+    end;
+  finally
+    C.Free;
+  end;
+end;
+
+procedure TMcpE2ETests.ToolSchemas_EveryArrayProperty_DeclaresItems;
+
+  procedure CheckProperties(const AToolName, APath: string; AProps: TJSONObject);
+  begin
+    if not Assigned(AProps) then
+      Exit;
+    for var Pair in AProps do begin
+      var PropObj := Pair.JsonValue as TJSONObject;
+      var PropPath := APath + Pair.JsonString.Value;
+      if PropObj.GetValue<string>('type', '') <> 'array' then
+        Continue;
+      var Items := PropObj.GetValue('items') as TJSONObject;
+      Assert.IsNotNull(Items, AToolName + ': array property "' + PropPath + '" has no "items"');
+      Assert.IsTrue(Items.GetValue<string>('type', '') <> '',
+        AToolName + ': "items" of "' + PropPath + '" has no "type"');
+      CheckProperties(AToolName, PropPath + '[].', Items.GetValue('properties') as TJSONObject);
+    end;
+  end;
+
+begin
+  var C := TMcpTestClient.Start(McpExe);
+  try
+    C.Call('initialize', nil).Free;
+    C.Notify('notifications/initialized', nil);
+
+    var Tools := C.Call('tools/list', nil);
+    try
+      var Arr := (Tools.GetValue('result') as TJSONObject).GetValue('tools') as TJSONArray;
+      Assert.IsTrue(Arr.Count > 0, 'no tools listed');
+      for var T in Arr do begin
+        var Tool := T as TJSONObject;
+        var Schema := Tool.GetValue('inputSchema') as TJSONObject;
+        Assert.IsNotNull(Schema, Tool.GetValue<string>('name') + ': no inputSchema');
+        CheckProperties(Tool.GetValue<string>('name'), '', Schema.GetValue('properties') as TJSONObject);
+      end;
     finally
       Tools.Free;
     end;
