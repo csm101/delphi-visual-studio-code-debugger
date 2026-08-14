@@ -877,10 +877,33 @@ Evaluate / expression grammar:
     `delphiSafelistKey` on the rows; VS Code contributes Always / Never entries
     to the Variables and Watch context menus. Tests: `SafeCallPolicyTests` (9),
     `SafelistDapTests` (2).
-  * **Open, design settled 2026-08-12:** (2) a shorter watchdog budget for
-    automatic calls plus an entry-byte hook sniff (`E9` / `FF25` -> defer rather
-    than call, because a hooked getter is not the code the safelist vouched
-    for); (3) the AI-agent contract — a JSON schema, a `SafelistProbe` lint, the
+  * **Increment 2a — the automatic-call time budget — DONE.** An authorised
+    getter used to be called with the same 8 s watchdog as an explicit "expand
+    to evaluate" click, so ONE blocking getter froze the Variables panel for the
+    whole timeout, once per authorised row. What bounds the wait now is the
+    BURST, not the call: `IDebugTarget.BeginAutoCallWindow` /
+    `EndAutoCallWindow` / `AutoCallWindowExhausted`, opened by
+    `ExpandProperties` around a whole property group for `AUTO_CALL_WINDOW_MS`
+    (1000), with each call inside it clamped to
+    `min(now + REMOTE_CALL_AUTO_TIMEOUT_MS, window deadline)` — 400 ms, declared
+    beside the 8 s constant it qualifies. Past the deadline a row defers without
+    calling at all, and a call the watchdog cut short defers too rather than
+    rendering `<evaluation cancelled>` as if it were the value, so the user's own
+    click still gets the full budget. Two consequences, both deliberate: the
+    outcome depends on ROW ORDER (a blocking getter eats the window, so rows
+    after it defer until re-expanded), and a cut-short getter leaves the debuggee
+    thread inside its blocking call, so nothing else can be called on that thread
+    until the block ends (`TRAPS.md` -> "Synthetic calls into the debuggee").
+    Regression: `SafelistDapTests.AnAuthorisedGetterThatHangs_DefersInsteadOfHoldingThePanel`
+    against `TWidget.SlowScore`, a getter that sleeps 5 s. The budget is
+    hardcoded on purpose; a launch.json setting is the answer only if real use
+    shows the fallback is too eager.
+  * **Open, design settled 2026-08-12:** (2b) an entry-byte hook sniff (`E9` /
+    `FF25` -> defer rather than call, because a hooked getter is not the code the
+    safelist vouched for) — the work there is telling a DETOUR from Delphi's own
+    legitimate import thunks, which are `FF25` too, by resolving the jump target
+    and checking whether it lands in the module the symbol belongs to; (3) the
+    AI-agent contract — a JSON schema, a `SafelistProbe` lint, the
     agent itself under `DevTools\safelist\`, and a distributed RTL archive, which
     is where `dependsOn` resolution lands (direct cross-library, and virtual via
     the concrete class VMT); (4) optional machine screening with Zydis for the

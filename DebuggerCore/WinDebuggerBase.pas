@@ -219,6 +219,11 @@ type
     // failure) instead of hanging the whole adapter on WaitForDebugEvent.
     FInRemoteCall:    Integer;
     FAbortRemoteCall: Integer;
+    // Auto-call window (see IDebugTarget.BeginAutoCallWindow). Depth counts
+    // nested opens so the OUTERMOST deadline survives; plain fields, not
+    // atomics, because only the thread that pumps the calls ever touches them.
+    FAutoCallDepth:    Integer;
+    FAutoCallDeadline: UInt64;
     // VA of a reusable scratch page in the debuggee used to hold the
     // hidden var-out result slot for managed / Variant / record getters.
     // Allocated lazily; zeroed on each use. One page (4 KB) is enough for
@@ -669,6 +674,9 @@ type
     // Requests the in-flight synthetic call (if any) to abort at the next pump
     // iteration. Thread-safe; a no-op when no call is running.
     procedure RequestAbortRemoteCall;
+    procedure BeginAutoCallWindow(TotalMs: Cardinal);
+    procedure EndAutoCallWindow;
+    function  AutoCallWindowExhausted: Boolean;
     function  TryResolveClassRef(const ClassName: string; out VA: UInt64): Boolean;
     function  CurrentScopeClassName: string;
     function  TryResolveConstValue(const Name: string;
@@ -965,6 +973,29 @@ end;
 procedure TWinDebugger.RequestAbortRemoteCall;
 begin
   AtomicExchange(FAbortRemoteCall, 1);
+end;
+
+procedure TWinDebugger.BeginAutoCallWindow(TotalMs: Cardinal);
+begin
+  // Only the outermost open sets the deadline: a nested burst must not extend
+  // the budget of the one that contains it.
+  if FAutoCallDepth = 0 then
+    FAutoCallDeadline := GetTickCount64 + TotalMs;
+  Inc(FAutoCallDepth);
+end;
+
+procedure TWinDebugger.EndAutoCallWindow;
+begin
+  if FAutoCallDepth = 0 then
+    Exit;
+  Dec(FAutoCallDepth);
+  if FAutoCallDepth = 0 then
+    FAutoCallDeadline := 0;
+end;
+
+function TWinDebugger.AutoCallWindowExhausted: Boolean;
+begin
+  Result := (FAutoCallDepth > 0) and (GetTickCount64 >= FAutoCallDeadline);
 end;
 
 function TWinDebugger.TryResolveClassRef(const ClassName: string;
@@ -5950,9 +5981,22 @@ begin
   // deadline, force the call thread's RIP to our INT3 trap so the very next
   // event completes the call as a FAILURE rather than hanging the adapter.
   const REMOTE_CALL_TIMEOUT_MS = 8000;
+  // A call made INSIDE an auto-call window was not asked for individually, so
+  // it gets a budget an order of magnitude smaller: the user is waiting on a
+  // panel that renders many rows, not on this one getter. Both numbers live
+  // here, together, so the policy is one place to read rather than
+  // milliseconds scattered through the layers that request a call.
+  const REMOTE_CALL_AUTO_TIMEOUT_MS = 400;
   AtomicExchange(FAbortRemoteCall, 0);
   AtomicExchange(FInRemoteCall, 1);
-  var CallDeadline := GetTickCount64 + REMOTE_CALL_TIMEOUT_MS;
+  var CallDeadline := GetTickCount64 + UInt64(REMOTE_CALL_TIMEOUT_MS);
+  if FAutoCallDepth > 0 then begin
+    // Whichever runs out first: this call's own reduced budget, or what is left
+    // of the window shared by the whole burst.
+    CallDeadline := GetTickCount64 + UInt64(REMOTE_CALL_AUTO_TIMEOUT_MS);
+    if FAutoCallDeadline < CallDeadline then
+      CallDeadline := FAutoCallDeadline;
+  end;
   var Aborted := False;
   try
     while True do begin

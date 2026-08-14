@@ -19,6 +19,19 @@ uses
   DebugSessionTypes, DebugTarget, DebugInfoTypes, DebugInfoSet,
   TD32FileReader, DelphiRtti, DelphiValueReaders, ExprEval, SafeCallPolicy;
 
+const
+  // How long ONE property group may spend, in total, on getters the safelist
+  // authorised. Not per getter: what the user waits for is the group. Once it
+  // is spent the remaining authorised rows defer without calling, which costs
+  // nothing and renders exactly what they would render with no safelist at all
+  // -- and a click still evaluates any of them on the full explicit budget.
+  //
+  // The consequence, stated because it looks like a defect when met cold: the
+  // outcome depends on ROW ORDER. One getter that blocks eats most of the
+  // window, so rows after it defer even though they would have answered
+  // instantly. Re-expanding retries them.
+  AUTO_CALL_WINDOW_MS = 1000;
+
 type
   // A pending nested-expansion node, addressed by an opaque TVarHandle. Minted
   // when a variable/field is found expandable; the table is rebuilt each stop.
@@ -141,8 +154,12 @@ type
     // clicking "expand to evaluate" would have made, value formatting and
     // drill-down handle included. On failure the row carries the error text,
     // which for a mayRaise member is the intended outcome, not a defect.
-    procedure EvaluateGetterInto(var Child: TSessionVariable;
-                const PropExpr, DeclaredTypeName: string);
+    // Returns False for the ONE failure that is not an answer: a call the
+    // auto-call watchdog cut short. The caller must then render the deferred
+    // placeholder, because a row reading `<evaluation cancelled>` would hide
+    // the click that can still evaluate it on the full budget.
+    function  EvaluateGetterInto(var Child: TSessionVariable;
+                const PropExpr, DeclaredTypeName: string): Boolean;
     function  ExpandViaMembers(const Exp: TSessionExpansion): TArray<TSessionVariable>;
     function  ExpandDynArray(const Exp: TSessionExpansion): TArray<TSessionVariable>;
     function  ExpandProperties(const Exp: TSessionExpansion): TArray<TSessionVariable>;
@@ -910,6 +927,14 @@ begin
   // levels (Caption, AutoScroll, ...) appears more than once. Keep the first (most
   // specific) and drop later duplicates so the group is not noisy (F7).
   var Seen := TDictionary<string, Boolean>.Create;
+  // Every getter the safelist authorises below runs inside ONE window, because
+  // what the user waits for is this group of rows, not any single getter in it.
+  // Without it the wait is per row and multiplies: twenty authorised getters
+  // that each block would each pay the full watchdog timeout. Opened only when
+  // a policy exists -- with none, nothing here calls anything.
+  var HasAutoCalls := (Policy <> nil) and (Debugger <> nil);
+  if HasAutoCalls then
+    Debugger.BeginAutoCallWindow(AUTO_CALL_WINDOW_MS);
   try
     for var P in Members do begin
       if P.Kind <> cmkProperty then Continue;
@@ -965,12 +990,18 @@ begin
         // would have made: same resolution, same guards, no new call path.
         Child.SafelistKey := SafelistKeyFor(Exp.TypeName, P);
         if PropExpr <> '' then begin
+          // Three ways to end up deferred, and only the first is a decision
+          // about this property: the safelist did not authorise it; the burst's
+          // time budget is already spent, so calling would only buy an abort;
+          // or the call started and the watchdog cut it short.
+          var Evaluated := False;
           if (Policy <> nil) and
              TSafeCallPolicy.AllowsAutoCall(
-               Policy.Resolve(SafelistKeysFor(Exp.TypeName, P))) then begin
-            EvaluateGetterInto(Child, PropExpr, P.TypeName);
-          end
-          else begin
+               Policy.Resolve(SafelistKeysFor(Exp.TypeName, P))) and
+             (Debugger <> nil) and not Debugger.AutoCallWindowExhausted then begin
+            Evaluated := EvaluateGetterInto(Child, PropExpr, P.TypeName);
+          end;
+          if not Evaluated then begin
             var GetExp := Default(TSessionExpansion);
             GetExp.Kind         := exPropertyGetter;
             GetExp.BaseAddr     := Exp.BaseAddr;
@@ -992,6 +1023,8 @@ begin
   finally
     List.Free;
     Seen.Free;
+    if HasAutoCalls then
+      Debugger.EndAutoCallWindow;
   end;
 end;
 
@@ -1034,9 +1067,10 @@ begin
   Result := Keys[0];
 end;
 
-procedure TVariableExpander.EvaluateGetterInto(var Child: TSessionVariable;
-  const PropExpr, DeclaredTypeName: string);
+function TVariableExpander.EvaluateGetterInto(var Child: TSessionVariable;
+  const PropExpr, DeclaredTypeName: string): Boolean;
 begin
+  Result := False;
   if Debugger = nil then
     Exit;
   Debugger.ClearActiveFrame;
@@ -1050,12 +1084,17 @@ begin
   end;
 
   if not OK then begin
-    // The raise/AV/watchdog abort inside the synthetic call turned into an
-    // error string. Showing it IS the contract for a mayRaise member.
+    // A window that is spent by the time the call returns is the signature of
+    // the watchdog having cut it short: report that, so the caller defers the
+    // row instead of showing a cancellation as if it were the property's
+    // value. A getter that RAISES answers long before the budget runs out, so
+    // it keeps the error text -- which IS the contract for a mayRaise member.
+    if Debugger.AutoCallWindowExhausted then
+      Exit(False);
     Child.Value := Val.TypeHint;
     if DeclaredTypeName <> '' then
       Child.TypeName := DeclaredTypeName;
-    Exit;
+    Exit(True);
   end;
 
   Child.Value := FormatExprValue(Val);
@@ -1078,6 +1117,7 @@ begin
     Child.Handle     := MintHandle(ChildExp);
     if ChildExp.IsRecord then Child.Kind := vkRecord else Child.Kind := vkClass;
   end;
+  Result := True;
 end;
 
 // Runs a deferred getter-backed property (exPropertyGetter). Evaluates the

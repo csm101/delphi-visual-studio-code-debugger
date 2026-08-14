@@ -21,9 +21,13 @@ type
   private
     FClient:   TDapClient;
     FScratch:  string;
-    // The Score row, walked fresh each call (caller frees): expansion handles
-    // are minted per request, so a re-walk sees the CURRENT rendering.
+    // A property row of W, walked fresh each call (caller frees): expansion
+    // handles are minted per request, so a re-walk sees the CURRENT rendering.
+    function  PropertiesRef: Integer;
+    function  PropRow(const PropName: string): TJSONObject;
     function  ScoreRow: TJSONObject;
+    // Writes a safelist decision the way the context menu does -- by expression.
+    procedure Safelist(const Expression, Verdict: string);
   public
     [Setup]    procedure Setup;
     [TearDown] procedure TearDown;
@@ -37,6 +41,10 @@ type
     // A denied getter is refused even in a WATCH, where calls are otherwise
     // allowed because the user typed the expression.
     [Test] procedure DenyByExpression_BlocksTheGetterInAWatch;
+    // An authorised getter that BLOCKS must not hold the panel for its own
+    // sake: the burst has one time budget, and a getter that overruns it is
+    // deferred rather than rendered as a cancellation.
+    [Test] procedure AnAuthorisedGetterThatHangs_DefersInsteadOfHoldingThePanel;
   end;
 
 implementation
@@ -108,6 +116,24 @@ end;
 
 function TSafelistDapTests.ScoreRow: TJSONObject;
 begin
+  Result := PropRow('Score');
+end;
+
+procedure TSafelistDapTests.Safelist(const Expression, Verdict: string);
+begin
+  var Seq := FClient.SendRequest('delphiSafelistAdd',
+    Format('{"expression":"%s","verdict":"%s"}', [Expression, Verdict]));
+  var Resp := FClient.WaitRawResponse(Seq);
+  try
+    Assert.IsTrue(Resp.GetValue<Boolean>('success', False),
+      Format('safelist %s of %s failed: %s', [Verdict, Expression, Resp.ToJSON]));
+  finally
+    Resp.Free;
+  end;
+end;
+
+function TSafelistDapTests.PropertiesRef: Integer;
+begin
   var LocalsRef := FClient.GetLocalsRef(FClient.GetFrameId);
   var WVar := FClient.FindVar(LocalsRef, 'W');
   Assert.IsTrue(WVar <> nil, 'W not in locals');
@@ -128,9 +154,13 @@ begin
     Groups.Free;
   end;
   Assert.IsTrue(PropsRef > 0, 'properties group not expandable');
+  Result := PropsRef;
+end;
 
-  Result := FClient.FindVar(PropsRef, 'Score');
-  Assert.IsTrue(Result <> nil, 'Score not among the properties');
+function TSafelistDapTests.PropRow(const PropName: string): TJSONObject;
+begin
+  Result := FClient.FindVar(PropertiesRef, PropName);
+  Assert.IsTrue(Result <> nil, PropName + ' not among the properties');
 end;
 
 procedure TSafelistDapTests.DeferredGetter_CarriesItsSafelistKey;
@@ -264,6 +294,48 @@ begin
   finally
     After.Free;
   end;
+end;
+
+procedure TSafelistDapTests.AnAuthorisedGetterThatHangs_DefersInsteadOfHoldingThePanel;
+begin
+  // Both are authorised. Score answers at once; SlowScore sleeps five seconds --
+  // longer than any budget, and long enough that waiting for it would be
+  // unmistakable in the elapsed time.
+  for var Expr in ['W.Score', 'W.SlowScore'] do
+    Safelist(Expr, 'allow');
+
+  // ONE walk, and both rows read out of it. It has to be one: a getter cut
+  // short leaves the debuggee thread inside the blocking call it was making
+  // (here a 5 s Sleep), so nothing else can be called on that thread until the
+  // block ends -- a later walk would see EVERY authorised getter fail, which
+  // says nothing about the budget.
+  var Started := GetTickCount64;
+  var Fast, Slow: string;
+  var Resp := FClient.Variables(PropertiesRef);
+  var Elapsed := GetTickCount64 - Started;
+  try
+    for var Row in (Resp.GetValue('variables') as TJSONArray) do begin
+      var V := Row as TJSONObject;
+      if SameText(V.GetValue<string>('name', ''), 'Score')     then Fast := V.GetValue<string>('value', '');
+      if SameText(V.GetValue<string>('name', ''), 'SlowScore') then Slow := V.GetValue<string>('value', '');
+    end;
+  finally
+    Resp.Free;
+  end;
+
+  // Score is reached while the budget is intact, so it answers.
+  Assert.IsTrue(Fast.Contains('84'),
+    'an authorised getter reached with budget left must render its value, got: ' + Fast);
+  // SlowScore is cut short -- and a cut-short call is not an answer. Rendering
+  // the cancellation as its value would hide the click that still evaluates it
+  // on the full explicit budget.
+  Assert.AreEqual('(expand to evaluate)', Slow,
+    'a getter the watchdog cut short must DEFER, got: ' + Slow);
+  // The getter sleeps 5 s, so anything below that proves the panel was not held
+  // waiting for it. Deliberately loose: the assertions above carry the meaning,
+  // this one only separates "cut short" from "waited it out".
+  Assert.IsTrue(Elapsed < 4500,
+    Format('the group took %d ms; the budget must cut the hung getter short', [Elapsed]));
 end;
 
 initialization

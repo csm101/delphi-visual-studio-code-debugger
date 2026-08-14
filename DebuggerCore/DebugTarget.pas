@@ -599,6 +599,28 @@ type
     // Requests the in-flight synthetic call (if any) to abort at the next pump
     // iteration. Thread-safe; a no-op when no call is running.
     procedure RequestAbortRemoteCall;
+    // An AUTO-CALL WINDOW bounds a BURST of synthetic calls nobody asked for
+    // one by one -- the getters a safelist authorises while rendering a
+    // Variables request. An explicit "expand to evaluate" click can afford the
+    // full per-call budget: the user asked, and is watching a progress cue. An
+    // automatic call cannot, because there are as many of them as there are
+    // rows, and a single getter that blocks would otherwise freeze the panel
+    // for the whole watchdog timeout, once per hung row.
+    //
+    // So the caller opens a window around the burst, and inside it every call
+    // gets the SHORTER of its own reduced budget and whatever is left of the
+    // window. Nested opens keep the outer deadline: the burst is the thing
+    // being bounded, not the nesting.
+    //
+    // Same-thread by construction (the request handler that renders the rows is
+    // the thread that pumps the call), so this needs no synchronisation, unlike
+    // the cross-thread RequestAbortRemoteCall above.
+    procedure BeginAutoCallWindow(TotalMs: Cardinal);
+    procedure EndAutoCallWindow;
+    // True when a window is open and its deadline has passed. Asked BEFORE a
+    // call, so a row that is already past the deadline costs nothing at all
+    // rather than paying an abort to find out.
+    function  AutoCallWindowExhausted: Boolean;
     // Resolves a bare class NAME to its runtime class reference (TClass = the
     // VMT address), scoped to the active frame's `uses` so a same-named class
     // in another unit is not picked. Used as the Self argument when invoking a

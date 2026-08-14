@@ -159,6 +159,10 @@ type
     FArgCur: Currency;
     FOnNotify: TWidgetNotify;  // backing field for the OnNotify event handler
     function DoCalcScore:   Integer;     // deliberately NOT named GetScore
+    // Blocks for far longer than any automatic-call budget, so a safelisted
+    // getter that HANGS can be reproduced deliberately. Nothing in the program
+    // reads SlowScore: it exists only for a debugger to try to evaluate.
+    function DoSlowScore:   Integer;
     function DoCalcInt64:   Int64;
     function DoCalcCard:    Cardinal;
     function DoCalcBool:    Boolean;
@@ -228,6 +232,7 @@ type
     property Value:    Integer       read FValue;
     property Active:   Boolean       read FActive;
     property Score:    Integer       read DoCalcScore;
+    property SlowScore: Integer      read DoSlowScore;
     property AsInt64:  Int64         read DoCalcInt64;
     property AsCard:   Cardinal      read DoCalcCard;
     property AsBool:   Boolean       read DoCalcBool;
@@ -536,6 +541,7 @@ begin
 end;
 
 function TWidget.DoCalcScore: Integer;     begin Result := FValue * 2;       end; // 84
+function TWidget.DoSlowScore: Integer;     begin Sleep(5000); Result := FValue * 3; end; // never returns within a budget
 function TWidget.DoCalcInt64: Int64;       begin Result := Int64($1122334455667788); end;
 function TWidget.DoCalcCard:  Cardinal;    begin Result := Cardinal($DEADBEEF); end;
 function TWidget.DoCalcBool:  Boolean;     begin Result := True;             end;

@@ -382,6 +382,18 @@ absurdly.
   a re-attach in the same session loads module symbols synchronously (slower first stop,
   still correct); no-op when prefetch is off, which is the default.
 
+## Synthetic calls into the debuggee
+
+- **Aborting a call does not give the thread back.** The abort hijacks RIP to the
+  INT3 trap, which only works when the thread is executing code. A thread parked
+  in a kernel wait (`Sleep`, a lock, an I/O) does not reach the trap until the
+  wait ends, so the pump falls through to its 2 s hard-restore and the call
+  reports failure — but the thread stays inside the blocking operation for as
+  long as it was going to. Every later call on that thread fails until then.
+  A test that cuts a blocking getter short and then evaluates something else on
+  the same thread is measuring the leftover block, not the thing it named. Read
+  everything you need out of the SAME expansion, or wait the block out.
+
 ## Engine and language gotchas
 
 - **When a reported stop disagrees with the exception event's own address, suspect
