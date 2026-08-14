@@ -92,6 +92,11 @@ Enable the hook once per clone:
 git config core.hooksPath githooks
 ```
 
+**Never stage `TASK_RESUME.md` with the work.** `git add -A` will, so stage
+explicitly. With the stub in `HEAD` the hook's rewrite matches what is committed
+and the worktree stays clean; commit the cursor text once and `HEAD` holds a
+cursor describing finished work, which `git checkout --` will happily restore.
+
 Everything durable goes elsewhere, in the same change set as the code:
 
 - a measured fact about a format -> `RSM_*.md`, `TD32_FORMAT_NOTES.md`

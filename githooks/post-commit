@@ -10,9 +10,14 @@
 # doing it. Committing therefore erases it.
 #
 # The stub is a FIXED text with no commit id in it, so the rewrite is a no-op
-# whenever the file already holds the stub. A repository with nothing in flight
-# stays clean; the file only shows up as modified in the one commit that
-# followed real cursor text, and is clean again after that.
+# whenever the file already holds the stub, and the worktree stays clean.
+#
+# That only holds if the CURSOR IS NEVER STAGED. Commit the work, not the notes
+# about the work: with the stub in HEAD, the rewrite matches what is committed
+# and nothing shows as modified. Stage the cursor text once (`git add -A` will)
+# and HEAD now holds a cursor describing finished work -- restoring the file
+# from HEAD brings it back, which is the exact failure this hook exists to
+# prevent. Re-run this hook by hand and commit the stub to recover.
 
 set -e
 
