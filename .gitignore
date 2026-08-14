@@ -34,6 +34,11 @@ __history/
 # VS Code workspace state
 .vscode/settings.json
 
+# Dropped here by the Delphi IDE plugin (EditInVsCodeDelphiPlugin) when it
+# generates a workspace. It is the plugin's own team-defaults file, meant to be
+# versioned in the projects it generates FOR, not in this repository.
+vscode-workspace-defaults.json
+
 # any local developer settings
 *.local.json
 
