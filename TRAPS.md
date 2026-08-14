@@ -306,6 +306,21 @@ absurdly.
   byte-identical restore possible: `gh release create <tag> --verify-tag
   --latest=false --notes-file <notes> <zip>`, then `--latest` if it was latest.
 
+## Session notes and the resume cursor
+
+- **`TASK_RESUME.md` is erased by `githooks/post-commit`, and that is the
+  feature.** It holds only uncommitted, mid-step state. Anything durable belongs
+  in the commit message, `PROJECT_STATE.md`, `TRAPS.md` or a format document —
+  written in the same change set as the code. Do not rewrite the cursor after
+  committing to "keep the history": the file's whole failure mode was a
+  confident "next action" that described work finished weeks earlier.
+- **The hook does not run until `core.hooksPath` is set, and a fresh clone does
+  not set it.** `git config core.hooksPath githooks`, once per clone. Without it
+  nothing errors — the cursor simply starts rotting again, silently.
+- **A hook script must stay LF.** `.gitattributes` checks this tree out as CRLF;
+  `githooks/*` is exempted explicitly, because Git's POSIX shell reads
+  `#!/bin/sh\r` as a missing interpreter.
+
 ## Symbol providers and concurrency
 
 - **Any provider the adapter queries is hit from two threads and runs under

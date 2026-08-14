@@ -8,6 +8,11 @@
 # that slips through.
 * text=auto eol=crlf
 
+# Git hooks are run by Git's own POSIX shell, which chokes on a CR at the end of
+# a line (`#!/bin/sh\r` is not an interpreter). They are the one part of this
+# Windows-only tree that must stay LF.
+githooks/* text eol=lf
+
 # The Zydis disassembler DLL is a deliberate exception to "build output stays
 # ignored" (ThirdParty/Zydis/PROVENANCE.md) — it is committed so normal builds
 # stay Delphi-only. Mark it explicitly binary so eol=crlf above never touches it.

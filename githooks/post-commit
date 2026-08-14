@@ -1,0 +1,46 @@
+#!/bin/sh
+#
+# post-commit -- reset TASK_RESUME.md to its stub.
+#
+# TASK_RESUME.md is the cursor for work that is IN FLIGHT and not yet committed.
+# Once a commit exists, the commit message is the record of what landed, and any
+# cursor text left behind now describes finished work -- a confident pointer at
+# the past, which is worse than no pointer at all. That is not hypothetical: the
+# file once carried a "next action" from weeks earlier, and grew to 3343 lines
+# doing it. Committing therefore erases it.
+#
+# The stub is a FIXED text with no commit id in it, so the rewrite is a no-op
+# whenever the file already holds the stub. A repository with nothing in flight
+# stays clean; the file only shows up as modified in the one commit that
+# followed real cursor text, and is clean again after that.
+
+set -e
+
+root=$(git rev-parse --show-toplevel) || exit 0
+cursor="$root/TASK_RESUME.md"
+tmp="$cursor.post-commit-tmp"
+
+cat > "$tmp" <<'STUB'
+# TASK_RESUME
+
+Nothing in flight.
+
+This file is the cursor for work that is started and NOT yet committed: where a
+long step was interrupted, what was already tried, what to do next. It is erased
+automatically by the `post-commit` hook in `githooks/`, because once work is
+committed the commit message is the record.
+
+If you are reading this stub, there is no interrupted work. Read `git log`,
+`PROJECT_STATE.md` and `TRAPS.md` instead.
+STUB
+
+# CRLF, matching .gitattributes (text=auto eol=crlf).
+sed -i 's/$/\r/' "$tmp"
+
+if cmp -s "$tmp" "$cursor"; then
+  rm -f "$tmp"
+  exit 0
+fi
+
+mv -f "$tmp" "$cursor"
+echo "post-commit: TASK_RESUME.md reset to its stub (nothing in flight)."

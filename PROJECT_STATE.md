@@ -857,6 +857,47 @@ Evaluate / expression grammar:
   `$28` record (var-out functions tag `Result` as `$23` instead of
   `$20`).
 
+- **Safe-getter safelist — increment 1 SHIPPED (0.6.0), increments 2-4 open.**
+  A property backed by a getter cannot be expanded without CALLING it, and an
+  arbitrary getter can allocate, lock or raise inside a stopped process. The
+  safelist is the list of getters a call is allowed to be made for automatically.
+  * **Built:** `DebuggerCore\SafeCallPolicy.pas` — five discovery tiers with a
+    fixed precedence (`user.safelist.json` > source-anchored ancestor walk >
+    source-path pool > user-global generated > shipped), category verdicts
+    applied in `AllowsAutoCall` (pure / trusted / mayRaise call automatically;
+    lazyInit / conditional / unsafe / deny never do), per-archive parse that is
+    lazy and mtime-validated, atomic sorted writes of the user file, and
+    `DELPHI_DEBUGGER_SAFELIST_DIR` to redirect it in tests. When a call is
+    allowed the expander runs EXACTLY the call the "expand to evaluate" click
+    would have made (`EvaluateGetterInto`) — no second call path. Rows carry
+    `SafelistKey` (declaring class + getter name, falling back to class +
+    property); indexed properties stay excluded. DAP: `delphiSafelistAdd` /
+    `delphiSafelistRemove` / `delphiSafelistReload` plus an
+    `invalidated(variables)` event so the panel re-renders at once, with
+    `delphiSafelistKey` on the rows; VS Code contributes Always / Never entries
+    to the Variables and Watch context menus. Tests: `SafeCallPolicyTests` (9),
+    `SafelistDapTests` (2).
+  * **Open, design settled 2026-08-12:** (2) a shorter watchdog budget for
+    automatic calls plus an entry-byte hook sniff (`E9` / `FF25` -> defer rather
+    than call, because a hooked getter is not the code the safelist vouched
+    for); (3) the AI-agent contract — a JSON schema, a `SafelistProbe` lint, the
+    agent itself under `DevTools\safelist\`, and a distributed RTL archive, which
+    is where `dependsOn` resolution lands (direct cross-library, and virtual via
+    the concrete class VMT); (4) optional machine screening with Zydis for the
+    hover tier. **Hover stays call-free until (4) exists.**
+
+Manual verification still open (needs a human in VS Code; no code is blocked on it):
+- Memory view: payload behaviour on a string and on a dynamic array in both
+  panels, a byte WRITE through the `edit` toggle, and whether the changed-byte
+  highlight survives the pane's own re-measure.
+- `F10` at an exception stop lands on the `except` / `finally` that receives it;
+  on an x86 `try/finally` it must REFUSE with a visible reason — the refusal is
+  the correct behaviour, not a defect.
+- Breakpoints panel -> "Add Data Breakpoint at Address", which has never been
+  driven by hand.
+- Hydra2: breakpoint in a BPL loaded after startup, then locals and evaluate.
+  The only core use case the suite does not reproduce.
+
 Project / packaging:
 - Publish the VS Code extension instead of manual local install.
 
