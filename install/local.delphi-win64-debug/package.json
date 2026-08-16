@@ -651,6 +651,15 @@
                 },
                 "description": "Per-exception rules, evaluated top-down (first match wins). A matching rule's action overrides the exception filters; with no match the filters decide. Criteria (class/classIs/code/message/messageRegex/unit/line range) are AND-ed; omitted criteria are wildcards."
               },
+              "useGlobalExceptionRules": {
+                "type": "boolean",
+                "default": true,
+                "description": "Also load the shared machine-wide exception rules file (default %USERPROFILE%\\.DelphiWinDebugger\\exceptionRules.json). Project `exceptionRules` are evaluated first, then the shared rules as a fallback."
+              },
+              "globalExceptionRulesPath": {
+                "type": "string",
+                "description": "Override the shared exception-rules file location (default %USERPROFILE%\\.DelphiWinDebugger\\exceptionRules.json). JSON object with an `exceptionRules` array (or a bare array)."
+              },
               "progressLocation": {
                 "type": "string",
                 "enum": [
