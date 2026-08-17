@@ -601,6 +601,14 @@ type
     [Test] procedure ExpandVariable_LongDynArray_SaysItWasTruncated;
     // The evaluator's own recursion is bounded like everything else here.
     [Test] procedure ExprSemantics_DeepNesting_IsRefused_NotACrash;
+
+    // THE oracle: for each expression, the answer DCC64 computed from the same
+    // source text is the expected value. Every other evaluator test asserts a
+    // value a human worked out, which is worth exactly as much as that human's
+    // reading of the language -- and a reading that was wrong produced an
+    // evaluator and an assertion that agreed with each other and not with
+    // Delphi. This one cannot: the compiler is the authority.
+    [Test] procedure ExprOracle_DebuggerAgreesWithTheCompiler;
   end;
 
 implementation
@@ -7645,6 +7653,133 @@ begin
     var After := Session.Evaluate('1 + 1');
     Assert.IsTrue(After.Success and After.Value.Contains('2'),
       'the session must still evaluate afterwards: ' + After.ErrorText);
+  finally
+    if Session.State = dsStopped then Session.Terminate;
+    Session.Free;
+  end;
+end;
+
+type
+  // `Oracle` is the local RunExprOracle assigned from `Expr`, so the compiler
+  // has already answered the question this test asks the debugger.
+  TOracleCase = record
+    Oracle: string;
+    Expr:   string;
+  end;
+
+function OracleCase(const Oracle, Expr: string): TOracleCase;
+begin
+  Result.Oracle := Oracle;
+  Result.Expr   := Expr;
+end;
+
+procedure TDebugSessionTests.ExprOracle_DebuggerAgreesWithTheCompiler;
+const
+  ORACLE_MARKER = 'EXPR_ORACLE';
+
+  // One row per line of RunExprOracle, in the same order. Keep the two together:
+  // this table and that procedure are the pairing, and a row that drifts from
+  // its line fails loudly rather than passing on the wrong expression.
+  function Cases: TArray<TOracleCase>;
+  begin
+    Result := [
+      // Bitwise / boolean against a comparison. Under the old C-like precedence
+      // `Flags and Mask = 0` grouped as `Flags and (Mask = 0)` and answered the
+      // opposite of what the very same text answers in the target.
+      OracleCase('Ora01', 'Flags and Mask = 0'),
+      OracleCase('Ora02', 'Flags and Mask <> 0'),
+      OracleCase('Ora03', 'Flags and $0F = $0F'),
+      OracleCase('Ora04', 'Flags or Mask = 255'),
+      OracleCase('Ora05', 'Flags xor Mask = 255'),
+      OracleCase('Ora06', 'Flags or 0 and 0 = 15'),
+      OracleCase('Ora07', 'not (Flags = 15)'),
+      OracleCase('Ora08', '(Flags > 1) and (Mask > 1)'),
+      OracleCase('Ora09', '(Flags > 99) or (Mask > 1)'),
+      // Integer operators no test had ever put through the evaluator.
+      OracleCase('Ora10', 'Flags shl 4 = 240'),
+      OracleCase('Ora11', 'Mask shr 4 = 15'),
+      OracleCase('Ora12', 'Flags div 4 = 3'),
+      OracleCase('Ora13', 'Flags mod 4 = 3'),
+      OracleCase('Ora14', 'Flags / 2 = 7.5'),
+      OracleCase('Ora15', '-Flags = 0 - 15'),
+      OracleCase('Ora16', '1 + 2 * 3 = 7'),
+      OracleCase('Ora17', '(1 + 2) * 3 = 9'),
+      // Relational operators, likewise: before this, ONE expression in the whole
+      // suite contained an `=` and none contained `<>`, `<`, `>`, `<=` or `>=`.
+      OracleCase('Ora18', 'Small <> Flags'),
+      OracleCase('Ora19', 'Small < Flags'),
+      OracleCase('Ora20', 'Small <= Flags'),
+      OracleCase('Ora21', 'Flags > Small'),
+      OracleCase('Ora22', 'Flags >= Small'),
+      // Strings, where the comparison used to be on the heap pointer.
+      OracleCase('Ora23', 'Greeting = ''Hello'''),
+      OracleCase('Ora24', 'Greeting = ''Nope'''),
+      OracleCase('Ora25', 'Greeting <> ''Nope'''),
+      OracleCase('Ora26', 'Greeting = GreetingCopy'),
+      OracleCase('Ora27', 'Greeting < ''Z'''),
+      OracleCase('Ora28', 'Greeting >= ''Hello'''),
+      OracleCase('Ora29', 'Narrow = ''Hello'''),
+      OracleCase('Ora30', 'Blank = '''''),
+      OracleCase('Ora31', 'Initial = ''H'''),
+      OracleCase('Ora32', 'Initial = ''h'''),
+      // Enum and set.
+      OracleCase('Ora33', 'Mode = wmRunning'),
+      OracleCase('Ora34', 'wmRunning in Modes')];
+  end;
+
+  // The rendered Boolean, normalised. An evaluator answer and a local read must
+  // be compared as the SAME thing, or the test measures the formatter.
+  function BoolText(const Rendered: string): string;
+  begin
+    Result := LowerCase(Trim(Rendered));
+    if Result.StartsWith('true')  then Exit('True');
+    if Result.StartsWith('false') then Exit('False');
+    Result := '<' + Rendered + '>';
+  end;
+
+begin
+  var Line := MarkerLine(EVAL_SOURCE, ORACLE_MARKER);
+  Assert.IsTrue(Line > 0, 'marker ' + ORACLE_MARKER + ' not found');
+  var Session := OpenSessionAtMarker(TargetExe, TargetMap, TargetRsm, TargetDir,
+    EVAL_SOURCE, Line);
+  try
+    Assert.AreEqual(Ord(dsStopped), Ord(Session.State), 'did not stop');
+
+    var Failures := '';
+    var Trues    := 0;
+    var Falses   := 0;
+    for var Check in Cases do begin
+      // What the COMPILER answered, read back out of the frame.
+      var FromCompiler := Session.Evaluate(Check.Oracle);
+      if not FromCompiler.Success then begin
+        Failures := Failures + Format('%s (%s): the oracle local itself did not read: %s; ',
+          [Check.Oracle, Check.Expr, FromCompiler.ErrorText]);
+        Continue;
+      end;
+      var Expected := BoolText(FromCompiler.Value);
+      if Expected = 'True' then Inc(Trues) else if Expected = 'False' then Inc(Falses);
+
+      // What the DEBUGGER answers for the same source text.
+      var FromDebugger := Session.Evaluate(Check.Expr);
+      if not FromDebugger.Success then begin
+        Failures := Failures + Format('"%s": refused (%s) where the compiler said %s; ',
+          [Check.Expr, FromDebugger.ErrorText, Expected]);
+        Continue;
+      end;
+      var Actual := BoolText(FromDebugger.Value);
+      if Actual <> Expected then
+        Failures := Failures + Format('"%s": compiler says %s, debugger says %s; ',
+          [Check.Expr, Expected, Actual]);
+    end;
+
+    Assert.AreEqual('', Failures,
+      'the debugger must answer what the Delphi compiler answers for the same ' +
+      'expression -- ' + Failures);
+    // A table that happened to be all-True would pass with an evaluator that
+    // returned True for everything. Both outcomes have to be present.
+    Assert.IsTrue((Trues > 0) and (Falses > 0),
+      Format('the oracle must contain both outcomes, got %d true / %d false',
+        [Trues, Falses]));
   finally
     if Session.State = dsStopped then Session.Terminate;
     Session.Free;

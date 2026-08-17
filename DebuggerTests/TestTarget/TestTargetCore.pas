@@ -1008,6 +1008,93 @@ begin
   end;
 end;
 
+// The ORACLE for expression semantics.
+//
+// Every Ora* local below is a Boolean that DCC64 computed from the expression
+// written beside it. The test asks the debugger to evaluate that same source
+// text and asserts the two agree. The expected value is therefore the Delphi
+// compiler's, never a number someone typed into an assertion -- which is
+// precisely how `S = 'abc'` and `Flags and MASK = 0` stayed wrong through a
+// thousand passing tests: the evaluator and the assertion were written from the
+// same misunderstanding of the language, agreed with each other, and proved
+// nothing about Delphi.
+//
+// Add a form here rather than an `Assert.AreEqual` somewhere: one line in this
+// procedure and one row in the test's table, and the compiler owns the answer.
+procedure RunExprOracle;
+var
+  Flags, Mask, Small:            Integer;
+  Greeting, GreetingCopy, Blank: string;
+  Narrow:                        AnsiString;
+  Initial:                       Char;
+  Mode:                          TWorkMode;
+  Modes:                         TWorkModes;
+  // Bitwise / boolean against a comparison -- the precedence that was inverted.
+  Ora01, Ora02, Ora03, Ora04, Ora05, Ora06, Ora07, Ora08, Ora09: Boolean;
+  // Integer operators no test had ever evaluated.
+  Ora10, Ora11, Ora12, Ora13, Ora14, Ora15, Ora16, Ora17: Boolean;
+  // Relational operators, likewise.
+  Ora18, Ora19, Ora20, Ora21, Ora22: Boolean;
+  // Strings, where the comparison used to be on the pointer.
+  Ora23, Ora24, Ora25, Ora26, Ora27, Ora28, Ora29, Ora30, Ora31, Ora32: Boolean;
+  // Enum and set.
+  Ora33, Ora34: Boolean;
+begin
+  Flags := $0F;
+  Mask  := $F0;
+  Small := 3;
+  Greeting     := 'Hello';
+  GreetingCopy := Copy('xHello', 2, 5);   // same text, its own allocation
+  Blank        := '';
+  Narrow       := 'Hello';
+  Initial      := 'H';
+  Mode         := wmRunning;
+  Modes        := [wmRunning, wmPaused];
+
+  Ora01 := Flags and Mask = 0;
+  Ora02 := Flags and Mask <> 0;
+  Ora03 := Flags and $0F = $0F;
+  Ora04 := Flags or Mask = 255;
+  Ora05 := Flags xor Mask = 255;
+  Ora06 := Flags or 0 and 0 = 15;
+  Ora07 := not (Flags = 15);
+  Ora08 := (Flags > 1) and (Mask > 1);
+  Ora09 := (Flags > 99) or (Mask > 1);
+
+  Ora10 := Flags shl 4 = 240;
+  Ora11 := Mask shr 4 = 15;
+  Ora12 := Flags div 4 = 3;
+  Ora13 := Flags mod 4 = 3;
+  Ora14 := Flags / 2 = 7.5;
+  Ora15 := -Flags = 0 - 15;
+  Ora16 := 1 + 2 * 3 = 7;
+  Ora17 := (1 + 2) * 3 = 9;
+
+  Ora18 := Small <> Flags;
+  Ora19 := Small < Flags;
+  Ora20 := Small <= Flags;
+  Ora21 := Flags > Small;
+  Ora22 := Flags >= Small;
+
+  Ora23 := Greeting = 'Hello';
+  Ora24 := Greeting = 'Nope';
+  Ora25 := Greeting <> 'Nope';
+  Ora26 := Greeting = GreetingCopy;
+  Ora27 := Greeting < 'Z';
+  Ora28 := Greeting >= 'Hello';
+  Ora29 := Narrow = 'Hello';
+  Ora30 := Blank = '';
+  Ora31 := Initial = 'H';
+  Ora32 := Initial = 'h';
+
+  Ora33 := Mode = wmRunning;
+  Ora34 := wmRunning in Modes;
+
+  GSink.Use([Ora01, Ora02, Ora03, Ora04, Ora05, Ora06, Ora07, Ora08, Ora09, Ora10, Ora11, Ora12]);
+  GSink.Use([Ora13, Ora14, Ora15, Ora16, Ora17, Ora18, Ora19, Ora20, Ora21, Ora22, Ora23, Ora24]);
+  GSink.Use([Ora25, Ora26, Ora27, Ora28, Ora29, Ora30, Ora31, Ora32, Ora33, Ora34]);  // {BP:EXPR_ORACLE}
+end;
+
 constructor TIndexedBag.Create;
 begin
   inherited Create;
@@ -2272,6 +2359,7 @@ begin
   RunDeepNestedTest;
   RunEvalTests;
   RunExprSemanticsTests;
+  RunExprOracle;
   RunDateTimeAliasTest;
   RunStepConsecutiveCalls;
   RunStepIntoPrologue;

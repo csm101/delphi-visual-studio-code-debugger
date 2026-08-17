@@ -203,6 +203,25 @@ absurdly.
 
 ## Fixture design
 
+- **For anything the LANGUAGE defines, let the compiler compute the expected
+  value.** A hand-written `Assert.AreEqual` is worth exactly as much as its
+  author's reading of Delphi, and a wrong reading produces an evaluator and an
+  assertion built from the same misunderstanding: they agree with each other,
+  the test is green, and nothing has been proved. Measured cost of this: of the
+  232 expressions the whole suite evaluated, none contained `and`, `or`, `xor`,
+  `not`, `div`, `mod`, `shl`, `shr`, `<>`, `<`, `>`, `<=` or `>=`, and exactly
+  one contained `=` -- while `TEST_CATALOG.md` said "[x] Boolean ops,
+  comparisons, precedence". `S = 'abc'` compared heap pointers and `Flags and
+  MASK = 0` grouped C-style for as long as the project had existed, and both
+  surfaced only when someone read the evaluator against the language while
+  writing the user manual. `RunExprOracle` + `ExprOracle_DebuggerAgreesWithThe`
+  `Compiler` is the pattern: the fixture assigns the expression to a Boolean
+  local, the test evaluates the same source text, the two must match.
+- **A `[x]` in `TEST_CATALOG.md` must NAME the test that backs it.** A ticked box
+  with no test name is a claim, and it actively prevents the test from being
+  written -- nobody writes a test for something the catalog says is covered. An
+  empty `[ ]` would have been better than the line above.
+
 - **An argument containing ZERO BYTES silently makes an over-wide read look
   correct.** `Win32_StepOver_AdvancesWithinTheSameFrame` could never have caught
   the over-wide return-address read: the fourth pushed value was the Double 2.5,

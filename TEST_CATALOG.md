@@ -185,7 +185,25 @@ real implementation. Run summary shows the live count
 - [x] Field access `a.b.c`
 - [x] Indexed property `a.Level[0]`
 - [x] Method call (no args, with args, chained)
+- [x] **The compiler is the oracle.** 34 expressions are assigned to Boolean
+      locals in `RunExprOracle` (marker `EXPR_ORACLE`), so DCC64 computes the
+      expected answer; the test evaluates the SAME source text through the
+      debugger and asserts they agree
+      (`ExprOracle_DebuggerAgreesWithTheCompiler`). Covers `and` `or` `xor`
+      `not` `div` `mod` `shl` `shr` `/`, all six relational operators, string
+      and Char comparison, enum `=` and `in`, and the precedence combinations
+      between them.
+      Written after an audit found that, of 232 expressions the suite evaluated,
+      NONE contained `and` `or` `xor` `not` `div` `mod` `shl` `shr` `<>` `<` `>`
+      `<=` `>=` and exactly one contained `=` -- while this line read
+      "[x] Boolean ops, comparisons, precedence, unary minus". A hand-written
+      assertion is worth only as much as its author's reading of the language,
+      and a wrong reading produces an evaluator and an assertion that agree with
+      each other and not with Delphi. Add a form here rather than an
+      `Assert.AreEqual`: one line in the fixture, one row in the table.
 - [x] Boolean ops, comparisons, precedence, unary minus
+      (`ExprOracle_DebuggerAgreesWithTheCompiler`,
+      `ExprSemantics_OperatorPrecedence_MatchesDelphi`)
 - [x] DELPHI operator precedence: `and` with `*`, `or`/`xor` with `+`, both
       tighter than any comparison, so `Flags and MASK = 0` groups as the source
       does and the C-like `a > 1 and b < 2` no longer parses

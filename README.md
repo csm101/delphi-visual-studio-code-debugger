@@ -22,7 +22,7 @@ The repository contains **three programs** that share one debugger engine:
 |---|---|---|
 | **Debug adapter** | A **Debug Adapter Protocol (DAP)** server. This is the debugger itself: breakpoints, stepping, call stacks, variables, expression evaluation. Any DAP client can drive it. | `VisualStudioCodeDelphiDebugger\` |
 | **VS Code extension** | The client that makes it usable in the editor: the `delphi-win64` debug type, the process picker for attaching, status-bar progress, and an editor for the exception rules. | `install\local.delphi-win64-debug\` |
-| **MCP server** | The same engine exposed to an **AI agent** over the Model Context Protocol — 36 tools (`set_breakpoint`, `step_into`, `get_locals`, `evaluate_expression`, `get_call_stack`, `read_memory`, …). It lets an agent run a program, stop it, and read its actual state instead of guessing from the source. | `MCPDebugger\` |
+| **MCP server** | The same engine exposed to an **AI agent** over the Model Context Protocol — 44 tools (`set_breakpoint`, `step_into`, `get_locals`, `evaluate_expression`, `get_call_stack`, `read_memory`, …). It lets an agent run a program, stop it, and read its actual state instead of guessing from the source. | `MCPDebugger\` |
 
 The engine is shared: `DebuggerCore\` holds the Windows Debug API loop, the
 symbol readers (`.rsm`, TD32, `.map`, `.dcp`, JCL) and the expression evaluator.
@@ -718,7 +718,7 @@ the `claude` CLI, user scope) and with VS Code by merging the user `mcp.json`.
 It is idempotent, and `-Unregister` removes it. `install\Install.exe` offers the
 same registration at the end of an install.
 
-The 33 tools cover the debugging cycle:
+The 44 tools cover the debugging cycle:
 
 | Group | Tools |
 |---|---|
@@ -762,7 +762,7 @@ symbol resolution reaches both.
 |---|---|
 | `DebuggerCore\` | The debugger proper: Windows debug loop, symbol readers (`.rsm`, TD32, `.map`, `.dcp`, JCL), expression evaluator, exception rules |
 | `VisualStudioCodeDelphiDebugger\` | DAP server: reads DAP from stdin, drives the engine |
-| `MCPDebugger\` | MCP server: the same engine as 33 tools an agent can call |
+| `MCPDebugger\` | MCP server: the same engine as 44 tools an agent can call |
 | `install\local.delphi-win64-debug\` | VS Code extension: registers the `delphi-win64` debug type, the attach picker and the exception-rules editor, and bundles the adapter |
 | `Debugme.dpr` | A small program used as a debug target while developing the debugger |
 
