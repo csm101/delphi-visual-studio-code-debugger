@@ -1039,6 +1039,10 @@ var
   Ora23, Ora24, Ora25, Ora26, Ora27, Ora28, Ora29, Ora30, Ora31, Ora32: Boolean;
   // Enum and set.
   Ora33, Ora34: Boolean;
+  // Forms the catalogue claimed were covered and were not: string concat, nil
+  // comparison, numeric casts, `as`, and genuinely MIXED int/float arithmetic.
+  Ora35, Ora36, Ora37, Ora38, Ora39, Ora40, Ora41, Ora42, Ora43: Boolean;
+  Present, Absent: TWidget;
 begin
   Flags := $0F;
   Mask  := $F0;
@@ -1090,9 +1094,26 @@ begin
   Ora33 := Mode = wmRunning;
   Ora34 := wmRunning in Modes;
 
-  GSink.Use([Ora01, Ora02, Ora03, Ora04, Ora05, Ora06, Ora07, Ora08, Ora09, Ora10, Ora11, Ora12]);
-  GSink.Use([Ora13, Ora14, Ora15, Ora16, Ora17, Ora18, Ora19, Ora20, Ora21, Ora22, Ora23, Ora24]);
-  GSink.Use([Ora25, Ora26, Ora27, Ora28, Ora29, Ora30, Ora31, Ora32, Ora33, Ora34]);  // {BP:EXPR_ORACLE}
+  Present := TWidget.Create('present', 1);
+  Absent  := nil;
+  try
+    Ora35 := Greeting + '!' = 'Hello!';
+    Ora36 := Blank + Greeting = Greeting;   // concat where one side is a nil handle
+    Ora37 := Absent = nil;
+    Ora38 := Present <> nil;
+    Ora39 := Integer(Initial) = 72;
+    Ora40 := Flags * 1.0 = 15.0;            // int operand, float operand
+    Ora41 := Flags + 1.5 = 16.5;
+    Ora42 := (Present as TWidget).FValue = 1;
+    Ora43 := TObject(Present) <> nil;
+
+    GSink.Use([Ora01, Ora02, Ora03, Ora04, Ora05, Ora06, Ora07, Ora08, Ora09, Ora10, Ora11, Ora12]);
+    GSink.Use([Ora13, Ora14, Ora15, Ora16, Ora17, Ora18, Ora19, Ora20, Ora21, Ora22, Ora23, Ora24]);
+    GSink.Use([Ora25, Ora26, Ora27, Ora28, Ora29, Ora30, Ora31, Ora32, Ora33, Ora34, Ora35, Ora36]);
+    GSink.Use([Ora37, Ora38, Ora39, Ora40, Ora41, Ora42, Ora43]);  // {BP:EXPR_ORACLE}
+  finally
+    Present.Free;
+  end;
 end;
 
 constructor TIndexedBag.Create;

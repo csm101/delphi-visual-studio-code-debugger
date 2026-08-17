@@ -7724,7 +7724,19 @@ const
       OracleCase('Ora32', 'Initial = ''h'''),
       // Enum and set.
       OracleCase('Ora33', 'Mode = wmRunning'),
-      OracleCase('Ora34', 'wmRunning in Modes')];
+      OracleCase('Ora34', 'wmRunning in Modes'),
+      // Forms TEST_CATALOG.md ticked without a test behind them. String concat
+      // and nil comparison had NEVER been evaluated by anything; `as` likewise;
+      // "arithmetic int and float mix" was covered only by int-with-int.
+      OracleCase('Ora35', 'Greeting + ''!'' = ''Hello!'''),
+      OracleCase('Ora36', 'Blank + Greeting = Greeting'),
+      OracleCase('Ora37', 'Absent = nil'),
+      OracleCase('Ora38', 'Present <> nil'),
+      OracleCase('Ora39', 'Integer(Initial) = 72'),
+      OracleCase('Ora40', 'Flags * 1.0 = 15.0'),
+      OracleCase('Ora41', 'Flags + 1.5 = 16.5'),
+      OracleCase('Ora42', '(Present as TWidget).FValue = 1'),
+      OracleCase('Ora43', 'TObject(Present) <> nil')];
   end;
 
   // The rendered Boolean, normalised. An evaluator answer and a local read must

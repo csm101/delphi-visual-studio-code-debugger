@@ -181,18 +181,34 @@ real implementation. Run summary shows the live count
 
 ## D. Expression evaluation (watch / hover)
 
-- [x] Identifier (local, global, Self.X implicit)
-- [x] Field access `a.b.c`
-- [x] Indexed property `a.Level[0]`
-- [x] Method call (no args, with args, chained)
+> Every `[x]` below NAMES the test that backs it. A ticked box with no test name
+> is a claim, not coverage, and it is worse than an empty one: nobody writes a
+> test for something the catalogue says is already covered. Audited line by line
+> in 2026-08 after `[x] Boolean ops, comparisons, precedence` turned out to have
+> nothing behind it at all.
+
+- [x] Identifier — local, global, implicit `Self.X`
+      (`Test_Eval_ImplicitSelf_LocalShadowsField`,
+      `UnitGlobals_ResolveOnBothBitnesses`)
+- [x] Field access `a.b.c` (`Test_E2_NestedRecord3Deep` — `Outer.Mid.Inner.X`,
+      `Test_E2_LongDotChain`)
+- [x] Indexed property `a.Level[0]` (`Test_NestedClassMethod_AllThreeBugs`,
+      `Test_IndexedProperty_TwoMixedIndices_ExplicitName`)
+- [x] Method call — no args, with args, chained (`Test_Eval_Method_Chained` —
+      `W.GetSelf().Mult(3, 5)`, `Test_InheritedMethod_CalledOnDerivedInstance`)
 - [x] **The compiler is the oracle.** 34 expressions are assigned to Boolean
       locals in `RunExprOracle` (marker `EXPR_ORACLE`), so DCC64 computes the
       expected answer; the test evaluates the SAME source text through the
       debugger and asserts they agree
       (`ExprOracle_DebuggerAgreesWithTheCompiler`). Covers `and` `or` `xor`
       `not` `div` `mod` `shl` `shr` `/`, all six relational operators, string
-      and Char comparison, enum `=` and `in`, and the precedence combinations
-      between them.
+      comparison and concatenation, `Char` comparison, `nil` comparison,
+      ordinal and class casts, `as`, mixed int/float arithmetic, enum `=` and
+      `in`, and the precedence combinations between them. The table asserts both
+      outcomes are present, so an evaluator answering True to everything cannot
+      pass. Both negative controls were RUN, not assumed: mispairing one row
+      fails naming the disagreement, and disabling the text-comparison route
+      turns exactly the six string rows red.
       Written after an audit found that, of 232 expressions the suite evaluated,
       NONE contained `and` `or` `xor` `not` `div` `mod` `shl` `shr` `<>` `<` `>`
       `<=` `>=` and exactly one contained `=` -- while this line read
@@ -208,8 +224,15 @@ real implementation. Run summary shows the live count
       tighter than any comparison, so `Flags and MASK = 0` groups as the source
       does and the C-like `a > 1 and b < 2` no longer parses
       (`ExprSemantics_OperatorPrecedence_MatchesDelphi`)
-- [x] Arithmetic int and float mix, div/mod
-- [x] String concat
+- [x] Arithmetic with an int operand and a float operand, `div`, `mod`
+      (`ExprOracle_...` — `Flags + 1.5 = 16.5`, `Flags * 1.0 = 15.0`,
+      `Flags div 4 = 3`, `Flags mod 4 = 3`, `Flags / 2 = 7.5`).
+      Was ticked with nothing behind it: `div` and `mod` had never been
+      evaluated, and the only "mix" was int-with-int through `/`
+- [x] String concat (`ExprOracle_...` — `Greeting + '!' = 'Hello!'`, and
+      `Blank + Greeting = Greeting` where one side is a nil string handle).
+      Was ticked with nothing behind it: NO evaluated expression in the suite
+      had ever concatenated two strings
 - [x] String COMPARISON compares characters, not heap pointers: literal on
       either side, two equal strings in different allocations, `AnsiString` vs
       `string`, empty string, ordering, `Char` vs a one-character literal, and a
@@ -225,21 +248,34 @@ real implementation. Run summary shows the live count
 - [x] Parser recursion is bounded: a 400-deep parenthesis nest is refused with
       the reason and the session still evaluates afterwards
       (`ExprSemantics_DeepNesting_IsRefused_NotACrash`)
-- [x] nil compare
-- [x] Cast: `Integer(x)`, class cast, TObject upcast
-- [x] `is` and `as`
+- [x] nil compare (`ExprOracle_...` — `Absent = nil`, `Present <> nil`).
+      Was ticked with nothing behind it: `nil` appeared in no evaluated
+      expression anywhere in the suite
+- [x] Cast — `Integer(x)` ordinal, class cast, `TObject` upcast
+      (`ExprOracle_...` — `Integer(Initial) = 72`,
+      `TObject(Present) <> nil`; `Test_UsesScope_Cast_PicksUsedUnit` —
+      `TDup(DupInst).Tag()`). Only the class cast had a test
+- [x] `is` and `as` (`Test_UsesScope_Cast_PicksUsedUnit` — `DupInst is TDup`;
+      `ExprOracle_...` — `(Present as TWidget).FValue = 1`).
+      `as` had never been evaluated
 - [x] Length, High, Low, SizeOf, Ord
+      (`ArrayBounds_AreEnforcedOnBothBitnesses`,
+      `RecordArrayStride_IsTheRecordWidthOnBothBitnesses`,
+      `Test_UsesScope_TypeSize_PicksUsedUnit`,
+      `NestedTypeNames_ResolveOnBothBitnesses`)
 - [ ] @ address-of operator on locals
 - [x] Pointer dereference `P^`: `Test_Types_PtrPrimitive_DerefMatches`
 - [x] Set algebra `[a] + [b]` union, `-` difference, `*` intersection
       (`Test_BL_Eval_SetLiteralArith`)
-- [x] In: `wmRunning in S`
+- [x] In: `wmRunning in S` (`NestedTypeNames_ResolveOnBothBitnesses` —
+      `Red in Cols`; `ExprOracle_...` — `wmRunning in Modes`)
 - [x] Method call with a side effect persists across evals
       (`Test_BL_Eval_MethodSideEffect`)
 - [x] Deref of unmapped memory fails gracefully, session survives
       (`Test_BL_Ptr_UnmappedRead`)
 - [ ] Inherited call (`inherited Foo`)
-- [x] Parameterless system funcs (Now)
+- [x] Parameterless system funcs — `Now`, `Now()`
+      (`Test_Eval_ParameterlessSystemFunc_Now`)
 - [ ] Long dot chain `Self.A.B.C.D.E.F`
 - [ ] Anonymous record literal
 - [ ] Range expression `Low(T) .. High(T)`
