@@ -104,9 +104,17 @@
     return node;
   }
 
+  // A webview cannot veto its own disposal, so the only way closing the tab can
+  // stop being destructive is for the HOST to hold the latest draft. It offers
+  // it back when the panel goes away with edits still pending.
+  function postDirtyState() {
+    vscode.postMessage({ type: 'dirty', dirty: dirty, rules: dirty ? currentRules() : [] });
+  }
+
   function markDirty() {
     dirty = true;
     statusText = 'Unsaved changes';
+    postDirtyState();
   }
 
   function moveRule(from, to) {
@@ -369,6 +377,7 @@
     if (!message) return;
     if (message.type === 'saved') {
       dirty = false;
+      postDirtyState();
       statusText = 'Saved - review the ' + fileNoun() + ' editor that just opened';
       updateToolbar();
     } else if (message.type === 'saveFailed') {

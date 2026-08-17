@@ -662,13 +662,30 @@ class MemoryPane {
           cell.value.toString(16).toUpperCase().padStart(2, '0');
         if (editable && cell.value !== null) {
           s.contentEditable = 'true';
+          // A typed cell commits on Enter AND on losing focus. Before, only
+          // Enter wrote: clicking away left the typed text sitting in the cell
+          // until the next render, so the pane was showing a byte that is not
+          // in the debuggee and the user had no way to tell whether the write
+          // had happened. Escape is the way out without writing.
+          let committed = s.textContent;
+          const commit = () => {
+            const text = s.textContent.trim();
+            if (text === committed) return;
+            committed = text;
+            vscodeApi.postMessage({ type: 'write', offset: cell.offset, text: text });
+          };
           s.addEventListener('keydown', (e) => {
             if (e.key === 'Enter') {
               e.preventDefault();
-              vscodeApi.postMessage({ type: 'write', offset: cell.offset, text: s.textContent });
+              commit();
+              s.blur();
+            } else if (e.key === 'Escape') {
+              e.preventDefault();
+              s.textContent = committed;
               s.blur();
             }
           });
+          s.addEventListener('blur', commit);
         }
         hex.appendChild(s);
         hex.appendChild(document.createTextNode(' '));

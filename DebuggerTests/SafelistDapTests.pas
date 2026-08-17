@@ -329,8 +329,14 @@ begin
   // SlowScore is cut short -- and a cut-short call is not an answer. Rendering
   // the cancellation as its value would hide the click that still evaluates it
   // on the full explicit budget.
-  Assert.AreEqual('(expand to evaluate)', Slow,
+  Assert.IsTrue(Slow.StartsWith('(expand to evaluate'),
     'a getter the watchdog cut short must DEFER, got: ' + Slow);
+  // ...and it must say WHICH of the three reasons this is. "I have not
+  // authorised this yet" and "it ran out of time" want opposite reactions from
+  // the user, and one shared text made them indistinguishable.
+  Assert.AreNotEqual('(expand to evaluate)', Slow,
+    'an authorised getter that was cut short must not read like an ' +
+    'unauthorised one, got: ' + Slow);
   // The getter sleeps 5 s, so anything below that proves the panel was not held
   // waiting for it. Deliberately loose: the assertions above carry the meaning,
   // this one only separates "cut short" from "waited it out".

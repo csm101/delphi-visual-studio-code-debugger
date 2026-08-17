@@ -122,6 +122,14 @@ type
 
     // Conditional / hit-count / logpoint breakpoint evaluation (shared engine).
     FBpEval:     TBpEvaluator;
+    // Set by HandleBpHit when a breakpoint's condition would not evaluate, read
+    // (and cleared) by the next stop report so the frontend can name the reason.
+    FBpConditionError: string;
+    // Conditions already announced on the console, keyed by breakpoint address +
+    // condition text. Once per breakpoint per session: the stop itself repeats as
+    // long as the user keeps continuing, but the explanation only needs saying
+    // once, and editing the condition makes it a different key.
+    FAnnouncedBadConditions: TDictionary<string, Boolean>;
 
     // Which getters may be auto-evaluated (SafeCallPolicy.pas). Owned here,
     // handed to the expander by SyncExpander like every other dependency.
@@ -759,6 +767,7 @@ begin
   FDebuggerOutput := TList<string>.Create;
   FExpander    := TVariableExpander.Create;
   FBpEval      := TBpEvaluator.Create;
+  FAnnouncedBadConditions := TDictionary<string, Boolean>.Create;
   // The safe-getter policy: user dir (env-overridable, which is how the tests
   // keep their hands off the real user file) + the adapter's own directory for
   // the shipped archives. Source dirs arrive at Launch/Attach.
@@ -801,6 +810,7 @@ begin
   FRtti.Free;
   FExpander.Free;        // frees only its handle table; reader refs not owned
   FBpEval.Free;          // owns nothing; reader/rtti refs not owned
+  FAnnouncedBadConditions.Free;
   FSafePolicy.Free;
   FDebuggerOutput.Free;
   FDebuggeeOutput.Free;
@@ -2095,6 +2105,11 @@ begin
   FExpander.Reset;             // expansion handles are valid only within a stop
   FStoppedOnException := Reason = srException;
   FStopReason := Reason;
+  // Only a breakpoint stop can carry one, and HandleBpHit assigns it (empty or
+  // not) on every breakpoint it decides. Clearing here stops one leaking into the
+  // next step or exception stop.
+  if Reason <> srBreakpoint then
+    FBpConditionError := '';
   if (FRtti = nil) and (FDebugger <> nil) and (FDebugger.ProcessHandle <> 0) then
     FRtti := TDelphiRtti.Create(FDebugger.ProcessHandle, FDebugger.TargetLayout);
   if FDebugger <> nil then begin
@@ -2142,6 +2157,7 @@ begin
       Info.ExceptionDescription := FDebugger.LastExceptionDesc;
     if Reason = srDataBreakpoint then
       Info.DataBreakpointDescription := BuildDataBreakpointDescription;
+    Info.BreakpointConditionError := FBpConditionError;
     FOnStopped(Info);
   end;
 end;
@@ -2185,10 +2201,27 @@ begin
   FBpEval.Rtti      := FRtti;
   FBpEval.DebugInfo := FDebugInfo;
   FBpEval.Readers   := Readers;
+  FBpConditionError := '';
   var LogText: string;
-  case FBpEval.Decide(BP.Condition, BP.HitCondition, BP.LogMessage, BP.HitCount, LogText) of
-    bpStop:
+  var ConditionError: string;
+  case FBpEval.Decide(BP.Condition, BP.HitCondition, BP.LogMessage, BP.HitCount,
+         LogText, ConditionError) of
+    bpStop: begin
+      // Carried to the stop report so the frontend can name the reason inline.
+      // The console line is emitted once per breakpoint per session: the stop
+      // repeats as long as the user keeps continuing, the explanation need not.
+      FBpConditionError := ConditionError;
+      if ConditionError <> '' then begin
+        var Key := IntToHex(BP.VA, 16) + '|' + BP.Condition;
+        if not FAnnouncedBadConditions.ContainsKey(Key) then begin
+          FAnnouncedBadConditions.Add(Key, True);
+          FDebuggerOutput.Add(ConditionError);
+          if Assigned(FOnOutput) then
+            FOnOutput(okNotice, ConditionError);
+        end;
+      end;
       Result := True;
+    end;
     bpLog: begin
       FDebuggerOutput.Add(LogText);
       // A logpoint message is the USER's, not the debugger's: it goes where the
@@ -2452,10 +2485,12 @@ begin
       // Both directions are stored: a module unload that makes the line stop
       // resolving must not leave a client believing the breakpoint is still live.
       StoreVerifiedState(Key, Verified);
-      // The event stays a verified-transition notification only -- a subscribed DAP
-      // frontend uses it to re-colour a gutter that was drawn unverified.
-      if Verified and Assigned(FOnBreakpointChanged) then
-        FOnBreakpointChanged(Spec.SourceFile, Line, True);
+      // BOTH directions. Reporting only the transition to verified told the user
+      // the good news and never the bad: when the owning module unloaded, the
+      // line stopped resolving and the gutter marker stayed solid -- the
+      // debugger claiming a breakpoint was armed when it was not.
+      if Assigned(FOnBreakpointChanged) then
+        FOnBreakpointChanged(Spec.SourceFile, Line, Verified);
     end;
   end;
 end;
@@ -2585,6 +2620,11 @@ begin
   // module name rebinds and replants at whatever base it reloads at.
   if HaveAddressBreakpoints then
     RepostAddressBreakpoints;
+  // A SOURCE breakpoint in a unit of this module resolved through the provider
+  // that has just gone away, so its line no longer binds. Re-deriving the
+  // verified state here is what turns the gutter marker back to grey; without
+  // it the only flips ever reported were the ones on the way UP.
+  NotifyBreakpointFlips;
 end;
 
 function TDebugSession.FrameToSession(const F: TStackFrame;
@@ -3795,6 +3835,7 @@ begin
   end;
   if FStopReason = srDataBreakpoint then
     Result.DataBreakpointDescription := BuildDataBreakpointDescription;
+  Result.BreakpointConditionError := FBpConditionError;
 end;
 
 function TDebugSession.DrainDebuggeeOutput: TArray<string>;

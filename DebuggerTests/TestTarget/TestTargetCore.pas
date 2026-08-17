@@ -974,6 +974,40 @@ begin
   W.Free;
 end;
 
+// Fixtures for the expression-evaluator semantics: string comparison, Delphi
+// operator precedence and the compiler intrinsics. Deliberately a procedure of
+// its own rather than more locals in RunEvalTests -- several tests assert the
+// exact local set of that frame, and this one exists to be added to.
+procedure RunExprSemanticsTests;
+var
+  Greeting:     string;
+  GreetingCopy: string;      // the same characters in a DIFFERENT allocation
+  Blank:        string;
+  Narrow:       AnsiString;  // the other string family, its own header layout
+  Initial:      Char;
+  Flags:        Integer;
+  Mask:         Integer;
+  Present:      TWidget;
+  Absent:       TWidget;
+begin
+  Greeting := 'Hello';
+  // Built at run time so it cannot share the literal's storage: the whole point
+  // of the comparison tests is that two equal strings live at two addresses.
+  GreetingCopy := Copy('xHello', 2, 5);
+  Blank        := '';
+  Narrow       := 'Hello';
+  Initial      := 'H';
+  Flags        := $0F;
+  Mask         := $F0;    // Flags and Mask = 0 -- true only with Delphi precedence
+  Present      := TWidget.Create('present', 1);
+  Absent       := nil;
+  try
+    GSink.Use([Greeting, GreetingCopy, Blank, string(Narrow), Initial, Flags, Mask, Absent = nil]);  // {BP:EXPR_SEMANTICS}
+  finally
+    Present.Free;
+  end;
+end;
+
 constructor TIndexedBag.Create;
 begin
   inherited Create;
@@ -1054,6 +1088,20 @@ begin
   Big[0]    := 5;
   Big[1499] := 6;
   GSink.Use(Big);  // {BP:BIG_VARARRAY_BODY}
+end;
+
+// Fixture for the dynamic-array expansion cap. More elements than the 1024 the
+// expander is willing to list, so there is something for the "showing first N
+// of M" trailer to say -- without it, 1024 of 1500 looked exactly like all of
+// an array of 1024.
+procedure RunBigDynArrayProbe;
+var
+  Big: TArray<Integer>;
+begin
+  SetLength(Big, 1500);
+  Big[0]    := 5;
+  Big[1499] := 6;
+  GSink.Use([Length(Big), Big[0], Big[1499]]);  // {BP:BIG_DYNARRAY_BODY}
 end;
 
 procedure RunOdsProbe;
@@ -2223,6 +2271,7 @@ begin
   RunClosureParamSampler;
   RunDeepNestedTest;
   RunEvalTests;
+  RunExprSemanticsTests;
   RunDateTimeAliasTest;
   RunStepConsecutiveCalls;
   RunStepIntoPrologue;
@@ -2236,6 +2285,7 @@ begin
     RunGotoProbe;
   RunEnumPackProbe;
   RunBigVarArrayProbe;
+  RunBigDynArrayProbe;
   if FindCmdLineSwitch('run-ods') or FindCmdLineSwitch('-run-ods') then
     RunOdsProbe;
   RunNestedVariantTest;

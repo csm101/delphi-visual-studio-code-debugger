@@ -664,11 +664,16 @@ function activate(context) {
   );
 
   // The safe-getter safelist. A getter-backed property row defers as "(expand
-  // to evaluate)"; these two actions write the user's decision through the
-  // adapter (which owns the file and the reload), and the panel re-renders at
-  // once via the invalidated event the adapter sends back. The row names its
-  // own safelist entry (delphiSafelistKey), so what the user clicked and what
-  // the file says cannot disagree.
+  // to evaluate)"; these actions write the user's decision through the adapter
+  // (which owns the file and the reload), and the panel re-renders at once via
+  // the invalidated event the adapter sends back. The row names its own
+  // safelist entry (delphiSafelistKey), so what the user clicked and what the
+  // file says cannot disagree.
+  //
+  // 'forget' is the way back out. Without it "Always Evaluate This Property"
+  // was a one-way door: undoing it meant hand-editing a JSON file whose path
+  // the UI never showed. The confirmation names that file too, so a decision
+  // stays reversible even when the row it was made on is long gone.
   function safelistAction(verdict) {
     return async (commandArgument) => {
       const session = vscode.debug.activeDebugSession;
@@ -682,8 +687,9 @@ function activate(context) {
       const expression = variable &&
         (variable.evaluateName || (typeof variable.name === 'string' ? variable.name : ''));
       if (!expression) return;
+      const command = verdict === 'forget' ? 'delphiSafelistRemove' : 'delphiSafelistAdd';
       try {
-        const reply = await session.customRequest('delphiSafelistAdd',
+        const reply = await session.customRequest(command,
           { expression: expression, verdict: verdict });
         if (reply && reply.applicable === false) {
           vscode.window.showInformationMessage(
@@ -691,11 +697,15 @@ function activate(context) {
             'needs no permission — it is always shown.');
           return;
         }
+        const outcome = {
+          deny:   'will never auto-evaluate',
+          forget: 'is back to asking before it evaluates',
+        }[verdict] || 'will auto-evaluate from now on';
+        // The file is named because it is the only way to review or undo these
+        // decisions in bulk; the adapter returns its path with every reply.
+        const where = reply && reply.userFile ? ' — recorded in ' + reply.userFile : '';
         vscode.window.setStatusBarMessage(
-          verdict === 'deny'
-            ? 'Delphi: "' + expression + '" will never auto-evaluate'
-            : 'Delphi: "' + expression + '" will auto-evaluate from now on',
-          6000);
+          'Delphi: "' + expression + '" ' + outcome + where, 8000);
       } catch (err) {
         vscode.window.showWarningMessage(
           'Safelist update failed: ' + (err && err.message ? err.message : String(err)));
@@ -704,7 +714,8 @@ function activate(context) {
   }
   context.subscriptions.push(
     vscode.commands.registerCommand('delphi-win64.safelistAllow', safelistAction('allow')),
-    vscode.commands.registerCommand('delphi-win64.safelistDeny', safelistAction('deny')));
+    vscode.commands.registerCommand('delphi-win64.safelistDeny', safelistAction('deny')),
+    vscode.commands.registerCommand('delphi-win64.safelistForget', safelistAction('forget')));
 
   const modules = modulesView.register(context);
 

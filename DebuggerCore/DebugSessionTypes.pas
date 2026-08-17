@@ -49,7 +49,11 @@ type
   // the Debug Console. okDebugger is the debugger talking about itself (symbol
   // loading, modules without debug info, warnings), which is diagnostics and
   // drowns the other two when mixed with them.
-  TOutputKind = (okDebuggee, okDebugger, okLogPoint);
+  // okNotice is the debugger reporting a fault in something the USER wrote -- a
+  // breakpoint condition that would not evaluate. It goes to the Debug Console
+  // rather than the diagnostics channel precisely because it is about the user's
+  // own input: burying it among symbol-loading lines is how it stayed invisible.
+  TOutputKind = (okDebuggee, okDebugger, okLogPoint, okNotice);
 
   TVarKind = (
     vkScalar,
@@ -321,6 +325,11 @@ type
     // WHICH thread wrote the cell is frequently the whole answer, so it is not
     // buried inside this string alone.
     DataBreakpointDescription: string;
+    // Populated only when Reason = srBreakpoint AND the breakpoint's condition
+    // could not be evaluated. The stop happened BECAUSE the condition failed, so
+    // a frontend that renders a stop reason must say so -- otherwise the user
+    // sees an unconditional-looking stop on a line they conditioned.
+    BreakpointConditionError: string;
   end;
 
   TCompactSnapshot = record
@@ -336,6 +345,9 @@ type
     Exception_:      TSessionExceptionInfo;
     // Populated only when StopReason = srDataBreakpoint; see TStopInfo.
     DataBreakpointDescription: string;
+    // Populated when the stop happened because a breakpoint condition would not
+    // evaluate; see TStopInfo.BreakpointConditionError.
+    BreakpointConditionError: string;
   end;
 
   // Per runtime-module (DLL/BPL) sidecar overrides from a frontend's launch

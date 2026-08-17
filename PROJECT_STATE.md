@@ -338,7 +338,9 @@ Variable expansion (RTTI-driven, `DelphiRtti.pas`):
 - Class instance field expansion (all visibility levels, all ancestor classes)
   via VMT extended RTTI (`TFieldExEntry` records). Validated on `TFoo`.
 - Record field expansion via TypeInfo `tkRecord`/`tkMRecord` field table.
-- Dynamic-array element enumeration (up to 512 elements).
+- Dynamic-array element enumeration (up to 1024 elements,
+  `VariableExpander.pas`; the 512 cap belongs to the RTTI walk in
+  `DelphiRtti.pas`, which is a different limit).
 - Nested expansion: each expandable field gets its own `variablesReference`.
 
 Class-member resolution (RSM-driven, `RsmFileReader.ParseClassMemberSection`):
@@ -355,9 +357,23 @@ Class-member resolution (RSM-driven, `RsmFileReader.ParseClassMemberSection`):
 Evaluate / watch:
 - Qualified identifiers (e.g. `Increment.d1`).
 - Registers, address-of, memory dereference, literals.
-- Pascal grammar with full precedence: `or` / `xor` < `and` < comparison
-  (`=` `<>` `<` `<=` `>` `>=`) < add (`+` `-`) < mul (`*` `/` `div` `mod`
-  `shl` `shr`) < unary (`-` `not` `@` `[]`) < primary.
+- Pascal grammar with DELPHI's precedence: comparison (`=` `<>` `<` `<=`
+  `>` `>=` `in` `is` `as`) < add (`+` `-` `or` `xor`) < mul (`*` `/`
+  `div` `mod` `and` `shl` `shr`) < unary (`-` `not` `@` `[]`) < primary.
+  `and` sits with the multiplicative operators and `or`/`xor` with the
+  additive ones, both binding TIGHTER than any comparison — which is why
+  `(a > 1) and (b < 2)` needs its parentheses here exactly as in Delphi.
+  It used to be the other way round (C-like), so `Flags and MASK = 0`
+  silently meant `Flags and (MASK = 0)`.
+- Relational operators between STRING operands compare characters
+  (ordinal, `CompareStr`), across UnicodeString / WideString /
+  AnsiString (code page from the string's own `TStrRec`) / ShortString,
+  and against a `Char`. `nil` reads as the empty string, since that is
+  how Delphi stores one. A string against a non-text operand is refused
+  with a reason. Previously these compared HEAP POINTERS, so `S = 'abc'`
+  was False whatever S held.
+- Bounded per expression: `MAX_EXPR_NESTING` = 64 parser levels,
+  `MAX_EXPR_CALLS` = 32 calls into the debuggee.
 - Mixed int / float arithmetic auto-promotes to Double; `/` always yields
   Double like Pascal source.
 - String concat with `+` allocates a new immortal Delphi string in the
@@ -384,7 +400,20 @@ Evaluate / watch:
   watch (no debuggee crash, no silent pass-through).
 - Built-in intrinsics: `Length(s | dynarray)`, `SizeOf(type)`,
   `Ord(enum)`, `Low(t)` / `High(t)` for ordinals / enums / arrays /
-  strings.
+  strings, `Assigned`, `Pred`, `Succ`, `Abs`, `Chr`, `Trunc`, `Round`,
+  `Int`, `Frac`, and — on the string reader above — `Copy`, `Pos`,
+  `UpperCase`, `LowerCase` (ASCII-only, as the RTL's are).
+- A Delphi intrinsic that is NOT implemented (`Inc`, `Dec`, `Format`,
+  `SetLength`, `TypeInfo`, `Write`, …) is refused by name with the
+  reason, from a table in `TryUnsupportedIntrinsicAdvice`. It is compiler
+  magic with no callable symbol, so without the table it fell through to
+  symbol resolution and came back as "not found" — which reads as an
+  accusation about the user's variable rather than a statement about the
+  function.
+- Character literals (`#65`, `#$41`) and literal runs (`'a'#13#10'b'` is
+  one constant; a lone `#N` is a `Char`). Float literals take an
+  exponent (`1e6`, `1.5e-3`). A leading-dot float (`.5`) is refused by
+  name — Pascal, unlike C, requires the digit.
 - Set algebra on set operands: `+` union, `-` difference, `*`
   intersection (bitmask ops; `TExprValue.IsSet` routes them).
 - Open-array parameter indexing: a `^Element` base (how `array of T`
@@ -420,7 +449,11 @@ Evaluate / watch:
 Breakpoint kinds:
 - Source-line BPs (always-on or conditional).
 - Conditional BPs (DAP `condition`): expression evaluated at hit; non-zero =
-  stop, zero / eval-failure = silent continue.
+  stop, zero = silent continue, and a condition that CANNOT BE EVALUATED = stop
+  with the reason (`stopped.description`/`text`, plus one Debug Console line per
+  breakpoint per session). The hit-count gate is skipped on that path so a
+  `%N` hit condition cannot swallow the report. Matches the Delphi IDE; the old
+  "eval failure = silent continue" is the one failure nothing reveals.
 - Hit-count BPs (DAP `hitCondition`): supports `N`, `=N`, `>N`, `>=N`, `%N`.
 - Log-points (DAP `logMessage`): never stops; emits `output` event with
   `{expr}` placeholders rendered through the same evaluator. `{{` / `}}`
@@ -1331,8 +1364,10 @@ VS Code:
 
 ## Diagnostic logging
 
-`%TEMP%\dap_adapter.log`, line-timestamped. Always on today.
-Make opt-in is a roadmap item.
+`%TEMP%\dap_adapter.log`, line-timestamped. **Off by default**
+(`DapProtocol.pas`); turned on by `"diagnosticLog": true` in `launch.json`, or
+by `DAP_LOG=1` in the environment. One previous generation is kept beside it as
+`dap_adapter.1.log`.
 
 ## Repository and release invariants (recorded 2026-08-08)
 

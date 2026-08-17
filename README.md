@@ -624,8 +624,7 @@ every project without per-project config. By default the adapter reads:
 It is a JSON object with an `exceptionRules` array (a bare array is also
 accepted), using the same rule schema as above:
 
-```jsonc
-// %USERPROFILE%\.DelphiWinDebugger\exceptionRules.json
+```json
 {
   "exceptionRules": [
     { "class": "EAbort", "action": "ignore" },
@@ -633,6 +632,12 @@ accepted), using the same rule schema as above:
   ]
 }
 ```
+
+> **Strict JSON — unlike `launch.json`.** This file is read with Delphi's
+> `System.JSON`, not with VS Code's JSONC parser, so a `//` comment or a trailing
+> comma makes the whole file fail to parse. Comments in `launch.json` are fine
+> because VS Code strips them before the adapter ever sees the config; nothing
+> strips them here.
 
 Precedence: a project's `exceptionRules` (in `launch.json`) are evaluated
 **first**, then the shared file's rules — so a project can override the shared
@@ -644,7 +649,10 @@ finally to the exception filters). Control it from `launch.json`:
 | `useGlobalExceptionRules` | `true` | Load the shared rules file |
 | `globalExceptionRulesPath` | *(the path above)* | Use a custom shared-rules file location |
 
-A missing or malformed shared file is ignored (it never breaks debugging).
+A missing or malformed shared file is ignored: it never breaks debugging, but it
+also fails **silently** — you simply get zero shared rules, with nothing in the
+Debug Console to say so. If the shared baseline appears to have stopped applying,
+suspect a parse error first, and enable `diagnosticLog` to see the reason.
 
 The shared file is **hot-reloaded**: edit it while stopped on a breakpoint or
 exception, then resume (continue / step) and the new rules apply to subsequent
@@ -687,6 +695,10 @@ configuration; every other byte of the file — comments included — is left
 untouched. The file is left open and unsaved so the change can be reviewed or
 undone before it hits disk. If the workspace is not trusted the editor is
 read-only and offers **Copy JSON** instead.
+
+Closing the tab with unsaved edits does not throw them away: VS Code gives a
+webview no way to veto its own disposal, so the extension keeps the draft and
+offers **Reopen With Those Changes**.
 
 ---
 
@@ -793,7 +805,7 @@ At runtime the adapter compares the debuggee's actual `ImageBase` (from `CREATE_
 - [x] Attach to a running process (`request: attach`, requires SeDebugPrivilege; auto-elevates when possible)
 - [x] Stop at entry point (`stopAtEntry: true`)
 - [x] Breakpoints in source files (set from VS Code gutter)
-- [x] Conditional breakpoints, hit-count breakpoints, and log-points
+- [x] Conditional breakpoints, hit-count breakpoints, and log-points. A condition the debugger **cannot evaluate** — a typo, a variable that is not in scope on that line — makes the breakpoint **stop** and say why, in the stop widget and in the Debug Console, exactly as the Delphi IDE does. The opposite policy (treat a failed evaluation as "condition false") is the one failure nothing reveals: the breakpoint silently never fires and you conclude the code path is dead
 - [x] Step over (`F10`), step into (`F11`), step out (`Shift+F11`)
 - [x] Continue (`F5`), pause (injected `DebugBreakProcess`)
 - [x] Set next statement (DAP `gotoTargets` / `goto`)
@@ -818,7 +830,9 @@ At runtime the adapter compares the debuggee's actual `ImageBase` (from `CREATE_
 - [x] Object / record / dynamic-array expansion in the Variables tree (all fields, all ancestor classes, nested)
 - [x] Generic collection inspection: `TList<T>` and `TDictionary<...>` expand and enumerate their elements
 - [x] Hover data tips in the editor (`evaluateForHovers`)
-- [x] Full Pascal expression evaluator: qualified identifiers, arithmetic / comparison / boolean / set ops, string concat, indexing, type casts, `is` / `as`, `Length` / `SizeOf` / `Ord` / `Low` / `High`, enum / set literals, method and property calls (executed in the debuggee, raises aborted cleanly)
+- [x] Full Pascal expression evaluator, with **Delphi's own operator precedence** — `and` binds with `*`, `or`/`xor` with `+`, both tighter than any comparison, so `Flags and MASK = 0` pasted out of your source means there what it means here (and `(a > 1) and (b < 2)` needs its parentheses, exactly as in Delphi). Qualified identifiers, arithmetic / comparison / boolean / set ops, string concat, indexing, type casts, `is` / `as`, enum / set literals, character literals (`#13#10`), exponent floats (`1.5e-3`), method and property calls (executed in the debuggee, raises aborted cleanly)
+- [x] String comparison compares **characters**, not heap pointers, across `string` / `AnsiString` / `WideString` / `ShortString` and against a `Char`: `S = 'abc'` and `S1 = S2` answer what the debuggee's own code would. Comparing a string with something that is not text is refused with a reason rather than silently compared as a number
+- [x] Intrinsics: `Length` `SizeOf` `Ord` `Low` `High` `Assigned` `Pred` `Succ` `Abs` `Chr` `Trunc` `Round` `Int` `Frac` `Copy` `Pos` `UpperCase` `LowerCase`. A Delphi intrinsic that is *not* implemented (`Inc`, `Format`, `SetLength`, …) is refused **by name with the reason** — it is compiler magic with no callable symbol in the binary — instead of coming back as "not found", which reads like an accusation about your variable
 - [x] `setVariable` for primitives, floats, dates, chars, sized integer writes
 - [x] `setVariable` for enums (by name / ordinal) and sets (by bitmask) at the correct storage width
 - [x] `setVariable` for strings via in-process `@UStrAsg` / `@LStrAsg` (no refcount leak)
@@ -834,7 +848,7 @@ At runtime the adapter compares the debuggee's actual `ImageBase` (from `CREATE_
 - [x] Exception filter UI (`delphi` / `av` / `all` / `unhandled`, with per-class condition)
 - [x] Per-exception rule engine (`exceptionRules`): match on class / message / regex / unit / line, act with ignore / log / logStack / break
 - [x] Shared machine-wide exception rules (`%USERPROFILE%\.DelphiWinDebugger\exceptionRules.json`) applied across projects
-- [x] Accurate breakpoint verification state reported back to VS Code
+- [x] Accurate breakpoint verification state reported back to VS Code, in **both** directions: the gutter marker goes solid when the owning package loads and back to grey — with a Debug Console line — when it unloads, instead of staying solid over a breakpoint that is no longer armed
 - [x] Delphi RTL/VCL source resolution via `sourceSearchPaths` and the `BDS` env var
 
 ## Roadmap / not yet implemented

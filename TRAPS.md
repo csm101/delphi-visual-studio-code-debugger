@@ -103,6 +103,14 @@ absurdly.
   regression in the code under test, and sends the next hour in the wrong
   direction. Editing even a COMMENT counts as touching it: it shifts the
   `{BP:MARKER}` lines away from the compiled binary's line table.
+  Two artefacts in particular are missed, and they fail differently:
+  `TestHost\...\TestSubject.bpl` (`build_host.bat`) recompiles the SAME
+  `TestTarget\*.pas` units, so every `TDebuggerTestsBpl` case times out or
+  reports `<local: not found>`; and `TestTarget.jdbg` (`build_jdbg.bat`) is a
+  sidecar of the exe, so `JclDebugReaderTests` fails as a line-number/function
+  DISAGREEMENT between JCL and TD32 rather than as a timeout — which looks like a
+  reader bug and is not one. Re-verified the hard way in 2026-08; the sequential
+  re-check does not rescue you, because a stale fixture is not load-sensitive.
 - **Killing a suite mid-run leaves the adapter and `TestHost` alive**, holding the
   adapter exe open; the next build fails with `F2039 Could not create output
   file`. Kill them and move on — there is nothing to investigate.
@@ -229,6 +237,14 @@ absurdly.
   vacuously.
 - **Do not assert `proven:true` on raw-stack hits from an x64 fixture** — the
   call-site decoder is x86 only, so on x64 every hit is honestly `proven:false`.
+- **A `{BP:MARKER}` comment must sit on the statement's FIRST source line.** The
+  line table has an entry for the line a statement STARTS on, not for its
+  continuation lines, so a marker parked on the second line of a wrapped call
+  resolves to a line no address maps to: the breakpoint is accepted, never binds,
+  and the test fails with a bare "did not stop" that says nothing about why. Cost
+  one build+run round on `EXPR_SEMANTICS`; the fix was to fold the `GSink.Use([…])`
+  call back onto one line (the repo allows up to 130 columns for exactly this
+  kind of case).
 - **`Format('%x', ...)` emits UPPERCASE hex.** Every debugger-rendered address or
   value string (`$2A`, not `$2a`) follows it, so an assertion written in lowercase
   fails on a feature that works. Cost one full build+run round on the

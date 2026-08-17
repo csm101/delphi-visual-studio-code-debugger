@@ -1,22 +1,26 @@
 unit ExprEval;
-// Recursive-descent expression evaluator for the Win64 DAP adapter.
-//
-// Grammar (current):
-//   Expr    := Unary
-//   Unary   := '@' Primary        -- address-of
-//             | '[' Expr ']'      -- memory dereference
-//             | Primary Suffix*
-//   Primary := IntLiteral | '(' Expr ')' | Ident
-//   Suffix  := '[' Expr ']'       -- string char or dynarray element (step 1)
-//            | '.' Ident          -- field/property (step 2, RTTI-driven)
-//
-// Binary operators and function calls are deferred (see PROJECT_STATE.md).
+// Recursive-descent expression evaluator for the Delphi debugger frontends
+// (DAP watch / hover / Debug Console, MCP evaluate, breakpoint conditions and
+// logpoints). The language it accepts is Pascal, with Pascal's own operator
+// precedence: the per-level grammar is documented on the ParseXxx declarations
+// in the private section below.
 
 interface
 
 uses
   System.SysUtils, System.Math,
   DebugInfoTypes, DebugInfoSet, DebugTarget, DelphiRtti, DapProtocol;
+
+const
+  // Parser nesting a single expression may reach. Far past anything a person
+  // writes -- `Obj.List[I].Owner.Items[J].Name` is depth 2 -- and far short of
+  // what would exhaust the stack. It exists because the expression text is user
+  // input, and `(((((((...` is all it takes to recurse without one.
+  MAX_EXPR_NESTING = 64;
+  // Calls into the debuggee one expression may make. A getter chain such as
+  // `A.B.C.D` is a handful; anything approaching this is a runaway, and each
+  // call runs real code in the process being debugged.
+  MAX_EXPR_CALLS = 32;
 
 type
   TExprValue = record
@@ -88,6 +92,13 @@ type
     // itself: the retry runs against a real class, and if that also misses the
     // answer is "no such member", not another recovery attempt.
     FRecoveringInterfaceSelf: Boolean;
+    // Parser nesting depth and the number of debuggee calls this ONE expression
+    // has made. An expression is user input like any other and both were
+    // unbounded: `((((((...` recursed until the stack gave out, and a chain of
+    // getter calls could run the debuggee arbitrarily many times. Everything
+    // else in this codebase is bounded; these are now too.
+    FDepth:     Integer;
+    FCallCount: Integer;
 
     // Tokenizer
     procedure SkipWS;
@@ -96,13 +107,11 @@ type
     function  ScanIdent: string;
     function  ScanIntLiteral(out V: Int64): Boolean;
 
-    // Recursive descent. Precedence (low -> high):
-    //   ParseOr  := ParseAnd  ( ('or' | 'xor') ParseAnd  )*
-    //   ParseAnd := ParseCmp  ( 'and'           ParseCmp  )*
-    //   ParseCmp := ParseAdd  ( cmpOp           ParseAdd  )?
-    //   ParseAdd := ParseMul  ( ('+' | '-')     ParseMul  )*
-    //   ParseMul := ParseUnary( ('*' | '/' | 'div' | 'mod' | 'shl' | 'shr')
-    //                                            ParseUnary )*
+    // Recursive descent, with DELPHI's precedence (low -> high):
+    //   ParseCmp := ParseAdd  ( cmpOp ParseAdd )?
+    //   ParseAdd := ParseMul  ( ('+' | '-' | 'or' | 'xor')  ParseMul  )*
+    //   ParseMul := ParseUnary( ('*' | '/' | 'div' | 'mod' | 'and' | 'shl' |
+    //                            'shr')                     ParseUnary )*
     //   ParseUnary  := '@' ParsePrimary
     //                | '[' ParseExpr ']'
     //                | '-' ParseUnary
@@ -110,18 +119,37 @@ type
     //                | ParsePrimary Suffix*
     //   ParsePrimary := IntLit | FloatLit | StrLit | True | False | nil
     //                 | '(' ParseExpr ')' | Ident
+    //
+    // `and` sits with the multiplicative operators and `or` / `xor` with the
+    // additive ones, both binding TIGHTER than any comparison -- which is
+    // exactly why Delphi makes you write `(a > 1) and (b < 2)`. The evaluator
+    // used to bind them the other way round (C-like), so `Flags and MASK = 0`,
+    // pasted out of the user's own source, silently meant
+    // `Flags and (MASK = 0)`.
     function  ParseExpr: TExprValue;
-    function  ParseOr:   TExprValue;
-    function  ParseAnd:  TExprValue;
     function  ParseCmp:  TExprValue;
     function  ParseAdd:  TExprValue;
     function  ParseMul:  TExprValue;
     function  ParseUnary: TExprValue;
+    // The body of ParseUnary. Split out only so ParseUnary itself can be the
+    // depth guard for the `-` / `not` self-recursion.
+    function  ParseUnaryInner: TExprValue;
     function  ParsePrimary: TExprValue;
     function  MatchKeyword(const KW: string): Boolean;
     function  ApplyArith(const L, R: TExprValue; const Op: string): TExprValue;
     function  ApplyBoolean(const L, R: TExprValue; const Op: string): TExprValue;
     function  ApplyCompare(const L, R: TExprValue; const Op: string): TExprValue;
+    // True when the value IS a Delphi string (any family, including a
+    // ShortString), as opposed to a character. Only a string forces the text
+    // path: two characters compare perfectly well as ordinals.
+    function  IsStringValue(const V: TExprValue): Boolean;
+    // Reads the CHARACTERS behind a text-valued operand -- the three long-string
+    // families differ in where and how their length is stored, and a character
+    // has no length at all. Reason names why on a miss.
+    function  TryReadTextOperand(const V: TExprValue; out S: string;
+                out Reason: string): Boolean;
+    // Relational operator between two text operands, comparing characters.
+    function  CompareAsText(const L, R: TExprValue; const Op: string): TExprValue;
     function  ConcatStrings(const L, R: TExprValue): TExprValue;
     function  MaskByType(V: UInt64; const T: string): Int64;
     function  IsFloatHint(const H: string): Boolean;
@@ -140,6 +168,12 @@ type
     function  IsBuiltinIntrinsic(const Name: string): Boolean;
     function  ApplyIntrinsic(const Name: string;
                 const Args: TArray<TExprValue>): TExprValue;
+    // A Delphi intrinsic this evaluator does NOT implement. Compiler magic has
+    // no callable symbol in the binary, so without this the name falls through
+    // to symbol resolution and comes back as "not found" -- which reads as
+    // "your variable is wrong" rather than "this is not available here".
+    function  TryUnsupportedIntrinsicAdvice(const Name: string;
+                out Advice: string): Boolean;
     function  ParseStringLiteral(out S: string): Boolean;
     function  ApplySuffixes(const Base: TExprValue): TExprValue;
     function  ApplyIndex(const Base: TExprValue; Idx: Int64): TExprValue;
@@ -1567,6 +1601,14 @@ begin
         '<%s: evaluating this would CALL it; hover does not run code -- use the ' +
         'Debug Console or a watch>', [MethodName])));
   end;
+  // ...and, being that choke point, also where ONE expression's total number of
+  // debuggee calls is bounded. Each call runs real code in the process being
+  // debugged, so an expression that keeps producing them is not something to let
+  // run to completion just because each individual call looked reasonable.
+  Inc(FCallCount);
+  if FCallCount > MAX_EXPR_CALLS then
+    Exit(InvalidValue(Format('<this expression has already called into the ' +
+      'debuggee %d times; refusing to make more>', [MAX_EXPR_CALLS])));
   // Three call modes: instance method (Base is a class instance), class method
   // (ForceClassMethod -- Self is the class VMT in ClassRefSelf, not an instance),
   // and free procedure (Base is the synthetic "no-receiver" sentinel passed by
@@ -3273,9 +3315,58 @@ end;
 
 function TExprEvaluator.IsBuiltinIntrinsic(const Name: string): Boolean;
 begin
-  Result := SameText(Name, 'Length')  or SameText(Name, 'SizeOf')   or
-            SameText(Name, 'Ord')     or SameText(Name, 'High')     or
-            SameText(Name, 'Low');
+  for var Intrinsic in ['Length', 'SizeOf', 'Ord', 'High', 'Low',
+                        'Assigned', 'Pred', 'Succ', 'Abs', 'Chr',
+                        'Trunc', 'Round', 'Int', 'Frac',
+                        'Copy', 'Pos', 'UpperCase', 'LowerCase'] do
+    if SameText(Name, Intrinsic) then
+      Exit(True);
+  Result := False;
+end;
+
+function TExprEvaluator.TryUnsupportedIntrinsicAdvice(const Name: string;
+  out Advice: string): Boolean;
+type
+  TIntrinsicNote = record
+    Name: string;
+    Note: string;
+  end;
+const
+  NOTES: array[0..24] of TIntrinsicNote = (
+    (Name: 'Format';     Note: 'it takes an open array of const, which cannot be built from outside the process -- concatenate with + instead'),
+    (Name: 'Concat';     Note: 'use + between the strings'),
+    (Name: 'Inc';        Note: 'it changes a variable rather than yielding a value -- write X + 1'),
+    (Name: 'Dec';        Note: 'it changes a variable rather than yielding a value -- write X - 1'),
+    (Name: 'New';        Note: 'it allocates in the debuggee, which an expression must not do'),
+    (Name: 'Dispose';    Note: 'it frees memory in the debuggee, which an expression must not do'),
+    (Name: 'SetLength';  Note: 'it modifies its argument, so it is a statement rather than an expression'),
+    (Name: 'Insert';     Note: 'it modifies its argument, so it is a statement rather than an expression'),
+    (Name: 'Delete';     Note: 'it modifies its argument, so it is a statement rather than an expression'),
+    (Name: 'Include';    Note: 'it modifies its argument -- test membership with "x in S" instead'),
+    (Name: 'Exclude';    Note: 'it modifies its argument -- test membership with "x in S" instead'),
+    (Name: 'Initialize'; Note: 'it modifies its argument, so it is a statement rather than an expression'),
+    (Name: 'Finalize';   Note: 'it modifies its argument, so it is a statement rather than an expression'),
+    (Name: 'Str';        Note: 'it returns through a var parameter, which an expression cannot supply'),
+    (Name: 'Val';        Note: 'it returns through var parameters, which an expression cannot supply'),
+    (Name: 'Write';      Note: 'it is I/O, not an expression'),
+    (Name: 'Writeln';    Note: 'it is I/O, not an expression'),
+    (Name: 'Read';       Note: 'it is I/O, not an expression'),
+    (Name: 'Readln';     Note: 'it is I/O, not an expression'),
+    (Name: 'Exit';       Note: 'it is a control-flow statement, not an expression'),
+    (Name: 'Break';      Note: 'it is a control-flow statement, not an expression'),
+    (Name: 'Continue';   Note: 'it is a control-flow statement, not an expression'),
+    (Name: 'Halt';       Note: 'it would end the debuggee, which an expression must not do'),
+    (Name: 'TypeInfo';   Note: 'it yields a compile-time pointer that the debug information does not record'),
+    (Name: 'Addr';       Note: 'write @X, which this evaluator implements'));
+begin
+  Advice := '';
+  for var Note in NOTES do
+    if SameText(Name, Note.Name) then begin
+      Advice := Format('<%s is a Delphi compiler intrinsic, not a function in ' +
+        'the binary, so the debugger cannot call it: %s>', [Note.Name, Note.Note]);
+      Exit(True);
+    end;
+  Result := False;
 end;
 
 function TExprEvaluator.ApplyIntrinsic(const Name: string;
@@ -3377,9 +3468,118 @@ function TExprEvaluator.ApplyIntrinsic(const Name: string;
       [OpName, A.TypeHint]));
   end;
 
+  // Wraps a computed string as a value the rest of the evaluator can use, which
+  // means it has to EXIST in the debuggee: every consumer (formatting, passing
+  // it on as a call argument) reads it back through a pointer. Same mechanism a
+  // string literal and `+` between two strings already use.
+  function MakeRemoteString(const S: string): TExprValue;
+  var
+    Ptr: UInt64;
+  begin
+    if not FDebugger.AllocateRemoteString(S, 'UnicodeString', Ptr) then
+      Exit(InvalidValue('<could not allocate the result string in the debuggee>'));
+    Result          := Default(TExprValue);
+    Result.TypeHint := 'UnicodeString';
+    Result.RawValue := Ptr;
+    Result.Size     := 8;
+    Result.IsValid  := True;
+  end;
+
+  function MakeChar(Code: Word): TExprValue;
+  begin
+    Result          := Default(TExprValue);
+    Result.TypeHint := 'Char';
+    Result.RawValue := Code;
+    Result.Size     := 2;
+    Result.IsValid  := True;
+  end;
+
+  // Copy(S, Index, Count) over text. Delphi's Copy also works on arrays; that
+  // needs an allocation shaped like a dynamic array, which is a different job.
+  function CopyText(const A: TArray<TExprValue>): TExprValue;
+  var
+    Text, Reason: string;
+  begin
+    if Length(A) <> 3 then
+      Exit(InvalidValue(Format('<Copy: 3 args expected, got %d>', [Length(A)])));
+    if not TryReadTextOperand(A[0], Text, Reason) then
+      Exit(InvalidValue(Format('<Copy: %s>', [Reason])));
+    Result := MakeRemoteString(System.Copy(Text, AsInt64(A[1]), AsInt64(A[2])));
+  end;
+
+  // Pos(SubStr, S) and the three-argument Pos(SubStr, S, Offset).
+  function PosInText(const A: TArray<TExprValue>): TExprValue;
+  var
+    Needle, Haystack, Reason: string;
+  begin
+    if (Length(A) < 2) or (Length(A) > 3) then
+      Exit(InvalidValue(Format('<Pos: 2 or 3 args expected, got %d>', [Length(A)])));
+    if not TryReadTextOperand(A[0], Needle, Reason) then
+      Exit(InvalidValue(Format('<Pos: %s>', [Reason])));
+    if not TryReadTextOperand(A[1], Haystack, Reason) then
+      Exit(InvalidValue(Format('<Pos: %s>', [Reason])));
+    var Offset: Integer := 1;
+    if Length(A) = 3 then
+      Offset := AsInt64(A[2]);
+    Result := MakeInt64(System.Pos(Needle, Haystack, Offset));
+  end;
+
+  // Delphi's UpperCase / LowerCase map ONLY the ASCII letters -- the RTL says so
+  // and the debuggee's own code behaves that way, so a locale-aware mapping here
+  // would disagree with the program being debugged.
+  function ChangeAsciiCase(const A: TExprValue; ToUpper: Boolean): TExprValue;
+  var
+    Text, Reason: string;
+  begin
+    if not TryReadTextOperand(A, Text, Reason) then
+      Exit(InvalidValue(Format('<%s>', [Reason])));
+    for var I := 1 to Length(Text) do
+      if ToUpper and CharInSet(Text[I], ['a'..'z']) then
+        Text[I] := Char(Ord(Text[I]) - 32)
+      else if (not ToUpper) and CharInSet(Text[I], ['A'..'Z']) then
+        Text[I] := Char(Ord(Text[I]) + 32);
+    Result := MakeRemoteString(Text);
+  end;
+
+  // Pred / Succ keep the operand's TYPE, so `Succ(Mode)` still renders as the
+  // enum element rather than as a bare ordinal.
+  function StepOrdinal(const A: TExprValue; Delta: Int64): TExprValue;
+  begin
+    if IsFloatHint(A.TypeHint) then
+      Exit(InvalidValue(Format('<Pred/Succ need an ordinal, not "%s">', [A.TypeHint])));
+    Result          := A;
+    Result.RawValue := UInt64(MaskByType(A.RawValue, A.TypeHint) + Delta);
+    Result.Address  := 0;    // a computed value, no longer the variable itself
+    Result.IsSymbolRef := False;
+  end;
+
 begin
+  // The multi-argument intrinsics go first: the single-argument arity check
+  // below does not describe them.
+  if SameText(Name, 'Copy') then Exit(CopyText(Args));
+  if SameText(Name, 'Pos')  then Exit(PosInText(Args));
   if Length(Args) <> 1 then
     Exit(InvalidValue(Format('<%s: 1 arg expected, got %d>', [Name, Length(Args)])));
+  // `Assigned(X)` is exactly `X <> nil` -- the compiler emits nothing else. It
+  // is the single most-reached-for intrinsic in a breakpoint condition.
+  if SameText(Name, 'Assigned') then
+    Exit(MakeBool(Args[0].RawValue <> 0));
+  if SameText(Name, 'Pred') then Exit(StepOrdinal(Args[0], -1));
+  if SameText(Name, 'Succ') then Exit(StepOrdinal(Args[0], +1));
+  if SameText(Name, 'Abs') then begin
+    if IsFloatHint(Args[0].TypeHint) then
+      Exit(MakeDouble(System.Abs(AsDouble(Args[0]))));
+    Exit(MakeInt64(System.Abs(AsInt64(Args[0]))));
+  end;
+  // Chr yields a Char rather than the AnsiChar of its RTL declaration: in a
+  // Unicode debuggee that is what the value is compared and displayed against.
+  if SameText(Name, 'Chr')   then Exit(MakeChar(Word(AsInt64(Args[0]) and $FFFF)));
+  if SameText(Name, 'Trunc') then Exit(MakeInt64(System.Trunc(AsDouble(Args[0]))));
+  if SameText(Name, 'Round') then Exit(MakeInt64(System.Round(AsDouble(Args[0]))));
+  if SameText(Name, 'Int')   then Exit(MakeDouble(System.Int(AsDouble(Args[0]))));
+  if SameText(Name, 'Frac')  then Exit(MakeDouble(System.Frac(AsDouble(Args[0]))));
+  if SameText(Name, 'UpperCase') then Exit(ChangeAsciiCase(Args[0], True));
+  if SameText(Name, 'LowerCase') then Exit(ChangeAsciiCase(Args[0], False));
   if SameText(Name, 'Length') then begin
     if IsStringTypeHint(Args[0].TypeHint) then Exit(StringLength(Args[0]));
     if Args[0].TypeHint.StartsWith('TArray<', True) or
@@ -3553,6 +3753,177 @@ begin
   Result := MakeInt64(Z);
 end;
 
+function TExprEvaluator.IsStringValue(const V: TExprValue): Boolean;
+begin
+  if IsStringTypeHint(V.TypeHint) then
+    Exit(True);
+  if SameText(V.TypeHint, 'ShortString') then
+    Exit(True);
+  Result := TypeNameToKind(V.TypeHint) = TK_STRING;   // `string[N]` aliases
+end;
+
+function TExprEvaluator.TryReadTextOperand(const V: TExprValue; out S: string;
+  out Reason: string): Boolean;
+const
+  // Same ceiling ConcatStrings works to. Beyond it the value is refused rather
+  // than truncated: a truncated read compares equal to the wrong things.
+  MAX_STR_LEN = 65536;
+
+  // Delphi long strings all put their length in the 4 bytes below the character
+  // data; UnicodeString counts ELEMENTS and a WideString (an OLE BSTR) counts
+  // BYTES, which is the whole difference between the two.
+  function ReadUtf16(Ptr: UInt64; LengthIsBytes: Boolean): Boolean;
+  var
+    RawLen: Integer;
+    Buf:    TBytes;
+  begin
+    if Ptr = 0 then
+      Exit(True);                       // a nil handle IS the empty string
+    if not FDebugger.ReadProcessMemoryAt(Ptr - 4, @RawLen, 4) then begin
+      Reason := Format('string at 0x%x could not be read', [Ptr]);
+      Exit(False);
+    end;
+    var CharCount := RawLen;
+    if LengthIsBytes then
+      CharCount := RawLen div SizeOf(WideChar);
+    if CharCount = 0 then
+      Exit(True);
+    if (CharCount < 0) or (CharCount > MAX_STR_LEN) then begin
+      Reason := Format('string at 0x%x claims %d characters', [Ptr, CharCount]);
+      Exit(False);
+    end;
+    SetLength(Buf, CharCount * 2);
+    if not FDebugger.ReadProcessMemoryAt(Ptr, @Buf[0], CharCount * 2) then begin
+      Reason := Format('string body at 0x%x could not be read', [Ptr]);
+      Exit(False);
+    end;
+    S := TEncoding.Unicode.GetString(Buf);
+    Result := True;
+  end;
+
+  // An AnsiString carries its own code page in TStrRec (a Word at Ptr-12).
+  // Decoding a UTF8String or a non-system-page AnsiString with the machine's
+  // ANSI page produces different characters, and therefore a different answer.
+  function ReadAnsi(Ptr: UInt64): Boolean;
+  var
+    RawLen: Integer;
+    CP:     Word;
+    Buf:    TBytes;
+  begin
+    if Ptr = 0 then
+      Exit(True);
+    if not FDebugger.ReadProcessMemoryAt(Ptr - 4, @RawLen, 4) then begin
+      Reason := Format('string at 0x%x could not be read', [Ptr]);
+      Exit(False);
+    end;
+    if RawLen = 0 then
+      Exit(True);
+    if (RawLen < 0) or (RawLen > MAX_STR_LEN) then begin
+      Reason := Format('string at 0x%x claims %d bytes', [Ptr, RawLen]);
+      Exit(False);
+    end;
+    SetLength(Buf, RawLen);
+    if not FDebugger.ReadProcessMemoryAt(Ptr, @Buf[0], RawLen) then begin
+      Reason := Format('string body at 0x%x could not be read', [Ptr]);
+      Exit(False);
+    end;
+    CP := 0;
+    FDebugger.ReadProcessMemoryAt(Ptr - 12, @CP, SizeOf(CP));
+    var Enc: TEncoding;
+    case CP of
+      65001: Enc := TEncoding.UTF8;
+      1200:  Enc := TEncoding.Unicode;
+      0, $FFFF: Enc := TEncoding.ANSI;   // CP_ACP / CP_NONE (RawByteString)
+    else
+      try
+        Enc := TEncoding.GetEncoding(CP);
+      except
+        Enc := TEncoding.ANSI;           // code page not installed on this machine
+      end;
+    end;
+    try
+      S := Enc.GetString(Buf);
+    finally
+      if not TEncoding.IsStandardEncoding(Enc) then
+        Enc.Free;
+    end;
+    Result := True;
+  end;
+
+  // A ShortString lives INLINE: a length byte followed by that many AnsiChars,
+  // so it is read from the value's address rather than through a handle.
+  function ReadShort: Boolean;
+  var
+    Len: Byte;
+    Buf: TBytes;
+  begin
+    if V.Address = 0 then begin
+      Reason := 'a ShortString has no address in this expression';
+      Exit(False);
+    end;
+    if not ReadU8(V.Address, Len) then begin
+      Reason := Format('ShortString at 0x%x could not be read', [V.Address]);
+      Exit(False);
+    end;
+    if Len = 0 then
+      Exit(True);
+    SetLength(Buf, Len);
+    if not FDebugger.ReadProcessMemoryAt(V.Address + 1, @Buf[0], Len) then begin
+      Reason := Format('ShortString body at 0x%x could not be read', [V.Address]);
+      Exit(False);
+    end;
+    S := TEncoding.ANSI.GetString(Buf);
+    Result := True;
+  end;
+
+begin
+  S      := '';
+  Reason := '';
+  var Kind := TypeNameToKind(V.TypeHint);
+  // Delphi stores the empty string as a nil pointer, so `S = nil` and `S = ''`
+  // ask the same question. Accepting it keeps working what used to work by
+  // accident when this comparison was a pointer comparison.
+  if (Kind = TK_POINTER) and (V.RawValue = 0) then
+    Exit(True);
+  case Kind of
+    // An AnsiChar's byte is taken as its code point. Beyond ASCII that is the
+    // Latin-1 reading rather than the machine's ANSI page -- a single character
+    // carries no code page of its own to consult.
+    TK_CHAR:  begin S := Char(Byte(V.RawValue and $FF));   Exit(True); end;
+    TK_WCHAR: begin S := Char(Word(V.RawValue and $FFFF)); Exit(True); end;
+    TK_USTRING: Exit(ReadUtf16(V.RawValue, False));
+    TK_WSTRING: Exit(ReadUtf16(V.RawValue, True));
+    TK_LSTRING: Exit(ReadAnsi(V.RawValue));
+    TK_STRING:  Exit(ReadShort);
+  end;
+  if SameText(V.TypeHint, 'ShortString') then
+    Exit(ReadShort);
+  Reason := Format('"%s" is not text', [V.TypeHint]);
+  Result := False;
+end;
+
+function TExprEvaluator.CompareAsText(const L, R: TExprValue;
+  const Op: string): TExprValue;
+var
+  LeftText, RightText, Reason: string;
+begin
+  if not TryReadTextOperand(L, LeftText, Reason) then
+    Exit(InvalidValue(Format('<cannot compare as text: left operand %s>', [Reason])));
+  if not TryReadTextOperand(R, RightText, Reason) then
+    Exit(InvalidValue(Format('<cannot compare as text: right operand %s>', [Reason])));
+  // ORDINAL comparison, which is what Delphi's own =, <>, <, <=, >, >= do for
+  // strings. A locale-aware collation would answer differently for accented and
+  // mixed-case text, and would not be what the debuggee's own code decided.
+  var Ordering := CompareStr(LeftText, RightText);
+  if      Op = '='  then Result := MakeBool(Ordering =  0)
+  else if Op = '<>' then Result := MakeBool(Ordering <> 0)
+  else if Op = '<'  then Result := MakeBool(Ordering <  0)
+  else if Op = '<=' then Result := MakeBool(Ordering <= 0)
+  else if Op = '>'  then Result := MakeBool(Ordering >  0)
+  else if Op = '>=' then Result := MakeBool(Ordering >= 0)
+  else Result := InvalidValue(Format('<string comparison "%s" not supported>', [Op]));
+end;
+
 function TExprEvaluator.ApplyCompare(const L, R: TExprValue; const Op: string): TExprValue;
 
   function CompareInt64Op(LL, RR: Int64): Boolean;
@@ -3578,6 +3949,13 @@ function TExprEvaluator.ApplyCompare(const L, R: TExprValue; const Op: string): 
   end;
 
 begin
+  // A string operand's RawValue is a HEAP POINTER. Comparing those answers a
+  // question nobody asked and answers it wrongly: `S = 'abc'` compared S's
+  // allocation with the freshly allocated literal's, so it was False whatever S
+  // held, and so was `S1 = S2` for two equal strings. Delphi's relational
+  // operators on strings compare characters; so does this.
+  if IsStringValue(L) or IsStringValue(R) then
+    Exit(CompareAsText(L, R, Op));
   if IsFloatHint(L.TypeHint) or IsFloatHint(R.TypeHint) then
     Result := MakeBool(CompareDoubleOp(AsDouble(L), AsDouble(R)))
   else
@@ -3586,34 +3964,14 @@ end;
 
 function TExprEvaluator.ParseExpr: TExprValue;
 begin
-  Result := ParseOr;
-end;
-
-function TExprEvaluator.ParseOr: TExprValue;
-begin
-  Result := ParseAnd;
-  if not Result.IsValid then Exit;
-  while True do begin
-    var Op: string := '';
-    if      MatchKeyword('or')  then Op := 'or'
-    else if MatchKeyword('xor') then Op := 'xor'
-    else Break;
-    var Rhs := ParseAnd;
-    if not Rhs.IsValid then Exit(Rhs);
-    Result := ApplyBoolean(Result, Rhs, Op);
-    if not Result.IsValid then Exit;
-  end;
-end;
-
-function TExprEvaluator.ParseAnd: TExprValue;
-begin
-  Result := ParseCmp;
-  if not Result.IsValid then Exit;
-  while MatchKeyword('and') do begin
-    var Rhs := ParseCmp;
-    if not Rhs.IsValid then Exit(Rhs);
-    Result := ApplyBoolean(Result, Rhs, 'and');
-    if not Result.IsValid then Exit;
+  Inc(FDepth);
+  try
+    if FDepth > MAX_EXPR_NESTING then
+      Exit(InvalidValue(Format('<expression nested deeper than %d levels>',
+        [MAX_EXPR_NESTING])));
+    Result := ParseCmp;
+  finally
+    Dec(FDepth);
   end;
 end;
 
@@ -3685,48 +4043,94 @@ begin
   Result := ApplyCompare(Lhs, Rhs, Op);
 end;
 
+// Additive level -- which in Delphi also carries `or` and `xor`.
 function TExprEvaluator.ParseAdd: TExprValue;
 begin
   Result := ParseMul;
   if not Result.IsValid then Exit;
   while True do begin
     SkipWS;
-    if FPos > Length(FExpr) then Break;
     var Op: string := '';
-    if FExpr[FPos] = '+' then Op := '+'
-    else if FExpr[FPos] = '-' then Op := '-'
-    else Break;
-    Inc(FPos);
+    var IsBooleanOp := False;
+    if MatchKeyword('or') then begin
+      Op := 'or';  IsBooleanOp := True;
+    end
+    else if MatchKeyword('xor') then begin
+      Op := 'xor'; IsBooleanOp := True;
+    end
+    else if FPos > Length(FExpr) then
+      Break
+    else if FExpr[FPos] = '+' then begin
+      Op := '+'; Inc(FPos);
+    end
+    else if FExpr[FPos] = '-' then begin
+      Op := '-'; Inc(FPos);
+    end
+    else
+      Break;
     var Rhs := ParseMul;
     if not Rhs.IsValid then Exit(Rhs);
-    Result := ApplyArith(Result, Rhs, Op);
+    if IsBooleanOp then
+      Result := ApplyBoolean(Result, Rhs, Op)
+    else
+      Result := ApplyArith(Result, Rhs, Op);
     if not Result.IsValid then Exit;
   end;
 end;
 
+// Multiplicative level -- which in Delphi also carries `and`.
 function TExprEvaluator.ParseMul: TExprValue;
 begin
   Result := ParseUnary;
   if not Result.IsValid then Exit;
   while True do begin
     SkipWS;
-    if FPos > Length(FExpr) then Break;
     var Op: string := '';
-    if FExpr[FPos] = '*' then begin Op := '*'; Inc(FPos); end
-    else if FExpr[FPos] = '/' then begin Op := '/'; Inc(FPos); end
+    var IsBooleanOp := False;
+    if MatchKeyword('and') then begin
+      Op := 'and'; IsBooleanOp := True;
+    end
     else if MatchKeyword('div') then Op := 'div'
     else if MatchKeyword('mod') then Op := 'mod'
     else if MatchKeyword('shl') then Op := 'shl'
     else if MatchKeyword('shr') then Op := 'shr'
-    else Break;
+    else if FPos > Length(FExpr) then
+      Break
+    else if FExpr[FPos] = '*' then begin
+      Op := '*'; Inc(FPos);
+    end
+    else if FExpr[FPos] = '/' then begin
+      Op := '/'; Inc(FPos);
+    end
+    else
+      Break;
     var Rhs := ParseUnary;
     if not Rhs.IsValid then Exit(Rhs);
-    Result := ApplyArith(Result, Rhs, Op);
+    if IsBooleanOp then
+      Result := ApplyBoolean(Result, Rhs, Op)
+    else
+      Result := ApplyArith(Result, Rhs, Op);
     if not Result.IsValid then Exit;
   end;
 end;
 
+// Guarded for depth as well as ParseExpr: `-` and `not` recurse straight back
+// into this function without passing through ParseExpr, so `not not not ...`
+// would otherwise be unbounded on its own.
 function TExprEvaluator.ParseUnary: TExprValue;
+begin
+  Inc(FDepth);
+  try
+    if FDepth > MAX_EXPR_NESTING then
+      Exit(InvalidValue(Format('<expression nested deeper than %d levels>',
+        [MAX_EXPR_NESTING])));
+    Result := ParseUnaryInner;
+  finally
+    Dec(FDepth);
+  end;
+end;
+
+function TExprEvaluator.ParseUnaryInner: TExprValue;
 var
   Inner: TExprValue;
   Ptr:   UInt64;
@@ -3762,10 +4166,11 @@ begin
   // [ expr ]  ->  read 8 bytes at address given by expr
   if MatchChar('[') then begin
     Inner := ParseExpr;
-    if not MatchChar(']') then
-      Exit(InvalidValue('<missing ] in dereference>'));
+    // Inner failure first, for the same reason as the `)` case above.
     if not Inner.IsValid then
       Exit(Inner);
+    if not MatchChar(']') then
+      Exit(InvalidValue('<missing ] in dereference>'));
     Ptr := Inner.RawValue;
     if not ReadU64(Ptr, V) then
       Exit(InvalidValue(Format('<read failed @ 0x%x>', [Ptr])));
@@ -3828,6 +4233,123 @@ begin
 end;
 
 function TExprEvaluator.ParsePrimary: TExprValue;
+
+  // `#65` / `#$41`. Consumes nothing unless the whole form is there, so a bare
+  // `#` still reaches the generic "unexpected character" path.
+  function TryParseCharCode(out Code: Word): Boolean;
+  var
+    V: Int64;
+  begin
+    Result := False;
+    if (FPos > Length(FExpr)) or (FExpr[FPos] <> '#') then
+      Exit;
+    var Save := FPos;
+    Inc(FPos);
+    if (not ScanIntLiteral(V)) or (V < 0) or (V > $FFFF) then begin
+      FPos := Save;
+      Exit;
+    end;
+    Code   := Word(V);
+    Result := True;
+  end;
+
+  // A Pascal string constant is a SEQUENCE of quoted runs and character codes:
+  // `'line'#13#10'next'` is one literal. A sequence that is exactly one
+  // character code is a Char, which is what `C = #9` needs it to be.
+  function ParseStringOrCharLiteral: TExprValue;
+  var
+    Buf:  string;
+    Code: Word;
+  begin
+    var Parts     := 0;
+    var LoneChar  := True;
+    while FPos <= Length(FExpr) do begin
+      if FExpr[FPos] = '''' then begin
+        var Run: string;
+        if not ParseStringLiteral(Run) then
+          Exit(InvalidValue('<unterminated string literal>'));
+        Buf      := Buf + Run;
+        LoneChar := False;
+        Inc(Parts);
+      end
+      else if TryParseCharCode(Code) then begin
+        Buf := Buf + Char(Code);
+        Inc(Parts);
+      end
+      else
+        Break;
+    end;
+    if Parts = 0 then
+      Exit(InvalidValue('<expected a string or character literal>'));
+    if LoneChar and (Parts = 1) then begin
+      Result          := Default(TExprValue);
+      Result.TypeHint := 'Char';
+      Result.RawValue := Ord(Buf[1]);
+      Result.Size     := 2;
+      Result.IsValid  := True;
+      Exit;
+    end;
+    // A string constant has to EXIST in the debuggee: it may be passed on as a
+    // call argument, and every consumer reads it back through a pointer.
+    var Ptr: UInt64;
+    if not FDebugger.AllocateRemoteString(Buf, 'UnicodeString', Ptr) then
+      Exit(InvalidValue('<failed to allocate string literal in debuggee>'));
+    Result          := Default(TExprValue);
+    Result.TypeHint := 'UnicodeString';
+    Result.RawValue := Ptr;
+    Result.Size     := 8;
+    Result.IsValid  := True;
+  end;
+
+  // Pascal float literal: digits, then a fraction and/or an exponent -- `1.5`,
+  // `1e6`, `1.0e-3`. Rewinds and answers False for a plain integer, so the
+  // integer parser still gets it.
+  function TryParseFloatLiteral(out Value: Double): Boolean;
+
+    procedure SkipDigits;
+    begin
+      while (FPos <= Length(FExpr)) and CharInSet(FExpr[FPos], ['0'..'9']) do
+        Inc(FPos);
+    end;
+
+  begin
+    Result := False;
+    if (FPos > Length(FExpr)) or not CharInSet(FExpr[FPos], ['0'..'9']) then
+      Exit;
+    var Save := FPos;
+    SkipDigits;
+    var IsFloat := False;
+    if (FPos < Length(FExpr)) and (FExpr[FPos] = '.') and
+       CharInSet(FExpr[FPos + 1], ['0'..'9']) then begin
+      Inc(FPos);
+      SkipDigits;
+      IsFloat := True;
+    end;
+    if (FPos <= Length(FExpr)) and CharInSet(FExpr[FPos], ['e', 'E']) then begin
+      // Commit to the exponent only if it is complete: `1e` is not a literal,
+      // and consuming the `e` would leave an identifier fragment behind.
+      var AfterMantissa := FPos;
+      Inc(FPos);
+      if (FPos <= Length(FExpr)) and CharInSet(FExpr[FPos], ['+', '-']) then
+        Inc(FPos);
+      if (FPos <= Length(FExpr)) and CharInSet(FExpr[FPos], ['0'..'9']) then begin
+        SkipDigits;
+        IsFloat := True;
+      end
+      else
+        FPos := AfterMantissa;
+    end;
+    if not IsFloat then begin
+      FPos := Save;
+      Exit;
+    end;
+    var FS := TFormatSettings.Create;
+    FS.DecimalSeparator := '.';
+    Result := TryStrToFloat(Copy(FExpr, Save, FPos - Save), Value, FS);
+    if not Result then
+      FPos := Save;
+  end;
+
 var
   IntV: Int64;
 begin
@@ -3838,57 +4360,37 @@ begin
   // Parenthesised sub-expression
   if MatchChar('(') then begin
     Result := ParseExpr;
-    if not MatchChar(')') then
+    // The INNER failure wins. Complaining about a missing `)` on top of it
+    // replaces the real reason -- an unresolved name, a nesting bound -- with a
+    // punctuation error the user cannot act on.
+    if Result.IsValid and not MatchChar(')') then
       Result := InvalidValue('<missing )>');
     Exit;
   end;
 
-  // Pascal string literal: 'text' with doubled '' for literal apostrophes.
-  // Allocates the value in the debuggee so it can be marshalled as an arg.
-  if FExpr[FPos] = '''' then begin
-    var S: string;
-    if not ParseStringLiteral(S) then
-      Exit(InvalidValue('<unterminated string literal>'));
-    Result := Default(TExprValue);
-    Result.TypeHint := 'UnicodeString';
+  // String / character constant: 'text' (doubled '' for a literal apostrophe),
+  // #65, and any run of the two.
+  if (FExpr[FPos] = '''') or (FExpr[FPos] = '#') then
+    Exit(ParseStringOrCharLiteral);
+
+  // Float literal -- must be tried BEFORE integer parsing so that "1.5" is not
+  // consumed as Int=1 followed by ".5".
+  var FloatV: Double;
+  if TryParseFloatLiteral(FloatV) then begin
+    Result          := Default(TExprValue);
+    Result.TypeHint := 'Double';
+    Result.RawValue := PUInt64(@FloatV)^;
     Result.Size     := 8;
-    var Ptr: UInt64;
-    if FDebugger.AllocateRemoteString(S, 'UnicodeString', Ptr) then begin
-      Result.RawValue := Ptr;
-      Result.IsValid  := True;
-    end else
-      Exit(InvalidValue('<failed to allocate string literal in debuggee>'));
+    Result.IsValid  := True;
     Exit;
   end;
 
-  // Float literal (decimal point) -- must be checked BEFORE integer parsing
-  // so that "1.5" doesn't get consumed as Int=1 then ".5".
-  if CharInSet(FExpr[FPos], ['0'..'9']) then begin
-    // Look ahead for a decimal point inside the digit run.
-    var SaveStart := FPos;
-    while (FPos <= Length(FExpr)) and CharInSet(FExpr[FPos], ['0'..'9']) do
-      Inc(FPos);
-    if (FPos <= Length(FExpr)) and (FExpr[FPos] = '.') and
-       (FPos + 1 <= Length(FExpr)) and CharInSet(FExpr[FPos + 1], ['0'..'9']) then begin
-      // It's a float.
-      Inc(FPos);
-      while (FPos <= Length(FExpr)) and CharInSet(FExpr[FPos], ['0'..'9']) do
-        Inc(FPos);
-      var FltStr := Copy(FExpr, SaveStart, FPos - SaveStart);
-      var FS: TFormatSettings;
-      FS := TFormatSettings.Create;
-      FS.DecimalSeparator := '.';
-      var Dbl: Double := StrToFloat(FltStr, FS);
-      Result          := Default(TExprValue);
-      Result.TypeHint := 'Double';
-      Result.RawValue := PUInt64(@Dbl)^;
-      Result.Size     := 8;
-      Result.IsValid  := True;
-      Exit;
-    end;
-    // Not a float -- rewind and let the integer parser take it.
-    FPos := SaveStart;
-  end;
+  // Pascal, unlike C, requires a digit before the point. Said plainly, because
+  // the alternative is a generic "unexpected character" that reads like a bug.
+  if (FExpr[FPos] = '.') and (FPos < Length(FExpr)) and
+     CharInSet(FExpr[FPos + 1], ['0'..'9']) then
+    Exit(InvalidValue('<a Pascal float literal needs a digit before the point: ' +
+      'write 0.5, not .5>'));
 
   // Integer literal (decimal, $HEX, 0xHEX)
   if CharInSet(FExpr[FPos], ['0'..'9', '$']) then begin
@@ -3974,6 +4476,12 @@ begin
         Exit(ApplyIntrinsic(Name, Args));
       if (Length(Args) = 1) and IsKnownTypeName(Name) then
         Exit(ApplyCast(Name, Args[0]));
+      // A known intrinsic that this evaluator does not implement is refused HERE
+      // rather than by symbol resolution: there is no symbol to find, and "not
+      // found" reads as an accusation about the user's variable.
+      var IntrinsicAdvice: string;
+      if TryUnsupportedIntrinsicAdvice(Name, IntrinsicAdvice) then
+        Exit(InvalidValue(IntrinsicAdvice));
       // Free-procedure / function call. ApplyMethodCall detects the
       // "no receiver" case (Base.IsValid=False) and skips Self in the
       // call frame; return-type ABI dispatch comes from the proc's
@@ -4033,6 +4541,10 @@ function TExprEvaluator.Evaluate(const Expr: string; out Val: TExprValue): Boole
 begin
   FExpr := Trim(Expr);
   FPos  := 1;
+  // Both budgets are per EXPRESSION, so they reset here rather than at Create:
+  // an evaluator instance that is reused for a second expression starts fresh.
+  FDepth     := 0;
+  FCallCount := 0;
   Val   := ParseExpr;
   SkipWS;
   // If input was not fully consumed, report a parse error.

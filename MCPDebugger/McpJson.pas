@@ -350,6 +350,11 @@ begin
     // stopReason = "dataBreakpoint".
     if S.StopReason = srDataBreakpoint then
       Result.AddPair('dataBreakpointDescription', S.DataBreakpointDescription);
+    // Present only when the stop happened BECAUSE the breakpoint's condition
+    // would not evaluate. Without it the stop looks unconditional, which is the
+    // one thing an agent reading this snapshot cannot otherwise tell.
+    if S.BreakpointConditionError <> '' then
+      Result.AddPair('breakpointConditionError', S.BreakpointConditionError);
   end;
 end;
 

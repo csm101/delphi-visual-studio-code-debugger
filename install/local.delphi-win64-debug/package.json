@@ -2,7 +2,7 @@
   "name": "delphi-win64-debug",
   "displayName": "Delphi Debugger (Win32 and Win64)",
   "description": "Debug Delphi Win32 and Win64 applications in VS Code - breakpoints, stepping, call stacks, watches and exception rules, without the Embarcadero IDE. The debug adapter is always a 64-bit process, so a 32-bit target is debugged without the address-space ceiling a 32-bit debugger works under.",
-  "version": "0.6.1",
+  "version": "0.7.0",
   "publisher": "local",
   "license": "MIT",
   "author": "Carlo Sirna",
@@ -103,6 +103,12 @@
         "title": "Never Auto-Evaluate This Property (Delphi)",
         "category": "Delphi Debugger",
         "icon": "$(eye-closed)"
+      },
+      {
+        "command": "delphi-win64.safelistForget",
+        "title": "Forget Evaluation Decision (Delphi)",
+        "category": "Delphi Debugger",
+        "icon": "$(discard)"
       }
     ],
     "views": {
@@ -156,6 +162,10 @@
           "when": "false"
         },
         {
+          "command": "delphi-win64.safelistForget",
+          "when": "false"
+        },
+        {
           "command": "delphi-win64.copyModulePath",
           "when": "false"
         }
@@ -182,6 +192,11 @@
           "command": "delphi-win64.safelistDeny",
           "when": "debugType == 'delphi-win64'",
           "group": "2_delphi@2"
+        },
+        {
+          "command": "delphi-win64.safelistForget",
+          "when": "debugType == 'delphi-win64'",
+          "group": "2_delphi@3"
         }
       ],
       "debug/watch/context": [
@@ -199,17 +214,22 @@
           "command": "delphi-win64.safelistDeny",
           "when": "debugType == 'delphi-win64'",
           "group": "2_delphi@2"
+        },
+        {
+          "command": "delphi-win64.safelistForget",
+          "when": "debugType == 'delphi-win64'",
+          "group": "2_delphi@3"
         }
       ],
       "view/title": [
         {
           "command": "delphi-win64.editExceptionRules",
-          "when": "view == workbench.debug.breakPointsView",
+          "when": "view == workbench.debug.breakPointsView && (!debugType || debugType == 'delphi-win64')",
           "group": "navigation@99"
         },
         {
           "command": "delphi-win64.editExceptionRules",
-          "when": "view == workbench.debug.callStackView",
+          "when": "view == workbench.debug.callStackView && (!debugType || debugType == 'delphi-win64')",
           "group": "navigation@99"
         },
         {
@@ -307,7 +327,8 @@
               },
               "stopAtEntry": {
                 "type": "boolean",
-                "default": false
+                "default": false,
+                "description": "Stop at the program's entry point as soon as it starts, before any of your code runs. Use it to set breakpoints in initialization sections, or in units of a package the program loads early. Launch only: an attach joins a process that is already past its entry point."
               },
               "rawStackScan": {
                 "type": "boolean",
@@ -339,7 +360,7 @@
                   "debugConsole"
                 ],
                 "enumDescriptions": [
-                  "Send the debugger's own messages to the \"Delphi Debug\" channel in the Output panel, keeping the Debug Console for your program's output and your logpoint messages.",
+                  "Send the debugger's own messages to the \"Delphi Debugger\" channel in the Output panel, keeping the Debug Console for your program's output and your logpoint messages.",
                   "Print the debugger's own messages in the Debug Console, mixed in with the program's output (the behaviour before this setting existed)."
                 ],
                 "default": "outputChannel",
@@ -514,6 +535,14 @@
                 "description": "When stopping the debug session, terminate the attached process instead of leaving it running. Default false: detaching leaves the application alive.",
                 "default": false
               },
+              "mapFile": {
+                "type": "string",
+                "description": "Path to the .map file (default: same as program with .map extension)"
+              },
+              "rsmFile": {
+                "type": "string",
+                "description": "Path to the .rsm file (default: same as program with .rsm extension). Needed for local variable inspection."
+              },
               "sourceRoot": {
                 "type": "string",
                 "description": "Root directory for source file lookup"
@@ -524,6 +553,24 @@
                   "type": "string"
                 },
                 "description": "Extra directories (searched two levels deep) for resolving unit source files when stopped outside the project — typically used to point at the Delphi installation's source tree, e.g. \"${env:BDS}/source\". If the BDS environment variable is set, its \"source\" subdirectory is also searched automatically."
+              },
+              "rawStackScan": {
+                "type": "boolean",
+                "default": false,
+                "description": "Append a brute-force sweep of the thread's stack below the real call stack, marked \"[raw]\" and greyed out. Use it when the call stack ends inside code with no debug information and you need to find which of your own routines is underneath: 32-bit targets carry no unwind data, so the walk stops at the first routine built without a frame pointer. \"[raw]\" means the instruction ending at that address was decoded and is a call; \"[raw?]\" means there was no line table to decode from. NEITHER means the frame is still live — a call that has already returned leaves its return address behind — so treat these as positions on the stack, not as callers."
+              },
+              "diagnosticsLocation": {
+                "type": "string",
+                "enum": [
+                  "outputChannel",
+                  "debugConsole"
+                ],
+                "enumDescriptions": [
+                  "Send the debugger's own messages to the \"Delphi Debugger\" channel in the Output panel, keeping the Debug Console for your program's output and your logpoint messages.",
+                  "Print the debugger's own messages in the Debug Console, mixed in with the program's output (the behaviour before this setting existed)."
+                ],
+                "default": "outputChannel",
+                "description": "Where the DEBUGGER's own messages go — symbol loading, modules without debug info, warnings. Your program's output and your logpoint messages always go to the Debug Console, whichever you choose. A multi-package application emits hundreds of \"no debug info\" lines before it prints anything of its own, which is why they are separated by default."
               },
               "modules": {
                 "type": "array",

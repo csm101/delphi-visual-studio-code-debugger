@@ -993,21 +993,33 @@ begin
           // Three ways to end up deferred, and only the first is a decision
           // about this property: the safelist did not authorise it; the burst's
           // time budget is already spent, so calling would only buy an abort;
-          // or the call started and the watchdog cut it short.
-          var Evaluated := False;
-          if (Policy <> nil) and
+          // or the call started and the watchdog cut it short. They call for
+          // three different reactions from the user -- authorise it, expand it,
+          // or expand it and expect it to be slow -- so they say three different
+          // things. One text for all three left "I need to allow this" looking
+          // exactly like "it timed out, try again".
+          var Evaluated  := False;
+          var Authorised := (Policy <> nil) and
              TSafeCallPolicy.AllowsAutoCall(
-               Policy.Resolve(SafelistKeysFor(Exp.TypeName, P))) and
-             (Debugger <> nil) and not Debugger.AutoCallWindowExhausted then begin
+               Policy.Resolve(SafelistKeysFor(Exp.TypeName, P)));
+          var BudgetLeft := (Debugger <> nil) and not Debugger.AutoCallWindowExhausted;
+          if Authorised and BudgetLeft then
             Evaluated := EvaluateGetterInto(Child, PropExpr, P.TypeName);
-          end;
           if not Evaluated then begin
             var GetExp := Default(TSessionExpansion);
             GetExp.Kind         := exPropertyGetter;
             GetExp.BaseAddr     := Exp.BaseAddr;
             GetExp.TypeName     := P.TypeName;
             GetExp.EvaluateName := PropExpr;
-            Child.Value      := '(expand to evaluate)';
+            // The unauthorised case keeps the bare wording: it is the normal
+            // resting state of every getter-backed property, and the sentence
+            // it needs to say is simply what to do next.
+            if not Authorised then
+              Child.Value := '(expand to evaluate)'
+            else if not BudgetLeft then
+              Child.Value := '(expand to evaluate -- automatic evaluation budget spent at this stop)'
+            else
+              Child.Value := '(expand to evaluate -- the getter call was cut short)';
             Child.Expandable := True;
             Child.Handle     := MintHandle(GetExp);
           end;
@@ -1292,6 +1304,17 @@ begin
       if Child.DataAddress = 0 then
         Child.ValueSize := Exp.ElemSize;
       List.Add(Child);
+    end;
+    // Say so when the list is not the whole array. `Capped` was computed and
+    // never used, so a 50000-element array showed 1024 children with nothing to
+    // distinguish that from an array of 1024 -- a quiet lie about the data.
+    // Same trailer the variant-array path already emits, for the same reason.
+    if Capped then begin
+      var Trailer := Default(TSessionVariable);
+      Trailer.Name  := '...';
+      Trailer.Value := Format('(showing first %d of %d elements)',
+        [MAX_CHILDREN, Exp.ElemCount]);
+      List.Add(Trailer);
     end;
     Result := List.ToArray;
   finally

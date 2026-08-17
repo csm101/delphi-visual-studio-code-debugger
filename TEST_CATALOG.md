@@ -82,6 +82,10 @@ real implementation. Run summary shows the live count
 - [ ] Multi-dim static array -- display + `[i,j]` index. BLOCKED: TD32 types
       a static array as its element ("Integer"), dims lost (needs LF_ARRAY).
 - [x] Multi-dim dynamic array expand (`Test_E2_MultiDimDynamic_Expand`)
+- [x] A dynamic array longer than the 1024-child cap SAYS it was truncated,
+      with the true element count (`ExpandVariable_LongDynArray_SaysItWasTruncated`;
+      fixture `RunBigDynArrayProbe`, marker `BIG_DYNARRAY_BODY`). Before this the
+      list simply stopped, so 1024 of 50000 rendered exactly like an array of 1024
 - [ ] Open array parameter (`array of const`)
 - [x] Open array parameter `array of T` -- `A[i]` indexing in a watch
       (`Test_E2_OpenArrayParam_Element`; `^Element` base, DerefPtr)
@@ -182,8 +186,27 @@ real implementation. Run summary shows the live count
 - [x] Indexed property `a.Level[0]`
 - [x] Method call (no args, with args, chained)
 - [x] Boolean ops, comparisons, precedence, unary minus
+- [x] DELPHI operator precedence: `and` with `*`, `or`/`xor` with `+`, both
+      tighter than any comparison, so `Flags and MASK = 0` groups as the source
+      does and the C-like `a > 1 and b < 2` no longer parses
+      (`ExprSemantics_OperatorPrecedence_MatchesDelphi`)
 - [x] Arithmetic int and float mix, div/mod
 - [x] String concat
+- [x] String COMPARISON compares characters, not heap pointers: literal on
+      either side, two equal strings in different allocations, `AnsiString` vs
+      `string`, empty string, ordering, `Char` vs a one-character literal, and a
+      refusal when the other operand is not text
+      (`ExprSemantics_StringComparison_ComparesCharacters`)
+- [x] Intrinsics beyond the original five -- `Assigned` `Pred` `Succ` `Abs`
+      `Chr` `Trunc` `Round` `Int` `Copy` `Pos` `UpperCase` `LowerCase` -- and an
+      UNIMPLEMENTED intrinsic refused by name with the reason rather than as an
+      unresolved symbol (`ExprSemantics_Intrinsics_EvaluateOrExplain`)
+- [x] Pascal literal forms: `#65` / `#$41`, literal runs (`'a'#13#10'b'`),
+      exponent floats, and the leading-dot float refused by name
+      (`ExprSemantics_Literals_FollowPascal`)
+- [x] Parser recursion is bounded: a 400-deep parenthesis nest is refused with
+      the reason and the session still evaluates afterwards
+      (`ExprSemantics_DeepNesting_IsRefused_NotACrash`)
 - [x] nil compare
 - [x] Cast: `Integer(x)`, class cast, TObject upcast
 - [x] `is` and `as`
@@ -209,8 +232,15 @@ real implementation. Run summary shows the live count
 
 - [x] Set / clear BP at source line
 - [x] Conditional BP
+- [x] A condition that CANNOT be evaluated stops and reports the reason, in the
+      stop info and once on the console
+      (`Breakpoint_UnevaluatableCondition_StopsAndSaysWhy`,
+      `..._AnnouncedOncePerSession`)
 - [x] Hit-count BP
 - [x] Log point BP
+- [x] The verified-state event reports the transition DOWN as well as up: a
+      source breakpoint in a package unit goes unverified when the package
+      unloads (`Bpl_BreakpointGoesUnverified_WhenItsModuleUnloads`)
 - [x] Step over
 - [x] Step over a call that hits a BP in the callee -- BP wins
       (`Test_BL_Step_OverCallThatHitsBp`)

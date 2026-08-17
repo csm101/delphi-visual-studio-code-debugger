@@ -6446,7 +6446,7 @@ begin
     Exit;
   end
   else begin
-    // Clean detach. Three things must happen BEFORE DebugActiveProcessStop or
+    // Clean detach. Four things must happen BEFORE DebugActiveProcessStop or
     // the detached target is left in a state no debugger is listening for:
     //   1) Restore every planted INT3 to its original byte.
     //   2) If we are stopped on a held debug event (BP the client never
@@ -6454,6 +6454,13 @@ begin
     //   3) Clear every armed DR7 slot on every thread -- a detached target
     //      with a watchpoint still armed keeps trapping into a debugger that
     //      is no longer there to catch it.
+    //   4) Resume whatever a per-thread step left suspended. Every stop path
+    //      thaws through ReportStopped, but a disconnect can arrive with a step
+    //      still in flight, and an explicit SuspendThread outlives the detach:
+    //      those threads would stay parked forever in a process that carries on
+    //      running. Only this branch needs it -- the kill branch above ends the
+    //      process, which makes its suspend counts moot.
+    ThawStepFrozenThreads;
     if FWatchArmedSlots <> 0 then
       for var Slot := 0 to 3 do
         if FWatchSlots[Slot].InUse then

@@ -325,7 +325,7 @@ type
     // hand; read by the `delphiMemoryExtent` request the memory view issues.
     FMemoryExtents: TDictionary<string, TMemoryExtent>;
     // Where the DEBUGGER's own diagnostics go. True (default) sends them as
-    // `delphiLog` custom events for the extension's "Delphi Debug" output
+    // `delphiLog` custom events for the extension's "Delphi Debugger" output
     // channel; False keeps the old behaviour and prints them in the Debug
     // Console. The program's output and logpoint messages are unaffected
     // either way -- they always go to the Debug Console.
@@ -680,10 +680,11 @@ type
     // back to the un-scoped warm-up).
     function  WarmupUsesScopeForFrame(FrameRva: UInt64): Boolean;
     // Emits a DAP `breakpoint` changed event so VS Code re-colours a gutter marker
-    // from grey to solid. Driven only by SessionBreakpointChanged (the session's
-    // OnBreakpointChanged) -- the single re-colour path.
+    // -- grey to solid when the owning module's symbols arrive, and solid back to
+    // grey when that module unloads. Driven only by SessionBreakpointChanged (the
+    // session's OnBreakpointChanged) -- the single re-colour path.
     procedure SendBreakpointChanged(Id, Line: Integer;
-                const SourceName, SourcePath: string);
+                const SourceName, SourcePath: string; Verified: Boolean);
     function  FindSourceFile(const Name: string): string;
     function  ResolveSourcePath(const BaseName: string): string;
     function  ResolveUnitToSource(const UnitName: string): string;
@@ -1182,7 +1183,7 @@ begin
     Loc := Trim(Args.GetValue<string>('diagnosticsLocation', ''));
   FDiagnosticsToOutputChannel := not SameText(Loc, 'debugConsole');
   if FDiagnosticsToOutputChannel then
-    DapLog('diagnosticsLocation = outputChannel ("Delphi Debug" via delphiLog events)')
+    DapLog('diagnosticsLocation = outputChannel ("Delphi Debugger" via delphiLog events)')
   else
     DapLog('diagnosticsLocation = debugConsole');
 end;
@@ -1337,15 +1338,14 @@ begin
 end;
 
 // TDebugSession.OnBreakpointChanged subscriber -- the SINGLE gutter re-colour path.
-// The session fires this from RepostBreakpoints/NotifyBreakpointFlips when a stored
-// spec's line flips to verified after a runtime module's symbols load. Look up the
-// numeric id we handed VS Code for that 'file|line' and emit the DAP `breakpoint`
-// changed event so the marker goes grey -> solid.
+// The session fires this from RepostBreakpoints/NotifyBreakpointFlips whenever a
+// stored spec's line changes verified state: up when a runtime module's symbols
+// load, DOWN when that module unloads. Look up the numeric id we handed VS Code
+// for that 'file|line' and emit the DAP `breakpoint` changed event, so the marker
+// follows in both directions rather than only going grey -> solid.
 procedure TDapServer.SessionBreakpointChanged(const SourceFile: string;
   Line: Integer; Verified: Boolean);
 begin
-  if not Verified then
-    Exit;
   var Base := LowerCase(ExtractFileName(SourceFile));
   var Key  := Base + '|' + IntToStr(Line);
   var Id: Integer;
@@ -1353,7 +1353,14 @@ begin
     Exit;
   var FullPath := '';
   FBpSourcePath.TryGetValue(Base, FullPath);
-  SendBreakpointChanged(Id, Line, ExtractFileName(SourceFile), FullPath);
+  SendBreakpointChanged(Id, Line, ExtractFileName(SourceFile), FullPath, Verified);
+  // Losing a breakpoint is worth saying out loud. The marker turning grey is
+  // easy to miss in a gutter the user is not looking at, and the effect --
+  // execution running straight past a line they set a breakpoint on -- is
+  // otherwise indistinguishable from the line never being reached.
+  if not Verified then
+    SendConsoleLog(Format('[BP] %s:%d is no longer bound -- the module that ' +
+      'owns this source is not loaded', [ExtractFileName(SourceFile), Line]));
 end;
 
 procedure TDapServer.SessionSymbolsArrived(Sender: TObject);
@@ -1580,13 +1587,13 @@ begin
 end;
 
 procedure TDapServer.SendBreakpointChanged(Id, Line: Integer;
-  const SourceName, SourcePath: string);
+  const SourceName, SourcePath: string; Verified: Boolean);
 var
   Body: TJSONObject;
 begin
   var Bp := TJSONObject.Create;
   Bp.AddPair('id',       TJSONNumber.Create(Id));
-  Bp.AddPair('verified', TJSONBool.Create(True));
+  Bp.AddPair('verified', TJSONBool.Create(Verified));
   Bp.AddPair('line',     TJSONNumber.Create(Line));
   var Src := TJSONObject.Create;
   Src.AddPair('name', SourceName);
@@ -1601,8 +1608,8 @@ begin
   finally
     Body.Free;
   end;
-  DapLog(Format('breakpoint changed: id=%d verified=true %s:%d',
-    [Id, SourceName, Line]));
+  DapLog(Format('breakpoint changed: id=%d verified=%s %s:%d',
+    [Id, BoolToStr(Verified, True), SourceName, Line]));
 end;
 
 function TDapServer.FindSourceFile(const Name: string): string;
@@ -1745,7 +1752,19 @@ begin
   try
     case Info.Reason of
       srEntry:      Body.AddPair('reason', 'entry');
-      srBreakpoint: Body.AddPair('reason', 'breakpoint');
+      srBreakpoint: begin
+        Body.AddPair('reason', 'breakpoint');
+        if Info.BreakpointConditionError <> '' then begin
+          // The stop happened BECAUSE the condition would not evaluate. VS Code
+          // has no modal message box (which is how the Delphi IDE reports this),
+          // but `description` / `text` on the stopped event put the reason in the
+          // inline widget where exception and watchpoint stops already explain
+          // themselves -- otherwise this looks like an unconditional stop on a
+          // line the user deliberately conditioned.
+          Body.AddPair('description', Info.BreakpointConditionError);
+          Body.AddPair('text',        Info.BreakpointConditionError);
+        end;
+      end;
       srStep:       Body.AddPair('reason', 'step');
       srException: begin
         Body.AddPair('reason', 'exception');
@@ -1938,15 +1957,26 @@ begin
       SendOutputEvent(Text, 'stdout');
     okLogPoint:
       SendOutputEvent(Text + sLineBreak, 'console');
+    okNotice:
+      // The debugger complaining about something the user WROTE. Console, for
+      // the same reason a logpoint goes there: it is about the user's own input,
+      // and the diagnostics channel is where it would be buried.
+      SendOutputEvent(Text + sLineBreak, 'console');
   else
     SendDiagnosticEvent(Text);
   end;
 end;
 
-// Diagnostics for the extension's "Delphi Debug" output channel. Falls back to
-// the Debug Console when no client is listening for the custom event, so a
-// plain DAP client (or a VS Code without our extension) still sees them rather
-// than losing them silently.
+// Diagnostics for the extension's "Delphi Debugger" output channel, as the
+// `delphiLog` custom event. The destination is chosen SOLELY by the
+// `diagnosticsLocation` config value; there is no listener detection, and DAP
+// offers no capability a client could declare that would provide one.
+//
+// The consequence, stated rather than papered over: a client that is not this
+// extension and does not set `"diagnosticsLocation": "debugConsole"` receives
+// `delphiLog` events it has no handler for, and the lines are lost. A plain DAP
+// client should set that option. (An earlier version of this comment claimed a
+// fallback that the code never had.)
 procedure TDapServer.SendDiagnosticEvent(const Text: string);
 begin
   if not FDiagnosticsToOutputChannel then begin
@@ -5048,9 +5078,32 @@ begin
     else if Cmd = 'delphiSetRawStackScan' then HandleSetRawStackScan(Seq, Args)
     else if Cmd = 'delphiMemoryExtent'    then HandleMemoryExtent(Seq, Args)
     else if Cmd.StartsWith('delphiSafelist') then HandleSafelist(Seq, Cmd, Args)
-    else
-      // Unknown command: send empty success response to avoid VS Code hanging
-      FIO.SendResponse(Seq, Cmd, True);
+    // `cancel` is the one command worth tolerating as a no-op: the client is
+    // abandoning a request, and answering "done" is honest whether or not that
+    // request was still running. Everything else falls through to the refusal
+    // below.
+    else if Cmd = 'cancel'            then FIO.SendResponse(Seq, Cmd, True)
+    else begin
+      // Unknown command. The client MUST be answered -- an unanswered request
+      // leaves it waiting forever -- but answering "success" with an empty body
+      // is the wrong way to do it: a client that acts on that success sees a
+      // silent no-op, the user presses something and nothing happens, and there
+      // is no error anywhere. An error response unblocks the client just as
+      // well and says what actually happened.
+      //
+      // Every optional request this adapter does not implement (`terminate`,
+      // `restart`, `restartFrame`, `stepBack`, `reverseContinue`,
+      // `setFunctionBreakpoints`, `setExpression`, `completions`,
+      // `loadedSources`, `breakpointLocations`, `terminateThreads`,
+      // `stepInTargets`) is gated on a capability this adapter does not
+      // advertise, so a compliant client never sends one and no user-visible
+      // error toast can come of this.
+      DapLog(Format('ProcessRequest: refusing unimplemented command "%s" (seq=%d)',
+        [Cmd, Seq]));
+      FIO.SendErrorResponse(Seq, Cmd,
+        Format('"%s" is not implemented by this debug adapter. Its capability ' +
+               'is not advertised, so nothing should be sending it.', [Cmd]));
+    end;
   except
     // A handler that raises must still ANSWER the request: a logged-but-
     // unanswered request leaves the client waiting forever (e.g. a malformed
