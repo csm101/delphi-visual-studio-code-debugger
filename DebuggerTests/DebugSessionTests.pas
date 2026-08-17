@@ -609,6 +609,21 @@ type
     // evaluator and an assertion that agreed with each other and not with
     // Delphi. This one cannot: the compiler is the authority.
     [Test] procedure ExprOracle_DebuggerAgreesWithTheCompiler;
+
+    // TEST_CATALOG.md section A ticked a row per primitive type -- Integer,
+    // Cardinal, Byte/ShortInt, Word/SmallInt, Int64/UInt64, the floats,
+    // Boolean, the chars, the strings -- and no fixture so much as DECLARED a
+    // Cardinal, ShortInt, AnsiChar or Currency local for a test to read. Each
+    // one must render the value the fixture assigned, under its declared type
+    // name.
+    [Test] procedure PrimitiveLocals_DisplayTheirValueAndDeclaredType;
+
+    // TEST_CATALOG.md section C ticked "Destructor side-effect verified (BP in
+    // Destroy body)" and nothing planted a breakpoint in a destructor at all --
+    // the only destructor test in the suite was a name-demangling unit test.
+    // A destructor frame is its own kind: it is reached through Free, not a
+    // call the user wrote, and its Self is about to stop existing.
+    [Test] procedure Breakpoint_InDestructorBody_StopsAndTheBodyRuns;
   end;
 
 implementation
@@ -7792,6 +7807,136 @@ begin
     Assert.IsTrue((Trues > 0) and (Falses > 0),
       Format('the oracle must contain both outcomes, got %d true / %d false',
         [Trues, Falses]));
+  finally
+    if Session.State = dsStopped then Session.Terminate;
+    Session.Free;
+  end;
+end;
+
+type
+  // Name is the local; Fragment is the text the RENDERED value must contain --
+  // the literal the fixture assigned, so the assertion is anchored to the
+  // program's own source and not to whatever the formatter happens to emit.
+  // TypeNames is the set of names the client may legitimately be told,
+  // '|'-separated. More than one is allowed only where DELPHI ITSELF makes them
+  // the same type -- `LongInt` IS `Integer`, `LongWord` IS `Cardinal`, `string`
+  // IS `UnicodeString` -- so the compiler cannot tell them apart either and
+  // demanding the source spelling would be demanding the impossible. It is NOT
+  // a licence to accept whatever the formatter prints.
+  TPrimitiveCase = record
+    Name:      string;
+    Fragment:  string;
+    TypeNames: string;
+  end;
+
+function PrimitiveCase(const Name, Fragment, TypeNames: string): TPrimitiveCase;
+begin
+  Result.Name      := Name;
+  Result.Fragment  := Fragment;
+  Result.TypeNames := TypeNames;
+end;
+
+procedure TDebugSessionTests.PrimitiveLocals_DisplayTheirValueAndDeclaredType;
+const
+  PRIMITIVE_MARKER = 'PRIMITIVE_DISPLAY';
+
+  function Cases: TArray<TPrimitiveCase>;
+  begin
+    Result := [
+      PrimitiveCase('VInteger',  '-123456789',           'Integer'),
+      // LongInt IS Integer and LongWord IS Cardinal on both Windows targets --
+      // one type with two spellings, and the compiler records only one.
+      PrimitiveCase('VLongInt',  '987654321',            'LongInt|Integer'),
+      // Above MaxInt on purpose: read as signed this renders negative.
+      PrimitiveCase('VCardinal', '4000000000',           'Cardinal'),
+      PrimitiveCase('VLongWord', '3221225472',           'LongWord|Cardinal'),
+      PrimitiveCase('VByte',     '234',                  'Byte'),
+      PrimitiveCase('VShortInt', '-77',                  'ShortInt'),
+      PrimitiveCase('VWord',     '60001',                'Word'),
+      PrimitiveCase('VSmallInt', '-30001',               'SmallInt'),
+      PrimitiveCase('VInt64',    '-1234567890123456789', 'Int64'),
+      // Above MaxInt64: a signed read wraps to a negative.
+      PrimitiveCase('VUInt64',   '17293822569102704640', 'UInt64'),
+      PrimitiveCase('VSingle',   '1.5',                  'Single'),
+      PrimitiveCase('VDouble',   '-2.25',                'Double'),
+      PrimitiveCase('VCurrency', '12.34',                'Currency'),
+      PrimitiveCase('VBoolean',  'True',                 'Boolean'),
+      PrimitiveCase('VAnsiChar', 'A',                    'AnsiChar'),
+      PrimitiveCase('VWideChar', 'Z',                    'Char'),
+      // `RawByteString` is NOT an alias of `AnsiString` -- it is accepted here
+      // only because TD32 tag $0036 carries no public type name and the reader
+      // currently answers RawByteString for the whole AnsiString family, which
+      // also costs this local the hex/ascii rendering meant for RawByteString.
+      // Open question in KNOWN_UNKNOWNS.md; tighten this row when it is settled.
+      PrimitiveCase('VAnsiStr',  'ansi-content',         'AnsiString|RawByteString'),
+      // `string` IS `UnicodeString`.
+      PrimitiveCase('VUniStr',   'unicode-content',      'UnicodeString|string')];
+  end;
+
+begin
+  var Line := MarkerLine(EVAL_SOURCE, PRIMITIVE_MARKER);
+  Assert.IsTrue(Line > 0, 'marker ' + PRIMITIVE_MARKER + ' not found');
+  var Session := OpenSessionAtMarker(TargetExe, TargetMap, TargetRsm, TargetDir,
+    EVAL_SOURCE, Line);
+  try
+    Assert.AreEqual(Ord(dsStopped), Ord(Session.State), 'did not stop');
+    var Failures := '';
+    for var Check in Cases do begin
+      var R := Session.Evaluate(Check.Name);
+      if not R.Success then begin
+        Failures := Failures + Format('%s: %s; ', [Check.Name, R.ErrorText]);
+        Continue;
+      end;
+      if not R.Value.Contains(Check.Fragment) then
+        Failures := Failures + Format('%s: value "%s" does not contain "%s"; ',
+          [Check.Name, R.Value, Check.Fragment]);
+      var TypeAccepted := False;
+      for var Allowed in Check.TypeNames.Split(['|']) do
+        if SameText(R.TypeName, Allowed) then
+          TypeAccepted := True;
+      if not TypeAccepted then
+        Failures := Failures + Format('%s: type "%s", expected one of "%s"; ',
+          [Check.Name, R.TypeName, Check.TypeNames]);
+    end;
+    Assert.AreEqual('', Failures,
+      'every primitive local must render the value the fixture assigned, under ' +
+      'its declared type -- ' + Failures);
+  finally
+    if Session.State = dsStopped then Session.Terminate;
+    Session.Free;
+  end;
+end;
+
+procedure TDebugSessionTests.Breakpoint_InDestructorBody_StopsAndTheBodyRuns;
+begin
+  var Line := MarkerLine(EVAL_SOURCE, 'DTOR_BODY');
+  Assert.IsTrue(Line > 0, 'marker DTOR_BODY not found');
+  var Session := OpenSessionAtMarker(TargetExe, TargetMap, TargetRsm, TargetDir,
+    EVAL_SOURCE, Line);
+  try
+    Assert.AreEqual(Ord(dsStopped), Ord(Session.State),
+      'a breakpoint in a destructor body must fire -- the frame is reached ' +
+      'through Free, not through a call the user wrote');
+    var Fn, Src: string;
+    var StopLine: Integer;
+    Assert.IsTrue(Session.GetCurrentLocation(Fn, Src, StopLine), 'no location');
+    Assert.AreEqual(Line, StopLine, 'stopped at the wrong line');
+    Assert.IsTrue(Fn.Contains('Destroy'),
+      'the frame must be named as the destructor, got: ' + Fn);
+
+    // Self is still a live object here, and its field must read: a destructor
+    // frame that cannot show the object being destroyed is of no use.
+    var Tag := Session.Evaluate('FTag');
+    Assert.IsTrue(Tag.Success and Tag.Value.Contains('4242'),
+      'the dying object''s field must be readable in its destructor: ' +
+      Tag.Value + Tag.ErrorText);
+
+    // ...and the body must actually RUN, not merely be stopped in. GDtorRan is
+    // incremented before the marker, so it is already 1 at the stop.
+    var Ran := Session.Evaluate('GDtorRan');
+    Assert.IsTrue(Ran.Success and Ran.Value.Contains('1'),
+      'the destructor body must have executed up to the marker: ' +
+      Ran.Value + Ran.ErrorText);
   finally
     if Session.State = dsStopped then Session.Terminate;
     Session.Free;

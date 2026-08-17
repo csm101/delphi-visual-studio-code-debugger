@@ -124,6 +124,16 @@ type
     After:  Byte;
   end;
 
+  // A destructor with a body worth stopping in: it has a field to read, a
+  // marker line, and an effect (GDtorRan) observable after it returns.
+  TDtorProbe = class
+  private
+    FTag: Integer;
+  public
+    constructor Create(ATag: Integer);
+    destructor Destroy; override;
+  end;
+
   // Indexed (array) property sampler.
   TIndexedBag = class
   private
@@ -465,6 +475,11 @@ var
   // Uses-graph collision twin: same name as TestPackage's GUsesGraph (333).
   GUsesGraph: Integer;
   GCounter: Integer;
+  // Bumped by TDtorProbe.Destroy. A breakpoint in a DESTRUCTOR body is the one
+  // frame kind TEST_CATALOG.md section C claimed and nothing tested; this
+  // counter is what makes "the destructor body actually ran" observable from
+  // outside, rather than only "we stopped somewhere called Destroy".
+  GDtorRan: Integer;
   // Per-thread stepping isolation fixture (see RunPerThreadStepFixture): two
   // worker threads spin incrementing their OWN counter until GStepIsoStop is set.
   // While the debugger single-steps ONE of them the other must stay frozen, so
@@ -1114,6 +1129,82 @@ begin
   finally
     Present.Free;
   end;
+end;
+
+// One local of every PRIMITIVE type, for the "local variable type display"
+// claims in TEST_CATALOG.md section A. Those rows were ticked for years with no
+// test behind them, and no fixture even declared a Cardinal, ShortInt, AnsiChar
+// or Currency local for one to read.
+//
+// Values are chosen to be self-evidencing: negative where the type is signed
+// (a lost sign shows up), above the signed maximum where it is unsigned (a
+// signed read wraps to a negative), and never zero -- a zero byte is exactly
+// what makes an over-wide or mis-sized read look correct by accident.
+procedure RunPrimitiveDisplaySampler;
+var
+  VInteger:  Integer;
+  VLongInt:  LongInt;
+  VCardinal: Cardinal;
+  VLongWord: LongWord;
+  VByte:     Byte;
+  VShortInt: ShortInt;
+  VWord:     Word;
+  VSmallInt: SmallInt;
+  VInt64:    Int64;
+  VUInt64:   UInt64;
+  VSingle:   Single;
+  VDouble:   Double;
+  VCurrency: Currency;
+  VBoolean:  Boolean;
+  VAnsiChar: AnsiChar;
+  VWideChar: Char;
+  VAnsiStr:  AnsiString;
+  VUniStr:   UnicodeString;
+begin
+  VInteger  := -123456789;
+  VLongInt  := 987654321;
+  VCardinal := 4000000000;              // above MaxInt: a signed read goes negative
+  VLongWord := $C0000000;
+  VByte     := 234;
+  VShortInt := -77;
+  VWord     := 60001;                   // above MaxSmallInt, same reason
+  VSmallInt := -30001;
+  VInt64    := -1234567890123456789;
+  VUInt64   := $F000000000000000;       // above MaxInt64
+  VSingle   := 1.5;
+  VDouble   := -2.25;
+  VCurrency := 12.34;
+  VBoolean  := True;
+  VAnsiChar := 'A';
+  VWideChar := 'Z';
+  VAnsiStr  := 'ansi-content';
+  VUniStr   := 'unicode-content';
+  GSink.Use([VInteger, VLongInt, VCardinal, VLongWord, VByte, VShortInt, VWord, VSmallInt, VInt64]);
+  GSink.Use([VSingle, VDouble, VCurrency, VBoolean, VWideChar, string(VAnsiStr), VUniStr]);  // {BP:PRIMITIVE_DISPLAY}
+end;
+
+{ TDtorProbe }
+
+constructor TDtorProbe.Create(ATag: Integer);
+begin
+  inherited Create;
+  FTag := ATag;
+end;
+
+destructor TDtorProbe.Destroy;
+begin
+  Inc(GDtorRan);
+  GSink.Use([FTag]);   // {BP:DTOR_BODY}
+  inherited;
+end;
+
+procedure RunDestructorProbe;
+var
+  Probe: TDtorProbe;
+begin
+  Probe := TDtorProbe.Create(4242);
+  Probe.Free;                       // runs Destroy, where the marker sits
+  GSink.Use([GDtorRan]);
 end;
 
 constructor TIndexedBag.Create;
@@ -2381,6 +2472,8 @@ begin
   RunEvalTests;
   RunExprSemanticsTests;
   RunExprOracle;
+  RunPrimitiveDisplaySampler;
+  RunDestructorProbe;
   RunDateTimeAliasTest;
   RunStepConsecutiveCalls;
   RunStepIntoPrologue;

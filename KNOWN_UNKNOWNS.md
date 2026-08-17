@@ -5,6 +5,35 @@ or condition the work. Move resolved items out of this file into
 whichever document now holds the answer (`RSM_*`, `DAP_DEBUGGER_*`,
 `PROJECT_STATE.md`) — do not leave them here as historical record.
 
+## Is TD32 tag `$0036` really `RawByteString`, or the whole AnsiString family?
+
+`TD32FileReader.pas` names tag `$0036` `RawByteString`. Its own comment says the
+4-byte payload "references a runtime type-info record; it does NOT carry the
+public type name", so the name is a CHOICE the reader makes for the whole
+`tkLString` family.
+
+Measured 2026-08 by `PrimitiveLocals_DisplayTheirValueAndDeclaredType`: a local
+declared `AnsiString` is reported to the client as `RawByteString`, and because
+`DelphiValueReaders.FormatStringByPointer` gives `RawByteString` the hex/ascii
+dump reserved for it, that local renders as
+`'ansi-content'  [61(a) 6E(n) 73(s) ...]` instead of plain decoded text. The
+VALUE is right and the KIND is right (`TK_LSTRING`); only the name and therefore
+the rendering are wrong for the common case.
+
+`AnsiString` is overwhelmingly the more common declaration, so today the reader
+labels the common case as the rare one. Renaming `$0036` to `AnsiString` would
+simply move the mislabel onto real `RawByteString` locals unless the two can be
+told apart.
+
+**What would settle it:** a probe that compiles a unit declaring an `AnsiString`,
+a `UTF8String` and a `RawByteString` local and dumps the TD32 type records for
+all three. If they carry different tags (or a distinguishable payload, e.g. the
+code page), the reader can name each correctly and the rendering follows. If
+they are identical, the right answer is to name `$0036` `AnsiString` and accept
+that `RawByteString` locals lose their hex view — the lesser error.
+
+Until then the test accepts both names for that row and says why.
+
 ## Embedded TD32 (`.debug` PE section)
 
 Single-file debug-info source. Format is Borland proprietary TD32
