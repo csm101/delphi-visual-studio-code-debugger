@@ -7,6 +7,20 @@ application is debugged across the WOW64 boundary, so the debugger does not work
 inside a 32-bit address space, which is where a large project's symbol data
 would otherwise run out of room.
 
+## Important: set up your project with the companion Delphi IDE plugin
+
+To debug your own application, VS Code must first know about your project —
+launch configuration, LSP settings, workspace layout. The
+[EditInVsCodeDelphiPlugin](https://github.com/csm101/EditInVsCodeDelphiPlugin)
+generates all of that from inside the Delphi IDE, so install it first:
+
+1. `git clone https://github.com/csm101/EditInVsCodeDelphiPlugin`
+2. Open `EditInVSCode.dpk` in the Delphi IDE
+3. Right-click the project in the Project Manager and choose **Install**
+
+Once installed, choose **Tools → Edit in Visual Studio Code** from the Delphi
+IDE: your project opens in VS Code already configured for this debugger.
+
 {{HIGHLIGHTS}}
 
 ## Install
@@ -21,10 +35,6 @@ would otherwise run out of room.
 shows "Windows protected your PC". Choose *More info -> Run anyway*, or build the
 identical zip yourself from source with `build_setup_zip.bat` — a reasonable
 preference for a debugger, which by nature attaches to other processes.
-
-You will also want the [Delphi IDE plugin](https://github.com/csm101/EditInVsCodeDelphiPlugin):
-it generates the workspace and launch configuration from your Delphi project,
-which is otherwise a few hundred search paths to write by hand.
 
 ## Requirements
 
