@@ -2,6 +2,7 @@
 
 Debug Delphi **32-bit and 64-bit** applications outside the Embarcadero IDE — a
 real debugger built on the Windows Debug API, written in Delphi.
+<img width="1348" height="927" alt="image" src="https://github.com/user-attachments/assets/edd07b7d-7fd5-41c2-8bf4-6a3e0f3e5cb6" />
 
 > **The debugger itself is always a 64-bit process, whichever target it
 > debugs.** A 32-bit application is debugged by a 64-bit adapter across the
