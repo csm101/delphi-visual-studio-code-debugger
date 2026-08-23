@@ -1,0 +1,9 @@
+{
+  "_comment": "Exception rules that belong to THIS project, not to one launch configuration. The debugger finds this file because .vscode/launch.json names the project through `delphiProjectFile`; it is read before that configuration's own `exceptionRules` and before the machine-wide file, first match wins. Personal overrides go in Debugme.ExceptionSettings.local.json, which is gitignored. Strict JSON only -- this is not launch.json, so no comments and no trailing commas.",
+  "exceptionRules": [
+    {
+      "message": "Bare error",
+      "action": "log"
+    }
+  ]
+}

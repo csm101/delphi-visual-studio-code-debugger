@@ -458,6 +458,7 @@ matter of re-running `install-dev.bat` (dev) or `install\Install.exe`
 | `exceptionRules` | *(empty)* | Per-exception rule table — see [Exception handling](#exception-handling) |
 | `useGlobalExceptionRules` | `true` | Also load the shared machine-wide rules file — see [Shared rules across projects](#shared-rules-across-projects) |
 | `globalExceptionRulesPath` | `%USERPROFILE%\.DelphiWinDebugger\exceptionRules.json` | Custom location for the shared rules file |
+| `delphiProjectFile` | *(empty)* | The `.dpr` / `.dpk` / `.dproj` this configuration debugs. Enables the project's own rule files — see [Rules that belong to a project](#rules-that-belong-to-a-project) |
 
 Source files are resolved by searching `sourceRoot` and one level of subdirectories. If a source file appears in multiple locations, the first match wins.
 
@@ -636,6 +637,55 @@ keep working).
 ]
 ```
 
+### Rules that belong to a project
+
+A launch configuration is the wrong home for a rule that belongs to a
+**package**. If you maintain one `.dpk` inside a host application that loads
+dozens of them, your rules have nothing to do with which host `.exe` anyone
+launches to test it — and copying them into every configuration that starts that
+host is how they go stale.
+
+So a configuration may name the Delphi project it debugs:
+
+```jsonc
+"delphiProjectFile": "${workspaceFolder}/packages/libTabAnagD29.dpk"
+```
+
+The RAD Studio plugin writes this line for you when it generates the launch
+configuration, so there is normally nothing to maintain by hand. It may name the
+`.dpr`, the `.dpk` or the `.dproj` — only the folder and the base name are used.
+
+Two rule files next to that project then join the chain:
+
+| File | Who it is for |
+|---|---|
+| `<Project>.ExceptionSettings.json` | the project's own rules — **commit it**, so every developer on the package gets them |
+| `<Project>.ExceptionSettings.local.json` | your own overrides — **gitignore it** |
+
+Both use the same schema and the same two shapes as the shared file below (an
+object with an `exceptionRules` array, or a bare array), are strict JSON in the
+same way, and are hot-reloaded on resume. A missing or malformed one is ignored.
+
+This repository ships a worked example: `Debugme.ExceptionSettings.json` sits
+next to `Debugme.dpr`, and both the launch and the attach configuration in
+`.vscode/launch.json` reach it through their `delphiProjectFile` line.
+
+**Without `delphiProjectFile` nothing project-scoped is looked for**, and rules
+resolve exactly as they did before this existed — an older `launch.json`, or one
+written by hand, keeps working untouched.
+
+### Which rule wins
+
+Rules are evaluated top-down across all four scopes, narrowest first, and the
+**first match wins**; if nothing matches, the exception filters decide.
+
+| # | Scope | Where |
+|---|---|---|
+| 1 | your own, for this project | `<Project>.ExceptionSettings.local.json` |
+| 2 | the project's, shared with its team | `<Project>.ExceptionSettings.json` |
+| 3 | one launch configuration | `exceptionRules` in `launch.json` |
+| 4 | every project on this machine | the shared file below |
+
 ### Shared rules across projects
 
 A machine-wide rules file lets you define a baseline once and have it apply to
@@ -663,10 +713,10 @@ accepted), using the same rule schema as above:
 > because VS Code strips them before the adapter ever sees the config; nothing
 > strips them here.
 
-Precedence: a project's `exceptionRules` (in `launch.json`) are evaluated
-**first**, then the shared file's rules — so a project can override the shared
-baseline, and anything it doesn't address falls back to the shared rules (and
-finally to the exception filters). Control it from `launch.json`:
+It is the **widest** scope: everything in the table under
+[Which rule wins](#which-rule-wins) is consulted before it, so anything a project
+does not address falls back here, and anything this file does not address falls
+back to the exception filters. Control it from `launch.json`:
 
 | Property | Default | Description |
 |---|---|---|
@@ -678,12 +728,14 @@ also fails **silently** — you simply get zero shared rules, with nothing in th
 Debug Console to say so. If the shared baseline appears to have stopped applying,
 suspect a parse error first, and enable `diagnosticLog` to see the reason.
 
-The shared file is **hot-reloaded**: edit it while stopped on a breakpoint or
-exception, then resume (continue / step) and the new rules apply to subsequent
-exceptions — no need to restart the session. The adapter re-reads the file on
-resume only when its timestamp changed, and logs a line to the debug console
-when it does. (Project `exceptionRules` come from `launch.json` and are not
-hot-reloaded.)
+Every rules FILE is **hot-reloaded** — the shared one and both project sidecars.
+Edit one while stopped on a breakpoint or exception, then resume (continue /
+step) and the new rules apply to subsequent exceptions, with no need to restart
+the session. The adapter re-reads a file on resume only when its timestamp
+changed, and logs a line to the debug console naming which one it reloaded.
+Creating a file that did not exist when the session started counts as a change
+too. (The `exceptionRules` array inside `launch.json` arrives with the launch
+request and is therefore not hot-reloaded.)
 
 ### Editing rules from the UI
 

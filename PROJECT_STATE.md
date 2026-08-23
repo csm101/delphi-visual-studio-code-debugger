@@ -97,6 +97,10 @@ VS Code  ── DAP (JSON over stdio) ──>  VisualStudioCodeDelphiDebugger.ex
   `DapServer` (they drive the variables view) and call into this unit.
   Stage 1 of the `DapServer` de-god-classing (4894 → ~4350 lines).
 - `Debugme.dpr`: trivial test target. Extended on demand to validate features.
+  It runs to completion in well under a second, so `--attach-demo` exists to make
+  it attachable: it loops raising and catching the exception named in
+  `Debugme.ExceptionSettings.json`, the repository's worked example of a
+  project-scoped rule file. A normal run is unaffected.
   Never used as ground truth — every feature must work on real Delphi Win64
   binaries.
 - `DebuggerTests\`: DUnitX integration test suite. Launches the adapter,

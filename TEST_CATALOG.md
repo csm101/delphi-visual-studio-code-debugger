@@ -566,6 +566,10 @@ fixture):
 - [x] A rule scoped to `TestPackage.dpk` fires inside a host executable that
       declares nothing about the package
       (`PackageSidecar_AppliesInsideAHostThatKnowsNothingAboutIt`)
+- [x] The worked example committed in this repository is a file the adapter can
+      actually read -- strict JSON, right shape, known actions. A broken one
+      would be silently ignored, which is exactly why it is asserted
+      (`TheDebugmeSampleSidecar_IsAFileTheAdapterCanActuallyRead`)
 
 ---
 

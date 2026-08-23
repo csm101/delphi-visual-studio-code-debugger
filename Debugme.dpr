@@ -83,9 +83,33 @@ begin
   end;
 end;
 
+// Opt-in loop for exercising an ATTACH configuration against this program.
+// Debugme normally runs to completion in well under a second, so by the time a
+// debugger has attached there is nothing left to observe. With `--attach-demo`
+// it keeps raising and catching the exception `Debugme.ExceptionSettings.json`
+// names, long enough to attach and watch that rule decide. Nothing changes for
+// a normal run.
+procedure AttachDemoLoop;
+begin
+  for var Pass := 1 to 120 do begin
+    try
+      raise Exception.Create('Bare error');
+    except
+      on E: Exception do
+        Writeln('attach-demo ', Pass, ': ', E.Message);
+    end;
+    Sleep(500);
+  end;
+end;
+
 var data: TDateTime;
 var x: integer;
 begin
+  if FindCmdLineSwitch('attach-demo') or FindCmdLineSwitch('-attach-demo') then begin
+    AttachDemoLoop;
+    Halt(0);
+  end;
+
   var localdata := now;
   Writeln(localdata);
   data := localdata + 1;

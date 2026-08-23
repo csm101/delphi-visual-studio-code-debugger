@@ -101,12 +101,14 @@ type
     [TearDown] procedure TearDown;
 
     [Test] procedure PackageSidecar_AppliesInsideAHostThatKnowsNothingAboutIt;
+    // The repository's own worked example, which is also the one a reader copies.
+    [Test] procedure TheDebugmeSampleSidecar_IsAFileTheAdapterCanActuallyRead;
   end;
 
 implementation
 
 uses
-  System.SysUtils, System.IOUtils, Winapi.Windows, TestTempDirs;
+  System.SysUtils, System.StrUtils, System.IOUtils, Winapi.Windows, TestTempDirs;
 
 const
   // The exception `--run-exception-test` raises and catches.
@@ -510,6 +512,42 @@ begin
       'stopped on the wrong exception: ' + Stopped.GetValue<string>('description', ''));
   finally
     Stopped.Free;
+  end;
+end;
+
+// A rules file the adapter cannot parse is IGNORED, deliberately -- a broken
+// file must not stop anyone debugging. That makes a broken one invisible, so the
+// sample committed in this repository, which is what a reader copies, is checked
+// here rather than left to be discovered as "the rule does nothing".
+procedure TPackageExceptionRulesTests.TheDebugmeSampleSidecar_IsAFileTheAdapterCanActuallyRead;
+begin
+  const SampleProject = 'Debugme.dpr';
+  if not TFile.Exists(RepoRoot + SampleProject) then
+    Assert.Pass('SKIP: ' + SampleProject + ' is not present in this clone');
+
+  const Sidecar = RepoRoot + 'Debugme.ExceptionSettings.json';
+  Assert.IsTrue(TFile.Exists(Sidecar),
+    SampleProject + ' has no ' + ExtractFileName(Sidecar) + ' beside it');
+
+  var Root := TJSONObject.ParseJSONValue(TFile.ReadAllText(Sidecar, TEncoding.UTF8));
+  Assert.IsNotNull(Root, ExtractFileName(Sidecar) +
+    ' is not strict JSON -- these files are not JSONC, so a comment or a trailing comma makes them do nothing');
+  try
+    var Rules: TJSONArray := nil;
+    if Root is TJSONArray then
+      Rules := TJSONArray(Root)
+    else if Root is TJSONObject then
+      Rules := TJSONObject(Root).FindValue('exceptionRules') as TJSONArray;
+    Assert.IsNotNull(Rules, ExtractFileName(Sidecar) +
+      ' must be a bare array or an object with an "exceptionRules" array');
+    Assert.IsTrue(Rules.Count > 0, ExtractFileName(Sidecar) + ' declares no rules at all');
+    for var Item in Rules do begin
+      var Action := (Item as TJSONObject).GetValue<string>('action', '');
+      Assert.IsTrue(MatchStr(Action, ['ignore', 'log', 'logStack', 'break']),
+        'rule with an action the engine does not know: "' + Action + '"');
+    end;
+  finally
+    Root.Free;
   end;
 end;
 
