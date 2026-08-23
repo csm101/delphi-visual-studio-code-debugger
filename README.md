@@ -647,7 +647,7 @@ host is how they go stale.
 So a configuration may name the Delphi project it debugs:
 
 ```jsonc
-"delphiProjectFile": "${workspaceFolder}/packages/libTabAnagD29.dpk"
+"delphiProjectFile": "${workspaceFolder}/packages/ReportEngine.dpk"
 ```
 
 The RAD Studio plugin writes this line for you when it generates the launch

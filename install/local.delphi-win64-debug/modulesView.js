@@ -53,13 +53,14 @@ function moduleDescription(module) {
 
 // Substring match over the NAME and the PATH, case-insensitive. The path is
 // included on purpose: on a machine where every package is called libSomething,
-// "hydra_2" or "Bpl\Win64" is often what tells them apart. A blank needle is
-// "no filter" rather than "match nothing" -- an empty filter box must not empty
-// the view.
+// the directory ("Bpl\Win64", "Win32\Release") is often what tells them apart.
+// A blank needle is "no filter" rather than "match nothing" -- an empty filter
+// box must not empty the view.
 //
-// Space-separated words are AND-ed, so "qbf 29" finds libQbfD29 without
-// requiring the exact spelling: with 150 modules loaded, the whole point is to
-// type two fragments you remember rather than one string you do not.
+// Space-separated words are AND-ed, so "rtl 290" finds rtl290.bpl and
+// dbrtl290.bpl without requiring either exact spelling: with 150 modules loaded,
+// the whole point is to type two fragments you remember rather than one string
+// you do not.
 function filterModules(modules, needle) {
   const words = String(needle || '').toLowerCase().split(/\s+/).filter((w) => w.length > 0);
   if (words.length === 0) return (modules || []).slice();
@@ -234,7 +235,9 @@ function register(context) {
     vscode.commands.registerCommand('delphi-win64.filterModules', async () => {
       const answer = await vscode.window.showInputBox({
         prompt: 'Show only modules whose name or path contains all of these words',
-        placeHolder: 'e.g. qbf   ·   tabautomezzi   ·   bpl win64',
+        // One fragment, two fragments AND-ed, and a path -- the three things
+        // the box can do, in examples any Delphi installation actually has.
+        placeHolder: 'e.g. vcl   ·   rtl 290   ·   bpl win64',
         value: provider.filter
       });
       if (answer === undefined) return;   // dismissed: leave the filter alone

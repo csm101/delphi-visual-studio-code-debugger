@@ -28,11 +28,11 @@ function eq(label, got, expected) {
   else { failures++; console.log('FAIL  ' + label + ' -> ' + g + '   expected ' + e); }
 }
 
-const main    = { name: 'hydra2.exe', delphiIsMain: true, delphiFormats: ['td32', 'map'],
+const main    = { name: 'MyApp.exe', delphiIsMain: true, delphiFormats: ['td32', 'map'],
                   symbolStatus: 'TD32 (embedded), .map', addressRange: '0x400000' };
-const withDcp = { name: 'libtabautomezzid29.bpl', delphiFormats: ['td32', 'dcp'],
+const withDcp = { name: 'ReportEngine290.bpl', delphiFormats: ['td32', 'dcp'],
                   symbolStatus: 'TD32 (embedded), .dcp', addressRange: '0x543D0000',
-                  path: 'C:\\Bpl\\libtabautomezzid29.bpl', delphiImageSize: 15427734 };
+                  path: 'C:\\Bpl\\ReportEngine290.bpl', delphiImageSize: 15427734 };
 const bare    = { name: 'ntdll.dll', delphiFormats: [], symbolStatus: 'no debug information',
                   addressRange: '0x7FF85C700000' };
 const indexing = { name: 'vcl290.bpl', delphiFormats: [], symbolStatus: 'indexing',
@@ -44,10 +44,10 @@ const sorted = mv.sortModules([bare, withDcp, main, indexing]).map((m) => m.name
 // The executable is what was launched, so it leads. Then the modules WITHOUT
 // debug information: this view exists to answer "why can I see nothing in this
 // package", and burying that under forty rows of healthy ones defeats it.
-eq('the main module leads', sorted[0], 'hydra2.exe');
+eq('the main module leads', sorted[0], 'MyApp.exe');
 eq('modules with no symbols come next, alphabetically',
    [sorted[1], sorted[2]], ['ntdll.dll', 'vcl290.bpl']);
-eq('modules with symbols come last', sorted[3], 'libtabautomezzid29.bpl');
+eq('modules with symbols come last', sorted[3], 'ReportEngine290.bpl');
 eq('sorting does not mutate the caller\'s array',
    mv.sortModules([bare, main])[0] !== undefined, true);
 
@@ -66,19 +66,21 @@ eq('matches by name, case-insensitively',
 // The path matters: on a machine where every package is libSomething, the
 // directory is often what tells them apart.
 eq('matches by path too',
-   mv.filterModules(many, 'C:\\Bpl').map((m) => m.name), ['libtabautomezzid29.bpl']);
-// Words are AND-ed, so two remembered fragments beat one exact spelling.
+   mv.filterModules(many, 'C:\\Bpl').map((m) => m.name), ['ReportEngine290.bpl']);
+// Words are AND-ed, so two remembered fragments beat one exact spelling. Note
+// that '290' alone would also match vcl290.bpl: the second word is what makes
+// this one rule out the other.
 eq('space-separated words are all required',
-   mv.filterModules(many, 'tab d29').map((m) => m.name), ['libtabautomezzid29.bpl']);
+   mv.filterModules(many, 'report 290').map((m) => m.name), ['ReportEngine290.bpl']);
 eq('a word that matches nothing rules the module out',
-   mv.filterModules(many, 'tab zzz').length, 0);
+   mv.filterModules(many, 'report zzz').length, 0);
 
 eq('the summary counts modules when unfiltered', mv.filterSummary(150, 150, ''), '150 modules');
 eq('one module is not "modules"', mv.filterSummary(1, 1, ''), '1 module');
 // "7 of 150" is the difference between a filter that worked and one that
 // silently matched nothing.
 eq('the summary shows what was filtered away',
-   mv.filterSummary(150, 7, 'qbf'), '7 of 150 — filter: qbf');
+   mv.filterSummary(150, 7, 'vcl'), '7 of 150 — filter: vcl');
 
 /* --------------------------------------------------------------- status -- */
 

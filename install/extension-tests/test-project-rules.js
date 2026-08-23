@@ -64,11 +64,11 @@ function withTempDirectory(fn) {
 console.log('project rule files - naming');
 
 test('the two files sit next to the project and are named after it', () => {
-  const project = path.join('C:', 'work', 'TabAnag', 'libTabAnagD29.dpk');
+  const project = path.join('C:', 'work', 'packages', 'ReportEngine.dpk');
   assert.strictEqual(projectRules.projectRulesPath(project),
-    path.join('C:', 'work', 'TabAnag', 'libTabAnagD29.ExceptionSettings.json'));
+    path.join('C:', 'work', 'packages', 'ReportEngine.ExceptionSettings.json'));
   assert.strictEqual(projectRules.localProjectRulesPath(project),
-    path.join('C:', 'work', 'TabAnag', 'libTabAnagD29.ExceptionSettings.local.json'));
+    path.join('C:', 'work', 'packages', 'ReportEngine.ExceptionSettings.local.json'));
 });
 
 test('.dpr, .dpk and .dproj name the same pair of files', () => {
