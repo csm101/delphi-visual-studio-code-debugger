@@ -493,9 +493,32 @@ synthetic **`$exception`** pseudo-variable:
   and read its `Message` child.
 - **Hover** — hovering `$exception` in the editor shows the same value.
 
-It is present only on an exception stop (it disappears on the next breakpoint/step
-stop) and reflects the Delphi exception object; access violations have no Delphi
-object, so `$exception` is not shown for them (the class/message summary still is).
+- **Expressions** — `$exception` is a name the expression language understands,
+  so `$exception.Message` works, and so does a **breakpoint condition** such as
+  `$exception.Message = 'ORA-00942'`.
+
+It stays available for as long as execution is inside the `except` block that
+caught it — not only at the instant of the raise — so a breakpoint a few lines
+into a handler still shows the exception being handled. Outside a handler it
+reports that there is none, and says why, rather than showing the last
+exception the debugger happened to see.
+
+Access violations have no Delphi object until the RTL converts them, so
+`$exception` is not shown for a raw hardware fault (the class/message summary
+still is).
+
+**Where the handler names the exception**, as in `on E: Exception do`, that name
+is listed in **Locals** instead, for the length of the clause — including in a
+program's `begin..end.` block, where the compiler does not give the alias a stack
+slot at all. `$exception` and the alias are never both offered for the same
+handler: one object under two names in one Locals scope reads as two variables.
+
+> **32-bit targets.** Everything above is x64. A 32-bit binary has no `.pdata`,
+> so nothing in it states where an `except` block begins and ends, and the
+> debugger will not guess: inside a handler on Win32, `$exception` reports the
+> limitation by name instead of showing a value it cannot justify. An `on E:`
+> alias inside an ordinary procedure is unaffected on both bitnesses — there it
+> is a normal local.
 
 > **`$exception` shows `not available` in the Watch panel?** That string is
 > VS Code's, not the debugger's — the adapter would answer

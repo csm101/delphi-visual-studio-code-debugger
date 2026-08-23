@@ -2,7 +2,7 @@
   "name": "delphi-win64-debug",
   "displayName": "Delphi Debugger (Win32 and Win64)",
   "description": "Debug Delphi Win32 and Win64 applications in VS Code - breakpoints, stepping, call stacks, watches and exception rules, without the Embarcadero IDE. The debug adapter is always a 64-bit process, so a 32-bit target is debugged without the address-space ceiling a 32-bit debugger works under.",
-  "version": "0.6.2",
+  "version": "0.6.3",
   "publisher": "local",
   "license": "MIT",
   "author": "Carlo Sirna",

@@ -145,8 +145,15 @@ if ($DryRun) {
 # ----------------------------------------------------------------- release --
 
 Write-Host ''
-Write-Host "=== Creating DRAFT release $tag ==="
-gh release create $tag --draft --target main `
+# GitHub creates the tag at this commitish WHEN THE DRAFT IS PUBLISHED, so a
+# BRANCH NAME here means the tag lands wherever that branch happens to point at
+# that moment. It pointed at `main`, which is not the branch this project
+# releases from: v0.5.0, v0.6.0, v0.6.1 and v0.6.2 all tagged the same stale
+# commit, and none of them describes the tree that was actually shipped.
+# Pin the exact commit that was built.
+$target = (& git -C $repo rev-parse HEAD).Trim()
+Write-Host "=== Creating DRAFT release $tag at $target ==="
+gh release create $tag --draft --target $target `
     --title "$tag - Delphi Debugger for VS Code (Win32 and Win64)" `
     --notes-file $notesPath `
     $zip
