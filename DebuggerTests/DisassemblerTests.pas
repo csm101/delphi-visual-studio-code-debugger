@@ -1,6 +1,6 @@
 unit DisassemblerTests;
 
-// Tests for the IDisassembler seam (DISASSEMBLY_PLAN.md increments 2 and 3).
+// Tests for the IDisassembler seam (docs/DISASSEMBLY_PLAN.md increments 2 and 3).
 //
 // Increment 2 shipped with the negative (DLL-missing) path proven here and
 // the positive (real decode) path proven only manually, via DevTools\
@@ -92,7 +92,7 @@ type
     [Test] procedure ProvenBoundary_LandsExactly_ReturnsExactPrecedingInstructions;
     // The same bytes, but TargetVA points MID-INSTRUCTION (inside the 7-byte
     // `sub rsp, 0x98`), so forward decode from the boundary overshoots it.
-    // DISASSEMBLY_PLAN.md "before": this must refuse (empty result), never
+    // docs/DISASSEMBLY_PLAN.md "before": this must refuse (empty result), never
     // hand back a misaligned guess.
     [Test] procedure Misalignment_DoesNotLandExactly_RefusesWithEmptyResult;
   end;
@@ -314,7 +314,7 @@ begin
 
   // PUSH imm8 (0x2A), sign-extended -- Zydis's own formatter prints this as
   // 'push 0x2a', the EXACT 'mnemonic 0x<hex>' shape a resolved direct
-  // call/jmp/jcc target also has (DISASSEMBLY_PLAN.md "Verified in increment
+  // call/jmp/jcc target also has (docs/DISASSEMBLY_PLAN.md "Verified in increment
   // 2"). ImageBase=0 so the instruction's own VA IS the RVA a symbol lookup
   // would use, and the fake provider below answers a name for literal
   // address $2A -- exactly the operand this instruction pushes -- so an open
@@ -483,7 +483,7 @@ begin
     Assert.AreNotEqual(Byte($CC), FixedByte,
       'ReadCodeMemoryAt must restore the ORIGINAL opcode, not the planted INT3 -- ' +
       'a disassembly fed this memory would otherwise show `int3` where the ' +
-      'user''s own code is (DISASSEMBLY_PLAN.md trap 1)');
+      'user''s own code is (docs/DISASSEMBLY_PLAN.md trap 1)');
   finally
     Session.Terminate;
     Session.Free;

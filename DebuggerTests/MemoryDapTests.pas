@@ -1,7 +1,7 @@
 unit MemoryDapTests;
 
 // DAP-layer plumbing for `readMemory`/`writeMemory` and `memoryReference` on
-// variables (ASSEMBLY_LEVEL_DEBUGGING.md increment 3). The engine primitives
+// variables (docs/ASSEMBLY_LEVEL_DEBUGGING.md increment 3). The engine primitives
 // (IDebugTarget.ReadCodeMemoryAt / WriteMemoryPartial) are the SAME ones the
 // MCP `read_memory`/`write_memory` tools and the `disassemble` request already
 // use -- their truncate-at-region-boundary and INT3-restoring behaviour is
@@ -834,7 +834,7 @@ end;
 
 initialization
   // EXPLICIT registration: this project does not use RTTI auto-scan, and an
-  // unregistered fixture silently never runs (TRAPS.md).
+  // unregistered fixture silently never runs (docs/TRAPS.md).
   TDUnitX.RegisterTestFixture(TMemoryDapTests);
 
 end.

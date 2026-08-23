@@ -18,7 +18,7 @@ VS Code  ── DAP (JSON over stdio) ──>  VisualStudioCodeDelphiDebugger.ex
   a `TDebugSessionState` machine and returns the neutral records in
   `DebugSessionTypes.pas`. Two frontends sit on it: `TDapServer` (VS Code / DAP)
   and `TMcpServer` (`McpServer.pas`, `McpJson.pas`, `McpToolSchemas.pas`) — a
-  Model Context Protocol stdio server (`DelphiDebuggerMcp.exe`, `build_mcp.bat`)
+  Model Context Protocol stdio server (`DelphiDebuggerMcp.exe`, `scripts/build_mcp.bat`)
   exposing semantic tools to an autonomous agent (Claude Code). `ProcessEnum.pas`
   backs process listing + a pre-attach architecture gate. See `MCP_SERVER.md` and
   the "Two frontends" section of `DAP_DEBUGGER_ARCHITECTURE.md`. Status: the MCP
@@ -158,7 +158,7 @@ VS Code side:
   `main` field, so no `extension.js` is required. Installed by
   `install\Install.exe`, which packages it into a `.vsix` and installs via
   `code --install-extension` (required on VS Code 1.96+; folder copy is no
-  longer loaded), or `install-dev.bat` (points at build output).
+  longer loaded), or `scripts/install-dev.bat` (points at build output).
 
 IDE integration:
 - `C:\Athens\sharedlibraries\shareddesign\IdeHooks\DGVisualStudioCodeIntegration.pas`
@@ -730,7 +730,7 @@ Debugger features:
   increment 6" and `TEST_CATALOG.md` "M. Disassembly".
   **Increment 7, packaging — DONE (2026-08-09).** `Zydis.dll` now ships next
   to every installed adapter (`install\Install.exe`, both portable-zip and
-  repository-mode staging, plus `update-install.bat`/`build_setup_zip.bat`)
+  repository-mode staging, plus `scripts/update-install.bat`/`scripts/build_setup_zip.bat`)
   and MCP server install (`%LOCALAPPDATA%\DelphiWin64Debugger\`), with the
   MIT licence text alongside it. The committed DLL was relinked `/MT` (static
   CRT) — measured +16.3% size (576,512 -> 670,720 bytes) for dropping the
@@ -1377,13 +1377,13 @@ Architecture / portability:
 Full rebuild (Debugme + VisualStudioCodeDelphiDebugger):
 
 ```bat
-call build_debug.bat
+call scripts\build_debug.bat
 ```
 
 Adapter only (faster iteration):
 
 ```bat
-call build_dap.bat
+call scripts\build_dap.bat
 ```
 
 Manual debug target build:
@@ -1396,9 +1396,9 @@ dcc64 Debugme.dpr
 Outputs:
 
 ```
-Win64\Debug\Debugme.exe
-Win64\Debug\Debugme.rsm
-Win64\Debug\Debugme.map
+samples\Debugme\Win64\Debug\Debugme.exe
+samples\Debugme\Win64\Debug\Debugme.rsm
+samples\Debugme\Win64\Debug\Debugme.map
 VisualStudioCodeDelphiDebugger\Win64\Debug\VisualStudioCodeDelphiDebugger.exe
 ```
 
@@ -1407,7 +1407,7 @@ RSM smoke test (`DevTools` tree, sources include the project's
 
 ```bat
 cmd /c "C:\Athens\GitHub\Win64Debugger\DevTools\build_all.bat"
-DevTools\Win64\Debug\TestRsmParser.exe Win64\Debug\Debugme.rsm
+DevTools\Win64\Debug\TestRsmParser.exe samples\Debugme\Win64\Debug\Debugme.rsm
 ```
 
 VS Code:
@@ -1435,7 +1435,7 @@ by `DAP_LOG=1` in the environment. One previous generation is kept beside it as
   written, a push on 2026-08-10 created a second remote branch `public-main` and
   from 2026-08-12 all work went there, while `origin/main` — the repository's
   DEFAULT branch, and so what every visitor and every `git clone` gets — froze at
-  the 12 August tree. It also silently broke `make_release.ps1`, whose
+  the 12 August tree. It also silently broke `scripts/make_release.ps1`, whose
   `--target main` had been correct until that day: v0.5.0, v0.6.0, v0.6.1 and
   v0.6.2 all tagged the frozen commit instead of what they shipped.
 

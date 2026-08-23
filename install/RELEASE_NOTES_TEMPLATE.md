@@ -39,7 +39,7 @@ IDE: your project opens in VS Code already configured for this debugger.
 
 **Windows will warn you**: these executables are not code-signed, so SmartScreen
 shows "Windows protected your PC". Choose *More info -> Run anyway*, or build the
-identical zip yourself from source with `build_setup_zip.bat` — a reasonable
+identical zip yourself from source with `scripts/build_setup_zip.bat` — a reasonable
 preference for a debugger, which by nature attaches to other processes.
 
 ## Requirements
@@ -74,7 +74,7 @@ symbols. To step into the RTL and VCL, also enable *Use debug .dcus*.
 | `Setup.exe` | Installer and updater |
 | `local.delphi-win64-debug/` | The VS Code extension plus the DAP adapter |
 | `DelphiDebuggerMcp.exe` | MCP server — {{MCP_TOOL_COUNT}} tools that let an agent set breakpoints, step, and read locals |
-| `register-mcp.ps1` | Registers or unregisters the MCP server |
+| `scripts/register-mcp.ps1` | Registers or unregisters the MCP server |
 
 SHA-256 of the zip:
 `{{SHA256}}`

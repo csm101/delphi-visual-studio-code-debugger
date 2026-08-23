@@ -13,18 +13,18 @@ unit ExceptionStepTests;
 // next source line, so a step of ANY kind means: run to the first `except` or
 // `finally` block up the stack that actually receives it, and land in the
 // user's own source. Where that block cannot be PROVEN, refuse and say what is
-// missing. See DAP_DEBUGGER_ARCHITECTURE.md ("Stepping at an exception stop")
-// and EH_FORMAT_NOTES.md for the layouts.
+// missing. See docs/DAP_DEBUGGER_ARCHITECTURE.md ("Stepping at an exception stop")
+// and docs/EH_FORMAT_NOTES.md for the layouts.
 //
 // Debuggee: DevTools\Fixtures\ExcNestFixture.dpr, built for both bitnesses by
 // DevTools\build_exc_fixture.bat. It is reused rather than extended into
 // TestTarget on purpose -- adding scenarios there shifts RSM import indices and
-// marker ordering (TRAPS.md).
+// marker ordering (docs/TRAPS.md).
 //
 // Every test is BITNESS-PARAMETERISED and COLLECTS its failures rather than
 // asserting per case: both executables are called ExcNestFixture.exe, so a
 // message built from the file name cannot identify the bitness, and a
-// first-failure abort would hide the x86 case entirely (TRAPS.md).
+// first-failure abort would hide the x86 case entirely (docs/TRAPS.md).
 
 interface
 

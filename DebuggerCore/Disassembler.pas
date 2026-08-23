@@ -1,6 +1,6 @@
 unit Disassembler;
 
-// The disassembly seam (DISASSEMBLY_PLAN.md increment 2, "The seam"). This
+// The disassembly seam (docs/DISASSEMBLY_PLAN.md increment 2, "The seam"). This
 // unit is deliberately library-free: no third-party disassembler is named or
 // imported here, so every caller depends only on this interface and can be
 // tested without the backend's DLL. `ZydisDisassembler.pas` is the (currently
@@ -26,7 +26,7 @@ type
   // Returns the number of bytes actually placed in Buf, which may be LESS
   // than Size -- a read that reaches the end of a section, a page boundary
   // backed by nothing, or EOF is a NORMAL case and must be answered with a
-  // shorter buffer, never with a failure (DISASSEMBLY_PLAN.md trap: "reads
+  // shorter buffer, never with a failure (docs/DISASSEMBLY_PLAN.md trap: "reads
   // across a page boundary into unmapped memory must TRUNCATE, not fail the
   // whole request"). 0 means nothing at all was readable at VA.
   //
@@ -72,7 +72,7 @@ type
     function Disassemble(VA: UInt64; Count: Integer): TArray<TDisasmInstruction>;
   end;
 
-  // Reusable backward-disassembly mechanism (DISASSEMBLY_PLAN.md, "before" --
+  // Reusable backward-disassembly mechanism (docs/DISASSEMBLY_PLAN.md, "before" --
   // decision: proven-boundary-only). x86/x64 cannot be decoded backwards, so
   // the only exact way to find instructions PRECEDING TargetVA is to start
   // from a PROVEN earlier boundary and decode FORWARD, keeping the result

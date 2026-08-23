@@ -142,9 +142,9 @@ begin
     Exit;
   Writeln('Adapter executable not found:');
   Writeln('  ' + AdapterExePath);
-  if not AskYesNo('Build it now (runs build_dap.bat)?', True) then
+  if not AskYesNo('Build it now (runs scripts/build_dap.bat)?', True) then
     raise Exception.Create('Adapter executable is required. Build it and re-run.');
-  var ExitCode := RunAndWait('cmd.exe /c "' + TPath.Combine(RepoRoot, 'build_dap.bat') + '"');
+  var ExitCode := RunAndWait('cmd.exe /c "' + TPath.Combine(RepoRoot, 'scripts\build_dap.bat') + '"');
   if (ExitCode <> 0) or not TFile.Exists(AdapterExePath) then
     raise Exception.Create('Build failed; adapter executable still missing.');
 end;
@@ -159,7 +159,7 @@ begin
 end;
 
 // ------------------------------- Zydis DLL -----------------------------------
-// Optional disassembly backend (DISASSEMBLY_PLAN.md increment 7). Both the
+// Optional disassembly backend (docs/DISASSEMBLY_PLAN.md increment 7). Both the
 // adapter and the MCP server already look for it NEXT TO THEIR OWN exe first
 // (DapServer.pas / McpServer.pas ResolveZydisDllPath), so staging only needs
 // to place the DLL (and its MIT licence text, "ships alongside" per the plan)
@@ -198,7 +198,7 @@ end;
 // ------------------------------- MCP server ---------------------------------
 // The MCP server is a standalone stdio exe registered with Claude Code / VS Code
 // by ABSOLUTE path, so it is copied to a stable per-user location (surviving
-// deletion of the installer/zip) and register-mcp.ps1 does the registration.
+// deletion of the installer/zip) and scripts/register-mcp.ps1 does the registration.
 
 // Portable (zip): bundled next to the installer. Repository: the build output.
 function McpSourceExe: string;
@@ -216,10 +216,10 @@ end;
 
 function RegisterScriptPath: string;
 begin
-  Result := TPath.Combine(ExeDir, 'register-mcp.ps1');   // bundled (portable)
+  Result := TPath.Combine(ExeDir, 'scripts/register-mcp.ps1');   // bundled (portable)
   if TFile.Exists(Result) then
     Exit;
-  Result := TPath.Combine(RepoRoot, 'register-mcp.ps1'); // repository
+  Result := TPath.Combine(RepoRoot, 'scripts\register-mcp.ps1'); // repository
 end;
 
 procedure EnsureMcpBuilt;
@@ -228,9 +228,9 @@ begin
     Exit;
   Writeln('MCP server executable not found:');
   Writeln('  ' + McpSourceExe);
-  if not AskYesNo('Build it now (runs build_mcp.bat)?', True) then
+  if not AskYesNo('Build it now (runs scripts/build_mcp.bat)?', True) then
     raise Exception.Create('MCP server executable is required. Build it and re-run.');
-  var ExitCode := RunAndWait('cmd.exe /c "' + TPath.Combine(RepoRoot, 'build_mcp.bat') + '"');
+  var ExitCode := RunAndWait('cmd.exe /c "' + TPath.Combine(RepoRoot, 'scripts\build_mcp.bat') + '"');
   if (ExitCode <> 0) or not TFile.Exists(McpSourceExe) then
     raise Exception.Create('Build failed; MCP server executable still missing.');
 end;
@@ -268,7 +268,7 @@ begin
 
   var Script := RegisterScriptPath;
   if not TFile.Exists(Script) then begin
-    Writeln('register-mcp.ps1 not found; skipping automatic registration.');
+    Writeln('scripts/register-mcp.ps1 not found; skipping automatic registration.');
     Writeln('Register manually:  claude mcp add delphi-win64-debugger -s user -- "' + Dest + '"');
     Exit;
   end;
@@ -574,7 +574,7 @@ begin
       StageFiles;
     end;
     // Idempotent either way: portable mode's StageDir already carries
-    // Zydis.dll from the zip (build_setup_zip.bat stages it into
+    // Zydis.dll from the zip (scripts/build_setup_zip.bat stages it into
     // local.delphi-win64-debug before zipping); repository mode needs it
     // copied here since StageFiles above only staged the adapter exe.
     CopyZydisIfAvailable(StageDir);

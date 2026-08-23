@@ -1,8 +1,8 @@
 #!/bin/sh
 #
-# post-commit -- reset TASK_RESUME.md to its stub.
+# post-commit -- reset docs/TASK_RESUME.md to its stub.
 #
-# TASK_RESUME.md is the cursor for work that is IN FLIGHT and not yet committed.
+# docs/TASK_RESUME.md is the cursor for work that is IN FLIGHT and not yet committed.
 # Once a commit exists, the commit message is the record of what landed, and any
 # cursor text left behind now describes finished work -- a confident pointer at
 # the past, which is worse than no pointer at all. That is not hypothetical: the
@@ -22,7 +22,7 @@
 set -e
 
 root=$(git rev-parse --show-toplevel) || exit 0
-cursor="$root/TASK_RESUME.md"
+cursor="$root/docs/TASK_RESUME.md"
 tmp="$cursor.post-commit-tmp"
 
 cat > "$tmp" <<'STUB'
@@ -48,4 +48,4 @@ if cmp -s "$tmp" "$cursor"; then
 fi
 
 mv -f "$tmp" "$cursor"
-echo "post-commit: TASK_RESUME.md reset to its stub (nothing in flight)."
+echo "post-commit: docs/TASK_RESUME.md reset to its stub (nothing in flight)."

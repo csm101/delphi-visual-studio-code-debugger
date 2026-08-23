@@ -501,7 +501,7 @@ function adapterArguments() {
 }
 
 // Where the adapter exe is, taken from the manifest rather than assumed: the
-// dev-loop script (install-dev.ps1) REWRITES `program` to point at the compiler
+// dev-loop script (scripts/install-dev.ps1) REWRITES `program` to point at the compiler
 // build output, and hardcoding the extension-relative copy here would silently
 // run yesterday's adapter in a dev session.
 function adapterExecutablePath(context) {

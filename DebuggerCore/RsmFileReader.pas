@@ -2604,7 +2604,7 @@ end;
 // `63 35` cluster most recently opened (records are grouped by unit; a cluster
 // starts a unit's block -- same gap>256 heuristic as EnsureUnitUsesParsed).
 //
-// $25 record layout (reverse-engineered, see RSM_FIELD_OFFSETS.md):
+// $25 record layout (reverse-engineered, see docs/RSM_FIELD_OFFSETS.md):
 //   25 [LEN] [NAME ANSI] | 8A 00 00 (marker) | [4-byte name hash] |
 //   [type-id byte] 00 00 | [value leaf]
 // Value leaf: bit0=0 -> single-byte ordinal, value = leaf>>1 (covers the common

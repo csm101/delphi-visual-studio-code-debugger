@@ -39,9 +39,16 @@ The repository contains **three programs** that share one debugger engine:
 | **VS Code extension** | The client that makes it usable in the editor: the `delphi-win64` debug type, the process picker for attaching, status-bar progress, and an editor for the exception rules. | `install\local.delphi-win64-debug\` |
 | **MCP server** | The same engine exposed to an **AI agent** over the Model Context Protocol — 44 tools (`set_breakpoint`, `step_into`, `get_locals`, `evaluate_expression`, `get_call_stack`, `read_memory`, …). It lets an agent run a program, stop it, and read its actual state instead of guessing from the source. | `MCPDebugger\` |
 
-The engine is shared: `DebuggerCore\` holds the Windows Debug API loop, the
-symbol readers (`.rsm`, TD32, `.map`, `.dcp`, JCL) and the expression evaluator.
-The three front ends are thin.
+The rest of the tree:
+
+| | |
+|---|---|
+| `DebuggerCore\` | The shared engine: the Windows Debug API loop, the symbol readers (`.rsm`, TD32, `.map`, `.dcp`, JCL) and the expression evaluator. The three front ends are thin. |
+| `docs\` | Format notes, architecture, plans, open questions — see [docs/README.md](docs/README.md) |
+| `scripts\` | Build, install and release scripts. Run them from anywhere; each resolves the repository root itself. |
+| `samples\Debugme\` | The sample program to debug, and the DLL it loads at runtime |
+| `DebuggerTests\` | The DUnitX suite (~1300 tests) and its targets |
+| `DevTools\` | Argv-driven probes for inspecting `.rsm` / TD32 / MAP / PE bytes |
 
 > **You will almost certainly also want the [Delphi IDE plugin](https://github.com/csm101/EditInVsCodeDelphiPlugin).**
 > It adds an *Open in VS Code* command to the Delphi IDE that generates the
@@ -138,12 +145,14 @@ cd Win64Debugger
 :: 2. Build the adapter and install the extension in DEVELOPMENT mode. It writes
 ::    a manifest whose "program" points directly at the build-output exe, so a
 ::    rebuild is reflected on the next debug session with no copy. Run once.
-call install-dev.bat
+call scripts\install-dev.bat
 
 :: 3. Build the bundled sample so there is something to debug. A fresh clone
 ::    has no .exe/.map/.rsm (they are gitignored), so build them once.
 call rsvars.bat
+pushd samples\Debugme
 dcc64 Debugme.dpr
+popd
 ```
 
 Now open the project and start a session:
@@ -160,7 +169,7 @@ Now open the project and start a session:
 After a change to the adapter source, the edit/test loop is just:
 
 1. Stop the running debug session (`Shift+F5`) — the exe is locked while it runs.
-2. `call build_dap.bat`
+2. `call scripts\build_dap.bat`
 3. `F5` — VS Code relaunches the freshly built adapter. No re-install, no copy.
 
 To debug your **own** application instead, compile it with debug info
@@ -169,14 +178,14 @@ To debug your **own** application instead, compile it with debug info
 [Launch configuration](#launch-configuration).
 
 > **Install to use, not develop** — to copy the adapter into the extensions
-> folder (so it no longer depends on the checkout) run `build_installer.bat`
+> folder (so it no longer depends on the checkout) run `scripts/build_installer.bat`
 > then `install\Install.exe`. It is interactive: builds the adapter if needed,
 > detects VS Code / VS Code Insiders, updates an existing install in place after
 > confirmation. See [VS Code extension setup](#vs-code-extension-setup).
 
 > **Ship to another machine** — to install on a machine **without** the
 > repository or a Delphi toolchain, build a self-contained zip with
-> `build_setup_zip.bat` and ship it — see
+> `scripts/build_setup_zip.bat` and ship it — see
 > [Distributable zip](#distributable-zip-no-repo-no-delphi-on-the-target).
 
 ---
@@ -186,7 +195,7 @@ To debug your **own** application instead, compile it with debug info
 ### One-shot: build everything
 
 ```bat
-call build_debug.bat
+call scripts\build_debug.bat
 ```
 
 This initializes the Delphi compiler environment (`rsvars.bat`), compiles `Debugme.exe` (emitting its `.map` and `.rsm`), and compiles `VisualStudioCodeDelphiDebugger.exe`.
@@ -194,7 +203,7 @@ This initializes the Delphi compiler environment (`rsvars.bat`), compiles `Debug
 ### Adapter only (faster iteration)
 
 ```bat
-call build_dap.bat
+call scripts\build_dap.bat
 ```
 
 ### Compiler flags for the debug target
@@ -208,7 +217,7 @@ Key flags that must be active when compiling the program you want to debug:
 | `-DDEBUG` | Optional conditional define |
 | `-E.\Win64\Debug` | Output directory |
 
-For `Debugme` these are set in `Debugme.cfg` (one per line, without the leading `-`).
+For `Debugme` these are set in `samples\Debugme\Debugme.cfg` (one per line, without the leading `-`).
 
 The same flags apply to a 32-bit target built with `dcc32`, where `-$O-` is not
 merely advisable: without a frame pointer, locals and parameters cannot be
@@ -227,7 +236,7 @@ The build configurations point at the default install location
 `C:\Athens\jcl\jcl\source` (subdirectories `windows`, `common`, `include`); adjust
 those paths if your JCL lives elsewhere. The affected configs are the adapter
 `VisualStudioCodeDelphiDebugger\VisualStudioCodeDelphiDebugger.cfg`, the test
-runner `DebuggerTests\RunTests.cfg`, and `build_mcp.bat`.
+runner `DebuggerTests\RunTests.cfg`, and `scripts/build_mcp.bat`.
 
 **To build without JCL** (e.g. JCL is not installed): compile with the
 `JCL_DEBUG_OFF` conditional defined. This removes the `uses JclDebug` entirely, so
@@ -239,7 +248,7 @@ when the define is off). Add the define to the relevant `.cfg` files, e.g.:
 ```
 
 into `VisualStudioCodeDelphiDebugger.cfg`, `DebuggerTests\RunTests.cfg`, and pass
-`-DJCL_DEBUG_OFF` on the `dcc64` command line in `build_mcp.bat`. With the define
+`-DJCL_DEBUG_OFF` on the `dcc64` command line in `scripts/build_mcp.bat`. With the define
 off, `JclDebugReader` compiles to a no-op factory (it never registers a provider);
 everything else — TD32, `.map`, `.rsm`/`.dcp` symbol resolution — is unaffected.
 
@@ -318,10 +327,10 @@ The extension lives in a local directory under VS Code's extension folder. It is
 
 ### Recommended: the installer
 
-After building the adapter (`build_dap.bat`), run:
+After building the adapter (`scripts/build_dap.bat`), run:
 
 ```bat
-call build_installer.bat
+call scripts\build_installer.bat
 install\Install.exe
 ```
 
@@ -335,14 +344,14 @@ confirmation). Reload VS Code afterwards.
 
 ```bat
 :: build the adapter and stage it into install\local.delphi-win64-debug\
-call update-install.bat
+call scripts\update-install.bat
 :: copy the staged folder into your VS Code extensions directory
 call install\install.bat
 ```
 
 ### Manual
 
-1. Build the adapter (`build_dap.bat`).
+1. Build the adapter (`scripts/build_dap.bat`).
 2. Create the folder
    `%USERPROFILE%\.vscode\extensions\local.delphi-win64-debug\`.
 3. Copy `install\local.delphi-win64-debug\package.json` and the built
@@ -370,7 +379,7 @@ To install the debugger on another machine that has neither the repository nor a
 Delphi toolchain, build a self-contained zip on a development machine:
 
 ```bat
-call build_setup_zip.bat
+call scripts\build_setup_zip.bat
 ```
 
 It builds the adapter, builds the portable installer, and bundles everything into
@@ -396,29 +405,29 @@ it runs in **repository** mode and builds/stages from the build output first.
 
 The installs above copy the adapter, which is right for distribution but
 awkward while changing the adapter: every fix would need a rebuild plus a
-re-copy. For development use `install-dev.bat` instead — it builds the adapter
-(`build_dap.bat`) and then writes a `package.json` into the extensions folder
+re-copy. For development use `scripts/install-dev.bat` instead — it builds the adapter
+(`scripts/build_dap.bat`) and then writes a `package.json` into the extensions folder
 whose `program` points **directly** at the build-output executable (no copy).
 On a fresh clone this single command is enough (no separate build step):
 
 ```bat
-call install-dev.bat   :: builds + installs; run once
+call scripts\install-dev.bat   :: builds + installs; run once
 ```
 
 After that, the edit/test loop for the **adapter** is just:
 
 1. Stop the running debug session in VS Code (`Shift+F5`) — the executable is locked while it runs.
-2. `call build_dap.bat`
+2. `call scripts\build_dap.bat`
 3. `F5`
 
 No re-install, no copy: VS Code relaunches the freshly built adapter.
 
 The **extension** is a different matter, because VS Code loads its code from the
-installed folder rather than from the repository. `install-dev.bat` mirrors the
+installed folder rather than from the repository. `scripts/install-dev.bat` mirrors the
 staged extension files (`extension.js`, the webview assets, the manifest) into
 that folder, so after changing any of them the loop is:
 
-1. `call install-dev.bat`
+1. `call scripts\install-dev.bat`
 2. *Developer: Reload Window* in VS Code
 
 A change to the extension's **version** is the one thing this cannot deliver. VS
@@ -431,14 +440,14 @@ arrives; the script says so when the two differ. To move to a new version, run
 it retire the previous folder itself.
 
 Both modes use the same `local.delphi-win64-debug` folder, so switching is just a
-matter of re-running `install-dev.bat` (dev) or `install\Install.exe`
+matter of re-running `scripts/install-dev.bat` (dev) or `install\Install.exe`
 (distribution copy).
 
 | Mode | `program` points at | After a fix |
 |---|---|---|
 | `Install.exe` (local distribution copy) | a copy in the extensions folder | rebuild + re-run the installer + reload |
-| `build_setup_zip.bat` (ship to another PC) | a copy from the extracted zip | rebuild the zip + re-run `Setup.exe` on the target |
-| `install-dev.bat` (development) | the build output directly | stop session + rebuild + `F5` |
+| `scripts/build_setup_zip.bat` (ship to another PC) | a copy from the extracted zip | rebuild the zip + re-run `Setup.exe` on the target |
+| `scripts/install-dev.bat` (development) | the build output directly | stop session + rebuild + `F5` |
 
 ---
 
@@ -813,8 +822,8 @@ debug a Delphi program the way a developer does — run it, stop it, and read th
 real state — instead of inferring behaviour from the source.
 
 ```powershell
-cmd /c build_mcp.bat
-powershell -ExecutionPolicy Bypass -File register-mcp.ps1 MCPDebugger\Win64\Debug\DelphiDebuggerMcp.exe
+cmd /c scripts\build_mcp.bat
+powershell -ExecutionPolicy Bypass -File scripts/register-mcp.ps1 MCPDebugger\Win64\Debug\DelphiDebuggerMcp.exe
 ```
 
 The script registers the server as `delphi-win64-debugger` with Claude Code (via
@@ -1017,7 +1026,7 @@ The debugger depends on, but does not redistribute, third-party components:
 
 - **JEDI Code Library (JCL)** — used to read `JCLDEBUG` / `.jdbg` line
   information. Mozilla Public License 1.1 / GPL. Set `JCL_ROOT` (see
-  `setpaths.bat`) to point at your own checkout.
+  `scripts/setpaths.bat`) to point at your own checkout.
 - **DUnitX** — the integration test suite only. Apache License 2.0. Set
   `DUNITX_ROOT`.
 - **Embarcadero Delphi RTL/VCL** — required to build; covered by your own

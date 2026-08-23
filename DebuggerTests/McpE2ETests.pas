@@ -56,7 +56,7 @@ type
     // distinguishable from "the module is not loaded".
     [Test] procedure LoadedModules_DescribeMainAndPackages;
     [Test] procedure SourceFiles_ListTheFileSetBreakpointExpects;
-    // Data breakpoints (watchpoints) -- increment 5 of DATA_BREAKPOINTS_PLAN.md.
+    // Data breakpoints (watchpoints) -- increment 5 of docs/DATA_BREAKPOINTS_PLAN.md.
     // The session/engine correctness (per-thread replication, DR6
     // disambiguation, slot allocation) is proven by DataBp_SessionApi_* in
     // DebugSessionTests.pas; these cover the MCP TOOL surface on top of it --
@@ -68,13 +68,13 @@ type
     [Test] procedure DataBreakpoint_LocalRefusedWithReason;
     [Test] procedure DataBreakpoint_SlotExhaustion_RefusesFifthWithEngineMessage;
     [Test] procedure DataBreakpoint_ListAndRemove_ClearsHardwareSlotForReal;
-    // DISASSEMBLY_PLAN.md increment 4: MCP `disassemble`.
+    // docs/DISASSEMBLY_PLAN.md increment 4: MCP `disassemble`.
     [Test] procedure Disassemble_Forward_ReturnsDecodedInstructionsAtStopAddress;
     [Test] procedure Disassemble_ViaFrameIndex_MatchesAddressForm;
     [Test] procedure Disassemble_Before_ReturnsProvenPrecedingInstructions;
     [Test] procedure Disassemble_Win32_Forward_ReturnsDecodedInstructions;
     [Test] procedure Disassemble_ReportsUnavailable_WhenZydisDllNotFound;
-    // DISASSEMBLY_PLAN.md increment 5: address breakpoints. Uses disassemble's
+    // docs/DISASSEMBLY_PLAN.md increment 5: address breakpoints. Uses disassemble's
     // own echoed address (the documented workflow: feed a frame/instruction
     // address straight back in) so the tool surface is proven the way an
     // agent would actually drive it, not with a hand-computed VA.
@@ -83,7 +83,7 @@ type
     [Test] procedure SetBreakpointAtAddress_RefusedWhenNotInAnyLoadedModule;
     [Test] procedure RemoveBreakpointAtAddress_UnplantsAndDoesNotStopAgain;
 
-    // ASSEMBLY_LEVEL_DEBUGGING.md increment 4: registers. The MCP equivalent
+    // docs/ASSEMBLY_LEVEL_DEBUGGING.md increment 4: registers. The MCP equivalent
     // of DAP's writable Registers scope -- same TDebugSession.GetRegisters /
     // SetRegister path, so these prove the TOOL surface (JSON shape, the
     // "must be stopped" gate, an unrecognised-name refusal); the register
@@ -94,7 +94,7 @@ type
     [Test] procedure GetRegisters_RefusedBeforeLaunch;
     [Test] procedure SetRegister_WritesAndReadsBack;
     [Test] procedure SetRegister_UnknownName_Refused;
-    // ASSEMBLY_LEVEL_DEBUGGING.md increment 6: the write side of the same
+    // docs/ASSEMBLY_LEVEL_DEBUGGING.md increment 6: the write side of the same
     // path had no WOW64 override (unlike GetRegisters/ReadThreadRegisters,
     // which does) -- an unverified path, not a provenly-wrong one. Measured
     // (DevTools\Wow64RegWriteProbe.dpr) at a REAL breakpoint the native
@@ -111,7 +111,7 @@ type
     // confirmed RED without this fix.
     [Test] procedure SetRegister_Win32_ExtendedRegister_Refused;
 
-    // ASSEMBLY_LEVEL_DEBUGGING.md increment 4: instruction-granularity
+    // docs/ASSEMBLY_LEVEL_DEBUGGING.md increment 4: instruction-granularity
     // stepping over MCP. The ENGINE rules (call/rep/recursion, every refusal
     // reason) are InstructionStepTests.pas's job and are not re-proven here;
     // this proves granularity:"instruction" reaches TDebugSession.
@@ -147,7 +147,7 @@ const
   EVAL_MARKER = 'EVAL_BODY';
   EVAL_SOURCE = 'TestTargetCore.pas';
   // Data-breakpoint fixtures (shared with DataBp_SessionApi_* in
-  // DebuggerTests\DebugSessionTests.pas; see DATA_BREAKPOINTS_PLAN.md).
+  // DebuggerTests\DebugSessionTests.pas; see docs/DATA_BREAKPOINTS_PLAN.md).
   DATABP_ARGS       = '-run-databp-step';
   DATABPTHREAD_ARGS = '-run-databp-thread';
 
@@ -361,8 +361,8 @@ begin
   Result := RepoRoot + 'DebuggerTests\TestHost\Win64\Debug\TestHost.exe';
 end;
 
-// ASSEMBLY_LEVEL_DEBUGGING.md increment 1's own fixture -- a separate target
-// on purpose (TRAPS.md: adding scenarios to TestTarget shifts RSM import
+// docs/ASSEMBLY_LEVEL_DEBUGGING.md increment 1's own fixture -- a separate target
+// on purpose (docs/TRAPS.md: adding scenarios to TestTarget shifts RSM import
 // indices and marker ordering). mapFile/rsmFile are left to launch_debuggee's
 // default (exe path with .map/.rsm), same as every other launch in this file.
 const
@@ -1870,7 +1870,7 @@ begin
   end;
 end;
 
-// DISASSEMBLY_PLAN.md increment 4: MCP `disassemble`.
+// docs/DISASSEMBLY_PLAN.md increment 4: MCP `disassemble`.
 
 function ParseHexAddr(const S: string): UInt64;
 var
@@ -2101,7 +2101,7 @@ begin
   end;
 end;
 
-// Zydis is optional (DISASSEMBLY_PLAN.md "Constraints"): this is the path
+// Zydis is optional (docs/DISASSEMBLY_PLAN.md "Constraints"): this is the path
 // every user without the VC++ runtime hits, so it must report cleanly, never
 // crash and never fabricate a result. Copies the MCP exe to a scratch
 // directory outside the repo, so neither its own-directory Zydis.dll check
@@ -2652,7 +2652,7 @@ begin
   end;
 end;
 
-// ASSEMBLY_LEVEL_DEBUGGING.md increment 6. Same shape as
+// docs/ASSEMBLY_LEVEL_DEBUGGING.md increment 6. Same shape as
 // SetRegister_WritesAndReadsBack, on the 32-bit target: a WOW64-width
 // sentinel (the real register is 32 bits wide, so a 64-bit sentinel would
 // only prove the low half round-trips), re-read via a FRESH get_registers

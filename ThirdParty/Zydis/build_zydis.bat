@@ -1,6 +1,6 @@
 @echo off
 rem Regenerates bin\x64\Zydis.dll from zydis.submodule.
-rem NOT called by build_all.bat / build_dap.bat / build_debug.bat — those stay
+rem NOT called by build_all.bat / scripts/build_dap.bat / scripts/build_debug.bat — those stay
 rem Delphi-only. Run this manually whenever the pinned submodule commit changes.
 rem
 rem Needs: Visual Studio 2026 (MSVC toolset 14.51.36231) + its bundled CMake.

@@ -3,8 +3,8 @@ unit RsmTags;
 // Named constants for the Delphi `.rsm` (Remote Symbol Map) byte tags
 // reverse-engineered for Athens 36 Win64. Centralising them here keeps the
 // magic out of the body of every parser pass and makes additions (new dcc64
-// record kinds) a single-line edit. See RSM_FORMAT_NOTES.md and
-// RSM_RECORD_TYPES.md for the structural meaning of each tag.
+// record kinds) a single-line edit. See docs/RSM_FORMAT_NOTES.md and
+// docs/RSM_RECORD_TYPES.md for the structural meaning of each tag.
 
 interface
 

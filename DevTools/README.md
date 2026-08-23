@@ -42,14 +42,14 @@ Binaries land in `DevTools\Win32\Debug\`.
 Run a built tool from `Win64\Debug` without typing the path:
 
 ```bat
-DevTools\devtool.bat TestRsmParser Win64\Debug\Debugme.rsm
+DevTools\devtool.bat TestRsmParser samples\Debugme\Win64\Debug\Debugme.rsm
 ```
 
 ### Third-party sources
 
 `TdsProbe` and `JclProbe` compile against the upstream JCL sources. When those
 sources are absent, `build_all.bat` skips those two tools and builds the rest.
-The source roots are resolved by `..\setpaths.bat` and can be overridden from
+The source roots are resolved by `..\scripts\setpaths.bat` and can be overridden from
 the environment:
 
 ```bat
@@ -74,7 +74,7 @@ Analyzes a Delphi `.rsm` file and produces three output files next to the input:
 | `.hex.txt`      | Full hex + ASCII dump |
 
 ```bat
-DevTools\Win64\Debug\RsmAnalyzer.exe Win64\Debug\Debugme.rsm
+DevTools\Win64\Debug\RsmAnalyzer.exe samples\Debugme\Win64\Debug\Debugme.rsm
 ```
 
 Reach for this when the RSM parser fails to find a procedure or variable —
@@ -88,7 +88,7 @@ together with the tag context (bytes before the string hit). The search term
 defaults to `Create`.
 
 ```bat
-DevTools\Win64\Debug\ScanRsmMethods.exe Win64\Debug\Debugme.rsm TWidget.Create
+DevTools\Win64\Debug\ScanRsmMethods.exe samples\Debugme\Win64\Debug\Debugme.rsm TWidget.Create
 ```
 
 Reach for this to locate where a class method name appears in the RSM and
@@ -98,7 +98,7 @@ declared in the `.dpr`).
 #### ScanRsmConsts
 
 ```bat
-DevTools\Win64\Debug\ScanRsmConsts.exe Win64\Debug\Debugme.rsm [name-substring-filter]
+DevTools\Win64\Debug\ScanRsmConsts.exe samples\Debugme\Win64\Debug\Debugme.rsm [name-substring-filter]
 ```
 
 Scans an `.rsm` for named-constant records (tag `0x25`) and dumps their
@@ -108,7 +108,7 @@ encoded after its name.
 #### DumpRsmUses
 
 ```bat
-DevTools\Win64\Debug\DumpRsmUses.exe Win64\Debug\Debugme.rsm [unit-name-filter]
+DevTools\Win64\Debug\DumpRsmUses.exe samples\Debugme\Win64\Debug\Debugme.rsm [unit-name-filter]
 ```
 
 Dumps the unit-dependency ("uses") clusters recorded in an `.rsm`. Reach for
@@ -129,7 +129,7 @@ twice with one small source change and see which bytes moved.
 #### DumpRsmNames
 
 ```bat
-DevTools\Win64\Debug\DumpRsmNames.exe Win64\Debug\Debugme.rsm
+DevTools\Win64\Debug\DumpRsmNames.exe samples\Debugme\Win64\Debug\Debugme.rsm
 ```
 
 Prints the total number of procedure names the RSM reader indexed, then lists
@@ -141,7 +141,7 @@ name browser — use `TestRsmParser` for a full listing.
 #### DumpRsmClass
 
 ```bat
-DevTools\Win64\Debug\DumpRsmClass.exe Win64\Debug\Debugme.rsm TWidget
+DevTools\Win64\Debug\DumpRsmClass.exe samples\Debugme\Win64\Debug\Debugme.rsm TWidget
 ```
 
 Dumps the members (fields, methods, properties) the RSM reader resolves for a
@@ -158,12 +158,12 @@ globals, the user types, and every procedure discovered by the parser with its
 local variables (name, RBP offset, type id, type hint).
 
 ```bat
-DevTools\Win64\Debug\TestRsmParser.exe Win64\Debug\Debugme.rsm
+DevTools\Win64\Debug\TestRsmParser.exe samples\Debugme\Win64\Debug\Debugme.rsm
 ```
 
 Run this after changing `RsmFileReader.pas` to verify the parser still finds
 the expected procedures and locals. With no argument it falls back to
-`..\Win64\Debug\Debugme.rsm` relative to the executable.
+`..\..\..\samples\Debugme\Win64\Debug\Debugme.rsm` relative to the executable.
 
 #### PrebuildIdx
 
@@ -204,7 +204,7 @@ debugger silently rebuilds the index forever.
 #### TestTD32Reader
 
 ```bat
-DevTools\Win64\Debug\TestTD32Reader.exe Win64\Debug\Debugme.exe
+DevTools\Win64\Debug\TestTD32Reader.exe samples\Debugme\Win64\Debug\Debugme.exe
 ```
 
 Smoke test for `DebuggerCore\TD32FileReader.pas`: loads the `.debug` section,
@@ -298,13 +298,13 @@ Answers "why does this variable report `Double` when it is declared
 alias (id `$0041`, no name record anywhere) is distinguishable from a decoding
 gap. The `-rsm*` modes ask the same of `.rsm` / `.dcp` — use `-rsmscan` to FIND a
 subject in a real package instead of guessing a routine name. Findings are
-recorded in `TD32_FORMAT_NOTES.md` → "Named float aliases are FLATTENED at the
+recorded in `docs/TD32_FORMAT_NOTES.md` → "Named float aliases are FLATTENED at the
 variable".
 
 #### Td32LineLookup
 
 ```bat
-DevTools\Win64\Debug\Td32LineLookup.exe Win64\Debug\Debugme.exe Debugme.dpr 120
+DevTools\Win64\Debug\Td32LineLookup.exe samples\Debugme\Win64\Debug\Debugme.exe Debugme.dpr 120
 ```
 
 Resolves source file + line to the RVA(s) a breakpoint would bind at, from the
@@ -313,7 +313,7 @@ TD32 line table. First tool to reach for on "my breakpoint never binds".
 #### DumpTd32Globals
 
 ```bat
-DevTools\Win64\Debug\DumpTd32Globals.exe Win64\Debug\Debugme.exe [name-substring-filter]
+DevTools\Win64\Debug\DumpTd32Globals.exe samples\Debugme\Win64\Debug\Debugme.exe [name-substring-filter]
 ```
 
 Lists the global/unit-level symbols a module's TD32 debug info exposes;
@@ -322,7 +322,7 @@ answers "which module actually owns this global?".
 #### CvProbe
 
 ```bat
-DevTools\Win64\Debug\CvProbe.exe Win64\Debug\Debugme.exe
+DevTools\Win64\Debug\CvProbe.exe samples\Debugme\Win64\Debug\Debugme.exe
 ```
 
 Probes a PE file's embedded CodeView debug section through the Windows
@@ -336,7 +336,7 @@ per-RVA lines as a sample, not a full scan.
 #### DiffTD32RsmNames
 
 ```bat
-DevTools\Win64\Debug\DiffTD32RsmNames.exe Win64\Debug\Debugme.exe
+DevTools\Win64\Debug\DiffTD32RsmNames.exe samples\Debugme\Win64\Debug\Debugme.exe
 ```
 
 Takes the EXE path and reads the sibling `.rsm` implicitly. Diffs the procedure
@@ -348,7 +348,7 @@ TD32 emits that RSM does not recognize fails the locals lookup downstream.
 #### Td32ProcNesting
 
 ```bat
-DevTools\Win64\Debug\Td32ProcNesting.exe Win64\Debug\Debugme.exe [name-substring]
+DevTools\Win64\Debug\Td32ProcNesting.exe samples\Debugme\Win64\Debug\Debugme.exe [name-substring]
 ```
 
 Answers whether the TD32 symbol stream expresses nested (inner) procedures as a
@@ -369,7 +369,7 @@ nothing in the TD32 container is pointer-sized.
 #### CompareMapTD32
 
 ```bat
-DevTools\Win64\Debug\CompareMapTD32.exe Win64\Debug\Debugme.exe
+DevTools\Win64\Debug\CompareMapTD32.exe samples\Debugme\Win64\Debug\Debugme.exe
 ```
 
 Takes the EXE path and reads the sibling `.map` implicitly. Cross-validates
@@ -384,18 +384,18 @@ Tests that the MAP file reader correctly identifies nested (inner) procedures
 and resolves their enclosing parent.
 
 ```bat
-DevTools\Win64\Debug\TestNested.exe Win64\Debug\Debugme.map
+DevTools\Win64\Debug\TestNested.exe samples\Debugme\Win64\Debug\Debugme.map
 ```
 
 Reach for this when debugging step-in / step-out behaviour for nested
-procedures. With no argument it falls back to `..\Win64\Debug\Debugme.map`
+procedures. With no argument it falls back to `..\..\..\samples\Debugme\Win64\Debug\Debugme.map`
 relative to the executable. Note: the inner-procedure names it probes are a
 fixed list (`ThisIsALocalProcedure`, `Increment`, `Inner`, `NotANest`).
 
 #### RvaLookup
 
 ```bat
-DevTools\Win64\Debug\RvaLookup.exe Win64\Debug\Debugme.map Win64\Debug\Debugme.rsm 2CCA0 2CD10
+DevTools\Win64\Debug\RvaLookup.exe samples\Debugme\Win64\Debug\Debugme.map samples\Debugme\Win64\Debug\Debugme.rsm 2CCA0 2CD10
 ```
 
 Resolves a list of RVAs against a MAP + RSM pair, producing
@@ -408,7 +408,7 @@ WinDbg/cdb, which show Delphi binaries as huge offsets from the single
 #### MapSegBaseProbe
 
 ```bat
-DevTools\Win64\Debug\MapSegBaseProbe.exe Win64\Debug\Debugme.exe Win64\Debug\Debugme.map [seg:offset ...]
+DevTools\Win64\Debug\MapSegBaseProbe.exe samples\Debugme\Win64\Debug\Debugme.exe samples\Debugme\Win64\Debug\Debugme.map [seg:offset ...]
 ```
 
 Determines how a MAP's segment table must be converted into image RVAs, and
@@ -432,7 +432,7 @@ section table and the RVA→file-offset translation. Useful for manual
 disassembly of a specific function's prologue/epilogue.
 
 ```bat
-DevTools\Win64\Debug\DumpFunc.exe Win64\Debug\Debugme.exe 2CCA0 64
+DevTools\Win64\Debug\DumpFunc.exe samples\Debugme\Win64\Debug\Debugme.exe 2CCA0 64
 ```
 
 Arguments: `<exe-path> <hex-RVA> <byte-count>`.
@@ -444,7 +444,7 @@ DevTools\Win64\Debug\DisasmProbe.exe DebuggerTests\TestTarget\Win64\Debug\TestTa
 DevTools\Win64\Debug\DisasmProbe.exe DebuggerTests\TestTarget\Win32\Debug\TestTarget.exe F4E78 10
 ```
 
-Proves the Zydis dependency end to end (`DISASSEMBLY_PLAN.md` increment 1):
+Proves the Zydis dependency end to end (`docs/DISASSEMBLY_PLAN.md` increment 1):
 loads `ThirdParty\Zydis\bin\x64\Zydis.dll`, reads real bytes out of a real PE
 image at a given RVA, and decodes a run of instructions through
 `DebuggerCore\ZydisApi.pas`. No feature lives here — `IDisassembler` and
@@ -496,7 +496,7 @@ DevTools\Win64\Debug\Disasm.exe -live ^
   DebuggerTests\TestTarget TestTargetCore.pas EVAL_BODY 12
 ```
 
-Exercises the real feature (`DISASSEMBLY_PLAN.md` increment 2): the
+Exercises the real feature (`docs/DISASSEMBLY_PLAN.md` increment 2): the
 `IDisassembler` seam (`DebuggerCore\Disassembler.pas`), the Zydis backend
 behind it (`DebuggerCore\ZydisDisassembler.pas` — the only unit besides
 `ZydisApi.pas` itself allowed to reference Zydis), and symbolication of the
@@ -547,7 +547,7 @@ DevTools\run_disasm_coverage.bat "C:\Program Files (x86)\Embarcadero\Studio\23.0
 DevTools\run_disasm_coverage.bat C:\Athens\hydra_2\Win32\Debug\Hydra2SingleEXE.exe -sample 3
 ```
 
-Differential coverage sweep (`DISASSEMBLY_PLAN.md` increment 3): feeds the
+Differential coverage sweep (`docs/DISASSEMBLY_PLAN.md` increment 3): feeds the
 SAME bytes to Zydis (via the real `IDisassembler`/`TZydisDisassembler`
 production backend) and to an INDEPENDENT oracle — dumpbin `/DISASM:BYTES`
 from the Visual Studio 2026 MSVC toolset — over real compiled binaries, and
@@ -640,7 +640,7 @@ capped, only the listing). `-dumpbin <path>` / `-zydisdll <path>` override
 the normal search order.
 
 **Measured baseline (2026-08-08), full detail and classification of every
-divergence in `DISASSEMBLY_PLAN.md` "Verified in increment 3 — Half B":**
+divergence in `docs/DISASSEMBLY_PLAN.md` "Verified in increment 3 — Half B":**
 
 | binary | bitness | methodology | spans | positions compared | clean spans | boundary | length | refusal | mnemonic |
 |---|---|---|---|---|---|---|---|---|---|
@@ -664,7 +664,7 @@ table does not know at all. A single UNSAMPLED full sweep of
 divergences that vanish entirely at the 33% sample — traced to dumpbin
 itself silently omitting output beyond an internal capacity threshold on
 the ~100+ MB synthetic image the full sweep produces, not a Zydis defect;
-full write-up in `DISASSEMBLY_PLAN.md`.
+full write-up in `docs/DISASSEMBLY_PLAN.md`.
 
 **To reproduce or extend this baseline**: rebuild `DevTools` (`build_all.bat`
 already includes `DisasmCoverage`), then re-run the invocations above and
@@ -675,7 +675,7 @@ should be justified by a measured example the same way every entry above is.
 #### HexDump
 
 ```bat
-DevTools\Win64\Debug\HexDump.exe Win64\Debug\Debugme.rsm 1A40 128
+DevTools\Win64\Debug\HexDump.exe samples\Debugme\Win64\Debug\Debugme.rsm 1A40 128
 ```
 
 Hex + ASCII dump of any file. Arguments: `<file> <hex-offset> <byte-count>`.
@@ -684,7 +684,7 @@ Reach for this to read the bytes around an offset another tool reported.
 #### FindBytes
 
 ```bat
-DevTools\Win64\Debug\FindBytes.exe Win64\Debug\Debugme.rsm 6328 20
+DevTools\Win64\Debug\FindBytes.exe samples\Debugme\Win64\Debug\Debugme.rsm 6328 20
 ```
 
 Scans any binary for a hex byte pattern and lists every hit offset; the
@@ -748,7 +748,7 @@ the JCL is absent.
 #### JclProbe
 
 ```bat
-DevTools\Win64\Debug\JclProbe.exe Win64\Debug\Debugme.exe
+DevTools\Win64\Debug\JclProbe.exe samples\Debugme\Win64\Debug\Debugme.exe
 ```
 
 Reports whether a PE image carries JCL debug info (linked JCLDEBUG section or
@@ -758,7 +758,7 @@ the `.jdbg` file.
 #### TdsProbe
 
 ```bat
-DevTools\Win64\Debug\TdsProbe.exe Win64\Debug\Debugme.exe
+DevTools\Win64\Debug\TdsProbe.exe samples\Debugme\Win64\Debug\Debugme.exe
 ```
 
 Parses the embedded TD32 (`.debug` section, `FB09` magic) of a Delphi-built EXE
@@ -931,7 +931,7 @@ architecture, image path, command line); no argument lists all.
 #### StackDump
 
 ```bat
-DevTools\Win64\Debug\StackDump.exe 12345 Win64\Debug\Debugme.map Win64\Debug\Debugme.rsm
+DevTools\Win64\Debug\StackDump.exe 12345 samples\Debugme\Win64\Debug\Debugme.map samples\Debugme\Win64\Debug\Debugme.rsm
 ```
 
 Attaches read-only to a running process (no `DebugActiveProcess`, so it does
@@ -946,7 +946,7 @@ when a step appears to hang.
 ```bat
 DevTools\Win64\Debug\StepPerf.exe ^
   VisualStudioCodeDelphiDebugger\Win64\Debug\VisualStudioCodeDelphiDebugger.exe ^
-  Win64\Debug\Debugme.exe Debugme.dpr 120 -n20 MyVar
+  samples\Debugme\Win64\Debug\Debugme.exe Debugme.dpr 120 -n20 MyVar
 ```
 
 Measures per-phase step latency (step, `stackTrace`, `scopes`, `variables`, and
@@ -1008,7 +1008,7 @@ so partial progress is visible while the probe is still running.
 This probe established the WOW64 facts the adapter is built on — the exception
 codes, the unwindability of the first stop, and that dbghelp contributes nothing
 to an i386 walk. They are recorded in "Target architecture" in
-`DAP_DEBUGGER_ARCHITECTURE.md`; re-run the probe to re-measure them rather than
+`docs/DAP_DEBUGGER_ARCHITECTURE.md`; re-run the probe to re-measure them rather than
 trusting either document.
 
 #### Win32SessionProbe
@@ -1064,7 +1064,7 @@ on a native x64 target and on a WOW64 x86 target from the same 64-bit probe.
 | `-allscopes` | make every scope-table entry a candidate, not only the one covering the frame |
 | `-timeout MS` | `WaitForDebugEvent` timeout (default 20000) |
 
-**Everything this probe measured now lives in `EH_FORMAT_NOTES.md`** — the trap-flag
+**Everything this probe measured now lives in `docs/EH_FORMAT_NOTES.md`** — the trap-flag
 result table, the x64 `.pdata` / `UNWIND_INFO` / scope-table / clause-table layout,
 the x86 `fs:[0]` stub classification, and the two traps. That document is the
 reference the shipped planner (`TWinDebugger.PlanExceptionStep` and its x86
@@ -1110,7 +1110,7 @@ redirected to `NUL`: a console debuggee pops a window that steals the keyboard
 focus on every one of the dozens of launches a measurement run makes. Those
 flags are legitimate in a stand-alone probe and are **banned in the adapter** —
 an `SW_HIDE` in the adapter's own `CreateProcess` once hid the VCL main forms of
-the applications being debugged (`TRAPS.md`). Nothing in that block may be
+the applications being debugged (`docs/TRAPS.md`). Nothing in that block may be
 carried across into `DebuggerCore`.
 
 Nothing in the probe is fixture specific: every path, address and count comes
@@ -1130,7 +1130,7 @@ from the command line, and it works against any executable of either bitness.
 | `run_wow64probe.bat` | Runs `Wow64StackProbe` with its output tee'd to a log file |
 | `run_disasm_coverage.bat` | Runs `DisasmCoverage` with the Visual Studio toolset initialised first, so `dumpbin.exe` is on `PATH` |
 | `devtool.bat` | Runs a built tool from `Win64\Debug` |
-| `..\setpaths.bat` | Resolves the JCL / DUnitX source roots |
+| `..\scripts\setpaths.bat` | Resolves the JCL / DUnitX source roots |
 
 The tools that exercise the debugger's parsers reference the shared engine
 units in `..\DebuggerCore\` (`RsmFileReader.pas`, `TD32FileReader.pas`,
@@ -1176,7 +1176,7 @@ trap: which `DR6` bit fired, whether the watched write was already visible in
 target memory, and whether `DR7` survived. Works against both a native x64 and a
 WOW64 x86 target from the same 64-bit probe.
 
-Built for increment 1 of `DATA_BREAKPOINTS_PLAN.md`, and kept because it is the
+Built for increment 1 of `docs/DATA_BREAKPOINTS_PLAN.md`, and kept because it is the
 fastest way to re-check debug-register behaviour after any change to the thread
 context funnel.
 

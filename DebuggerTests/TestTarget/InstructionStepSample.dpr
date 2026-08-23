@@ -1,6 +1,6 @@
 program InstructionStepSample;
 
-// Fixture for INSTRUCTION-GRANULARITY stepping (ASSEMBLY_LEVEL_DEBUGGING.md
+// Fixture for INSTRUCTION-GRANULARITY stepping (docs/ASSEMBLY_LEVEL_DEBUGGING.md
 // increment 1). Every scenario here exists because a source-line step cannot
 // produce it:
 //
@@ -22,7 +22,7 @@ program InstructionStepSample;
 //
 // Separate target on purpose. Adding scenarios to TestTarget shifts RSM
 // per-unit import indices and perturbs first-hit marker ordering, which has
-// broken unrelated tests before (TRAPS.md, "Fixture design").
+// broken unrelated tests before (docs/TRAPS.md, "Fixture design").
 //
 // GUI subsystem and deliberately silent: it is launched by the test runner,
 // which drives TDebugSession directly, and nothing here should reach a console.
@@ -59,7 +59,7 @@ begin
   // Several instructions on ONE source line, so a single-instruction step can
   // be distinguished from a source-line step by the line NOT changing. Not the
   // routine's first statement, deliberately: a breakpoint on the first
-  // statement is subject to entry/body adjustment (TRAPS.md).
+  // statement is subject to entry/body adjustment (docs/TRAPS.md).
   X := (X * 3) + (X shr 2) - 5;            // {BP:INSTR_MULTI}
   GSink := InstrStepCallee(X, 5) + X;      // {BP:INSTR_CALLSITE}
   GSink := GSink + 1;                      // {BP:INSTR_CALLSITE_NEXT}
@@ -183,7 +183,7 @@ begin
   InstrStepRepScenario;
   InstrStepWatchScenario;
   InstrStepMemRefScenario;
-  // Keeps every global live so no store above is elided (TRAPS.md: "a local
+  // Keeps every global live so no store above is elided (docs/TRAPS.md: "a local
   // nothing ever reads gets its store ELIDED even under -$O-").
   if (GSink = MaxInt) and (GDepthSum = MaxInt) and (GInstrWatched = MaxInt) then
     Halt(1);

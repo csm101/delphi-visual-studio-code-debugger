@@ -4,7 +4,7 @@ rem units from DebuggerCore\. DCUs + exe land in MCPDebugger\Win64\Debug\.
 call rsvars.bat
 call "%~dp0setpaths.bat" jcl
 if errorlevel 1 exit /b 1
-pushd "%~dp0MCPDebugger"
+pushd "%~dp0..\MCPDebugger"
 if not exist Win64\Debug md Win64\Debug
 rem -GD emits a detailed .map so a crash/hang dump of this exe can be symbolicated
 rem (needed to name functions in a hang like F14; see MCP_LIVE_FINDINGS_TODO.md).

@@ -20,7 +20,7 @@ type
   TStopReason = (srEntry, srBreakpoint, srStep, srException, srPause,
     srDataBreakpoint);
 
-  // Instruction-granularity stepping (ASSEMBLY_LEVEL_DEBUGGING.md increment 1).
+  // Instruction-granularity stepping (docs/ASSEMBLY_LEVEL_DEBUGGING.md increment 1).
   // Deliberately NOT the same as the source-level TStepMode: "advance until the
   // source line changes" has no terminating condition in code with no line
   // table, which is exactly the code someone steps through one instruction at a
@@ -69,7 +69,7 @@ type
   // actually receives this exception, and stop in the user's own source.
   //
   // The trap flag cannot express that. Measured with DevTools\ExcHandlerProbe
-  // (EH_FORMAT_NOTES.md): armed at the stop and resumed with
+  // (docs/EH_FORMAT_NOTES.md): armed at the stop and resumed with
   // DBG_EXCEPTION_NOT_HANDLED, TF produces NO single-step event at all on
   // native x64, and on WOW64 only for a software raise, landing inside
   // ntdll32!KiUserExceptionDispatcher. A one-shot breakpoint planted at the
@@ -108,7 +108,7 @@ type
   // [StartVA, EndVA) is the block's real extent, not a guess: dcc wraps every
   // handler body in a compiler-generated `try .. finally` (it is what calls
   // System.@DoneExcept), and that finally's scope-table entry is the narrowest
-  // protected range containing the block's second byte. See EH_FORMAT_NOTES.md.
+  // protected range containing the block's second byte. See docs/EH_FORMAT_NOTES.md.
   TExcHandlerBlock = record
     Kind:       TExcHandlerBlockKind;
     StartVA:    UInt64;   // first instruction of the block
@@ -354,7 +354,7 @@ type
   // '', FDllBases otherwise) and plant there. A module not currently loaded
   // means the whole spec is silently dropped: no VA can be computed, so
   // nothing is planted and nothing lingers half-resolved
-  // (DISASSEMBLY_PLAN.md, "Address breakpoints").
+  // (docs/DISASSEMBLY_PLAN.md, "Address breakpoints").
   TAddrBpSpec = record
     ModuleName:    string;   // '' = the main exe; lowercase file name otherwise
     Rvas:          TArray<UInt64>;
@@ -427,7 +427,7 @@ type
     function  WriteMemoryAt(VA: UInt64; Buf: Pointer; Size: NativeUInt): Boolean;
     // Like WriteMemoryAt, but reports how many bytes actually landed instead
     // of collapsing every outcome to a Boolean. DAP `writeMemory`'s
-    // `allowPartial` (ASSEMBLY_LEVEL_DEBUGGING.md increment 3) needs the true
+    // `allowPartial` (docs/ASSEMBLY_LEVEL_DEBUGGING.md increment 3) needs the true
     // count when a write crosses from writable into read-only/unmapped
     // memory; MCP's all-or-nothing `write_memory` keeps using WriteMemoryAt.
     // Returns whatever WriteProcessMemory itself reports (0..Size); never
@@ -435,7 +435,7 @@ type
     function  WriteMemoryPartial(VA: UInt64; Buf: Pointer; Size: NativeUInt): NativeUInt;
     // Like ReadProcessMemoryAt, but for reading CODE a caller intends to
     // disassemble or otherwise inspect as instructions rather than data.
-    // Two differences (DISASSEMBLY_PLAN.md, "Traps"):
+    // Two differences (docs/DISASSEMBLY_PLAN.md, "Traps"):
     //   1. Any byte the debugger itself planted an INT3 over (a user
     //      breakpoint) is returned as the ORIGINAL opcode, not $CC -- reading
     //      raw process memory at a planted breakpoint would otherwise show
@@ -453,7 +453,7 @@ type
     // there). x86/x64 cannot be decoded backwards, so this -- plus decoding
     // FORWARD from it and checking the result lands exactly on VA -- is the
     // only exact way to find instructions preceding an address
-    // (DISASSEMBLY_PLAN.md, "before"). False when no debug-info provider
+    // (docs/DISASSEMBLY_PLAN.md, "before"). False when no debug-info provider
     // owns VA's routine at all; callers needing a boundary for a
     // symbol-less module fall back to NearestExportedEntryBefore, never to
     // a guess here.
@@ -537,7 +537,7 @@ type
 
     // --- Hardware watchpoints (debug registers) ------------------------------
     // The raw per-thread primitive and what the event pump saw. Increment 2 of
-    // DATA_BREAKPOINTS_PLAN.md stops deliberately here: no slot allocator, no
+    // docs/DATA_BREAKPOINTS_PLAN.md stops deliberately here: no slot allocator, no
     // replication onto other threads, no stop reason. What the increment buys
     // is that the stepping engine no longer mistakes a watchpoint hit for its
     // own completed step -- both arrive as the same single-step exception.
@@ -552,7 +552,7 @@ type
     function  HardwareWatchpointHitCount: Integer;
     function  LastHardwareWatchpointHit: TWatchpointHit;
 
-    // Process-wide allocator (increment 3 of DATA_BREAKPOINTS_PLAN.md): picks a
+    // Process-wide allocator (increment 3 of docs/DATA_BREAKPOINTS_PLAN.md): picks a
     // free slot and arms it on EVERY thread the debugger knows about -- live now,
     // created later, or already running at attach -- and keeps it that way until
     // ClearDataWatchpoint or detach. The raw per-thread pair above only ever
@@ -575,7 +575,7 @@ type
     function  ApplyDataBreakpointCommand(const Spec: TDataBpArmSpec;
                 out Slot: Integer; out RefusalReason: string): Boolean;
 
-    // --- Instruction-granularity stepping (ASSEMBLY_LEVEL_DEBUGGING.md inc 1) --
+    // --- Instruction-granularity stepping (docs/ASSEMBLY_LEVEL_DEBUGGING.md inc 1) --
     // Steps ThreadId (0 = the currently-stopped thread) by exactly one machine
     // instruction, per TInstructionStepKind. Returns False WITHOUT resuming the
     // debuggee and fills RefusalReason when the step cannot be taken exactly:
@@ -615,7 +615,7 @@ type
     // seam: production leaves it unset and the engine builds a Zydis-backed one
     // on first use, while a test can supply a double (notably an unavailable
     // backend, which the process-wide one-shot Zydis load latch makes impossible
-    // to produce by pointing the loader at a bad path -- see TRAPS.md).
+    // to produce by pointing the loader at a bad path -- see docs/TRAPS.md).
     procedure SetInstructionDisassembler(const Disasm: IDisassembler);
 
     // Mutators (used by `setVariable` and the synthetic remote-call path).

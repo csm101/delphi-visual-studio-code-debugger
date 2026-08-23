@@ -106,7 +106,7 @@ function baseName(name) {
  * The adapter executable, taken from this extension's own manifest.
  *
  * `contributes.debuggers[0].program` is the single place the adapter's location
- * is declared, and install-dev.ps1 rewrites it to point at the build output, so
+ * is declared, and scripts/install-dev.ps1 rewrites it to point at the build output, so
  * reading it keeps the picker and the debug sessions on the same binary in both
  * a released install and a development one.
  */
@@ -129,7 +129,7 @@ function adapterExecutablePath(extensionDir) {
   const resolved = path.isAbsolute(program) ? program : path.resolve(directory, program);
   if (!fs.existsSync(resolved)) {
     throw new Error('the debug adapter was not found at ' + resolved +
-      ' (build it with build_dap.bat, or reinstall the extension)');
+      ' (build it with scripts/build_dap.bat, or reinstall the extension)');
   }
   return resolved;
 }

@@ -12,7 +12,7 @@ program JclProbe;
 // Doubles as a link check that JclDebug compiles for Win64 in this toolchain.
 //
 // Usage: JclProbe.exe <pe-or-jdbg-file>
-// Example: JclProbe.exe Win64\Debug\Debugme.exe
+// Example: JclProbe.exe samples\Debugme\Win64\Debug\Debugme.exe
 
 {$APPTYPE CONSOLE}
 

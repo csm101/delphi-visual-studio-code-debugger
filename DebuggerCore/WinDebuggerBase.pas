@@ -60,7 +60,7 @@ type
     Description: string;   // who asked for it, e.g. an expression or "GCounter";
                            // '' when armed through the raw per-thread primitive
                            // directly (tests, probes) rather than the allocator.
-    // "old -> new" is the whole point of a data breakpoint (DATA_BREAKPOINTS_PLAN.md
+    // "old -> new" is the whole point of a data breakpoint (docs/DATA_BREAKPOINTS_PLAN.md
     // "Reporting a hit"). A write watchpoint traps AFTER the store completes, so
     // NewValue is readable at the stop; OldValue only exists because it was
     // captured HERE at arm time and refreshed at every hit -- read at Address
@@ -90,7 +90,7 @@ type
     FPreferredBase: UInt64;
     FDebugInfo:    TDebugInfoSet;
     FBreakpoints:  TList<TBreakpointRec>;
-    // smInstr is instruction granularity (ASSEMBLY_LEVEL_DEBUGGING.md increment
+    // smInstr is instruction granularity (docs/ASSEMBLY_LEVEL_DEBUGGING.md increment
     // 1) and is deliberately a MODE of its own rather than a flag on smInto /
     // smOver: those two terminate on a new SOURCE LINE, which is not a condition
     // that exists in the code instruction stepping is for.
@@ -99,7 +99,7 @@ type
     // destination is the `except` / `finally` block that receives the exception.
     // It terminates on a one-shot breakpoint at a PROVEN handler block, never on
     // a line change and never on the trap flag (which does not survive exception
-    // dispatch -- EH_FORMAT_NOTES.md).
+    // dispatch -- docs/EH_FORMAT_NOTES.md).
     FStepMode:     (smNone, smInto, smOver, smOut, smInstr, smToHandler);
     FStepOverVA:   UInt64;  // temp one-shot BP address for step-over/out
     // Range-based step-over: single-step inside the current function's RVA
@@ -406,7 +406,7 @@ type
     // The `except` block PC is standing IN, if any -- the question "am I inside
     // a handler right now", as opposed to PlanExceptionStep's "where will this
     // exception land". Reads the same x64 `.pdata` / `UNWIND_INFO` / Delphi
-    // scope-table chain (EH_FORMAT_NOTES.md) and answers False for everything
+    // scope-table chain (docs/EH_FORMAT_NOTES.md) and answers False for everything
     // it cannot prove, a non-Delphi language handler included.
     //
     // x86 overrides it to a flat False: a 32-bit binary has no `.pdata`, and the
@@ -507,7 +507,7 @@ type
     function  RvaInStepFunc(Rva: UInt64): Boolean;
     function  StepOverAtNewLine(Rva: UInt64): Boolean;
     procedure HandleSmOverStep(Tid: DWORD; PcVA: UInt64);
-    // --- instruction granularity (ASSEMBLY_LEVEL_DEBUGGING.md increment 1) ---
+    // --- instruction granularity (docs/ASSEMBLY_LEVEL_DEBUGGING.md increment 1) ---
     // The decoder, built on first use. Nil only when the process does not exist
     // yet; an UNAVAILABLE backend is still a live instance whose Available is
     // False, so the refusal can quote its StatusText.
@@ -2227,7 +2227,7 @@ begin
   ReportStopped(srStep, PcVA);
 end;
 
-{ ---------------- instruction granularity (ASSEMBLY_LEVEL_DEBUGGING.md #1) --- }
+{ ---------------- instruction granularity (docs/ASSEMBLY_LEVEL_DEBUGGING.md #1) --- }
 
 // The mnemonic Zydis's Intel formatter printed, lowercased. Classifying by the
 // decoder's OWN text is the same discipline ZydisDisassembler already uses for
@@ -2384,7 +2384,7 @@ begin
     Exit;
   end;
 
-  // On x86 a stack walk does not survive a still-planted breakpoint (TRAPS.md),
+  // On x86 a stack walk does not survive a still-planted breakpoint (docs/TRAPS.md),
   // and step-out takes one. At a breakpoint stop the byte is already restored
   // and the PC already rewound by the hit handler; this covers the remaining
   // case -- a step that LANDED on an address carrying a persistent breakpoint --
@@ -2505,7 +2505,7 @@ begin
 end;
 
 // x64. The handler address is derivable EXACTLY here, and the layout is
-// documented in EH_FORMAT_NOTES.md: RUNTIME_FUNCTION (dbghelp's own .pdata
+// documented in docs/EH_FORMAT_NOTES.md: RUNTIME_FUNCTION (dbghelp's own .pdata
 // lookup) -> UNWIND_INFO -> language handler -> Delphi's MSVC-shaped scope
 // table -> per-entry finally funclet / bare except block / `on` clause table.
 //
@@ -3527,7 +3527,7 @@ end;
 // module that cannot be resolved (unloaded, or never loaded under this
 // name) means the whole spec is dropped after the clear: nothing is
 // planted, and no half-resolved placeholder is kept in FBreakpoints
-// (DISASSEMBLY_PLAN.md, "Address breakpoints" -- "do NOT plant").
+// (docs/DISASSEMBLY_PLAN.md, "Address breakpoints" -- "do NOT plant").
 procedure TWinDebugger.DoSetAddressBreakpoints(const Spec: TAddrBpSpec);
 
   function NthOrEmpty(const Arr: TArray<string>; Idx: Integer): string;
@@ -5693,7 +5693,7 @@ begin
 end;
 
 // See DebugTarget.IDebugTarget.ReadCodeMemoryAt: restores the debugger's own
-// planted INT3 bytes within the returned window (DISASSEMBLY_PLAN.md trap 1)
+// planted INT3 bytes within the returned window (docs/DISASSEMBLY_PLAN.md trap 1)
 // and truncates at the end of the committed region instead of failing the
 // whole request (trap 2). Shared, unchanged, by TWin32Debugger: breakpoint
 // planting and FProcess are inherited as-is (only the architecture seam --
@@ -6110,7 +6110,7 @@ begin
 
       // A hardware watchpoint fired while the synthetic call was running. DR6
       // must be sampled before anything else touches this thread's context --
-      // TRAPS.md, the ordering that made increment 2's WOW64 measurement
+      // docs/TRAPS.md, the ordering that made increment 2's WOW64 measurement
       // observable in the first place -- or the bits leak into the FIRST
       // ordinary step after the call returns, and that step is misread as a
       // watchpoint hit. Increment 4 decision: a watchpoint hit during a

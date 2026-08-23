@@ -4499,7 +4499,7 @@ begin
   //   * `Ident(arg, ...)` -- known type -> cast; built-in intrinsic -> eval.
   //     Free-proc / function calls are NOT yet wired (return-type
   //     dispatch is the same heuristic-prone problem the $2E method
-  //     case faces; see KNOWN_UNKNOWNS.md).
+  //     case faces; see docs/KNOWN_UNKNOWNS.md).
   //   * Local / global / register / qualified-name match -> return value.
   //   * Bare enum value (`wmPaused`) -> enum ordinal.
   if CharInSet(FExpr[FPos], ['A'..'Z', 'a'..'z', '_']) then begin

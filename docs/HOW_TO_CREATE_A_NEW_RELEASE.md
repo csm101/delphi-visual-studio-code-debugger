@@ -1,6 +1,6 @@
 # How to create a new release
 
-Everything is driven by `make_release.bat`. It builds the distributable zip,
+Everything is driven by `scripts/make_release.bat`. It builds the distributable zip,
 renders the release notes from a template and creates a **draft** release on
 GitHub with the zip attached. It never publishes: the last step is always a
 human reading the draft.
@@ -102,13 +102,13 @@ Keep the file wherever you like — it is an input, not part of the repository.
 Dry run first. It renders the notes, prints the numbers and sends nothing:
 
 ```powershell
-cmd /c "C:\Athens\GitHub\Win64Debugger\make_release.bat -DryRun -Highlights whatsnew.md"
+cmd /c "C:\Athens\GitHub\Win64Debugger\scripts\make_release.bat -DryRun -Highlights whatsnew.md"
 ```
 
 Read the output. Then, for real:
 
 ```powershell
-cmd /c "C:\Athens\GitHub\Win64Debugger\make_release.bat -Highlights whatsnew.md"
+cmd /c "C:\Athens\GitHub\Win64Debugger\scripts\make_release.bat -Highlights whatsnew.md"
 ```
 
 What happens, in order:
@@ -118,7 +118,7 @@ What happens, in order:
 3. refuses if a release or draft with that tag already exists;
 4. warns about unpushed commits, and REFUSES if HEAD itself is not on the
    upstream branch — the tag is created at that exact commit;
-5. runs `build_setup_zip.bat` — which rebuilds the adapter, the MCP server, the
+5. runs `scripts/build_setup_zip.bat` — which rebuilds the adapter, the MCP server, the
    installer, and stages the extension (including `Zydis.dll`, the optional
    disassembly backend, and its MIT licence text — a missing
    `ThirdParty\Zydis\bin\x64\Zydis.dll` at build time is a printed warning,
@@ -171,7 +171,7 @@ edit it. Do not paste that URL anywhere; after publishing the address is
 times.**
 
 ```powershell
-cmd /c "C:\Athens\GitHub\Win64Debugger\make_release.bat -Verify"
+cmd /c "C:\Athens\GitHub\Win64Debugger\scripts\make_release.bat -Verify"
 ```
 
 The tag does not exist until you publish: GitHub creates it then, from the
@@ -225,5 +225,5 @@ prefer releasing a fixed version over quietly deleting the broken one.
 - Changing the boilerplate for every future release means editing
   `install\RELEASE_NOTES_TEMPLATE.md`. Its placeholders are `{{VERSION}}`,
   `{{SHA256}}`, `{{MCP_TOOL_COUNT}}` and `{{HIGHLIGHTS}}`; adding a new one
-  requires teaching `make_release.ps1` to substitute it, or the guard in step 8
+  requires teaching `scripts/make_release.ps1` to substitute it, or the guard in step 8
   will stop the release.

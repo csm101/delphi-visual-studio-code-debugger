@@ -9,7 +9,7 @@ rem on a fresh clone.)
 
 cd /d %~dp0
 call rsvars.bat
-call ..\setpaths.bat jcl-optional
+call ..\scripts\setpaths.bat jcl-optional
 if not exist Win64\Debug md Win64\Debug
 
 rem Shared engine units live in ..\DebuggerCore (used by the DAP + MCP debuggers

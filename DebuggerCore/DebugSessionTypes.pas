@@ -113,7 +113,7 @@ type
     // (a stack local, a class/record field, an array element). 0 means "no
     // real address" -- a register-resident local, a synthetic group row
     // ('properties'/'fields'), or a value a getter CALL produced rather than
-    // read from a slot. DAP's `memoryReference` (ASSEMBLY_LEVEL_DEBUGGING.md
+    // read from a slot. DAP's `memoryReference` (docs/ASSEMBLY_LEVEL_DEBUGGING.md
     // increment 3) is built from this and only emitted when it is non-zero;
     // every producer of a TSessionVariable follows the same convention
     // established locals already use (LV.Address <> 0 means addressable).
@@ -210,7 +210,7 @@ type
   // Which frame a data breakpoint's address belongs to, and therefore how long
   // that address means anything. dbtLocal is the ONLY kind whose address dies:
   // it is valid exactly while the frame identified by (ThreadId, FrameBase,
-  // FuncEntryVA) is still on the stack (increment 6 of DATA_BREAKPOINTS_PLAN.md).
+  // FuncEntryVA) is still on the stack (increment 6 of docs/DATA_BREAKPOINTS_PLAN.md).
   TDataBpScopeKind = (dbsAddress, dbsGlobal, dbsLocal);
 
   // Identity of the stack frame a dbsLocal watchpoint is scoped to. Compared
@@ -228,7 +228,7 @@ type
     FuncEntryVA: UInt64;
   end;
 
-  // Session-facing data-breakpoint spec (increment 4 of DATA_BREAKPOINTS_PLAN.md;
+  // Session-facing data-breakpoint spec (increment 4 of docs/DATA_BREAKPOINTS_PLAN.md;
   // frame scoping added by increment 6). Expression is a literal address
   // ("$1234" / "0x1234" / a plain decimal) or a global/unit variable name
   // resolved the same way the evaluator resolves one.
@@ -259,7 +259,7 @@ type
     Expression: string;
     // Resolved module+RVA when Address falls inside a known module -- a bare
     // VA does not survive a relaunch or a rebased package (see address
-    // breakpoints in DISASSEMBLY_PLAN.md for the same reasoning). ModuleName
+    // breakpoints in docs/DISASSEMBLY_PLAN.md for the same reasoning). ModuleName
     // is '' when Address falls outside every known module.
     ModuleName: string;
     Rva:        UInt64;

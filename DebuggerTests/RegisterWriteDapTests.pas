@@ -1,6 +1,6 @@
 unit RegisterWriteDapTests;
 
-// DAP-layer proof for ASSEMBLY_LEVEL_DEBUGGING.md increment 6: `setVariable`
+// DAP-layer proof for docs/ASSEMBLY_LEVEL_DEBUGGING.md increment 6: `setVariable`
 // on the `Registers` scope shares the exact engine path MCP's `set_register`
 // does (DapServer.HandleSetVariable -> TDebugSession.SetRegister ->
 // IDebugTarget.SetRegisterByName), so whatever the fix does at the engine

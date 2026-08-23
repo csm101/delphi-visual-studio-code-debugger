@@ -1,12 +1,14 @@
 @echo off
 setlocal
 
-set REPO_ROOT=%~dp0
+rem scripts\ is one level below the repository root; keep the trailing
+rem backslash, every use below concatenates a path straight onto it.
+for %%I in ("%~dp0..") do set "REPO_ROOT=%%~fI\"
 set EXT_DIR=%REPO_ROOT%install\local.delphi-win64-debug
 set BUILT_EXE=%REPO_ROOT%VisualStudioCodeDelphiDebugger\Win64\Debug\VisualStudioCodeDelphiDebugger.exe
 
 echo === Building VisualStudioCodeDelphiDebugger ===
-call "%REPO_ROOT%build_dap.bat"
+call "%~dp0build_dap.bat"
 if errorlevel 1 (
   echo ERROR: build_dap.bat failed.
   exit /b 1
@@ -30,7 +32,7 @@ if errorlevel 1 (
   exit /b 1
 )
 
-rem Optional disassembly backend (DISASSEMBLY_PLAN.md increment 7). Missing is
+rem Optional disassembly backend (docs/DISASSEMBLY_PLAN.md increment 7). Missing is
 rem NOT fatal here: the adapter loads Zydis.dll dynamically and degrades
 rem disassemble/instructionPointerReference to UNAVAILABLE without it, so a
 rem repo without ThirdParty\Zydis\bin\x64\Zydis.dll still stages a working

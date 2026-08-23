@@ -173,7 +173,7 @@ type
     // The global that LIVES at Rva -- the reverse of FindGlobal, which asks by
     // name. Used when an address is the only thing known about a variable, e.g.
     // the compiler-allocated slot an `on E:` clause stores the exception object
-    // into (see EH_FORMAT_NOTES.md). Scoped to the providers that own Rva, so a
+    // into (see docs/EH_FORMAT_NOTES.md). Scoped to the providers that own Rva, so a
     // multi-module target answers from the right binary.
     function  TryGetGlobalAtRva(Rva: UInt64; out Global: TGlobalSymbol): Boolean;
     function  FindGlobalForRva(Rva: UInt64; const Name: string;

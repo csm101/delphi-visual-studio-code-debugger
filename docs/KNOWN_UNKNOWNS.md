@@ -1726,7 +1726,7 @@ question recurring, and the re-check log
 
   What it does not provide, and nobody has asked for: automatic updates (users
   re-run the installer) and hosted distribution of the installer itself
-  (`build_setup_zip.bat` / `make_release.bat` package it).
+  (`scripts/build_setup_zip.bat` / `scripts/make_release.bat` package it).
 
 ## Open items recovered from the task journal (2026-08-08)
 

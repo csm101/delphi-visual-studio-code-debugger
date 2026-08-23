@@ -20,7 +20,7 @@ unit JclDebugReader;
 //     JCL cannot rebuild the nested-proc parent linkage MAP provides for
 //     outer-scope locals. Nested procs DO appear in a readable demangled form
 //     (`Unit.Outer.Inner$ActRec.$0$Body`); deriving parent linkage from that is
-//     a possible future enhancement (see DEBUG_INFO_FORMATS_TODO.md).
+//     a possible future enhancement (see docs/DEBUG_INFO_FORMATS_TODO.md).
 
 interface
 

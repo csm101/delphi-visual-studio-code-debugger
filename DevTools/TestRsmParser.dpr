@@ -70,7 +70,7 @@ begin
       Dump(ParamStr(1))
     else
       Dump(ExpandFileName(ExtractFilePath(ParamStr(0)) +
-        '..\Win64\Debug\Debugme.rsm'));
+        '..\..\..\samples\Debugme\Win64\Debug\Debugme.rsm'));
   except
     on E: Exception do begin
       Writeln('ERROR: ', E.ClassName, ': ', E.Message);

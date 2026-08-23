@@ -1,6 +1,6 @@
 program DisasmProbe;
 
-// Proves the Zydis pipeline end to end (DISASSEMBLY_PLAN.md increment 1):
+// Proves the Zydis pipeline end to end (docs/DISASSEMBLY_PLAN.md increment 1):
 // loads the committed Zydis.dll, reads real bytes out of a real PE image at a
 // caller-given RVA, and decodes a run of instructions through
 // DebuggerCore\ZydisApi.pas. No feature lives here -- IDisassembler and
@@ -15,7 +15,7 @@ program DisasmProbe;
 // -mode     overrides the machine mode Zydis decodes with. Default: read from
 //           the image's own PE header (IMAGE_FILE_HEADER.Machine) -- never
 //           assume the host's bitness, exactly like the real IDisassembler
-//           will (DISASSEMBLY_PLAN.md "The seam").
+//           will (docs/DISASSEMBLY_PLAN.md "The seam").
 // -zydisdll overrides where Zydis.dll is loaded from. Default: the normal
 //           Windows DLL search order (this exe's own directory, then PATH);
 //           if that finds nothing, falls back to the repo-relative

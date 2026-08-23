@@ -30,7 +30,7 @@ If you received the `delphi-win64-debugger-setup-*.zip`:
    > choose *More info → Run anyway*. If you would rather not trust a binary
    > from the internet — a reasonable position for a debugger, which by nature
    > attaches to other processes — build it yourself from the repository
-   > instead: `build_setup_zip.bat` produces this exact zip.
+   > instead: `scripts/build_setup_zip.bat` produces this exact zip.
 2. Run `Setup.exe`. It packages the extension into a `.vsix` and installs it
    through the VS Code CLI (`code --install-extension`), which registers it
    properly and updates any previous version in place. It then offers to install
@@ -62,20 +62,20 @@ already compiled and bundled inside the zip.
 ### MCP debug server (Claude Code + VS Code)
 
 The zip also bundles `DelphiDebuggerMcp.exe` (a Model Context Protocol stdio
-server that lets an AI agent drive the debugger) and `register-mcp.ps1`. When you
+server that lets an AI agent drive the debugger) and `scripts/register-mcp.ps1`. When you
 answer "yes" to the MCP prompt, `Setup.exe` copies the server to
 `%LOCALAPPDATA%\DelphiWin64Debugger\` and registers it with **Claude Code**
 (`claude mcp add … -s user`) and **VS Code / VS Code Insiders** (user `mcp.json`).
 Restart Claude Code / reload VS Code to pick it up. To (un)register later:
 
 ```
-powershell -ExecutionPolicy Bypass -File register-mcp.ps1 "%LOCALAPPDATA%\DelphiWin64Debugger\DelphiDebuggerMcp.exe"
-powershell -ExecutionPolicy Bypass -File register-mcp.ps1 -Unregister
+powershell -ExecutionPolicy Bypass -File scripts/register-mcp.ps1 "%LOCALAPPDATA%\DelphiWin64Debugger\DelphiDebuggerMcp.exe"
+powershell -ExecutionPolicy Bypass -File scripts/register-mcp.ps1 -Unregister
 ```
 
 The tool surface is documented at
-<https://github.com/csm101/delphi-visual-studio-code-debugger/blob/main/MCP_SERVER.md>
-(`MCP_SERVER.md` is not bundled in this zip).
+<https://github.com/csm101/delphi-visual-studio-code-debugger/blob/main/docs/MCP_SERVER.md>
+(`docs/MCP_SERVER.md` is not bundled in this zip).
 
 > **`code` must be on PATH.** Recent VS Code builds (1.96+) no longer load
 > extensions that are merely copied into the extensions directory; a real VSIX
@@ -88,20 +88,20 @@ The tool surface is documented at
 
 The `local.delphi-win64-debug` folder must contain the built
 `VisualStudioCodeDelphiDebugger.exe`. From a clean checkout, build and stage it
-first by running `update-install.bat` at the repository root (or use the
+first by running `scripts/update-install.bat` at the repository root (or use the
 interactive installer below, which builds and stages for you).
 
-To produce the distributable zip described above, run `build_setup_zip.bat` at
+To produce the distributable zip described above, run `scripts/build_setup_zip.bat` at
 the repository root; the result lands in `dist\`.
 
-For interactive day-to-day development, run `install-dev.bat` instead: it builds
+For interactive day-to-day development, run `scripts/install-dev.bat` instead: it builds
 the adapter and points the installed extension's `program` directly at the build
 output, so a rebuild plus a VS Code reload is enough to pick up changes (no copy).
 
 Choose one of:
 
 - **Interactive installer (recommended)** — from the repository root run
-  `build_installer.bat` then `install\Install.exe`. It builds the adapter if
+  `scripts/build_installer.bat` then `install\Install.exe`. It builds the adapter if
   needed, packages the extension into a `.vsix`, and installs it via the VS Code
   CLI (`code --install-extension`). If `code` is not on PATH it falls back to a
   folder copy and prints the manual VSIX command.
@@ -194,7 +194,7 @@ The `.rsm` file is missing or not found. Check the `rsmFile` setting in your lau
 **Disassembly / Disassembly View reports unavailable**
 `Zydis.dll` (the disassembly backend) is missing next to the adapter or MCP
 server executable. It is staged automatically by `Setup.exe`/`Install.exe`
-and `update-install.bat`; if it is absent, re-run the installer, or copy
+and `scripts/update-install.bat`; if it is absent, re-run the installer, or copy
 `Zydis.dll` from `ThirdParty\Zydis\bin\x64\` (in a source checkout) next to
 `VisualStudioCodeDelphiDebugger.exe`. Everything else in the debugger works
 without it — this is an optional feature by design.

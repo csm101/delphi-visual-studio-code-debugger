@@ -37,7 +37,7 @@ function DataBreakpointToJson(const Bp: TSessionDataBreakpoint; const OwnId: str
 function DataBreakpointListToJson(const Bps: TArray<TSessionDataBreakpoint>;
   const OwnIds: TArray<string>): TJSONArray;
 
-// ASSEMBLY_LEVEL_DEBUGGING.md increment 4: the MCP equivalent of the DAP
+// docs/ASSEMBLY_LEVEL_DEBUGGING.md increment 4: the MCP equivalent of the DAP
 // Registers scope. `value` is a variable-width hex string (never a bare JSON
 // number -- a 64-bit register does not fit an IEEE double without loss), same
 // convention DisasmInstructionToJson/DataBreakpointToJson already use for

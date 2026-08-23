@@ -48,7 +48,7 @@ unit ModuleSymbolLoader;
 // here, removing each module's providers from FDebugInfo first.
 //
 // Load-order invariants (a violation reintroduces the 30-70s freeze or mis-types
-// symbols -- see DAP_DEBUGGER_ARCHITECTURE.md):
+// symbols -- see docs/DAP_DEBUGGER_ARCHITECTURE.md):
 //   * Provider registration order per module: RSM before TD32 before MAP before
 //     DCP. The main-module TD32 is the PRIMARY (front-inserted for member/local/
 //     enum lookups); everything else is appended. First-match-wins is load-bearing.

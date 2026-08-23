@@ -12,7 +12,7 @@ if not exist "%SOURCE_DIR%\package.json" (
 )
 if not exist "%SOURCE_DIR%\VisualStudioCodeDelphiDebugger.exe" (
   echo ERROR: VisualStudioCodeDelphiDebugger.exe not present in source folder.
-  echo Run update-install.bat at the repository root first to build and stage it.
+  echo Run scripts\update-install.bat in the repository first to build and stage it.
   exit /b 1
 )
 

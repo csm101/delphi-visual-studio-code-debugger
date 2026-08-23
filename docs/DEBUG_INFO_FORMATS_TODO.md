@@ -70,7 +70,7 @@ is absent. Wired into `build_and_run.bat`.
   `JCL_DEBUG` define defaults ON inside `JclDebugReader.pas`; the JCL include/unit
   search paths are added to the three configs that compile `ModuleSymbolLoader`:
   `VisualStudioCodeDelphiDebugger.cfg`, `DebuggerTests\RunTests.cfg`, and
-  `build_mcp.bat` (inline). Those paths are harmless when the define is off.
+  `scripts/build_mcp.bat` (inline). Those paths are harmless when the define is off.
 - To DISABLE (e.g. an open-source build without JCL installed): compile with
   `-D JCL_DEBUG_OFF` (or define it in the `.cfg`). The `uses JclDebug` then
   vanishes, so JCL need not be installed and the search paths are ignored.

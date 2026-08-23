@@ -139,7 +139,7 @@ type
                   Lines: TArray<Integer>;
                   const Conditions, HitConditions, LogMessages: TArray<string>
                   ): TJSONObject; overload;
-    // Address breakpoints (DISASSEMBLY_PLAN.md increment 5). Addresses are
+    // Address breakpoints (docs/DISASSEMBLY_PLAN.md increment 5). Addresses are
     // '0x...' strings (matching what disassemble/stackTrace echo); the whole
     // set replaces whatever a previous call planted, per the DAP spec.
     function    SetInstructionBreakpoints(
@@ -184,7 +184,7 @@ type
     function    ConfigDone: TJSONObject;
     function    Continue_(ThreadId: Integer = 1): TJSONObject;
     // Granularity, when non-empty, is sent verbatim as the DAP `granularity`
-    // argument (ASSEMBLY_LEVEL_DEBUGGING.md increment 2) -- '' omits the field
+    // argument (docs/ASSEMBLY_LEVEL_DEBUGGING.md increment 2) -- '' omits the field
     // entirely, matching what a client that predates the capability sends.
     function    StepIn(ThreadId: Integer = 1; const Granularity: string = ''): TJSONObject;
     function    StepOut(ThreadId: Integer = 1; const Granularity: string = ''): TJSONObject;
@@ -196,7 +196,7 @@ type
     function    StepOverRaw(ThreadId: Integer; const Granularity: string): TJSONObject;
     function    SourceContent(SourceReference: Integer): TJSONObject;
     function    StackTrace(ThreadId: Integer = 1): TJSONObject;
-    // DAP disassemble (DISASSEMBLY_PLAN.md increment 6). InstructionOffset
+    // DAP disassemble (docs/DISASSEMBLY_PLAN.md increment 6). InstructionOffset
     // can be negative -- VS Code's own convention for "instructions before
     // memoryReference". Raises on a success:false response; use
     // DisassembleRaw to inspect a failure (e.g. "not stopped") without
@@ -207,7 +207,7 @@ type
     // without raising -- for tests that expect the request to fail cleanly.
     function    DisassembleRaw(const MemoryReference: string; InstructionOffset,
                   InstructionCount: Integer; ByteOffset: Integer = 0): TJSONObject;
-    // DAP readMemory/writeMemory (ASSEMBLY_LEVEL_DEBUGGING.md increment 3).
+    // DAP readMemory/writeMemory (docs/ASSEMBLY_LEVEL_DEBUGGING.md increment 3).
     // Raises on success:false; use the Raw variants to inspect a refusal
     // (e.g. "not stopped", a rejected partial write) without raising.
     function    ReadMemory(const MemoryReference: string; Count: Integer;
@@ -638,7 +638,7 @@ begin
   // would leave that path unexercised.
   Args.AddPair('supportsInvalidatedEvent', TJSONBool.Create(True));
   // Real VS Code declares this so the adapter knows the client understands
-  // `memoryReference` fields (ASSEMBLY_LEVEL_DEBUGGING.md increment 3). The
+  // `memoryReference` fields (docs/ASSEMBLY_LEVEL_DEBUGGING.md increment 3). The
   // adapter does not currently gate memoryReference emission on it (neither
   // does the pre-existing `instructionPointerReference`), but a test client
   // that stayed silent here would not mirror what a real client sends.

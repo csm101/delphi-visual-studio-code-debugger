@@ -66,8 +66,8 @@ over CMake's default `MultiThreadedDLL` (`/MD`) — see "Runtime library: /MD vs
 This is exactly what `build_zydis.bat` in this folder runs (`cd /d %~dp0`,
 resolve `VsDevCmd.bat` and `cmake.exe` by their absolute install paths, clean
 `build\`, configure, build, copy `build\Zydis.dll` to `bin\x64\Zydis.dll`,
-hash it). It is **not** called by `build_all.bat`, `build_dap.bat` or
-`build_debug.bat` — those stay Delphi-only. Run it by hand, from the repo, any
+hash it). It is **not** called by `build_all.bat`, `scripts/build_dap.bat` or
+`scripts/build_debug.bat` — those stay Delphi-only. Run it by hand, from the repo, any
 time the pinned submodule commit changes:
 
 ```bat
@@ -128,7 +128,7 @@ every DevTools consumer (`DevTools\build_all.bat`) and re-ran
 effectively no external runtime dependency — a machine with nothing but a
 stock Windows install can load it.
 
-## Verification questions answered (DISASSEMBLY_PLAN.md, increment 1)
+## Verification questions answered (docs/DISASSEMBLY_PLAN.md, increment 1)
 
 1. **Version and API shape** — `ZydisDisassembleIntel` exists exactly as the
    plan assumed (`include/Zydis/Disassembler.h`), confirmed by both source

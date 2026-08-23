@@ -1,7 +1,7 @@
 unit InstructionStepTests;
 
 // Instruction-granularity stepping, at the ENGINE level
-// (ASSEMBLY_LEVEL_DEBUGGING.md increment 1). No DAP and no MCP: these drive
+// (docs/ASSEMBLY_LEVEL_DEBUGGING.md increment 1). No DAP and no MCP: these drive
 // TDebugSession.StepInstruction directly, against a fixture built for exactly
 // this (DebuggerTests\TestTarget\InstructionStepSample.dpr).
 //
@@ -40,7 +40,7 @@ type
   [TestFixture]
   TInstructionStepTests = class
   public
-    // TRAPS.md: ZydisTryLoad is a process-wide ONE-SHOT latch, so a test that
+    // docs/TRAPS.md: ZydisTryLoad is a process-wide ONE-SHOT latch, so a test that
     // deliberately drove it at a missing DLL poisons every later test in the
     // same process. Reset before every test that wants a real decode.
     [Setup] procedure ResetDisassemblerLoadLatch;
@@ -257,7 +257,7 @@ end;
 
 // A real IDisassembler that is simply not available. Injected rather than
 // produced by pointing the Zydis loader at a missing DLL: that loader is a
-// process-wide one-shot latch (TRAPS.md), so a bad path is either ignored
+// process-wide one-shot latch (docs/TRAPS.md), so a bad path is either ignored
 // (already loaded) or poisons every later test.
 type
   TUnavailableDisassembler = class(TInterfacedObject, IDisassembler)
@@ -614,7 +614,7 @@ end;
 
 initialization
   // EXPLICIT registration: this project does not use RTTI auto-scan, and an
-  // unregistered fixture silently never runs (TRAPS.md).
+  // unregistered fixture silently never runs (docs/TRAPS.md).
   TDUnitX.RegisterTestFixture(TInstructionStepTests);
 
 end.

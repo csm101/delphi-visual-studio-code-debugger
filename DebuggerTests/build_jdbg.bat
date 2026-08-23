@@ -4,7 +4,7 @@ rem JclDebugReaderTests can exercise the JCL provider. Gated on JCL presence:
 rem when JCL is not installed this is skipped and the JCL tests self-skip.
 cd /d %~dp0
 call rsvars.bat
-call ..\setpaths.bat jcl-optional
+call ..\scripts\setpaths.bat jcl-optional
 if "%HAVE_JCL%"=="0" (
   echo   [build_jdbg] JCL not present at %JCL_ROOT% -- skipping .jdbg generation
   exit /b 0

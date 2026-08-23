@@ -4,15 +4,15 @@ call rsvars.bat
 
 echo.
 echo === Build Adapter ===
-call ..\build_dap.bat
+call ..\scripts\build_dap.bat
 if errorlevel 1 ( echo FAILED: Adapter & exit /b 1 )
-rem build_dap.bat -> rsvars.bat -> dcc64 chain can leave cwd outside
+rem scripts/build_dap.bat -> rsvars.bat -> dcc64 chain can leave cwd outside
 rem this script's folder; use absolute paths for subsequent calls so
 rem relative lookups don't fail when cwd has drifted.
 
 echo.
 echo === Build MCP Server ===
-call "%~dp0..\build_mcp.bat"
+call "%~dp0..\scripts\build_mcp.bat"
 if errorlevel 1 ( echo FAILED: MCP Server & exit /b 1 )
 
 echo.
@@ -29,7 +29,7 @@ rem skipped MapOnlyGlobals, NestedEnumSample, NoSourceStop and
 rem InstructionStepSample. A fixture that is never rebuilt fails as "Timeout
 rem waiting for stopped event" -- the breakpoint line no longer matches the
 rem compiled binary -- which reads as a defect in the debugger rather than a
-rem stale exe (TRAPS.md, the stale-fixture trap).
+rem stale exe (docs/TRAPS.md, the stale-fixture trap).
 rem build_target.bat also builds the ExcNestFixture debuggee (DevTools\Fixtures),
 rem so it is not invoked separately here.
 call "%~dp0build_target.bat"
@@ -49,7 +49,7 @@ echo.
 echo === Build RunTests ===
 rem Delegate to build_runner.bat rather than repeating the dcc64 line here:
 rem the duplicate silently went stale once already (it missed the JCL/DUnitX
-rem search paths after they moved out of RunTests.cfg into setpaths.bat).
+rem search paths after they moved out of RunTests.cfg into scripts/setpaths.bat).
 call "%~dp0build_runner.bat"
 if errorlevel 1 ( echo FAILED: RunTests & exit /b 1 )
 

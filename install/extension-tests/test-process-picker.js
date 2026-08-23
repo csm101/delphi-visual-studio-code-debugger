@@ -149,7 +149,7 @@ async function main() {
   });
 
   await test('a dev-mode absolute program path is used as it stands', () => {
-    // install-dev.ps1 rewrites `program` to the build output, with forward
+    // scripts/install-dev.ps1 rewrites `program` to the build output, with forward
     // slashes; the picker must follow the manifest rather than assume a layout.
     writeFakeManifest(fakeAdapterPath.replace(/\\/g, '/'));
     assert.strictEqual(path.resolve(picker.adapterExecutablePath(fakeExtensionDir)), fakeAdapterPath);

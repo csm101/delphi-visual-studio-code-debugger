@@ -64,16 +64,16 @@ Not allowed:
 If a temporary shortcut is unavoidable:
 - mark it clearly with TODO PROTOTYPE
 - document what must change for real projects
-- update TASK_RESUME.md with the limitation
+- update docs/TASK_RESUME.md with the limitation
 
 # Session continuity rules
 
 The record of what happened is `git log`. The record of where the project stands
-is `PROJECT_STATE.md`. Neither needs maintaining by hand as a side activity:
-commit messages are written when committing, and `PROJECT_STATE.md` is updated in
+is `docs/PROJECT_STATE.md`. Neither needs maintaining by hand as a side activity:
+commit messages are written when committing, and `docs/PROJECT_STATE.md` is updated in
 the same change set as the work it describes.
 
-`TASK_RESUME.md` covers the one case those two cannot: work that is **started and
+`docs/TASK_RESUME.md` covers the one case those two cannot: work that is **started and
 not yet committed**, interrupted mid-step. Write into it what a new session cannot
 get from the diff — the hypothesis being tested, what was already tried and
 refuted, the exact next action — and only while that state is uncommitted.
@@ -92,21 +92,21 @@ Enable the hook once per clone:
 git config core.hooksPath githooks
 ```
 
-**Never stage `TASK_RESUME.md` with the work.** `git add -A` will, so stage
+**Never stage `docs/TASK_RESUME.md` with the work.** `git add -A` will, so stage
 explicitly. With the stub in `HEAD` the hook's rewrite matches what is committed
 and the worktree stays clean; commit the cursor text once and `HEAD` holds a
 cursor describing finished work, which `git checkout --` will happily restore.
 
 Everything durable goes elsewhere, in the same change set as the code:
 
-- a measured fact about a format -> `RSM_*.md`, `TD32_FORMAT_NOTES.md`
-- an architectural decision or mechanism -> `DAP_DEBUGGER_ARCHITECTURE.md`
-- an open question or a refuted hypothesis -> `KNOWN_UNKNOWNS.md`
-- a rule that prevents wasted work -> `TRAPS.md`
-- what is done / what is next at project scale -> `PROJECT_STATE.md`
+- a measured fact about a format -> `RSM_*.md`, `docs/TD32_FORMAT_NOTES.md`
+- an architectural decision or mechanism -> `docs/DAP_DEBUGGER_ARCHITECTURE.md`
+- an open question or a refuted hypothesis -> `docs/KNOWN_UNKNOWNS.md`
+- a rule that prevents wasted work -> `docs/TRAPS.md`
+- what is done / what is next at project scale -> `docs/PROJECT_STATE.md`
 - the narrative of a change that landed -> the commit message, not a file
 
-PROJECT_STATE.md must contain:
+docs/PROJECT_STATE.md must contain:
 
 - architecture status
 - implemented features
@@ -120,18 +120,18 @@ The following documents at the repository root are living specifications.
 They describe state of knowledge about the project's formats and
 architecture and are maintained continuously alongside the code:
 
-- `RSM_FORMAT_NOTES.md` — overall structure of the Delphi `.rsm` file.
-- `RSM_RECORD_TYPES.md` — catalog of tags / record kinds with confirmed /
+- `docs/RSM_FORMAT_NOTES.md` — overall structure of the Delphi `.rsm` file.
+- `docs/RSM_RECORD_TYPES.md` — catalog of tags / record kinds with confirmed /
   inferred / conjectured status.
-- `RSM_FIELD_OFFSETS.md` — byte-level layout of each record.
-- `DAP_DEBUGGER_ARCHITECTURE.md` — modules, threading model, breakpoint /
+- `docs/RSM_FIELD_OFFSETS.md` — byte-level layout of each record.
+- `docs/DAP_DEBUGGER_ARCHITECTURE.md` — modules, threading model, breakpoint /
   evaluate / setVariable flows, capability list.
-- `EH_FORMAT_NOTES.md` — where a Delphi binary records its exception-handling
+- `docs/EH_FORMAT_NOTES.md` — where a Delphi binary records its exception-handling
   scopes on each bitness (`.pdata` / `UNWIND_INFO` / scope + clause tables on
   x64, the `fs:[0]` registration chain on x86), and which parts of it a debugger
   can actually derive a handler address from.
-- `KNOWN_UNKNOWNS.md` — open questions that block or condition the work.
-- `TRAPS.md` — operational rules that prevent wasted work. Every entry is there
+- `docs/KNOWN_UNKNOWNS.md` — open questions that block or condition the work.
+- `docs/TRAPS.md` — operational rules that prevent wasted work. Every entry is there
   because it already cost time once. Read it before an unfamiliar kind of change,
   and grep it when something behaves absurdly.
 
@@ -142,9 +142,9 @@ Rules:
   not re-derive what is already written.
 - When you discover or confirm a fact: update the relevant document in
   the same change set as the code or experiment that produced the fact.
-- When an entry in `KNOWN_UNKNOWNS.md` is resolved: move the answer into
+- When an entry in `docs/KNOWN_UNKNOWNS.md` is resolved: move the answer into
   whichever document now owns it (`RSM_*`, `DAP_DEBUGGER_*`,
-  `PROJECT_STATE.md`) and remove the entry from `KNOWN_UNKNOWNS.md`. Do
+  `docs/PROJECT_STATE.md`) and remove the entry from `docs/KNOWN_UNKNOWNS.md`. Do
   not leave resolved questions there for historical reference.
 - If a document disagrees with the code: the code wins. Correct the
   document, do not bend the code to match the document.
@@ -155,12 +155,12 @@ When starting a new session:
 
 1. `git log --oneline -15` and `git status` — what landed recently, and whether
    anything is uncommitted
-2. Read PROJECT_STATE.md
-3. Read TASK_RESUME.md. If it holds the stub, there is no interrupted work and
+2. Read docs/PROJECT_STATE.md
+3. Read docs/TASK_RESUME.md. If it holds the stub, there is no interrupted work and
    the previous two steps are the whole picture.
 4. Read the living specifications relevant to the next step — pick them from the
    list under "Living specifications" above, which is the ONLY list of those
-   documents. `KNOWN_UNKNOWNS.md` and `TRAPS.md` are read in every session
+   documents. `docs/KNOWN_UNKNOWNS.md` and `docs/TRAPS.md` are read in every session
    regardless of focus.
 5. Inspect only referenced files first
 6. Resume exactly from next step
@@ -227,19 +227,19 @@ Run tools (after building):
 
 ```powershell
 # Inspect RSM binary structure
-DevTools\Win64\Debug\RsmAnalyzer.exe     Win64\Debug\Debugme.rsm
+DevTools\Win64\Debug\RsmAnalyzer.exe     samples\Debugme\Win64\Debug\Debugme.rsm
 
 # Find a method/class name in RSM and show surrounding bytes
-DevTools\Win64\Debug\ScanRsmMethods.exe  Win64\Debug\Debugme.rsm TWidget.Create
+DevTools\Win64\Debug\ScanRsmMethods.exe  samples\Debugme\Win64\Debug\Debugme.rsm TWidget.Create
 
 # Dump function bytes from PE at hex RVA
-DevTools\Win64\Debug\DumpFunc.exe        Win64\Debug\Debugme.exe 2CCA0 64
+DevTools\Win64\Debug\DumpFunc.exe        samples\Debugme\Win64\Debug\Debugme.exe 2CCA0 64
 
 # Smoke-test adapter RSM parser against any .rsm file
-DevTools\Win64\Debug\TestRsmParser.exe   Win64\Debug\Debugme.rsm
+DevTools\Win64\Debug\TestRsmParser.exe   samples\Debugme\Win64\Debug\Debugme.rsm
 
 # Test nested-proc detection in MAP reader
-DevTools\Win64\Debug\TestNested.exe      Win64\Debug\Debugme.map
+DevTools\Win64\Debug\TestNested.exe      samples\Debugme\Win64\Debug\Debugme.map
 
 # Prebuild .idx symbol-index sidecars for a directory (offline warm-up),
 # or -verify that a parser change kept the sidecar format byte-identical
@@ -360,7 +360,7 @@ Use the existing build scripts when possible.
 Build everything:
 
 ```bat
-call build_debug.bat
+call scripts\build_debug.bat
 ```
 
 This initializes the Delphi compiler environment, compiles `Debugme.exe` (emitting its `.map` and `.rsm`), and compiles `VisualStudioCodeDelphiDebugger.exe`.
@@ -368,10 +368,10 @@ This initializes the Delphi compiler environment, compiles `Debugme.exe` (emitti
 Build adapter only:
 
 ```powershell
-cmd /c "C:\Athens\GitHub\Win64Debugger\build_dap.bat" 2>&1
+cmd /c "C:\Athens\GitHub\Win64Debugger\scripts\build_dap.bat" 2>&1
 ```
 
-**Critical:** `build_dap.bat` does `pushd VisualStudioCodeDelphiDebugger` before compiling, so DCUs and EXE land in
+**Critical:** `scripts\build_dap.bat` compiles from inside `VisualStudioCodeDelphiDebugger\`, so DCUs and EXE land in
 `VisualStudioCodeDelphiDebugger\Win64\Debug\`. Running `dcc64` directly from the repo root puts output in `Win64\Debug\`
 (wrong location — VS Code extension expects `VisualStudioCodeDelphiDebugger\Win64\Debug\VisualStudioCodeDelphiDebugger.exe`).
 Never invoke `dcc64 VisualStudioCodeDelphiDebugger\VisualStudioCodeDelphiDebugger.dpr` from the repo root without explicit `-E` and `-NU` overrides.
@@ -380,15 +380,17 @@ Manual debug target build:
 
 ```bat
 call rsvars.bat
+pushd samples\Debugme
 dcc64 Debugme.dpr
+popd
 ```
 
 Debug target outputs:
 
 ```text
-Win64\Debug\Debugme.exe
-Win64\Debug\Debugme.rsm
-Win64\Debug\Debugme.map
+samples\Debugme\Win64\Debug\Debugme.exe
+samples\Debugme\Win64\Debug\Debugme.rsm
+samples\Debugme\Win64\Debug\Debugme.map
 ```
 
 Compiler flags for debug targets:
@@ -447,7 +449,7 @@ Install (build first, then one of):
   is present but its CLI is not on PATH. When no editor is detected it prints
   download links and the manual install command instead of blocking on a prompt
   (the `FamilyEditors` table in `Install.dpr` is the editor list).
-- `install-dev.bat` — development: builds, then points the extension `program`
+- `scripts/install-dev.bat` — development: builds, then points the extension `program`
   directly at the build output (no copy; fastest iteration).
 
 `install\local.delphi-win64-debug\package.json` is the single source of truth

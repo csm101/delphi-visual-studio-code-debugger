@@ -24,7 +24,7 @@ uses
 
 // Full definition lives in the disassemble section further down (it is the
 // same helper HandleDisassemble uses to locate Zydis.dll); needed earlier by
-// TDapServer.BuildPlaceholderDisassembly (ASSEMBLY_LEVEL_DEBUGGING.md
+// TDapServer.BuildPlaceholderDisassembly (docs/ASSEMBLY_LEVEL_DEBUGGING.md
 // increment 5). Forward-declared so call order is irrelevant.
 function ResolveZydisDllPath: string; forward;
 
@@ -501,7 +501,7 @@ type
     procedure HandleAttach(Seq: Integer; Args: TJSONObject);
     procedure HandleConfigurationDone(Seq: Integer);
     procedure HandleSetBreakpoints(Seq: Integer; Args: TJSONObject);
-    // Address breakpoints (DISASSEMBLY_PLAN.md increment 5) -- VS Code's own
+    // Address breakpoints (docs/DISASSEMBLY_PLAN.md increment 5) -- VS Code's own
     // address-breakpoint channel, and the one the Disassembly View gutter
     // uses. Replaces the WHOLE set on every call, per the DAP spec, using
     // FInstrBpIds to remove exactly what the previous call planted.
@@ -528,10 +528,10 @@ type
                 const Reason: string);
     procedure HandleContinue(Seq: Integer; Args: TJSONObject);
     function  StepThreadFromArgs(Args: TJSONObject): DWORD;
-    // ASSEMBLY_LEVEL_DEBUGGING.md increment 2: true only for the exact string
+    // docs/ASSEMBLY_LEVEL_DEBUGGING.md increment 2: true only for the exact string
     // "instruction". Absent, or any other value (VS Code also sends "line" and
     // "statement"), takes the unchanged source-level path -- see
-    // DAP_DEBUGGER_ARCHITECTURE.md "Instruction granularity (DAP)".
+    // docs/DAP_DEBUGGER_ARCHITECTURE.md "Instruction granularity (DAP)".
     function  WantsInstructionGranularity(Args: TJSONObject): Boolean;
     // Shared by next/stepIn/stepOut when granularity="instruction". The
     // engine's decision phase (TDebugSession.StepInstruction) is synchronous
@@ -552,16 +552,16 @@ type
     procedure HandleStepOut(Seq: Integer; Args: TJSONObject);
     procedure HandlePause(Seq: Integer; Args: TJSONObject);
     procedure HandleStackTrace(Seq: Integer; Args: TJSONObject);
-    // DISASSEMBLY_PLAN.md increment 6: DAP `disassemble`, what makes the
+    // docs/DISASSEMBLY_PLAN.md increment 6: DAP `disassemble`, what makes the
     // Disassembly View work. Reuses the exact same IDisassembler/Zydis
     // pipeline the MCP `disassemble` tool already uses, and the SAME
     // proven-boundary-only backward-decode mechanism (Disassembler
     // .DisassembleBackward / IDebugTarget.NearestInstructionBoundaryBefore /
     // NearestExportedEntryBefore) established in increment 4 -- see
     // "Decision: backward disassembly is proven-boundary-only" in
-    // DISASSEMBLY_PLAN.md.
+    // docs/DISASSEMBLY_PLAN.md.
     procedure HandleDisassemble(Seq: Integer; Args: TJSONObject);
-    // ASSEMBLY_LEVEL_DEBUGGING.md increment 3: `readMemory`/`writeMemory`.
+    // docs/ASSEMBLY_LEVEL_DEBUGGING.md increment 3: `readMemory`/`writeMemory`.
     // Thin surface over the engine primitives MCP's read_memory/write_memory
     // already use -- see the implementation comments for the base64/
     // unreadableBytes/allowPartial contract.
@@ -614,7 +614,7 @@ type
     // Placeholder document for a frame the providers could not give source for.
     procedure HandleSource(Seq: Integer; Args: TJSONObject);
     function  SyntheticSourceText(const F: TSessionFrame): string;
-    // ASSEMBLY_LEVEL_DEBUGGING.md increment 5: the disassembly section of that
+    // docs/ASSEMBLY_LEVEL_DEBUGGING.md increment 5: the disassembly section of that
     // document -- real decode around the frame's PC, not prose, using the same
     // mechanism HandleDisassemble uses. Falls back to naming the real reason
     // when the Zydis backend is unavailable; never blank.
@@ -1648,7 +1648,7 @@ end;
 
 // HISTORICAL — the routine this described NO LONGER EXISTS. Kept only because
 // the behaviour it describes is still observed and is currently UNEXPLAINED (see
-// KNOWN_UNKNOWNS.md, "an exception stop does not report the faulting frame"):
+// docs/KNOWN_UNKNOWNS.md, "an exception stop does not report the faulting frame"):
 // on an exception stop the reported frame 0 is the calling Delphi frame with
 // real source, not the true fault address, and that also reproduces against the
 // engine directly rather than only through this adapter. So whatever produces
@@ -2133,18 +2133,18 @@ begin
     // to watch the byte just past the end of a buffer, which is most of what
     // watchpoints are wanted for.
     Caps.AddPair('supportsDataBreakpointBytes',      TJSONBool.Create(True));
-    // Address breakpoints (DISASSEMBLY_PLAN.md increment 5): VS Code's own
+    // Address breakpoints (docs/DISASSEMBLY_PLAN.md increment 5): VS Code's own
     // address-breakpoint channel, and what the Disassembly View gutter uses to
     // let a click plant one. `setInstructionBreakpoints` behind it replaces the
     // whole address-breakpoint set on every call, matching the DAP spec.
     Caps.AddPair('supportsInstructionBreakpoints',   TJSONBool.Create(True));
-    // Disassembly View (DISASSEMBLY_PLAN.md increment 6): the `disassemble`
+    // Disassembly View (docs/DISASSEMBLY_PLAN.md increment 6): the `disassemble`
     // request behind it decodes real target memory through the same
     // IDisassembler/Zydis backend the MCP `disassemble` tool already uses.
     // `instructionPointerReference` on every StackFrame (HandleStackTrace) is
     // what enables "Open Disassembly View" from the Call Stack.
     Caps.AddPair('supportsDisassembleRequest',       TJSONBool.Create(True));
-    // ASSEMBLY_LEVEL_DEBUGGING.md increment 3: `readMemory`/`writeMemory`,
+    // docs/ASSEMBLY_LEVEL_DEBUGGING.md increment 3: `readMemory`/`writeMemory`,
     // what backs VS Code's "View Binary Data" memory inspector. Same engine
     // primitives (IDebugTarget.ReadCodeMemoryAt / WriteMemoryPartial) the MCP
     // `read_memory`/`write_memory` tools already use -- not a second path.
@@ -2162,7 +2162,7 @@ begin
       Caps.AddPair('supportsReadMemoryRequest',      TJSONBool.Create(True));
       Caps.AddPair('supportsWriteMemoryRequest',     TJSONBool.Create(True));
     end;
-    // ASSEMBLY_LEVEL_DEBUGGING.md increment 2: `granularity: "instruction"` on
+    // docs/ASSEMBLY_LEVEL_DEBUGGING.md increment 2: `granularity: "instruction"` on
     // next/stepIn/stepOut, routed to TDebugSession.StepInstruction (increment
     // 1's engine primitive). VS Code sends the field only when the
     // Disassembly View has focus, and only once this capability says the
@@ -2733,7 +2733,7 @@ begin
   end;
 end;
 
-// DISASSEMBLY_PLAN.md increment 5: address breakpoints over DAP. Unlike
+// docs/DISASSEMBLY_PLAN.md increment 5: address breakpoints over DAP. Unlike
 // `setBreakpoints` (scoped to one source file, other files untouched),
 // `setInstructionBreakpoints` replaces the WHOLE address-breakpoint set on
 // every call -- there is no file to scope by, an instruction reference is
@@ -3330,7 +3330,7 @@ end;
 // gap), the decoded mnemonic, and -- when the line table has one -- the source
 // file and line for THIS instruction's own address, independently of whether
 // the frame's own PC has one. When the file is named but cannot be resolved on
-// disk, naming it plainly IS the actionable answer (ASSEMBLY_LEVEL_DEBUGGING.md
+// disk, naming it plainly IS the actionable answer (docs/ASSEMBLY_LEVEL_DEBUGGING.md
 // increment 5's "line known, file missing" case); when it resolves, the full
 // path is shown so the reader knows disassembly was not the only option.
 function TDapServer.FormatPlaceholderInstruction(const Ins: TDisasmInstruction;
@@ -3356,7 +3356,7 @@ begin
 end;
 
 // The disassembly section of a sourceless frame's placeholder document
-// (ASSEMBLY_LEVEL_DEBUGGING.md increment 5). Deliberately the SAME mechanism
+// (docs/ASSEMBLY_LEVEL_DEBUGGING.md increment 5). Deliberately the SAME mechanism
 // HandleDisassemble (increment 6) uses -- the same byte reader
 // (FDebugger.ReadCodeMemoryAt, which restores this debugger's own planted
 // breakpoint bytes before decoding, never a raw read), the same backend, the
@@ -3431,7 +3431,7 @@ end;
 // forward, so stopping in sourceless code is indistinguishable from not stopping
 // at all. Says which of the three reasons applies and what can be done about it,
 // then shows the disassembly around the frame's PC -- real code, not just an
-// explanation of its absence (ASSEMBLY_LEVEL_DEBUGGING.md increment 5).
+// explanation of its absence (docs/ASSEMBLY_LEVEL_DEBUGGING.md increment 5).
 function TDapServer.SyntheticSourceText(const F: TSessionFrame): string;
 const
   // This document opens in a plain text editor with no word wrap, so a long
@@ -3642,7 +3642,7 @@ begin
       var F  := Frames[I];
       var FO := TJSONObject.Create;
       FO.AddPair('id', TJSONNumber.Create(I));
-      // DISASSEMBLY_PLAN.md increment 6: what enables "Open Disassembly View"
+      // docs/DISASSEMBLY_PLAN.md increment 6: what enables "Open Disassembly View"
       // from the Call Stack. Emitted for every frame, including raw-scan hits
       // and nameless ones -- IP is always populated (TSessionFrame.IP), same
       // field McpJson.FrameListToJson already echoes as "address".
@@ -3704,14 +3704,14 @@ begin
 end;
 
 { ----------------------------- disassemble ---------------------------------
-  DISASSEMBLY_PLAN.md increment 6. Mirrors MCPDebugger\McpServer.pas'
+  docs/DISASSEMBLY_PLAN.md increment 6. Mirrors MCPDebugger\McpServer.pas'
   ResolveZydisDllPath/DefaultZydisDllPath exactly -- VisualStudioCodeDelphiDebugger.exe
   sits at the same three-levels-below-repo-root depth
   (VisualStudioCodeDelphiDebugger\Win64\<Config>\*.exe) as DelphiDebuggerMcp.exe
   (MCPDebugger\Win64\<Config>\*.exe), so the same relative fallback path finds
   the committed dev-build DLL. Kept as a local copy rather than shared: the two
   frontends are separate executables (see "Two frontends over one core" in
-  DAP_DEBUGGER_ARCHITECTURE.md), and increments 4/5 already duplicate small
+  docs/DAP_DEBUGGER_ARCHITECTURE.md), and increments 4/5 already duplicate small
   helpers like this one across them rather than introduce a shared unit for a
   few lines. }
 
@@ -3776,7 +3776,7 @@ end;
 // (debugAdapterProtocol.json, DisassembleArguments.instructionCount) --
 // BuildInvalidDapInstruction/presentationHint:'invalid' is this adapter's
 // answer, and it is also how the proven-boundary-only backward-decode
-// refusal from DISASSEMBLY_PLAN.md's increment-4 decision reaches the
+// refusal from docs/DISASSEMBLY_PLAN.md's increment-4 decision reaches the
 // client: never a partial or guessed decode presented as real, only fewer
 // PROVEN entries with the rest clearly marked. A forward read that runs off
 // mapped memory is padded the same way, for the same reason.
@@ -3929,7 +3929,7 @@ begin
   end;
 end;
 
-// DAP `readMemory` (ASSEMBLY_LEVEL_DEBUGGING.md increment 3). Reuses the SAME
+// DAP `readMemory` (docs/ASSEMBLY_LEVEL_DEBUGGING.md increment 3). Reuses the SAME
 // engine primitive the MCP `read_memory` tool and `disassemble` already use
 // (IDebugTarget.ReadCodeMemoryAt) -- not a second read path. That primitive
 // restores the debugger's OWN planted INT3 bytes within the returned window
@@ -4245,7 +4245,7 @@ begin
   end;
 end;
 
-// DAP `writeMemory` (ASSEMBLY_LEVEL_DEBUGGING.md increment 3). Writing into a
+// DAP `writeMemory` (docs/ASSEMBLY_LEVEL_DEBUGGING.md increment 3). Writing into a
 // live debuggee is destructive and the caller is doing it deliberately, but a
 // write that only PARTLY lands (the tail of the requested range crosses from
 // writable into read-only/unmapped memory) must never be reported the same
@@ -4412,7 +4412,7 @@ begin
     Item.AddPair('type',  V.TypeName);
   end;
   Item.AddPair('variablesReference', TJSONNumber.Create(RefForHandle(V.Handle)));
-  // `memoryReference` (ASSEMBLY_LEVEL_DEBUGGING.md increment 3): only when the
+  // `memoryReference` (docs/ASSEMBLY_LEVEL_DEBUGGING.md increment 3): only when the
   // value genuinely lives at a known target address -- a stack local, a
   // class/record field, an array element. A register-resident local, a
   // synthetic group row ('properties'/'fields'), or a getter-produced value
@@ -4533,7 +4533,7 @@ begin
   Item.AddPair('type',               ClsName);
   Item.AddPair('variablesReference', TJSONNumber.Create(VarRef));
   // The live exception object's own address -- always genuine when
-  // BuildCurrentExceptionRef succeeded (ASSEMBLY_LEVEL_DEBUGGING.md increment 3).
+  // BuildCurrentExceptionRef succeeded (docs/ASSEMBLY_LEVEL_DEBUGGING.md increment 3).
   if ObjAddr <> 0 then
     Item.AddPair('memoryReference', '0x' + IntToHex(ObjAddr, 1));
   Arr.AddElement(Item);

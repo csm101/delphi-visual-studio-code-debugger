@@ -21,7 +21,10 @@ uses
   System.Math,
   System.Generics.Collections,
   Winapi.Windows,
-  DapClient in '..\DebuggerTests\DapClient.pas';
+  DapClient in '..\DebuggerTests\DapClient.pas',
+  // DapClient stages its exception rules into a scratch directory, and that
+  // directory's lifetime rules live here rather than in five copies.
+  TestTempDirs in '..\DebuggerTests\TestTempDirs.pas';
 
 type
   TPhase = (phAdapterSpawn, phInitialize, phSetBreakpoints, phSetExcBreakpoints,

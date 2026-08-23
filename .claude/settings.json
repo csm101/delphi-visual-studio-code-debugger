@@ -1,11 +1,11 @@
 {
   "permissions": {
     "allow": [
-      "PowerShell(cmd /c \"C:\\Athens\\GitHub\\Win64Debugger\\build_dap.bat\" *)",
-      "PowerShell(cmd /c \"C:\\Athens\\GitHub\\Win64Debugger\\update-install.bat\" *)",
-      "PowerShell(cmd /c \"C:\\Athens\\GitHub\\Win64Debugger\\build_installer.bat\" *)",
-      "PowerShell(cmd /c \"C:\\Athens\\GitHub\\Win64Debugger\\build_setup_zip.bat\" *)",
-      "PowerShell(cmd /c \"C:\\Athens\\GitHub\\Win64Debugger\\build_mcp.bat\" *)",
+      "PowerShell(cmd /c \"C:\\Athens\\GitHub\\Win64Debugger\\scripts\\build_dap.bat\" *)",
+      "PowerShell(cmd /c \"C:\\Athens\\GitHub\\Win64Debugger\\scripts\\update-install.bat\" *)",
+      "PowerShell(cmd /c \"C:\\Athens\\GitHub\\Win64Debugger\\scripts\\build_installer.bat\" *)",
+      "PowerShell(cmd /c \"C:\\Athens\\GitHub\\Win64Debugger\\scripts\\build_setup_zip.bat\" *)",
+      "PowerShell(cmd /c \"C:\\Athens\\GitHub\\Win64Debugger\\scripts\\build_mcp.bat\" *)",
       "PowerShell(cmd /c \"C:\\Athens\\GitHub\\Win64Debugger\\DevTools\\*.bat\" *)",
       "PowerShell(cmd /c \"C:\\Athens\\GitHub\\Win64Debugger\\DevTools\\build_all.bat\" *)",
       "PowerShell(cmd /c \"C:\\Athens\\GitHub\\Win64Debugger\\DevTools\\devtool.bat\" *)",
@@ -30,7 +30,7 @@
               "-File",
               "C:\\Athens\\GitHub\\Win64Debugger\\.claude\\check_task_resume.ps1"
             ],
-            "statusMessage": "Checking TASK_RESUME.md size"
+            "statusMessage": "Checking docs/TASK_RESUME.md size"
           }
         ]
       }

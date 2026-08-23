@@ -1,6 +1,6 @@
 unit PlaceholderDisassemblyTests;
 
-// ASSEMBLY_LEVEL_DEBUGGING.md increment 5: the placeholder document a
+// docs/ASSEMBLY_LEVEL_DEBUGGING.md increment 5: the placeholder document a
 // sourceless frame gets now carries real disassembly around the frame's PC,
 // not just a paragraph explaining why there is no source. Measured 2026-08-09
 // in VS Code: selecting a sourceless frame opens the ADAPTER'S placeholder

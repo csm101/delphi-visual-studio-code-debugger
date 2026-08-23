@@ -8,7 +8,10 @@ REM
 REM On a target PC: extract the zip anywhere and run Setup.exe. If the extension is
 REM already installed it is updated in place; otherwise it is installed fresh.
 setlocal
-cd /d %~dp0
+rem scripts\ is one level below the repository root, so %~dp0 is NOT the root.
+rem Sibling scripts stay on %~dp0; anything repository-relative uses %REPO%.
+for %%I in ("%~dp0..") do set "REPO=%%~fI"
+cd /d "%REPO%"
 
 echo === [1/3] Build adapter and stage it into install\local.delphi-win64-debug ===
 call "%~dp0update-install.bat"
@@ -32,40 +35,40 @@ if errorlevel 1 (
   exit /b 1
 )
 
-set DIST=%~dp0dist
+set DIST=%REPO%\dist
 set STAGE=%DIST%\delphi-win64-debugger-setup
 if exist "%STAGE%" rmdir /s /q "%STAGE%"
 mkdir "%STAGE%"
 
-copy /Y "%~dp0install\Install.exe" "%STAGE%\Setup.exe" >nul
+copy /Y "%REPO%\install\Install.exe" "%STAGE%\Setup.exe" >nul
 if errorlevel 1 (
   echo ERROR: could not copy Setup.exe.
   exit /b 1
 )
-xcopy /E /I /Y "%~dp0install\local.delphi-win64-debug" "%STAGE%\local.delphi-win64-debug" >nul
+xcopy /E /I /Y "%REPO%\install\local.delphi-win64-debug" "%STAGE%\local.delphi-win64-debug" >nul
 if errorlevel 1 (
   echo ERROR: could not copy extension folder.
   exit /b 1
 )
-copy /Y "%~dp0install\INSTALL_INSTRUCTIONS.md" "%STAGE%\INSTALL_INSTRUCTIONS.md" >nul
+copy /Y "%REPO%\install\INSTALL_INSTRUCTIONS.md" "%STAGE%\INSTALL_INSTRUCTIONS.md" >nul
 
 rem MCP server exe + its registration script (Setup.exe installs + registers them).
-copy /Y "%~dp0MCPDebugger\Win64\Debug\DelphiDebuggerMcp.exe" "%STAGE%\DelphiDebuggerMcp.exe" >nul
+copy /Y "%REPO%\MCPDebugger\Win64\Debug\DelphiDebuggerMcp.exe" "%STAGE%\DelphiDebuggerMcp.exe" >nul
 if errorlevel 1 (
   echo ERROR: could not copy MCP server exe.
   exit /b 1
 )
 copy /Y "%~dp0register-mcp.ps1" "%STAGE%\register-mcp.ps1" >nul
 
-rem Disassembly backend (DISASSEMBLY_PLAN.md increment 7), staged next to
+rem Disassembly backend (docs/DISASSEMBLY_PLAN.md increment 7), staged next to
 rem Setup.exe: Install.exe (renamed Setup.exe) copies it from here alongside
 rem the MCP server exe into its per-user install location. Missing is a
 rem warning, not a build failure -- the adapter/MCP server still start and
 rem work for everything except disassemble/instructionPointerReference, which
 rem degrade to UNAVAILABLE without it.
-if exist "%~dp0ThirdParty\Zydis\bin\x64\Zydis.dll" (
-  copy /Y "%~dp0ThirdParty\Zydis\bin\x64\Zydis.dll" "%STAGE%\Zydis.dll" >nul
-  copy /Y "%~dp0ThirdParty\Zydis\LICENSE" "%STAGE%\Zydis-LICENSE.txt" >nul
+if exist "%REPO%\ThirdParty\Zydis\bin\x64\Zydis.dll" (
+  copy /Y "%REPO%\ThirdParty\Zydis\bin\x64\Zydis.dll" "%STAGE%\Zydis.dll" >nul
+  copy /Y "%REPO%\ThirdParty\Zydis\LICENSE" "%STAGE%\Zydis-LICENSE.txt" >nul
 ) else (
   echo WARNING: ThirdParty\Zydis\bin\x64\Zydis.dll not found -- this zip's MCP server will report disassembly UNAVAILABLE.
 )
@@ -73,7 +76,7 @@ if exist "%~dp0ThirdParty\Zydis\bin\x64\Zydis.dll" (
 echo.
 echo === [3/3] Compress to zip ===
 set VER=
-for /f "usebackq delims=" %%V in (`powershell -NoProfile -Command "(Get-Content -Raw '%~dp0install\local.delphi-win64-debug\package.json' | ConvertFrom-Json).version"`) do set VER=%%V
+for /f "usebackq delims=" %%V in (`powershell -NoProfile -Command "(Get-Content -Raw '%REPO%\install\local.delphi-win64-debug\package.json' | ConvertFrom-Json).version"`) do set VER=%%V
 if "%VER%"=="" set VER=0.0.0
 set ZIP=%DIST%\delphi-win64-debugger-setup-v%VER%.zip
 if exist "%ZIP%" del /q "%ZIP%"

@@ -392,7 +392,7 @@ type
     // deferred here -- the package is not loaded when it is set -- so this also
     // covers binding a breakpoint to a module that arrives later.
     [Test] procedure Win32_Bpl_BreakpointInPackage_FiresWithLocals;
-    // ASSEMBLY_LEVEL_DEBUGGING.md increment 6: SetRegisterByName had no WOW64
+    // docs/ASSEMBLY_LEVEL_DEBUGGING.md increment 6: SetRegisterByName had no WOW64
     // override (unlike ReadThreadRegisters, which does) -- unverified, not
     // provenly wrong. Measured (DevTools\Wow64RegWriteProbe.dpr): at a REAL
     // breakpoint the native GetThreadContext/SetThreadContext pair the base
@@ -466,14 +466,14 @@ type
     [Test] procedure DataBp_StepCompletesWithWatchpointArmed;
     [Test] procedure DataBp_HitDuringStep_IsNotReportedAsStepCompletion;
     [Test] procedure DataBp_HitOnTheSteppedInstruction_StillCompletesTheStep;
-    // Increment 3 (DATA_BREAKPOINTS_PLAN.md): the per-thread allocator. A
+    // Increment 3 (docs/DATA_BREAKPOINTS_PLAN.md): the per-thread allocator. A
     // single-threaded fixture would pass every one of these while the feature
     // stayed process-wide-on-one-thread by accident.
     [Test] procedure DataBp_WorkerThreadWrite_NamesTheWorkerThread;
     [Test] procedure DataBp_ThreadCreatedAfterArm_StillTrips;
     [Test] procedure DataBp_SlotExhaustion_RefusesTheFifth;
     [Test] procedure DataBp_CleanDetach_LeavesTargetUnarmed;
-    // Increment 4 (DATA_BREAKPOINTS_PLAN.md): the session API itself --
+    // Increment 4 (docs/DATA_BREAKPOINTS_PLAN.md): the session API itself --
     // resolving an expression, arming through ApplyDataBreakpointCommand, the
     // NEW srDataBreakpoint stop reason, and old->new capture.
     [Test] procedure DataBp_SessionApi_StopsWithOldNewAndThread;
@@ -481,7 +481,7 @@ type
     [Test] procedure DataBp_SessionApi_SlotExhaustion_PerSpecResults;
     [Test] procedure DataBp_SessionApi_RemoveAll_StopsWatching;
     [Test] procedure DataBp_DuringSyntheticCall_AbortsEvaluation;
-    // Increment 6 (DATA_BREAKPOINTS_PLAN.md): watchpoints on LOCALS, which
+    // Increment 6 (docs/DATA_BREAKPOINTS_PLAN.md): watchpoints on LOCALS, which
     // increment 4 refused. GetDataBreakpointInfo derives the address and the
     // frame identity; the session retires the watchpoint at the first stop
     // where that frame is gone rather than watching reused stack.
@@ -505,7 +505,7 @@ type
     [Test] procedure Registers_HaveRipAndRsp;
     [Test] procedure ResolveSourcePath_ResolvesCoreUnit;
     [Test] procedure RemoveAllBreakpoints_ClearsPlantedInt3;
-    // Address breakpoints (DISASSEMBLY_PLAN.md increment 5): module+RVA
+    // Address breakpoints (docs/DISASSEMBLY_PLAN.md increment 5): module+RVA
     // identity, deferred/rebound binding, refusal for an unattributable
     // address, and the unified ListBreakpoints surface.
     [Test] procedure AddrBp_MainExe_SetAtKnownAddress_StopsThere;
@@ -616,7 +616,7 @@ type
     // Delphi. This one cannot: the compiler is the authority.
     [Test] procedure ExprOracle_DebuggerAgreesWithTheCompiler;
 
-    // TEST_CATALOG.md section A ticked a row per primitive type -- Integer,
+    // docs/TEST_CATALOG.md section A ticked a row per primitive type -- Integer,
     // Cardinal, Byte/ShortInt, Word/SmallInt, Int64/UInt64, the floats,
     // Boolean, the chars, the strings -- and no fixture so much as DECLARED a
     // Cardinal, ShortInt, AnsiChar or Currency local for a test to read. Each
@@ -624,7 +624,7 @@ type
     // name.
     [Test] procedure PrimitiveLocals_DisplayTheirValueAndDeclaredType;
 
-    // TEST_CATALOG.md section C ticked "Destructor side-effect verified (BP in
+    // docs/TEST_CATALOG.md section C ticked "Destructor side-effect verified (BP in
     // Destroy body)" and nothing planted a breakpoint in a destructor at all --
     // the only destructor test in the suite was a name-demangling unit test.
     // A destructor frame is its own kind: it is reached through Free, not a
@@ -787,7 +787,7 @@ end;
 // to be bitness-independent: the register file is reached differently, the
 // meaning of the bits is not.
 //
-// Increment 2 of DATA_BREAKPOINTS_PLAN.md has no stop reason for a watchpoint
+// Increment 2 of docs/DATA_BREAKPOINTS_PLAN.md has no stop reason for a watchpoint
 // yet, so a hit that completes no step of ours is recorded and resumed. What is
 // under test is that the stepping engine never sees it.
 
@@ -1262,7 +1262,7 @@ end;
 // A watchpoint firing INSIDE a synthetic call must abort the call, exactly
 // like a raise -- silently swallowing it would make the invoked code behave
 // differently from the same code running normally, and DR6 would leak into
-// the first ordinary step after the call returns (TRAPS.md).
+// the first ordinary step after the call returns (docs/TRAPS.md).
 procedure RunDataBpDuringSyntheticCallAbortsEvaluation(const ExePath, MapPath,
   RsmPath, SourceDir: string);
 begin
@@ -2632,7 +2632,7 @@ end;
 // here rather than in a Win32 mirror, and failures are COLLECTED rather than
 // asserted per case: both executables are called NoSourceStop.exe, so a message
 // built from the file name cannot say which one failed, and a first-failure
-// abort would hide the second (TRAPS.md, "Fixture design").
+// abort would hide the second (docs/TRAPS.md, "Fixture design").
 procedure TDebugSessionTests.ExceptionInOsCode_TopFrameIsTheFaultingFrame;
 
   function FaultFrameProblem(const ExePath: string): string;
@@ -2715,7 +2715,7 @@ end;
 //
 // Both bitnesses, failures COLLECTED: both executables are called TestTarget.exe
 // so a message built from the path cannot say which one failed, and a
-// first-failure abort would hide the second (TRAPS.md, "Fixture design").
+// first-failure abort would hide the second (docs/TRAPS.md, "Fixture design").
 procedure TDebugSessionTests.ExceptionStop_DefaultFrameServesLocals_ExplicitSelectionWins;
 
   function HasLocal(const Locals: TArray<TSessionVariable>;
@@ -3546,7 +3546,7 @@ end;
 
 // An address in a module that is not currently loaded cannot be attributed
 // to anything -- refused outright rather than planted at a VA that may
-// belong to something else once a module maps there (DISASSEMBLY_PLAN.md).
+// belong to something else once a module maps there (docs/DISASSEMBLY_PLAN.md).
 procedure TDebugSessionTests.AddrBp_RefusedWhenAddressNotInAnyLoadedModule;
 begin
   var Session := LaunchStoppedAtEntry(TargetExe, TargetMap, TargetRsm, TargetDir);
@@ -7811,7 +7811,7 @@ const
       // Enum and set.
       OracleCase('Ora33', 'Mode = wmRunning'),
       OracleCase('Ora34', 'wmRunning in Modes'),
-      // Forms TEST_CATALOG.md ticked without a test behind them. String concat
+      // Forms docs/TEST_CATALOG.md ticked without a test behind them. String concat
       // and nil comparison had NEVER been evaluated by anything; `as` likewise;
       // "arithmetic int and float mix" was covered only by int-with-int.
       OracleCase('Ora35', 'Greeting + ''!'' = ''Hello!'''),
@@ -7938,7 +7938,7 @@ const
       // only because TD32 tag $0036 carries no public type name and the reader
       // currently answers RawByteString for the whole AnsiString family, which
       // also costs this local the hex/ascii rendering meant for RawByteString.
-      // Open question in KNOWN_UNKNOWNS.md; tighten this row when it is settled.
+      // Open question in docs/KNOWN_UNKNOWNS.md; tighten this row when it is settled.
       PrimitiveCase('VAnsiStr',  'ansi-content',         'AnsiString|RawByteString'),
       // `string` IS `UnicodeString`.
       PrimitiveCase('VUniStr',   'unicode-content',      'UnicodeString|string')];

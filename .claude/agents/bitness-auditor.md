@@ -13,7 +13,7 @@ targets. So the question is no longer "would this compile at 32 bits": the adapt
 is always 64-bit. The question is **"does this confuse the host's pointer width
 with the target's"**, which is a live class of defect, not a porting exercise.
 
-Why this sweep still exists, from `DAP_DEBUGGER_ARCHITECTURE.md`: on x64 the host
+Why this sweep still exists, from `docs/DAP_DEBUGGER_ARCHITECTURE.md`: on x64 the host
 and target pointer sizes coincide, so **every site that conflates them is correct
 by accident**. Five were found, each in a different layer — `LocalReadSize`,
 `SyntheticLocal`, `PrimTypeSize`, `SizeForKind`, and `GetClassProperties`' walk of

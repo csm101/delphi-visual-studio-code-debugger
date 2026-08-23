@@ -180,7 +180,7 @@ end;
 // Overrides the base's native GetThreadContext/SetThreadContext pair with the
 // documented-correct Wow64Get/SetThreadContext one, replacing an UNVERIFIED
 // path with a verified one rather than a provenly-wrong one -- see
-// ASSEMBLY_LEVEL_DEBUGGING.md increment 6 for the full measurement writeup
+// docs/ASSEMBLY_LEVEL_DEBUGGING.md increment 6 for the full measurement writeup
 // (DevTools\Wow64RegWriteProbe.dpr). Measured, not assumed: at the WOW64
 // loader breakpoint (before the 32-bit environment finishes initialising) a
 // native write is genuinely invisible to Wow64GetThreadContext, but at a REAL
@@ -841,7 +841,7 @@ end;
 // There is no `.pdata` on a 32-bit target, so nothing the base class decodes
 // exists. The dispatch data is the fs:[0] registration chain, walked innermost
 // first, and each record's Handler points at an `E9 rel32` stub INSIDE the
-// protected routine. The stub's target names the case (EH_FORMAT_NOTES.md):
+// protected routine. The stub's target names the case (docs/EH_FORMAT_NOTES.md):
 //
 //   @HandleOnException  -- an `except` with `on` clauses. A clause table follows
 //                          the stub at stub+5, holding ABSOLUTE VAs (not RVAs):
@@ -875,7 +875,7 @@ begin
   // block's extent; the fs:[0] registration chain says where an exception
   // WOULD be dispatched, which is a different question, and the block address
   // is not even derivable from it for a bare `except` or a `finally`
-  // (EH_FORMAT_NOTES.md, "x86 -- partial, and the negative half is
+  // (docs/EH_FORMAT_NOTES.md, "x86 -- partial, and the negative half is
   // load-bearing").
   //
   // So a 32-bit target gets no synthesised handler alias and no handler-scoped

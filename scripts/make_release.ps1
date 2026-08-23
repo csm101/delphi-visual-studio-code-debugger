@@ -21,7 +21,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$repo = $PSScriptRoot
+$repo = Split-Path -Parent $PSScriptRoot
 
 function Fail([string]$message) {
     Write-Host "ERROR: $message" -ForegroundColor Red
@@ -135,7 +135,7 @@ if ($SkipBuild) {
 }
 else {
     Write-Host "=== Building $tag ==="
-    cmd /c "`"$repo\build_setup_zip.bat`""
+    cmd /c "`"$PSScriptRoot\build_setup_zip.bat`""
     if ($LASTEXITCODE -ne 0) { Fail "build_setup_zip.bat failed." }
     if (-not (Test-Path $zip)) { Fail "the build did not produce $zip" }
 }

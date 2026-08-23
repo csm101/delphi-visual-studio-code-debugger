@@ -6,11 +6,10 @@ if errorlevel 1 (
   exit /b 1
 )
 
-REM Strip the trailing backslash from %~dp0 before passing it to PowerShell:
-REM "%~dp0" expands to "...\" and the closing \" escapes the quote, so the
-REM argument arrives with a stray double-quote embedded in the path.
-set "REPO_ROOT=%~dp0"
-set "REPO_ROOT=%REPO_ROOT:~0,-1%"
+REM The repository root is one level above scripts\, with NO trailing
+REM backslash: "%~dp0" ends in one, and the closing \" would then escape the
+REM quote and hand PowerShell a path with a stray double-quote inside it.
+for %%I in ("%~dp0..") do set "REPO_ROOT=%%~fI"
 
 echo === Pointing installed extension(s) at the build output ===
 powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0install-dev.ps1" "%REPO_ROOT%"
@@ -25,5 +24,5 @@ if errorlevel 1 (
 )
 
 echo === Registering MCP server with Claude Code + VS Code (build output) ===
-powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0register-mcp.ps1" "%~dp0MCPDebugger\Win64\Debug\DelphiDebuggerMcp.exe"
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0register-mcp.ps1" "%REPO_ROOT%\MCPDebugger\Win64\Debug\DelphiDebuggerMcp.exe"
 exit /b %ERRORLEVEL%

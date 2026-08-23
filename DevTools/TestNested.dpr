@@ -38,7 +38,7 @@ begin
       Run(ParamStr(1))
     else
       Run(ExpandFileName(ExtractFilePath(ParamStr(0)) +
-        '..\Win64\Debug\Debugme.map'));
+        '..\..\..\samples\Debugme\Win64\Debug\Debugme.map'));
   except
     on E: Exception do begin
       Writeln('ERROR: ', E.ClassName, ': ', E.Message);

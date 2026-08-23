@@ -13,7 +13,7 @@ REM Nothing is ever published automatically: the release is left as a draft.
 REM PowerShell 7 when present, Windows PowerShell otherwise. The script itself
 REM avoids cmdlets that are missing on older hosts, so either works.
 setlocal
-cd /d %~dp0
+cd /d "%~dp0.."
 where pwsh >nul 2>&1
 if %ERRORLEVEL%==0 (
   pwsh -NoProfile -ExecutionPolicy Bypass -File "%~dp0make_release.ps1" %*

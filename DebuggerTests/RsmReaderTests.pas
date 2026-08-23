@@ -420,10 +420,10 @@ var
   Members: TArray<TClassMember>;
   RsmPath: string;
 begin
-  RsmPath := ExtractFilePath(ParamStr(0)) + '..\..\..\Win64\Debug\Debugme.rsm';
+  RsmPath := ExtractFilePath(ParamStr(0)) + '..\..\..\samples\Debugme\Win64\Debug\Debugme.rsm';
   if not FileExists(RsmPath) then
     Assert.Fail('Debugme.rsm not found at ' + RsmPath +
-                ' -- run build_debug.bat first');
+                ' -- run scripts/build_debug.bat first');
   Rsm := TRsmFile.Create;
   try
     Rsm.LoadFromFile(RsmPath);
@@ -448,9 +448,9 @@ begin
   // symbols (large compile output for Win64 unwind tables) are what
   // trip the scanner -- TestTarget.rsm doesn't have a record at the
   // same relative position so its TPoint3D parses even with the bug.
-  RsmPath := ExtractFilePath(ParamStr(0)) + '..\..\..\Win64\Debug\Debugme.rsm';
+  RsmPath := ExtractFilePath(ParamStr(0)) + '..\..\..\samples\Debugme\Win64\Debug\Debugme.rsm';
   if not FileExists(RsmPath) then
-    Assert.Fail('Debugme.rsm missing -- run build_debug.bat first');
+    Assert.Fail('Debugme.rsm missing -- run scripts/build_debug.bat first');
   Rsm := TRsmFile.Create;
   try
     Rsm.LoadFromFile(RsmPath);

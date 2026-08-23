@@ -1,7 +1,7 @@
 unit InstructionStepDapTests;
 
 // DAP-layer plumbing for instruction-granularity stepping
-// (ASSEMBLY_LEVEL_DEBUGGING.md increment 2). InstructionStepTests.pas already
+// (docs/ASSEMBLY_LEVEL_DEBUGGING.md increment 2). InstructionStepTests.pas already
 // proves the ENGINE primitive exhaustively, on both bitnesses, including every
 // refusal path (unavailable disassembler, unprovable return address) and the
 // call/rep/recursion rules. This file proves the THIN layer on top: does
@@ -31,7 +31,7 @@ unit InstructionStepDapTests;
 // (`WantsInstructionGranularity`) and the refusal-routing test are plain JSON
 // glue with no bitness-sensitive content, so they run once, on Win64 -- the
 // same scoping call already recorded for `setInstructionBreakpoints`' DAP
-// layer (TEST_CATALOG.md, "DAP-layer Win32 coverage ... not written this
+// layer (docs/TEST_CATALOG.md, "DAP-layer Win32 coverage ... not written this
 // increment ... DAP is JSON glue over the same already-bitness-proven session
 // code").
 
@@ -402,7 +402,7 @@ end;
 
 initialization
   // EXPLICIT registration: this project does not use RTTI auto-scan, and an
-  // unregistered fixture silently never runs (TRAPS.md).
+  // unregistered fixture silently never runs (docs/TRAPS.md).
   TDUnitX.RegisterTestFixture(TInstructionStepDapTests);
 
 end.

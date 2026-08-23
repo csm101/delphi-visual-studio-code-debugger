@@ -476,7 +476,7 @@ var
   GUsesGraph: Integer;
   GCounter: Integer;
   // Bumped by TDtorProbe.Destroy. A breakpoint in a DESTRUCTOR body is the one
-  // frame kind TEST_CATALOG.md section C claimed and nothing tested; this
+  // frame kind docs/TEST_CATALOG.md section C claimed and nothing tested; this
   // counter is what makes "the destructor body actually ran" observable from
   // outside, rather than only "we stopped somewhere called Destroy".
   GDtorRan: Integer;
@@ -1132,7 +1132,7 @@ begin
 end;
 
 // One local of every PRIMITIVE type, for the "local variable type display"
-// claims in TEST_CATALOG.md section A. Those rows were ticked for years with no
+// claims in docs/TEST_CATALOG.md section A. Those rows were ticked for years with no
 // test behind them, and no fixture even declared a Cardinal, ShortInt, AnsiChar
 // or Currency local for one to read.
 //

@@ -43,7 +43,7 @@ declare a hang based on CPU time.
 
 ## Reporting
 
-Read the last known pass/fail counts from `PROJECT_STATE.md` or `TASK_RESUME.md`
+Read the last known pass/fail counts from `docs/PROJECT_STATE.md` or `docs/TASK_RESUME.md`
 so you can report a delta rather than a bare number.
 
 Your final message must contain, and nothing more:

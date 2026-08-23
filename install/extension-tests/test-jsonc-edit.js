@@ -47,7 +47,7 @@ const LAUNCH_JSON = [
   '      "name": "Debug SampleApp",',
   '      "type": "delphi-win64",',
   '      "request": "launch",',
-  '      // The exe is produced by build_debug.bat',
+  '      // The exe is produced by scripts/build_debug.bat',
   '      "program": "${workspaceFolder}/Win64/Debug/SampleApp.exe",',
   '      "exceptionRules": [',
   '        // EAbort is control-flow noise.',
@@ -72,7 +72,7 @@ const ALL_COMMENTS = [
   '// See https://go.microsoft.com/fwlink/?linkid=830387',
   '/* Two configurations: the GUI host and the console tool.',
   'Keep the console one last, F5 picks the first. */',
-  '// The exe is produced by build_debug.bat',
+  '// The exe is produced by scripts/build_debug.bat',
   '// Second config: no exception rules at all.',
   '// note the path',
   '// trailing comment at the end of the object'

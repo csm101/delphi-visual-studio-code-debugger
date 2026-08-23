@@ -12,7 +12,7 @@ program ExcNestFixture;
             (or a nil-pointer write with -av)
 
   It is a SEPARATE target on purpose: adding scenarios to DebuggerTests'
-  TestTarget shifts RSM import indices and marker ordering (TRAPS.md).
+  TestTarget shifts RSM import indices and marker ordering (docs/TRAPS.md).
 
   GUI SUBSYSTEM, NO OUTPUT, ON PURPOSE. A console debuggee makes Windows
   allocate a new console window on every launch, and a probe that relaunches it

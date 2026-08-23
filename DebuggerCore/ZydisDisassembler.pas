@@ -1,6 +1,6 @@
 unit ZydisDisassembler;
 
-// The Zydis-backed implementation of IDisassembler (DISASSEMBLY_PLAN.md
+// The Zydis-backed implementation of IDisassembler (docs/DISASSEMBLY_PLAN.md
 // increment 2). This is the ONLY unit besides ZydisApi.pas itself allowed to
 // reference ZydisApi -- everything else in the debugger, including DevTools
 // and any future MCP/DAP surface, must go through IDisassembler
@@ -208,7 +208,7 @@ begin
     end
     else begin
       // Undecodable -- render exactly one byte as data and try to resync on
-      // the next one, never guess a length. DISASSEMBLY_PLAN.md: "an
+      // the next one, never guess a length. docs/DISASSEMBLY_PLAN.md: "an
       // instruction Zydis cannot decode renders as `db XX`, never a guess."
       Item.Length := 1;
       SetLength(Item.Bytes, 1);

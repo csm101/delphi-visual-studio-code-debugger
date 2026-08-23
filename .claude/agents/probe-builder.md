@@ -15,7 +15,7 @@ probe in `c:\Athens\__ClaudeTools\` — that directory is scratch the user delet
 at will, and probes written there get lost and rewritten.
 
 `DevTools\build_all.bat` auto-discovers every `*.dpr` in the directory, so adding
-a probe is: write `DevTools\MyProbe.dpr`, build, run. `setpaths.bat` resolves
+a probe is: write `DevTools\MyProbe.dpr`, build, run. `scripts/setpaths.bat` resolves
 `JCL_ROOT` and `DUNITX_ROOT` for the build scripts.
 
 Build with the **PowerShell** tool (the Bash `cmd /c` path breaks `rsvars.bat`):
@@ -42,9 +42,9 @@ Binaries land in `DevTools\Win64\Debug\`.
 
 ## Before writing anything
 
-Read the relevant living specification first — `RSM_FORMAT_NOTES.md`,
-`RSM_RECORD_TYPES.md`, `RSM_FIELD_OFFSETS.md`, `TD32_FORMAT_NOTES.md`,
-`KNOWN_UNKNOWNS.md`. Do not re-derive a layout that is already documented.
+Read the relevant living specification first — `docs/RSM_FORMAT_NOTES.md`,
+`docs/RSM_RECORD_TYPES.md`, `docs/RSM_FIELD_OFFSETS.md`, `docs/TD32_FORMAT_NOTES.md`,
+`docs/KNOWN_UNKNOWNS.md`. Do not re-derive a layout that is already documented.
 
 ## Reporting
 

@@ -1,7 +1,7 @@
 unit ZydisApi;
 
 // Dynamic-load import unit for Zydis (ThirdParty\Zydis\bin\x64\Zydis.dll),
-// the x86/x64 disassembler chosen in DISASSEMBLY_PLAN.md. This is an IMPORT
+// the x86/x64 disassembler chosen in docs/DISASSEMBLY_PLAN.md. This is an IMPORT
 // UNIT, not a header translation: it declares only the two entry points a
 // caller needs (ZydisDisassembleIntel, ZydisGetVersion) plus the byte offsets
 // this unit reads out of Zydis's output struct.

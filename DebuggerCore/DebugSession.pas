@@ -52,7 +52,7 @@ type
                                   Line: Integer; Verified: Boolean) of object;
   // A data breakpoint the session REMOVED on its own, with the reason. Today
   // that is exactly one case: a frame-scoped watchpoint whose frame has exited
-  // (increment 6 of DATA_BREAKPOINTS_PLAN.md). The user must be told -- a
+  // (increment 6 of docs/DATA_BREAKPOINTS_PLAN.md). The user must be told -- a
   // watchpoint silently left on dead stack reports hits that are lies.
   TSessionDataBpRemovedEvent  = procedure(const Bp: TSessionDataBreakpoint;
                                   const Reason: string) of object;
@@ -79,7 +79,7 @@ type
     FFrameSelected:      Boolean;
     // Index into FLastFrames of the frame the session serves when the client has
     // selected none. See DefaultFrameIndexFor for what decides it, and
-    // DAP_DEBUGGER_ARCHITECTURE.md "Frames versus the active frame" for why the
+    // docs/DAP_DEBUGGER_ARCHITECTURE.md "Frames versus the active frame" for why the
     // set of frames and the frame locals come from are two different questions.
     FDefaultFrameIndex:  Integer;
     FExePath:            string;
@@ -99,7 +99,7 @@ type
     FBpSpecs:     TDictionary<string, TBpSpec>;   // lcase file -> last spec, for repost on module load
     FBpVerified:  TDictionary<string, Boolean>;   // 'lcasefile|line' -> last-known verified state, for flip detection
 
-    // Data breakpoints (watchpoints; increment 4 of DATA_BREAKPOINTS_PLAN.md).
+    // Data breakpoints (watchpoints; increment 4 of docs/DATA_BREAKPOINTS_PLAN.md).
     // Unlike source breakpoints there is no per-file grouping -- SetDataBreakpoints
     // replaces the WHOLE set on every call, mirroring DAP's own setDataBreakpoints.
     FDataBreakpoints: TList<TSessionDataBreakpoint>;
@@ -329,7 +329,7 @@ type
     // for each line that flipped to verified.
     procedure NotifyBreakpointFlips;
     procedure StoreVerifiedState(const BpId: string; Verified: Boolean);
-    // Address breakpoints (DISASSEMBLY_PLAN.md increment 5). Identity is
+    // Address breakpoints (docs/DISASSEMBLY_PLAN.md increment 5). Identity is
     // (ModuleName, Rva), resolved from the caller's absolute address at SET
     // time against GetModules -- never a bare VA, which is meaningless across
     // a relaunch or an ASLR-rebased package.
@@ -409,7 +409,7 @@ type
     // Why the last step abandoned itself, or '' when it completed normally.
     function  LastStepNote: string;
     // One MACHINE INSTRUCTION rather than one source line
-    // (ASSEMBLY_LEVEL_DEBUGGING.md increment 1). Unlike the three above it can
+    // (docs/ASSEMBLY_LEVEL_DEBUGGING.md increment 1). Unlike the three above it can
     // REFUSE -- there is no line table to fall back on in the code this exists
     // for, so an instruction whose length cannot be decoded, or a frame whose
     // return address cannot be proven, is answered with False and a reason
@@ -431,7 +431,7 @@ type
     procedure RepostBreakpoints;
 
     // Breakpoint at an ABSOLUTE ADDRESS rather than a source line
-    // (DISASSEMBLY_PLAN.md increment 5) -- what makes a disassembly view
+    // (docs/DISASSEMBLY_PLAN.md increment 5) -- what makes a disassembly view
     // actionable. The address is resolved to (ModuleName, Rva) against the
     // CURRENT module table (GetModules) at set time and that pair, not the
     // bare VA, is the breakpoint's identity: it re-resolves to a fresh VA
@@ -468,7 +468,7 @@ type
     // getter-backed property (nothing to permit).
     function  SafelistKeyForExpression(const Expr: string): string;
 
-    // Data breakpoints (watchpoints; increment 4 of DATA_BREAKPOINTS_PLAN.md).
+    // Data breakpoints (watchpoints; increment 4 of docs/DATA_BREAKPOINTS_PLAN.md).
     // Mirrors the source-breakpoint API's shape, but SetDataBreakpoints
     // replaces the WHOLE set on every call (no per-file grouping exists for an
     // address), matching DAP's own setDataBreakpoints semantics. Only callable
@@ -3227,7 +3227,7 @@ begin
   // The local's own storage address (0 for a register-resident local -- every
   // provider already leaves Address unset in that case, which is why the rest
   // of this codebase already tests LV.Address <> 0 as "has a real address").
-  // Feeds DAP's `memoryReference` (ASSEMBLY_LEVEL_DEBUGGING.md increment 3).
+  // Feeds DAP's `memoryReference` (docs/ASSEMBLY_LEVEL_DEBUGGING.md increment 3).
   Result.Address      := LV.Address;
   // ...and where its BYTES are, when the slot only holds a reference to them.
   // A `string` local's own eight bytes are a pointer; someone opening a memory

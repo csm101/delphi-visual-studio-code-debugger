@@ -45,7 +45,7 @@ The debugger engine is exposed through two frontends:
 - `TMcpServer` (`McpServer.pas`) is a second frontend: newline-delimited JSON-RPC
   2.0 over stdio, exposing semantic tools to an autonomous agent. It shares the
   engine via `TDebugSession`; it does NOT round-trip through DAP. Shipped as a
-  separate exe (`DelphiDebuggerMcp.exe`, `build_mcp.bat`). See `MCP_SERVER.md`.
+  separate exe (`DelphiDebuggerMcp.exe`, `scripts/build_mcp.bat`). See `MCP_SERVER.md`.
 - **Current status:** the MCP frontend is built on `TDebugSession` and covers
   launch/attach, breakpoints (incl. conditional/hit/logpoint), stepping, stack,
   locals + nested expansion (class/record/dynamic-array), evaluate, and multi-

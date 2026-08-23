@@ -962,7 +962,7 @@ begin
   //
   // These flags are legitimate HERE and BANNED in the adapter: an SW_HIDE in the
   // adapter's own CreateProcess once hid the VCL main forms of the applications
-  // being debugged (TRAPS.md / project memory). Nothing in this block may be
+  // being debugged (docs/TRAPS.md / project memory). Nothing in this block may be
   // carried across into DebuggerCore.
   var NulSec := Default(TSecurityAttributes);
   NulSec.nLength := SizeOf(NulSec);

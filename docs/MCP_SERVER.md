@@ -18,7 +18,7 @@ protocol traffic; diagnostics go to `%TEMP%\mcp_adapter.log`.
 ## Build
 
 ```bat
-call build_mcp.bat
+call scripts\build_mcp.bat
 ```
 
 Output: `MCPDebugger\Win64\Debug\DelphiDebuggerMcp.exe`.
@@ -32,9 +32,9 @@ Claude Code and VS Code** (stable + Insiders):
 - **From the distributable zip:** run `Setup.exe` and accept "Also install and
   register the MCP debug server?". It copies `DelphiDebuggerMcp.exe` to
   `%LOCALAPPDATA%\DelphiWin64Debugger\` and registers that stable path.
-- **From source (dev):** `install-dev.bat` builds the MCP server and registers
-  the build-output exe (so a `build_mcp.bat` rebuild is picked up on restart).
-- **Directly:** `powershell -ExecutionPolicy Bypass -File register-mcp.ps1
+- **From source (dev):** `scripts/install-dev.bat` builds the MCP server and registers
+  the build-output exe (so a `scripts/build_mcp.bat` rebuild is picked up on restart).
+- **Directly:** `powershell -ExecutionPolicy Bypass -File scripts/register-mcp.ps1
   <path-to-DelphiDebuggerMcp.exe>` — idempotent; `-Unregister` removes it.
 
 Registration writes the Claude Code user config via `claude mcp add … -s user`

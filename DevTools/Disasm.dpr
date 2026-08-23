@@ -1,6 +1,6 @@
 program Disasm;
 
-// Exercises the IDisassembler seam end to end (DISASSEMBLY_PLAN.md increment
+// Exercises the IDisassembler seam end to end (docs/DISASSEMBLY_PLAN.md increment
 // 2): the Zydis backend behind it, and symbolication of the output through
 // the SAME provider set (TDebugInfoSet: MAP + RSM + TD32) the adapter itself
 // queries when naming a stack frame.

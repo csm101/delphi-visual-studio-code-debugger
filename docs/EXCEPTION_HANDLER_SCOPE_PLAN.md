@@ -35,7 +35,7 @@ Repro commands used (for whoever picks this up — re-run to confirm before
 changing anything):
 
 ```
-launch_debuggee  Win64\Debug\Debugme.exe, stopAtEntry
+launch_debuggee  samples\Debugme\Win64\Debug\Debugme.exe, stopAtEntry
 set_breakpoints  Debugme.dpr:103
 continue_and_wait   -> stops on the raise itself (line 99, stopReason=exception)
 continue_and_wait   -> stops on the breakpoint (line 103, stopReason=breakpoint)

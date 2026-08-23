@@ -54,7 +54,7 @@ breakpoint set later can be raced past.
 
 Targets: `DebuggerTests\TestTarget` (both bitnesses) and the multi-BPL fixture.
 For a live host, follow whatever the instructions give you — and never launch a
-real ERP client unattended (see `TRAPS.md`).
+real ERP client unattended (see `docs/TRAPS.md`).
 
 ## Output
 

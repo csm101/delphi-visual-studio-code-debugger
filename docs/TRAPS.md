@@ -92,7 +92,7 @@ absurdly.
   that exists only under overflow/range checking passes the suite. Pin the
   directive in the unit source for arithmetic on debuggee-supplied addresses.
 - **After any unit move, re-verify all four builds**: DAP (`.cfg` + `.dpr`
-  in-clauses + `.dproj`), `build_mcp.bat`, `RunTests`/`build_runner`, and DevTools
+  in-clauses + `.dproj`), `scripts/build_mcp.bat`, `RunTests`/`build_runner`, and DevTools
   `build_all.bat` flags.
 - **`build_and_run.bat` must call `build_runner.bat`**, never keep its own copy of
   the compile line — it silently went stale when search paths moved.
@@ -120,7 +120,7 @@ absurdly.
   Use `cd /d %~dp0` inside the `.bat`, then `-E.`. `dcc64` will not create a
   missing `-NU` output directory — `mkdir` it first.
 - **JCL is not optional** (`DebuggerCore\JclDebugReader.pas` needs it).
-  `JCL_ROOT` / `DUNITX_ROOT` come from `setpaths.bat`; never hardcode them back
+  `JCL_ROOT` / `DUNITX_ROOT` come from `scripts/setpaths.bat`; never hardcode them back
   into `.cfg` files (`dcc64` reads `.cfg` unconditionally, with no conditional
   syntax).
 - **Do NOT fork the `.cfg` files for 32-bit builds**: `-E` / `-NU` are overridable

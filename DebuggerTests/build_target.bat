@@ -36,7 +36,7 @@ rem No-source-stop fixture: faults inside the RTL (-rtl) or inside kernel32 (-os
 rem so a stop can be observed where the top frame has no source to open. Used to
 rem settle, by measurement rather than assumption, whether VS Code opens the
 rem Disassembly View by itself and whether our placeholder source suppresses it
-rem (see KNOWN_UNKNOWNS.md). Separate target for the usual reason: adding
+rem (see docs/KNOWN_UNKNOWNS.md). Separate target for the usual reason: adding
 rem scenarios to TestTarget shifts RSM import indices and marker ordering.
 dcc64 -$O- -V -VN -E.\Win64\Debug -NU.\Win64\Debug NoSourceStop.dpr 2>&1
 set NOSRC64_ERR=%errorlevel%
@@ -44,7 +44,7 @@ dcc32 -$O- -V -VN -E.\Win32\Debug -NU.\Win32\Debug NoSourceStop.dpr 2>&1
 set NOSRC32_ERR=%errorlevel%
 rem Instruction-stepping fixture: a multi-instruction line, a plain call, a
 rem recursive call, a `rep movsb` over 64 KB and a watched write inside a call
-rem (ASSEMBLY_LEVEL_DEBUGGING.md increment 1). Full debug info (-V -VN -VR -GD)
+rem (docs/ASSEMBLY_LEVEL_DEBUGGING.md increment 1). Full debug info (-V -VN -VR -GD)
 rem because the tests place source breakpoints in it and read stop locations.
 rem Both bitnesses: instruction stepping is where x86 and x64 differ most.
 rem Separate target for the usual reason -- adding scenarios to TestTarget

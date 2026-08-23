@@ -577,7 +577,7 @@ type
     // member records to the owning unit, and (d) resolve member typeIds
     // against the unit's local table rather than the global FUserTypes.
     // Currently tracked as the "RSM TypeId cross-unit collisions" item in
-    // KNOWN_UNKNOWNS.md.
+    // docs/KNOWN_UNKNOWNS.md.
     [Test]
     procedure Test_Hover_ExceptionInHandler_Message;
 
@@ -808,13 +808,13 @@ type
     [Test] procedure Test_Bpl_DefinedClass_ExpandInLocals;
     [Test] procedure Test_Bpl_UnloadReload_BpRebinds;
     [Test] procedure Test_Bpl_TwoModules_EachBpRoutes;
-    // DISASSEMBLY_PLAN.md increment 5: setInstructionBreakpoints. The address
+    // docs/DISASSEMBLY_PLAN.md increment 5: setInstructionBreakpoints. The address
     // form of Test_Bpl_UnloadReload_BpRebinds above -- module+RVA identity
     // must survive the SAME unload/reload round trip.
     [Test] procedure Test_SetInstructionBreakpoints_Bpl_UnloadReload_Rebinds;
     [Test] procedure Test_SetInstructionBreakpoints_Basic_StopsAndVerifies;
 
-    // DISASSEMBLY_PLAN.md increment 6: DAP `disassemble` +
+    // docs/DISASSEMBLY_PLAN.md increment 6: DAP `disassemble` +
     // `instructionPointerReference`, the last functional increment.
     [Test] procedure Test_Initialize_AdvertisesSupportsDisassembleRequest;
     [Test] procedure Test_StackTrace_InstructionPointerReference_MatchesRip;
@@ -1358,7 +1358,7 @@ end;
 // the value formatter, not a hex string; a register's own value is exactly
 // where execution stopped and is already rendered as hex (with the same
 // "  (<decimal>)" display decoration ExtractDisplayValue strips elsewhere).
-// Used by DISASSEMBLY_PLAN.md increment 5's setInstructionBreakpoints tests,
+// Used by docs/DISASSEMBLY_PLAN.md increment 5's setInstructionBreakpoints tests,
 // which have no other in-protocol way to learn an address
 // (instructionPointerReference on stack frames is increment 6).
 function CurrentRipHex(Client: TDapClient; FrameId: Integer): string;
@@ -1405,7 +1405,7 @@ begin
   Result := StrToUInt64(S);
 end;
 
-// The top stack frame's `instructionPointerReference` (DISASSEMBLY_PLAN.md
+// The top stack frame's `instructionPointerReference` (docs/DISASSEMBLY_PLAN.md
 // increment 6) -- the field that makes "Open Disassembly View" available
 // from the Call Stack, and the address form disassemble tests feed straight
 // back into FClient.Disassemble.
@@ -4068,7 +4068,7 @@ begin
   end;
 end;
 
-// Requirement 5 of EXCEPTION_HANDLER_SCOPE_PLAN.md: the alias has to work in an
+// Requirement 5 of docs/EXCEPTION_HANDLER_SCOPE_PLAN.md: the alias has to work in an
 // arbitrary expression, and a breakpoint condition is the case that proves it
 // -- the condition is evaluated by the adapter while the target is stopped
 // inside the handler, with no Watch panel involved.
@@ -7844,7 +7844,7 @@ end;
 // instructionPointerReference is the field that makes "Open Disassembly
 // View" available from the Call Stack. Cross-checked against the
 // independent, already-trusted Registers-scope RIP oracle
-// (DISASSEMBLY_PLAN.md increment 5 used the same oracle before this field
+// (docs/DISASSEMBLY_PLAN.md increment 5 used the same oracle before this field
 // existed), not merely asserted non-empty.
 procedure TDebuggerTests.Test_StackTrace_InstructionPointerReference_MatchesRip;
 var
@@ -7940,7 +7940,7 @@ begin
   end;
 end;
 
-// The refusal path (DISASSEMBLY_PLAN.md, "Decision: backward disassembly is
+// The refusal path (docs/DISASSEMBLY_PLAN.md, "Decision: backward disassembly is
 // proven-boundary-only") expressed at the DAP layer. 0x1000 sits inside
 // Windows' reserved NULL-page region and belongs to no loaded module, so
 // neither a debug-info boundary nor a PE export can prove anything about it

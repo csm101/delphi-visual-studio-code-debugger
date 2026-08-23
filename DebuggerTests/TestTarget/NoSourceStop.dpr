@@ -3,7 +3,7 @@ program NoSourceStop;
 // A target that stops where there is NO SOURCE to open, so the client-side
 // behaviour can be observed instead of assumed.
 //
-// The open question it exists to answer (see KNOWN_UNKNOWNS.md): now that the
+// The open question it exists to answer (see docs/KNOWN_UNKNOWNS.md): now that the
 // adapter declares supportsDisassembleRequest and every frame carries
 // instructionPointerReference, does VS Code open the Disassembly View by itself
 // when a stop has no source -- and does the adapter's placeholder source
@@ -12,7 +12,7 @@ program NoSourceStop;
 //
 // Separate target on purpose. Adding scenarios to TestTarget shifts RSM per-unit
 // import indices and perturbs first-hit marker ordering, which has broken
-// unrelated tests before (see TRAPS.md, "Fixture design").
+// unrelated tests before (see docs/TRAPS.md, "Fixture design").
 //
 // Built with -$O- -V -VN like the other fixtures, so THIS program has full debug
 // info. That is deliberate: the faulting frame must be the one without source,

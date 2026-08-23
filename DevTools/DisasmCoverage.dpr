@@ -1,6 +1,6 @@
 program DisasmCoverage;
 
-// Differential coverage sweep for the disassembly backend (DISASSEMBLY_PLAN.md
+// Differential coverage sweep for the disassembly backend (docs/DISASSEMBLY_PLAN.md
 // increment 3). Feeds the SAME bytes to Zydis (via IDisassembler /
 // TZydisDisassembler, the production backend in DebuggerCore) and to an
 // INDEPENDENT oracle -- dumpbin /DISASM:BYTES from the MSVC toolset -- over

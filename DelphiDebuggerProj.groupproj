@@ -3,7 +3,7 @@
         <ProjectGuid>{395CF165-2971-4E28-9129-E287079DCFD4}</ProjectGuid>
     </PropertyGroup>
     <ItemGroup>
-        <Projects Include="Debugme.dproj">
+        <Projects Include="samples\Debugme\Debugme.dproj">
             <Dependencies/>
         </Projects>
         <Projects Include="VisualStudioCodeDelphiDebugger\VisualStudioCodeDelphiDebugger.dproj">
@@ -36,13 +36,13 @@
         </BorlandProject>
     </ProjectExtensions>
     <Target Name="Debugme">
-        <MSBuild Projects="Debugme.dproj"/>
+        <MSBuild Projects="samples\Debugme\Debugme.dproj"/>
     </Target>
     <Target Name="Debugme:Clean">
-        <MSBuild Projects="Debugme.dproj" Targets="Clean"/>
+        <MSBuild Projects="samples\Debugme\Debugme.dproj" Targets="Clean"/>
     </Target>
     <Target Name="Debugme:Make">
-        <MSBuild Projects="Debugme.dproj" Targets="Make"/>
+        <MSBuild Projects="samples\Debugme\Debugme.dproj" Targets="Make"/>
     </Target>
     <Target Name="VisualStudioCodeDelphiDebugger">
         <MSBuild Projects="VisualStudioCodeDelphiDebugger\VisualStudioCodeDelphiDebugger.dproj"/>

@@ -50,7 +50,7 @@ type
     FQuit:    Boolean;
     FWait:    TPendingWait;
 
-    // Data breakpoints (watchpoints; increment 5 of DATA_BREAKPOINTS_PLAN.md).
+    // Data breakpoints (watchpoints; increment 5 of docs/DATA_BREAKPOINTS_PLAN.md).
     // TDebugSession.SetDataBreakpoints replaces the WHOLE set on every call
     // (mirrors DAP's own setDataBreakpoints) and reassigns every entry a FRESH
     // session-level Id each time, even for specs that did not change -- so an id
@@ -82,17 +82,17 @@ type
     procedure CheckWaitTimeout;
     procedure HandleReadMemory(const IdJson, AddrStr: string; Count: Integer);
     procedure HandleWriteMemory(const IdJson, AddrStr, HexBytes: string);
-    // DISASSEMBLY_PLAN.md increment 4. AddrStr = '' means "resolve from
+    // docs/DISASSEMBLY_PLAN.md increment 4. AddrStr = '' means "resolve from
     // FrameIndex/ThreadId instead" (same frame-selection convention
     // get_locals/get_variable/evaluate_expression already use -- no separate
     // opaque frameId shape).
     procedure HandleDisassemble(const IdJson, AddrStr: string;
                 FrameIndex: Integer; ThreadId: Cardinal; Count, Before: Integer);
-    // DISASSEMBLY_PLAN.md increment 5. AddrStr is parsed the same way
+    // docs/DISASSEMBLY_PLAN.md increment 5. AddrStr is parsed the same way
     // read_memory/disassemble parse theirs (ParseAddress: "0x..", "$..", decimal).
     procedure HandleSetBreakpointAtAddress(const IdJson, AddrStr,
                 Condition, HitCondition, LogMessage: string);
-    // ASSEMBLY_LEVEL_DEBUGGING.md increment 4: step_over/step_into/step_out all
+    // docs/ASSEMBLY_LEVEL_DEBUGGING.md increment 4: step_over/step_into/step_out all
     // funnel through this so "granularity" is handled once. Kind is the
     // pre-existing 1:1 mapping each tool already implies (step_over -> iskOver,
     // etc); the SAME facade increment 2's DAP plumbing calls
@@ -936,7 +936,7 @@ begin
       SendToolJson(IdJson, McpJson.StringListToJson(FSession.DrainDebuggerOutput));
       Exit;
     end;
-    // ASSEMBLY_LEVEL_DEBUGGING.md increment 4: the MCP equivalent of DAP's
+    // docs/ASSEMBLY_LEVEL_DEBUGGING.md increment 4: the MCP equivalent of DAP's
     // writable Registers scope (REGISTERS_VAR_REF in DapServer.pas). Both go
     // through the SAME session-level path -- FSession.GetRegisters /
     // FSession.SetRegister, backed by TDebugTarget.GetRegisters /
@@ -1071,7 +1071,7 @@ begin
   SendToolJson(IdJson, Obj);
 end;
 
-// ASSEMBLY_LEVEL_DEBUGGING.md increment 4. "statement" (default, or omitted)
+// docs/ASSEMBLY_LEVEL_DEBUGGING.md increment 4. "statement" (default, or omitted)
 // keeps the pre-existing fire-and-forget behaviour (the source-level step
 // never refuses). "instruction" calls TDebugSession.StepInstruction FIRST and
 // only arms the wait when it is ACCEPTED -- exactly the ordering increment 2's
@@ -1165,16 +1165,16 @@ begin
       Exit(M.Name);
 end;
 
-// DISASSEMBLY_PLAN.md increment 4: MCP `disassemble`. Requires a stop, same
+// docs/DISASSEMBLY_PLAN.md increment 4: MCP `disassemble`. Requires a stop, same
 // as get_call_stack/get_raw_stack_scan -- both the byte read and (when
 // resolving via frameIndex/threadId) the call stack need a consistent,
 // non-running snapshot.
 //
-// Zydis is optional (DISASSEMBLY_PLAN.md, "Constraints"): a missing or
+// Zydis is optional (docs/DISASSEMBLY_PLAN.md, "Constraints"): a missing or
 // version-mismatched DLL is reported as available:false with a reason, never
 // a partial or fabricated result -- the ORDINARY case on a machine without
 // the VC++ runtime, not an error. `before` is a SEPARATE refusal channel
-// from the call itself (decision recorded in DISASSEMBLY_PLAN.md): backward
+// from the call itself (decision recorded in docs/DISASSEMBLY_PLAN.md): backward
 // disassembly is answered only from a PROVEN earlier instruction boundary
 // (debug info, or a module's PE export table when it has none) that decodes
 // forward to land EXACTLY on the requested address; anything else refuses

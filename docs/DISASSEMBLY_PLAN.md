@@ -150,7 +150,7 @@ Rationale per item:
 - **Submodule pinned** — provenance and byte-for-byte rebuildability. Without it
   the committed DLL is a blob taken on trust.
 - **DLL committed** (approved by the maintainer 2026-08-08) — `build_all.bat` and
-  `build_dap.bat` stay Delphi-only. `build_zydis.bat` is run by whoever bumps the
+  `scripts/build_dap.bat` stay Delphi-only. `build_zydis.bat` is run by whoever bumps the
   dependency, never by whoever builds the project.
 - **`ZydisApi.pas` minimal** — import only what is used (`ZydisDisassembleIntel`,
   `ZydisGetVersion`). A small surface is less to repair across library versions.
@@ -1179,7 +1179,7 @@ NEXT TO THE EXE's own directory first (before the repo-relative fallback) —
 that resolution logic needed no code change. What was missing was actually
 PLACING the DLL there in every path a user can install through:
 
-- `update-install.bat` (repository dev staging into `install\
+- `scripts/update-install.bat` (repository dev staging into `install\
   local.delphi-win64-debug\`) now also copies `Zydis.dll` +
   `ThirdParty\Zydis\LICENSE` (as `Zydis-LICENSE.txt`) into the extension
   folder, right after the adapter exe. Missing source DLL is a printed NOTE,
@@ -1189,7 +1189,7 @@ PLACING the DLL there in every path a user can install through:
   / `CopyZydisIfAvailable`, mirroring the existing "next to me, else
   repo-relative" pattern the adapter/MCP server themselves use for consistency:
   checked next to `Install.exe` first (covers the portable zip, where
-  `build_setup_zip.bat` now stages `Zydis.dll` at the zip root next to
+  `scripts/build_setup_zip.bat` now stages `Zydis.dll` at the zip root next to
   `Setup.exe`), else `ThirdParty\Zydis\bin\x64\Zydis.dll` under `RepoRoot`
   (covers running `Install.exe` straight from a repository checkout). Called
   once for the extension `StageDir` (idempotent in portable mode, where the
@@ -1198,11 +1198,11 @@ PLACING the DLL there in every path a user can install through:
   MCP exe copy. A missing DLL prints a NOTE and the install continues — never
   a hard failure, per the constraint that a missing DLL degrades the feature
   to UNAVAILABLE, never blocks a start or an install.
-- `build_setup_zip.bat` stages `Zydis.dll` + `Zydis-LICENSE.txt` at the zip
+- `scripts/build_setup_zip.bat` stages `Zydis.dll` + `Zydis-LICENSE.txt` at the zip
   root, next to `Setup.exe`/`DelphiDebuggerMcp.exe`, mirroring how the MCP
   server exe is already staged flat rather than in a subfolder. A missing
   source DLL is a printed WARNING, not a failed zip build.
-- `install-dev.bat` / `build_dap.bat` / `build_mcp.bat` needed NO change: dev
+- `scripts/install-dev.bat` / `scripts/build_dap.bat` / `scripts/build_mcp.bat` needed NO change: dev
   mode points the installed extension's `program` straight at
   `VisualStudioCodeDelphiDebugger\Win64\Debug\...exe`, which is three levels
   below the repo root — exactly where `DefaultZydisDllPath`'s existing
