@@ -53,6 +53,17 @@ function projectBaseName(projectFile) {
 }
 
 /**
+ * How a project's rule files are named in the picker. The project is named the
+ * way the developer knows it -- `Debugme.dproj`, not `Debugme` -- because that is
+ * the file they opened in the IDE, and the whole point of the entry is that the
+ * rules belong to THAT project rather than to whatever launch configuration
+ * happens to start it.
+ */
+function projectTargetName(projectFile, kind) {
+  return path.basename(projectFile) + ' rules (' + (kind === 'projectLocal' ? 'local' : 'shared') + ')';
+}
+
+/**
  * The absolute project path a configuration points at, or '' when it names
  * none - or names one through a variable nothing here can expand. Unlike the
  * adapter, which is handed a path VS Code has already substituted, the editor
@@ -102,10 +113,9 @@ function collectProjectTargets(configurations, options) {
 
   const targets = [];
   for (const entry of byProject.values()) {
-    const base = projectBaseName(entry.projectFile);
     const tiers = [
-      { kind: 'projectLocal',  filePath: localProjectRulesPath(entry.projectFile), name: base + ' rules (local)' },
-      { kind: 'projectShared', filePath: projectRulesPath(entry.projectFile),      name: base + ' rules (shared)' }
+      { kind: 'projectLocal',  filePath: localProjectRulesPath(entry.projectFile) },
+      { kind: 'projectShared', filePath: projectRulesPath(entry.projectFile) }
     ];
     for (const tier of tiers) {
       const file = readFile(tier.filePath);
@@ -113,7 +123,7 @@ function collectProjectTargets(configurations, options) {
         kind: tier.kind,
         filePath: tier.filePath,
         documentLabel: tier.filePath,
-        name: tier.name,
+        name: projectTargetName(entry.projectFile, tier.kind),
         projectFile: entry.projectFile,
         declaredBy: entry.declaredBy.slice(),
         exceptionRules: file.rules,
@@ -133,6 +143,7 @@ module.exports = {
   projectRulesPath: projectRulesPath,
   localProjectRulesPath: localProjectRulesPath,
   projectBaseName: projectBaseName,
+  projectTargetName: projectTargetName,
   resolveProjectFile: resolveProjectFile,
   collectProjectTargets: collectProjectTargets
 };

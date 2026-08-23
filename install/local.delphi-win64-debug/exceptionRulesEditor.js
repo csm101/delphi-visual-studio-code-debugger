@@ -142,20 +142,47 @@ function buildGlobalTarget(configurations) {
 }
 
 /**
+ * Which launch configurations still deserve an entry of their own.
+ *
+ * "Debug Debugme" and "Attach to Debugme.exe" are the same project debugged two
+ * ways. Nobody wants a DIFFERENT exception policy depending on whether they
+ * pressed F5 or attached - offering that choice is offering a way to make the
+ * two disagree - so once the project itself is an editable target, the
+ * per-configuration entries stop being useful and are dropped.
+ *
+ * Two exceptions, and only these:
+ *
+ *   - a configuration that ALREADY has rules stays listed, whatever else is on
+ *     offer. Hiding it would strand rules a user wrote before this existed,
+ *     with no way to see or move them;
+ *   - when no configuration names a project, there is nothing to offer instead,
+ *     so the list is exactly what it always was.
+ *
+ * The adapter still reads a configuration's `exceptionRules` either way. This is
+ * about what the picker proposes, not about what is honoured.
+ */
+function launchTargetsToOffer(configurations, projectTargets) {
+  if (!projectTargets || projectTargets.length === 0) return configurations.slice();
+  return configurations.filter((configuration) => configuration.exceptionRules.length > 0);
+}
+
+/**
  * Everything the user may pick in the target QuickPick, ordered the way the
- * adapter resolves rules: the project's own files first, then the launch
- * configurations, then the machine-wide file. The order is the feature - a user
- * choosing where to put a rule is choosing how widely it should reach.
+ * adapter resolves rules: the project's own files first, then any launch
+ * configuration still worth listing, then the machine-wide file. The order is
+ * the feature - a user choosing where to put a rule is choosing how widely it
+ * should reach.
  */
 async function collectTargets() {
   const scan = await findDelphiConfigurations();
   const projectTargets = projectRules.collectProjectTargets(scan.found);
-  const targets = projectTargets.concat(scan.found);
+  const launchTargets = launchTargetsToOffer(scan.found, projectTargets);
+  const targets = projectTargets.concat(launchTargets);
   targets.push(buildGlobalTarget(scan.found));
   return {
     targets: targets,
     parseErrors: scan.parseErrors,
-    launchCount: scan.found.length,
+    launchCount: launchTargets.length,
     projectCount: projectTargets.length
   };
 }
@@ -166,7 +193,7 @@ function describeTarget(target) {
     return {
       label: target.name,
       description: `${target.exceptionRules.length} rule(s)`,
-      detail: target.documentLabel,
+      detail: target.documentLabel + '  —  this configuration only',
       target: target
     };
   }
@@ -402,6 +429,7 @@ module.exports = {
   findDelphiConfigurations: findDelphiConfigurations,
   collectTargets: collectTargets,
   buildGlobalTarget: buildGlobalTarget,
+  launchTargetsToOffer: launchTargetsToOffer,
   writeRulesFile: writeRulesFile,
   describeTarget: describeTarget,
   pickTarget: pickTarget,

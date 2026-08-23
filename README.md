@@ -689,6 +689,12 @@ Rules are evaluated top-down across all four scopes, narrowest first, and the
 | 3 | one launch configuration | `exceptionRules` in `launch.json` |
 | 4 | every project on this machine | the shared file below |
 
+Tier 3 is still honoured, but the rules editor stops **proposing** it once the
+project itself is on offer — *Debug X* and *Attach to X* are the same project
+debugged two ways, and per-configuration rules are mostly a way to make them
+disagree. A configuration that already holds rules keeps its entry so they stay
+reachable; to add new ones there, edit `launch.json` by hand.
+
 ### Shared rules across projects
 
 A machine-wide rules file lets you define a baseline once and have it apply to

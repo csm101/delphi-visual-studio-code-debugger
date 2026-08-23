@@ -126,8 +126,9 @@ test('one project yields local first, then shared', () => {
     [{ name: 'Debug Debugme', delphiProjectFile: 'C:\\repo\\Debugme.dproj', workspaceFolder: 'C:\\repo' }],
     { directoryExists: () => true, readRulesFile: () => ({ exists: false, shape: 'empty', rules: [] }) });
   assert.deepStrictEqual(targets.map((t) => t.kind), ['projectLocal', 'projectShared']);
-  assert.ok(targets[0].name.endsWith('rules (local)'), targets[0].name);
-  assert.ok(targets[1].name.startsWith('Debugme'), targets[1].name);
+  // Named after the project FILE, which is what the developer opened in the IDE.
+  assert.strictEqual(targets[0].name, 'Debugme.dproj rules (local)');
+  assert.strictEqual(targets[1].name, 'Debugme.dproj rules (shared)');
 });
 
 test('a launch and an attach configuration for the same project give ONE pair, naming both', () => {
@@ -178,6 +179,38 @@ test('a sidecar written through the shared-file writer keeps its shape', () => w
   assert.deepStrictEqual(globalRules.parseGlobalRules(text).rules, [{ class: 'EAbort', action: 'ignore' }]);
 }));
 
+console.log('project rule files - which launch configurations still get an entry');
+
+// The user-visible point of the whole change: with a project on offer, "Debug X"
+// and "Attach to X" stop being two ways to disagree with each other.
+test('a project on offer replaces the per-configuration entries', () => {
+  const configurations = [
+    { name: 'Debug Debugme', exceptionRules: [] },
+    { name: 'Attach to Debugme.exe', exceptionRules: [] }
+  ];
+  const offered = editor.launchTargetsToOffer(configurations, [{ kind: 'projectShared' }]);
+  assert.deepStrictEqual(offered, []);
+});
+
+test('a configuration that already has rules is never hidden', () => {
+  const withRules = { name: 'Debug Debugme', exceptionRules: [{ action: 'ignore' }] };
+  const offered = editor.launchTargetsToOffer(
+    [withRules, { name: 'Attach to Debugme.exe', exceptionRules: [] }],
+    [{ kind: 'projectShared' }]);
+  assert.deepStrictEqual(offered.map((c) => c.name), ['Debug Debugme']);
+});
+
+test('with no project named, the list is exactly what it always was', () => {
+  const configurations = [
+    { name: 'Debug Debugme', exceptionRules: [] },
+    { name: 'Attach to Debugme.exe', exceptionRules: [] }
+  ];
+  assert.deepStrictEqual(editor.launchTargetsToOffer(configurations, []).map((c) => c.name),
+    ['Debug Debugme', 'Attach to Debugme.exe']);
+  assert.deepStrictEqual(editor.launchTargetsToOffer(configurations, undefined).map((c) => c.name),
+    ['Debug Debugme', 'Attach to Debugme.exe']);
+});
+
 console.log('project rule files - how the picker describes them');
 
 function describeKind(kind, overrides) {
@@ -205,13 +238,14 @@ test('the entry names the configurations that use it', () => {
     /used by Debug Debugme, Attach to Debugme/);
 });
 
-test('a launch configuration entry is unchanged - no icon, no notes', () => {
+test('a launch configuration entry keeps its name and says how far it reaches', () => {
   const described = editor.describeTarget({
     kind: 'launch', name: 'Debug Debugme', documentLabel: 'repo/.vscode/launch.json',
     exceptionRules: [{ action: 'break' }]
   });
   assert.strictEqual(described.label, 'Debug Debugme');
-  assert.strictEqual(described.detail, 'repo/.vscode/launch.json');
+  assert.match(described.detail, /^repo\/\.vscode\/launch\.json/);
+  assert.match(described.detail, /this configuration only/);
   assert.strictEqual(described.description, '1 rule(s)');
 });
 
