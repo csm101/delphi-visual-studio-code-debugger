@@ -3125,11 +3125,34 @@ filters) and `Test_ExceptionRule_Code_Decimal_BreaksOnNative`.
 
 ### `$exception` pseudo-variable
 
-The debugger records the live exception object's VA on a Delphi-raise break
-(`FExceptionObjAddr`, exposed via `IDebugTarget.CurrentExceptionObject`).
-`DapServer` tracks `FStoppedOnException` (set in `OnStopped` from the reason) and,
-on an exception stop, prepends a synthetic `$exception` row to the Locals scope
-via `AppendExceptionLocal`. The shared `BuildCurrentExceptionRef` builds the
+Two sources, tried in this order.
+
+**At an exception stop**, the debugger's own record of the raise it just
+reported: `FExceptionObjAddr`, exposed via
+`IDebugTarget.CurrentExceptionObject`, with `DapServer.FStoppedOnException` (set
+in `OnStopped` from the reason) as the gate.
+
+**Away from one**, the `except` block the PC is standing in, via
+`IDebugTarget.TryGetHandlerException`. That is what keeps `$exception` alive for
+the WHOLE handler rather than only at the instant of the raise: it locates the
+block from the routine's own x64 exception-dispatch data
+(`TryGetExceptHandlerBlockAt`) and reads the object from the RTL's per-thread
+raise list by calling `System.ExceptObject` in the target -- resolved in the
+module the handler is executing in, falling back to the export directory for a
+packaged RTL that ships without symbols. `CurrentExceptionObject` cannot answer
+this question: it is the last raise the debugger SAW and stays set for the rest
+of the session, long after the handler returned and the object was freed.
+
+Offered only for a BARE `except .. end`. Inside an `on X: ... do` clause the
+alias is listed as an ordinary local instead, and showing one object under two
+names in one Locals scope reads as two variables. x64 only -- a 32-bit binary
+has no `.pdata`, so nothing in it states a block's extent; the refusal from
+`ExceptHandlerScopeUnavailableReason` says so rather than rendering an empty row
+(`Win32_BareHandlerException_RefusesWithAReason` is the both-bitness control).
+
+`DapServer` prepends the synthetic `$exception` row to the Locals scope via
+`AppendExceptionLocal`; `TDebugSession.AppendBareHandlerException` does the same
+for the MCP frontend. The shared `BuildCurrentExceptionRef` builds the
 inline `Class: Message` value and an expansion ref (`ekRsmMembers` when the class
 is in RSM/TD32, else `ekClass` RTTI reader). `HandleEvaluate` short-circuits a
 bare `$exception` through the same builder (frame-independent, resolved before

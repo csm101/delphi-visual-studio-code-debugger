@@ -717,7 +717,9 @@ type
     // carries value + type; the child ref comes from RefForHandle(V.Handle).
     procedure EmitVar(Arr: TJSONArray; const V: TSessionVariable);
     function  BuildCurrentExceptionRef(out ValueStr, ClassName: string;
-                out VarRef: Integer; out ObjAddr: UInt64): Boolean;
+                out VarRef: Integer; out ObjAddr: UInt64;
+                out HandlerKind: TExcHandlerBlockKind;
+                out Reason: string): Boolean;
     procedure AppendExceptionLocal(Arr: TJSONArray);
   public
     constructor Create;
@@ -4350,29 +4352,63 @@ begin
   Arr.AddElement(Item);
 end;
 
-// Shared builder for the `$exception` pseudo-variable. Returns False when not
-// stopped on a Delphi raise (or the object is not a live instance). On success:
-// ValueStr = "Class: Message", ClassName = the raised class, VarRef = an
-// expansion ref so the object's members can be drilled into.
+// Shared builder for the `$exception` pseudo-variable. Returns False, with a
+// Reason, when there is no exception in scope. On success: ValueStr =
+// "Class: Message", ClassName = the raised class, VarRef = an expansion ref so
+// the object's members can be drilled into.
+//
+// Two sources, in this order:
+//   1. the stop itself, when it IS an exception stop -- the object of the raise
+//      the debugger just reported;
+//   2. otherwise the `except` block the PC is standing in, asked of the RTL's
+//      own raise list. This is what keeps `$exception` alive for the WHOLE
+//      handler instead of only at the instant of the raise. HandlerKind comes
+//      back so the caller can honour the alias/`$exception` exclusion.
 function TDapServer.BuildCurrentExceptionRef(out ValueStr, ClassName: string;
-  out VarRef: Integer; out ObjAddr: UInt64): Boolean;
+  out VarRef: Integer; out ObjAddr: UInt64;
+  out HandlerKind: TExcHandlerBlockKind; out Reason: string): Boolean;
 begin
-  ValueStr  := '';
-  ClassName := '';
-  VarRef    := 0;
-  ObjAddr   := 0;
-  Result    := False;
-  if not FStoppedOnException then Exit;
-  if (FDebugger = nil) or (FRtti = nil) then Exit;
-  var ExcObj := FDebugger.CurrentExceptionObject;
-  if (ExcObj < 65536) or not FRtti.IsClassInstance(ExcObj) then Exit;
+  ValueStr    := '';
+  ClassName   := '';
+  VarRef      := 0;
+  ObjAddr     := 0;
+  HandlerKind := ehbNone;
+  Reason      := '';
+  Result      := False;
+  if (FDebugger = nil) or (FRtti = nil) then begin
+    Reason := 'no debug session';
+    Exit;
+  end;
+
+  var ExcObj: UInt64 := 0;
+  var FromStop := FStoppedOnException;
+  if FromStop then
+    ExcObj := FDebugger.CurrentExceptionObject
+  else if not FDebugger.TryGetHandlerException(HandlerKind, ExcObj, Reason) then
+    Exit;
+  if (ExcObj < 65536) or not FRtti.IsClassInstance(ExcObj) then begin
+    if Reason = '' then
+      Reason := 'no live Delphi exception object';
+    Exit;
+  end;
   ObjAddr := ExcObj;
 
-  ClassName := FDebugger.LastExceptionClass;
-  var Msg   := FDebugger.LastExceptionMessage;
-  ValueStr  := ClassName;
-  if Msg <> '' then
-    ValueStr := ClassName + ': ' + Msg;
+  // At an exception stop the recorded class and message describe exactly this
+  // object. Reached through a handler they still do whenever the object is the
+  // one that raise reported, which is every case except a nested exception
+  // that has already been handled -- there the VMT is the only honest source,
+  // and a class name with no message beats a message belonging to something
+  // else.
+  if FromStop or (ExcObj = FDebugger.CurrentExceptionObject) then begin
+    ClassName := FDebugger.LastExceptionClass;
+    var Msg   := FDebugger.LastExceptionMessage;
+    ValueStr  := ClassName;
+    if Msg <> '' then
+      ValueStr := ClassName + ': ' + Msg;
+  end else begin
+    ClassName := FRtti.GetInstanceClassName(ExcObj);
+    ValueStr  := ClassName;
+  end;
 
   // Mint an expansion for the live object (member table when the class is
   // known, else runtime RTTI) and map it to a DAP ref so the object's members
@@ -4382,16 +4418,26 @@ begin
   Result := True;
 end;
 
-// When stopped on a Delphi exception, surface the live exception object as a
-// synthetic `$exception` entry at the top of the Locals scope so the user can
-// inspect (and expand) its class, Message and fields like any other object.
+// Surfaces the live exception object as a synthetic `$exception` entry at the
+// top of the Locals scope so it is inspectable (and expandable) without anyone
+// having to know to type the name into Watch.
+//
+// Offered at an exception stop, and inside a BARE `except .. end` for as long
+// as the stop stays in that block. NOT inside an `on X: ... do` clause: there
+// the exception already has a source-level name and that name is listed as an
+// ordinary local, so adding `$exception` beside it would show one object under
+// two names in the same Locals scope.
 procedure TDapServer.AppendExceptionLocal(Arr: TJSONArray);
 var
   ValueStr, ClsName: string;
   VarRef: Integer;
   ObjAddr: UInt64;
+  HandlerKind: TExcHandlerBlockKind;
+  Reason: string;
 begin
-  if not BuildCurrentExceptionRef(ValueStr, ClsName, VarRef, ObjAddr) then Exit;
+  if not BuildCurrentExceptionRef(ValueStr, ClsName, VarRef, ObjAddr,
+           HandlerKind, Reason) then Exit;
+  if HandlerKind = ehbOnClause then Exit;
   var Item := TJSONObject.Create;
   Item.AddPair('name',               '$exception');
   Item.AddPair('evaluateName',       '$exception');
@@ -4663,7 +4709,10 @@ begin
       var ValueStr, ClsName: string;
       var VarRef: Integer;
       var ObjAddr: UInt64;
-      if BuildCurrentExceptionRef(ValueStr, ClsName, VarRef, ObjAddr) then begin
+      var HandlerKind: TExcHandlerBlockKind;
+      var ExcReason: string;
+      if BuildCurrentExceptionRef(ValueStr, ClsName, VarRef, ObjAddr,
+           HandlerKind, ExcReason) then begin
         Body.AddPair('result', ValueStr);
         if ClsName <> '' then Body.AddPair('type', ClsName);
         Body.AddPair('variablesReference', TJSONNumber.Create(VarRef));
@@ -4683,7 +4732,13 @@ begin
           NoExcText := '<hardware fault: no Delphi exception object exists yet --' +
             ' the RTL creates one only when it converts the fault. The fault''s' +
             ' class, address and message are in the stop reason and the Debug' +
-            ' Console.>';
+            ' Console.>'
+        else if ExcReason <> '' then
+          // Away from an exception stop the honest answer is not "none" but
+          // WHY none: on a 32-bit target the handler's extent is not derivable
+          // at all, and a row that simply never appears is indistinguishable
+          // from a bug.
+          NoExcText := '<no exception in scope: ' + ExcReason + '>';
         Body.AddPair('result', NoExcText);
         Body.AddPair('variablesReference', TJSONNumber.Create(0));
       end;

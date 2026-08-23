@@ -1,6 +1,6 @@
 # Exception-handler scope — plan
 
-Status: **increment 1 DONE. Increments 2 and 3 open.** Spec'd 2026-08-23 from a live MCP repro against
+Status: **increments 1 and 2 DONE. Increment 3 open.** Spec'd 2026-08-23 from a live MCP repro against
 `Debugme.exe` and `TestTarget.exe` (not guessed — see the table below). User-
 requested: today's `$exception`/`on E:` behavior in an exception handler reads
 as a bug wearing a "by design" comment, not an actual design choice.
@@ -120,6 +120,39 @@ start working the moment `get_locals` does. **Verify this explicitly with a
 conditional-breakpoint test — do not assume it falls out for free.**
 
 ## Increment 2 — `$exception` live for the whole handler, not just the initial stop
+
+**DONE.** The plan below was right about the mechanism; two things it flagged as
+unverified came back with answers.
+
+- The RTL entry point is `System.ExceptObject`, confirmed against the shipped
+  System.pas (`TABLE_BASED_EXCEPTIONS` branch: it returns
+  `RaiseListPtr^.ExceptObject`) and present as a public symbol in a Win64 and a
+  Win32 Delphi binary. `AcquireExceptionObject` is the wrong one -- it TAKES
+  ownership of the object, which a debugger must never do to a running program.
+  The threadvar cannot be read directly: it lives in Delphi's own TLS block at
+  an offset no symbol carries, so the value is fetched by CALLING the routine.
+- Which copy of it matters, and this was not anticipated. A process split into
+  runtime packages holds the RTL in `rtl<version>.bpl` while a statically-linked
+  exe has a second one, and the two do not share a raise list. Resolving by name
+  in the BPL scenario found `TestHost.exe`'s static copy and it answered nil for
+  an exception being handled inside the package -- a confident wrong answer, and
+  the core use case of this project. Fixed by resolving in the module the
+  handler is executing in and falling back to that module's EXPORT DIRECTORY,
+  which is the only thing that still names a routine in a package shipped
+  without debug information (`TWinDebugger.TryResolveExportedRoutine`).
+
+Also measured, and it is why the RTL is involved at all: a bare `except` stores
+the exception object NOWHERE. Its block's first instruction is a `nop` on both a
+main block and a procedure; `RAX` holds the object on entry and is simply
+dropped. Written up in `EH_FORMAT_NOTES.md`.
+
+The gate is the block locator increment 1 built, restricted to
+`ehbBareExcept` -- which is what makes requirement 3's exclusion structural
+rather than a rule someone has to remember. x86 refuses with a reason naming the
+limitation; `Win32_BareHandlerException_RefusesWithAReason` asserts both halves
+against an x64 control at the same marker.
+
+### The plan as written
 
 Applies only to the **unaliased** case (bare `except .. end`, no `on`) — once
 increment 1 lands, the aliased case is already correct for the handler's full

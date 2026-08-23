@@ -285,6 +285,7 @@ type
     // an $ActRec activation record with debug-info members. False when not found.
     function  TryFindClosureSelf(out SelfAddr: UInt64; out ClassName: string): Boolean;
     procedure AppendClosureCapturedLocals(var Locals: TArray<TSessionVariable>);
+    procedure AppendBareHandlerException(var Vars: TArray<TSessionVariable>);
     // Surface the anon method's own declared parameters (arg1..argN) from the
     // decoded signature + Win64 ABI home slots (no provider carries their slots).
     procedure AppendAnonMethodParams(var Locals: TArray<TSessionVariable>;
@@ -3265,6 +3266,43 @@ begin
   Result := FExpander.GetChildren(Handle);
 end;
 
+// A bare `except .. end` catches an exception it gives no name to, so nothing
+// in the frame's locals refers to it and there is nothing for the user to type
+// into a watch either. Surface it as `$exception`, for as long as the stop
+// stays inside that block.
+//
+// Only for the BARE form. An `on X: ... do` clause already names the object,
+// and that name is an ordinary local row -- listing the same object twice under
+// two names in one Locals scope is worse than listing it once.
+procedure TDebugSession.AppendBareHandlerException(
+  var Vars: TArray<TSessionVariable>);
+begin
+  if FDebugger = nil then Exit;
+  var Kind: TExcHandlerBlockKind;
+  var ObjVA: UInt64;
+  var Reason: string;
+  if not FDebugger.TryGetHandlerException(Kind, ObjVA, Reason) then Exit;
+  if Kind <> ehbBareExcept then Exit;
+  if (ObjVA < 65536) or (EnsureRtti = nil) or not EnsureRtti.IsClassInstance(ObjVA) then Exit;
+
+  var V := Default(TSessionVariable);
+  V.Name         := '$exception';
+  V.EvaluateName := '$exception';
+  V.TypeName     := EnsureRtti.GetInstanceClassName(ObjVA);
+  if V.TypeName = '' then
+    V.TypeName := 'Exception';
+  V.Value := V.TypeName;
+  if (ObjVA = FDebugger.CurrentExceptionObject) and
+     (FDebugger.LastExceptionMessage <> '') then
+    V.Value := V.TypeName + ': ' + FDebugger.LastExceptionMessage;
+  V.Kind       := vkClass;
+  V.Address    := ObjVA;
+  V.Expandable := True;
+  SyncExpander;
+  V.Handle := FExpander.MakeClassExpansion(ObjVA, V.TypeName, '$exception');
+  Vars := Vars + [V];
+end;
+
 function TDebugSession.GetLocals: TArray<TSessionVariable>;
 begin
   var Guard := InteractiveWait;   // bound symbol-index waits (F14)
@@ -3288,6 +3326,7 @@ begin
     // Inside an anonymous method body, the captured variables live in the hidden
     // Self ($ActRec) object, not the (empty) stack-local set -- surface them.
     AppendClosureCapturedLocals(Result);
+    AppendBareHandlerException(Result);
   finally
     if Retarget then
       FDebugger.ClearActiveFrame;

@@ -405,6 +405,22 @@ type
     // (0 when not stopped on a Delphi raise). Surfaced as the `$exception`
     // pseudo-local so the object is inspectable in the Variables panel.
     function  CurrentExceptionObject: UInt64;
+    // The exception the `except` block the stopped PC is standing IN is
+    // currently handling, and what kind of block that is.
+    //
+    // A different question from CurrentExceptionObject, which is the last raise
+    // this debugger SAW. That one stays set for the rest of the session -- long
+    // after the handler returned and the RTL freed the object -- so it cannot
+    // answer "is there an exception in scope right now" without lying every
+    // time the answer is no. This asks the RTL's own per-thread raise list
+    // (System.ExceptObject), which is right by construction, nested handlers
+    // included.
+    //
+    // Kind is ehbNone whenever the PC is not inside a handler this debugger can
+    // locate. Reason names what is missing whenever the answer is False, so a
+    // caller can say WHY instead of showing nothing.
+    function  TryGetHandlerException(out Kind: TExcHandlerBlockKind;
+                out ObjVA: UInt64; out Reason: string): Boolean;
 
     // Memory I/O.
     function  ReadProcessMemoryAt(VA: UInt64; Buf: Pointer; Size: NativeUInt): Boolean;

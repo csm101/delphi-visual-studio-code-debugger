@@ -417,6 +417,22 @@ absurdly.
   a re-attach in the same session loads module symbols synchronously (slower first stop,
   still correct); no-op when prefetch is off, which is the default.
 
+## RTL routines in a packaged application
+
+- **An RTL routine resolved BY NAME can be the wrong copy.** A process split
+  into runtime packages holds the RTL in `rtl<version>.bpl`, but an exe that
+  links the RTL statically has a second one, and per-thread RTL state is NOT
+  shared between them. Resolving `System.ExceptObject` by name in
+  `TestHost.exe` + `TestSubject.bpl` finds the host's static copy, whose raise
+  list is empty, and calling it says "nothing is being handled" while the
+  package is inside a handler. Resolve in the module the code is EXECUTING in
+  (compare `SymGetModuleBase64` of the candidate against that of the PC), and
+  fall back to `TWinDebugger.TryResolveExportedRoutine` — `rtl290.bpl` has no
+  debug information at all, and its export directory is the only thing left
+  that names a routine.
+- The same hazard applies to every other by-name RTL lookup in the engine
+  (`@UStrAsg` and friends in `SetStringVariable`). Not yet re-measured there.
+
 ## Synthetic calls into the debuggee
 
 - **Aborting a call does not give the thread back.** The abort hijacks RIP to the

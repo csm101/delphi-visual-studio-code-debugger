@@ -503,6 +503,19 @@ fixture):
       handler via runtime VMT (`Test_BL_Exc_BplDefinedClass`)
 - [x] Re-raise (bare `raise;`) -- second exception stop, propagation to the
       outer handler (`Test_BL_Exc_ReRaise`)
+- [x] Bare `except .. end` (no `on`): the caught exception is a `$exception`
+      Locals row and an evaluable expression for the WHOLE block, in a
+      procedure, in a BPL and in a program main block
+      (`Test_BareHandler_DollarExceptionInLocals`,
+      `Test_BareHandler_DollarExceptionEvaluates`,
+      `Test_MainBlockBareHandler_DollarExceptionInLocals`)
+- [x] `$exception` and an `on E:` alias are mutually exclusive for one handler
+      (`Test_MainBlockAliasedHandler_NoDollarExceptionBesideAlias`,
+      `Test_MainBlockHandler_AliasAbsentInBareHandler`) and neither is offered
+      outside a handler (`Test_MainBlock_NoDollarExceptionOutsideAnyHandler`)
+- [x] x86 states the limitation instead of showing nothing, against an x64
+      control at the same marker
+      (`Win32_BareHandlerException_RefusesWithAReason`)
 - [ ] Nested except / try-finally
 - [x] OS exception (access violation) surfaces via the `av` filter
       (`Test_BL_Exc_OsAccessViolation`)

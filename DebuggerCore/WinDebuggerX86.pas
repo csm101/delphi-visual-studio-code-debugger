@@ -67,6 +67,7 @@ type
     // Declines, always -- see the body.
     function  TryGetExceptHandlerBlockAt(PC: UInt64;
                 out Blk: TExcHandlerBlock): Boolean; override;
+    function  ExceptHandlerScopeUnavailableReason: string; override;
     // Base address of the 32-bit TEB of Tid, which is where fs:[0] points.
     function  Teb32Base(Tid: DWORD; out Base: UInt64; out How: string): Boolean;
 
@@ -857,6 +858,15 @@ end;
 // deliberate choice over the alternative (stop on the stub, whose address does
 // resolve to the `finally` line): a refusal that names what is missing is worth
 // more than a stop that looks right and is not.
+function TWin32Debugger.ExceptHandlerScopeUnavailableReason: string;
+begin
+  Result := 'this is a 32-bit target: it has no `.pdata`, so nothing in it ' +
+    'states where an `except` block begins and ends. The fs:[0] chain answers ' +
+    'a different question -- where an exception WOULD be dispatched -- and for ' +
+    'a bare `except` it does not name the block at all. Handler-scoped ' +
+    '`$exception` and the synthesised `on` alias are therefore x64-only.';
+end;
+
 function TWin32Debugger.TryGetExceptHandlerBlockAt(PC: UInt64;
   out Blk: TExcHandlerBlock): Boolean;
 begin

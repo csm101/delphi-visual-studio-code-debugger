@@ -1923,6 +1923,20 @@ begin
   end;
 end;
 
+// A bare `except .. end` inside an ordinary PROCEDURE. The exception it caught
+// has no source-level name at all, so `$exception` is the only way to reach it
+// -- and unlike the main-block probes this one is compiled into the BPL too, so
+// the scenario covers a runtime package as well as a monolithic exe.
+procedure RunBareExceptProbe;
+begin
+  try
+    raise Exception.Create('bare-test-probe');
+  except
+    GSink.Use(['bare handler']);
+    GSink.Use([0]); // {BP:BARE_EXCEPT}
+  end;
+end;
+
 function FreeAdd(A, B: Integer): Integer;
 begin
   Result := A + B;
@@ -2521,6 +2535,9 @@ begin
   if FindCmdLineSwitch('run-exception-handler') or
      FindCmdLineSwitch('-run-exception-handler') then
     RunExceptionHandlerProbe;
+  if FindCmdLineSwitch('run-bare-except') or
+     FindCmdLineSwitch('-run-bare-except') then
+    RunBareExceptProbe;
   if FindCmdLineSwitch('run-exception-test') or
      FindCmdLineSwitch('-run-exception-test') then
     RunExceptionTest;

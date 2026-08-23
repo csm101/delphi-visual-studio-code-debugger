@@ -600,6 +600,18 @@ type
     // quietly break the case that already worked.
     [Test] procedure Test_ProcedureHandler_AliasStillListedInLocals;
 
+    // --- `$exception` for the whole life of a bare handler -------------------
+    // A bare `except .. end` names its exception nothing, and stores it
+    // nowhere: measured, the block's first instruction is a `nop` and the
+    // object is only ever on the RTL's per-thread raise list. So `$exception`
+    // is the only handle on it, and it has to stay valid for every stop inside
+    // the block -- not just at the instant of the raise.
+    [Test] procedure Test_BareHandler_DollarExceptionInLocals;
+    [Test] procedure Test_BareHandler_DollarExceptionEvaluates;
+    [Test] procedure Test_MainBlockBareHandler_DollarExceptionInLocals;
+    [Test] procedure Test_MainBlockAliasedHandler_NoDollarExceptionBesideAlias;
+    [Test] procedure Test_MainBlock_NoDollarExceptionOutsideAnyHandler;
+
     // --- expression evaluator: class property (field-backed) via dot syntax ---
     [Test]
     procedure Test_Eval_PropertyDot;
@@ -4115,6 +4127,102 @@ begin
       'the `on E:` alias of a handler inside a procedure must stay in Locals');
     Assert.IsTrue(ExcVar.GetValue<string>('type', '').Contains('Exception'),
       'E should be typed as an Exception, got: ' + ExcVar.GetValue<string>('type', ''));
+  finally
+    ExcVar.Free;
+  end;
+end;
+
+// A bare handler inside an ordinary procedure -- and, under the BPL scenario,
+// inside a runtime package. The stop is two statements into the block, so this
+// is "still valid after continuing past the raise", not "valid at the raise".
+procedure TDebuggerTests.Test_BareHandler_DollarExceptionInLocals;
+var FrameId, LocalsRef: Integer;
+    ExcVar: TJSONObject;
+begin
+  StartSession('BARE_EXCEPT', FrameId, LocalsRef, ['--run-bare-except']);
+  ExcVar := FindLocalByName(FClient, LocalsRef, '$exception');
+  try
+    Assert.IsNotNull(ExcVar,
+      'a bare `except` must surface its exception as $exception in Locals');
+    Assert.IsTrue(ExcVar.GetValue<string>('value', '').Contains('bare-test-probe'),
+      '$exception should carry the raised message, got: '
+      + ExcVar.GetValue<string>('value', ''));
+    Assert.IsTrue(ExcVar.GetValue<Integer>('variablesReference', 0) > 0,
+      '$exception must be expandable');
+  finally
+    ExcVar.Free;
+  end;
+end;
+
+// Same stop, through `evaluate`. This is the path a Watch expression and a
+// breakpoint condition take, and it used to answer `<no current exception>`
+// anywhere but the original exception stop.
+procedure TDebuggerTests.Test_BareHandler_DollarExceptionEvaluates;
+var FrameId, LocalsRef: Integer;
+    Resp: TJSONObject;
+begin
+  StartSession('BARE_EXCEPT', FrameId, LocalsRef, ['--run-bare-except']);
+  Resp := FClient.Evaluate('$exception', FrameId, 'watch');
+  try
+    Assert.IsTrue(Resp.GetValue<string>('result', '').Contains('bare-test-probe'),
+      'evaluate $exception inside a bare handler should return the live ' +
+      'exception, got: ' + Resp.GetValue<string>('result', ''));
+    Assert.IsTrue(Resp.GetValue<Integer>('variablesReference', 0) > 0,
+      'evaluate $exception must return an expandable reference');
+  finally
+    Resp.Free;
+  end;
+end;
+
+// The same again in a program main block, where the frame has no locals table
+// worth the name.
+procedure TDebuggerTests.Test_MainBlockBareHandler_DollarExceptionInLocals;
+var FrameId, LocalsRef: Integer;
+    ExcVar: TJSONObject;
+begin
+  StartSession('MAIN_EXC_BARE', FrameId, LocalsRef, ['--main-exc']);
+  ExcVar := FindLocalByName(FClient, LocalsRef, '$exception');
+  try
+    Assert.IsNotNull(ExcVar,
+      'a bare `except` in the main block must surface $exception too');
+    Assert.IsTrue(ExcVar.GetValue<string>('value', '').Contains('main-bare'),
+      '$exception should carry the raised message, got: '
+      + ExcVar.GetValue<string>('value', ''));
+  finally
+    ExcVar.Free;
+  end;
+end;
+
+// Mutual exclusion, the other way round from
+// Test_MainBlockHandler_AliasAbsentInBareHandler: where the handler DOES name
+// the exception, `$exception` must not appear beside the alias. One object
+// under two names in one Locals scope reads as two variables.
+procedure TDebuggerTests.Test_MainBlockAliasedHandler_NoDollarExceptionBesideAlias;
+var FrameId, LocalsRef: Integer;
+    ExcVar: TJSONObject;
+begin
+  StartSession('MAIN_EXC_ALIASED', FrameId, LocalsRef, ['--main-exc']);
+  ExcVar := FindLocalByName(FClient, LocalsRef, '$exception');
+  try
+    Assert.IsNull(ExcVar,
+      '$exception must not be listed beside an `on E:` alias for the same handler');
+  finally
+    ExcVar.Free;
+  end;
+end;
+
+// And outside every handler it must be gone again -- the debugger's record of
+// the last raise it saw survives for the rest of the session, so "there is an
+// exception in scope" cannot be answered from it.
+procedure TDebuggerTests.Test_MainBlock_NoDollarExceptionOutsideAnyHandler;
+var FrameId, LocalsRef: Integer;
+    ExcVar: TJSONObject;
+begin
+  StartSession('MAIN_GCOUNTER', FrameId, LocalsRef, ['--main-exc']);
+  ExcVar := FindLocalByName(FClient, LocalsRef, '$exception');
+  try
+    Assert.IsNull(ExcVar,
+      '$exception must not be listed when the stop is not inside a handler');
   finally
     ExcVar.Free;
   end;

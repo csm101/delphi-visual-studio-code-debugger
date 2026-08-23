@@ -102,7 +102,7 @@ VS Code  ── DAP (JSON over stdio) ──>  VisualStudioCodeDelphiDebugger.ex
 - `DebuggerTests\`: DUnitX integration test suite. Launches the adapter,
   exercises BPs / locals / step / globals / evaluate.
   Run with `cmd /c "C:\Athens\GitHub\Win64Debugger\DebuggerTests\build_and_run.bat"`.
-  Current status: **1282 found / 1278 pass / 0 fail / 0 leaked / 4 ignored**,
+  Current status: **1293 found / 1289 pass / 0 fail / 0 leaked / 4 ignored**,
   in ~80 s (~12 s build + ~68 s of tests across 8 concurrent worker processes).
   Set `RUNTESTS_JOBS=1` for the sequential path — same results, ~440 s. See
   "Parallel execution" in `CLAUDE.md`.
@@ -1220,6 +1220,20 @@ Architecture / portability:
   Common "noise" first-chance codes seen in large Delphi apps:
   `STATUS_GUARD_PAGE_VIOLATION` ($80000001, fires on every stack/heap page
   growth), C++ SEH probing, CLR internal exceptions.
+- **`$exception` for the whole life of a bare handler — implemented (x64).**
+  A bare `except .. end` names its exception nothing and, measured, stores it
+  nowhere: the block's first instruction is a `nop`. The object exists only on
+  the RTL's per-thread raise list, so the debugger asks the RTL —
+  `System.ExceptObject`, called in the target, resolved in the module the
+  handler runs in and falling back to that module's export directory for a
+  packaged RTL that ships without symbols (`TryResolveExportedRoutine`; getting
+  this wrong reads another RTL's empty raise list and reports, confidently,
+  that nothing is being handled). Gated on the PC being inside a bare-except
+  block, so the row appears for every stop in the handler and disappears at its
+  end. `IDebugTarget.TryGetHandlerException`; surfaced by
+  `DapServer.AppendExceptionLocal` and `TDebugSession.AppendBareHandlerException`.
+  Never offered beside an `on E:` alias. x86 refuses with a reason that names
+  the limitation rather than rendering nothing.
 - **The `on E:` alias of a handler in a PROGRAM MAIN BLOCK — implemented
   (x64).** `get_locals` lists it while, and only while, the stop is lexically
   inside that clause. It is not an ordinary local and never was: dcc gives a

@@ -129,6 +129,44 @@ If no entry covers `BlockRva + 1`, the end is NOT derivable and the caller must
 decline. Widening to the end of the routine would keep a handler-scoped name
 alive past its own block, which reads as a live variable and is a dangling one.
 
+### A bare `except` keeps the object NOWHERE
+
+The table above has no row for a bare `except .. end`, and that is the finding,
+not an omission. Measured on both a program main block and an ordinary
+procedure, the block's first instruction is a `nop`: `RAX` still holds the
+exception object on entry and the compiler simply does not store it. There is no
+slot to read and no name to read it under.
+
+```
+$2FD90  90                      nop                     ; Debugme.dpr:112   (main block)
+$2B8C5  90                      nop                     ; ExcNestFixture.dpr:95 (procedure)
+```
+
+So for a bare handler the exception exists, for a debugger's purposes, only on
+the RTL's own per-thread raise list -- `RaiseListPtr`, pushed by the handler
+prologue and popped by `System.@DoneExcept`. `System.ExceptObject` returns
+`RaiseListPtr^.ExceptObject` and is the only always-correct source: it is right
+under nesting, and it goes empty exactly when the handler ends.
+
+Reading `RaiseListPtr` directly is not an option -- it is a threadvar in
+Delphi's own TLS block at an offset no symbol carries -- so it is reached by
+CALLING `System.ExceptObject` in the target.
+
+**Which copy of it.** A process can hold more than one RTL, and they do not
+share a raise list: an exe that links the RTL statically has its own, while a
+package that `requires rtl` uses the one in `rtl<version>.bpl`. Calling the
+wrong copy reads an empty raise list and reports, with complete confidence, that
+nothing is being handled -- measured on `TestHost.exe` + `TestSubject.bpl`,
+where the host's static copy answers nil for an exception being handled inside
+the package. The copy in the module the HANDLER is executing in is the right
+one. When that module has none of its own -- the packaged case, and `rtl290.bpl`
+ships without debug information -- the export directory still names it:
+
+| bitness | export name in `rtl290.bpl` |
+|---|---|
+| x64 | `_ZN6System12ExceptObjectEv` |
+| x86 | `@System@ExceptObject$qqrv` |
+
 ### The `on` alias, and where the compiler puts it
 
 `on <X>: <Class> do` allocates X, and the block's FIRST instruction stores the

@@ -37,6 +37,12 @@ type
     // A breakpoint on a 32-bit target must bind and fire, and report the line
     // the user asked for.
     [Test] procedure Win32_Breakpoint_BindsAndFires;
+    // Handler-scoped `$exception` is x64-only, and the 32-bit answer has to be
+    // a stated limitation rather than an empty Locals row. A row that simply
+    // never appears is indistinguishable from a bug from the outside, so the
+    // x64 control here proves the feature works at the same marker while the
+    // 32-bit side proves the refusal SAYS why.
+    [Test] procedure Win32_BareHandlerException_RefusesWithAReason;
     // The call stack must unwind past the recursion into the caller chain --
     // this is what StackWalk64 with IMAGE_FILE_MACHINE_I386 buys.
     [Test] procedure Win32_CallStack_UnwindsPastRecursion;
@@ -728,7 +734,8 @@ end;
 // rather than blocking forever. The caller owns Session.Free.
 function OpenSessionAtMarker(const ExePath, MapPath, RsmPath, SourceRoot,
   SourceBaseName: string; Line: Integer;
-  const TargetArgs: string = ''): TDebugSession;
+  const TargetArgs: string = '';
+  SilenceExceptionFilters: Boolean = False): TDebugSession;
 begin
   Result := TDebugSession.Create;
   var Opts: TLaunchOptions;
@@ -741,6 +748,14 @@ begin
   // Several TestTarget scenarios only run behind a command-line switch, so
   // without this a breakpoint inside one verifies and then never hits.
   Opts.Args        := TargetArgs;
+  // A scenario that RAISES on its way to the marker stops on the raise first
+  // with the default filters, and the pump below returns at that stop -- the
+  // breakpoint never gets a turn. Callers whose fixture deliberately raises
+  // ask for silence instead of racing it.
+  if SilenceExceptionFilters then begin
+    Opts.ExceptionFilters    := Default(TExceptionFilters);
+    Opts.ExceptionFiltersSet := True;
+  end;
 
   Assert.IsTrue(Result.Launch(Opts), 'Launch returned False');
 
@@ -4264,6 +4279,54 @@ begin
     Assert.AreEqual(Line, StopLine, 'stopped on the wrong line');
   finally
     Session.Free;
+  end;
+end;
+
+procedure TWin32RunControlTests.Win32_BareHandlerException_RefusesWithAReason;
+const
+  SRC    = 'TestTargetCore.pas';
+  MARKER = 'BARE_EXCEPT';
+  ARGS   = '--run-bare-except';
+begin
+  var Line := MarkerLine(SRC, MARKER);
+  Assert.IsTrue(Line > 0, 'marker not found: ' + MARKER);
+
+  // The x64 control first: same source, same marker, same fixture, so a
+  // failure here is about the feature and not about the fixture.
+  var S64 := OpenSessionAtMarker(Win64Exe, Win64Map, Win64Rsm, TargetDir,
+    SRC, Line, ARGS, {SilenceExceptionFilters=}True);
+  try
+    Assert.AreEqual(Ord(dsStopped), Ord(S64.State), 'the x64 control did not stop');
+    var Found64 := False;
+    var Seen := '';
+    for var V in S64.GetLocals do begin
+      Seen := Seen + V.Name + ' ';
+      if V.Name = '$exception' then begin
+        Found64 := True;
+        Assert.IsTrue(V.Value.Contains('bare-test-probe'),
+          'x64 $exception should carry the raised message, got: ' + V.Value);
+      end;
+    end;
+    var FnName, SrcFile: string;
+    var StopLine: Integer;
+    S64.GetCurrentLocation(FnName, SrcFile, StopLine);
+    Assert.IsTrue(Found64,
+      Format('the x64 control did not list $exception inside a bare handler ' +
+             '(stopped in %s at %s:%d; locals: %s)',
+             [FnName, ExtractFileName(SrcFile), StopLine, Seen]));
+  finally
+    S64.Free;
+  end;
+
+  var S32 := OpenSessionAtMarker(Win32Exe, Win32Map, Win32Rsm, TargetDir,
+    SRC, Line, ARGS, {SilenceExceptionFilters=}True);
+  try
+    Assert.AreEqual(Ord(dsStopped), Ord(S32.State), 'the 32-bit target did not stop');
+    for var V in S32.GetLocals do
+      Assert.AreNotEqual('$exception', V.Name,
+        'a 32-bit target cannot bound a handler block, so it must not claim to');
+  finally
+    S32.Free;
   end;
 end;
 
