@@ -414,6 +414,9 @@ type
     // thread is currently executing.
     function  TryGetExceptHandlerBlockAt(PC: UInt64;
                 out Blk: TExcHandlerBlock): Boolean; virtual;
+    // Why TryGetExceptHandlerBlockAt can never answer on this target, or '' when
+    // it can in principle and simply did not this time. x86 overrides it.
+    function  ExceptHandlerScopeUnavailableReason: string; virtual;
     // The exception alias of the `on <X>: <Class> do` clause PC is standing in,
     // when the compiler put X somewhere the ordinary locals path cannot see.
     //
@@ -777,9 +780,6 @@ type
     // `_ZN6System12ExceptObjectEv` on x64, `@System@ExceptObject$qqrv` on x86.
     function  TryResolveExportedRoutine(ModBase: UInt64;
                 const ExportName: AnsiString; out VA: UInt64): Boolean;
-    // Why TryGetExceptHandlerBlockAt can never answer on this target, or '' when
-    // it can in principle and simply did not this time. x86 overrides it.
-    function  ExceptHandlerScopeUnavailableReason: string; virtual;
     procedure SetExceptionRules(const Rules: TArray<TExceptionRule>);
     property  OnStopped:      TOnStopped     read GetOnStopped     write SetOnStopped;
     property  OnExited:       TOnExited      read GetOnExited      write SetOnExited;
