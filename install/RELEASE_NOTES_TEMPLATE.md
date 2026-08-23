@@ -2,6 +2,12 @@ Debug Delphi Win32 and Win64 applications from VS Code, or from an AI agent over
 MCP. No Delphi toolchain and no build step needed to install: the adapter, the
 MCP server and the VS Code extension are all compiled and bundled.
 
+## 📖 [Documentation, tutorial and feature tour → mcasoftware.dev](https://mcasoftware.dev/products/delphi-debugger/index.html)
+
+New here? **Start there rather than with this page.** It covers installation, a
+first debug session, a 12-chapter VS Code tutorial, the MCP / AI-agent guide and
+the architecture notes, with screenshots.
+
 The adapter is always a 64-bit process, whichever target it debugs — a 32-bit
 application is debugged across the WOW64 boundary, so the debugger does not work
 inside a 32-bit address space, which is where a large project's symbol data

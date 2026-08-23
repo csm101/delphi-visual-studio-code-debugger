@@ -3,6 +3,12 @@
 Debug **Delphi 32-bit and 64-bit** applications directly in VS Code — no
 Embarcadero IDE required.
 
+### 📖 [Documentation, tutorial and feature tour → mcasoftware.dev](https://mcasoftware.dev/products/delphi-debugger/index.html)
+
+**Start there.** Installation, a first debug session, a **12-chapter VS Code
+tutorial**, the MCP / AI-agent guide and the architecture notes, with
+screenshots. What follows here is the reference.
+
 This extension registers the `delphi-win64` debug type and ships a Debug Adapter
 Protocol (DAP) server that drives the Windows Debug API. It reads the debug
 information the Delphi compiler already emits (`.map`, `.rsm`, the TD32 `.debug`

@@ -13,7 +13,7 @@
   "bugs": {
     "url": "https://github.com/csm101/delphi-visual-studio-code-debugger/issues"
   },
-  "homepage": "https://github.com/csm101/delphi-visual-studio-code-debugger#readme",
+  "homepage": "https://mcasoftware.dev/products/delphi-debugger/index.html",
   "icon": "icon.png",
   "engines": {
     "vscode": "^1.80.0"
