@@ -3152,7 +3152,24 @@ has no `.pdata`, so nothing in it states a block's extent; the refusal from
 
 `DapServer` prepends the synthetic `$exception` row to the Locals scope via
 `AppendExceptionLocal`; `TDebugSession.AppendBareHandlerException` does the same
-for the MCP frontend. The shared `BuildCurrentExceptionRef` builds the
+for the MCP frontend.
+
+`$exception` is also a token of the EXPRESSION language
+(`TExprEvaluator.ResolveCurrentException`), matched in `ParsePrimary` ahead of
+the integer-literal scanner -- `$` opens a Pascal hex literal and `$e` is a
+valid one, so the scanner used to consume two characters and leave `xception`
+as an unexpected token. It resolves to an ordinary class-typed operand, which is
+what makes `$exception.Message` and `$exception is EMyError` work and, more to
+the point, what makes `$exception` usable in a BREAKPOINT CONDITION -- that path
+runs through `BreakpointEval` and never sees the frontend's literal-string
+intercept. Where no exception is in scope it yields
+`<no exception in scope: ...>` carrying the refusal reason, never a parse error
+about a name the user typed correctly.
+
+`HandleEvaluate` keeps its short-circuit for the bare literal `$exception`
+because that path also mints the `Class: Message` display and a
+`memoryReference`, matching the Locals row; anything dotted or compound goes to
+the parser. The shared `BuildCurrentExceptionRef` builds the
 inline `Class: Message` value and an expansion ref (`ekRsmMembers` when the class
 is in RSM/TD32, else `ekClass` RTTI reader). `HandleEvaluate` short-circuits a
 bare `$exception` through the same builder (frame-independent, resolved before

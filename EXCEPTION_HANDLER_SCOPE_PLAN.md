@@ -1,6 +1,6 @@
 # Exception-handler scope — plan
 
-Status: **increments 1 and 2 DONE. Increment 3 open.** Spec'd 2026-08-23 from a live MCP repro against
+Status: **DONE** -- all three increments landed, every acceptance criterion covered by a test. Spec'd 2026-08-23 from a live MCP repro against
 `Debugme.exe` and `TestTarget.exe` (not guessed — see the table below). User-
 requested: today's `$exception`/`on E:` behavior in an exception handler reads
 as a bug wearing a "by design" comment, not an actual design choice.
@@ -195,6 +195,22 @@ nothing — a Watch/Locals row that just never appears, with no explanation,
 is indistinguishable from a bug from the outside.
 
 ## Increment 3 — `$exception` as a parseable expression token
+
+**DONE**, and exactly as diagnosed: `$` opens a Pascal hex literal, `$e` is a
+valid one, so `ScanIntLiteral` consumed two characters and left `xception` as an
+unexpected token at position 3. `$exception` is now matched in `ParsePrimary`
+ahead of the literal scanner and resolves to an ordinary class-typed operand
+(`TExprEvaluator.ResolveCurrentException`), so `$exception.Message` and
+`$exception is EMyError` are expressions like any other -- and a breakpoint
+condition, which never sees the DAP frontend's literal-string intercept, works.
+
+Where no exception is in scope the answer is `<no exception in scope: reason>`
+rather than a parse error about a name the user typed correctly; that is also
+how a 32-bit target reports the limitation from increment 2.
+
+The frontend's short-circuit for the bare literal `$exception` is deliberately
+kept: it mints the `Class: Message` display and a `memoryReference` matching the
+Locals row. Anything dotted or compound goes to the parser.
 
 Separate, narrower bug, independent of whether an exception is actually
 active right now: `evaluate_expression("$exception")` fails to parse at all

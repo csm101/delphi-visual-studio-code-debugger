@@ -514,8 +514,15 @@ fixture):
       `Test_MainBlockHandler_AliasAbsentInBareHandler`) and neither is offered
       outside a handler (`Test_MainBlock_NoDollarExceptionOutsideAnyHandler`)
 - [x] x86 states the limitation instead of showing nothing, against an x64
-      control at the same marker
+      control at the same marker, and says it through `evaluate` too rather
+      than only by omitting a row
       (`Win32_BareHandlerException_RefusesWithAReason`)
+- [x] `$exception` is a real expression token: dotted expressions
+      (`Test_DollarException_DottedExpressionEvaluates`), breakpoint conditions
+      in both directions (`Test_DollarException_GatesConditionalBreakpoint`,
+      `Test_DollarException_ConditionFalse_NeverStops`), and a stated reason
+      instead of a parse error where no exception is in scope
+      (`Test_DollarException_OutsideHandler_SaysWhyNotParseError`)
 - [ ] Nested except / try-finally
 - [x] OS exception (access violation) surfaces via the `av` filter
       (`Test_BL_Exc_OsAccessViolation`)

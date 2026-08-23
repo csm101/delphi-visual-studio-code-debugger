@@ -256,6 +256,10 @@ type
     function  InvalidValue(const Msg: string): TExprValue;
     function  LocalToExpr(const L: TLocalValue): TExprValue;
     function  ResolveIdent(const Name: string): TExprValue;
+    // `$exception` -- the exception in scope right now, as an ordinary
+    // class-typed operand, so `$exception.Message` and
+    // `$exception is EMyError` are expressions like any other.
+    function  ResolveCurrentException: TExprValue;
     function  TryGetRegister(const Regs: TRegisterSnapshot; const Name: string;
                 out Val: UInt64): Boolean;
 
@@ -490,6 +494,42 @@ begin
   Result          := Default(TExprValue);
   Result.TypeHint := Msg;
   Result.IsValid  := False;
+end;
+
+function TExprEvaluator.ResolveCurrentException: TExprValue;
+const
+  TK_CLASS = 7;
+begin
+  if FDebugger = nil then
+    Exit(InvalidValue('<no exception in scope: no debug session>'));
+
+  // Two sources, the same two the Locals row uses: the stop itself when it is
+  // an exception stop, otherwise the `except` block the PC is standing in.
+  var ObjVA := FDebugger.CurrentExceptionObject;
+  var Reason := '';
+  if not FDebugger.StoppedOnUndeliveredException then begin
+    var Kind: TExcHandlerBlockKind;
+    if not FDebugger.TryGetHandlerException(Kind, ObjVA, Reason) then
+      ObjVA := 0;
+  end;
+  if ObjVA = 0 then begin
+    if Reason = '' then
+      Reason := 'no Delphi exception object';
+    Exit(InvalidValue('<no exception in scope: ' + Reason + '>'));
+  end;
+
+  var LV := Default(TLocalValue);
+  LV.Name       := '$exception';
+  LV.Address    := 0;         // a pseudo-variable: the object has an address, the NAME has no slot
+  LV.RawValue   := ObjVA;
+  LV.ValueValid := True;
+  LV.Kind       := lkLocal;
+  LV.TypeKind   := TK_CLASS;
+  if FRtti <> nil then
+    LV.TypeHint := FRtti.GetInstanceClassName(ObjVA);
+  if LV.TypeHint = '' then
+    LV.TypeHint := 'Exception';
+  Result := LocalToExpr(LV);
 end;
 
 function TExprEvaluator.LocalToExpr(const L: TLocalValue): TExprValue;
@@ -4391,6 +4431,14 @@ begin
      CharInSet(FExpr[FPos + 1], ['0'..'9']) then
     Exit(InvalidValue('<a Pascal float literal needs a digit before the point: ' +
       'write 0.5, not .5>'));
+
+  // `$exception`, BEFORE the integer literal below. `$` opens a Pascal hex
+  // literal, and `$e` is a valid one, so the literal scanner used to eat the
+  // first two characters and leave `xception` as an unexpected token -- which
+  // is why `$exception` worked only where a frontend intercepted the whole
+  // string before the parser ever saw it, and never in a breakpoint condition.
+  if MatchKeyword('$exception') then
+    Exit(ResolveCurrentException);
 
   // Integer literal (decimal, $HEX, 0xHEX)
   if CharInSet(FExpr[FPos], ['0'..'9', '$']) then begin

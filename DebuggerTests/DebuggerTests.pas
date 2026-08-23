@@ -612,6 +612,17 @@ type
     [Test] procedure Test_MainBlockAliasedHandler_NoDollarExceptionBesideAlias;
     [Test] procedure Test_MainBlock_NoDollarExceptionOutsideAnyHandler;
 
+    // --- `$exception` as a real expression token -----------------------------
+    // `$` opens a Pascal hex literal and `$e` is a valid one, so the literal
+    // scanner used to eat two characters and leave `xception` behind. The name
+    // therefore worked ONLY where a frontend intercepted the whole string
+    // before the parser saw it -- never in a dotted expression, never in a
+    // breakpoint condition.
+    [Test] procedure Test_DollarException_DottedExpressionEvaluates;
+    [Test] procedure Test_DollarException_GatesConditionalBreakpoint;
+    [Test] procedure Test_DollarException_ConditionFalse_NeverStops;
+    [Test] procedure Test_DollarException_OutsideHandler_SaysWhyNotParseError;
+
     // --- expression evaluator: class property (field-backed) via dot syntax ---
     [Test]
     procedure Test_Eval_PropertyDot;
@@ -4225,6 +4236,96 @@ begin
       '$exception must not be listed when the stop is not inside a handler');
   finally
     ExcVar.Free;
+  end;
+end;
+
+// A dotted expression never reaches the frontend's literal-string intercept,
+// so this is the parser answering.
+procedure TDebuggerTests.Test_DollarException_DottedExpressionEvaluates;
+var FrameId, LocalsRef: Integer;
+    Resp: TJSONObject;
+begin
+  StartSession('BARE_EXCEPT', FrameId, LocalsRef, ['--run-bare-except']);
+  Resp := FClient.Evaluate('$exception.Message', FrameId, 'watch');
+  try
+    Assert.IsTrue(Resp.GetValue<string>('result', '').Contains('bare-test-probe'),
+      '$exception.Message should read the live exception, got: '
+      + Resp.GetValue<string>('result', ''));
+  finally
+    Resp.Free;
+  end;
+end;
+
+// The case the plan named as the point of the whole token: a breakpoint
+// condition, evaluated by the adapter with no Watch panel anywhere near it.
+procedure TDebuggerTests.Test_DollarException_GatesConditionalBreakpoint;
+var BpLine, FrameId, LocalsRef: Integer;
+    Stopped: TJSONObject;
+begin
+  BpLine := Bp('BARE_EXCEPT');
+
+  FClient := TDapClient.Create;
+  FClient.Start(AdapterExe);
+  FClient.Initialize.Free;
+  Assert.IsTrue(FClient.WaitForInitialized, 'adapter did not send initialized event');
+  FClient.SetBreakpoints(FBpSourceFile, [BpLine],
+    ['$exception.Message = ''bare-test-probe'''], [''], ['']).Free;
+  FClient.SetExceptionBreakpoints([]).Free;
+  LaunchTarget(['--run-bare-except']).Free;
+  FClient.ConfigDone.Free;
+
+  Stopped := FClient.WaitForStopped;
+  try
+    Assert.AreEqual('breakpoint', Stopped.GetValue<string>('reason', ''),
+      'a condition reading $exception must let the breakpoint through');
+  finally
+    Stopped.Free;
+  end;
+  FrameId   := FClient.GetFrameId;
+  LocalsRef := FClient.GetLocalsRef(FrameId);
+  Assert.IsTrue(LocalsRef > 0, 'no Locals scope at the conditional stop');
+end;
+
+// And the other direction. Without this, a condition that merely failed to
+// evaluate -- which now STOPS and reports, by design -- would pass the test
+// above without the token ever having been understood.
+procedure TDebuggerTests.Test_DollarException_ConditionFalse_NeverStops;
+var BpLine: Integer;
+begin
+  BpLine := Bp('BARE_EXCEPT');
+
+  FClient := TDapClient.Create;
+  FClient.Start(AdapterExe);
+  FClient.Initialize.Free;
+  Assert.IsTrue(FClient.WaitForInitialized, 'adapter did not send initialized event');
+  FClient.SetBreakpoints(FBpSourceFile, [BpLine],
+    ['$exception.Message = ''not-this-one'''], [''], ['']).Free;
+  FClient.SetExceptionBreakpoints([]).Free;
+  LaunchTarget(['--run-bare-except']).Free;
+  FClient.ConfigDone.Free;
+
+  Assert.IsTrue(FClient.WaitForTerminated(20000),
+    'a FALSE $exception condition must swallow the breakpoint; the target ' +
+    'stopped instead of running to exit');
+end;
+
+// Where there is no exception the answer must be a stated reason, not a parse
+// error about a token the user typed correctly.
+procedure TDebuggerTests.Test_DollarException_OutsideHandler_SaysWhyNotParseError;
+var FrameId, LocalsRef: Integer;
+    Resp: TJSONObject;
+    Display: string;
+begin
+  StartSession('EVAL_BODY', FrameId, LocalsRef);
+  Resp := FClient.Evaluate('$exception.Message', FrameId, 'watch');
+  try
+    Display := Resp.GetValue<string>('result', '');
+    Assert.IsFalse(Display.Contains('unexpected token'),
+      '$exception must parse even where there is no exception, got: ' + Display);
+    Assert.IsTrue(Display.Contains('no exception in scope'),
+      'the answer should say there is no exception in scope, got: ' + Display);
+  finally
+    Resp.Free;
   end;
 end;
 

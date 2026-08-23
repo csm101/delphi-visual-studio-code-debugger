@@ -4325,6 +4325,14 @@ begin
     for var V in S32.GetLocals do
       Assert.AreNotEqual('$exception', V.Name,
         'a 32-bit target cannot bound a handler block, so it must not claim to');
+    // ...and asking outright must explain the limitation rather than implying
+    // that nothing is being handled. A row that silently never appears is
+    // indistinguishable from a bug from the outside.
+    var R := S32.Evaluate('$exception');
+    Assert.IsFalse(R.Value.Contains('unexpected token'),
+      '$exception must parse on a 32-bit target too, got: ' + R.Value);
+    Assert.IsTrue(R.Value.Contains('32-bit'),
+      'the 32-bit refusal must name the reason, got: ' + R.Value);
   finally
     S32.Free;
   end;

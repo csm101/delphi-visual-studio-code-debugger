@@ -102,7 +102,7 @@ VS Code  ── DAP (JSON over stdio) ──>  VisualStudioCodeDelphiDebugger.ex
 - `DebuggerTests\`: DUnitX integration test suite. Launches the adapter,
   exercises BPs / locals / step / globals / evaluate.
   Run with `cmd /c "C:\Athens\GitHub\Win64Debugger\DebuggerTests\build_and_run.bat"`.
-  Current status: **1293 found / 1289 pass / 0 fail / 0 leaked / 4 ignored**,
+  Current status: **1301 found / 1297 pass / 0 fail / 0 leaked / 4 ignored**,
   in ~80 s (~12 s build + ~68 s of tests across 8 concurrent worker processes).
   Set `RUNTESTS_JOBS=1` for the sequential path — same results, ~440 s. See
   "Parallel execution" in `CLAUDE.md`.
@@ -1220,6 +1220,15 @@ Architecture / portability:
   Common "noise" first-chance codes seen in large Delphi apps:
   `STATUS_GUARD_PAGE_VIOLATION` ($80000001, fires on every stack/heap page
   growth), C++ SEH probing, CLR internal exceptions.
+- **`$exception` as an expression token — implemented.** It is matched in
+  `TExprEvaluator.ParsePrimary` before the integer-literal scanner (`$` opens a
+  Pascal hex literal and `$e` is a valid one, so the scanner used to eat two
+  characters and leave `xception` behind) and resolves to an ordinary
+  class-typed operand. That is what makes `$exception.Message` work, and what
+  makes `$exception` usable in a BREAKPOINT CONDITION — a path that never sees
+  the DAP frontend's literal-string intercept, which is the only reason the name
+  appeared to work at all before. No exception in scope yields
+  `<no exception in scope: <reason>>`, never a parse error.
 - **`$exception` for the whole life of a bare handler — implemented (x64).**
   A bare `except .. end` names its exception nothing and, measured, stores it
   nowhere: the block's first instruction is a `nop`. The object exists only on
