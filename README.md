@@ -667,8 +667,11 @@ object with an `exceptionRules` array, or a bare array), are strict JSON in the
 same way, and are hot-reloaded on resume. A missing or malformed one is ignored.
 
 This repository ships a worked example: `Debugme.ExceptionSettings.json` sits
-next to `Debugme.dpr`, and both the launch and the attach configuration in
-`.vscode/launch.json` reach it through their `delphiProjectFile` line.
+next to `Debugme.dpr` and logs one of the two exceptions the sample raises
+instead of breaking on it. Add
+`"delphiProjectFile": "${workspaceFolder}/Debugme.dproj"` to the **Debug
+Debugme** and **Attach to Debugme.exe** configurations -- which is what the RAD
+Studio plugin writes for you -- and both reach that same file.
 
 **Without `delphiProjectFile` nothing project-scoped is looked for**, and rules
 resolve exactly as they did before this existed — an older `launch.json`, or one
