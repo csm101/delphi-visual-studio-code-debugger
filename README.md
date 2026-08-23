@@ -667,10 +667,9 @@ same way, and are hot-reloaded on resume. A missing or malformed one is ignored.
 
 This repository ships a worked example: `Debugme.ExceptionSettings.json` sits
 next to `Debugme.dpr` and logs one of the two exceptions the sample raises
-instead of breaking on it. Add
-`"delphiProjectFile": "${workspaceFolder}/Debugme.dproj"` to the **Debug
-Debugme** and **Attach to Debugme.exe** configurations -- which is what the RAD
-Studio plugin writes for you -- and both reach that same file.
+instead of breaking on it. Both **Debug Debugme** and **Attach to Debugme.exe**
+in `.vscode/launch.json` reach it through their `delphiProjectFile` line, so the
+same project rule applies whichever way the session starts.
 
 **Without `delphiProjectFile` nothing project-scoped is looked for**, and only
 the machine-wide file applies.
