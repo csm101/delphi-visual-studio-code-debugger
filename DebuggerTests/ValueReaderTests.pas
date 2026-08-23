@@ -130,6 +130,8 @@ type
     function  LastExceptionIsDelphiRaise: Boolean;
     function  LastExceptionMessage: string;
     function  CurrentExceptionObject: UInt64;
+    function  TryGetHandlerException(out Kind: TExcHandlerBlockKind;
+                out ObjVA: UInt64; out Reason: string): Boolean;
     function  WriteMemoryAt(VA: UInt64; Buf: Pointer; Size: NativeUInt): Boolean;
     function  WriteMemoryPartial(VA: UInt64; Buf: Pointer; Size: NativeUInt): NativeUInt;
     function  RvaToVA(Rva: UInt64): UInt64;
@@ -176,6 +178,9 @@ type
     function  AddressIsExecutable(VA: UInt64): Boolean;
     function  RemoteCallInFlight: Boolean;
     procedure RequestAbortRemoteCall;
+    procedure BeginAutoCallWindow(TotalMs: Cardinal);
+    procedure EndAutoCallWindow;
+    function  AutoCallWindowExhausted: Boolean;
     function  TryResolveClassRef(const ClassName: string; out VA: UInt64): Boolean;
     function  TryResolveConstValue(const Name: string; out Value: Int64; out TypeHint: string): Boolean;
     function  GetRemoteScratchSlot(MinSize: NativeUInt): UInt64;
@@ -270,6 +275,14 @@ function  TFakeMemTarget.LastExceptionClass: string; begin Result := ''; end;
 function  TFakeMemTarget.LastExceptionIsDelphiRaise: Boolean; begin Result := False; end;
 function  TFakeMemTarget.LastExceptionMessage: string; begin Result := ''; end;
 function  TFakeMemTarget.CurrentExceptionObject: UInt64; begin Result := 0; end;
+function  TFakeMemTarget.TryGetHandlerException(out Kind: TExcHandlerBlockKind;
+  out ObjVA: UInt64; out Reason: string): Boolean;
+begin
+  Kind   := ehbNone;
+  ObjVA  := 0;
+  Reason := 'this fake target has no exception dispatch data';
+  Result := False;
+end;
 function  TFakeMemTarget.WriteMemoryAt(VA: UInt64; Buf: Pointer; Size: NativeUInt): Boolean; begin Result := False; end;
 function  TFakeMemTarget.WriteMemoryPartial(VA: UInt64; Buf: Pointer; Size: NativeUInt): NativeUInt; begin Result := 0; end;
 function  TFakeMemTarget.RvaToVA(Rva: UInt64): UInt64; begin Result := Rva; end;
@@ -336,6 +349,10 @@ function  TFakeMemTarget.TryResolveSymbolVA(const Name: string; out VA: UInt64):
 function  TFakeMemTarget.AddressIsExecutable(VA: UInt64): Boolean; begin Result := False; end;
 function  TFakeMemTarget.RemoteCallInFlight: Boolean; begin Result := False; end;
 procedure TFakeMemTarget.RequestAbortRemoteCall; begin end;
+// This target runs no code, so an auto-call window has nothing to bound.
+procedure TFakeMemTarget.BeginAutoCallWindow(TotalMs: Cardinal); begin end;
+procedure TFakeMemTarget.EndAutoCallWindow; begin end;
+function  TFakeMemTarget.AutoCallWindowExhausted: Boolean; begin Result := False; end;
 function  TFakeMemTarget.TryResolveClassRef(const ClassName: string; out VA: UInt64): Boolean; begin VA := 0; Result := False; end;
 function  TFakeMemTarget.TryResolveConstValue(const Name: string; out Value: Int64; out TypeHint: string): Boolean; begin Value := 0; TypeHint := ''; Result := False; end;
 function  TFakeMemTarget.GetRemoteScratchSlot(MinSize: NativeUInt): UInt64; begin Result := 0; end;

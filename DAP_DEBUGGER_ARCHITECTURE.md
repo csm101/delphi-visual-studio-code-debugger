@@ -331,11 +331,11 @@ wire contract. Handlers: `TDapServer.HandleReadMemory`/`HandleWriteMemory`
     fields still get `memoryReference` — they are genuine memory regardless
     of how the base address was obtained; only the getter's own un-expanded
     result is addressless.
-  - Not extended to `evaluate`/watch results beyond the `$exception` special
-    case: DAP's `EvaluateResponse.body` has its own optional
-    `memoryReference` field and a plain evaluated expression could honestly
-    carry one, but wiring every branch of `HandleEvaluate` was out of scope
-    for this increment.
+  - Also emitted on `evaluate`/watch results (`HandleEvaluate`), by the same
+    rule: the payload address when the value is a reference, the expression's
+    own storage otherwise, and nothing at all for an rvalue. Without it VS Code
+    offered no "View Binary Data" on a watch row, so the only way to dump a
+    string or an array was to find it in the Locals tree.
 
 - **Not verified**: no test drives a real VS Code memory inspector against
   the adapter (same caveat `disassemble`'s own section already records for
@@ -1065,8 +1065,20 @@ Three guards enforce this (`DapServer.pas`):
   is not a DAP request; answering it with an empty success response
   (`command:""`) was the amplification vector that, fed back in a loopback
   condition, once drove a multi-million-line `dap_adapter.log` (7.3 GB,
-  filled the scratch disk). Genuinely-unknown but *named* commands still
-  get the success response (with the real command name) the spec expects.
+  filled the scratch disk).
+- **An unknown but NAMED command is refused, not silently succeeded.** The
+  constraint that produced the old empty-success answer is right — a client left
+  unanswered waits forever — but "success" is the wrong way to satisfy it: a
+  client that acts on it sees a silent no-op, the user presses something and
+  nothing happens, and there is no error anywhere. An error response unblocks the
+  client just as well and is true. `cancel` is the one allowlisted exception,
+  answered as a genuine no-op: the client is abandoning a request, and "done" is
+  honest either way. Every optional request this adapter does not implement
+  (`terminate`, `restart`, `restartFrame`, `stepBack`, `reverseContinue`,
+  `setFunctionBreakpoints`, `setExpression`, `completions`, `loadedSources`,
+  `breakpointLocations`, `terminateThreads`, `stepInTargets`) is gated on a
+  capability this adapter does not advertise, so a compliant client never sends
+  one and no user-visible error toast follows from the change.
 
 `stdin` EOF (client closed the pipe) flows through `ReadMessage` → nil →
 stdin thread `DoShutDown` → `PopItem` returns `wrAbandoned`, which sends a
@@ -1145,6 +1157,60 @@ the `$CC` the first wrote and save THAT as its original byte, so unplanting
 would restore a breakpoint instruction and leave the target trapping forever at
 an address no breakpoint owns. `PlantInt3` adopts the first planter's original
 byte and skips the write.
+
+### A condition that will not evaluate STOPS, and says why
+
+`TBpEvaluator.Decide` (`BreakpointEval.pas`) gates a fired breakpoint on
+condition → hit count → logpoint. Three outcomes matter here, and one of them
+used to be silent:
+
+| Condition | Decision |
+|---|---|
+| evaluates non-zero | stop |
+| evaluates zero | resume |
+| **cannot be evaluated at all** | **stop**, carrying the reason |
+
+The last row used to resume. That policy optimises for the wrong failure: a
+breakpoint that never fires is indistinguishable from a code path that is never
+reached, and the user acts on the wrong conclusion. Stopping too often is a
+nuisance they see and fix in seconds. It is also what the Delphi IDE does — a
+message box, then a stop — so it is the behaviour this audience already expects.
+
+The hit-count gate is deliberately **skipped** on that path: a hit condition
+such as `%100` would otherwise swallow the very stop that reports the fault.
+
+The reason travels out of the core as `TStopInfo.BreakpointConditionError` (and
+`TCompactSnapshot.BreakpointConditionError`, so the MCP snapshot carries it as
+`breakpointConditionError`). The DAP frontend puts it in the `stopped` event's
+`description` / `text` — the inline widget where exception and watchpoint stops
+already explain themselves, VS Code having no modal equivalent of the IDE's
+message box — and emits a Debug Console line **once per breakpoint per session**
+(keyed on breakpoint VA + condition text, so editing the condition re-announces
+it). The stop itself repeats for as long as the user keeps continuing; the
+explanation does not need to.
+
+That console line is a fourth output kind, `okNotice`. `okDebugger` diagnostics
+go to the Output channel, which is exactly where this would be buried: a notice
+is the debugger complaining about something the USER wrote, so it belongs beside
+their program's own output.
+
+### The verified-state event reports BOTH directions
+
+`TDebugSession.NotifyBreakpointFlips` re-derives every stored spec's line against
+the current providers, compares it with `FBpVerified` and fires
+`OnBreakpointChanged` on a transition. `TDapServer.SessionBreakpointChanged` is
+the single re-colour path: it maps `file|line` back to the numeric id VS Code was
+given and emits the DAP `breakpoint` / `changed` event.
+
+It used to fire only on the transition TO verified, and `HandleDllUnloaded` only
+reposted ADDRESS breakpoints. So a source breakpoint in a package unit went solid
+when the package loaded and stayed solid after it unloaded — the debugger
+claiming a breakpoint was armed when its line no longer resolved at all.
+`HandleDllUnloaded` now calls `NotifyBreakpointFlips` as well, and the event
+carries `Verified` through to the DAP body. The unverified transition also
+emits a diagnostics line: a marker turning grey in a gutter nobody is looking at
+is easy to miss, and its effect — execution running straight past the line — is
+otherwise indistinguishable from the line never being reached.
 
 ### Address breakpoints (DISASSEMBLY_PLAN.md increment 5)
 
@@ -2187,8 +2253,9 @@ rendering still has no automated coverage.
    `IFunctionNameProvider.GetEnclosingProcedure`. Each parent's RBP is
    recovered from the hidden parent-frame pointer at
    `ChildRBP + ChildFrameSize + 0x10` (Win64 home slot for RCX).
-   Locals from each parent are surfaced with a `parent.` prefix; cap
-   at depth 32.
+   Locals from each parent are surfaced prefixed with the ENCLOSING ROUTINE'S
+   OWN NAME plus a dot (`RunOuter.Total`, not `parent.Total`), so a name at
+   depth 2 says which routine it came from; cap at depth 32.
 
 The read width per local comes from `LocalReadSize` (`DelphiValueReaders`),
 which distinguishes genuinely 8-byte types from pointer-sized ones; the latter
@@ -2387,12 +2454,47 @@ Property value resolution (`AppendRsmProperties`):
 
 ## Evaluate / watch
 
-`evaluate` accepts:
-- bare identifiers: register, local (own or parent via short-name
-  lookup), then global by `NameToRva`.
-- `@identifier` → address of.
-- `[expr]` → read 8 bytes at the resolved address.
-- numeric literals (`0x…`, `$…`, decimal).
+`evaluate` accepts a Pascal expression, with Pascal's own operator precedence
+(`ExprEval.pas`; the per-level grammar is on the `ParseXxx` declarations there):
+
+| Level | Operators |
+|---|---|
+| comparison (loosest) | `=` `<>` `<` `<=` `>` `>=` `in` `is` `as` |
+| additive | `+` `-` `or` `xor` |
+| multiplicative | `*` `/` `div` `mod` `and` `shl` `shr` |
+| unary | `@` `-` `not` `[expr]` (dereference) |
+| suffix (tightest) | `.field` `[index]` `(args)` |
+
+`and` sitting with the multiplicative operators — and therefore binding tighter
+than any comparison — is what makes `Flags and MASK = 0` mean what it means in
+the user's own source, and is why `(a > 1) and (b < 2)` needs its parentheses
+here exactly as it does in Delphi.
+
+Operands: registers, locals (own or an enclosing routine's), globals by
+`NameToRva`, integer / float / string / character literals (`$…`, `0x…`,
+`1.0e6`, `'text'`, `#13#10`), set literals, enum elements, casts to a known
+type name, and the intrinsics `Length` `SizeOf` `Ord` `High` `Low` `Assigned`
+`Pred` `Succ` `Abs` `Chr` `Trunc` `Round` `Int` `Frac` `Copy` `Pos`
+`UpperCase` `LowerCase`. An intrinsic that is NOT implemented is refused by
+name with the reason, never as an unresolved symbol.
+
+Relational operators between string operands compare CHARACTERS (ordinal,
+`CompareStr`), across the UnicodeString / WideString / AnsiString / ShortString
+families and against a `Char`. Comparing a string with a non-text operand is
+refused rather than silently compared as a number.
+
+Two budgets bound ONE expression, reset per `Evaluate` call:
+`MAX_EXPR_NESTING` = 64 parser levels (`((((((…` is user input like any other,
+and both `ParseExpr` and `ParseUnary` guard it — `-` and `not` recurse straight
+back into `ParseUnary` without passing through `ParseExpr`), and
+`MAX_EXPR_CALLS` = 32 calls into the debuggee, counted at `ApplyMethodCall`,
+which is the single choke point every method, class method, free routine and
+property getter goes through.
+
+A failure from an inner sub-expression wins over the punctuation complaint
+around it: `(` … `)` and `[` … `]` report "missing `)`" / "missing `]`" only when
+what they enclose parsed cleanly. Otherwise a depth bound or an unresolved name
+surfaced as a bracket error the user could not act on.
 
 `evaluateForHovers` is advertised so VS Code uses the same path for
 hover data tips.
@@ -3023,11 +3125,51 @@ filters) and `Test_ExceptionRule_Code_Decimal_BreaksOnNative`.
 
 ### `$exception` pseudo-variable
 
-The debugger records the live exception object's VA on a Delphi-raise break
-(`FExceptionObjAddr`, exposed via `IDebugTarget.CurrentExceptionObject`).
-`DapServer` tracks `FStoppedOnException` (set in `OnStopped` from the reason) and,
-on an exception stop, prepends a synthetic `$exception` row to the Locals scope
-via `AppendExceptionLocal`. The shared `BuildCurrentExceptionRef` builds the
+Two sources, tried in this order.
+
+**At an exception stop**, the debugger's own record of the raise it just
+reported: `FExceptionObjAddr`, exposed via
+`IDebugTarget.CurrentExceptionObject`, with `DapServer.FStoppedOnException` (set
+in `OnStopped` from the reason) as the gate.
+
+**Away from one**, the `except` block the PC is standing in, via
+`IDebugTarget.TryGetHandlerException`. That is what keeps `$exception` alive for
+the WHOLE handler rather than only at the instant of the raise: it locates the
+block from the routine's own x64 exception-dispatch data
+(`TryGetExceptHandlerBlockAt`) and reads the object from the RTL's per-thread
+raise list by calling `System.ExceptObject` in the target -- resolved in the
+module the handler is executing in, falling back to the export directory for a
+packaged RTL that ships without symbols. `CurrentExceptionObject` cannot answer
+this question: it is the last raise the debugger SAW and stays set for the rest
+of the session, long after the handler returned and the object was freed.
+
+Offered only for a BARE `except .. end`. Inside an `on X: ... do` clause the
+alias is listed as an ordinary local instead, and showing one object under two
+names in one Locals scope reads as two variables. x64 only -- a 32-bit binary
+has no `.pdata`, so nothing in it states a block's extent; the refusal from
+`ExceptHandlerScopeUnavailableReason` says so rather than rendering an empty row
+(`Win32_BareHandlerException_RefusesWithAReason` is the both-bitness control).
+
+`DapServer` prepends the synthetic `$exception` row to the Locals scope via
+`AppendExceptionLocal`; `TDebugSession.AppendBareHandlerException` does the same
+for the MCP frontend.
+
+`$exception` is also a token of the EXPRESSION language
+(`TExprEvaluator.ResolveCurrentException`), matched in `ParsePrimary` ahead of
+the integer-literal scanner -- `$` opens a Pascal hex literal and `$e` is a
+valid one, so the scanner used to consume two characters and leave `xception`
+as an unexpected token. It resolves to an ordinary class-typed operand, which is
+what makes `$exception.Message` and `$exception is EMyError` work and, more to
+the point, what makes `$exception` usable in a BREAKPOINT CONDITION -- that path
+runs through `BreakpointEval` and never sees the frontend's literal-string
+intercept. Where no exception is in scope it yields
+`<no exception in scope: ...>` carrying the refusal reason, never a parse error
+about a name the user typed correctly.
+
+`HandleEvaluate` keeps its short-circuit for the bare literal `$exception`
+because that path also mints the `Class: Message` display and a
+`memoryReference`, matching the Locals row; anything dotted or compound goes to
+the parser. The shared `BuildCurrentExceptionRef` builds the
 inline `Class: Message` value and an expansion ref (`ekRsmMembers` when the class
 is in RSM/TD32, else `ekClass` RTTI reader). `HandleEvaluate` short-circuits a
 bare `$exception` through the same builder (frame-independent, resolved before
@@ -3073,15 +3215,30 @@ after the first instant.
 | `supportsSetVariable`                   | true  |
 | `supportsGotoTargetsRequest`            | true  |
 | `supportsDataBreakpoints`               | true  |
+| `supportsDataBreakpointBytes`           | true  |
 | `supportsInstructionBreakpoints`        | true  |
 | `supportsDisassembleRequest`            | true  |
+| `supportsModulesRequest`                | true  |
 | `supportsSteppingGranularity`            | true  |
-| `supportsReadMemoryRequest`             | true  |
-| `supportsWriteMemoryRequest`            | true  |
+| `supportsReadMemoryRequest`             | true, unless `--no-stock-memory-view` |
+| `supportsWriteMemoryRequest`            | true, unless `--no-stock-memory-view` |
 | `supportsProgressReporting`             | true  |
 
-Anything else is currently absent (function breakpoints, `modules`,
-`setExpression`).
+`--no-stock-memory-view` withdraws the two memory capabilities without
+disabling the requests: the VS Code extension passes it because it ships its
+own memory view, and reaches the requests through `customRequest`, which is not
+gated on an advertised capability.
+
+Two CLIENT capabilities are read back out of the `initialize` arguments and
+gated on, because sending either event to a client that never declared it is a
+protocol error the spec leaves the client free to reject:
+
+| Client capability          | What it gates |
+|----------------------------|---------------|
+| `supportsInvalidatedEvent` | the `invalidated` event (raw-stack toggle redraw) |
+| `supportsMemoryEvent`      | the `memory` event (hex pane refresh at a stop) |
+
+Anything else is currently absent (function breakpoints, `setExpression`).
 
 ## Known assumptions and limits
 

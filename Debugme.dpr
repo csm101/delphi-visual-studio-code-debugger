@@ -99,9 +99,23 @@ begin
     raise Exception.Create('Test error');
     readln;
   except
-    on E: Exception do
-      Writeln(E.ClassName, ': ', E.Message);
+    on E: Exception do begin
+      Writeln('aliased handler entered');
+      Writeln(E.ClassName, ': ', E.Message);  // {BP:MAIN_EXC_ALIASED}
+      Writeln('aliased handler leaving');
+    end;
   end;
+
+  // Bare `except` in the program main block: no alias, so the only name the
+  // exception object has is the debugger's synthetic `$exception`.
+  try
+    raise Exception.Create('Bare error');
+  except
+    Writeln('bare handler entered');
+    Writeln('bare handler still running');    // {BP:MAIN_EXC_BARE}
+    Writeln('bare handler leaving');
+  end;
+
   foo.Free;
   TestDynamicPlugin;
 end.

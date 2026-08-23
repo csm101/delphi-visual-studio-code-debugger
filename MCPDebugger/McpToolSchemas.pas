@@ -18,14 +18,66 @@ type
   TPropSpec = record
     Name, JsonType, Desc: string;
     Required: Boolean;
+    // Element schema when JsonType = 'array'. Ownership passes to the tool
+    // schema that consumes the spec. JSON Schema requires `items` on every
+    // array: VS Code / Copilot reject a tool whose array property lacks it.
+    Items: TJSONObject;
   end;
 
 function Prop(const AName, AType, ADesc: string; ARequired: Boolean = False): TPropSpec;
 begin
+  Result := Default(TPropSpec);
   Result.Name     := AName;
   Result.JsonType := AType;
   Result.Desc     := ADesc;
   Result.Required := ARequired;
+end;
+
+// Element schema for an array of scalars, e.g. ItemsOfType('string').
+function ItemsOfType(const AType: string): TJSONObject;
+begin
+  Result := TJSONObject.Create;
+  Result.AddPair('type', AType);
+end;
+
+function ArrayProp(const AName, ADesc: string; AItems: TJSONObject; ARequired: Boolean = False): TPropSpec;
+begin
+  Result := Prop(AName, 'array', ADesc, ARequired);
+  Result.Items := AItems;
+end;
+
+function BuildProperties(const Props: array of TPropSpec; ARequired: TJSONArray): TJSONObject;
+begin
+  Result := TJSONObject.Create;
+  for var P in Props do begin
+    var PObj := TJSONObject.Create;
+    PObj.AddPair('type', P.JsonType);
+    PObj.AddPair('description', P.Desc);
+    if P.JsonType = 'array' then begin
+      if Assigned(P.Items) then
+        PObj.AddPair('items', P.Items)
+      else
+        PObj.AddPair('items', ItemsOfType('string'));
+    end
+    else
+      P.Items.Free;
+    Result.AddPair(P.Name, PObj);
+    if P.Required then
+      ARequired.Add(P.Name);
+  end;
+end;
+
+// Element schema for an array of objects with known fields.
+function ItemsOfObject(const Props: array of TPropSpec): TJSONObject;
+begin
+  Result := TJSONObject.Create;
+  Result.AddPair('type', 'object');
+  var RequiredArr := TJSONArray.Create;
+  Result.AddPair('properties', BuildProperties(Props, RequiredArr));
+  if RequiredArr.Count > 0 then
+    Result.AddPair('required', RequiredArr)
+  else
+    RequiredArr.Free;
 end;
 
 function MakeTool(const Name, Desc: string;
@@ -37,17 +89,8 @@ begin
 
   var Schema := TJSONObject.Create;
   Schema.AddPair('type', 'object');
-  var PropsObj := TJSONObject.Create;
   var RequiredArr := TJSONArray.Create;
-  for var P in Props do begin
-    var PObj := TJSONObject.Create;
-    PObj.AddPair('type', P.JsonType);
-    PObj.AddPair('description', P.Desc);
-    PropsObj.AddPair(P.Name, PObj);
-    if P.Required then
-      RequiredArr.Add(P.Name);
-  end;
-  Schema.AddPair('properties', PropsObj);
+  Schema.AddPair('properties', BuildProperties(Props, RequiredArr));
   if RequiredArr.Count > 0 then
     Schema.AddPair('required', RequiredArr)
   else
@@ -75,9 +118,9 @@ begin
      Prop('mapFile', 'string', 'Override path to the .map (defaults to the exe with .map).'),
      Prop('rsmFile', 'string', 'Override path to the .rsm (defaults to the exe with .rsm).'),
      Prop('sourceRoot', 'string', 'Primary root directory to resolve source files against.'),
-     Prop('sourceSearchPaths', 'array', 'Additional source roots (array of paths; each may be ;-separated and use ${env:VAR}). Searched when a file is not under sourceRoot.'),
+     ArrayProp('sourceSearchPaths', 'Additional source roots (array of paths; each may be ;-separated and use ${env:VAR}). Searched when a file is not under sourceRoot.', ItemsOfType('string')),
      Prop('workspaceFolder', 'string', 'Base for resolving ${workspaceFolder} in the paths above.'),
-     Prop('exceptionFilters', 'array', 'Which exceptions break: any of "delphi" (first-chance Delphi raises), "av" (access violations), "all" (every first-chance), "unhandled" (second-chance). Omit for the default [delphi, av, unhandled]; pass [] or e.g. ["unhandled"] to stop breaking on first-chance exceptions in a noisy app.'),
+     ArrayProp('exceptionFilters', 'Which exceptions break: any of "delphi" (first-chance Delphi raises), "av" (access violations), "all" (every first-chance), "unhandled" (second-chance). Omit for the default [delphi, av, unhandled]; pass [] or e.g. ["unhandled"] to stop breaking on first-chance exceptions in a noisy app.', ItemsOfType('string')),
      Prop('delphiExceptionClasses', 'string', 'Comma/semicolon-separated class names to narrow the "delphi" filter (e.g. "EAccessViolation, EConvertError"). Empty = all Delphi raises.'),
      Prop('stopAtEntry', 'boolean', 'Stop at the program entry point instead of running to the first breakpoint.')]));
 
@@ -101,7 +144,7 @@ begin
      Prop('mapFile', 'string', 'Override path to the .map.'),
      Prop('rsmFile', 'string', 'Override path to the .rsm.'),
      Prop('sourceRoot', 'string', 'Primary root directory to resolve source files against.'),
-     Prop('sourceSearchPaths', 'array', 'Additional source roots (array of paths; each may be ;-separated and use ${env:VAR}).'),
+     ArrayProp('sourceSearchPaths', 'Additional source roots (array of paths; each may be ;-separated and use ${env:VAR}).', ItemsOfType('string')),
      Prop('workspaceFolder', 'string', 'Base for resolving ${workspaceFolder} in the paths above.'),
      Prop('killOnDetach', 'boolean', 'If true, terminate the target when the debug session ends; default false (leave it running).')]));
 
@@ -144,7 +187,14 @@ begin
     'Set several breakpoints at once. Each object in "breakpoints" takes sourceFile, ' +
     'line, and optional condition / hitCondition / logMessage. All breakpoints for a ' +
     'given file replace that file''s previous set; files not listed are unchanged.',
-    [Prop('breakpoints', 'array', 'Array of { sourceFile, line, condition?, hitCondition?, logMessage? }.', True)]));
+    [ArrayProp('breakpoints', 'Array of { sourceFile, line, condition?, hitCondition?, logMessage? }.',
+       ItemsOfObject(
+         [Prop('sourceFile', 'string', 'Source file path (absolute, or relative to sourceRoot).', True),
+          Prop('line', 'integer', '1-based line number.', True),
+          Prop('condition', 'string', 'Expression that must be true for the breakpoint to stop.'),
+          Prop('hitCondition', 'string', 'Hit-count gate: "5" (5th hit), ">5", ">=5", "%5" (every 5th).'),
+          Prop('logMessage', 'string', 'Logpoint: emit this message (with {expr} substituted) instead of stopping.')]),
+       True)]));
 
   Result.Add(MakeTool('list_breakpoints',
     'List all currently set breakpoints with their verified state.', []));
@@ -362,7 +412,7 @@ begin
     'Change which exceptions break, on the LIVE session (also settable at launch via ' +
     'exceptionFilters). Useful to silence first-chance breaks in an app that raises many ' +
     '(e.g. pass ["unhandled"] so only truly-unhandled exceptions stop).',
-    [Prop('filters', 'array', 'Any of "delphi", "av", "all", "unhandled". [] = never break on first-chance.', True),
+    [ArrayProp('filters', 'Any of "delphi", "av", "all", "unhandled". [] = never break on first-chance.', ItemsOfType('string'), True),
      Prop('delphiExceptionClasses', 'string', 'Comma/semicolon-separated class names to narrow the "delphi" filter. Empty = all.')]));
 
   Result.Add(MakeTool('get_locals',

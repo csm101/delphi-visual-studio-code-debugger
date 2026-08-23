@@ -581,6 +581,48 @@ type
     [Test]
     procedure Test_Hover_ExceptionInHandler_Message;
 
+    // --- exception handlers in the PROGRAM MAIN BLOCK ------------------------
+    // A handler inside `begin .. end.` is not the same case as one inside a
+    // procedure. dcc does not give its `on E:` alias a stack slot: it allocates
+    // a module-level static (measured on both bitnesses), so every symbol
+    // reader calls the alias a global and none of them calls it a local of the
+    // block. The adapter recovers it from the routine's own exception-dispatch
+    // data instead -- and only for the extent of the clause that owns it, which
+    // is what keeps it away from a sibling BARE handler.
+    [Test] procedure Test_MainBlockHandler_AliasListedInLocals;
+    [Test] procedure Test_MainBlockHandler_AliasAbsentInBareHandler;
+    [Test] procedure Test_MainBlockHandler_AliasAbsentOutsideHandler;
+    [Test] procedure Test_MainBlockHandler_AliasMessageEvaluates;
+    [Test] procedure Test_MainBlockHandler_AliasGatesConditionalBreakpoint;
+    [Test] procedure Test_MainBlockHandler_AliasConditionFalse_NeverStops;
+    // The control: inside an ordinary PROCEDURE the alias is a real stack local
+    // and always was listed. Here so that the main-block work above cannot
+    // quietly break the case that already worked.
+    [Test] procedure Test_ProcedureHandler_AliasStillListedInLocals;
+
+    // --- `$exception` for the whole life of a bare handler -------------------
+    // A bare `except .. end` names its exception nothing, and stores it
+    // nowhere: measured, the block's first instruction is a `nop` and the
+    // object is only ever on the RTL's per-thread raise list. So `$exception`
+    // is the only handle on it, and it has to stay valid for every stop inside
+    // the block -- not just at the instant of the raise.
+    [Test] procedure Test_BareHandler_DollarExceptionInLocals;
+    [Test] procedure Test_BareHandler_DollarExceptionEvaluates;
+    [Test] procedure Test_MainBlockBareHandler_DollarExceptionInLocals;
+    [Test] procedure Test_MainBlockAliasedHandler_NoDollarExceptionBesideAlias;
+    [Test] procedure Test_MainBlock_NoDollarExceptionOutsideAnyHandler;
+
+    // --- `$exception` as a real expression token -----------------------------
+    // `$` opens a Pascal hex literal and `$e` is a valid one, so the literal
+    // scanner used to eat two characters and leave `xception` behind. The name
+    // therefore worked ONLY where a frontend intercepted the whole string
+    // before the parser saw it -- never in a dotted expression, never in a
+    // breakpoint condition.
+    [Test] procedure Test_DollarException_DottedExpressionEvaluates;
+    [Test] procedure Test_DollarException_GatesConditionalBreakpoint;
+    [Test] procedure Test_DollarException_ConditionFalse_NeverStops;
+    [Test] procedure Test_DollarException_OutsideHandler_SaysWhyNotParseError;
+
     // --- expression evaluator: class property (field-backed) via dot syntax ---
     [Test]
     procedure Test_Eval_PropertyDot;
@@ -1260,10 +1302,7 @@ begin
   // it under the BPL scenario with a documented reason. (Tier-2 expression-eval
   // tests that merely used MAIN_GCOUNTER as a running-process anchor have been
   // re-vehicled to the portable EVAL_BODY marker, so they do NOT skip here.)
-  if (Scenario = tsBpl) and
-     (SameText(BpMarker, 'MAIN_FIRST_LINE') or
-      SameText(BpMarker, 'MAIN_GCOUNTER')   or
-      SameText(BpMarker, 'MAIN_AFTER_NESTED')) then
+  if (Scenario = tsBpl) and BpMarker.StartsWith('MAIN_', True) then
     Assert.Pass('SKIP[bpl]: marker ''' + BpMarker + ''' is program-main-block only ' +
       '(no BPL equivalent; a package has no program begin..end. block)');
   BpLine  := Bp(BpMarker);
@@ -3950,6 +3989,341 @@ begin
       'hover type for E should mention Exception, got: ' + TypeStr);
     Assert.IsTrue(VarRef > 0,
       'hover on E must expose variablesReference > 0');
+  finally
+    Resp.Free;
+  end;
+end;
+
+// The alias of a main-block `on E: Exception do` must be a Locals row, not
+// something the user has to know to type into Watch. See the declaration for
+// why the ordinary locals path cannot see it.
+procedure TDebuggerTests.Test_MainBlockHandler_AliasListedInLocals;
+var FrameId, LocalsRef: Integer;
+    ExcVar: TJSONObject;
+begin
+  StartSession('MAIN_EXC_ALIASED', FrameId, LocalsRef, ['--main-exc']);
+  ExcVar := FindLocalByName(FClient, LocalsRef, 'E');
+  try
+    Assert.IsNotNull(ExcVar,
+      'the `on E:` alias of a main-block handler must appear in Locals');
+    Assert.IsTrue(ExcVar.GetValue<string>('type', '').Contains('Exception'),
+      'E should be typed as an Exception, got: ' + ExcVar.GetValue<string>('type', ''));
+    Assert.IsTrue(ExcVar.GetValue<Integer>('variablesReference', 0) > 0,
+      'E must be expandable');
+    Assert.IsFalse(ExcVar.GetValue<string>('value', '').Contains('nil'),
+      'E must hold the live exception, got: ' + ExcVar.GetValue<string>('value', ''));
+  finally
+    ExcVar.Free;
+  end;
+end;
+
+// The sibling BARE `except` in the same main block. Its handler has no alias,
+// so the alias of the OTHER handler must not appear there -- that slot is a
+// module-level static holding a dangling pointer to the already-freed previous
+// exception, which reads as a plausible value and is not one.
+procedure TDebuggerTests.Test_MainBlockHandler_AliasAbsentInBareHandler;
+var FrameId, LocalsRef: Integer;
+    ExcVar: TJSONObject;
+begin
+  StartSession('MAIN_EXC_BARE', FrameId, LocalsRef, ['--main-exc']);
+  ExcVar := FindLocalByName(FClient, LocalsRef, 'E');
+  try
+    Assert.IsNull(ExcVar,
+      'a bare `except` must not borrow the name of another handler''s alias');
+  finally
+    ExcVar.Free;
+  end;
+end;
+
+// And nowhere else in the main block either: before the raise, the static
+// exists and reads nil, which would list a variable the source has not
+// declared at that point.
+procedure TDebuggerTests.Test_MainBlockHandler_AliasAbsentOutsideHandler;
+var FrameId, LocalsRef: Integer;
+    ExcVar: TJSONObject;
+begin
+  StartSession('MAIN_GCOUNTER', FrameId, LocalsRef, ['--main-exc']);
+  ExcVar := FindLocalByName(FClient, LocalsRef, 'E');
+  try
+    Assert.IsNull(ExcVar,
+      'the handler alias must not be listed outside its own `on` clause');
+  finally
+    ExcVar.Free;
+  end;
+end;
+
+// Being a Locals row is not enough: the value has to be the live object, which
+// is what reading a property off it proves.
+procedure TDebuggerTests.Test_MainBlockHandler_AliasMessageEvaluates;
+var FrameId, LocalsRef: Integer;
+    Resp: TJSONObject;
+begin
+  StartSession('MAIN_EXC_ALIASED', FrameId, LocalsRef, ['--main-exc']);
+  Resp := FClient.Evaluate('E.Message', FrameId, 'watch');
+  try
+    Assert.IsTrue(Resp.GetValue<string>('result', '').Contains('main-aliased'),
+      'E.Message should be ''main-aliased'', got: ' + Resp.GetValue<string>('result', ''));
+  finally
+    Resp.Free;
+  end;
+end;
+
+// Requirement 5 of EXCEPTION_HANDLER_SCOPE_PLAN.md: the alias has to work in an
+// arbitrary expression, and a breakpoint condition is the case that proves it
+// -- the condition is evaluated by the adapter while the target is stopped
+// inside the handler, with no Watch panel involved.
+procedure TDebuggerTests.Test_MainBlockHandler_AliasGatesConditionalBreakpoint;
+var BpLine, FrameId, LocalsRef: Integer;
+    Stopped: TJSONObject;
+begin
+  SkipIfBpl('MAIN_EXC_ALIASED is program-main-block only');
+  BpLine := Bp('MAIN_EXC_ALIASED');
+
+  FClient := TDapClient.Create;
+  FClient.Start(AdapterExe);
+  FClient.Initialize.Free;
+  Assert.IsTrue(FClient.WaitForInitialized, 'adapter did not send initialized event');
+  FClient.SetBreakpoints(FBpSourceFile, [BpLine],
+    ['E.Message = ''main-aliased'''], [''], ['']).Free;
+  FClient.SetExceptionBreakpoints([]).Free;
+  LaunchTarget(['--main-exc']).Free;
+  FClient.ConfigDone.Free;
+
+  Stopped := FClient.WaitForStopped;
+  try
+    Assert.AreEqual('breakpoint', Stopped.GetValue<string>('reason', ''),
+      'a condition on the handler alias must let the breakpoint through');
+  finally
+    Stopped.Free;
+  end;
+  FrameId   := FClient.GetFrameId;
+  LocalsRef := FClient.GetLocalsRef(FrameId);
+  Assert.IsTrue(LocalsRef > 0, 'no Locals scope at the conditional stop');
+end;
+
+// The other half of the same claim: a condition that reads the alias and is
+// FALSE must swallow the breakpoint. Without this, a condition that simply
+// fails to evaluate (and falls open) would pass the test above.
+procedure TDebuggerTests.Test_MainBlockHandler_AliasConditionFalse_NeverStops;
+var BpLine: Integer;
+begin
+  SkipIfBpl('MAIN_EXC_ALIASED is program-main-block only');
+  BpLine := Bp('MAIN_EXC_ALIASED');
+
+  FClient := TDapClient.Create;
+  FClient.Start(AdapterExe);
+  FClient.Initialize.Free;
+  Assert.IsTrue(FClient.WaitForInitialized, 'adapter did not send initialized event');
+  FClient.SetBreakpoints(FBpSourceFile, [BpLine],
+    ['E.Message = ''not-this-one'''], [''], ['']).Free;
+  FClient.SetExceptionBreakpoints([]).Free;
+  LaunchTarget(['--main-exc']).Free;
+  FClient.ConfigDone.Free;
+
+  Assert.IsTrue(FClient.WaitForTerminated(20000),
+    'a FALSE condition on the handler alias must swallow the breakpoint; ' +
+    'the target stopped instead of running to exit');
+end;
+
+// Control for the whole group: an `on E:` inside an ordinary procedure gets a
+// real stack slot and has always been listed. It must stay listed.
+procedure TDebuggerTests.Test_ProcedureHandler_AliasStillListedInLocals;
+var FrameId, LocalsRef: Integer;
+    ExcVar: TJSONObject;
+begin
+  StartSession('EXC_HANDLER', FrameId, LocalsRef, ['--run-exception-handler']);
+  ExcVar := FindLocalByName(FClient, LocalsRef, 'E');
+  try
+    Assert.IsNotNull(ExcVar,
+      'the `on E:` alias of a handler inside a procedure must stay in Locals');
+    Assert.IsTrue(ExcVar.GetValue<string>('type', '').Contains('Exception'),
+      'E should be typed as an Exception, got: ' + ExcVar.GetValue<string>('type', ''));
+  finally
+    ExcVar.Free;
+  end;
+end;
+
+// A bare handler inside an ordinary procedure -- and, under the BPL scenario,
+// inside a runtime package. The stop is two statements into the block, so this
+// is "still valid after continuing past the raise", not "valid at the raise".
+procedure TDebuggerTests.Test_BareHandler_DollarExceptionInLocals;
+var FrameId, LocalsRef: Integer;
+    ExcVar: TJSONObject;
+begin
+  StartSession('BARE_EXCEPT', FrameId, LocalsRef, ['--run-bare-except']);
+  ExcVar := FindLocalByName(FClient, LocalsRef, '$exception');
+  try
+    Assert.IsNotNull(ExcVar,
+      'a bare `except` must surface its exception as $exception in Locals');
+    Assert.IsTrue(ExcVar.GetValue<string>('value', '').Contains('bare-test-probe'),
+      '$exception should carry the raised message, got: '
+      + ExcVar.GetValue<string>('value', ''));
+    Assert.IsTrue(ExcVar.GetValue<Integer>('variablesReference', 0) > 0,
+      '$exception must be expandable');
+  finally
+    ExcVar.Free;
+  end;
+end;
+
+// Same stop, through `evaluate`. This is the path a Watch expression and a
+// breakpoint condition take, and it used to answer `<no current exception>`
+// anywhere but the original exception stop.
+procedure TDebuggerTests.Test_BareHandler_DollarExceptionEvaluates;
+var FrameId, LocalsRef: Integer;
+    Resp: TJSONObject;
+begin
+  StartSession('BARE_EXCEPT', FrameId, LocalsRef, ['--run-bare-except']);
+  Resp := FClient.Evaluate('$exception', FrameId, 'watch');
+  try
+    Assert.IsTrue(Resp.GetValue<string>('result', '').Contains('bare-test-probe'),
+      'evaluate $exception inside a bare handler should return the live ' +
+      'exception, got: ' + Resp.GetValue<string>('result', ''));
+    Assert.IsTrue(Resp.GetValue<Integer>('variablesReference', 0) > 0,
+      'evaluate $exception must return an expandable reference');
+  finally
+    Resp.Free;
+  end;
+end;
+
+// The same again in a program main block, where the frame has no locals table
+// worth the name.
+procedure TDebuggerTests.Test_MainBlockBareHandler_DollarExceptionInLocals;
+var FrameId, LocalsRef: Integer;
+    ExcVar: TJSONObject;
+begin
+  StartSession('MAIN_EXC_BARE', FrameId, LocalsRef, ['--main-exc']);
+  ExcVar := FindLocalByName(FClient, LocalsRef, '$exception');
+  try
+    Assert.IsNotNull(ExcVar,
+      'a bare `except` in the main block must surface $exception too');
+    Assert.IsTrue(ExcVar.GetValue<string>('value', '').Contains('main-bare'),
+      '$exception should carry the raised message, got: '
+      + ExcVar.GetValue<string>('value', ''));
+  finally
+    ExcVar.Free;
+  end;
+end;
+
+// Mutual exclusion, the other way round from
+// Test_MainBlockHandler_AliasAbsentInBareHandler: where the handler DOES name
+// the exception, `$exception` must not appear beside the alias. One object
+// under two names in one Locals scope reads as two variables.
+procedure TDebuggerTests.Test_MainBlockAliasedHandler_NoDollarExceptionBesideAlias;
+var FrameId, LocalsRef: Integer;
+    ExcVar: TJSONObject;
+begin
+  StartSession('MAIN_EXC_ALIASED', FrameId, LocalsRef, ['--main-exc']);
+  ExcVar := FindLocalByName(FClient, LocalsRef, '$exception');
+  try
+    Assert.IsNull(ExcVar,
+      '$exception must not be listed beside an `on E:` alias for the same handler');
+  finally
+    ExcVar.Free;
+  end;
+end;
+
+// And outside every handler it must be gone again -- the debugger's record of
+// the last raise it saw survives for the rest of the session, so "there is an
+// exception in scope" cannot be answered from it.
+procedure TDebuggerTests.Test_MainBlock_NoDollarExceptionOutsideAnyHandler;
+var FrameId, LocalsRef: Integer;
+    ExcVar: TJSONObject;
+begin
+  StartSession('MAIN_GCOUNTER', FrameId, LocalsRef, ['--main-exc']);
+  ExcVar := FindLocalByName(FClient, LocalsRef, '$exception');
+  try
+    Assert.IsNull(ExcVar,
+      '$exception must not be listed when the stop is not inside a handler');
+  finally
+    ExcVar.Free;
+  end;
+end;
+
+// A dotted expression never reaches the frontend's literal-string intercept,
+// so this is the parser answering.
+procedure TDebuggerTests.Test_DollarException_DottedExpressionEvaluates;
+var FrameId, LocalsRef: Integer;
+    Resp: TJSONObject;
+begin
+  StartSession('BARE_EXCEPT', FrameId, LocalsRef, ['--run-bare-except']);
+  Resp := FClient.Evaluate('$exception.Message', FrameId, 'watch');
+  try
+    Assert.IsTrue(Resp.GetValue<string>('result', '').Contains('bare-test-probe'),
+      '$exception.Message should read the live exception, got: '
+      + Resp.GetValue<string>('result', ''));
+  finally
+    Resp.Free;
+  end;
+end;
+
+// The case the plan named as the point of the whole token: a breakpoint
+// condition, evaluated by the adapter with no Watch panel anywhere near it.
+procedure TDebuggerTests.Test_DollarException_GatesConditionalBreakpoint;
+var BpLine, FrameId, LocalsRef: Integer;
+    Stopped: TJSONObject;
+begin
+  BpLine := Bp('BARE_EXCEPT');
+
+  FClient := TDapClient.Create;
+  FClient.Start(AdapterExe);
+  FClient.Initialize.Free;
+  Assert.IsTrue(FClient.WaitForInitialized, 'adapter did not send initialized event');
+  FClient.SetBreakpoints(FBpSourceFile, [BpLine],
+    ['$exception.Message = ''bare-test-probe'''], [''], ['']).Free;
+  FClient.SetExceptionBreakpoints([]).Free;
+  LaunchTarget(['--run-bare-except']).Free;
+  FClient.ConfigDone.Free;
+
+  Stopped := FClient.WaitForStopped;
+  try
+    Assert.AreEqual('breakpoint', Stopped.GetValue<string>('reason', ''),
+      'a condition reading $exception must let the breakpoint through');
+  finally
+    Stopped.Free;
+  end;
+  FrameId   := FClient.GetFrameId;
+  LocalsRef := FClient.GetLocalsRef(FrameId);
+  Assert.IsTrue(LocalsRef > 0, 'no Locals scope at the conditional stop');
+end;
+
+// And the other direction. Without this, a condition that merely failed to
+// evaluate -- which now STOPS and reports, by design -- would pass the test
+// above without the token ever having been understood.
+procedure TDebuggerTests.Test_DollarException_ConditionFalse_NeverStops;
+var BpLine: Integer;
+begin
+  BpLine := Bp('BARE_EXCEPT');
+
+  FClient := TDapClient.Create;
+  FClient.Start(AdapterExe);
+  FClient.Initialize.Free;
+  Assert.IsTrue(FClient.WaitForInitialized, 'adapter did not send initialized event');
+  FClient.SetBreakpoints(FBpSourceFile, [BpLine],
+    ['$exception.Message = ''not-this-one'''], [''], ['']).Free;
+  FClient.SetExceptionBreakpoints([]).Free;
+  LaunchTarget(['--run-bare-except']).Free;
+  FClient.ConfigDone.Free;
+
+  Assert.IsTrue(FClient.WaitForTerminated(20000),
+    'a FALSE $exception condition must swallow the breakpoint; the target ' +
+    'stopped instead of running to exit');
+end;
+
+// Where there is no exception the answer must be a stated reason, not a parse
+// error about a token the user typed correctly.
+procedure TDebuggerTests.Test_DollarException_OutsideHandler_SaysWhyNotParseError;
+var FrameId, LocalsRef: Integer;
+    Resp: TJSONObject;
+    Display: string;
+begin
+  StartSession('EVAL_BODY', FrameId, LocalsRef);
+  Resp := FClient.Evaluate('$exception.Message', FrameId, 'watch');
+  try
+    Display := Resp.GetValue<string>('result', '');
+    Assert.IsFalse(Display.Contains('unexpected token'),
+      '$exception must parse even where there is no exception, got: ' + Display);
+    Assert.IsTrue(Display.Contains('no exception in scope'),
+      'the answer should say there is no exception in scope, got: ' + Display);
   finally
     Resp.Free;
   end;

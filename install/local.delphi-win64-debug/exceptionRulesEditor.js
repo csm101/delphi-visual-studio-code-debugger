@@ -287,8 +287,18 @@ function openEditorPanel(context, target, initialRules) {
       : 'Write these rules back into the launch configuration'
   });
 
+  // The latest draft the webview has reported as unsaved, or null when it is
+  // clean. A webview cannot cancel its own disposal -- onDidDispose fires after
+  // the fact -- so keeping the draft here is what makes closing the tab
+  // recoverable instead of a silent discard.
+  let pendingDraft = null;
+
   panel.webview.onDidReceiveMessage(async (message) => {
     if (!message) return;
+    if (message.type === 'dirty') {
+      pendingDraft = message.dirty ? message.rules : null;
+      return;
+    }
     if (message.type === 'copy') {
       await vscode.env.clipboard.writeText(message.text);
       vscode.window.showInformationMessage('Exception rules copied to the clipboard.');
@@ -317,6 +327,18 @@ function openEditorPanel(context, target, initialRules) {
       panel.webview.postMessage({ type: 'saveFailed', message: String(error.message || error) });
       vscode.window.showErrorMessage('Could not update exception rules: ' + (error.message || error));
     }
+  }, undefined, context.subscriptions);
+
+  panel.onDidDispose(() => {
+    if (!pendingDraft) return;
+    const draft = pendingDraft;
+    pendingDraft = null;
+    vscode.window.showWarningMessage(
+      `Exception rules for ${target.name} were closed with unsaved changes.`,
+      'Reopen With Those Changes'
+    ).then((choice) => {
+      if (choice) openEditorPanel(context, target, draft);
+    });
   }, undefined, context.subscriptions);
 
   context.subscriptions.push(panel);

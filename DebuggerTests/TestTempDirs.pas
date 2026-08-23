@@ -101,7 +101,17 @@ procedure PurgeLeftoverTempDirs(const Prefix: string);
     try
       for var Dir in TDirectory.GetDirectories(Parent, Prefix + '*') do
         try
-          TDirectory.Delete(Dir, True);
+          // Only OLD leftovers. The suite runs as several worker PROCESSES, and
+          // a sibling's scratch directory matches the same prefix while its
+          // test is still using it -- a file lock saved the fixtures whose
+          // scratch holds a running exe, but a directory of plain JSON files
+          // deleted out from under a live sibling failed two tests on their
+          // first parallel run. Ten minutes cleanly separates "a crashed
+          // earlier run left this behind" from "a sibling made this seconds
+          // ago"; a leftover younger than that survives one run and is swept
+          // by the next.
+          if TDirectory.GetCreationTime(Dir) < Now - (10 / (24 * 60)) then
+            TDirectory.Delete(Dir, True);
         except
           // Held by a running sibling, or by an image section not yet released.
         end;

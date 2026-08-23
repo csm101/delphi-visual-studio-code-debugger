@@ -2455,8 +2455,34 @@ var
     Result := DecodeTD32Name(Buf);
   end;
 
+  // Name of a $0204/$0205 proc record, mangled as stored -- enough to identify
+  // the enclosing routine in a dump without repeating the demangler.
+  function ProcRecordName(Payload, PayloadEnd: PByte): string;
+  begin
+    Result := '';
+    if PayloadEnd - Payload < 40 then
+      Exit;
+    Result := ResolveNameByIndex(PCardinal(Payload + 36)^);
+  end;
+
+  // [start, end) RVA of a $0207 BLOCK32 record -- the same field layout
+  // ParseSymbolStream decodes.
+  function BlockRangeText(Payload, PayloadEnd: PByte): string;
+  begin
+    Result := '';
+    if PayloadEnd - Payload < 18 then
+      Exit;
+    var BlkLen: Cardinal := PCardinal(Payload + 8)^;
+    var BlkOff: Cardinal := PCardinal(Payload + 12)^;
+    var BlkSeg: Word     := PWord(Payload + 16)^;
+    if (BlkSeg < 1) or (BlkSeg > Cardinal(Length(FSegmentVAs))) then
+      Exit;
+    var BlkStart := SegOffsetToRva(BlkSeg, BlkOff);
+    Result := Format('$%x..$%x', [BlkStart, BlkStart + BlkLen]);
+  end;
+
   procedure Emit(const Tag, Nm: string; ModIndex: Integer; Kind: Word;
-    Payload, PayloadEnd: PByte);
+    Payload, PayloadEnd: PByte; const ScopeNames, ScopeBlks: TArray<string>);
   begin
     if Nm = '' then
       Exit;
@@ -2478,11 +2504,25 @@ var
         Rva := SegOffsetToRva(Seg, Offs);
       SegInfo := Format(' seg=%d offs=$%x rva=$%x', [Seg, Offs, Rva]);
     end;
-    Lines := Lines + [Format('%-6s unit=%-24s kind=$%.4x name="%s"%s',
-      [Tag, UnitForMod(ModIndex), Kind, Nm, SegInfo])];
+    var ScopeInfo := '';
+    if Length(ScopeNames) > 0 then begin
+      ScopeInfo := ' scope=' + ScopeNames[High(ScopeNames)] +
+                   Format(' depth=%d', [Length(ScopeNames)]);
+      if ScopeBlks[High(ScopeBlks)] <> '' then
+        ScopeInfo := ScopeInfo + ' block=' + ScopeBlks[High(ScopeBlks)];
+    end;
+    Lines := Lines + [Format('%-6s unit=%-24s kind=$%.4x name="%s"%s%s',
+      [Tag, UnitForMod(ModIndex), Kind, Nm, SegInfo, ScopeInfo])];
   end;
 
   procedure ScanStream(Base, Stop: PByte; ModIndex: Integer; const Tag: string);
+  var
+    // Mirrors the scope stack ParseSymbolStream keeps, so a dumped record can
+    // say WHICH routine and WHICH lexical block it was nested in. A data record
+    // ($0201/$0202) nested inside a proc scope is not a program-wide global at
+    // all, and that difference is invisible without this.
+    ScopeNames: TArray<string>;
+    ScopeBlks:  TArray<string>;
   begin
     var Cur := Base;
     while Cur + 4 <= Stop do begin
@@ -2494,12 +2534,28 @@ var
       var PayloadEnd := Cur + 2 + Int64(RecSize);
       Inc(TotalRecs);
       case Kind of
-        $0202: begin Inc(TotalGData); Emit(Tag, NameByIdxAt(Payload, PayloadEnd, 12), ModIndex, Kind, Payload, PayloadEnd); end;
-        $0201: begin Inc(TotalLData); Emit(Tag, NameByIdxAt(Payload, PayloadEnd, 12), ModIndex, Kind, Payload, PayloadEnd); end;
-        $0200: begin Inc(TotalBpRel); Emit(Tag, NameByIdxAt(Payload, PayloadEnd, 8), ModIndex, Kind, Payload, PayloadEnd); end;
-        $0002: Emit(Tag, NameByIdxAt(Payload, PayloadEnd, 6), ModIndex, Kind, Payload, PayloadEnd);
-        $0203: begin Inc(TotalPub); Emit(Tag, PubName(Payload, PayloadEnd), ModIndex, Kind, Payload, PayloadEnd); end;
-        $0204, $0205: Inc(TotalProc);
+        $0202: begin Inc(TotalGData); Emit(Tag, NameByIdxAt(Payload, PayloadEnd, 12), ModIndex, Kind, Payload, PayloadEnd, ScopeNames, ScopeBlks); end;
+        $0201: begin Inc(TotalLData); Emit(Tag, NameByIdxAt(Payload, PayloadEnd, 12), ModIndex, Kind, Payload, PayloadEnd, ScopeNames, ScopeBlks); end;
+        $0200: begin Inc(TotalBpRel); Emit(Tag, NameByIdxAt(Payload, PayloadEnd, 8), ModIndex, Kind, Payload, PayloadEnd, ScopeNames, ScopeBlks); end;
+        $0002: Emit(Tag, NameByIdxAt(Payload, PayloadEnd, 6), ModIndex, Kind, Payload, PayloadEnd, ScopeNames, ScopeBlks);
+        $0203: begin Inc(TotalPub); Emit(Tag, PubName(Payload, PayloadEnd), ModIndex, Kind, Payload, PayloadEnd, ScopeNames, ScopeBlks); end;
+        $0204, $0205: begin
+          Inc(TotalProc);
+          ScopeNames := ScopeNames + [ProcRecordName(Payload, PayloadEnd)];
+          ScopeBlks  := ScopeBlks  + [''];
+        end;
+        $0207: begin
+          if Length(ScopeNames) > 0 then
+            ScopeNames := ScopeNames + [ScopeNames[High(ScopeNames)]]
+          else
+            ScopeNames := ScopeNames + [''];
+          ScopeBlks := ScopeBlks + [BlockRangeText(Payload, PayloadEnd)];
+        end;
+        $0006:
+          if Length(ScopeNames) > 0 then begin
+            SetLength(ScopeNames, Length(ScopeNames) - 1);
+            SetLength(ScopeBlks,  Length(ScopeBlks)  - 1);
+          end;
       end;
       Inc(Cur, 2 + Int64(RecSize));
     end;

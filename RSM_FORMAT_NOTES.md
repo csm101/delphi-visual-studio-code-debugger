@@ -287,3 +287,18 @@ See `KNOWN_UNKNOWNS.md`. The big buckets:
   arrays, generics).
 - Whether other parameter-kind tags (0x21, 0x23, …) exist and what they mean.
 - The `0xC6` global variant payload.
+
+## What the main-block table does NOT contain
+
+The program main block's locals are the `$20` records carrying the `$46`
+(`TYPEREF_MARKER_MAIN`) type reference, and they cover the block's inline
+`var`s -- `localdata`, `foo`, `TheWidget`, `TheStuff`. They do **not** cover the
+alias of an `on E: ... do` handler written in that main block, and no amount of
+scope-walking will make them: dcc does not give that alias a stack slot at all.
+It allocates a module-level static instead, which lands in TD32 as an LDATA32
+global and in the RSM outside the main-block local table.
+
+Recorded because the shape of the symptom -- "`E` is missing from the main
+block's locals" -- invites a search for a missing RSM record. There is nothing
+to find. See `EH_FORMAT_NOTES.md`, "The `on` alias, and where the compiler puts
+it".

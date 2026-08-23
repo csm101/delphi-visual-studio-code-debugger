@@ -174,6 +174,16 @@ function test(name, fn) {
   }
 }
 
+// The webview also posts a `dirty` message on every edit, so the host can offer
+// the draft back when the tab is closed unsaved. Tests that care about the SAVE
+// must name it rather than assume it is the first thing posted -- which it only
+// ever was for a save with no edit before it.
+function lastPosted(view, type) {
+  const matches = view.posted.filter((message) => message && message.type === type);
+  assert.ok(matches.length > 0, 'nothing of type "' + type + '" was posted');
+  return matches[matches.length - 1];
+}
+
 const SAMPLE = {
   configurationName: 'Debug SampleApp',
   documentLabel: 'SampleApp/.vscode/launch.json',
@@ -198,7 +208,7 @@ test('renders one card per rule, numbered in evaluation order', () => {
 test('save posts the rules in the displayed order', () => {
   const view = loadWebview(SAMPLE);
   findByTitle(view.document, 'Write these rules back into the launch configuration')[0].fire('click');
-  assert.strictEqual(view.posted.length, 1);
+  assert.strictEqual(view.posted.length, 1, 'a save with no edit before it posts nothing else');
   assert.strictEqual(view.posted[0].type, 'save');
   assert.deepStrictEqual(view.posted[0].rules, SAMPLE.rules);
 });
@@ -207,7 +217,7 @@ test('moving a rule down changes the evaluation order', () => {
   const view = loadWebview(SAMPLE);
   findByTitle(view.document, 'Move down (evaluated later)')[0].fire('click');
   findByTitle(view.document, 'Write these rules back into the launch configuration')[0].fire('click');
-  assert.deepStrictEqual(view.posted[0].rules.map((rule) => rule.action),
+  assert.deepStrictEqual(lastPosted(view, 'save').rules.map((rule) => rule.action),
     ['logStack', 'ignore', 'break']);
 });
 
@@ -224,7 +234,7 @@ test('delete and duplicate keep the model consistent', () => {
   findByTitle(view.document, 'Duplicate this rule')[0].fire('click');
   findByTitle(view.document, 'Delete this rule')[2].fire('click');
   findByTitle(view.document, 'Write these rules back into the launch configuration')[0].fire('click');
-  assert.deepStrictEqual(view.posted[0].rules.map((rule) => rule.action),
+  assert.deepStrictEqual(lastPosted(view, 'save').rules.map((rule) => rule.action),
     ['ignore', 'ignore', 'break']);
 });
 
@@ -246,7 +256,7 @@ test('a comma-separated class list becomes an array', () => {
   input.value = 'EAbort, EMyError';
   input.fire('input');
   findByTitle(view.document, 'Write these rules back into the launch configuration')[0].fire('click');
-  assert.deepStrictEqual(view.posted[0].rules[0].class, ['EAbort', 'EMyError']);
+  assert.deepStrictEqual(lastPosted(view, 'save').rules[0].class, ['EAbort', 'EMyError']);
 });
 
 test('a native exception code round-trips instead of being dropped on save', () => {
@@ -259,7 +269,7 @@ test('a native exception code round-trips instead of being dropped on save', () 
   const input = view.document.querySelector('[data-input-for="0:code"]');
   assert.strictEqual(input.value, '0x406D1388');
   findByTitle(view.document, 'Write these rules back into the launch configuration')[0].fire('click');
-  assert.deepStrictEqual(view.posted[0].rules[0], { code: '0x406D1388', action: 'ignore' });
+  assert.deepStrictEqual(lastPosted(view, 'save').rules[0], { code: '0x406D1388', action: 'ignore' });
 });
 
 test('a comma-separated code list becomes an array and an invalid code blocks saving', () => {
@@ -271,7 +281,7 @@ test('a comma-separated code list becomes an array and an invalid code blocks sa
   input.value = '0x406D1388, $C0000005';
   input.fire('input');
   findByTitle(view.document, 'Write these rules back into the launch configuration')[0].fire('click');
-  assert.deepStrictEqual(view.posted[0].rules[0].code, ['0x406D1388', '$C0000005']);
+  assert.deepStrictEqual(lastPosted(view, 'save').rules[0].code, ['0x406D1388', '$C0000005']);
 
   input.value = 'C0000005';   // no 0x / $ prefix: not a code
   input.fire('input');
@@ -286,7 +296,7 @@ test('changing the action updates the model and the help text', () => {
   select.value = 'log';
   select.fire('change');
   findByTitle(view.document, 'Write these rules back into the launch configuration')[0].fire('click');
-  assert.strictEqual(view.posted[0].rules[2].action, 'log');
+  assert.strictEqual(lastPosted(view, 'save').rules[2].action, 'log');
 });
 
 test('unknown fields loaded from launch.json are reported, not silently kept', () => {
@@ -307,8 +317,30 @@ test('read-only mode disables editing but still allows Copy JSON', () => {
   });
   assert.strictEqual(view.document.getElementById('save-button').disabled, true);
   findByTitle(view.document, 'Copy the exceptionRules array to the clipboard')[0].fire('click');
-  assert.strictEqual(view.posted[0].type, 'copy');
-  assert.match(view.posted[0].text, /"class": "EAbort"/);
+  assert.strictEqual(lastPosted(view, 'copy').type, 'copy');
+  assert.match(lastPosted(view, 'copy').text, /"class": "EAbort"/);
+});
+
+/*
+ * A webview cannot veto its own disposal, so the only thing that can stop a
+ * closed tab from discarding unsaved work is the HOST holding the latest draft.
+ * The webview therefore reports every edit, and reports the draft going clean
+ * again once the save lands -- otherwise the host would offer back work that is
+ * already on disk.
+ */
+test('every edit reports the draft to the host, and a save reports it clean', () => {
+  const view = loadWebview(SAMPLE);
+  findByTitle(view.document, 'Move down (evaluated later)')[0].fire('click');
+  const afterEdit = lastPosted(view, 'dirty');
+  assert.strictEqual(afterEdit.dirty, true);
+  assert.deepStrictEqual(afterEdit.rules.map((rule) => rule.action),
+    ['logStack', 'ignore', 'break'],
+    'the draft the host keeps must be the edited one, not the original');
+
+  view.post({ type: 'saved' });
+  const afterSave = lastPosted(view, 'dirty');
+  assert.strictEqual(afterSave.dirty, false,
+    'a saved draft must not be offered back as unsaved work');
 });
 
 test('adding a rule appends a break rule at the end', () => {
@@ -316,7 +348,7 @@ test('adding a rule appends a break rule at the end', () => {
   assert.match(view.document.getElementById('app').textContent, /No exception rules yet/);
   findByTitle(view.document, 'Append a new rule at the end')[0].fire('click');
   findByTitle(view.document, 'Write these rules back into the launch configuration')[0].fire('click');
-  assert.deepStrictEqual(view.posted[0].rules, [{ action: 'break' }]);
+  assert.deepStrictEqual(lastPosted(view, 'save').rules, [{ action: 'break' }]);
 });
 
 test('the save button names the file it writes, shared file included', () => {

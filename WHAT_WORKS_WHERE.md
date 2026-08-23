@@ -70,6 +70,10 @@ same holds for B: `dcc32` builds the identical sources.
 | `setVariable` (primitives, floats, enums, sets, strings) | yes | yes | yes | — |
 | Conditional breakpoints, hit counts, log points | yes | yes | yes | — |
 | Exception stop names the class and the message | yes | yes | yes | — |
+| `on E:` alias listed in Locals, inside a procedure | yes | — | yes | — |
+| `on E:` alias listed in Locals, program main `begin..end` | yes | — | n/a | n/a |
+| `$exception` for the whole life of a bare `except` | yes | no | yes | — |
+| `$exception` in an expression / a breakpoint condition | yes | yes\* | yes | — |
 | Step into / over / out | yes | yes | yes | — |
 | Per-thread stepping (others frozen) | yes | — | — | — |
 | Interface local labelled with its concrete class | yes | yes | yes | — |
@@ -87,6 +91,14 @@ Notes on the starred cells:
   offsets has **not been measured**.
 * **Main-block locals, x86.** What is asserted is that they never carry an
   invented type. Full parity with x64 for that scope is not claimed.
+* **Exception in scope, x86.** `no` for the bare-`except` case, and measured:
+  locating a handler block needs its extent, a 32-bit binary has no `.pdata`, and
+  nothing else in it states one. The debugger refuses with a reason naming the
+  limitation rather than rendering an empty row
+  (`Win32_BareHandlerException_RefusesWithAReason` asserts both halves against an
+  x64 control at the same marker). The starred x86 cell on the expression row is
+  the same fact seen from the other side: the NAME parses everywhere, and where
+  the value cannot be justified the result carries the reason.
 * **`threadvar`.** Not resolved on any configuration — but it refuses with a
   reason instead of answering. It used to read the PE headers and report `0` for
   a variable holding `$5A5A5A5A`, on both bitnesses, with nothing marking the

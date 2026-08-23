@@ -102,7 +102,7 @@ VS Code  ── DAP (JSON over stdio) ──>  VisualStudioCodeDelphiDebugger.ex
 - `DebuggerTests\`: DUnitX integration test suite. Launches the adapter,
   exercises BPs / locals / step / globals / evaluate.
   Run with `cmd /c "C:\Athens\GitHub\Win64Debugger\DebuggerTests\build_and_run.bat"`.
-  Current status: **1188 found / 1184 pass / 0 fail / 0 leaked / 4 ignored**,
+  Current status: **1301 found / 1297 pass / 0 fail / 0 leaked / 4 ignored**,
   in ~80 s (~12 s build + ~68 s of tests across 8 concurrent worker processes).
   Set `RUNTESTS_JOBS=1` for the sequential path — same results, ~440 s. See
   "Parallel execution" in `CLAUDE.md`.
@@ -338,7 +338,9 @@ Variable expansion (RTTI-driven, `DelphiRtti.pas`):
 - Class instance field expansion (all visibility levels, all ancestor classes)
   via VMT extended RTTI (`TFieldExEntry` records). Validated on `TFoo`.
 - Record field expansion via TypeInfo `tkRecord`/`tkMRecord` field table.
-- Dynamic-array element enumeration (up to 512 elements).
+- Dynamic-array element enumeration (up to 1024 elements,
+  `VariableExpander.pas`; the 512 cap belongs to the RTTI walk in
+  `DelphiRtti.pas`, which is a different limit).
 - Nested expansion: each expandable field gets its own `variablesReference`.
 
 Class-member resolution (RSM-driven, `RsmFileReader.ParseClassMemberSection`):
@@ -355,9 +357,23 @@ Class-member resolution (RSM-driven, `RsmFileReader.ParseClassMemberSection`):
 Evaluate / watch:
 - Qualified identifiers (e.g. `Increment.d1`).
 - Registers, address-of, memory dereference, literals.
-- Pascal grammar with full precedence: `or` / `xor` < `and` < comparison
-  (`=` `<>` `<` `<=` `>` `>=`) < add (`+` `-`) < mul (`*` `/` `div` `mod`
-  `shl` `shr`) < unary (`-` `not` `@` `[]`) < primary.
+- Pascal grammar with DELPHI's precedence: comparison (`=` `<>` `<` `<=`
+  `>` `>=` `in` `is` `as`) < add (`+` `-` `or` `xor`) < mul (`*` `/`
+  `div` `mod` `and` `shl` `shr`) < unary (`-` `not` `@` `[]`) < primary.
+  `and` sits with the multiplicative operators and `or`/`xor` with the
+  additive ones, both binding TIGHTER than any comparison — which is why
+  `(a > 1) and (b < 2)` needs its parentheses here exactly as in Delphi.
+  It used to be the other way round (C-like), so `Flags and MASK = 0`
+  silently meant `Flags and (MASK = 0)`.
+- Relational operators between STRING operands compare characters
+  (ordinal, `CompareStr`), across UnicodeString / WideString /
+  AnsiString (code page from the string's own `TStrRec`) / ShortString,
+  and against a `Char`. `nil` reads as the empty string, since that is
+  how Delphi stores one. A string against a non-text operand is refused
+  with a reason. Previously these compared HEAP POINTERS, so `S = 'abc'`
+  was False whatever S held.
+- Bounded per expression: `MAX_EXPR_NESTING` = 64 parser levels,
+  `MAX_EXPR_CALLS` = 32 calls into the debuggee.
 - Mixed int / float arithmetic auto-promotes to Double; `/` always yields
   Double like Pascal source.
 - String concat with `+` allocates a new immortal Delphi string in the
@@ -384,7 +400,20 @@ Evaluate / watch:
   watch (no debuggee crash, no silent pass-through).
 - Built-in intrinsics: `Length(s | dynarray)`, `SizeOf(type)`,
   `Ord(enum)`, `Low(t)` / `High(t)` for ordinals / enums / arrays /
-  strings.
+  strings, `Assigned`, `Pred`, `Succ`, `Abs`, `Chr`, `Trunc`, `Round`,
+  `Int`, `Frac`, and — on the string reader above — `Copy`, `Pos`,
+  `UpperCase`, `LowerCase` (ASCII-only, as the RTL's are).
+- A Delphi intrinsic that is NOT implemented (`Inc`, `Dec`, `Format`,
+  `SetLength`, `TypeInfo`, `Write`, …) is refused by name with the
+  reason, from a table in `TryUnsupportedIntrinsicAdvice`. It is compiler
+  magic with no callable symbol, so without the table it fell through to
+  symbol resolution and came back as "not found" — which reads as an
+  accusation about the user's variable rather than a statement about the
+  function.
+- Character literals (`#65`, `#$41`) and literal runs (`'a'#13#10'b'` is
+  one constant; a lone `#N` is a `Char`). Float literals take an
+  exponent (`1e6`, `1.5e-3`). A leading-dot float (`.5`) is refused by
+  name — Pascal, unlike C, requires the digit.
 - Set algebra on set operands: `+` union, `-` difference, `*`
   intersection (bitmask ops; `TExprValue.IsSet` routes them).
 - Open-array parameter indexing: a `^Element` base (how `array of T`
@@ -420,7 +449,11 @@ Evaluate / watch:
 Breakpoint kinds:
 - Source-line BPs (always-on or conditional).
 - Conditional BPs (DAP `condition`): expression evaluated at hit; non-zero =
-  stop, zero / eval-failure = silent continue.
+  stop, zero = silent continue, and a condition that CANNOT BE EVALUATED = stop
+  with the reason (`stopped.description`/`text`, plus one Debug Console line per
+  breakpoint per session). The hit-count gate is skipped on that path so a
+  `%N` hit condition cannot swallow the report. Matches the Delphi IDE; the old
+  "eval failure = silent continue" is the one failure nothing reveals.
 - Hit-count BPs (DAP `hitCondition`): supports `N`, `=N`, `>N`, `>=N`, `%N`.
 - Log-points (DAP `logMessage`): never stops; emits `output` event with
   `{expr}` placeholders rendered through the same evaluator. `{{` / `}}`
@@ -857,6 +890,70 @@ Evaluate / expression grammar:
   `$28` record (var-out functions tag `Result` as `$23` instead of
   `$20`).
 
+- **Safe-getter safelist — increment 1 SHIPPED (0.6.0), increments 2-4 open.**
+  A property backed by a getter cannot be expanded without CALLING it, and an
+  arbitrary getter can allocate, lock or raise inside a stopped process. The
+  safelist is the list of getters a call is allowed to be made for automatically.
+  * **Built:** `DebuggerCore\SafeCallPolicy.pas` — five discovery tiers with a
+    fixed precedence (`user.safelist.json` > source-anchored ancestor walk >
+    source-path pool > user-global generated > shipped), category verdicts
+    applied in `AllowsAutoCall` (pure / trusted / mayRaise call automatically;
+    lazyInit / conditional / unsafe / deny never do), per-archive parse that is
+    lazy and mtime-validated, atomic sorted writes of the user file, and
+    `DELPHI_DEBUGGER_SAFELIST_DIR` to redirect it in tests. When a call is
+    allowed the expander runs EXACTLY the call the "expand to evaluate" click
+    would have made (`EvaluateGetterInto`) — no second call path. Rows carry
+    `SafelistKey` (declaring class + getter name, falling back to class +
+    property); indexed properties stay excluded. DAP: `delphiSafelistAdd` /
+    `delphiSafelistRemove` / `delphiSafelistReload` plus an
+    `invalidated(variables)` event so the panel re-renders at once, with
+    `delphiSafelistKey` on the rows; VS Code contributes Always / Never entries
+    to the Variables and Watch context menus. Tests: `SafeCallPolicyTests` (9),
+    `SafelistDapTests` (2).
+  * **Increment 2a — the automatic-call time budget — DONE.** An authorised
+    getter used to be called with the same 8 s watchdog as an explicit "expand
+    to evaluate" click, so ONE blocking getter froze the Variables panel for the
+    whole timeout, once per authorised row. What bounds the wait now is the
+    BURST, not the call: `IDebugTarget.BeginAutoCallWindow` /
+    `EndAutoCallWindow` / `AutoCallWindowExhausted`, opened by
+    `ExpandProperties` around a whole property group for `AUTO_CALL_WINDOW_MS`
+    (1000), with each call inside it clamped to
+    `min(now + REMOTE_CALL_AUTO_TIMEOUT_MS, window deadline)` — 400 ms, declared
+    beside the 8 s constant it qualifies. Past the deadline a row defers without
+    calling at all, and a call the watchdog cut short defers too rather than
+    rendering `<evaluation cancelled>` as if it were the value, so the user's own
+    click still gets the full budget. Two consequences, both deliberate: the
+    outcome depends on ROW ORDER (a blocking getter eats the window, so rows
+    after it defer until re-expanded), and a cut-short getter leaves the debuggee
+    thread inside its blocking call, so nothing else can be called on that thread
+    until the block ends (`TRAPS.md` -> "Synthetic calls into the debuggee").
+    Regression: `SafelistDapTests.AnAuthorisedGetterThatHangs_DefersInsteadOfHoldingThePanel`
+    against `TWidget.SlowScore`, a getter that sleeps 5 s. The budget is
+    hardcoded on purpose; a launch.json setting is the answer only if real use
+    shows the fallback is too eager.
+  * **Open, design settled 2026-08-12:** (2b) an entry-byte hook sniff (`E9` /
+    `FF25` -> defer rather than call, because a hooked getter is not the code the
+    safelist vouched for) — the work there is telling a DETOUR from Delphi's own
+    legitimate import thunks, which are `FF25` too, by resolving the jump target
+    and checking whether it lands in the module the symbol belongs to; (3) the
+    AI-agent contract — a JSON schema, a `SafelistProbe` lint, the
+    agent itself under `DevTools\safelist\`, and a distributed RTL archive, which
+    is where `dependsOn` resolution lands (direct cross-library, and virtual via
+    the concrete class VMT); (4) optional machine screening with Zydis for the
+    hover tier. **Hover stays call-free until (4) exists.**
+
+Manual verification still open (needs a human in VS Code; no code is blocked on it):
+- Memory view: payload behaviour on a string and on a dynamic array in both
+  panels, a byte WRITE through the `edit` toggle, and whether the changed-byte
+  highlight survives the pane's own re-measure.
+- `F10` at an exception stop lands on the `except` / `finally` that receives it;
+  on an x86 `try/finally` it must REFUSE with a visible reason — the refusal is
+  the correct behaviour, not a defect.
+- Breakpoints panel -> "Add Data Breakpoint at Address", which has never been
+  driven by hand.
+- Hydra2: breakpoint in a BPL loaded after startup, then locals and evaluate.
+  The only core use case the suite does not reproduce.
+
 Project / packaging:
 - Publish the VS Code extension instead of manual local install.
 
@@ -1123,6 +1220,45 @@ Architecture / portability:
   Common "noise" first-chance codes seen in large Delphi apps:
   `STATUS_GUARD_PAGE_VIOLATION` ($80000001, fires on every stack/heap page
   growth), C++ SEH probing, CLR internal exceptions.
+- **`$exception` as an expression token — implemented.** It is matched in
+  `TExprEvaluator.ParsePrimary` before the integer-literal scanner (`$` opens a
+  Pascal hex literal and `$e` is a valid one, so the scanner used to eat two
+  characters and leave `xception` behind) and resolves to an ordinary
+  class-typed operand. That is what makes `$exception.Message` work, and what
+  makes `$exception` usable in a BREAKPOINT CONDITION — a path that never sees
+  the DAP frontend's literal-string intercept, which is the only reason the name
+  appeared to work at all before. No exception in scope yields
+  `<no exception in scope: <reason>>`, never a parse error.
+- **`$exception` for the whole life of a bare handler — implemented (x64).**
+  A bare `except .. end` names its exception nothing and, measured, stores it
+  nowhere: the block's first instruction is a `nop`. The object exists only on
+  the RTL's per-thread raise list, so the debugger asks the RTL —
+  `System.ExceptObject`, called in the target, resolved in the module the
+  handler runs in and falling back to that module's export directory for a
+  packaged RTL that ships without symbols (`TryResolveExportedRoutine`; getting
+  this wrong reads another RTL's empty raise list and reports, confidently,
+  that nothing is being handled). Gated on the PC being inside a bare-except
+  block, so the row appears for every stop in the handler and disappears at its
+  end. `IDebugTarget.TryGetHandlerException`; surfaced by
+  `DapServer.AppendExceptionLocal` and `TDebugSession.AppendBareHandlerException`.
+  Never offered beside an `on E:` alias. x86 refuses with a reason that names
+  the limitation rather than rendering nothing.
+- **The `on E:` alias of a handler in a PROGRAM MAIN BLOCK — implemented
+  (x64).** `get_locals` lists it while, and only while, the stop is lexically
+  inside that clause. It is not an ordinary local and never was: dcc gives a
+  main-block alias a module-level static rather than a frame slot (measured on
+  both bitnesses), so every symbol reader files it as a program-wide global —
+  which is why `evaluate E` answered there long before Locals listed it, and why
+  no amount of RSM scope-walking would have found it. The adapter locates the
+  `on`-clause block from the routine's own scope + clause tables, decodes the
+  block's first instruction (the store of the exception object into the alias)
+  to learn the slot, and names it from the globals table.
+  `TWinDebugger.TryGetExceptHandlerBlockAt` / `TryGetHandlerAliasLocal`; formats
+  and the block-extent rule in `EH_FORMAT_NOTES.md`. Withdrawn again at the end
+  of the block, which is what keeps it out of a sibling bare `except`, where the
+  static holds a dangling pointer to the already-freed previous exception.
+  x86 declines (no `.pdata`, so no block extents); a handler inside a PROCEDURE
+  is unaffected on both bitnesses, its alias being a plain stack local.
 - **Pause button** — implemented via `DebugBreakProcess`, which injects a
   temporary thread that executes `INT3`. The resulting `EXCEPTION_BREAKPOINT`
   arrives with an unknown VA (not in our BP list). Detected by `FPauseRequested`
@@ -1267,8 +1403,10 @@ VS Code:
 
 ## Diagnostic logging
 
-`%TEMP%\dap_adapter.log`, line-timestamped. Always on today.
-Make opt-in is a roadmap item.
+`%TEMP%\dap_adapter.log`, line-timestamped. **Off by default**
+(`DapProtocol.pas`); turned on by `"diagnosticLog": true` in `launch.json`, or
+by `DAP_LOG=1` in the environment. One previous generation is kept beside it as
+`dap_adapter.1.log`.
 
 ## Repository and release invariants (recorded 2026-08-08)
 

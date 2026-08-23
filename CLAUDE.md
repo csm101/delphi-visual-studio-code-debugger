@@ -68,54 +68,36 @@ If a temporary shortcut is unavoidable:
 
 # Session continuity rules
 
-Maintain these files:
+The record of what happened is `git log`. The record of where the project stands
+is `PROJECT_STATE.md`. Neither needs maintaining by hand as a side activity:
+commit messages are written when committing, and `PROJECT_STATE.md` is updated in
+the same change set as the work it describes.
 
-- PROJECT_STATE.md   (high-level permanent state)
-- TASK_RESUME.md     (exact current task state)
+`TASK_RESUME.md` covers the one case those two cannot: work that is **started and
+not yet committed**, interrupted mid-step. Write into it what a new session cannot
+get from the diff — the hypothesis being tested, what was already tried and
+refuted, the exact next action — and only while that state is uncommitted.
 
-Update TASK_RESUME.md continuously enough that work can resume after an interruption in the middle of a long step.
+**The `post-commit` hook in `githooks/` erases it on every commit.** That is
+deliberate: once a commit exists the commit message is the record, and leftover
+cursor text now describes finished work. This is not hypothetical — the file once
+reached 3343 lines (~91k tokens) with a "next action" pointing at work finished
+weeks earlier. A stale cursor is worse than no cursor: it sends the next session
+in the wrong direction with confidence. Do not defeat the hook by rewriting the
+cursor after committing.
 
-Do not wait for a full step to finish.
+Enable the hook once per clone:
 
-Update TASK_RESUME.md whenever restart cost is starting to rise, especially after:
+```powershell
+git config core.hooksPath githooks
+```
 
-- a non-trivial discovery
-- a code edit
-- a test/build result
-- a local change of hypothesis
-- a switch of file, symbol, or investigation path
-- any sign that token budget may run out before the current step is complete
+**Never stage `TASK_RESUME.md` with the work.** `git add -A` will, so stage
+explicitly. With the stub in `HEAD` the hook's rewrite matches what is committed
+and the worktree stays clean; commit the cursor text once and `HEAD` holds a
+cursor describing finished work, which `git checkout --` will happily restore.
 
-If usage seems near limit:
-stop coding and update TASK_RESUME.md first.
-
-TASK_RESUME.md must contain:
-
-- current task
-- current substep
-- current files / symbols in focus
-- last completed action
-- next action if interrupted right now
-- files involved
-- what works
-- what is failing
-- last test result
-- exact next step
-- traps / hypotheses
-
-When a long step is still in progress, TASK_RESUME.md must describe the current cursor inside that step, not just the high-level milestone.
-
-The cursor should be brief but specific enough that a new session can continue without re-reading broad context.
-
-TASK_RESUME.md is OVERWRITTEN, never appended to, and stays under ~150 lines.
-
-"Update continuously" means keep the cursor CURRENT, not accumulate a journal.
-The file once reached 3343 lines (~91k tokens), at which point reading it cost
-more than reading the code it described, and its "next action" pointed at work
-finished weeks earlier. A stale cursor is worse than no cursor: it sends the next
-session in the wrong direction with confidence.
-
-Before adding a paragraph, ask where it belongs once this task ends:
+Everything durable goes elsewhere, in the same change set as the code:
 
 - a measured fact about a format -> `RSM_*.md`, `TD32_FORMAT_NOTES.md`
 - an architectural decision or mechanism -> `DAP_DEBUGGER_ARCHITECTURE.md`
@@ -124,9 +106,6 @@ Before adding a paragraph, ask where it belongs once this task ends:
 - what is done / what is next at project scale -> `PROJECT_STATE.md`
 - the narrative of a change that landed -> the commit message, not a file
 
-Only what is true RIGHT NOW about the task in flight stays in TASK_RESUME.md.
-When the task ends, move what survives and delete the rest.
-
 PROJECT_STATE.md must contain:
 
 - architecture status
@@ -134,8 +113,6 @@ PROJECT_STATE.md must contain:
 - open milestones
 - important technical discoveries
 - stable build/run commands
-
-PROJECT_STATE.md must not duplicate transient task state that belongs in TASK_RESUME.md.
 
 # Living specifications
 
@@ -176,14 +153,17 @@ Rules:
 
 When starting a new session:
 
-1. Read PROJECT_STATE.md
-2. Read TASK_RESUME.md
-3. Read the living specifications relevant to the next step — pick them from the
+1. `git log --oneline -15` and `git status` — what landed recently, and whether
+   anything is uncommitted
+2. Read PROJECT_STATE.md
+3. Read TASK_RESUME.md. If it holds the stub, there is no interrupted work and
+   the previous two steps are the whole picture.
+4. Read the living specifications relevant to the next step — pick them from the
    list under "Living specifications" above, which is the ONLY list of those
    documents. `KNOWN_UNKNOWNS.md` and `TRAPS.md` are read in every session
    regardless of focus.
-4. Inspect only referenced files first
-5. Resume exactly from next step
+5. Inspect only referenced files first
+6. Resume exactly from next step
 
 Do not restart analysis from zero unless required.
 

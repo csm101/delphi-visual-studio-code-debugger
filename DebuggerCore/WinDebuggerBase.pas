@@ -219,6 +219,11 @@ type
     // failure) instead of hanging the whole adapter on WaitForDebugEvent.
     FInRemoteCall:    Integer;
     FAbortRemoteCall: Integer;
+    // Auto-call window (see IDebugTarget.BeginAutoCallWindow). Depth counts
+    // nested opens so the OUTERMOST deadline survives; plain fields, not
+    // atomics, because only the thread that pumps the calls ever touches them.
+    FAutoCallDepth:    Integer;
+    FAutoCallDeadline: UInt64;
     // VA of a reusable scratch page in the debuggee used to hold the
     // hidden var-out result slot for managed / Variant / record getters.
     // Allocated lazily; zeroed on each use. One page (4 KB) is enough for
@@ -398,6 +403,32 @@ type
     // plausible-looking stop point.
     function  PlanExceptionStep(Tid: DWORD; out Plan: TExceptionStepPlan;
                 out RefusalReason: string): Boolean; virtual;
+    // The `except` block PC is standing IN, if any -- the question "am I inside
+    // a handler right now", as opposed to PlanExceptionStep's "where will this
+    // exception land". Reads the same x64 `.pdata` / `UNWIND_INFO` / Delphi
+    // scope-table chain (EH_FORMAT_NOTES.md) and answers False for everything
+    // it cannot prove, a non-Delphi language handler included.
+    //
+    // x86 overrides it to a flat False: a 32-bit binary has no `.pdata`, and the
+    // fs:[0] chain describes where an exception WOULD go, not which block the
+    // thread is currently executing.
+    function  TryGetExceptHandlerBlockAt(PC: UInt64;
+                out Blk: TExcHandlerBlock): Boolean; virtual;
+    // Why TryGetExceptHandlerBlockAt can never answer on this target, or '' when
+    // it can in principle and simply did not this time. x86 overrides it.
+    function  ExceptHandlerScopeUnavailableReason: string; virtual;
+    // The exception alias of the `on <X>: <Class> do` clause PC is standing in,
+    // when the compiler put X somewhere the ordinary locals path cannot see.
+    //
+    // In a procedure the alias is a plain stack local and every symbol reader
+    // already lists it. In a PROGRAM MAIN BLOCK dcc allocates it as a
+    // module-level static instead (measured: `_ZN7Debugme1EE`, an LDATA32 at a
+    // fixed RVA, on BOTH bitnesses), so it is a global to every reader and never
+    // a local of the block -- which is why `evaluate E` answered there while
+    // Locals did not list it. This recovers it, for the extent of the clause
+    // that owns it and no further.
+    function  TryGetHandlerAliasLocal(PC: UInt64;
+                out LV: TLocalValue): Boolean;
     // Shared by both architectures' planners: True when VA is an address in a
     // module with symbols that maps to a real source line, which is what
     // separates a user's own except/finally block from an RTL funclet or a
@@ -669,6 +700,9 @@ type
     // Requests the in-flight synthetic call (if any) to abort at the next pump
     // iteration. Thread-safe; a no-op when no call is running.
     procedure RequestAbortRemoteCall;
+    procedure BeginAutoCallWindow(TotalMs: Cardinal);
+    procedure EndAutoCallWindow;
+    function  AutoCallWindowExhausted: Boolean;
     function  TryResolveClassRef(const ClassName: string; out VA: UInt64): Boolean;
     function  CurrentScopeClassName: string;
     function  TryResolveConstValue(const Name: string;
@@ -734,6 +768,18 @@ type
     function  LastExceptionIsDelphiRaise: Boolean;
     function  LastExceptionMessage: string;
     function  CurrentExceptionObject: UInt64;
+    function  TryGetHandlerException(out Kind: TExcHandlerBlockKind;
+                out ObjVA: UInt64; out Reason: string): Boolean;
+    // The VA of a routine a module MAPPED IN THE DEBUGGEE exports by name.
+    //
+    // Needed because an application split into runtime packages keeps its RTL
+    // in `rtl<version>.bpl`, which ships without debug information: no symbol
+    // reader can name a single routine in it. The export directory can, and it
+    // is read out of the mapped image, so relocation is already applied.
+    // Delphi packages export every routine under its mangled name --
+    // `_ZN6System12ExceptObjectEv` on x64, `@System@ExceptObject$qqrv` on x86.
+    function  TryResolveExportedRoutine(ModBase: UInt64;
+                const ExportName: AnsiString; out VA: UInt64): Boolean;
     procedure SetExceptionRules(const Rules: TArray<TExceptionRule>);
     property  OnStopped:      TOnStopped     read GetOnStopped     write SetOnStopped;
     property  OnExited:       TOnExited      read GetOnExited      write SetOnExited;
@@ -965,6 +1011,29 @@ end;
 procedure TWinDebugger.RequestAbortRemoteCall;
 begin
   AtomicExchange(FAbortRemoteCall, 1);
+end;
+
+procedure TWinDebugger.BeginAutoCallWindow(TotalMs: Cardinal);
+begin
+  // Only the outermost open sets the deadline: a nested burst must not extend
+  // the budget of the one that contains it.
+  if FAutoCallDepth = 0 then
+    FAutoCallDeadline := GetTickCount64 + TotalMs;
+  Inc(FAutoCallDepth);
+end;
+
+procedure TWinDebugger.EndAutoCallWindow;
+begin
+  if FAutoCallDepth = 0 then
+    Exit;
+  Dec(FAutoCallDepth);
+  if FAutoCallDepth = 0 then
+    FAutoCallDeadline := 0;
+end;
+
+function TWinDebugger.AutoCallWindowExhausted: Boolean;
+begin
+  Result := (FAutoCallDepth > 0) and (GetTickCount64 >= FAutoCallDeadline);
 end;
 
 function TWinDebugger.TryResolveClassRef(const ClassName: string;
@@ -5950,9 +6019,22 @@ begin
   // deadline, force the call thread's RIP to our INT3 trap so the very next
   // event completes the call as a FAILURE rather than hanging the adapter.
   const REMOTE_CALL_TIMEOUT_MS = 8000;
+  // A call made INSIDE an auto-call window was not asked for individually, so
+  // it gets a budget an order of magnitude smaller: the user is waiting on a
+  // panel that renders many rows, not on this one getter. Both numbers live
+  // here, together, so the policy is one place to read rather than
+  // milliseconds scattered through the layers that request a call.
+  const REMOTE_CALL_AUTO_TIMEOUT_MS = 400;
   AtomicExchange(FAbortRemoteCall, 0);
   AtomicExchange(FInRemoteCall, 1);
-  var CallDeadline := GetTickCount64 + REMOTE_CALL_TIMEOUT_MS;
+  var CallDeadline := GetTickCount64 + UInt64(REMOTE_CALL_TIMEOUT_MS);
+  if FAutoCallDepth > 0 then begin
+    // Whichever runs out first: this call's own reduced budget, or what is left
+    // of the window shared by the whole burst.
+    CallDeadline := GetTickCount64 + UInt64(REMOTE_CALL_AUTO_TIMEOUT_MS);
+    if FAutoCallDeadline < CallDeadline then
+      CallDeadline := FAutoCallDeadline;
+  end;
   var Aborted := False;
   try
     while True do begin
@@ -6402,7 +6484,7 @@ begin
     Exit;
   end
   else begin
-    // Clean detach. Three things must happen BEFORE DebugActiveProcessStop or
+    // Clean detach. Four things must happen BEFORE DebugActiveProcessStop or
     // the detached target is left in a state no debugger is listening for:
     //   1) Restore every planted INT3 to its original byte.
     //   2) If we are stopped on a held debug event (BP the client never
@@ -6410,6 +6492,13 @@ begin
     //   3) Clear every armed DR7 slot on every thread -- a detached target
     //      with a watchpoint still armed keeps trapping into a debugger that
     //      is no longer there to catch it.
+    //   4) Resume whatever a per-thread step left suspended. Every stop path
+    //      thaws through ReportStopped, but a disconnect can arrive with a step
+    //      still in flight, and an explicit SuspendThread outlives the detach:
+    //      those threads would stay parked forever in a process that carries on
+    //      running. Only this branch needs it -- the kill branch above ends the
+    //      process, which makes its suspend counts moot.
+    ThawStepFrozenThreads;
     if FWatchArmedSlots <> 0 then
       for var Slot := 0 to 3 do
         if FWatchSlots[Slot].InUse then
@@ -6524,6 +6613,243 @@ function TWinDebugger.LastExceptionDesc: string;     begin Result := FLastExcept
 function TWinDebugger.LastExceptionClass: string;    begin Result := FLastExceptionClass;    end;
 function TWinDebugger.LastExceptionMessage: string;  begin Result := FLastExceptionMessage;  end;
 function TWinDebugger.CurrentExceptionObject: UInt64; begin Result := FExceptionObjAddr;       end;
+
+function TWinDebugger.TryResolveExportedRoutine(ModBase: UInt64;
+  const ExportName: AnsiString; out VA: UInt64): Boolean;
+const
+  MAX_EXPORT_NAMES = 200000;   // rtl290.bpl carries ~50 000; well clear of it
+var
+  // Filled by the bulk read below, before NameAt is ever called.
+  NamePtrs: TArray<UInt32>;
+
+  function ReadU16(At: UInt64; out Value: Word): Boolean;
+  begin
+    Value  := 0;
+    Result := ReadProcessMemoryAt(At, @Value, SizeOf(Value));
+  end;
+
+  function ReadU32(At: UInt64; out Value: UInt32): Boolean;
+  begin
+    Value  := 0;
+    Result := ReadProcessMemoryAt(At, @Value, SizeOf(Value));
+  end;
+
+  function NameAt(Index: Integer): AnsiString;
+  var
+    Buf: array[0..511] of AnsiChar;
+  begin
+    Result := '';
+    FillChar(Buf, SizeOf(Buf), 0);
+    // A short read at the end of a section is normal; the buffer stays
+    // zero-filled and the name simply ends where the bytes did.
+    if not ReadProcessMemoryAt(ModBase + NamePtrs[Index], @Buf[0], SizeOf(Buf) - 1) then
+      Exit;
+    Result := AnsiString(PAnsiChar(@Buf[0]));
+  end;
+
+begin
+  VA     := 0;
+  Result := False;
+  if ModBase = 0 then Exit;
+
+  var MzSig: Word;
+  if not ReadU16(ModBase, MzSig) or (MzSig <> $5A4D) then Exit;
+  var NtOff: UInt32;
+  if not ReadU32(ModBase + $3C, NtOff) or (NtOff = 0) or (NtOff > $10000) then Exit;
+  var PeSig: UInt32;
+  if not ReadU32(ModBase + NtOff, PeSig) or (PeSig <> $00004550) then Exit;
+  var OptMagic: Word;
+  if not ReadU16(ModBase + NtOff + 24, OptMagic) then Exit;
+  // The data directories start at a different offset in the optional header
+  // for PE32 and PE32+, and a WOW64 target's modules are PE32 while the
+  // debugger is not. Read the magic rather than assuming either.
+  var DirOff: UInt32;
+  case OptMagic of
+    $010B: DirOff := NtOff + 24 + 96;
+    $020B: DirOff := NtOff + 24 + 112;
+  else
+    Exit;
+  end;
+  var ExpRva, ExpSize: UInt32;
+  if not ReadU32(ModBase + DirOff, ExpRva) then Exit;
+  if not ReadU32(ModBase + DirOff + 4, ExpSize) then Exit;
+  if (ExpRva = 0) or (ExpSize = 0) then Exit;
+
+  var NumNames, NamesRva, OrdinalsRva, FunctionsRva: UInt32;
+  if not ReadU32(ModBase + ExpRva + 24, NumNames) then Exit;
+  if not ReadU32(ModBase + ExpRva + 28, FunctionsRva) then Exit;
+  if not ReadU32(ModBase + ExpRva + 32, NamesRva) then Exit;
+  if not ReadU32(ModBase + ExpRva + 36, OrdinalsRva) then Exit;
+  if (NumNames = 0) or (NumNames > MAX_EXPORT_NAMES) then Exit;
+
+  // One bulk read of the name-pointer array, then a binary search over it: the
+  // PE format requires the name table to be sorted, and a 50 000-entry linear
+  // scan would be 50 000 cross-process reads.
+  SetLength(NamePtrs, NumNames);
+  if not ReadProcessMemoryAt(ModBase + NamesRva, @NamePtrs[0],
+           NativeUInt(NumNames) * SizeOf(UInt32)) then Exit;
+
+  var Lo := 0;
+  var Hi := Integer(NumNames) - 1;
+  var Found := -1;
+  while Lo <= Hi do begin
+    var Mid := (Lo + Hi) div 2;
+    var Cmp := CompareStr(string(NameAt(Mid)), string(ExportName));  // ordinal, as the table is sorted
+    if Cmp = 0 then begin
+      Found := Mid;
+      Break;
+    end;
+    if Cmp < 0 then
+      Lo := Mid + 1
+    else
+      Hi := Mid - 1;
+  end;
+  if Found < 0 then Exit;
+
+  var Ordinal: Word;
+  if not ReadU16(ModBase + OrdinalsRva + UInt64(Found) * 2, Ordinal) then Exit;
+  var FuncRva: UInt32;
+  if not ReadU32(ModBase + FunctionsRva + UInt64(Ordinal) * 4, FuncRva) then Exit;
+  if FuncRva = 0 then Exit;
+  // An RVA inside the export directory itself is a FORWARDER string, not code.
+  if (FuncRva >= ExpRva) and (FuncRva < ExpRva + ExpSize) then Exit;
+  VA     := ModBase + FuncRva;
+  Result := True;
+end;
+
+function TWinDebugger.ExceptHandlerScopeUnavailableReason: string;
+begin
+  Result := '';
+end;
+
+function TWinDebugger.TryGetHandlerException(out Kind: TExcHandlerBlockKind;
+  out ObjVA: UInt64; out Reason: string): Boolean;
+const
+  // System.ExceptObject returns RaiseListPtr^.ExceptObject for the CALLING
+  // thread -- the RTL's own answer to "what is being handled here", pushed by
+  // the handler prologue and popped by @DoneExcept. Confirmed against the
+  // shipped RTL source (System.pas, TABLE_BASED_EXCEPTIONS branch) and present
+  // as a public symbol in both a Win64 and a Win32 Delphi binary.
+  //
+  // It is read by CALLING it rather than by reading the threadvar, because
+  // RaiseListPtr lives in Delphi's own TLS block at an offset the compiler
+  // keeps to itself: no symbol carries it, so there is nothing to read.
+  EXCEPT_OBJECT_SYMBOL = 'System.ExceptObject';
+
+  // WHICH System.ExceptObject. There can be more than one in a process and
+  // they do not share a raise list: an exe that statically links the RTL has
+  // its own, and a package that `requires rtl` uses the one in rtl<ver>.bpl.
+  // Calling the wrong copy reads an empty raise list and reports, with
+  // complete confidence, that nothing is being handled.
+  //
+  // So: the copy in the MODULE THE HANDLER IS EXECUTING IN wins. When that
+  // module has no copy of its own -- the packaged case, where the RTL lives in
+  // rtl<ver>.bpl and that binary ships without debug information -- fall back
+  // to the export directory, which is the only thing in a stripped package
+  // that still names a routine.
+  function TryResolveExceptObjectRoutine(PC: UInt64; out FnVA: UInt64;
+    out Why: string): Boolean;
+  begin
+    FnVA   := 0;
+    Why    := '';
+    Result := False;
+    var PcModBase := SymGetModuleBase64(FProcess, PC);
+
+    var Candidates := FDebugInfo.NameToRvaCandidates(EXCEPT_OBJECT_SYMBOL);
+    for var Rva in Candidates do begin
+      var VA := RvaToVA(Rva);
+      if (PcModBase <> 0) and (SymGetModuleBase64(FProcess, VA) <> PcModBase) then
+        Continue;
+      FnVA := VA;
+      Exit(True);
+    end;
+
+    var ExportName: AnsiString;
+    if TargetLayout.PointerSize = 8 then
+      ExportName := '_ZN6System12ExceptObjectEv'
+    else
+      ExportName := '@System@ExceptObject$qqrv';
+    // The handler's own module first, then every other mapped module. In a
+    // packaged application exactly one binary exports it, so the order only
+    // decides how quickly the search ends.
+    if TryResolveExportedRoutine(PcModBase, ExportName, FnVA) then
+      Exit(True);
+    for var KV in FDllBases do
+      if (KV.Value <> PcModBase) and
+         TryResolveExportedRoutine(KV.Value, ExportName, FnVA) then
+        Exit(True);
+    if (FImageBase <> PcModBase) and
+       TryResolveExportedRoutine(FImageBase, ExportName, FnVA) then
+      Exit(True);
+
+    Why := Format('%s could not be located in the module this handler runs in, ' +
+      'nor exported by any module mapped in the target, so the RTL''s own record ' +
+      'of the exception being handled cannot be read', [EXCEPT_OBJECT_SYMBOL]);
+  end;
+
+begin
+  Kind   := ehbNone;
+  ObjVA  := 0;
+  Reason := '';
+  Result := False;
+  if FDebugInfo = nil then begin
+    Reason := 'no debug information is loaded for this target';
+    Exit;
+  end;
+  // At an exception stop the thread is at the RAISE, not inside a handler, and
+  // hijacking it to run a synthetic call there is refused anyway. The exception
+  // object of that stop is CurrentExceptionObject's job.
+  if StoppedOnUndeliveredException then begin
+    Reason := 'the target is stopped ON an exception, not inside a handler';
+    Exit;
+  end;
+
+  var PC: UInt64 := FActiveFramePC;
+  if PC = 0 then begin
+    var TH := ThreadHandle(FStoppedTid);
+    if TH = 0 then begin
+      Reason := 'the stopped thread could not be opened';
+      Exit;
+    end;
+    var Ctx := Default(TContext);
+    Ctx.ContextFlags := CONTEXT_FULL;
+    if not GetThreadContext(TH, Ctx) then begin
+      Reason := 'the register context of the stopped thread could not be read';
+      Exit;
+    end;
+    PC := Ctx.Rip;
+  end;
+
+  var Blk: TExcHandlerBlock;
+  if not TryGetExceptHandlerBlockAt(PC, Blk) then begin
+    Reason := ExceptHandlerScopeUnavailableReason;
+    if Reason = '' then
+      Reason := Format('$%x is not inside an `except` block this debugger can ' +
+        'locate in the routine''s exception-dispatch data', [PC]);
+    Exit;
+  end;
+  Kind := Blk.Kind;
+
+  var FnVA: UInt64;
+  if not TryResolveExceptObjectRoutine(PC, FnVA, Reason) then
+    Exit;
+
+  var IntResult, FloatResult: UInt64;
+  if not RunRemoteCallEx(FnVA, 0, 0, 0, 0, IntResult, FloatResult) then begin
+    Reason := Format('calling %s in the target failed: %s',
+      [EXCEPT_OBJECT_SYMBOL, LastSyntheticCallError]);
+    Exit;
+  end;
+  if IntResult = 0 then begin
+    // Inside a handler block and yet no exception on the raise list: the only
+    // way that happens is a PC that is genuinely elsewhere (an inlined body,
+    // a mis-decoded block). Say so rather than showing a nil object.
+    Reason := 'the RTL reports no exception being handled on this thread';
+    Exit;
+  end;
+  ObjVA  := IntResult;
+  Result := True;
+end;
 function TWinDebugger.LastExceptionIsDelphiRaise: Boolean; begin Result := FLastExcIsDelphiRaise; end;
 
 function TWinDebugger.GetSourceLocation(out SourceFile: string;
@@ -7184,8 +7510,257 @@ begin
   end;
 end;
 
+function TWinDebugger.TryGetExceptHandlerBlockAt(PC: UInt64;
+  out Blk: TExcHandlerBlock): Boolean;
+const
+  UNW_FLAG_EHANDLER  = $01;
+  UNW_FLAG_UHANDLER  = $02;
+  UNW_FLAG_CHAININFO = $04;
+  MAX_CHAIN_DEPTH    = 4;
+  MAX_SCOPE_ENTRIES  = 256;
+  MAX_CLAUSES        = 64;
+type
+  // One { Begin, End, Handler, Target } row of Delphi's MSVC-shaped scope
+  // table, kept as read so the block search below can consult all of them.
+  TScopeRow = record
+    BeginRva, EndRva, Handler, Target: UInt32;
+  end;
+  // A block address the table names, before it is known whether PC is in it.
+  TCandidate = record
+    Kind:        TExcHandlerBlockKind;
+    StartRva:    UInt32;
+    ClassVmtRva: UInt32;
+  end;
+var
+  ModBase:    UInt64;
+  Rows:       TArray<TScopeRow>;
+  Candidates: TArray<TCandidate>;
+
+  function ReadU32At(VA: UInt64; out Value: UInt32): Boolean;
+  begin
+    Value  := 0;
+    Result := ReadProcessMemoryAt(VA, @Value, SizeOf(Value));
+  end;
+
+  procedure AddCandidate(Kind: TExcHandlerBlockKind; StartRva, ClassVmtRva: UInt32);
+  begin
+    if StartRva = 0 then Exit;
+    for var Existing in Candidates do
+      if Existing.StartRva = StartRva then Exit;
+    var C: TCandidate;
+    C.Kind        := Kind;
+    C.StartRva    := StartRva;
+    C.ClassVmtRva := ClassVmtRva;
+    Candidates := Candidates + [C];
+  end;
+
+  // DWORD Count; Count x { DWORD ClassVmtRva; DWORD BlockRva } -- one entry per
+  // `on <Class> do` clause of a single `except`.
+  procedure LoadClauseTable(TableRva: UInt32);
+  begin
+    var Count: UInt32;
+    if not ReadU32At(ModBase + TableRva, Count) then Exit;
+    if (Count = 0) or (Count > MAX_CLAUSES) then Exit;
+    for var I := 0 to Integer(Count) - 1 do begin
+      var Pair: array[0..1] of UInt32;
+      if not ReadProcessMemoryAt(ModBase + TableRva + 4 + UInt64(I) * 8,
+               @Pair[0], SizeOf(Pair)) then Exit;
+      AddCandidate(ehbOnClause, Pair[1], Pair[0]);
+    end;
+  end;
+
+  function LoadScopeTable(TableRva, FuncBeginRva, FuncEndRva: UInt32): Boolean;
+  begin
+    Result := False;
+    var Count: UInt32;
+    if not ReadU32At(ModBase + TableRva, Count) then Exit;
+    if (Count = 0) or (Count > MAX_SCOPE_ENTRIES) then Exit;
+    for var I := 0 to Integer(Count) - 1 do begin
+      var E: array[0..3] of UInt32;
+      if not ReadProcessMemoryAt(ModBase + TableRva + 4 + UInt64(I) * 16,
+               @E[0], SizeOf(E)) then Exit;
+      // The same shape check PlanExceptionStep applies: a protected range that
+      // is not inside the routine means this is not the table it looks like,
+      // and decoding on would produce confident nonsense.
+      if (E[0] >= E[1]) or (E[0] < FuncBeginRva) or (E[1] > FuncEndRva) then Exit;
+      var Row: TScopeRow;
+      Row.BeginRva := E[0];
+      Row.EndRva   := E[1];
+      Row.Handler  := E[2];
+      Row.Target   := E[3];
+      Rows := Rows + [Row];
+      if E[2] = 0 then
+        Continue                                 // try .. finally: not a handler
+      else if E[2] <= 2 then
+        AddCandidate(ehbBareExcept, E[3], 0)     // Handler is a flag, Target the block
+      else begin
+        LoadClauseTable(E[2]);
+        // Some entries carry BOTH a clause table and a Target block.
+        if E[3] <> 0 then
+          AddCandidate(ehbBareExcept, E[3], 0);
+      end;
+    end;
+    Result := True;
+  end;
+
+  function LoadFromUnwindInfo(UnwindRva, FuncBeginRva, FuncEndRva: UInt32;
+    Depth: Integer): Boolean;
+  begin
+    Result := False;
+    if Depth > MAX_CHAIN_DEPTH then Exit;
+    var Hdr: array[0..3] of Byte;
+    if not ReadProcessMemoryAt(ModBase + UnwindRva, @Hdr[0], SizeOf(Hdr)) then Exit;
+    var Version := Hdr[0] and 7;
+    if (Version <> 1) and (Version <> 2) then Exit;
+    var Flags   := Hdr[0] shr 3;
+    // The UNWIND_CODE array is padded to an EVEN number of 2-byte slots.
+    var Slots   := (Integer(Hdr[2]) + 1) and not 1;
+    var TailRva := UnwindRva + 4 + UInt32(Slots) * 2;
+
+    if (Flags and (UNW_FLAG_EHANDLER or UNW_FLAG_UHANDLER)) <> 0 then begin
+      var HandlerRva: UInt32;
+      if not ReadU32At(ModBase + TailRva, HandlerRva) then Exit;
+      // Under MSVC's __C_specific_handler the same field is a FILTER function,
+      // not a Delphi scope table, and every ntdll / kernelbase frame is one.
+      var HandlerName := '';
+      if FDebugInfo <> nil then
+        FDebugInfo.RvaToFunctionName(VAToRva(ModBase + HandlerRva), HandlerName);
+      if not ContainsText(HandlerName, 'DelphiExceptionHandler') then Exit;
+      Exit(LoadScopeTable(TailRva + 4, FuncBeginRva, FuncEndRva));
+    end;
+
+    if (Flags and UNW_FLAG_CHAININFO) <> 0 then begin
+      var Chained: TRuntimeFunctionEntry;
+      if not ReadProcessMemoryAt(ModBase + TailRva, @Chained, SizeOf(Chained)) then Exit;
+      Exit(LoadFromUnwindInfo(Chained.UnwindInfoAddress,
+        Chained.BeginAddress, Chained.EndAddress, Depth + 1));
+    end;
+    // No handler and no chain: this routine has no except block at all.
+  end;
+
+  // dcc wraps every handler BODY in a compiler-generated try .. finally -- it is
+  // what calls System.@DoneExcept -- so the block's extent is the narrowest
+  // protected range covering the byte AFTER the block starts. Measured on
+  // Debugme's main block: the `on E:` block at $2FCCE is covered by
+  // [$2FCCE, $2FD6F) and the bare block at $2FD90 by [$2FD91, $2FDF7).
+  //
+  // Taking the byte after the start is what makes the bare form work: its block
+  // address is the PREVIOUS entry's exclusive End, so the block address itself
+  // is not inside the wrapping range.
+  function NarrowestRangeCovering(Rva: UInt32; out EndRva: UInt32): Boolean;
+  begin
+    Result := False;
+    EndRva := 0;
+    var BestWidth: UInt32 := 0;
+    for var Row in Rows do begin
+      if (Rva < Row.BeginRva) or (Rva >= Row.EndRva) then Continue;
+      var Width := Row.EndRva - Row.BeginRva;
+      if (not Result) or (Width < BestWidth) then begin
+        Result    := True;
+        BestWidth := Width;
+        EndRva    := Row.EndRva;
+      end;
+    end;
+  end;
+
+begin
+  Blk    := Default(TExcHandlerBlock);
+  Result := False;
+  if (PC = 0) or (FProcess = 0) then Exit;
+  EnsureSymInitialized;
+  var RF: PRuntimeFunctionEntry := SymFunctionTableAccess64(FProcess, PC);
+  if RF = nil then Exit;
+  ModBase := SymGetModuleBase64(FProcess, PC);
+  if ModBase = 0 then Exit;
+  Rows       := nil;
+  Candidates := nil;
+  if not LoadFromUnwindInfo(RF.UnwindInfoAddress, RF.BeginAddress,
+           RF.EndAddress, 0) then Exit;
+
+  var PcRva := UInt32(PC - ModBase);
+  var BestWidth: UInt32 := 0;
+  for var Cand in Candidates do begin
+    if PcRva < Cand.StartRva then Continue;
+    var EndRva: UInt32;
+    // No wrapping range means the block's end is not derivable. Decline rather
+    // than stretch it to the end of the routine: a handler alias that lingers
+    // past its own block is exactly the confidently-wrong answer this exists
+    // to avoid.
+    if not NarrowestRangeCovering(Cand.StartRva + 1, EndRva) then Continue;
+    if PcRva >= EndRva then Continue;
+    var Width := EndRva - Cand.StartRva;
+    if Result and (Width >= BestWidth) then Continue;   // keep the innermost
+    Result    := True;
+    BestWidth := Width;
+    Blk.Kind    := Cand.Kind;
+    Blk.StartVA := ModBase + Cand.StartRva;
+    Blk.EndVA   := ModBase + EndRva;
+    if Cand.ClassVmtRva <> 0 then
+      Blk.ClassVmtVA := ModBase + Cand.ClassVmtRva
+    else
+      Blk.ClassVmtVA := 0;
+  end;
+end;
+
+function TWinDebugger.TryGetHandlerAliasLocal(PC: UInt64;
+  out LV: TLocalValue): Boolean;
+const
+  // `mov [rip+disp32], rax` -- the alias lives in a module-level static, which
+  // is what dcc emits for a handler in the program main block. Measured on
+  // Debugme.dpr:102 -> `48 89 05 F3 52 01 00`, storing into the LDATA32 `E`.
+  // A `48 89 45 xx` / `48 89 85 xx xx xx xx` (`mov [rbp+disp], rax`) says the
+  // alias is an ordinary stack local, which every symbol reader already lists,
+  // so there is nothing to synthesise for it.
+  MOV_RIPREL_RAX: array[0..2] of Byte = ($48, $89, $05);
+  MOV_RIPREL_LEN = 7;
+begin
+  LV     := Default(TLocalValue);
+  Result := False;
+  if FDebugInfo = nil then Exit;
+  var Blk: TExcHandlerBlock;
+  if not TryGetExceptHandlerBlockAt(PC, Blk) then Exit;
+  if Blk.Kind <> ehbOnClause then Exit;
+
+  var Code: array[0 .. MOV_RIPREL_LEN - 1] of Byte;
+  if not ReadProcessMemoryAt(Blk.StartVA, @Code[0], SizeOf(Code)) then Exit;
+  for var I := Low(MOV_RIPREL_RAX) to High(MOV_RIPREL_RAX) do
+    if Code[I] <> MOV_RIPREL_RAX[I] then Exit;
+  // Until that store has retired the slot still holds whatever the previous
+  // handler left in it. Standing on the `on` line itself is therefore outside
+  // the alias's real lifetime, not merely early in it.
+  if PC < Blk.StartVA + MOV_RIPREL_LEN then Exit;
+
+  var Disp   := PInteger(@Code[3])^;
+  var SlotVA := UInt64(Int64(Blk.StartVA) + MOV_RIPREL_LEN + Disp);
+  var Sym: TGlobalSymbol;
+  if not FDebugInfo.TryGetGlobalAtRva(VAToRva(SlotVA), Sym) then Exit;
+  if Sym.Name = '' then Exit;
+
+  LV.Name        := Sym.Name;
+  LV.TypeHint    := Sym.TypeHint;
+  LV.Address     := SlotVA;
+  LV.Kind        := lkLocal;
+  LV.ParamStatus := spsLocal;
+  LV.RawValue    := 0;
+  if ReadProcessMemoryAt(SlotVA, @LV.RawValue, TargetLayout.PointerSize) then
+    LV.ValueValid := True;
+  DapLog(Format('exception alias "%s" (%s) at $%x, live for the `on` block $%x..$%x',
+    [LV.Name, LV.TypeHint, SlotVA, Blk.StartVA, Blk.EndVA]));
+  Result := True;
+end;
+
 function TWinDebugger.GetLocalValuesForFrame(FrameRBP, FuncEntryVA: UInt64;
   const FuncName: string; FramePcRva: UInt64): TArray<TLocalValue>;
+
+  // True when Name is already among the locals collected for this frame.
+  function AlreadyListed(const Values: TArray<TLocalValue>;
+    const Name: string): Boolean;
+  begin
+    for var V in Values do
+      if SameText(V.Name, Name) then Exit(True);
+    Result := False;
+  end;
+
 begin
   SetLength(Result, 0);
   if (FrameRBP = 0) or (FuncEntryVA = 0) or (FuncName = '') then
@@ -7253,6 +7828,15 @@ begin
     CurRBP      := ParentRBP;
     CurEntry    := ParentEntry;
     CurInnerRva := ParentRva;
+  end;
+
+  // Only the immediate frame carries a PC, and the alias means nothing outside
+  // the block that PC is standing in -- an enclosing frame is somewhere else.
+  if FramePcRva <> 0 then begin
+    var Alias: TLocalValue;
+    if TryGetHandlerAliasLocal(RvaToVA(FramePcRva), Alias) and
+       not AlreadyListed(Result, Alias.Name) then
+      Result := Result + [Alias];
   end;
 end;
 

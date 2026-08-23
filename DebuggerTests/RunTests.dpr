@@ -52,6 +52,8 @@ uses
   InstructionStepDapTests in 'InstructionStepDapTests.pas',
   MemoryDapTests  in 'MemoryDapTests.pas',
   DapLogTests     in 'DapLogTests.pas',
+  SafeCallPolicyTests in 'SafeCallPolicyTests.pas',
+  SafelistDapTests in 'SafelistDapTests.pas',
   TestTempDirs    in 'TestTempDirs.pas',
   RegisterWriteDapTests in 'RegisterWriteDapTests.pas',
   PlaceholderDisassemblyTests in 'PlaceholderDisassemblyTests.pas',

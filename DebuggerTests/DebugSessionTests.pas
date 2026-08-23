@@ -37,6 +37,12 @@ type
     // A breakpoint on a 32-bit target must bind and fire, and report the line
     // the user asked for.
     [Test] procedure Win32_Breakpoint_BindsAndFires;
+    // Handler-scoped `$exception` is x64-only, and the 32-bit answer has to be
+    // a stated limitation rather than an empty Locals row. A row that simply
+    // never appears is indistinguishable from a bug from the outside, so the
+    // x64 control here proves the feature works at the same marker while the
+    // 32-bit side proves the refusal SAYS why.
+    [Test] procedure Win32_BareHandlerException_RefusesWithAReason;
     // The call stack must unwind past the recursion into the caller chain --
     // this is what StackWalk64 with IMAGE_FILE_MACHINE_I386 buys.
     [Test] procedure Win32_CallStack_UnwindsPastRecursion;
@@ -405,6 +411,12 @@ type
   [TestFixture]
   TDebugSessionTests = class
   private
+    // Verified-state transitions in the order the session reported them, as
+    // 'file:line=True|False'. A subscriber is the only way to observe them:
+    // the flip happens between two stops, with nothing to poll afterwards.
+    FBpFlips: TArray<string>;
+    procedure RecordBpFlip(const SourceFile: string; Line: Integer;
+      Verified: Boolean);
     function RepoRoot: string;
     function TargetDir: string;
     function TargetExe: string;
@@ -519,6 +531,8 @@ type
     [Test] procedure SetFieldVariable_ViaClassHandle_WritesField;
     [Test] procedure Terminate_ReapsDebuggeeProcess;
     [Test] procedure Terminate_ReleasesSymbolFileLock;
+    [Test] procedure NaturalExit_ReleasesTheImageFileLock;
+    [Test] procedure NaturalExit_ReleasesTheBplFileLock;
     [Test] procedure Pause_RetargetsToUserThread;
     [Test] procedure ExceptionFilters_ParseNames;
     [Test] procedure DeepNested_LocalsResolveAtDepth2;
@@ -556,6 +570,66 @@ type
     // provider (every local reported twice) or be built against a module record
     // that has already moved on.
     [Test] procedure Prefetch_ModuleLoadedSynchronously_IsNotParsedAgain;
+
+    // --- expression-evaluator semantics (fixture: EXPR_SEMANTICS) ------------
+    // A relational operator between strings must compare the CHARACTERS. It
+    // used to compare the heap pointers, so `S = 'abc'` was False whatever S
+    // held and two equal strings in different allocations never matched -- a
+    // confident wrong answer in a watch, and a breakpoint that silently never
+    // fired when the same text was used as a condition.
+    [Test] procedure ExprSemantics_StringComparison_ComparesCharacters;
+    // `and` / `or` / `xor` bind TIGHTER than a comparison in Delphi. They used
+    // to bind looser (C-like), so `Flags and MASK = 0` -- pasted out of the
+    // user's own source -- silently meant `Flags and (MASK = 0)`.
+    [Test] procedure ExprSemantics_OperatorPrecedence_MatchesDelphi;
+    // A Delphi intrinsic either evaluates or is refused with a reason naming
+    // what it is. Neither may come back as a bare "not found", which reads as an
+    // accusation about the user's variable.
+    [Test] procedure ExprSemantics_Intrinsics_EvaluateOrExplain;
+    // Character codes, exponent floats, and the one C form Pascal does not have.
+    [Test] procedure ExprSemantics_Literals_FollowPascal;
+    // A breakpoint condition that cannot be evaluated STOPS and says why. The
+    // reverse (treat it as false) is the one failure nothing downstream reveals.
+    [Test] procedure Breakpoint_UnevaluatableCondition_StopsAndSaysWhy;
+    // ...but the explanation is emitted once, not on every hit the user resumes
+    // through.
+    [Test] procedure Breakpoint_UnevaluatableCondition_AnnouncedOncePerSession;
+
+    // The verified-state event used to report only the transition UP. When the
+    // owning package unloaded, the line stopped resolving and nothing was said:
+    // the gutter marker stayed solid, telling the user a breakpoint was armed
+    // when it was not.
+    [Test] procedure Bpl_BreakpointGoesUnverified_WhenItsModuleUnloads;
+
+    // A dynamic array longer than the expansion cap must SAY it was truncated.
+    // 1024 of 50000 rendered exactly like an array of 1024 -- a quiet lie about
+    // the data, in the one view a debugger exists to provide.
+    [Test] procedure ExpandVariable_LongDynArray_SaysItWasTruncated;
+    // The evaluator's own recursion is bounded like everything else here.
+    [Test] procedure ExprSemantics_DeepNesting_IsRefused_NotACrash;
+
+    // THE oracle: for each expression, the answer DCC64 computed from the same
+    // source text is the expected value. Every other evaluator test asserts a
+    // value a human worked out, which is worth exactly as much as that human's
+    // reading of the language -- and a reading that was wrong produced an
+    // evaluator and an assertion that agreed with each other and not with
+    // Delphi. This one cannot: the compiler is the authority.
+    [Test] procedure ExprOracle_DebuggerAgreesWithTheCompiler;
+
+    // TEST_CATALOG.md section A ticked a row per primitive type -- Integer,
+    // Cardinal, Byte/ShortInt, Word/SmallInt, Int64/UInt64, the floats,
+    // Boolean, the chars, the strings -- and no fixture so much as DECLARED a
+    // Cardinal, ShortInt, AnsiChar or Currency local for a test to read. Each
+    // one must render the value the fixture assigned, under its declared type
+    // name.
+    [Test] procedure PrimitiveLocals_DisplayTheirValueAndDeclaredType;
+
+    // TEST_CATALOG.md section C ticked "Destructor side-effect verified (BP in
+    // Destroy body)" and nothing planted a breakpoint in a destructor at all --
+    // the only destructor test in the suite was a name-demangling unit test.
+    // A destructor frame is its own kind: it is reached through Free, not a
+    // call the user wrote, and its Self is about to stop existing.
+    [Test] procedure Breakpoint_InDestructorBody_StopsAndTheBodyRuns;
   end;
 
 implementation
@@ -660,7 +734,8 @@ end;
 // rather than blocking forever. The caller owns Session.Free.
 function OpenSessionAtMarker(const ExePath, MapPath, RsmPath, SourceRoot,
   SourceBaseName: string; Line: Integer;
-  const TargetArgs: string = ''): TDebugSession;
+  const TargetArgs: string = '';
+  SilenceExceptionFilters: Boolean = False): TDebugSession;
 begin
   Result := TDebugSession.Create;
   var Opts: TLaunchOptions;
@@ -673,6 +748,14 @@ begin
   // Several TestTarget scenarios only run behind a command-line switch, so
   // without this a breakpoint inside one verifies and then never hits.
   Opts.Args        := TargetArgs;
+  // A scenario that RAISES on its way to the marker stops on the raise first
+  // with the default filters, and the pump below returns at that stop -- the
+  // breakpoint never gets a turn. Callers whose fixture deliberately raises
+  // ask for silence instead of racing it.
+  if SilenceExceptionFilters then begin
+    Opts.ExceptionFilters    := Default(TExceptionFilters);
+    Opts.ExceptionFiltersSet := True;
+  end;
 
   Assert.IsTrue(Result.Launch(Opts), 'Launch returned False');
 
@@ -2341,6 +2424,174 @@ begin
   end;
 end;
 
+// Sibling of the one above, on the path the user actually hit: the target exits
+// ON ITS OWN and NOTHING calls Terminate. A held handle to the exited process
+// pins its image section and locks the .exe until the debugger process dies; on
+// an attach the session routinely outlives the target, so this is the difference
+// between "rebuild works" and "rebuild fails until you close the editor". The
+// session is deliberately still alive at the assert -- Terminate/Destroy would
+// close the handles and hide the bug -- so HandleExitProcess must release them
+// by itself. Uses a private COPY so a sibling worker's lock on the shared target
+// cannot masquerade as this leak.
+procedure TDebugSessionTests.NaturalExit_ReleasesTheImageFileLock;
+
+  function CanOpenExclusive(const Path: string): Boolean;
+  begin
+    Result := False;
+    try
+      var FS := TFileStream.Create(Path, fmOpenReadWrite or fmShareExclusive);
+      FS.Free;
+      Result := True;
+    except
+      // still locked
+    end;
+  end;
+
+begin
+  var Scratch := MakeTestScratchDir('ExitLock_');
+  try
+    var ProbeExe := TPath.Combine(Scratch, 'ExitLockProbe.exe');
+    TFile.Copy(TargetExe, ProbeExe);
+    TFile.Copy(TargetMap, TPath.ChangeExtension(ProbeExe, '.map'));
+    TFile.Copy(TargetRsm, TPath.ChangeExtension(ProbeExe, '.rsm'));
+
+    var Session := TDebugSession.Create;
+    try
+      var Opts         := Default(TLaunchOptions);
+      Opts.ExePath     := ProbeExe;
+      Opts.MapPath     := TPath.ChangeExtension(ProbeExe, '.map');
+      Opts.RsmPath     := TPath.ChangeExtension(ProbeExe, '.rsm');
+      Opts.SourceRoot  := TargetDir;
+      Opts.StopAtEntry := False;
+      Assert.IsTrue(Session.Launch(Opts), 'Launch returned False');
+
+      // Precondition, so the post-exit assert has teeth: a live, image-mapped
+      // debuggee locks its own .exe. If this is already open, the later "it
+      // unlocked" would prove nothing.
+      Assert.IsFalse(CanOpenExclusive(ProbeExe),
+        'the freshly launched target should lock its own .exe');
+
+      // No breakpoints: the target runs every scenario and returns from its main
+      // block on its own. Pump until it does.
+      var Deadline := GetTickCount64 + 60000;
+      while (not Session.HasExited) and (GetTickCount64 < Deadline) do
+        Session.Pump;
+      Assert.IsTrue(Session.HasExited, 'target did not exit on its own within 60 s');
+
+      // The moment of truth: the session is STILL ALIVE and no one called
+      // Terminate. If the exit handler released the process handle, the zombie is
+      // gone and the file is free -- allow a short window for the OS to drop the
+      // image lock.
+      // The moment of truth: the session is STILL ALIVE and no one called
+      // Terminate. The exit handler must have released the embedded-TD32
+      // mapping, so the file is free for a rebuild -- allow a short window for
+      // the OS to drop the image lock behind the exited process.
+      var LockDeadline := GetTickCount64 + 5000;
+      while (not CanOpenExclusive(ProbeExe)) and (GetTickCount64 < LockDeadline) do
+        Sleep(30);
+      Assert.IsTrue(CanOpenExclusive(ProbeExe),
+        'the .exe is still locked after the target exited on its own -- the ' +
+        'debugger is still holding the embedded-TD32 memory mapping');
+    finally
+      Session.Terminate;
+      Session.Free;
+    end;
+  finally
+    DeleteTempDirWithRetry(Scratch);
+  end;
+end;
+
+// The BPL counterpart: a runtime package the debugger loaded symbols for must
+// not stay locked after the host exits either. Private copies of host AND
+// package -- LoadPackage resolves the package beside the host, i.e. the copy --
+// so a sibling worker's lock on the shared ones cannot masquerade as this leak.
+procedure TDebugSessionTests.NaturalExit_ReleasesTheBplFileLock;
+
+  function CanOpenExclusive(const Path: string): Boolean;
+  begin
+    Result := False;
+    try
+      var FS := TFileStream.Create(Path, fmOpenReadWrite or fmShareExclusive);
+      FS.Free;
+      Result := True;
+    except
+      // still locked
+    end;
+  end;
+
+  procedure CopyIfExists(const Src, Dst: string);
+  begin
+    if TFile.Exists(Src) then
+      TFile.Copy(Src, Dst);
+  end;
+
+begin
+  var Scratch := MakeTestScratchDir('BplLock_');
+  try
+    var HostCopy := TPath.Combine(Scratch, 'TestHost.exe');
+    var BplCopy  := TPath.Combine(Scratch, 'TestSubject.bpl');
+    TFile.Copy(HostExe, HostCopy);
+    CopyIfExists(HostMap, TPath.ChangeExtension(HostCopy, '.map'));
+    CopyIfExists(HostRsm, TPath.ChangeExtension(HostCopy, '.rsm'));
+    var BplSrc := ExtractFilePath(HostExe) + 'TestSubject.bpl';
+    Assert.IsTrue(TFile.Exists(BplSrc), 'TestSubject.bpl not built beside TestHost.exe');
+    TFile.Copy(BplSrc, BplCopy);
+    CopyIfExists(TPath.ChangeExtension(BplSrc, '.map'), TPath.ChangeExtension(BplCopy, '.map'));
+    CopyIfExists(TPath.ChangeExtension(BplSrc, '.rsm'), TPath.ChangeExtension(BplCopy, '.rsm'));
+
+    var Line := MarkerLine(EVAL_SOURCE, EVAL_MARKER);
+    Assert.IsTrue(Line > 0, EVAL_MARKER + ' marker not found');
+
+    var Session := TDebugSession.Create;
+    try
+      var Opts         := Default(TLaunchOptions);
+      Opts.ExePath     := HostCopy;
+      Opts.MapPath     := TPath.ChangeExtension(HostCopy, '.map');
+      Opts.RsmPath     := TPath.ChangeExtension(HostCopy, '.rsm');
+      Opts.SourceRoot  := TargetDir;
+      Opts.StopAtEntry := False;
+      Assert.IsTrue(Session.Launch(Opts), 'Launch returned False');
+
+      var Spec: TBpLineSpec;
+      Spec      := Default(TBpLineSpec);
+      Spec.Line := Line;
+      Session.SetBreakpoints(EVAL_SOURCE, [Spec]);
+
+      // Run until the host has LoadPackage'd the copy and stopped inside it --
+      // that is when the package's embedded TD32 is mapped, i.e. the .bpl locked.
+      var Deadline := GetTickCount64 + 60000;
+      while (Session.State <> dsStopped) and (not Session.HasExited) and
+            (GetTickCount64 < Deadline) do
+        Session.Pump;
+      Assert.AreEqual(Ord(dsStopped), Ord(Session.State),
+        'did not stop inside the runtime package');
+      Assert.IsFalse(CanOpenExclusive(BplCopy),
+        'precondition: a package the debugger loaded symbols for locks its .bpl');
+
+      // Let the host run to its own exit.
+      Session.ContinueExecution;
+      var ExitDeadline := GetTickCount64 + 60000;
+      while (not Session.HasExited) and (GetTickCount64 < ExitDeadline) do
+        Session.Pump;
+      Assert.IsTrue(Session.HasExited, 'host did not exit on its own within 60 s');
+
+      // Session still alive, no Terminate: the exit handler must have released
+      // the package mapping too.
+      var LockDeadline := GetTickCount64 + 5000;
+      while (not CanOpenExclusive(BplCopy)) and (GetTickCount64 < LockDeadline) do
+        Sleep(30);
+      Assert.IsTrue(CanOpenExclusive(BplCopy),
+        'the .bpl is still locked after the host exited -- the debugger is still ' +
+        'holding the package''s embedded-TD32 memory mapping');
+    finally
+      Session.Terminate;
+      Session.Free;
+    end;
+  finally
+    DeleteTempDirWithRetry(Scratch);
+  end;
+end;
+
 // F11 repro attempt: a breakpoint inside a TWO-level nested proc (Inner in Middle in
 // Outer) -- the shape of SampleApp's ParseLiteralDate. The innermost frame must expose
 // its OWN local and, via the scope chain, the enclosing procs' locals.
@@ -3787,17 +4038,19 @@ end;
 procedure TDebugSessionTests.Prefetch_NoBreakpoints_LoadsRuntimePackageSymbols;
 // THE "when" REGRESSION TEST.
 //
-// With no breakpoints set, TDebugSession.HandleDllLoaded's eager gate never fires,
-// so before the background prefetcher NOTHING was parsed for any runtime-loaded
-// module: the first stop that touched one paid its whole TD32 parse synchronously,
-// and until that finished its frames had no names. Here the target runtime-loads
-// two packages and no breakpoint exists anywhere; both packages' symbols must
-// still become available.
+// No breakpoint touches EITHER runtime package, so TDebugSession.HandleDllLoaded's
+// eager gate never fires for them and nothing loads their symbols synchronously:
+// only the background prefetcher can. The target runtime-loads two packages, and
+// both must still become available. The single breakpoint used here is in the MAIN
+// exe (EVAL_BODY, which runs after both LoadPackage calls) purely to give a live
+// stop to observe at.
 //
 // DrainPrefetch is called explicitly because publication is deliberately confined
-// to moments when the debuggee is not executing (see TDebugSession.Pump). In a
-// real session that moment is the stop; here, where there is no breakpoint to stop
-// at, the test provides it.
+// to moments when the debuggee is not executing (see TDebugSession.Pump); the
+// main-exe stop is that moment. Draining after PROCESS EXIT -- what this test used
+// to do -- is gone on purpose: a debuggee exit now releases module symbol mappings
+// so the .bpl unlocks for a rebuild, which is the opposite of parsing a dead
+// process's file (see NaturalExit_ReleasesTheBplFileLock).
 begin
   // The prefetcher ships DISABLED (see SetSymbolPrefetchEnabled); this test is
   // what exercises it, so it turns it on for its own scope.
@@ -3818,26 +4071,38 @@ begin
     var Pkg1 := saUnknownModule;
     var Pkg2 := saUnknownModule;
 
-    // Entry stop first, then run on. No breakpoints are ever set.
+    // Entry stop first: the packages load AFTER entry, so neither is present yet.
     while (Session.State <> dsStopped) and (not Session.HasExited) and
           (GetTickCount64 < Deadline) do
       Session.Pump;
     Assert.AreEqual(Ord(dsStopped), Ord(Session.State), 'did not stop at entry');
     Assert.AreEqual(Ord(saUnknownModule), Ord(Session.ModuleSymbolState('testpackage.bpl')),
       'the package must not be loaded yet at the entry stop');
+
+    // A single breakpoint in the MAIN exe (EVAL_BODY runs after both LoadPackage
+    // calls) and NONE in either package: nothing loads the packages' symbols
+    // synchronously, so only the prefetcher can. It gives a LIVE, non-executing
+    // moment to observe publication at -- draining after PROCESS EXIT is no longer
+    // an option now that a debuggee exit releases module symbols so the .bpl
+    // unlocks for a rebuild (NaturalExit_ReleasesTheBplFileLock).
+    var Line := MarkerLine(EVAL_SOURCE, EVAL_MARKER);
+    Assert.IsTrue(Line > 0, EVAL_MARKER + ' marker not found');
+    var Spec: TBpLineSpec;
+    Spec      := Default(TBpLineSpec);
+    Spec.Line := Line;
+    Session.SetBreakpoints(EVAL_SOURCE, [Spec]);
     Session.ContinueExecution;
 
-    // The debuggee is short-lived, so keep draining for a grace period after it
-    // exits: the point under test is that the prefetcher parses and publishes a
-    // module nobody set a breakpoint in, not how fast it does so. The module
-    // records survive process exit (no UNLOAD_DLL burst), so publication still
-    // finds them.
-    var Grace: UInt64 := 0;
-    while GetTickCount64 < Deadline do begin
-      if not Session.HasExited then
-        Session.Pump
-      else if Grace = 0 then
-        Grace := GetTickCount64 + 10000;
+    while (Session.State <> dsStopped) and (not Session.HasExited) and
+          (GetTickCount64 < Deadline) do
+      Session.Pump;
+    Assert.AreEqual(Ord(dsStopped), Ord(Session.State),
+      'did not reach the main-exe EVAL_BODY stop with the packages mapped');
+
+    // Stopped, so the debuggee is not executing and publication is allowed. The
+    // prefetch worker keeps parsing while the target is paused; drain in a loop
+    // until both packages -- which no breakpoint touches -- become available.
+    while (GetTickCount64 < Deadline) do begin
       Session.Loader.DrainPrefetch;
       if Pkg1 = saUnknownModule then begin
         var S1 := Session.ModuleSymbolState('testpackage.bpl');
@@ -3849,15 +4114,12 @@ begin
       end;
       if (Pkg1 <> saUnknownModule) and (Pkg2 <> saUnknownModule) then
         Break;
-      if (Grace <> 0) and (GetTickCount64 > Grace) then
-        Break;
-      if Session.HasExited then
-        Sleep(5);
+      Sleep(5);
     end;
 
     Assert.IsTrue(Pkg1 in [saLoaded, saIndexing],
       'TestPackage.bpl symbols were never loaded although the package was mapped ' +
-      '(prefetch did not run: with no breakpoint set nothing else loads a module)');
+      '(prefetch did not run: no breakpoint touches the package)');
     var Dump := '';
     for var M in Session.Loader.Modules do
       if M.PrefetchRequested then
@@ -4017,6 +4279,62 @@ begin
     Assert.AreEqual(Line, StopLine, 'stopped on the wrong line');
   finally
     Session.Free;
+  end;
+end;
+
+procedure TWin32RunControlTests.Win32_BareHandlerException_RefusesWithAReason;
+const
+  SRC    = 'TestTargetCore.pas';
+  MARKER = 'BARE_EXCEPT';
+  ARGS   = '--run-bare-except';
+begin
+  var Line := MarkerLine(SRC, MARKER);
+  Assert.IsTrue(Line > 0, 'marker not found: ' + MARKER);
+
+  // The x64 control first: same source, same marker, same fixture, so a
+  // failure here is about the feature and not about the fixture.
+  var S64 := OpenSessionAtMarker(Win64Exe, Win64Map, Win64Rsm, TargetDir,
+    SRC, Line, ARGS, {SilenceExceptionFilters=}True);
+  try
+    Assert.AreEqual(Ord(dsStopped), Ord(S64.State), 'the x64 control did not stop');
+    var Found64 := False;
+    var Seen := '';
+    for var V in S64.GetLocals do begin
+      Seen := Seen + V.Name + ' ';
+      if V.Name = '$exception' then begin
+        Found64 := True;
+        Assert.IsTrue(V.Value.Contains('bare-test-probe'),
+          'x64 $exception should carry the raised message, got: ' + V.Value);
+      end;
+    end;
+    var FnName, SrcFile: string;
+    var StopLine: Integer;
+    S64.GetCurrentLocation(FnName, SrcFile, StopLine);
+    Assert.IsTrue(Found64,
+      Format('the x64 control did not list $exception inside a bare handler ' +
+             '(stopped in %s at %s:%d; locals: %s)',
+             [FnName, ExtractFileName(SrcFile), StopLine, Seen]));
+  finally
+    S64.Free;
+  end;
+
+  var S32 := OpenSessionAtMarker(Win32Exe, Win32Map, Win32Rsm, TargetDir,
+    SRC, Line, ARGS, {SilenceExceptionFilters=}True);
+  try
+    Assert.AreEqual(Ord(dsStopped), Ord(S32.State), 'the 32-bit target did not stop');
+    for var V in S32.GetLocals do
+      Assert.AreNotEqual('$exception', V.Name,
+        'a 32-bit target cannot bound a handler block, so it must not claim to');
+    // ...and asking outright must explain the limitation rather than implying
+    // that nothing is being handled. A row that silently never appears is
+    // indistinguishable from a bug from the outside.
+    var R := S32.Evaluate('$exception');
+    Assert.IsFalse(R.Value.Contains('unexpected token'),
+      '$exception must parse on a 32-bit target too, got: ' + R.Value);
+    Assert.IsTrue(R.Value.Contains('32-bit'),
+      'the 32-bit refusal must name the reason, got: ' + R.Value);
+  finally
+    S32.Free;
   end;
 end;
 
@@ -7051,6 +7369,647 @@ begin
     Assert.IsFalse(Session.SetRegister('R8', 1),
       'writing R8 (no such x86 register) must be refused, not silently accepted');
   finally
+    Session.Free;
+  end;
+end;
+
+{ --------------------------------------- expression-evaluator semantics ---- }
+
+const
+  EXPR_SEM_MARKER = 'EXPR_SEMANTICS';
+
+type
+  // Fragment is matched against the rendered value; when MustFail is set it is
+  // matched against the error text instead. Asserting the error TEXT matters as
+  // much as asserting a value: a refusal that does not say why is the defect
+  // these tests exist for.
+  TExprSemCheck = record
+    Expr:     string;
+    Fragment: string;
+    MustFail: Boolean;
+  end;
+
+function EvalCheck(const Expr, Fragment: string;
+  MustFail: Boolean = False): TExprSemCheck;
+begin
+  Result.Expr     := Expr;
+  Result.Fragment := Fragment;
+  Result.MustFail := MustFail;
+end;
+
+// Runs every check against ONE stopped session -- these are language questions,
+// not run-control ones, and a process launch per expression would cost minutes.
+function RunExprSemChecks(Session: TDebugSession;
+  const Checks: TArray<TExprSemCheck>): string;
+begin
+  Result := '';
+  for var Check in Checks do begin
+    var R := Session.Evaluate(Check.Expr);
+    var Got: string;
+    if R.Success then
+      Got := R.Value
+    else
+      Got := R.ErrorText;
+    if R.Success = Check.MustFail then begin
+      var Wanted := 'a value';
+      if Check.MustFail then
+        Wanted := 'a refusal';
+      Result := Result + Format('%s: expected %s, got "%s"; ',
+        [Check.Expr, Wanted, Got]);
+    end
+    // An empty Fragment means the outcome alone is the assertion: for a
+    // refusal whose wording is the parser's business, not this test's.
+    else if (Check.Fragment <> '') and not Got.Contains(Check.Fragment) then
+      Result := Result + Format('%s -> "%s" (expected to contain "%s"); ',
+        [Check.Expr, Got, Check.Fragment]);
+  end;
+end;
+
+procedure TDebugSessionTests.ExprSemantics_StringComparison_ComparesCharacters;
+begin
+  var Line := MarkerLine(EVAL_SOURCE, EXPR_SEM_MARKER);
+  Assert.IsTrue(Line > 0, 'marker ' + EXPR_SEM_MARKER + ' not found');
+  var Session := OpenSessionAtMarker(TargetExe, TargetMap, TargetRsm, TargetDir,
+    EVAL_SOURCE, Line);
+  try
+    Assert.AreEqual(Ord(dsStopped), Ord(Session.State), 'did not stop');
+    var Failures := RunExprSemChecks(Session, [
+      // The headline case: a literal is allocated fresh in the debuggee, so a
+      // pointer comparison could never match it.
+      EvalCheck('Greeting = ''Hello''',       'True'),
+      EvalCheck('Greeting = ''Nope''',        'False'),
+      EvalCheck('Greeting <> ''Hello''',      'False'),
+      EvalCheck('''Hello'' = Greeting',       'True'),   // literal on either side
+      // Two equal strings that are NOT the same allocation.
+      EvalCheck('Greeting = GreetingCopy',    'True'),
+      // The AnsiString family: a different header, a code page of its own, and
+      // it still has to compare equal to the same text.
+      EvalCheck('Narrow = ''Hello''',         'True'),
+      EvalCheck('Narrow = Greeting',          'True'),
+      EvalCheck('Blank = ''''',               'True'),
+      EvalCheck('Blank = Greeting',           'False'),
+      // Ordering, not just equality -- CompareStr semantics.
+      EvalCheck('Greeting < ''Z''',           'True'),
+      EvalCheck('Greeting > ''A''',           'True'),
+      EvalCheck('Greeting >= ''Hello''',      'True'),
+      // A Char against a one-character literal is the same question.
+      EvalCheck('Initial = ''H''',            'True'),
+      EvalCheck('Initial = ''h''',            'False'),
+      // A string against something that is not text is refused, not silently
+      // compared as a number.
+      EvalCheck('Greeting = Flags',           'not text', True)]);
+    Assert.AreEqual('', Failures,
+      'string comparison must compare characters -- ' + Failures);
+  finally
+    if Session.State = dsStopped then Session.Terminate;
+    Session.Free;
+  end;
+end;
+
+procedure TDebugSessionTests.ExprSemantics_OperatorPrecedence_MatchesDelphi;
+begin
+  var Line := MarkerLine(EVAL_SOURCE, EXPR_SEM_MARKER);
+  Assert.IsTrue(Line > 0, 'marker ' + EXPR_SEM_MARKER + ' not found');
+  var Session := OpenSessionAtMarker(TargetExe, TargetMap, TargetRsm, TargetDir,
+    EVAL_SOURCE, Line);
+  try
+    Assert.AreEqual(Ord(dsStopped), Ord(Session.State), 'did not stop');
+    // Flags = $0F, Mask = $F0.
+    var Failures := RunExprSemChecks(Session, [
+      // The bitmask idiom. Under the old (C-like) precedence this was
+      // `Flags and (Mask = 0)` = `15 and 0` = 0, so it answered False.
+      EvalCheck('Flags and Mask = 0',       'True'),
+      EvalCheck('Flags and $0F = $0F',      'True'),
+      EvalCheck('Flags and Mask <> 0',      'False'),
+      // `or` / `xor` sit with the additive operators, still tighter than `=`.
+      EvalCheck('Flags or Mask = 255',      'True'),
+      EvalCheck('Flags xor Mask = 255',     'True'),
+      // ...and `and` binds tighter than `or`: 15 or (0 and 0) = 15.
+      EvalCheck('Flags or 0 and 0 = 15',    'True'),
+      // Arithmetic keeps its own order within the same rule.
+      EvalCheck('1 + 2 * 3 = 7',            'True'),
+      EvalCheck('2 * 3 + 1 = 7',            'True'),
+      EvalCheck('8 div 4 - 2 = 0',          'True'),
+      // Boolean operands still work where Delphi allows them: parenthesised.
+      EvalCheck('(Flags > 1) and (Mask > 1)', 'True'),
+      EvalCheck('(Flags > 99) or (Mask > 1)', 'True'),
+      // The C-like form Delphi rejects. It used to be accepted here, which is
+      // the price of agreeing with the language; it must not silently answer.
+      EvalCheck('Flags > 1 and Mask > 1',   '', True)]);
+    Assert.AreEqual('', Failures,
+      'operator precedence must match Delphi -- ' + Failures);
+  finally
+    if Session.State = dsStopped then Session.Terminate;
+    Session.Free;
+  end;
+end;
+
+procedure TDebugSessionTests.ExprSemantics_Intrinsics_EvaluateOrExplain;
+begin
+  var Line := MarkerLine(EVAL_SOURCE, EXPR_SEM_MARKER);
+  Assert.IsTrue(Line > 0, 'marker ' + EXPR_SEM_MARKER + ' not found');
+  var Session := OpenSessionAtMarker(TargetExe, TargetMap, TargetRsm, TargetDir,
+    EVAL_SOURCE, Line);
+  try
+    Assert.AreEqual(Ord(dsStopped), Ord(Session.State), 'did not stop');
+    var Failures := RunExprSemChecks(Session, [
+      // The one a Delphi developer reaches for first in a condition.
+      EvalCheck('Assigned(Present)',      'True'),
+      EvalCheck('Assigned(Absent)',       'False'),
+      EvalCheck('Abs(0 - 5)',             '5'),
+      EvalCheck('Pred(10)',               '9'),
+      EvalCheck('Succ(10)',               '11'),
+      EvalCheck('Ord(Chr(65))',           '65'),
+      EvalCheck('Trunc(3.7)',             '3'),
+      EvalCheck('Round(3.7)',             '4'),
+      EvalCheck('Int(3.7)',               '3'),
+      // Now that strings can be read, the string intrinsics are worth having.
+      EvalCheck('Copy(Greeting, 2, 3)',   'ell'),
+      EvalCheck('Pos(''ll'', Greeting)',  '3'),
+      EvalCheck('UpperCase(Greeting)',    'HELLO'),
+      EvalCheck('LowerCase(Greeting)',    'hello'),
+      // Refused, but by NAME and with the reason -- never as "not found".
+      EvalCheck('Inc(Flags)',             'compiler intrinsic', True),
+      EvalCheck('TypeInfo(Flags)',        'compiler intrinsic', True),
+      EvalCheck('SetLength(Greeting)',    'compiler intrinsic', True)]);
+    Assert.AreEqual('', Failures,
+      'an intrinsic must evaluate or explain itself -- ' + Failures);
+  finally
+    if Session.State = dsStopped then Session.Terminate;
+    Session.Free;
+  end;
+end;
+
+procedure TDebugSessionTests.ExprSemantics_Literals_FollowPascal;
+begin
+  var Line := MarkerLine(EVAL_SOURCE, EXPR_SEM_MARKER);
+  Assert.IsTrue(Line > 0, 'marker ' + EXPR_SEM_MARKER + ' not found');
+  var Session := OpenSessionAtMarker(TargetExe, TargetMap, TargetRsm, TargetDir,
+    EVAL_SOURCE, Line);
+  try
+    Assert.AreEqual(Ord(dsStopped), Ord(Session.State), 'did not stop');
+    var Failures := RunExprSemChecks(Session, [
+      // Character codes, decimal and hex, and a run of them as one constant.
+      EvalCheck('Ord(#72)',            '72'),
+      EvalCheck('Initial = #72',       'True'),
+      EvalCheck('Initial = #$48',      'True'),
+      EvalCheck('Length(#13#10)',      '2'),
+      EvalCheck('''a''#66 = ''aB''',   'True'),
+      // Exponent form, with and without a fractional part.
+      EvalCheck('1.0e3 = 1000',        'True'),
+      EvalCheck('2e2 = 200',           'True'),
+      EvalCheck('1.5e-1 < 1',          'True'),
+      // A trailing `e` is not an exponent, so the literal ends before it and
+      // the leftover text is reported rather than silently swallowed.
+      EvalCheck('1e',                  '', True),
+      // Pascal, unlike C, has no leading-dot float -- and says so.
+      EvalCheck('.5 + 1',              'digit before the point', True)]);
+    Assert.AreEqual('', Failures,
+      'literal syntax must follow Pascal -- ' + Failures);
+  finally
+    if Session.State = dsStopped then Session.Terminate;
+    Session.Free;
+  end;
+end;
+
+procedure TDebugSessionTests.Breakpoint_UnevaluatableCondition_StopsAndSaysWhy;
+begin
+  var Line := MarkerLine(EVAL_SOURCE, EVAL_MARKER);
+  // A name that resolves to nothing: the shape of every typo, and of every
+  // condition written against a variable that is not in scope at that line.
+  var Session := OpenSessionWithBp(TargetExe, TargetMap, TargetRsm, TargetDir,
+    EVAL_SOURCE, Line, 'NoSuchSymbolAnywhere > 0', '', '');
+  try
+    Assert.AreEqual(Ord(dsStopped), Ord(Session.State),
+      'an unevaluatable condition must STOP -- treating it as false makes the ' +
+      'breakpoint silently never fire, which is indistinguishable from the ' +
+      'code path not being reached');
+    var Snap := Session.Snapshot;
+    Assert.IsTrue(Snap.BreakpointConditionError <> '',
+      'the stop must carry the reason, or nothing downstream can show it');
+    Assert.IsTrue(Snap.BreakpointConditionError.Contains('NoSuchSymbolAnywhere > 0'),
+      'the reason must quote the condition: ' + Snap.BreakpointConditionError);
+    var Logs := Session.DrainDebuggerOutput;
+    var Joined := '';
+    for var L in Logs do
+      Joined := Joined + L + '|';
+    Assert.IsTrue(Joined.Contains('could not be evaluated'),
+      'the reason must also reach the console: ' + Joined);
+  finally
+    if Session.State = dsStopped then Session.Terminate;
+    Session.Free;
+  end;
+end;
+
+procedure TDebugSessionTests.Breakpoint_UnevaluatableCondition_AnnouncedOncePerSession;
+begin
+  // CTOR_BODY (TWidget.Create) runs more than once per target run, so resuming
+  // lands on the same breakpoint again -- the case where re-announcing would
+  // flood the console.
+  var Line := MarkerLine(EVAL_SOURCE, 'CTOR_BODY');
+  Assert.IsTrue(Line > 0, 'CTOR_BODY marker not found');
+  var Session := OpenSessionWithBp(TargetExe, TargetMap, TargetRsm, TargetDir,
+    EVAL_SOURCE, Line, 'NoSuchSymbolAnywhere > 0', '', '');
+  try
+    Assert.AreEqual(Ord(dsStopped), Ord(Session.State), 'first hit did not stop');
+    var Announcements := 0;
+    for var L in Session.DrainDebuggerOutput do
+      if L.Contains('could not be evaluated') then
+        Inc(Announcements);
+    Assert.AreEqual(1, Announcements, 'the first hit must announce exactly once');
+
+    Session.ContinueExecution;
+    PumpUntilStop(Session, 60000);
+    Assert.AreEqual(Ord(dsStopped), Ord(Session.State),
+      'the second hit must stop as well -- the condition is still broken');
+    Announcements := 0;
+    for var L in Session.DrainDebuggerOutput do
+      if L.Contains('could not be evaluated') then
+        Inc(Announcements);
+    Assert.AreEqual(0, Announcements,
+      'the explanation is emitted once per breakpoint, not on every hit');
+  finally
+    if Session.State = dsStopped then Session.Terminate;
+    Session.Free;
+  end;
+end;
+
+procedure TDebugSessionTests.RecordBpFlip(const SourceFile: string;
+  Line: Integer; Verified: Boolean);
+begin
+  FBpFlips := FBpFlips + [Format('%s:%d=%s',
+    [ExtractFileName(SourceFile), Line, BoolToStr(Verified, True)])];
+end;
+
+procedure TDebugSessionTests.Bpl_BreakpointGoesUnverified_WhenItsModuleUnloads;
+
+  function Reported(const Flip: string): Boolean;
+  begin
+    for var Seen in FBpFlips do
+      if Seen = Flip then
+        Exit(True);
+    Result := False;
+  end;
+
+begin
+  var Line := MarkerLineInFile(PackageSrc, 'PKG_BP');
+  Assert.IsTrue(Line > 0, 'PKG_BP marker not found');
+  // --reload-package loads TestPackage.bpl, unloads it, and loads it again,
+  // with no user stop in between the unload and the reload -- so one continue
+  // covers both transitions.
+  var Session := LaunchStoppedAtEntry(TargetExe, TargetMap, TargetRsm, TargetDir,
+    '--reload-package');
+  try
+    SetLength(FBpFlips, 0);
+    Session.OnBreakpointChanged := RecordBpFlip;
+
+    var LineSpec  := Default(TBpLineSpec);
+    LineSpec.Line := Line;
+    Session.SetBreakpoints('TestPkgUnit.pas', [LineSpec]);
+    Session.ContinueExecution;
+    PumpUntilStoppedOrExited(Session, 30000);
+    Assert.AreEqual(Ord(dsStopped), Ord(Session.State), 'first load did not hit PKG_BP');
+
+    var Verified := Format('TestPkgUnit.pas:%d=True', [Line]);
+    var Unbound  := Format('TestPkgUnit.pas:%d=False', [Line]);
+    Assert.IsTrue(Reported(Verified),
+      'the breakpoint must be reported verified when the package loads: ' +
+      string.Join(', ', FBpFlips));
+
+    Session.ContinueExecution;
+    PumpUntilStoppedOrExited(Session, 30000);
+
+    Assert.IsTrue(Reported(Unbound),
+      'the breakpoint must be reported UNVERIFIED when its package unloads -- ' +
+      'a marker left solid claims a breakpoint is armed when it is not: ' +
+      string.Join(', ', FBpFlips));
+  finally
+    Session.OnBreakpointChanged := nil;
+    if Session.State = dsStopped then Session.Terminate;
+    Session.Free;
+  end;
+end;
+
+procedure TDebugSessionTests.ExpandVariable_LongDynArray_SaysItWasTruncated;
+const
+  MAX_CHILDREN = 1024;   // TVariableExpander.ExpandDynArray
+  TOTAL        = 1500;   // RunBigDynArrayProbe
+begin
+  var Line := MarkerLine(EVAL_SOURCE, 'BIG_DYNARRAY_BODY');
+  Assert.IsTrue(Line > 0, 'marker BIG_DYNARRAY_BODY not found');
+  var Session := OpenSessionAtMarker(TargetExe, TargetMap, TargetRsm, TargetDir,
+    EVAL_SOURCE, Line);
+  try
+    var Big: TSessionVariable;
+    Assert.IsTrue(FindVar(Session.GetLocals, 'Big', Big), 'local Big not found');
+    Assert.IsTrue(Big.Expandable and (Big.Handle <> 0), 'Big should be expandable');
+
+    var Elems := Session.GetChildren(Big.Handle);
+    Assert.AreEqual<Integer>(MAX_CHILDREN + 1, Length(Elems),
+      'expected the capped element list plus one trailer row');
+    var Trailer := Elems[High(Elems)];
+    Assert.AreEqual('...', Trailer.Name, 'the last row must be the trailer');
+    Assert.IsTrue(Trailer.Value.Contains(IntToStr(TOTAL)),
+      'the trailer must name the TRUE element count, or the truncation is ' +
+      'still invisible: ' + Trailer.Value);
+    Assert.IsTrue(Trailer.Value.Contains(IntToStr(MAX_CHILDREN)),
+      'the trailer must name how many are shown: ' + Trailer.Value);
+  finally
+    Session.Terminate;
+    Session.Free;
+  end;
+end;
+
+procedure TDebugSessionTests.ExprSemantics_DeepNesting_IsRefused_NotACrash;
+begin
+  var Line := MarkerLine(EVAL_SOURCE, EXPR_SEM_MARKER);
+  Assert.IsTrue(Line > 0, 'marker ' + EXPR_SEM_MARKER + ' not found');
+  var Session := OpenSessionAtMarker(TargetExe, TargetMap, TargetRsm, TargetDir,
+    EVAL_SOURCE, Line);
+  try
+    Assert.AreEqual(Ord(dsStopped), Ord(Session.State), 'did not stop');
+    // Well past MAX_EXPR_NESTING (64) and trivial to type by accident with a
+    // generated expression. Unbounded, this recursed until the stack gave out.
+    var Deep := StringOfChar('(', 400) + '1' + StringOfChar(')', 400);
+    var R := Session.Evaluate(Deep);
+    Assert.IsFalse(R.Success, 'a 400-deep expression must be refused');
+    Assert.IsTrue(R.ErrorText.Contains('nested'),
+      'the refusal must name the reason: ' + R.ErrorText);
+    // The session survives it: the bound is a refusal, not a crash.
+    var After := Session.Evaluate('1 + 1');
+    Assert.IsTrue(After.Success and After.Value.Contains('2'),
+      'the session must still evaluate afterwards: ' + After.ErrorText);
+  finally
+    if Session.State = dsStopped then Session.Terminate;
+    Session.Free;
+  end;
+end;
+
+type
+  // `Oracle` is the local RunExprOracle assigned from `Expr`, so the compiler
+  // has already answered the question this test asks the debugger.
+  TOracleCase = record
+    Oracle: string;
+    Expr:   string;
+  end;
+
+function OracleCase(const Oracle, Expr: string): TOracleCase;
+begin
+  Result.Oracle := Oracle;
+  Result.Expr   := Expr;
+end;
+
+procedure TDebugSessionTests.ExprOracle_DebuggerAgreesWithTheCompiler;
+const
+  ORACLE_MARKER = 'EXPR_ORACLE';
+
+  // One row per line of RunExprOracle, in the same order. Keep the two together:
+  // this table and that procedure are the pairing, and a row that drifts from
+  // its line fails loudly rather than passing on the wrong expression.
+  function Cases: TArray<TOracleCase>;
+  begin
+    Result := [
+      // Bitwise / boolean against a comparison. Under the old C-like precedence
+      // `Flags and Mask = 0` grouped as `Flags and (Mask = 0)` and answered the
+      // opposite of what the very same text answers in the target.
+      OracleCase('Ora01', 'Flags and Mask = 0'),
+      OracleCase('Ora02', 'Flags and Mask <> 0'),
+      OracleCase('Ora03', 'Flags and $0F = $0F'),
+      OracleCase('Ora04', 'Flags or Mask = 255'),
+      OracleCase('Ora05', 'Flags xor Mask = 255'),
+      OracleCase('Ora06', 'Flags or 0 and 0 = 15'),
+      OracleCase('Ora07', 'not (Flags = 15)'),
+      OracleCase('Ora08', '(Flags > 1) and (Mask > 1)'),
+      OracleCase('Ora09', '(Flags > 99) or (Mask > 1)'),
+      // Integer operators no test had ever put through the evaluator.
+      OracleCase('Ora10', 'Flags shl 4 = 240'),
+      OracleCase('Ora11', 'Mask shr 4 = 15'),
+      OracleCase('Ora12', 'Flags div 4 = 3'),
+      OracleCase('Ora13', 'Flags mod 4 = 3'),
+      OracleCase('Ora14', 'Flags / 2 = 7.5'),
+      OracleCase('Ora15', '-Flags = 0 - 15'),
+      OracleCase('Ora16', '1 + 2 * 3 = 7'),
+      OracleCase('Ora17', '(1 + 2) * 3 = 9'),
+      // Relational operators, likewise: before this, ONE expression in the whole
+      // suite contained an `=` and none contained `<>`, `<`, `>`, `<=` or `>=`.
+      OracleCase('Ora18', 'Small <> Flags'),
+      OracleCase('Ora19', 'Small < Flags'),
+      OracleCase('Ora20', 'Small <= Flags'),
+      OracleCase('Ora21', 'Flags > Small'),
+      OracleCase('Ora22', 'Flags >= Small'),
+      // Strings, where the comparison used to be on the heap pointer.
+      OracleCase('Ora23', 'Greeting = ''Hello'''),
+      OracleCase('Ora24', 'Greeting = ''Nope'''),
+      OracleCase('Ora25', 'Greeting <> ''Nope'''),
+      OracleCase('Ora26', 'Greeting = GreetingCopy'),
+      OracleCase('Ora27', 'Greeting < ''Z'''),
+      OracleCase('Ora28', 'Greeting >= ''Hello'''),
+      OracleCase('Ora29', 'Narrow = ''Hello'''),
+      OracleCase('Ora30', 'Blank = '''''),
+      OracleCase('Ora31', 'Initial = ''H'''),
+      OracleCase('Ora32', 'Initial = ''h'''),
+      // Enum and set.
+      OracleCase('Ora33', 'Mode = wmRunning'),
+      OracleCase('Ora34', 'wmRunning in Modes'),
+      // Forms TEST_CATALOG.md ticked without a test behind them. String concat
+      // and nil comparison had NEVER been evaluated by anything; `as` likewise;
+      // "arithmetic int and float mix" was covered only by int-with-int.
+      OracleCase('Ora35', 'Greeting + ''!'' = ''Hello!'''),
+      OracleCase('Ora36', 'Blank + Greeting = Greeting'),
+      OracleCase('Ora37', 'Absent = nil'),
+      OracleCase('Ora38', 'Present <> nil'),
+      OracleCase('Ora39', 'Integer(Initial) = 72'),
+      OracleCase('Ora40', 'Flags * 1.0 = 15.0'),
+      OracleCase('Ora41', 'Flags + 1.5 = 16.5'),
+      OracleCase('Ora42', '(Present as TWidget).FValue = 1'),
+      OracleCase('Ora43', 'TObject(Present) <> nil')];
+  end;
+
+  // The rendered Boolean, normalised. An evaluator answer and a local read must
+  // be compared as the SAME thing, or the test measures the formatter.
+  function BoolText(const Rendered: string): string;
+  begin
+    Result := LowerCase(Trim(Rendered));
+    if Result.StartsWith('true')  then Exit('True');
+    if Result.StartsWith('false') then Exit('False');
+    Result := '<' + Rendered + '>';
+  end;
+
+begin
+  var Line := MarkerLine(EVAL_SOURCE, ORACLE_MARKER);
+  Assert.IsTrue(Line > 0, 'marker ' + ORACLE_MARKER + ' not found');
+  var Session := OpenSessionAtMarker(TargetExe, TargetMap, TargetRsm, TargetDir,
+    EVAL_SOURCE, Line);
+  try
+    Assert.AreEqual(Ord(dsStopped), Ord(Session.State), 'did not stop');
+
+    var Failures := '';
+    var Trues    := 0;
+    var Falses   := 0;
+    for var Check in Cases do begin
+      // What the COMPILER answered, read back out of the frame.
+      var FromCompiler := Session.Evaluate(Check.Oracle);
+      if not FromCompiler.Success then begin
+        Failures := Failures + Format('%s (%s): the oracle local itself did not read: %s; ',
+          [Check.Oracle, Check.Expr, FromCompiler.ErrorText]);
+        Continue;
+      end;
+      var Expected := BoolText(FromCompiler.Value);
+      if Expected = 'True' then Inc(Trues) else if Expected = 'False' then Inc(Falses);
+
+      // What the DEBUGGER answers for the same source text.
+      var FromDebugger := Session.Evaluate(Check.Expr);
+      if not FromDebugger.Success then begin
+        Failures := Failures + Format('"%s": refused (%s) where the compiler said %s; ',
+          [Check.Expr, FromDebugger.ErrorText, Expected]);
+        Continue;
+      end;
+      var Actual := BoolText(FromDebugger.Value);
+      if Actual <> Expected then
+        Failures := Failures + Format('"%s": compiler says %s, debugger says %s; ',
+          [Check.Expr, Expected, Actual]);
+    end;
+
+    Assert.AreEqual('', Failures,
+      'the debugger must answer what the Delphi compiler answers for the same ' +
+      'expression -- ' + Failures);
+    // A table that happened to be all-True would pass with an evaluator that
+    // returned True for everything. Both outcomes have to be present.
+    Assert.IsTrue((Trues > 0) and (Falses > 0),
+      Format('the oracle must contain both outcomes, got %d true / %d false',
+        [Trues, Falses]));
+  finally
+    if Session.State = dsStopped then Session.Terminate;
+    Session.Free;
+  end;
+end;
+
+type
+  // Name is the local; Fragment is the text the RENDERED value must contain --
+  // the literal the fixture assigned, so the assertion is anchored to the
+  // program's own source and not to whatever the formatter happens to emit.
+  // TypeNames is the set of names the client may legitimately be told,
+  // '|'-separated. More than one is allowed only where DELPHI ITSELF makes them
+  // the same type -- `LongInt` IS `Integer`, `LongWord` IS `Cardinal`, `string`
+  // IS `UnicodeString` -- so the compiler cannot tell them apart either and
+  // demanding the source spelling would be demanding the impossible. It is NOT
+  // a licence to accept whatever the formatter prints.
+  TPrimitiveCase = record
+    Name:      string;
+    Fragment:  string;
+    TypeNames: string;
+  end;
+
+function PrimitiveCase(const Name, Fragment, TypeNames: string): TPrimitiveCase;
+begin
+  Result.Name      := Name;
+  Result.Fragment  := Fragment;
+  Result.TypeNames := TypeNames;
+end;
+
+procedure TDebugSessionTests.PrimitiveLocals_DisplayTheirValueAndDeclaredType;
+const
+  PRIMITIVE_MARKER = 'PRIMITIVE_DISPLAY';
+
+  function Cases: TArray<TPrimitiveCase>;
+  begin
+    Result := [
+      PrimitiveCase('VInteger',  '-123456789',           'Integer'),
+      // LongInt IS Integer and LongWord IS Cardinal on both Windows targets --
+      // one type with two spellings, and the compiler records only one.
+      PrimitiveCase('VLongInt',  '987654321',            'LongInt|Integer'),
+      // Above MaxInt on purpose: read as signed this renders negative.
+      PrimitiveCase('VCardinal', '4000000000',           'Cardinal'),
+      PrimitiveCase('VLongWord', '3221225472',           'LongWord|Cardinal'),
+      PrimitiveCase('VByte',     '234',                  'Byte'),
+      PrimitiveCase('VShortInt', '-77',                  'ShortInt'),
+      PrimitiveCase('VWord',     '60001',                'Word'),
+      PrimitiveCase('VSmallInt', '-30001',               'SmallInt'),
+      PrimitiveCase('VInt64',    '-1234567890123456789', 'Int64'),
+      // Above MaxInt64: a signed read wraps to a negative.
+      PrimitiveCase('VUInt64',   '17293822569102704640', 'UInt64'),
+      PrimitiveCase('VSingle',   '1.5',                  'Single'),
+      PrimitiveCase('VDouble',   '-2.25',                'Double'),
+      PrimitiveCase('VCurrency', '12.34',                'Currency'),
+      PrimitiveCase('VBoolean',  'True',                 'Boolean'),
+      PrimitiveCase('VAnsiChar', 'A',                    'AnsiChar'),
+      PrimitiveCase('VWideChar', 'Z',                    'Char'),
+      // `RawByteString` is NOT an alias of `AnsiString` -- it is accepted here
+      // only because TD32 tag $0036 carries no public type name and the reader
+      // currently answers RawByteString for the whole AnsiString family, which
+      // also costs this local the hex/ascii rendering meant for RawByteString.
+      // Open question in KNOWN_UNKNOWNS.md; tighten this row when it is settled.
+      PrimitiveCase('VAnsiStr',  'ansi-content',         'AnsiString|RawByteString'),
+      // `string` IS `UnicodeString`.
+      PrimitiveCase('VUniStr',   'unicode-content',      'UnicodeString|string')];
+  end;
+
+begin
+  var Line := MarkerLine(EVAL_SOURCE, PRIMITIVE_MARKER);
+  Assert.IsTrue(Line > 0, 'marker ' + PRIMITIVE_MARKER + ' not found');
+  var Session := OpenSessionAtMarker(TargetExe, TargetMap, TargetRsm, TargetDir,
+    EVAL_SOURCE, Line);
+  try
+    Assert.AreEqual(Ord(dsStopped), Ord(Session.State), 'did not stop');
+    var Failures := '';
+    for var Check in Cases do begin
+      var R := Session.Evaluate(Check.Name);
+      if not R.Success then begin
+        Failures := Failures + Format('%s: %s; ', [Check.Name, R.ErrorText]);
+        Continue;
+      end;
+      if not R.Value.Contains(Check.Fragment) then
+        Failures := Failures + Format('%s: value "%s" does not contain "%s"; ',
+          [Check.Name, R.Value, Check.Fragment]);
+      var TypeAccepted := False;
+      for var Allowed in Check.TypeNames.Split(['|']) do
+        if SameText(R.TypeName, Allowed) then
+          TypeAccepted := True;
+      if not TypeAccepted then
+        Failures := Failures + Format('%s: type "%s", expected one of "%s"; ',
+          [Check.Name, R.TypeName, Check.TypeNames]);
+    end;
+    Assert.AreEqual('', Failures,
+      'every primitive local must render the value the fixture assigned, under ' +
+      'its declared type -- ' + Failures);
+  finally
+    if Session.State = dsStopped then Session.Terminate;
+    Session.Free;
+  end;
+end;
+
+procedure TDebugSessionTests.Breakpoint_InDestructorBody_StopsAndTheBodyRuns;
+begin
+  var Line := MarkerLine(EVAL_SOURCE, 'DTOR_BODY');
+  Assert.IsTrue(Line > 0, 'marker DTOR_BODY not found');
+  var Session := OpenSessionAtMarker(TargetExe, TargetMap, TargetRsm, TargetDir,
+    EVAL_SOURCE, Line);
+  try
+    Assert.AreEqual(Ord(dsStopped), Ord(Session.State),
+      'a breakpoint in a destructor body must fire -- the frame is reached ' +
+      'through Free, not through a call the user wrote');
+    var Fn, Src: string;
+    var StopLine: Integer;
+    Assert.IsTrue(Session.GetCurrentLocation(Fn, Src, StopLine), 'no location');
+    Assert.AreEqual(Line, StopLine, 'stopped at the wrong line');
+    Assert.IsTrue(Fn.Contains('Destroy'),
+      'the frame must be named as the destructor, got: ' + Fn);
+
+    // Self is still a live object here, and its field must read: a destructor
+    // frame that cannot show the object being destroyed is of no use.
+    var Tag := Session.Evaluate('FTag');
+    Assert.IsTrue(Tag.Success and Tag.Value.Contains('4242'),
+      'the dying object''s field must be readable in its destructor: ' +
+      Tag.Value + Tag.ErrorText);
+
+    // ...and the body must actually RUN, not merely be stopped in. GDtorRan is
+    // incremented before the marker, so it is already 1 at the stop.
+    var Ran := Session.Evaluate('GDtorRan');
+    Assert.IsTrue(Ran.Success and Ran.Value.Contains('1'),
+      'the destructor body must have executed up to the marker: ' +
+      Ran.Value + Ran.ErrorText);
+  finally
+    if Session.State = dsStopped then Session.Terminate;
     Session.Free;
   end;
 end;

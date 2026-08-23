@@ -28,7 +28,7 @@ uses
   DebugSessionTypes, DebugTarget, DebugInfoTypes, DebugInfoSet,
   MapFileReader, RsmFileReader, TD32FileReader, ModuleSymbolLoader,
   DelphiRtti, DelphiValueReaders, ExprEval, WinDebuggerBase, WinDebuggerX86,
-  SourceResolver,
+  SourceResolver, SafeCallPolicy,
   VariableExpander, BreakpointEval, ExceptionRules, ValueEncoders, DapProtocol;
 
 const
@@ -122,6 +122,18 @@ type
 
     // Conditional / hit-count / logpoint breakpoint evaluation (shared engine).
     FBpEval:     TBpEvaluator;
+    // Set by HandleBpHit when a breakpoint's condition would not evaluate, read
+    // (and cleared) by the next stop report so the frontend can name the reason.
+    FBpConditionError: string;
+    // Conditions already announced on the console, keyed by breakpoint address +
+    // condition text. Once per breakpoint per session: the stop itself repeats as
+    // long as the user keeps continuing, but the explanation only needs saying
+    // once, and editing the condition makes it a different key.
+    FAnnouncedBadConditions: TDictionary<string, Boolean>;
+
+    // Which getters may be auto-evaluated (SafeCallPolicy.pas). Owned here,
+    // handed to the expander by SyncExpander like every other dependency.
+    FSafePolicy: TSafeCallPolicy;
 
     // Output ring buffers (MCP has no async channel -> drained on demand).
     FDebuggeeOutput: TList<string>;   // program stdout
@@ -273,6 +285,7 @@ type
     // an $ActRec activation record with debug-info members. False when not found.
     function  TryFindClosureSelf(out SelfAddr: UInt64; out ClassName: string): Boolean;
     procedure AppendClosureCapturedLocals(var Locals: TArray<TSessionVariable>);
+    procedure AppendBareHandlerException(var Vars: TArray<TSessionVariable>);
     // Surface the anon method's own declared parameters (arg1..argN) from the
     // decoded signature + Win64 ABI home slots (no provider carries their slots).
     procedure AppendAnonMethodParams(var Locals: TArray<TSessionVariable>;
@@ -437,6 +450,23 @@ type
     // SetAddressBreakpoint / ListBreakpoints). False when no bkAddress entry
     // has that Id.
     function  RemoveAddressBreakpoint(const Id: string): Boolean;
+
+    // The safe-getter policy's user file (SafeCallPolicy.pas): what the
+    // frontend's "always evaluate this property" / "never" actions write.
+    // Key spelling comes from TSessionVariable.SafelistKey, so the row and the
+    // archive cannot disagree. Reload also drops every cached verdict, which
+    // is what makes an external hand-edit take effect without a relaunch.
+    procedure SafelistAdd(const Key: string; Deny: Boolean);
+    procedure SafelistRemove(const Key: string);
+    procedure SafelistReload;
+    // The safelist key for a property EXPRESSION (`Application.ComponentCount`),
+    // built the same way the expansion builds it: evaluate the owner, take its
+    // runtime class, join `class.property`. VS Code does not propagate a
+    // variable's custom fields into a context-menu command, only standard ones
+    // like evaluateName -- so the frontend cannot pass the key the row carried
+    // and must pass the expression instead. '' when it does not name a
+    // getter-backed property (nothing to permit).
+    function  SafelistKeyForExpression(const Expr: string): string;
 
     // Data breakpoints (watchpoints; increment 4 of DATA_BREAKPOINTS_PLAN.md).
     // Mirrors the source-breakpoint API's shape, but SetDataBreakpoints
@@ -738,6 +768,12 @@ begin
   FDebuggerOutput := TList<string>.Create;
   FExpander    := TVariableExpander.Create;
   FBpEval      := TBpEvaluator.Create;
+  FAnnouncedBadConditions := TDictionary<string, Boolean>.Create;
+  // The safe-getter policy: user dir (env-overridable, which is how the tests
+  // keep their hands off the real user file) + the adapter's own directory for
+  // the shipped archives. Source dirs arrive at Launch/Attach.
+  FSafePolicy  := TSafeCallPolicy.Create(DefaultSafelistUserDir,
+                    ExtractFilePath(ParamStr(0)));
   FRsmDisabled := GetEnvironmentVariable('NO_RSM') = '1';
   FLoader      := TModuleSymbolLoader.Create;
   FLoader.DebugInfo       := FDebugInfo;
@@ -775,6 +811,8 @@ begin
   FRtti.Free;
   FExpander.Free;        // frees only its handle table; reader refs not owned
   FBpEval.Free;          // owns nothing; reader/rtti refs not owned
+  FAnnouncedBadConditions.Free;
+  FSafePolicy.Free;
   FDebuggerOutput.Free;
   FDebuggeeOutput.Free;
   FLoader.Free;          // removes its module providers from FDebugInfo, frees
@@ -930,6 +968,9 @@ begin
   if Opts.RsmPath <> '' then FRsmPath := Opts.RsmPath
   else                       FRsmPath := ChangeFileExt(FExePath, '.rsm');
   FResolver.Configure(Opts.SourceRoot, FExePath, Opts.ExtraSourcePaths);
+  // The safelist containment rule anchors on source directories; these are the
+  // ones the launch configuration knows about.
+  FSafePolicy.RegisterSourceDirs([Opts.SourceRoot] + Opts.ExtraSourcePaths);
 
   FModulesConfig := Opts.Modules;
   FLoader.LoadMainModule(FExePath, FMapPath, FRsmPath);
@@ -972,6 +1013,9 @@ begin
   if Opts.RsmPath <> '' then FRsmPath := Opts.RsmPath
   else                       FRsmPath := ChangeFileExt(FExePath, '.rsm');
   FResolver.Configure(Opts.SourceRoot, FExePath, Opts.ExtraSourcePaths);
+  // The safelist containment rule anchors on source directories; these are the
+  // ones the launch configuration knows about.
+  FSafePolicy.RegisterSourceDirs([Opts.SourceRoot] + Opts.ExtraSourcePaths);
 
   FModulesConfig := Opts.Modules;
   FLoader.LoadMainModule(FExePath, FMapPath, FRsmPath);
@@ -2062,6 +2106,11 @@ begin
   FExpander.Reset;             // expansion handles are valid only within a stop
   FStoppedOnException := Reason = srException;
   FStopReason := Reason;
+  // Only a breakpoint stop can carry one, and HandleBpHit assigns it (empty or
+  // not) on every breakpoint it decides. Clearing here stops one leaking into the
+  // next step or exception stop.
+  if Reason <> srBreakpoint then
+    FBpConditionError := '';
   if (FRtti = nil) and (FDebugger <> nil) and (FDebugger.ProcessHandle <> 0) then
     FRtti := TDelphiRtti.Create(FDebugger.ProcessHandle, FDebugger.TargetLayout);
   if FDebugger <> nil then begin
@@ -2109,6 +2158,7 @@ begin
       Info.ExceptionDescription := FDebugger.LastExceptionDesc;
     if Reason = srDataBreakpoint then
       Info.DataBreakpointDescription := BuildDataBreakpointDescription;
+    Info.BreakpointConditionError := FBpConditionError;
     FOnStopped(Info);
   end;
 end;
@@ -2119,6 +2169,15 @@ begin
   Inc(FStopGeneration);
   if Assigned(FOnExited) then
     FOnExited(ExitCode);
+  // The main exe AND every runtime BPL keep their own binary memory-mapped for
+  // the loader's whole life (embedded TD32). On an attach the session outlives
+  // the target, so those mappings lock each file on disk and block a rebuild
+  // until the server exits. Release them now that the process is gone; a later
+  // launch/attach reloads fresh readers from the new module-load events.
+  if FLoader <> nil then begin
+    FLoader.ReleaseMainSymbolMapping;
+    FLoader.ReleaseModuleSymbolMappings;
+  end;
 end;
 
 procedure TDebugSession.HandleTargetOutput(const Text: string);
@@ -2143,10 +2202,27 @@ begin
   FBpEval.Rtti      := FRtti;
   FBpEval.DebugInfo := FDebugInfo;
   FBpEval.Readers   := Readers;
+  FBpConditionError := '';
   var LogText: string;
-  case FBpEval.Decide(BP.Condition, BP.HitCondition, BP.LogMessage, BP.HitCount, LogText) of
-    bpStop:
+  var ConditionError: string;
+  case FBpEval.Decide(BP.Condition, BP.HitCondition, BP.LogMessage, BP.HitCount,
+         LogText, ConditionError) of
+    bpStop: begin
+      // Carried to the stop report so the frontend can name the reason inline.
+      // The console line is emitted once per breakpoint per session: the stop
+      // repeats as long as the user keeps continuing, the explanation need not.
+      FBpConditionError := ConditionError;
+      if ConditionError <> '' then begin
+        var Key := IntToHex(BP.VA, 16) + '|' + BP.Condition;
+        if not FAnnouncedBadConditions.ContainsKey(Key) then begin
+          FAnnouncedBadConditions.Add(Key, True);
+          FDebuggerOutput.Add(ConditionError);
+          if Assigned(FOnOutput) then
+            FOnOutput(okNotice, ConditionError);
+        end;
+      end;
       Result := True;
+    end;
     bpLog: begin
       FDebuggerOutput.Add(LogText);
       // A logpoint message is the USER's, not the debugger's: it goes where the
@@ -2410,10 +2486,12 @@ begin
       // Both directions are stored: a module unload that makes the line stop
       // resolving must not leave a client believing the breakpoint is still live.
       StoreVerifiedState(Key, Verified);
-      // The event stays a verified-transition notification only -- a subscribed DAP
-      // frontend uses it to re-colour a gutter that was drawn unverified.
-      if Verified and Assigned(FOnBreakpointChanged) then
-        FOnBreakpointChanged(Spec.SourceFile, Line, True);
+      // BOTH directions. Reporting only the transition to verified told the user
+      // the good news and never the bad: when the owning module unloaded, the
+      // line stopped resolving and the gutter marker stayed solid -- the
+      // debugger claiming a breakpoint was armed when it was not.
+      if Assigned(FOnBreakpointChanged) then
+        FOnBreakpointChanged(Spec.SourceFile, Line, Verified);
     end;
   end;
 end;
@@ -2543,6 +2621,11 @@ begin
   // module name rebinds and replants at whatever base it reloads at.
   if HaveAddressBreakpoints then
     RepostAddressBreakpoints;
+  // A SOURCE breakpoint in a unit of this module resolved through the provider
+  // that has just gone away, so its line no longer binds. Re-deriving the
+  // verified state here is what turns the gutter marker back to grey; without
+  // it the only flips ever reported were the ones on the way UP.
+  NotifyBreakpointFlips;
 end;
 
 function TDebugSession.FrameToSession(const F: TStackFrame;
@@ -3074,6 +3157,53 @@ end;
 // Pushes the current symbol/reader/rtti references into the shared expander just
 // before use. FRtti and FReaders are created lazily on the first stop, so the
 // expander must pick up whatever exists at point of use, not at construction.
+function TDebugSession.SafelistKeyForExpression(const Expr: string): string;
+begin
+  Result := '';
+  var Dotted := Trim(Expr);
+  var LastDot := Dotted.LastIndexOf('.');
+  if LastDot <= 0 then
+    Exit;   // no `owner.member`: nothing to key a property on
+  var OwnerExpr := Dotted.Substring(0, LastDot).Trim;
+  var Member    := Dotted.Substring(LastDot + 1).Trim;
+  if (OwnerExpr = '') or (Member = '') then
+    Exit;
+  // An index or a call in the member half is not a plain property name.
+  if (Member.IndexOfAny(['[', ']', '(', ')']) >= 0) then
+    Exit;
+
+  // Evaluate the OWNER for its runtime class -- the same class the expansion
+  // would key on, so the key written here matches the key the row looks up.
+  // Calls are disabled: naming a property must not run one to find its owner.
+  var Owner := EvaluateForFrame(OwnerExpr, DEFAULT_FRAME_INDEX, 0, {AllowCalls=}False);
+  if (not Owner.Success) or (Owner.TypeName = '') then
+    Exit;
+  // Strip any decoration the type carries; the class name is the bare leading
+  // identifier (e.g. 'TApplication' out of 'TApplication').
+  var Cls := Owner.TypeName.Trim;
+  var Sp := Cls.IndexOf(' ');
+  if Sp > 0 then
+    Cls := Cls.Substring(0, Sp);
+  if Cls = '' then
+    Exit;
+  Result := LowerCase(Cls + '.' + Member);
+end;
+
+procedure TDebugSession.SafelistAdd(const Key: string; Deny: Boolean);
+begin
+  FSafePolicy.AddUser(Key, Deny);
+end;
+
+procedure TDebugSession.SafelistRemove(const Key: string);
+begin
+  FSafePolicy.RemoveUser(Key);
+end;
+
+procedure TDebugSession.SafelistReload;
+begin
+  FSafePolicy.Reload;
+end;
+
 procedure TDebugSession.SyncExpander;
 begin
   FExpander.Debugger  := FDebugger;
@@ -3081,6 +3211,7 @@ begin
   FExpander.TD32      := FLoader.MainTD32;
   FExpander.Rtti      := FRtti;
   FExpander.Readers   := Readers;
+  FExpander.Policy    := FSafePolicy;
 end;
 
 function TDebugSession.LocalToSession(const LV: TLocalValue): TSessionVariable;
@@ -3135,6 +3266,43 @@ begin
   Result := FExpander.GetChildren(Handle);
 end;
 
+// A bare `except .. end` catches an exception it gives no name to, so nothing
+// in the frame's locals refers to it and there is nothing for the user to type
+// into a watch either. Surface it as `$exception`, for as long as the stop
+// stays inside that block.
+//
+// Only for the BARE form. An `on X: ... do` clause already names the object,
+// and that name is an ordinary local row -- listing the same object twice under
+// two names in one Locals scope is worse than listing it once.
+procedure TDebugSession.AppendBareHandlerException(
+  var Vars: TArray<TSessionVariable>);
+begin
+  if FDebugger = nil then Exit;
+  var Kind: TExcHandlerBlockKind;
+  var ObjVA: UInt64;
+  var Reason: string;
+  if not FDebugger.TryGetHandlerException(Kind, ObjVA, Reason) then Exit;
+  if Kind <> ehbBareExcept then Exit;
+  if (ObjVA < 65536) or (EnsureRtti = nil) or not EnsureRtti.IsClassInstance(ObjVA) then Exit;
+
+  var V := Default(TSessionVariable);
+  V.Name         := '$exception';
+  V.EvaluateName := '$exception';
+  V.TypeName     := EnsureRtti.GetInstanceClassName(ObjVA);
+  if V.TypeName = '' then
+    V.TypeName := 'Exception';
+  V.Value := V.TypeName;
+  if (ObjVA = FDebugger.CurrentExceptionObject) and
+     (FDebugger.LastExceptionMessage <> '') then
+    V.Value := V.TypeName + ': ' + FDebugger.LastExceptionMessage;
+  V.Kind       := vkClass;
+  V.Address    := ObjVA;
+  V.Expandable := True;
+  SyncExpander;
+  V.Handle := FExpander.MakeClassExpansion(ObjVA, V.TypeName, '$exception');
+  Vars := Vars + [V];
+end;
+
 function TDebugSession.GetLocals: TArray<TSessionVariable>;
 begin
   var Guard := InteractiveWait;   // bound symbol-index waits (F14)
@@ -3158,6 +3326,7 @@ begin
     // Inside an anonymous method body, the captured variables live in the hidden
     // Self ($ActRec) object, not the (empty) stack-local set -- surface them.
     AppendClosureCapturedLocals(Result);
+    AppendBareHandlerException(Result);
   finally
     if Retarget then
       FDebugger.ClearActiveFrame;
@@ -3475,6 +3644,16 @@ begin
     var Val: TExprValue := Default(TExprValue);
     var Display: string;
     var Eval := TExprEvaluator.Create(FDebugger, FRtti, FDebugInfo, AllowCalls);
+    // A denied getter is refused even in a watch / Debug Console, where calls
+    // are otherwise allowed because the user typed the expression. Only DENY
+    // bites here -- auto-evaluation of an allowed getter still needs no help, a
+    // typed watch already consented. nil when there is no policy.
+    if FSafePolicy <> nil then
+      Eval.CallVetoed :=
+        function(MethodKey: string): Boolean
+        begin
+          Result := FSafePolicy.Resolve([MethodKey]) = svDeny;
+        end;
     try
       if Eval.Evaluate(Expr, Val) then
         Display := FormatExprValue(Val)
@@ -3695,6 +3874,7 @@ begin
   end;
   if FStopReason = srDataBreakpoint then
     Result.DataBreakpointDescription := BuildDataBreakpointDescription;
+  Result.BreakpointConditionError := FBpConditionError;
 end;
 
 function TDebugSession.DrainDebuggeeOutput: TArray<string>;

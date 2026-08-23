@@ -117,6 +117,10 @@ const vscodeStub = {
           onDidReceiveMessage() {},
           postMessage() {}
         },
+        // The editor subscribes to disposal so that closing the tab with unsaved
+        // edits can offer them back instead of discarding them silently. The
+        // handler is captured rather than dropped, so a test can fire it.
+        onDidDispose(handler) { panel.disposeHandler = handler; },
         dispose() {}
       };
       recorded.panels.push(panel);

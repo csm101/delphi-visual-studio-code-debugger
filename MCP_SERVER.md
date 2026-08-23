@@ -99,6 +99,16 @@ To attach to processes owned by another user or elevated targets, run the client
 - `list_breakpoints`, `remove_all_breakpoints` — return/clear BOTH source and
   address breakpoints (see below); each entry carries `kind: "source"` or
   `"address"`.
+
+**Breakpoint conditions.** A `condition` that evaluates to zero suppresses the
+stop. A condition that **cannot be evaluated at all** — a typo, a name that is
+not in scope on that line — makes the breakpoint **stop anyway**, and the stop
+carries `breakpointConditionError` naming the condition and the reason. The
+opposite policy (treat a failed evaluation as false) is the one failure nothing
+reveals: the breakpoint silently never fires and the caller concludes the code
+path is dead. The hit-count gate is skipped on that path, so a `"%100"` hit
+condition cannot swallow the report, and the same text is appended once per
+breakpoint to `get_debugger_output`.
 - `set_breakpoint_at_address` — a breakpoint at an ABSOLUTE ADDRESS rather
   than a source line (`DISASSEMBLY_PLAN.md` increment 5), for a frame with no
   symbols or an address found by inspection (`disassemble`, `get_call_stack`,
@@ -191,12 +201,19 @@ the session to be stopped.
 
 ### Inspection (valid while stopped)
 - `get_compact_debug_snapshot` — state, stop reason, thread, current location,
-  top frames, top-frame locals, exception info if any, and
-  `dataBreakpointDescription` when the stop reason is `dataBreakpoint` (one
-  round trip).
+  top frames, top-frame locals, exception info if any,
+  `dataBreakpointDescription` when the stop reason is `dataBreakpoint`, and
+  `breakpointConditionError` when the stop happened BECAUSE the breakpoint's
+  condition could not be evaluated (one round trip). Without that last field the
+  stop looks unconditional, which is the one thing this snapshot could not
+  otherwise tell you — see "Breakpoint conditions" below.
 - `get_current_source_location`, `get_call_stack`, `get_locals`,
   `get_variable` (`name` — one named variable, with an expansion handle when it is
-  a local class/record/array), `evaluate_expression` (`expression`),
+  a local class/record/array), `evaluate_expression` (`expression` — Pascal,
+  with **Delphi's own operator precedence**: `and` binds with `*`, `or`/`xor`
+  with `+`, both tighter than any comparison, so `(a > 1) and (b < 2)` needs its
+  parentheses here exactly as in source. String comparison compares characters,
+  not heap pointers),
   `get_exception_details`,
   `get_debuggee_output` (program stdout), `get_debugger_output` (logpoint
   messages and debugger notices).

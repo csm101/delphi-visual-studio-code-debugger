@@ -103,6 +103,14 @@ absurdly.
   regression in the code under test, and sends the next hour in the wrong
   direction. Editing even a COMMENT counts as touching it: it shifts the
   `{BP:MARKER}` lines away from the compiled binary's line table.
+  Two artefacts in particular are missed, and they fail differently:
+  `TestHost\...\TestSubject.bpl` (`build_host.bat`) recompiles the SAME
+  `TestTarget\*.pas` units, so every `TDebuggerTestsBpl` case times out or
+  reports `<local: not found>`; and `TestTarget.jdbg` (`build_jdbg.bat`) is a
+  sidecar of the exe, so `JclDebugReaderTests` fails as a line-number/function
+  DISAGREEMENT between JCL and TD32 rather than as a timeout — which looks like a
+  reader bug and is not one. Re-verified the hard way in 2026-08; the sequential
+  re-check does not rescue you, because a stale fixture is not load-sensitive.
 - **Killing a suite mid-run leaves the adapter and `TestHost` alive**, holding the
   adapter exe open; the next build fails with `F2039 Could not create output
   file`. Kill them and move on — there is nothing to investigate.
@@ -195,6 +203,25 @@ absurdly.
 
 ## Fixture design
 
+- **For anything the LANGUAGE defines, let the compiler compute the expected
+  value.** A hand-written `Assert.AreEqual` is worth exactly as much as its
+  author's reading of Delphi, and a wrong reading produces an evaluator and an
+  assertion built from the same misunderstanding: they agree with each other,
+  the test is green, and nothing has been proved. Measured cost of this: of the
+  232 expressions the whole suite evaluated, none contained `and`, `or`, `xor`,
+  `not`, `div`, `mod`, `shl`, `shr`, `<>`, `<`, `>`, `<=` or `>=`, and exactly
+  one contained `=` -- while `TEST_CATALOG.md` said "[x] Boolean ops,
+  comparisons, precedence". `S = 'abc'` compared heap pointers and `Flags and
+  MASK = 0` grouped C-style for as long as the project had existed, and both
+  surfaced only when someone read the evaluator against the language while
+  writing the user manual. `RunExprOracle` + `ExprOracle_DebuggerAgreesWithThe`
+  `Compiler` is the pattern: the fixture assigns the expression to a Boolean
+  local, the test evaluates the same source text, the two must match.
+- **A `[x]` in `TEST_CATALOG.md` must NAME the test that backs it.** A ticked box
+  with no test name is a claim, and it actively prevents the test from being
+  written -- nobody writes a test for something the catalog says is covered. An
+  empty `[ ]` would have been better than the line above.
+
 - **An argument containing ZERO BYTES silently makes an over-wide read look
   correct.** `Win32_StepOver_AdvancesWithinTheSameFrame` could never have caught
   the over-wide return-address read: the fourth pushed value was the Double 2.5,
@@ -229,6 +256,14 @@ absurdly.
   vacuously.
 - **Do not assert `proven:true` on raw-stack hits from an x64 fixture** — the
   call-site decoder is x86 only, so on x64 every hit is honestly `proven:false`.
+- **A `{BP:MARKER}` comment must sit on the statement's FIRST source line.** The
+  line table has an entry for the line a statement STARTS on, not for its
+  continuation lines, so a marker parked on the second line of a wrapped call
+  resolves to a line no address maps to: the breakpoint is accepted, never binds,
+  and the test fails with a bare "did not stop" that says nothing about why. Cost
+  one build+run round on `EXPR_SEMANTICS`; the fix was to fold the `GSink.Use([…])`
+  call back onto one line (the repo allows up to 130 columns for exactly this
+  kind of case).
 - **`Format('%x', ...)` emits UPPERCASE hex.** Every debugger-rendered address or
   value string (`$2A`, not `$2a`) follows it, so an assertion written in lowercase
   fails on a feature that works. Cost one full build+run round on the
@@ -306,6 +341,21 @@ absurdly.
   byte-identical restore possible: `gh release create <tag> --verify-tag
   --latest=false --notes-file <notes> <zip>`, then `--latest` if it was latest.
 
+## Session notes and the resume cursor
+
+- **`TASK_RESUME.md` is erased by `githooks/post-commit`, and that is the
+  feature.** It holds only uncommitted, mid-step state. Anything durable belongs
+  in the commit message, `PROJECT_STATE.md`, `TRAPS.md` or a format document —
+  written in the same change set as the code. Do not rewrite the cursor after
+  committing to "keep the history": the file's whole failure mode was a
+  confident "next action" that described work finished weeks earlier.
+- **The hook does not run until `core.hooksPath` is set, and a fresh clone does
+  not set it.** `git config core.hooksPath githooks`, once per clone. Without it
+  nothing errors — the cursor simply starts rotting again, silently.
+- **A hook script must stay LF.** `.gitattributes` checks this tree out as CRLF;
+  `githooks/*` is exempted explicitly, because Git's POSIX shell reads
+  `#!/bin/sh\r` as a missing interpreter.
+
 ## Symbol providers and concurrency
 
 - **Any provider the adapter queries is hit from two threads and runs under
@@ -343,6 +393,57 @@ absurdly.
 - **`DapLog` needs `GLogPath` set in unit initialization**, not in `TDapIO.Create`,
   or every non-DAP consumer (probes, tests, MCP) logs nowhere even with
   `DAP_LOG=1`.
+- **Embedded TD32 keeps the debuggee's own binary memory-mapped for the loader's
+  whole life** (`TTD32FileReader.OpenMappedFile`, `FILE_SHARE_READ`, no write/delete
+  share). TD32 lives INSIDE the `.exe`/`.bpl`, so the binary is locked on disk while
+  the reader is alive. On a LAUNCH that is invisible — the session ends with the
+  target and frees the reader — but on an ATTACH the session outlives the target, so
+  the file stays locked and a rebuild fails until the server exits. Released now in
+  `TModuleSymbolLoader.ReleaseMainSymbolMapping`, called from
+  `TDebugSession.HandleTargetExited`; the next launch/attach reloads a fresh reader.
+  Do NOT try to fix this by closing the debuggee PROCESS handle or `DebugActiveProcessStop`
+  — both were tried and the file stayed locked; the mapping is the lock, not the
+  zombie. Adding write/delete share is also insufficient: a held mapping blocks the
+  linker's truncate (`ERROR_USER_MAPPED_FILE`) regardless. Runtime BPL readers
+  (`TModuleSymbols.Td32`) hold the identical lock on each `.bpl`; they are released the
+  same way in `ReleaseModuleSymbolMappings`, which FIRST calls `ShutdownPrefetch` — the
+  worker, not the dispatch thread, owns module readers, so freeing one it is mid-parse
+  would crash. Both releases are ARC-driven: the readers are owned solely by their
+  provider ref in `FDebugInfo` (freeing the raw object is a double-free — see
+  `TModuleSymbolLoader.Destroy`), so `RemoveProvider` (main) / `RemoveProvider` +
+  `FModules.Clear` (modules) drops the last ref and the destructor unmaps. Regressions:
+  `TDebugSessionTests.NaturalExit_ReleasesThe{Image,Bpl}FileLock`. A side effect worth
+  knowing: `ShutdownPrefetch` on exit disables prefetch for the rest of THAT session, so
+  a re-attach in the same session loads module symbols synchronously (slower first stop,
+  still correct); no-op when prefetch is off, which is the default.
+
+## RTL routines in a packaged application
+
+- **An RTL routine resolved BY NAME can be the wrong copy.** A process split
+  into runtime packages holds the RTL in `rtl<version>.bpl`, but an exe that
+  links the RTL statically has a second one, and per-thread RTL state is NOT
+  shared between them. Resolving `System.ExceptObject` by name in
+  `TestHost.exe` + `TestSubject.bpl` finds the host's static copy, whose raise
+  list is empty, and calling it says "nothing is being handled" while the
+  package is inside a handler. Resolve in the module the code is EXECUTING in
+  (compare `SymGetModuleBase64` of the candidate against that of the PC), and
+  fall back to `TWinDebugger.TryResolveExportedRoutine` — `rtl290.bpl` has no
+  debug information at all, and its export directory is the only thing left
+  that names a routine.
+- The same hazard applies to every other by-name RTL lookup in the engine
+  (`@UStrAsg` and friends in `SetStringVariable`). Not yet re-measured there.
+
+## Synthetic calls into the debuggee
+
+- **Aborting a call does not give the thread back.** The abort hijacks RIP to the
+  INT3 trap, which only works when the thread is executing code. A thread parked
+  in a kernel wait (`Sleep`, a lock, an I/O) does not reach the trap until the
+  wait ends, so the pump falls through to its 2 s hard-restore and the call
+  reports failure — but the thread stays inside the blocking operation for as
+  long as it was going to. Every later call on that thread fails until then.
+  A test that cuts a blocking getter short and then evaluates something else on
+  the same thread is measuring the leftover block, not the thing it named. Read
+  everything you need out of the SAME expansion, or wait the block out.
 
 ## Engine and language gotchas
 

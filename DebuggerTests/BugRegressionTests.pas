@@ -122,6 +122,17 @@ type
     // should read back as an array, not a bare pointer.
     [Test]
     procedure Test_Bug19_EmptyDynArray_DisplaysAsBrackets;
+
+    // An unknown DAP command used to be answered with an EMPTY SUCCESS
+    // response, to avoid leaving the client waiting. The constraint is right
+    // and the answer was not: a client that acts on that success sees a silent
+    // no-op -- the user presses something and nothing happens, with no error
+    // anywhere. An error response unblocks the client just as well and is true.
+    [Test]
+    procedure UnknownCommand_IsRefused_NotSilentlySucceeded;
+    // ...with one deliberate exception: `cancel` really is a harmless no-op.
+    [Test]
+    procedure CancelCommand_IsToleratedAsANoOp;
   end;
 
   // Bug 11: TDebugInfoSet.SortedRvas concatenated each provider's sorted
@@ -770,6 +781,55 @@ begin
           [I, Rvas[I - 1], Rvas[I]]));
   finally
     InfoSet.Free;
+  end;
+end;
+
+{ ------------------------------------------------- protocol robustness ---- }
+
+procedure TBugRegressionTests.UnknownCommand_IsRefused_NotSilentlySucceeded;
+begin
+  FClient := TDapClient.Create;
+  FClient.Start(AdapterExe);
+  FClient.Initialize.Free;
+  Assert.IsTrue(FClient.WaitForInitialized);
+  // `setExpression` is real DAP, and one of the optional requests this adapter
+  // does not implement. It is also exactly the shape that used to be dangerous:
+  // an empty success would have told the client the assignment was made.
+  var Seq  := FClient.SendRequest('setExpression',
+    '{"expression":"X","value":"1"}');
+  var Resp := FClient.WaitRawResponse(Seq, 8000);
+  try
+    Assert.IsFalse(Resp.GetValue<Boolean>('success', True),
+      'an unimplemented command must be REFUSED, not answered with an empty ' +
+      'success a client would act on: ' + Resp.ToJSON);
+    // The reason travels in `body.error.format`, where SendErrorResponse puts
+    // every refusal. It has to NAME the command: "something failed" is only
+    // marginally better than the empty success it replaced.
+    Assert.IsTrue(Resp.ToJSON.Contains('setExpression'),
+      'the refusal must name the command: ' + Resp.ToJSON);
+    Assert.IsTrue(Resp.ToJSON.Contains('not implemented'),
+      'the refusal must say what went wrong: ' + Resp.ToJSON);
+  finally
+    Resp.Free;
+  end;
+end;
+
+procedure TBugRegressionTests.CancelCommand_IsToleratedAsANoOp;
+begin
+  FClient := TDapClient.Create;
+  FClient.Start(AdapterExe);
+  FClient.Initialize.Free;
+  Assert.IsTrue(FClient.WaitForInitialized);
+  // The client is abandoning a request; answering "done" is honest whether or
+  // not anything was still running, and refusing would turn a client's cleanup
+  // into a visible error.
+  var Seq  := FClient.SendRequest('cancel', '{"requestId":1}');
+  var Resp := FClient.WaitRawResponse(Seq, 8000);
+  try
+    Assert.IsTrue(Resp.GetValue<Boolean>('success', False),
+      'cancel must be tolerated as a no-op: ' + Resp.ToJSON);
+  finally
+    Resp.Free;
   end;
 end;
 

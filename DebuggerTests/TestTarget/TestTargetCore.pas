@@ -124,6 +124,16 @@ type
     After:  Byte;
   end;
 
+  // A destructor with a body worth stopping in: it has a field to read, a
+  // marker line, and an effect (GDtorRan) observable after it returns.
+  TDtorProbe = class
+  private
+    FTag: Integer;
+  public
+    constructor Create(ATag: Integer);
+    destructor Destroy; override;
+  end;
+
   // Indexed (array) property sampler.
   TIndexedBag = class
   private
@@ -159,6 +169,10 @@ type
     FArgCur: Currency;
     FOnNotify: TWidgetNotify;  // backing field for the OnNotify event handler
     function DoCalcScore:   Integer;     // deliberately NOT named GetScore
+    // Blocks for far longer than any automatic-call budget, so a safelisted
+    // getter that HANGS can be reproduced deliberately. Nothing in the program
+    // reads SlowScore: it exists only for a debugger to try to evaluate.
+    function DoSlowScore:   Integer;
     function DoCalcInt64:   Int64;
     function DoCalcCard:    Cardinal;
     function DoCalcBool:    Boolean;
@@ -228,6 +242,7 @@ type
     property Value:    Integer       read FValue;
     property Active:   Boolean       read FActive;
     property Score:    Integer       read DoCalcScore;
+    property SlowScore: Integer      read DoSlowScore;
     property AsInt64:  Int64         read DoCalcInt64;
     property AsCard:   Cardinal      read DoCalcCard;
     property AsBool:   Boolean       read DoCalcBool;
@@ -460,6 +475,11 @@ var
   // Uses-graph collision twin: same name as TestPackage's GUsesGraph (333).
   GUsesGraph: Integer;
   GCounter: Integer;
+  // Bumped by TDtorProbe.Destroy. A breakpoint in a DESTRUCTOR body is the one
+  // frame kind TEST_CATALOG.md section C claimed and nothing tested; this
+  // counter is what makes "the destructor body actually ran" observable from
+  // outside, rather than only "we stopped somewhere called Destroy".
+  GDtorRan: Integer;
   // Per-thread stepping isolation fixture (see RunPerThreadStepFixture): two
   // worker threads spin incrementing their OWN counter until GStepIsoStop is set.
   // While the debugger single-steps ONE of them the other must stay frozen, so
@@ -536,6 +556,7 @@ begin
 end;
 
 function TWidget.DoCalcScore: Integer;     begin Result := FValue * 2;       end; // 84
+function TWidget.DoSlowScore: Integer;     begin Sleep(5000); Result := FValue * 3; end; // never returns within a budget
 function TWidget.DoCalcInt64: Int64;       begin Result := Int64($1122334455667788); end;
 function TWidget.DoCalcCard:  Cardinal;    begin Result := Cardinal($DEADBEEF); end;
 function TWidget.DoCalcBool:  Boolean;     begin Result := True;             end;
@@ -968,6 +989,224 @@ begin
   W.Free;
 end;
 
+// Fixtures for the expression-evaluator semantics: string comparison, Delphi
+// operator precedence and the compiler intrinsics. Deliberately a procedure of
+// its own rather than more locals in RunEvalTests -- several tests assert the
+// exact local set of that frame, and this one exists to be added to.
+procedure RunExprSemanticsTests;
+var
+  Greeting:     string;
+  GreetingCopy: string;      // the same characters in a DIFFERENT allocation
+  Blank:        string;
+  Narrow:       AnsiString;  // the other string family, its own header layout
+  Initial:      Char;
+  Flags:        Integer;
+  Mask:         Integer;
+  Present:      TWidget;
+  Absent:       TWidget;
+begin
+  Greeting := 'Hello';
+  // Built at run time so it cannot share the literal's storage: the whole point
+  // of the comparison tests is that two equal strings live at two addresses.
+  GreetingCopy := Copy('xHello', 2, 5);
+  Blank        := '';
+  Narrow       := 'Hello';
+  Initial      := 'H';
+  Flags        := $0F;
+  Mask         := $F0;    // Flags and Mask = 0 -- true only with Delphi precedence
+  Present      := TWidget.Create('present', 1);
+  Absent       := nil;
+  try
+    GSink.Use([Greeting, GreetingCopy, Blank, string(Narrow), Initial, Flags, Mask, Absent = nil]);  // {BP:EXPR_SEMANTICS}
+  finally
+    Present.Free;
+  end;
+end;
+
+// The ORACLE for expression semantics.
+//
+// Every Ora* local below is a Boolean that DCC64 computed from the expression
+// written beside it. The test asks the debugger to evaluate that same source
+// text and asserts the two agree. The expected value is therefore the Delphi
+// compiler's, never a number someone typed into an assertion -- which is
+// precisely how `S = 'abc'` and `Flags and MASK = 0` stayed wrong through a
+// thousand passing tests: the evaluator and the assertion were written from the
+// same misunderstanding of the language, agreed with each other, and proved
+// nothing about Delphi.
+//
+// Add a form here rather than an `Assert.AreEqual` somewhere: one line in this
+// procedure and one row in the test's table, and the compiler owns the answer.
+procedure RunExprOracle;
+var
+  Flags, Mask, Small:            Integer;
+  Greeting, GreetingCopy, Blank: string;
+  Narrow:                        AnsiString;
+  Initial:                       Char;
+  Mode:                          TWorkMode;
+  Modes:                         TWorkModes;
+  // Bitwise / boolean against a comparison -- the precedence that was inverted.
+  Ora01, Ora02, Ora03, Ora04, Ora05, Ora06, Ora07, Ora08, Ora09: Boolean;
+  // Integer operators no test had ever evaluated.
+  Ora10, Ora11, Ora12, Ora13, Ora14, Ora15, Ora16, Ora17: Boolean;
+  // Relational operators, likewise.
+  Ora18, Ora19, Ora20, Ora21, Ora22: Boolean;
+  // Strings, where the comparison used to be on the pointer.
+  Ora23, Ora24, Ora25, Ora26, Ora27, Ora28, Ora29, Ora30, Ora31, Ora32: Boolean;
+  // Enum and set.
+  Ora33, Ora34: Boolean;
+  // Forms the catalogue claimed were covered and were not: string concat, nil
+  // comparison, numeric casts, `as`, and genuinely MIXED int/float arithmetic.
+  Ora35, Ora36, Ora37, Ora38, Ora39, Ora40, Ora41, Ora42, Ora43: Boolean;
+  Present, Absent: TWidget;
+begin
+  Flags := $0F;
+  Mask  := $F0;
+  Small := 3;
+  Greeting     := 'Hello';
+  GreetingCopy := Copy('xHello', 2, 5);   // same text, its own allocation
+  Blank        := '';
+  Narrow       := 'Hello';
+  Initial      := 'H';
+  Mode         := wmRunning;
+  Modes        := [wmRunning, wmPaused];
+
+  Ora01 := Flags and Mask = 0;
+  Ora02 := Flags and Mask <> 0;
+  Ora03 := Flags and $0F = $0F;
+  Ora04 := Flags or Mask = 255;
+  Ora05 := Flags xor Mask = 255;
+  Ora06 := Flags or 0 and 0 = 15;
+  Ora07 := not (Flags = 15);
+  Ora08 := (Flags > 1) and (Mask > 1);
+  Ora09 := (Flags > 99) or (Mask > 1);
+
+  Ora10 := Flags shl 4 = 240;
+  Ora11 := Mask shr 4 = 15;
+  Ora12 := Flags div 4 = 3;
+  Ora13 := Flags mod 4 = 3;
+  Ora14 := Flags / 2 = 7.5;
+  Ora15 := -Flags = 0 - 15;
+  Ora16 := 1 + 2 * 3 = 7;
+  Ora17 := (1 + 2) * 3 = 9;
+
+  Ora18 := Small <> Flags;
+  Ora19 := Small < Flags;
+  Ora20 := Small <= Flags;
+  Ora21 := Flags > Small;
+  Ora22 := Flags >= Small;
+
+  Ora23 := Greeting = 'Hello';
+  Ora24 := Greeting = 'Nope';
+  Ora25 := Greeting <> 'Nope';
+  Ora26 := Greeting = GreetingCopy;
+  Ora27 := Greeting < 'Z';
+  Ora28 := Greeting >= 'Hello';
+  Ora29 := Narrow = 'Hello';
+  Ora30 := Blank = '';
+  Ora31 := Initial = 'H';
+  Ora32 := Initial = 'h';
+
+  Ora33 := Mode = wmRunning;
+  Ora34 := wmRunning in Modes;
+
+  Present := TWidget.Create('present', 1);
+  Absent  := nil;
+  try
+    Ora35 := Greeting + '!' = 'Hello!';
+    Ora36 := Blank + Greeting = Greeting;   // concat where one side is a nil handle
+    Ora37 := Absent = nil;
+    Ora38 := Present <> nil;
+    Ora39 := Integer(Initial) = 72;
+    Ora40 := Flags * 1.0 = 15.0;            // int operand, float operand
+    Ora41 := Flags + 1.5 = 16.5;
+    Ora42 := (Present as TWidget).FValue = 1;
+    Ora43 := TObject(Present) <> nil;
+
+    GSink.Use([Ora01, Ora02, Ora03, Ora04, Ora05, Ora06, Ora07, Ora08, Ora09, Ora10, Ora11, Ora12]);
+    GSink.Use([Ora13, Ora14, Ora15, Ora16, Ora17, Ora18, Ora19, Ora20, Ora21, Ora22, Ora23, Ora24]);
+    GSink.Use([Ora25, Ora26, Ora27, Ora28, Ora29, Ora30, Ora31, Ora32, Ora33, Ora34, Ora35, Ora36]);
+    GSink.Use([Ora37, Ora38, Ora39, Ora40, Ora41, Ora42, Ora43]);  // {BP:EXPR_ORACLE}
+  finally
+    Present.Free;
+  end;
+end;
+
+// One local of every PRIMITIVE type, for the "local variable type display"
+// claims in TEST_CATALOG.md section A. Those rows were ticked for years with no
+// test behind them, and no fixture even declared a Cardinal, ShortInt, AnsiChar
+// or Currency local for one to read.
+//
+// Values are chosen to be self-evidencing: negative where the type is signed
+// (a lost sign shows up), above the signed maximum where it is unsigned (a
+// signed read wraps to a negative), and never zero -- a zero byte is exactly
+// what makes an over-wide or mis-sized read look correct by accident.
+procedure RunPrimitiveDisplaySampler;
+var
+  VInteger:  Integer;
+  VLongInt:  LongInt;
+  VCardinal: Cardinal;
+  VLongWord: LongWord;
+  VByte:     Byte;
+  VShortInt: ShortInt;
+  VWord:     Word;
+  VSmallInt: SmallInt;
+  VInt64:    Int64;
+  VUInt64:   UInt64;
+  VSingle:   Single;
+  VDouble:   Double;
+  VCurrency: Currency;
+  VBoolean:  Boolean;
+  VAnsiChar: AnsiChar;
+  VWideChar: Char;
+  VAnsiStr:  AnsiString;
+  VUniStr:   UnicodeString;
+begin
+  VInteger  := -123456789;
+  VLongInt  := 987654321;
+  VCardinal := 4000000000;              // above MaxInt: a signed read goes negative
+  VLongWord := $C0000000;
+  VByte     := 234;
+  VShortInt := -77;
+  VWord     := 60001;                   // above MaxSmallInt, same reason
+  VSmallInt := -30001;
+  VInt64    := -1234567890123456789;
+  VUInt64   := $F000000000000000;       // above MaxInt64
+  VSingle   := 1.5;
+  VDouble   := -2.25;
+  VCurrency := 12.34;
+  VBoolean  := True;
+  VAnsiChar := 'A';
+  VWideChar := 'Z';
+  VAnsiStr  := 'ansi-content';
+  VUniStr   := 'unicode-content';
+  GSink.Use([VInteger, VLongInt, VCardinal, VLongWord, VByte, VShortInt, VWord, VSmallInt, VInt64]);
+  GSink.Use([VSingle, VDouble, VCurrency, VBoolean, VWideChar, string(VAnsiStr), VUniStr]);  // {BP:PRIMITIVE_DISPLAY}
+end;
+
+{ TDtorProbe }
+
+constructor TDtorProbe.Create(ATag: Integer);
+begin
+  inherited Create;
+  FTag := ATag;
+end;
+
+destructor TDtorProbe.Destroy;
+begin
+  Inc(GDtorRan);
+  GSink.Use([FTag]);   // {BP:DTOR_BODY}
+  inherited;
+end;
+
+procedure RunDestructorProbe;
+var
+  Probe: TDtorProbe;
+begin
+  Probe := TDtorProbe.Create(4242);
+  Probe.Free;                       // runs Destroy, where the marker sits
+  GSink.Use([GDtorRan]);
+end;
+
 constructor TIndexedBag.Create;
 begin
   inherited Create;
@@ -1048,6 +1287,20 @@ begin
   Big[0]    := 5;
   Big[1499] := 6;
   GSink.Use(Big);  // {BP:BIG_VARARRAY_BODY}
+end;
+
+// Fixture for the dynamic-array expansion cap. More elements than the 1024 the
+// expander is willing to list, so there is something for the "showing first N
+// of M" trailer to say -- without it, 1024 of 1500 looked exactly like all of
+// an array of 1024.
+procedure RunBigDynArrayProbe;
+var
+  Big: TArray<Integer>;
+begin
+  SetLength(Big, 1500);
+  Big[0]    := 5;
+  Big[1499] := 6;
+  GSink.Use([Length(Big), Big[0], Big[1499]]);  // {BP:BIG_DYNARRAY_BODY}
 end;
 
 procedure RunOdsProbe;
@@ -1670,6 +1923,20 @@ begin
   end;
 end;
 
+// A bare `except .. end` inside an ordinary PROCEDURE. The exception it caught
+// has no source-level name at all, so `$exception` is the only way to reach it
+// -- and unlike the main-block probes this one is compiled into the BPL too, so
+// the scenario covers a runtime package as well as a monolithic exe.
+procedure RunBareExceptProbe;
+begin
+  try
+    raise Exception.Create('bare-test-probe');
+  except
+    GSink.Use(['bare handler']);
+    GSink.Use([0]); // {BP:BARE_EXCEPT}
+  end;
+end;
+
 function FreeAdd(A, B: Integer): Integer;
 begin
   Result := A + B;
@@ -2217,6 +2484,10 @@ begin
   RunClosureParamSampler;
   RunDeepNestedTest;
   RunEvalTests;
+  RunExprSemanticsTests;
+  RunExprOracle;
+  RunPrimitiveDisplaySampler;
+  RunDestructorProbe;
   RunDateTimeAliasTest;
   RunStepConsecutiveCalls;
   RunStepIntoPrologue;
@@ -2230,6 +2501,7 @@ begin
     RunGotoProbe;
   RunEnumPackProbe;
   RunBigVarArrayProbe;
+  RunBigDynArrayProbe;
   if FindCmdLineSwitch('run-ods') or FindCmdLineSwitch('-run-ods') then
     RunOdsProbe;
   RunNestedVariantTest;
@@ -2263,6 +2535,9 @@ begin
   if FindCmdLineSwitch('run-exception-handler') or
      FindCmdLineSwitch('-run-exception-handler') then
     RunExceptionHandlerProbe;
+  if FindCmdLineSwitch('run-bare-except') or
+     FindCmdLineSwitch('-run-bare-except') then
+    RunBareExceptProbe;
   if FindCmdLineSwitch('run-exception-test') or
      FindCmdLineSwitch('-run-exception-test') then
     RunExceptionTest;

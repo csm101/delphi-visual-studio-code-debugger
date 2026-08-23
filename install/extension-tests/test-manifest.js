@@ -117,12 +117,33 @@ test('the rules editor is on the Breakpoints view title, and on Call Stack too',
   const entries = (contributes.menus['view/title'] || [])
     .filter((item) => item.command === 'delphi-win64.editExceptionRules');
   const views = entries.map((entry) => entry.when);
-  assert.ok(views.indexOf('view == workbench.debug.breakPointsView') !== -1,
+  assert.ok(views.some((when) => /view == workbench\.debug\.breakPointsView/.test(when)),
     'the button must be on the Breakpoints view, which survives with no session');
-  assert.ok(views.indexOf('view == workbench.debug.callStackView') !== -1,
+  assert.ok(views.some((when) => /view == workbench\.debug\.callStackView/.test(when)),
     'and on the Call Stack view, where it sits during a session');
   entries.forEach((entry) => assert.match(entry.group || '', /^navigation/,
     'anything but a navigation group hides the command in the "..." overflow menu'));
+});
+
+/*
+ * ...but not in someone else's debug session. Every other view/title
+ * contribution is gated on `debugType == 'delphi-win64'`; this one cannot be,
+ * because it is genuinely useful with NO session at all (editing the shared
+ * rules file), which is why it was left unguarded and why a user debugging
+ * Node or Python in the same window saw a Delphi icon in their Breakpoints
+ * title bar. "No active session OR the active session is ours" is the real
+ * intent, and `debugType` is the empty string when nothing is running.
+ */
+test('the rules editor stays out of other extensions\' debug sessions', () => {
+  const entries = (contributes.menus['view/title'] || [])
+    .filter((item) => item.command === 'delphi-win64.editExceptionRules');
+  assert.ok(entries.length > 0, 'no view/title entry for the rules editor');
+  entries.forEach((entry) => {
+    assert.match(entry.when, /!debugType/,
+      'the button must survive with no session at all: ' + entry.when);
+    assert.match(entry.when, /debugType == 'delphi-win64'/,
+      'and must not appear during another debug type: ' + entry.when);
+  });
 });
 
 /*

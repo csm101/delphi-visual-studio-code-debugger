@@ -18,6 +18,8 @@ uses
   // For NoStockMemoryViewSwitch: the unit that owns which command-line switches
   // this program recognises also owns their spelling.
   ProcessListJson,
+  // For DefaultSafelistUserDir (the safelist responses name the user file).
+  SafeCallPolicy,
   ExprEval, ValueEncoders, Disassembler, ZydisDisassembler;
 
 // Full definition lives in the disassemble section further down (it is the
@@ -323,7 +325,7 @@ type
     // hand; read by the `delphiMemoryExtent` request the memory view issues.
     FMemoryExtents: TDictionary<string, TMemoryExtent>;
     // Where the DEBUGGER's own diagnostics go. True (default) sends them as
-    // `delphiLog` custom events for the extension's "Delphi Debug" output
+    // `delphiLog` custom events for the extension's "Delphi Debugger" output
     // channel; False keeps the old behaviour and prints them in the Debug
     // Console. The program's output and logpoint messages are unaffected
     // either way -- they always go to the Debug Console.
@@ -576,6 +578,13 @@ type
     // for the extension's memory view. Deliberately NOT part of the DAP surface
     // -- no standard request carries a value's byte extent.
     procedure HandleMemoryExtent(Seq: Integer; Args: TJSONObject);
+    // Custom requests `delphiSafelistAdd` / `delphiSafelistRemove` /
+    // `delphiSafelistReload`: the safe-getter user file, written through the
+    // adapter because the adapter owns the paths and the reload. After a
+    // mutation an `invalidated(variables)` follows, so the panel re-renders
+    // with the row now evaluated (or deferred again) without waiting for the
+    // next stop.
+    procedure HandleSafelist(Seq: Integer; const Cmd: string; Args: TJSONObject);
     // Tells the client every tracked view may have changed. Called wherever the
     // debuggee's memory can have moved under an open pane: at each stop, and
     // after a write this adapter itself performed.
@@ -671,10 +680,11 @@ type
     // back to the un-scoped warm-up).
     function  WarmupUsesScopeForFrame(FrameRva: UInt64): Boolean;
     // Emits a DAP `breakpoint` changed event so VS Code re-colours a gutter marker
-    // from grey to solid. Driven only by SessionBreakpointChanged (the session's
-    // OnBreakpointChanged) -- the single re-colour path.
+    // -- grey to solid when the owning module's symbols arrive, and solid back to
+    // grey when that module unloads. Driven only by SessionBreakpointChanged (the
+    // session's OnBreakpointChanged) -- the single re-colour path.
     procedure SendBreakpointChanged(Id, Line: Integer;
-                const SourceName, SourcePath: string);
+                const SourceName, SourcePath: string; Verified: Boolean);
     function  FindSourceFile(const Name: string): string;
     function  ResolveSourcePath(const BaseName: string): string;
     function  ResolveUnitToSource(const UnitName: string): string;
@@ -707,7 +717,9 @@ type
     // carries value + type; the child ref comes from RefForHandle(V.Handle).
     procedure EmitVar(Arr: TJSONArray; const V: TSessionVariable);
     function  BuildCurrentExceptionRef(out ValueStr, ClassName: string;
-                out VarRef: Integer; out ObjAddr: UInt64): Boolean;
+                out VarRef: Integer; out ObjAddr: UInt64;
+                out HandlerKind: TExcHandlerBlockKind;
+                out Reason: string): Boolean;
     procedure AppendExceptionLocal(Arr: TJSONArray);
   public
     constructor Create;
@@ -1173,7 +1185,7 @@ begin
     Loc := Trim(Args.GetValue<string>('diagnosticsLocation', ''));
   FDiagnosticsToOutputChannel := not SameText(Loc, 'debugConsole');
   if FDiagnosticsToOutputChannel then
-    DapLog('diagnosticsLocation = outputChannel ("Delphi Debug" via delphiLog events)')
+    DapLog('diagnosticsLocation = outputChannel ("Delphi Debugger" via delphiLog events)')
   else
     DapLog('diagnosticsLocation = debugConsole');
 end;
@@ -1328,15 +1340,14 @@ begin
 end;
 
 // TDebugSession.OnBreakpointChanged subscriber -- the SINGLE gutter re-colour path.
-// The session fires this from RepostBreakpoints/NotifyBreakpointFlips when a stored
-// spec's line flips to verified after a runtime module's symbols load. Look up the
-// numeric id we handed VS Code for that 'file|line' and emit the DAP `breakpoint`
-// changed event so the marker goes grey -> solid.
+// The session fires this from RepostBreakpoints/NotifyBreakpointFlips whenever a
+// stored spec's line changes verified state: up when a runtime module's symbols
+// load, DOWN when that module unloads. Look up the numeric id we handed VS Code
+// for that 'file|line' and emit the DAP `breakpoint` changed event, so the marker
+// follows in both directions rather than only going grey -> solid.
 procedure TDapServer.SessionBreakpointChanged(const SourceFile: string;
   Line: Integer; Verified: Boolean);
 begin
-  if not Verified then
-    Exit;
   var Base := LowerCase(ExtractFileName(SourceFile));
   var Key  := Base + '|' + IntToStr(Line);
   var Id: Integer;
@@ -1344,7 +1355,14 @@ begin
     Exit;
   var FullPath := '';
   FBpSourcePath.TryGetValue(Base, FullPath);
-  SendBreakpointChanged(Id, Line, ExtractFileName(SourceFile), FullPath);
+  SendBreakpointChanged(Id, Line, ExtractFileName(SourceFile), FullPath, Verified);
+  // Losing a breakpoint is worth saying out loud. The marker turning grey is
+  // easy to miss in a gutter the user is not looking at, and the effect --
+  // execution running straight past a line they set a breakpoint on -- is
+  // otherwise indistinguishable from the line never being reached.
+  if not Verified then
+    SendConsoleLog(Format('[BP] %s:%d is no longer bound -- the module that ' +
+      'owns this source is not loaded', [ExtractFileName(SourceFile), Line]));
 end;
 
 procedure TDapServer.SessionSymbolsArrived(Sender: TObject);
@@ -1571,13 +1589,13 @@ begin
 end;
 
 procedure TDapServer.SendBreakpointChanged(Id, Line: Integer;
-  const SourceName, SourcePath: string);
+  const SourceName, SourcePath: string; Verified: Boolean);
 var
   Body: TJSONObject;
 begin
   var Bp := TJSONObject.Create;
   Bp.AddPair('id',       TJSONNumber.Create(Id));
-  Bp.AddPair('verified', TJSONBool.Create(True));
+  Bp.AddPair('verified', TJSONBool.Create(Verified));
   Bp.AddPair('line',     TJSONNumber.Create(Line));
   var Src := TJSONObject.Create;
   Src.AddPair('name', SourceName);
@@ -1592,8 +1610,8 @@ begin
   finally
     Body.Free;
   end;
-  DapLog(Format('breakpoint changed: id=%d verified=true %s:%d',
-    [Id, SourceName, Line]));
+  DapLog(Format('breakpoint changed: id=%d verified=%s %s:%d',
+    [Id, BoolToStr(Verified, True), SourceName, Line]));
 end;
 
 function TDapServer.FindSourceFile(const Name: string): string;
@@ -1736,7 +1754,19 @@ begin
   try
     case Info.Reason of
       srEntry:      Body.AddPair('reason', 'entry');
-      srBreakpoint: Body.AddPair('reason', 'breakpoint');
+      srBreakpoint: begin
+        Body.AddPair('reason', 'breakpoint');
+        if Info.BreakpointConditionError <> '' then begin
+          // The stop happened BECAUSE the condition would not evaluate. VS Code
+          // has no modal message box (which is how the Delphi IDE reports this),
+          // but `description` / `text` on the stopped event put the reason in the
+          // inline widget where exception and watchpoint stops already explain
+          // themselves -- otherwise this looks like an unconditional stop on a
+          // line the user deliberately conditioned.
+          Body.AddPair('description', Info.BreakpointConditionError);
+          Body.AddPair('text',        Info.BreakpointConditionError);
+        end;
+      end;
       srStep:       Body.AddPair('reason', 'step');
       srException: begin
         Body.AddPair('reason', 'exception');
@@ -1929,15 +1959,26 @@ begin
       SendOutputEvent(Text, 'stdout');
     okLogPoint:
       SendOutputEvent(Text + sLineBreak, 'console');
+    okNotice:
+      // The debugger complaining about something the user WROTE. Console, for
+      // the same reason a logpoint goes there: it is about the user's own input,
+      // and the diagnostics channel is where it would be buried.
+      SendOutputEvent(Text + sLineBreak, 'console');
   else
     SendDiagnosticEvent(Text);
   end;
 end;
 
-// Diagnostics for the extension's "Delphi Debug" output channel. Falls back to
-// the Debug Console when no client is listening for the custom event, so a
-// plain DAP client (or a VS Code without our extension) still sees them rather
-// than losing them silently.
+// Diagnostics for the extension's "Delphi Debugger" output channel, as the
+// `delphiLog` custom event. The destination is chosen SOLELY by the
+// `diagnosticsLocation` config value; there is no listener detection, and DAP
+// offers no capability a client could declare that would provide one.
+//
+// The consequence, stated rather than papered over: a client that is not this
+// extension and does not set `"diagnosticsLocation": "debugConsole"` receives
+// `delphiLog` events it has no handler for, and the lines are lost. A plain DAP
+// client should set that option. (An earlier version of this comment claimed a
+// fallback that the code never had.)
 procedure TDapServer.SendDiagnosticEvent(const Text: string);
 begin
   if not FDiagnosticsToOutputChannel then begin
@@ -4031,6 +4072,74 @@ begin
   end;
 end;
 
+procedure TDapServer.HandleSafelist(Seq: Integer; const Cmd: string;
+  Args: TJSONObject);
+begin
+  if SameText(Cmd, 'delphiSafelistReload') then begin
+    FSession.SafelistReload;
+    FIO.SendResponse(Seq, Cmd, True);
+    Exit;
+  end;
+
+  // The key comes EITHER pre-built (a row that carried it) OR as an
+  // `expression`, which is how the VS Code context menu reaches here: VS Code
+  // propagates a variable's standard fields (evaluateName) into the command but
+  // NOT custom ones, so the frontend cannot hand back the key the row carried.
+  // The session rebuilds it from the expression the same way the expansion does.
+  var Key := '';
+  if Args <> nil then begin
+    Key := Trim(Args.GetValue<string>('key', ''));
+    if Key = '' then begin
+      var Expr := Trim(Args.GetValue<string>('expression', ''));
+      if Expr <> '' then
+        Key := FSession.SafelistKeyForExpression(Expr);
+    end;
+  end;
+
+  if Key = '' then begin
+    // Not a getter-backed property -- a field read needs no permission. Report
+    // it as an unremarkable outcome, not an error the panel would surface.
+    var B := TJSONObject.Create;
+    try
+      B.AddPair('applicable', TJSONBool.Create(False));
+      FIO.SendResponse(Seq, Cmd, True, B);
+    finally
+      B.Free;
+    end;
+    Exit;
+  end;
+
+  if SameText(Cmd, 'delphiSafelistAdd') then
+    FSession.SafelistAdd(Key, Args.GetValue<string>('verdict', '') = 'deny')
+  else if SameText(Cmd, 'delphiSafelistRemove') then
+    FSession.SafelistRemove(Key)
+  else begin
+    FIO.SendErrorResponse(Seq, Cmd, 'unknown safelist command');
+    Exit;
+  end;
+
+  var Body := TJSONObject.Create;
+  try
+    Body.AddPair('userFile',
+      TPath.Combine(DefaultSafelistUserDir, 'user.safelist.json'));
+    FIO.SendResponse(Seq, Cmd, True, Body);
+  finally
+    Body.Free;
+  end;
+
+  // The decision changed while stopped: make the panel re-ask instead of
+  // showing yesterday's deferral until the next stop.
+  if FClientSupportsInvalidated and (FSession.State = dsStopped) then begin
+    var Inv := TJSONObject.Create;
+    try
+      Inv.AddPair('areas', TJSONArray.Create(TJSONString.Create('variables')));
+      FIO.SendEvent('invalidated', Inv);
+    finally
+      Inv.Free;
+    end;
+  end;
+end;
+
 procedure TDapServer.EmitMemoryChanged;
 begin
   if not FClientSupportsMemoryEvent then
@@ -4236,32 +4345,70 @@ begin
     Item.AddPair('memoryReference', RefStr);
     RememberMemoryExtent(RefStr, MemRef, V.ValueSize, V.Name, V.TypeName);
   end;
+  // Getter-backed property rows carry the safelist spelling, so the frontend's
+  // "always evaluate" / "never" actions name exactly the member this row is.
+  if V.SafelistKey <> '' then
+    Item.AddPair('delphiSafelistKey', V.SafelistKey);
   Arr.AddElement(Item);
 end;
 
-// Shared builder for the `$exception` pseudo-variable. Returns False when not
-// stopped on a Delphi raise (or the object is not a live instance). On success:
-// ValueStr = "Class: Message", ClassName = the raised class, VarRef = an
-// expansion ref so the object's members can be drilled into.
+// Shared builder for the `$exception` pseudo-variable. Returns False, with a
+// Reason, when there is no exception in scope. On success: ValueStr =
+// "Class: Message", ClassName = the raised class, VarRef = an expansion ref so
+// the object's members can be drilled into.
+//
+// Two sources, in this order:
+//   1. the stop itself, when it IS an exception stop -- the object of the raise
+//      the debugger just reported;
+//   2. otherwise the `except` block the PC is standing in, asked of the RTL's
+//      own raise list. This is what keeps `$exception` alive for the WHOLE
+//      handler instead of only at the instant of the raise. HandlerKind comes
+//      back so the caller can honour the alias/`$exception` exclusion.
 function TDapServer.BuildCurrentExceptionRef(out ValueStr, ClassName: string;
-  out VarRef: Integer; out ObjAddr: UInt64): Boolean;
+  out VarRef: Integer; out ObjAddr: UInt64;
+  out HandlerKind: TExcHandlerBlockKind; out Reason: string): Boolean;
 begin
-  ValueStr  := '';
-  ClassName := '';
-  VarRef    := 0;
-  ObjAddr   := 0;
-  Result    := False;
-  if not FStoppedOnException then Exit;
-  if (FDebugger = nil) or (FRtti = nil) then Exit;
-  var ExcObj := FDebugger.CurrentExceptionObject;
-  if (ExcObj < 65536) or not FRtti.IsClassInstance(ExcObj) then Exit;
+  ValueStr    := '';
+  ClassName   := '';
+  VarRef      := 0;
+  ObjAddr     := 0;
+  HandlerKind := ehbNone;
+  Reason      := '';
+  Result      := False;
+  if (FDebugger = nil) or (FRtti = nil) then begin
+    Reason := 'no debug session';
+    Exit;
+  end;
+
+  var ExcObj: UInt64 := 0;
+  var FromStop := FStoppedOnException;
+  if FromStop then
+    ExcObj := FDebugger.CurrentExceptionObject
+  else if not FDebugger.TryGetHandlerException(HandlerKind, ExcObj, Reason) then
+    Exit;
+  if (ExcObj < 65536) or not FRtti.IsClassInstance(ExcObj) then begin
+    if Reason = '' then
+      Reason := 'no live Delphi exception object';
+    Exit;
+  end;
   ObjAddr := ExcObj;
 
-  ClassName := FDebugger.LastExceptionClass;
-  var Msg   := FDebugger.LastExceptionMessage;
-  ValueStr  := ClassName;
-  if Msg <> '' then
-    ValueStr := ClassName + ': ' + Msg;
+  // At an exception stop the recorded class and message describe exactly this
+  // object. Reached through a handler they still do whenever the object is the
+  // one that raise reported, which is every case except a nested exception
+  // that has already been handled -- there the VMT is the only honest source,
+  // and a class name with no message beats a message belonging to something
+  // else.
+  if FromStop or (ExcObj = FDebugger.CurrentExceptionObject) then begin
+    ClassName := FDebugger.LastExceptionClass;
+    var Msg   := FDebugger.LastExceptionMessage;
+    ValueStr  := ClassName;
+    if Msg <> '' then
+      ValueStr := ClassName + ': ' + Msg;
+  end else begin
+    ClassName := FRtti.GetInstanceClassName(ExcObj);
+    ValueStr  := ClassName;
+  end;
 
   // Mint an expansion for the live object (member table when the class is
   // known, else runtime RTTI) and map it to a DAP ref so the object's members
@@ -4271,16 +4418,26 @@ begin
   Result := True;
 end;
 
-// When stopped on a Delphi exception, surface the live exception object as a
-// synthetic `$exception` entry at the top of the Locals scope so the user can
-// inspect (and expand) its class, Message and fields like any other object.
+// Surfaces the live exception object as a synthetic `$exception` entry at the
+// top of the Locals scope so it is inspectable (and expandable) without anyone
+// having to know to type the name into Watch.
+//
+// Offered at an exception stop, and inside a BARE `except .. end` for as long
+// as the stop stays in that block. NOT inside an `on X: ... do` clause: there
+// the exception already has a source-level name and that name is listed as an
+// ordinary local, so adding `$exception` beside it would show one object under
+// two names in the same Locals scope.
 procedure TDapServer.AppendExceptionLocal(Arr: TJSONArray);
 var
   ValueStr, ClsName: string;
   VarRef: Integer;
   ObjAddr: UInt64;
+  HandlerKind: TExcHandlerBlockKind;
+  Reason: string;
 begin
-  if not BuildCurrentExceptionRef(ValueStr, ClsName, VarRef, ObjAddr) then Exit;
+  if not BuildCurrentExceptionRef(ValueStr, ClsName, VarRef, ObjAddr,
+           HandlerKind, Reason) then Exit;
+  if HandlerKind = ehbOnClause then Exit;
   var Item := TJSONObject.Create;
   Item.AddPair('name',               '$exception');
   Item.AddPair('evaluateName',       '$exception');
@@ -4552,7 +4709,10 @@ begin
       var ValueStr, ClsName: string;
       var VarRef: Integer;
       var ObjAddr: UInt64;
-      if BuildCurrentExceptionRef(ValueStr, ClsName, VarRef, ObjAddr) then begin
+      var HandlerKind: TExcHandlerBlockKind;
+      var ExcReason: string;
+      if BuildCurrentExceptionRef(ValueStr, ClsName, VarRef, ObjAddr,
+           HandlerKind, ExcReason) then begin
         Body.AddPair('result', ValueStr);
         if ClsName <> '' then Body.AddPair('type', ClsName);
         Body.AddPair('variablesReference', TJSONNumber.Create(VarRef));
@@ -4572,7 +4732,13 @@ begin
           NoExcText := '<hardware fault: no Delphi exception object exists yet --' +
             ' the RTL creates one only when it converts the fault. The fault''s' +
             ' class, address and message are in the stop reason and the Debug' +
-            ' Console.>';
+            ' Console.>'
+        else if ExcReason <> '' then
+          // Away from an exception stop the honest answer is not "none" but
+          // WHY none: on a 32-bit target the handler's extent is not derivable
+          // at all, and a row that simply never appears is indistinguishable
+          // from a bug.
+          NoExcText := '<no exception in scope: ' + ExcReason + '>';
         Body.AddPair('result', NoExcText);
         Body.AddPair('variablesReference', TJSONNumber.Create(0));
       end;
@@ -4966,9 +5132,33 @@ begin
     else if Cmd = 'modules'           then HandleModules(Seq, Args)
     else if Cmd = 'delphiSetRawStackScan' then HandleSetRawStackScan(Seq, Args)
     else if Cmd = 'delphiMemoryExtent'    then HandleMemoryExtent(Seq, Args)
-    else
-      // Unknown command: send empty success response to avoid VS Code hanging
-      FIO.SendResponse(Seq, Cmd, True);
+    else if Cmd.StartsWith('delphiSafelist') then HandleSafelist(Seq, Cmd, Args)
+    // `cancel` is the one command worth tolerating as a no-op: the client is
+    // abandoning a request, and answering "done" is honest whether or not that
+    // request was still running. Everything else falls through to the refusal
+    // below.
+    else if Cmd = 'cancel'            then FIO.SendResponse(Seq, Cmd, True)
+    else begin
+      // Unknown command. The client MUST be answered -- an unanswered request
+      // leaves it waiting forever -- but answering "success" with an empty body
+      // is the wrong way to do it: a client that acts on that success sees a
+      // silent no-op, the user presses something and nothing happens, and there
+      // is no error anywhere. An error response unblocks the client just as
+      // well and says what actually happened.
+      //
+      // Every optional request this adapter does not implement (`terminate`,
+      // `restart`, `restartFrame`, `stepBack`, `reverseContinue`,
+      // `setFunctionBreakpoints`, `setExpression`, `completions`,
+      // `loadedSources`, `breakpointLocations`, `terminateThreads`,
+      // `stepInTargets`) is gated on a capability this adapter does not
+      // advertise, so a compliant client never sends one and no user-visible
+      // error toast can come of this.
+      DapLog(Format('ProcessRequest: refusing unimplemented command "%s" (seq=%d)',
+        [Cmd, Seq]));
+      FIO.SendErrorResponse(Seq, Cmd,
+        Format('"%s" is not implemented by this debug adapter. Its capability ' +
+               'is not advertised, so nothing should be sending it.', [Cmd]));
+    end;
   except
     // A handler that raises must still ANSWER the request: a logged-but-
     // unanswered request leaves the client waiting forever (e.g. a malformed

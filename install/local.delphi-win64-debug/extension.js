@@ -663,6 +663,60 @@ function activate(context) {
       (commandArgument) => memoryView.openMemoryView(context, commandArgument))
   );
 
+  // The safe-getter safelist. A getter-backed property row defers as "(expand
+  // to evaluate)"; these actions write the user's decision through the adapter
+  // (which owns the file and the reload), and the panel re-renders at once via
+  // the invalidated event the adapter sends back. The row names its own
+  // safelist entry (delphiSafelistKey), so what the user clicked and what the
+  // file says cannot disagree.
+  //
+  // 'forget' is the way back out. Without it "Always Evaluate This Property"
+  // was a one-way door: undoing it meant hand-editing a JSON file whose path
+  // the UI never showed. The confirmation names that file too, so a decision
+  // stays reversible even when the row it was made on is long gone.
+  function safelistAction(verdict) {
+    return async (commandArgument) => {
+      const session = vscode.debug.activeDebugSession;
+      if (!session || session.type !== DEBUG_TYPE) return;
+      // evaluateName, NOT a custom field: VS Code propagates a variable's
+      // standard DAP fields into a context-menu command but drops the ones the
+      // adapter added, so delphiSafelistKey never arrives here. The expression
+      // does, and the adapter rebuilds the key from it exactly as the expansion
+      // does. A row without one (a synthetic group, a scope) names nothing.
+      const variable = commandArgument && (commandArgument.variable || commandArgument);
+      const expression = variable &&
+        (variable.evaluateName || (typeof variable.name === 'string' ? variable.name : ''));
+      if (!expression) return;
+      const command = verdict === 'forget' ? 'delphiSafelistRemove' : 'delphiSafelistAdd';
+      try {
+        const reply = await session.customRequest(command,
+          { expression: expression, verdict: verdict });
+        if (reply && reply.applicable === false) {
+          vscode.window.showInformationMessage(
+            '"' + expression + '" is read directly (not through a getter), so it ' +
+            'needs no permission — it is always shown.');
+          return;
+        }
+        const outcome = {
+          deny:   'will never auto-evaluate',
+          forget: 'is back to asking before it evaluates',
+        }[verdict] || 'will auto-evaluate from now on';
+        // The file is named because it is the only way to review or undo these
+        // decisions in bulk; the adapter returns its path with every reply.
+        const where = reply && reply.userFile ? ' — recorded in ' + reply.userFile : '';
+        vscode.window.setStatusBarMessage(
+          'Delphi: "' + expression + '" ' + outcome + where, 8000);
+      } catch (err) {
+        vscode.window.showWarningMessage(
+          'Safelist update failed: ' + (err && err.message ? err.message : String(err)));
+      }
+    };
+  }
+  context.subscriptions.push(
+    vscode.commands.registerCommand('delphi-win64.safelistAllow', safelistAction('allow')),
+    vscode.commands.registerCommand('delphi-win64.safelistDeny', safelistAction('deny')),
+    vscode.commands.registerCommand('delphi-win64.safelistForget', safelistAction('forget')));
+
   const modules = modulesView.register(context);
 
   context.subscriptions.push(

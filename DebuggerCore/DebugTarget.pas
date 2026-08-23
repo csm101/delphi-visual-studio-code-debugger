@@ -92,6 +92,30 @@ type
     Description: string;
   end;
 
+  // What an `except` block is, when one has been located from a routine's own
+  // exception-dispatch data.
+  //   ehbOnClause   -- the block of an `on <X>: <Class> do` clause. The alias
+  //                    X names the exception object for the block's extent.
+  //   ehbBareExcept -- a bare `except .. end`. The object has no source-level
+  //                    name at all, which is what `$exception` exists for.
+  // The two are mutually exclusive for one block, and that is load-bearing:
+  // offering both names for the same handler would put a stale alias next to a
+  // live pseudo-variable.
+  TExcHandlerBlockKind = (ehbNone, ehbOnClause, ehbBareExcept);
+
+  // One located `except` block of the routine a PC is standing in.
+  //
+  // [StartVA, EndVA) is the block's real extent, not a guess: dcc wraps every
+  // handler body in a compiler-generated `try .. finally` (it is what calls
+  // System.@DoneExcept), and that finally's scope-table entry is the narrowest
+  // protected range containing the block's second byte. See EH_FORMAT_NOTES.md.
+  TExcHandlerBlock = record
+    Kind:       TExcHandlerBlockKind;
+    StartVA:    UInt64;   // first instruction of the block
+    EndVA:      UInt64;   // one past its last instruction
+    ClassVmtVA: UInt64;   // ehbOnClause only: the VMT the `on` clause names
+  end;
+
   // How one synthetic-call argument has to be materialised in the TARGET.
   //
   // This replaces a plain "is it a float" Boolean, which was sufficient on x64 --
@@ -381,6 +405,22 @@ type
     // (0 when not stopped on a Delphi raise). Surfaced as the `$exception`
     // pseudo-local so the object is inspectable in the Variables panel.
     function  CurrentExceptionObject: UInt64;
+    // The exception the `except` block the stopped PC is standing IN is
+    // currently handling, and what kind of block that is.
+    //
+    // A different question from CurrentExceptionObject, which is the last raise
+    // this debugger SAW. That one stays set for the rest of the session -- long
+    // after the handler returned and the RTL freed the object -- so it cannot
+    // answer "is there an exception in scope right now" without lying every
+    // time the answer is no. This asks the RTL's own per-thread raise list
+    // (System.ExceptObject), which is right by construction, nested handlers
+    // included.
+    //
+    // Kind is ehbNone whenever the PC is not inside a handler this debugger can
+    // locate. Reason names what is missing whenever the answer is False, so a
+    // caller can say WHY instead of showing nothing.
+    function  TryGetHandlerException(out Kind: TExcHandlerBlockKind;
+                out ObjVA: UInt64; out Reason: string): Boolean;
 
     // Memory I/O.
     function  ReadProcessMemoryAt(VA: UInt64; Buf: Pointer; Size: NativeUInt): Boolean;
@@ -599,6 +639,28 @@ type
     // Requests the in-flight synthetic call (if any) to abort at the next pump
     // iteration. Thread-safe; a no-op when no call is running.
     procedure RequestAbortRemoteCall;
+    // An AUTO-CALL WINDOW bounds a BURST of synthetic calls nobody asked for
+    // one by one -- the getters a safelist authorises while rendering a
+    // Variables request. An explicit "expand to evaluate" click can afford the
+    // full per-call budget: the user asked, and is watching a progress cue. An
+    // automatic call cannot, because there are as many of them as there are
+    // rows, and a single getter that blocks would otherwise freeze the panel
+    // for the whole watchdog timeout, once per hung row.
+    //
+    // So the caller opens a window around the burst, and inside it every call
+    // gets the SHORTER of its own reduced budget and whatever is left of the
+    // window. Nested opens keep the outer deadline: the burst is the thing
+    // being bounded, not the nesting.
+    //
+    // Same-thread by construction (the request handler that renders the rows is
+    // the thread that pumps the call), so this needs no synchronisation, unlike
+    // the cross-thread RequestAbortRemoteCall above.
+    procedure BeginAutoCallWindow(TotalMs: Cardinal);
+    procedure EndAutoCallWindow;
+    // True when a window is open and its deadline has passed. Asked BEFORE a
+    // call, so a row that is already past the deadline costs nothing at all
+    // rather than paying an abort to find out.
+    function  AutoCallWindowExhausted: Boolean;
     // Resolves a bare class NAME to its runtime class reference (TClass = the
     // VMT address), scoped to the active frame's `uses` so a same-named class
     // in another unit is not picked. Used as the Self argument when invoking a
