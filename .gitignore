@@ -92,3 +92,11 @@ ThirdParty/Zydis/build/
 # tracked source ThirdParty/Zydis/LICENSE. The DLL copies are already covered
 # by the *.dll rule above; this is the same treatment for its licence file.
 Zydis-LICENSE.txt
+
+# Project-scoped exception rules. The `.local` half is by definition personal --
+# one developer's overrides for the project they are working on -- so it is
+# ignored everywhere. The shared half IS meant to be committed, which is why only
+# the transient one TPackageExceptionRulesTests writes next to the test package
+# is named here.
+*.ExceptionSettings.local.json
+DebuggerTests/TestPackage/TestPackage.ExceptionSettings.json

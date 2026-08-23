@@ -19,6 +19,7 @@ uses
   X86DecodeTests  in 'X86DecodeTests.pas',
   RttiRobustnessTests in 'RttiRobustnessTests.pas',
   ExceptionRulesTests in 'ExceptionRulesTests.pas',
+  ProjectExceptionRulesTests in 'ProjectExceptionRulesTests.pas',
   ProcessListJsonTests in 'ProcessListJsonTests.pas',
   ProcessEnum     in '..\DebuggerCore\ProcessEnum.pas',
   ProcessListJson in '..\DebuggerCore\ProcessListJson.pas',

@@ -1,4 +1,4 @@
-unit DapServer;
+﻿unit DapServer;
 
 interface
 
@@ -129,10 +129,12 @@ begin
   Result := ParseExceptionRulesArray(Args.FindValue('exceptionRules') as TJSONArray);
 end;
 
-// Load shared, machine-wide exception rules from a JSON file. Accepts either a
-// bare array or an object with an `exceptionRules` key. Missing / malformed file
-// yields no rules (never raises -- a bad global file must not break debugging).
-function LoadGlobalExceptionRules(const Path: string): TArray<TExceptionRule>;
+// Load exception rules from a JSON file -- the machine-wide shared file or
+// either project sidecar; all three have the same shape. Accepts a bare array or
+// an object with an `exceptionRules` key. Strict JSON, no JSONC: this is not
+// launch.json. A missing or malformed file yields no rules and never raises --
+// rules the user cannot see are a nuisance, a debugger that will not start is not.
+function LoadExceptionRulesFile(const Path: string): TArray<TExceptionRule>;
 begin
   Result := nil;
   if (Path = '') or not FileExists(Path) then Exit;
@@ -150,7 +152,7 @@ begin
     end;
   except
     on E: Exception do
-      DapLog('LoadGlobalExceptionRules failed: ' + E.Message);
+      DapLog('LoadExceptionRulesFile failed: ' + E.Message);
   end;
 end;
 
@@ -162,8 +164,9 @@ begin
   Result := TPath.Combine(TPath.Combine(Home, '.DelphiWinDebugger'), 'exceptionRules.json');
 end;
 
-// Last-write time of the shared file, 0 when absent -- used to detect edits.
-function GlobalRulesFileMTime(const Path: string): TDateTime;
+// Last-write time of a rules file, 0 when absent -- used to detect edits. An
+// absent file legitimately has an mtime: creating it later IS a change.
+function ExceptionRulesFileMTime(const Path: string): TDateTime;
 begin
   Result := 0;
   if (Path <> '') and FileExists(Path) then
@@ -269,6 +272,22 @@ type
     Size:     UInt64;   // 0 = the adapter could not establish it (never guessed)
     Name:     string;
     TypeName: string;
+  end;
+
+  // One tier of the exception-rule precedence chain. The session holds them in
+  // order, most specific first, and the table handed to the engine is simply
+  // their rules concatenated -- first match wins across the whole chain, exactly
+  // as it did when there were only two tiers.
+  //
+  // A tier backed by a FILE carries the path and the mtime last seen there, so
+  // the resume path can notice an edit and reload just that tier. The launch
+  // configuration's own `exceptionRules` is a tier with no path: it comes from
+  // the launch request and cannot change while the session runs.
+  TExceptionRuleTier = record
+    Path:        string;   // '' = the inline launch-configuration tier
+    Description: string;   // how the console log names this tier
+    MTime:       TDateTime;
+    Rules:       TArray<TExceptionRule>;
   end;
 
   // Background symbol-loader work item. A VALUE copy of the fields the parse
@@ -441,12 +460,12 @@ type
     FExceptionFilters:    TExceptionFilters;
     FExceptionFiltersSet: Boolean;
     FDelphiClassFilter:   string;  // condition for the `delphi` filter (comma-separated class names)
-    // Exception-rule state, captured at launch so the shared (global) file can be
+    // Exception-rule state, captured at launch so the file-backed tiers can be
     // hot-reloaded on resume without re-reading launch.json.
-    FProjectExceptionRules: TArray<TExceptionRule>; // from launch.json, fixed for the session
-    FUseGlobalRules:        Boolean;
-    FGlobalRulesPath:       string;
-    FGlobalRulesMTime:      TDateTime; // last-seen mtime of the shared file (0 = absent)
+    FRuleTiers:         TArray<TExceptionRuleTier>; // ordered, most specific first
+    FDelphiProjectFile: string;   // `delphiProjectFile`, absolute; '' = no project scope
+    FUseGlobalRules:    Boolean;
+    FGlobalRulesPath:   string;
 
     // `progressLocation` from the launch/attach config -> FProgressAsCustomEvent.
     procedure ParseProgressLocation(Args: TJSONObject);
@@ -696,10 +715,15 @@ type
     // does both inside Launch/Attach.
     procedure ParseSourceAndModules(Args: TJSONObject; const ProgramPath: string);
     function  SessionModules: TArray<TSessionModuleConfig>;
-    // Capture exception-rule config (project + shared file, hot-reload state) and
-    // return the combined table for the launch/attach options.
+    // Capture exception-rule config (the whole precedence chain plus its
+    // hot-reload state) and return the combined table for the launch/attach
+    // options.
     function  ApplyExceptionRules(Args: TJSONObject): TArray<TExceptionRule>;
-    procedure ReloadGlobalRulesIfChanged;
+    function  ResolveDelphiProjectFile(Args: TJSONObject): string;
+    procedure AddFileRuleTier(const Path, Description: string);
+    procedure AddInlineRuleTier(const Rules: TArray<TExceptionRule>);
+    function  CombinedExceptionRules: TArray<TExceptionRule>;
+    procedure ReloadExceptionRuleFilesIfChanged;
     // Value formatting (FormatLocalValue / FormatLocalType / Variant + string
     // decode / SlotSizeAt) moved to DelphiValueReaders (TDelphiValueReader).
     // `Readers` lazily creates it and refreshes its Debugger/Rtti refs from
@@ -1681,42 +1705,123 @@ begin
   Result := True;
 end;
 
-// Capture the session's exception-rule config at launch/attach: project rules
-// (fixed), the shared-file path + toggle, and the file's current mtime. Returns
-// the combined table (project first, shared as fallback) so the caller can hand it
-// to the session's launch/attach options -- the session pushes it to the engine it
-// builds (the engine does not exist yet at this point).
+// The `delphiProjectFile` launch/attach argument: the `.dpr` / `.dpk` / `.dproj`
+// the configuration was generated for. The IDE plugin writes it as a
+// ${workspaceFolder}-relative path, which VS Code (or the MCP launch-config
+// loader) substitutes before the request reaches us, so it normally arrives
+// absolute and needs no expansion here.
+//
+// The field is OPTIONAL. Absent -- a hand-written launch.json, or a plugin older
+// than the field -- means no project scope exists, and the two sidecar tiers are
+// not looked for at all: resolution is then exactly what it was before they
+// existed. An entry still carrying a macro cannot name a directory, so say so
+// rather than deriving sidecar paths from a literal `${...}`.
+function TDapServer.ResolveDelphiProjectFile(Args: TJSONObject): string;
+begin
+  Result := Trim(Args.GetValue<string>('delphiProjectFile', ''));
+  if Result = '' then
+    Exit;
+  if (Pos('${', Result) > 0) or (Pos('$(', Result) > 0) then begin
+    DapLog('delphiProjectFile: IGNORED, unresolved macro in "' + Result + '"');
+    Exit('');
+  end;
+  Result := ExpandFileName(Result);
+end;
+
+// Append a file-backed tier. The file need not exist: an absent one contributes
+// no rules but keeps its place in the chain, so creating it mid-session is picked
+// up by the hot-reload on the next resume (mtime 0 -> a real timestamp).
+procedure TDapServer.AddFileRuleTier(const Path, Description: string);
+begin
+  if Path = '' then
+    Exit;
+  var Tier := Default(TExceptionRuleTier);
+  Tier.Path        := Path;
+  Tier.Description := Description;
+  Tier.MTime       := ExceptionRulesFileMTime(Path);
+  Tier.Rules       := LoadExceptionRulesFile(Path);
+  FRuleTiers := FRuleTiers + [Tier];
+  if Length(Tier.Rules) > 0 then
+    DapLog(Format('exceptionRules: %d %s rule(s) from %s',
+      [Length(Tier.Rules), Description, Path]));
+end;
+
+// The launch configuration's own `exceptionRules`. No path: it arrived with the
+// launch request and is fixed for the session.
+procedure TDapServer.AddInlineRuleTier(const Rules: TArray<TExceptionRule>);
+begin
+  var Tier := Default(TExceptionRuleTier);
+  Tier.Description := 'launch configuration';
+  Tier.Rules       := Rules;
+  FRuleTiers := FRuleTiers + [Tier];
+end;
+
+function TDapServer.CombinedExceptionRules: TArray<TExceptionRule>;
+begin
+  Result := nil;
+  for var Tier in FRuleTiers do
+    Result := Result + Tier.Rules;
+end;
+
+// Capture the session's exception-rule config at launch/attach and return the
+// combined table, so the caller can hand it to the session's launch/attach
+// options -- the session pushes it to the engine it builds (the engine does not
+// exist yet at this point).
+//
+// The chain runs from the narrowest scope to the widest, and first match wins
+// across all of it:
+//
+//   1. <Project>.ExceptionSettings.local.json  this developer, this machine
+//   2. <Project>.ExceptionSettings.json        the project's own, shared by the team
+//   3. the launch configuration's exceptionRules
+//   4. the machine-wide shared file
+//
+// Tiers 1 and 2 exist only when the configuration named a `delphiProjectFile`.
+// Tiers 3 and 4 are unchanged, in the same relative order they have always had.
 function TDapServer.ApplyExceptionRules(Args: TJSONObject): TArray<TExceptionRule>;
 begin
-  FProjectExceptionRules := ParseExceptionRules(Args);
-  FUseGlobalRules        := Args.GetValue<Boolean>('useGlobalExceptionRules', True);
-  FGlobalRulesPath       := Args.GetValue<string>('globalExceptionRulesPath', '');
+  SetLength(FRuleTiers, 0);
+  FDelphiProjectFile := ResolveDelphiProjectFile(Args);
+  FUseGlobalRules    := Args.GetValue<Boolean>('useGlobalExceptionRules', True);
+  FGlobalRulesPath   := Args.GetValue<string>('globalExceptionRulesPath', '');
   if FUseGlobalRules and (FGlobalRulesPath = '') then
     FGlobalRulesPath := DefaultGlobalExceptionRulesPath;
 
-  Result := FProjectExceptionRules;
-  if FUseGlobalRules then begin
-    FGlobalRulesMTime := GlobalRulesFileMTime(FGlobalRulesPath);
-    Result := Result + LoadGlobalExceptionRules(FGlobalRulesPath);
+  if FDelphiProjectFile <> '' then begin
+    DapLog('delphiProjectFile: ' + FDelphiProjectFile);
+    AddFileRuleTier(LocalProjectExceptionRulesPath(FDelphiProjectFile), 'project (local)');
+    AddFileRuleTier(ProjectExceptionRulesPath(FDelphiProjectFile),      'project (shared)');
   end;
+  AddInlineRuleTier(ParseExceptionRules(Args));
+  if FUseGlobalRules then
+    AddFileRuleTier(FGlobalRulesPath, 'machine-wide');
+
+  Result := CombinedExceptionRules;
 end;
 
-// Hot-reload: re-read the shared rules file when it has changed on disk, so the
-// user can edit it while stopped and have the new rules apply on resume without
-// restarting the session. Project rules are unchanged (they come from
-// launch.json). Called from the continue / step handlers.
-procedure TDapServer.ReloadGlobalRulesIfChanged;
+// Hot-reload: re-read every file-backed tier that changed on disk, so the user
+// can edit rules while stopped and have them apply on resume without restarting.
+// The launch-configuration tier never changes (it came with the launch request).
+// Called from the continue / step handlers.
+procedure TDapServer.ReloadExceptionRuleFilesIfChanged;
 begin
-  if (FDebugger = nil) or (not FUseGlobalRules) or (FGlobalRulesPath = '') then
+  if FDebugger = nil then
     Exit;
-  var MTime := GlobalRulesFileMTime(FGlobalRulesPath);
-  if MTime = FGlobalRulesMTime then
-    Exit;
-  FGlobalRulesMTime := MTime;
-  var Shared := LoadGlobalExceptionRules(FGlobalRulesPath);
-  FDebugger.SetExceptionRules(FProjectExceptionRules + Shared);
-  SendConsoleLog(Format('[exceptionRules] reloaded shared file (%d project + %d shared rules): %s',
-    [Length(FProjectExceptionRules), Length(Shared), FGlobalRulesPath]));
+  var Changed := False;
+  for var I := 0 to High(FRuleTiers) do begin
+    if FRuleTiers[I].Path = '' then
+      Continue;
+    var MTime := ExceptionRulesFileMTime(FRuleTiers[I].Path);
+    if MTime = FRuleTiers[I].MTime then
+      Continue;
+    FRuleTiers[I].MTime := MTime;
+    FRuleTiers[I].Rules := LoadExceptionRulesFile(FRuleTiers[I].Path);
+    Changed := True;
+    SendConsoleLog(Format('[exceptionRules] reloaded %s (%d rules): %s',
+      [FRuleTiers[I].Description, Length(FRuleTiers[I].Rules), FRuleTiers[I].Path]));
+  end;
+  if Changed then
+    FDebugger.SetExceptionRules(CombinedExceptionRules);
 end;
 
 // TDebugSession.OnSessionStopped subscriber. The neutral half (ClearActiveFrame,
@@ -3102,7 +3207,7 @@ begin
     Body.Free;
   end;
   if FLaunched then begin
-    ReloadGlobalRulesIfChanged;  // pick up shared-rules edits made while stopped
+    ReloadExceptionRuleFilesIfChanged;  // pick up rules-file edits made while stopped
     MarkBusy('Delphi debugger: running...', True);
     FSession.ContinueExecution;
   end;
@@ -3144,7 +3249,7 @@ begin
     FIO.SendErrorResponse(Seq, Cmd, 'Not running');
     Exit;
   end;
-  ReloadGlobalRulesIfChanged;
+  ReloadExceptionRuleFilesIfChanged;
   var RefusalReason: string;
   if not FSession.StepInstruction(Kind, StepThreadFromArgs(Args), RefusalReason) then begin
     FIO.SendErrorResponse(Seq, Cmd, RefusalReason);
@@ -3169,7 +3274,7 @@ begin
     FIO.SendResponse(Seq, Cmd, True);
     Exit;
   end;
-  ReloadGlobalRulesIfChanged;
+  ReloadExceptionRuleFilesIfChanged;
   var Busy := 'Delphi debugger: step over...';
   case Kind of
     iskInto: Busy := 'Delphi debugger: step into...';

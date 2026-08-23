@@ -44,6 +44,12 @@ type
     [Test] procedure NoMatch_ReturnsFalse;
     [Test] procedure NeedsRaiseSite_DetectsUnitOrLine;
     [Test] procedure CombinedCriteria_AllMustHold;
+    // Where a project's own rule files live, derived from whatever the IDE
+    // calls the project.
+    [Test] procedure SidecarPaths_SitNextToTheProject;
+    [Test] procedure SidecarPaths_AcceptDprDpkAndDproj;
+    [Test] procedure SidecarPaths_KeepADottedProjectName;
+    [Test] procedure SidecarPaths_EmptyProjectYieldsNoPath;
   end;
 
 implementation
@@ -324,6 +330,45 @@ begin
     'class fails -> no match');
 end;
 
+// The two files sit in the project's own directory and are named after it, so
+// they travel with the project in whatever VCS it lives in.
+procedure TExceptionRulesTests.SidecarPaths_SitNextToTheProject;
+begin
+  Assert.AreEqual('C:\work\hydra_2\TabAnag\libTabAnagD29.ExceptionSettings.json',
+    ProjectExceptionRulesPath('C:\work\hydra_2\TabAnag\libTabAnagD29.dpk'));
+  Assert.AreEqual('C:\work\hydra_2\TabAnag\libTabAnagD29.ExceptionSettings.local.json',
+    LocalProjectExceptionRulesPath('C:\work\hydra_2\TabAnag\libTabAnagD29.dpk'));
+end;
+
+// The RAD Studio OTA reports the .dproj; a hand-written configuration may name
+// the .dpr or .dpk. All three share a directory and a base name, so all three
+// must resolve to the same pair of files.
+procedure TExceptionRulesTests.SidecarPaths_AcceptDprDpkAndDproj;
+begin
+  const Expected = 'C:\proj\Debugme.ExceptionSettings.json';
+  for var Project in ['C:\proj\Debugme.dpr', 'C:\proj\Debugme.dpk', 'C:\proj\Debugme.dproj'] do
+    Assert.AreEqual(Expected, ProjectExceptionRulesPath(Project),
+      'unexpected sidecar path for ' + Project);
+end;
+
+// A project whose name contains dots keeps all of it: the extension is what is
+// replaced, not everything after the first dot.
+procedure TExceptionRulesTests.SidecarPaths_KeepADottedProjectName;
+begin
+  Assert.AreEqual('C:\proj\My.Company.Widgets.ExceptionSettings.json',
+    ProjectExceptionRulesPath('C:\proj\My.Company.Widgets.dpk'));
+end;
+
+// No project named means no project scope, which every caller reads as "this
+// tier does not exist".
+procedure TExceptionRulesTests.SidecarPaths_EmptyProjectYieldsNoPath;
+begin
+  Assert.AreEqual('', ProjectExceptionRulesPath(''));
+  Assert.AreEqual('', LocalProjectExceptionRulesPath('   '));
+end;
+
+
 initialization
   TDUnitX.RegisterTestFixture(TExceptionRulesTests);
+
 end.

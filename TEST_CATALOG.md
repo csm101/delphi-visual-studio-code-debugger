@@ -535,6 +535,38 @@ fixture):
       (`Test_BL_Exc_DuringEvaluate`) -- RunMethodCall aborts the synthetic
       call on raise/AV/second-chance and the session survives
 
+### F.1 Exception-rule scopes (`ProjectExceptionRulesTests.pas`)
+
+- [x] Where a project's two sidecar files live, for a `.dpr`, a `.dpk` and the
+      `.dproj` the IDE actually reports, including a dotted project name
+      (`SidecarPaths_SitNextToTheProject`, `SidecarPaths_AcceptDprDpkAndDproj`,
+      `SidecarPaths_KeepADottedProjectName`,
+      `SidecarPaths_EmptyProjectYieldsNoPath`)
+- [x] A rule that exists only in `<Project>.ExceptionSettings.json` breaks where
+      the filters would not (`SharedSidecar_BreaksWhereTheFiltersWouldNot`)
+- [x] No `delphiProjectFile` -> the sidecars are not looked for at all, so an
+      existing user's resolution is unchanged
+      (`WithoutDelphiProjectFile_TheSidecarsAreNotRead`); an unexpanded `${...}`
+      is ignored rather than used literally
+      (`UnresolvedMacroInTheProjectPath_IsIgnored`)
+- [x] Precedence proved in BOTH directions at every new seam -- local over
+      shared (`LocalSidecar_IgnoresWhereTheSharedSidecarBreaks`,
+      `LocalSidecar_BreaksWhereTheSharedSidecarIgnores`), shared over the launch
+      configuration (`SharedSidecar_IgnoresWhereTheLaunchConfigurationBreaks`,
+      `SharedSidecar_BreaksWhereTheLaunchConfigurationIgnores`), shared over the
+      machine-wide file (`SharedSidecar_BreaksWhereTheMachineWideFileIgnores`)
+- [x] A non-matching sidecar rule does not shadow the launch configuration's own
+      rules (`LaunchConfigurationStillDecidesWhatNoSidecarMatches`)
+- [x] Both file shapes (`SidecarAsBareArray_IsAccepted`) and a malformed file
+      costing the rules, not the session (`MalformedSidecar_LeavesDebuggingWorking`)
+- [x] Hot-reload on resume, both for an edit
+      (`SharedSidecar_HotReloadsOnResume`) and for a sidecar that did not exist
+      when the session started (`SidecarCreatedMidSession_IsPickedUpOnResume`)
+- [x] The attach path reads the same chain (`Attach_HonoursTheSharedSidecar`)
+- [x] A rule scoped to `TestPackage.dpk` fires inside a host executable that
+      declares nothing about the package
+      (`PackageSidecar_AppliesInsideAHostThatKnowsNothingAboutIt`)
+
 ---
 
 ## G. Threads

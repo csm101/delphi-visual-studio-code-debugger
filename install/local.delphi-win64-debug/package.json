@@ -507,6 +507,10 @@
               "globalExceptionRulesPath": {
                 "type": "string",
                 "description": "Override the shared exception-rules file location (default %USERPROFILE%\\.DelphiWinDebugger\\exceptionRules.json). JSON object with an `exceptionRules` array (or a bare array)."
+              },
+              "delphiProjectFile": {
+                "type": "string",
+                "description": "The .dpr / .dpk / .dproj this configuration debugs. Written automatically by the RAD Studio plugin. It enables two project-scoped rule files next to that project -- <Project>.ExceptionSettings.json (shared, commit it) and <Project>.ExceptionSettings.local.json (personal, gitignore it) -- which are evaluated BEFORE this configuration's `exceptionRules` and before the machine-wide file. Omit it and nothing project-scoped is looked for."
               }
             }
           },
@@ -706,6 +710,10 @@
               "globalExceptionRulesPath": {
                 "type": "string",
                 "description": "Override the shared exception-rules file location (default %USERPROFILE%\\.DelphiWinDebugger\\exceptionRules.json). JSON object with an `exceptionRules` array (or a bare array)."
+              },
+              "delphiProjectFile": {
+                "type": "string",
+                "description": "The .dpr / .dpk / .dproj this configuration debugs. Written automatically by the RAD Studio plugin. It enables two project-scoped rule files next to that project -- <Project>.ExceptionSettings.json (shared, commit it) and <Project>.ExceptionSettings.local.json (personal, gitignore it) -- which are evaluated BEFORE this configuration's `exceptionRules` and before the machine-wide file. Omit it and nothing project-scoped is looked for."
               },
               "progressLocation": {
                 "type": "string",

@@ -54,6 +54,24 @@ const
 const
   NO_EXCEPTION_CODE = 0;
 
+// Suffixes of the two sidecar rule files that sit next to a Delphi project.
+const
+  PROJECT_RULES_SUFFIX       = '.ExceptionSettings.json';
+  LOCAL_PROJECT_RULES_SUFFIX = '.ExceptionSettings.local.json';
+
+// Where a Delphi project's own exception rules live: two files in the project's
+// own directory, named after it.
+//
+//   <dir>\<Project>.ExceptionSettings.json        shared, travels in the project's VCS
+//   <dir>\<Project>.ExceptionSettings.local.json  personal, belongs in .gitignore
+//
+// ProjectFile is whatever the IDE calls the project -- `.dpr`, `.dpk` or the
+// `.dproj` the RAD Studio OTA actually reports; only its directory and base name
+// matter, and all three spellings share those. An empty argument yields an empty
+// path, which every caller treats as "no such tier".
+function ProjectExceptionRulesPath(const ProjectFile: string): string;
+function LocalProjectExceptionRulesPath(const ProjectFile: string): string;
+
 function ParseExceptionAction(const S: string; out Action: TExceptionAction): Boolean;
 function ExceptionActionToStr(Action: TExceptionAction): string;
 
@@ -103,6 +121,26 @@ function MatchExceptionRules(const Rules: TArray<TExceptionRule>;
   RaiseLine: Integer; out Action: TExceptionAction): Boolean; overload;
 
 implementation
+
+function SidecarRulesPath(const ProjectFile, Suffix: string): string;
+begin
+  var Project := Trim(ProjectFile);
+  if Project = '' then
+    Exit('');
+  // ChangeFileExt cuts at the LAST dot, so a project named `lib.TabAnag.dpk`
+  // keeps `lib.TabAnag` as its base name rather than losing half of it.
+  Result := ChangeFileExt(Project, Suffix);
+end;
+
+function ProjectExceptionRulesPath(const ProjectFile: string): string;
+begin
+  Result := SidecarRulesPath(ProjectFile, PROJECT_RULES_SUFFIX);
+end;
+
+function LocalProjectExceptionRulesPath(const ProjectFile: string): string;
+begin
+  Result := SidecarRulesPath(ProjectFile, LOCAL_PROJECT_RULES_SUFFIX);
+end;
 
 function ParseExceptionAction(const S: string; out Action: TExceptionAction): Boolean;
 begin

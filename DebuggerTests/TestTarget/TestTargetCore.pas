@@ -1875,6 +1875,24 @@ begin
   end;
 end;
 
+// Like RunAttachSurvive, but every pass RAISES and catches a Delphi exception.
+// An attach happens while the target is already running, so an attach test that
+// needs a first-chance exception needs one that keeps arriving after the attach
+// completes rather than one raised during startup, which is a race the test
+// would lose most of the time.
+procedure RunAttachRaiseLoop;
+begin
+  for var Pass := 1 to 120 do begin
+    try
+      raise Exception.Create('attach-exc');   // {BP:ATTACH_RAISE_LOOP}
+    except
+      on E: Exception do
+        GSink.Use(['attach-raise ', Pass, ': ', E.Message]);
+    end;
+    Sleep(250);
+  end;
+end;
+
 procedure RunLoadNoDebugDll;
 type
   TNoDebugAdd = function(A, B: Integer): Integer; stdcall;
@@ -2384,6 +2402,9 @@ begin
 
   if FindCmdLineSwitch('attach-survive') or FindCmdLineSwitch('-attach-survive') then
     RunAttachSurvive;
+
+  if FindCmdLineSwitch('attach-raise-loop') or FindCmdLineSwitch('-attach-raise-loop') then
+    RunAttachRaiseLoop;
 
   if FindCmdLineSwitch('run-per-thread-step') or FindCmdLineSwitch('-run-per-thread-step') then
     RunPerThreadStepFixture;

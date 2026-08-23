@@ -51,10 +51,17 @@ type
     // it. Applied by EVERY launch variant on purpose: an option that only some
     // of them honour is a trap for whoever writes the next test.
     procedure MaybeAddRawStackScan(Req: TJSONObject);
+    // Emits `delphiProjectFile` into a launch/attach request when the test set
+    // it. Same rule as above: every launch AND attach variant carries it, since
+    // the project-scoped rule files must be reachable from both.
+    procedure MaybeAddDelphiProjectFile(Req: TJSONObject);
 
   public
     // Set before Launch to exercise the adapter's raw stack sweep.
     RawStackScan: Boolean;
+    // Set before Launch/Attach to give the session a project scope, which is
+    // what makes the adapter look for <Project>.ExceptionSettings[.local].json.
+    DelphiProjectFile: string;
 
     constructor Create;
     destructor  Destroy; override;
@@ -621,6 +628,12 @@ begin
   Result := WaitResp(Seq);
 end;
 
+procedure TDapClient.MaybeAddDelphiProjectFile(Req: TJSONObject);
+begin
+  if DelphiProjectFile <> '' then
+    Req.AddPair('delphiProjectFile', DelphiProjectFile);
+end;
+
 procedure TDapClient.MaybeAddRawStackScan(Req: TJSONObject);
 begin
   if RawStackScan then
@@ -643,6 +656,7 @@ begin
   Req.AddPair('stopAtEntry',  TJSONBool.Create(False));
   Req.AddPair('noDebug',      TJSONBool.Create(False));
   MaybeAddRawStackScan(Req);
+  MaybeAddDelphiProjectFile(Req);
   Req.AddPair('useGlobalExceptionRules', TJSONBool.Create(False)); // test isolation: ignore the machine-wide rules file
   if Length(Args) > 0 then begin
     ArgArr := TJSONArray.Create;
@@ -684,6 +698,7 @@ begin
   Req.AddPair('stopAtEntry',  TJSONBool.Create(False));
   Req.AddPair('noDebug',      TJSONBool.Create(False));
   MaybeAddRawStackScan(Req);
+  MaybeAddDelphiProjectFile(Req);
   Req.AddPair('useGlobalExceptionRules',   TJSONBool.Create(True));
   Req.AddPair('globalExceptionRulesPath',  GlobalRulesPath);
   if Length(Args) > 0 then begin
@@ -722,6 +737,7 @@ begin
   Req.AddPair('stopAtEntry',  TJSONBool.Create(StopAtEntry));
   Req.AddPair('noDebug',      TJSONBool.Create(False));
   MaybeAddRawStackScan(Req);
+  MaybeAddDelphiProjectFile(Req);
   Req.AddPair('useGlobalExceptionRules', TJSONBool.Create(False)); // test isolation: ignore the machine-wide rules file
   if Length(Args) > 0 then begin
     ArgArr := TJSONArray.Create;
@@ -749,6 +765,7 @@ begin
   Req.AddPair('stopAtEntry',  TJSONBool.Create(StopAtEntry));
   Req.AddPair('noDebug',      TJSONBool.Create(False));
   MaybeAddRawStackScan(Req);
+  MaybeAddDelphiProjectFile(Req);
   Req.AddPair('useGlobalExceptionRules', TJSONBool.Create(False)); // test isolation: ignore the machine-wide rules file
   if Length(Args) > 0 then begin
     ArgArr := TJSONArray.Create;
@@ -785,6 +802,8 @@ begin
   if RsmFile     <> '' then Args.AddPair('rsmFile',    RsmFile);
   if SourceRoot  <> '' then Args.AddPair('sourceRoot', SourceRoot);
   Args.AddPair('killOnDetach', TJSONBool.Create(KillOnDetach));
+  Args.AddPair('useGlobalExceptionRules', TJSONBool.Create(False)); // test isolation: ignore the machine-wide rules file
+  MaybeAddDelphiProjectFile(Args);
   Seq    := SendCmd('attach', Args);
   Result := WaitResp(Seq);
 end;
@@ -801,6 +820,8 @@ begin
   if RsmFile     <> '' then Args.AddPair('rsmFile',    RsmFile);
   if SourceRoot  <> '' then Args.AddPair('sourceRoot', SourceRoot);
   Args.AddPair('killOnDetach', TJSONBool.Create(KillOnDetach));
+  Args.AddPair('useGlobalExceptionRules', TJSONBool.Create(False)); // test isolation: ignore the machine-wide rules file
+  MaybeAddDelphiProjectFile(Args);
   Result := WaitResp(SendCmd('attach', Args));
 end;
 
