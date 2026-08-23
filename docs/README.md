@@ -38,6 +38,7 @@ does not say for itself.
 | [DISASSEMBLY_PLAN.md](DISASSEMBLY_PLAN.md) · [ASSEMBLY_LEVEL_DEBUGGING.md](ASSEMBLY_LEVEL_DEBUGGING.md) | Disassembly, memory, registers, instruction-granularity stepping |
 | [DATA_BREAKPOINTS_PLAN.md](DATA_BREAKPOINTS_PLAN.md) | Watchpoints on a computed address |
 | [EXCEPTION_HANDLER_SCOPE_PLAN.md](EXCEPTION_HANDLER_SCOPE_PLAN.md) | Stepping at an exception stop |
+| [PROJECT_SCOPED_EXCEPTION_RULES_PLAN.md](PROJECT_SCOPED_EXCEPTION_RULES_PLAN.md) | Exception rules that belong to a Delphi project rather than to a launch configuration |
 | [DEBUG_INFO_FORMATS_TODO.md](DEBUG_INFO_FORMATS_TODO.md) | Debug-information formats not yet read |
 | [TASK_RESUME.md](TASK_RESUME.md) | A cursor for work interrupted mid-step. Erased on every commit, so a stub here means nothing is in flight |
 

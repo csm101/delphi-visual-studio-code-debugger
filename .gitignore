@@ -110,3 +110,8 @@ DelphiDebuggerProj.code-workspace
 # output by another name; one of them (Win64/Debug/TestPlugin.map.ddbidx) had
 # been committed by accident, which is what this line prevents.
 *.ddbidx
+
+# Editor tasks are personal: which build someone binds to a key says nothing
+# about the project. launch.json IS committed -- it is the debugger's own
+# configuration and the worked example the README points at.
+.vscode/tasks.json
