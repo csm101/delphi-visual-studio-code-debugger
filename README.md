@@ -455,10 +455,9 @@ matter of re-running `install-dev.bat` (dev) or `install\Install.exe`
 | `mapFile` | same path as `program` with `.map` extension | Delphi MAP file |
 | `sourceRoot` | *(empty)* | Root directory for source file lookup |
 | `stopAtEntry` | `false` | Break at the process entry point before any user code runs |
-| `exceptionRules` | *(empty)* | Per-exception rule table — see [Exception handling](#exception-handling) |
+| `delphiProjectFile` | *(empty)* | The `.dpr` / `.dpk` / `.dproj` this configuration debugs. It is where per-exception rules live — see [Rules that belong to a project](#rules-that-belong-to-a-project) |
 | `useGlobalExceptionRules` | `true` | Also load the shared machine-wide rules file — see [Shared rules across projects](#shared-rules-across-projects) |
 | `globalExceptionRulesPath` | `%USERPROFILE%\.DelphiWinDebugger\exceptionRules.json` | Custom location for the shared rules file |
-| `delphiProjectFile` | *(empty)* | The `.dpr` / `.dpk` / `.dproj` this configuration debugs. Enables the project's own rule files — see [Rules that belong to a project](#rules-that-belong-to-a-project) |
 
 Source files are resolved by searching `sourceRoot` and one level of subdirectories. If a source file appears in multiple locations, the first match wins.
 
@@ -535,13 +534,13 @@ handler: one object under two names in one Locals scope reads as two variables.
 > Setting the breakpoint in your own code, rather than relying on the raise site,
 > avoids the situation entirely.
 
-### Per-exception rules (`exceptionRules`)
+### Per-exception rules
 
-The four filters are coarse. For fine-grained control add an `exceptionRules`
-array to the launch config. Each rule matches an exception on any combination of
-criteria and selects an **action**. Rules are evaluated top-down, **first match
-wins**; if no rule matches, the filter selection above decides (so existing setups
-keep working).
+The four filters are coarse. For fine-grained control write an `exceptionRules`
+array to one of the rule files described under
+[Which rule wins](#which-rule-wins). Each rule matches an exception on any
+combination of criteria and selects an **action**. Rules are evaluated top-down,
+**first match wins**; if no rule matches, the filter selection above decides.
 
 **Match criteria** (all specified criteria must hold; omitted = wildcard):
 
@@ -587,30 +586,30 @@ keep working).
 
 **Examples:**
 
-```jsonc
+`MyApp.ExceptionSettings.json`, next to `MyApp.dproj` (comments shown for
+explanation only — rule files are strict JSON):
+
+```json
 {
-  "type": "delphi-win64",
-  "request": "launch",
-  "program": "${workspaceFolder}/Win64/Debug/MyApp.exe",
   "exceptionRules": [
-    // EAbort is control-flow noise: never break on it.
     { "class": "EAbort", "action": "ignore" },
 
-    // Log every Oracle error (with stack) but keep running.
     { "messageRegex": "ORA-\\d+", "action": "logStack" },
 
-    // Break only for AVs raised inside a hot method's line range.
     { "class": "EAccessViolation", "unit": "OracleData",
       "lineFrom": 2700, "lineTo": 2800, "action": "break" },
 
-    // Quietly log anything raised from code with no source mapping.
     { "unit": "*unknown*", "action": "log" },
 
-    // Catch-all: break on everything else.
     { "action": "break" }
   ]
 }
 ```
+
+Reading down: `EAbort` is control-flow noise, so never break on it; log every
+Oracle error with its stack but keep running; break for access violations only
+inside one method's line range; quietly log anything raised from code with no
+source mapping; break on everything else.
 
 ```jsonc
 // "Allow-list" style: ignore everything, break only on what you list.
@@ -655,7 +654,7 @@ The RAD Studio plugin writes this line for you when it generates the launch
 configuration, so there is normally nothing to maintain by hand. It may name the
 `.dpr`, the `.dpk` or the `.dproj` — only the folder and the base name are used.
 
-Two rule files next to that project then join the chain:
+Two rule files next to that project are then where its rules live:
 
 | File | Who it is for |
 |---|---|
@@ -673,27 +672,26 @@ instead of breaking on it. Add
 Debugme** and **Attach to Debugme.exe** configurations -- which is what the RAD
 Studio plugin writes for you -- and both reach that same file.
 
-**Without `delphiProjectFile` nothing project-scoped is looked for**, and rules
-resolve exactly as they did before this existed — an older `launch.json`, or one
-written by hand, keeps working untouched.
+**Without `delphiProjectFile` nothing project-scoped is looked for**, and only
+the machine-wide file applies.
 
 ### Which rule wins
 
-Rules are evaluated top-down across all four scopes, narrowest first, and the
+Rules are evaluated top-down across all three scopes, narrowest first, and the
 **first match wins**; if nothing matches, the exception filters decide.
 
 | # | Scope | Where |
 |---|---|---|
 | 1 | your own, for this project | `<Project>.ExceptionSettings.local.json` |
 | 2 | the project's, shared with its team | `<Project>.ExceptionSettings.json` |
-| 3 | one launch configuration | `exceptionRules` in `launch.json` |
-| 4 | every project on this machine | the shared file below |
+| 3 | every project on this machine | the shared file below |
 
-Tier 3 is still honoured, but the rules editor stops **proposing** it once the
-project itself is on offer — *Debug X* and *Attach to X* are the same project
-debugged two ways, and per-configuration rules are mostly a way to make them
-disagree. A configuration that already holds rules keeps its entry so they stay
-reachable; to add new ones there, edit `launch.json` by hand.
+> **`exceptionRules` inside `launch.json` is not read.** It used to be a scope of
+> its own, which meant *Debug X* and *Attach to X* — the same project, started
+> two ways — could disagree about which exceptions matter. Which rules apply and
+> how the session started are unrelated, so that scope is gone rather than kept
+> beside the ones that mean something. Move such a rule into the project file, or
+> into the shared file if it was never about one project.
 
 ### Shared rules across projects
 
@@ -743,8 +741,7 @@ step) and the new rules apply to subsequent exceptions, with no need to restart
 the session. The adapter re-reads a file on resume only when its timestamp
 changed, and logs a line to the debug console naming which one it reloaded.
 Creating a file that did not exist when the session started counts as a change
-too. (The `exceptionRules` array inside `launch.json` arrives with the launch
-request and is therefore not hot-reloaded.)
+too.
 
 ### Editing rules from the UI
 
@@ -768,18 +765,19 @@ While stopped on an exception, `Delphi Debugger: Create a Rule for This
 Exception...` also appears as a button in the floating debug toolbar, pre-filled
 from the exception in front of you.
 
-Pick a `delphi-win64` launch configuration and the editor opens with one card
-per rule, numbered in evaluation order. Each card separates the **match
-criteria** from the **action**, and the up/down buttons reorder rules — order is
-semantic, because the first match wins. Rules are validated as you type
-(unknown fields, invalid actions, regular expressions that do not compile,
-inverted line ranges); saving is blocked until the table is valid.
+Pick which of the rule files to edit — the project's own two, or the shared one
+— and the editor opens with one card per rule, numbered in evaluation order.
+Each card separates the **match criteria** from the **action**, and the up/down
+buttons reorder rules — order is semantic, because the first match wins. Rules
+are validated as you type (unknown fields, invalid actions, regular expressions
+that do not compile, inverted line ranges); saving is blocked until the table is
+valid.
 
-**Save to launch.json** replaces only the `exceptionRules` value of the selected
-configuration; every other byte of the file — comments included — is left
-untouched. The file is left open and unsaved so the change can be reviewed or
-undone before it hits disk. If the workspace is not trusted the editor is
-read-only and offers **Copy JSON** instead.
+**Save** replaces only the rule array; every other byte of the file — a header
+comment, a sibling key — is left untouched, and the file keeps its shape (a bare
+array stays an array). The file is left open and unsaved so the change can be
+reviewed or undone before it hits disk. If the workspace is not trusted the
+editor is read-only and offers **Copy JSON** instead.
 
 Closing the tab with unsaved edits does not throw them away: VS Code gives a
 webview no way to veto its own disposal, so the extension keeps the draft and
@@ -931,7 +929,7 @@ At runtime the adapter compares the debuggee's actual `ImageBase` (from `CREATE_
 - [x] Exception class name and message shown on stop (`exceptionInfo` details panel)
 - [x] `$exception` pseudo-variable: live exception object inspectable in Locals and Watch
 - [x] Exception filter UI (`delphi` / `av` / `all` / `unhandled`, with per-class condition)
-- [x] Per-exception rule engine (`exceptionRules`): match on class / message / regex / unit / line, act with ignore / log / logStack / break
+- [x] Per-exception rule engine: match on class / message / regex / unit / line / native code, act with ignore / log / logStack / break, scoped to a Delphi project or to the machine
 - [x] Shared machine-wide exception rules (`%USERPROFILE%\.DelphiWinDebugger\exceptionRules.json`) applied across projects
 - [x] Accurate breakpoint verification state reported back to VS Code, in **both** directions: the gutter marker goes solid when the owning package loads and back to grey — with a Debug Console line — when it unloads, instead of staying solid over a breakpoint that is no longer armed
 - [x] Delphi RTL/VCL source resolution via `sourceSearchPaths` and the `BDS` env var

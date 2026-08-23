@@ -3,35 +3,28 @@
 /*
  * Webview editor for exception rules.
  *
- * Three kinds of target can be edited, listed in the order the ADAPTER
- * evaluates them - most specific first, first match wins:
+ * Every target is a FILE, listed in the order the ADAPTER evaluates them - most
+ * specific first, first match wins:
  *
  *   - the two files belonging to the Delphi project a configuration names
  *     through `delphiProjectFile`: `<Project>.ExceptionSettings.local.json`
  *     (personal) and `<Project>.ExceptionSettings.json` (shared with the team).
  *     See projectRules.js;
- *   - a `delphi-win64` launch configuration in `.vscode/launch.json` or in a
- *     `.code-workspace` file (the project's own `exceptionRules`);
  *   - the machine-wide shared file, `%USERPROFILE%\.DelphiWinDebugger\
  *     exceptionRules.json` by default, or wherever `globalExceptionRulesPath`
  *     points (see globalRules.js).
  *
- * Everything that is a FILE - both project sidecars and the machine-wide one -
- * is read and written through globalRules.js, because they are the same kind of
- * file; only the launch configuration needs its own JSONC-preserving path.
+ * All three are the same kind of file and all three are read and written through
+ * globalRules.js. `launch.json` is still PARSED here - it is where
+ * `delphiProjectFile` and the shared-file override are declared - but it is
+ * never written any more: a launch configuration cannot carry rules of its own.
  *
- * Writing back is deliberately conservative in both cases. `launch.json` is
- * JSONC and is normally full of the user's own comments; re-serializing the
- * whole `configurations` array (which is what
- * `workspace.getConfiguration('launch').update('configurations', ...)` does)
- * would silently delete every comment inside it. Instead we parse the file
- * ourselves, locate the exact character range of the value to replace, and
- * apply a single-range WorkspaceEdit. Everything outside that range - comments
- * included - is left byte-for-byte identical. The shared file gets the same
- * treatment, and additionally keeps its shape: a bare array stays an array, an
- * object keeps every key other than `exceptionRules`.
+ * Writing back is deliberately conservative: the file keeps its shape (a bare
+ * array stays an array, an object keeps every key other than `exceptionRules`)
+ * and only the rule array's character range is replaced, so a header comment or
+ * a sibling key survives byte-for-byte.
  *
- * See install/extension-tests/test-jsonc-edit.js and test-global-rules.js for
+ * See install/extension-tests/test-global-rules.js and test-project-rules.js for
  * the regression tests that prove this.
  */
 
@@ -74,7 +67,10 @@ function launchDocumentCandidates() {
 
 /**
  * Collects every delphi-win64 configuration found in the candidate documents.
- * Parse failures are reported but do not abort the scan.
+ * These are not edit targets - they are what the targets are DERIVED from:
+ * `delphiProjectFile` names the project whose two rule files can be edited, and
+ * `globalExceptionRulesPath` / `useGlobalExceptionRules` say which machine-wide
+ * file is in play. Parse failures are reported but do not abort the scan.
  */
 async function findDelphiConfigurations() {
   const found = [];
@@ -100,13 +96,8 @@ async function findDelphiConfigurations() {
       const configuration = jsonc.getNodeValue(configurationNode);
       if (configuration.type !== DEBUG_TYPE) return;
       found.push({
-        kind: 'launch',
-        uri: candidate.uri,
-        rootPath: candidate.rootPath,
         documentLabel: candidate.label,
-        index: index,
         name: configuration.name || `configuration #${index + 1}`,
-        exceptionRules: Array.isArray(configuration.exceptionRules) ? configuration.exceptionRules : [],
         useGlobalExceptionRules: configuration.useGlobalExceptionRules,
         globalExceptionRulesPath: configuration.globalExceptionRulesPath,
         delphiProjectFile: configuration.delphiProjectFile,
@@ -142,61 +133,29 @@ function buildGlobalTarget(configurations) {
 }
 
 /**
- * Which launch configurations still deserve an entry of their own.
- *
- * "Debug Debugme" and "Attach to Debugme.exe" are the same project debugged two
- * ways. Nobody wants a DIFFERENT exception policy depending on whether they
- * pressed F5 or attached - offering that choice is offering a way to make the
- * two disagree - so once the project itself is an editable target, the
- * per-configuration entries stop being useful and are dropped.
- *
- * Two exceptions, and only these:
- *
- *   - a configuration that ALREADY has rules stays listed, whatever else is on
- *     offer. Hiding it would strand rules a user wrote before this existed,
- *     with no way to see or move them;
- *   - when no configuration names a project, there is nothing to offer instead,
- *     so the list is exactly what it always was.
- *
- * The adapter still reads a configuration's `exceptionRules` either way. This is
- * about what the picker proposes, not about what is honoured.
- */
-function launchTargetsToOffer(configurations, projectTargets) {
-  if (!projectTargets || projectTargets.length === 0) return configurations.slice();
-  return configurations.filter((configuration) => configuration.exceptionRules.length > 0);
-}
-
-/**
  * Everything the user may pick in the target QuickPick, ordered the way the
- * adapter resolves rules: the project's own files first, then any launch
- * configuration still worth listing, then the machine-wide file. The order is
- * the feature - a user choosing where to put a rule is choosing how widely it
- * should reach.
+ * adapter resolves rules: the project's own files first, then the machine-wide
+ * file. The order is the feature - a user choosing where to put a rule is
+ * choosing how widely it should reach.
+ *
+ * With no project named anywhere, the machine-wide file is the only target and
+ * pickTarget selects it without prompting - which is what it has always done
+ * when there is only one.
  */
 async function collectTargets() {
   const scan = await findDelphiConfigurations();
   const projectTargets = projectRules.collectProjectTargets(scan.found);
-  const launchTargets = launchTargetsToOffer(scan.found, projectTargets);
-  const targets = projectTargets.concat(launchTargets);
+  const targets = projectTargets.slice();
   targets.push(buildGlobalTarget(scan.found));
   return {
     targets: targets,
     parseErrors: scan.parseErrors,
-    launchCount: launchTargets.length,
     projectCount: projectTargets.length
   };
 }
 
 /** Icon, plus the trailing notes that say what picking this target commits to. */
 function describeTarget(target) {
-  if (target.kind === 'launch') {
-    return {
-      label: target.name,
-      description: `${target.exceptionRules.length} rule(s)`,
-      detail: target.documentLabel + '  —  this configuration only',
-      target: target
-    };
-  }
   const notes = [];
   if (!target.exists) notes.push('will be created');
   if (target.shape === 'invalid') notes.push('unreadable: ' + target.parseError);
@@ -260,38 +219,11 @@ function buildHtml(webview, extensionUri, initialState) {
 }
 
 /**
- * Re-reads the document, re-locates the configuration and replaces exactly the
- * `exceptionRules` value range. Returns the number of the line that changed so
- * the caller can reveal it.
- */
-async function writeLaunchRules(target, newRules) {
-  const document = await vscode.workspace.openTextDocument(target.uri);
-  const text = document.getText();
-  const root = jsonc.parseTree(text);
-  const configurationsNode = jsonc.findNodeAtPath(root, target.rootPath);
-  if (!configurationsNode || configurationsNode.type !== 'array') {
-    throw new Error('The configurations array is no longer present in ' + target.documentLabel + '.');
-  }
-  const configurationNode = configurationsNode.children[target.index];
-  if (!configurationNode || configurationNode.type !== 'object') {
-    throw new Error('The launch configuration moved in ' + target.documentLabel + '. Reopen the editor and try again.');
-  }
-  const configuration = jsonc.getNodeValue(configurationNode);
-  if (configuration.type !== DEBUG_TYPE || (configuration.name || '') !== target.name) {
-    throw new Error('"' + target.name + '" is no longer at the same position in ' +
-      target.documentLabel + '. Reopen the editor and try again.');
-  }
-
-  const edit = jsonc.computeSetPropertyEdit(text, configurationNode, 'exceptionRules',
-    (baseIndent, eol) => rules.serializeRules(newRules, baseIndent, eol));
-  return applyRangeEdit(target.uri, document, edit, target.documentLabel);
-}
-
-/**
- * Same idea for a rules FILE - the machine-wide one or either project sidecar,
- * which are all the same shape. It is created first (empty) when missing, so the
- * change goes through the normal document/undo path instead of a blind write to
- * disk.
+ * Stores the rules in a rules file - the machine-wide one or either project
+ * sidecar, which are all the same shape. It is created first (empty) when
+ * missing, so the change goes through the normal document/undo path instead of a
+ * blind write to disk, and only the rule array's range is replaced, so comments
+ * and sibling keys survive.
  */
 async function writeRulesFile(target, newRules) {
   globalRules.ensureGlobalRulesFile(target.filePath);
@@ -311,14 +243,6 @@ async function applyRangeEdit(uri, document, edit, label) {
   const applied = await vscode.workspace.applyEdit(workspaceEdit);
   if (!applied) throw new Error('VS Code refused the edit to ' + label + '.');
   return document.positionAt(edit.offset).line;
-}
-
-function writeRules(target, newRules) {
-  return target.kind === 'launch' ? writeLaunchRules(target, newRules) : writeRulesFile(target, newRules);
-}
-
-function targetUri(target) {
-  return target.kind === 'launch' ? target.uri : vscode.Uri.file(target.filePath);
 }
 
 /** What to call the destination in the panel's own buttons and blurbs. */
@@ -341,7 +265,7 @@ function openEditorPanel(context, target, initialRules) {
       localResourceRoots: [context.extensionUri]
     }
   );
-  const fileNoun = FILE_NOUNS[target.kind] || 'launch.json';
+  const fileNoun = FILE_NOUNS[target.kind] || 'the rules file';
   panel.webview.html = buildHtml(panel.webview, context.extensionUri, {
     configurationName: target.name,
     documentLabel: target.documentLabel,
@@ -350,9 +274,7 @@ function openEditorPanel(context, target, initialRules) {
     readOnlyReason: readOnly ? 'This workspace is not trusted, so the rules file cannot be modified.' : '',
     fileNoun: fileNoun,
     saveLabel: 'Save to ' + fileNoun,
-    saveTitle: target.kind === 'launch'
-      ? 'Write these rules back into the launch configuration'
-      : 'Write these rules back into ' + target.filePath
+    saveTitle: 'Write these rules back into ' + target.filePath
   });
 
   // The latest draft the webview has reported as unsaved, or null when it is
@@ -380,10 +302,10 @@ function openEditorPanel(context, target, initialRules) {
       return;
     }
     try {
-      const line = await writeRules(target, message.rules.map(rules.normalizeRule));
+      const line = await writeRulesFile(target, message.rules.map(rules.normalizeRule));
       target.exceptionRules = message.rules;
       panel.webview.postMessage({ type: 'saved' });
-      const document = await vscode.workspace.openTextDocument(targetUri(target));
+      const document = await vscode.workspace.openTextDocument(vscode.Uri.file(target.filePath));
       const editor = await vscode.window.showTextDocument(document, {
         preview: false,
         viewColumn: vscode.ViewColumn.Beside
@@ -429,9 +351,7 @@ module.exports = {
   findDelphiConfigurations: findDelphiConfigurations,
   collectTargets: collectTargets,
   buildGlobalTarget: buildGlobalTarget,
-  launchTargetsToOffer: launchTargetsToOffer,
-  writeRulesFile: writeRulesFile,
   describeTarget: describeTarget,
   pickTarget: pickTarget,
-  writeRules: writeRules
+  writeRules: writeRulesFile
 };

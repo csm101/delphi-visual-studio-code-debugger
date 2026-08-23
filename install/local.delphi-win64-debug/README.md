@@ -549,16 +549,14 @@ evaluates them — narrowest scope first:
   configuration names its project through `delphiProjectFile`;
 - **Shared rules (all projects)** — the machine-wide file described below.
 
-Both are created, together with their directory, the first time you save.
+Both are created, together with their directory, the first time you save. Where
+no configuration names a project, the shared file is the only target and is
+opened without asking.
 
-Individual launch configurations are **not** offered once the project itself is:
-*Debug X* and *Attach to X* are the same project debugged two ways, and a
-separate exception policy per configuration is mostly a way to make the two
-disagree. A configuration that already contains rules keeps its entry, so
-nothing written before this existed becomes unreachable — and the adapter still
-honours `exceptionRules` in launch.json either way, whether or not the picker
-proposes it. Where no configuration names a project, the list is unchanged: one
-entry per configuration, plus the shared file.
+Launch configurations are **not** in that list. `exceptionRules` inside
+`launch.json` is no longer read at all: it made *Debug X* and *Attach to X* —
+the same project, started two ways — able to disagree about which exceptions
+matter, which is the problem the project files exist to solve.
 
 The editor then opens with one card per rule, numbered in evaluation order,
 match criteria separated from the action, and up/down buttons to reorder. Rules

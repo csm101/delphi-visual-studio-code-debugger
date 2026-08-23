@@ -3076,31 +3076,29 @@ matcher takes the raw `ExceptionCode` alongside the decoded fields; the overload
 without it pass `NO_EXCEPTION_CODE` (0), which never satisfies a `code` rule.
 `ParseExceptionCode` accepts `0x…`, `$…`, decimal and signed decimal.
 
-`DapServer.ParseExceptionRules` builds the table from the launch.json
-`exceptionRules` array (`class`/`classIs` string|array, `code` string|number|
-array, `message`, `messageRegex`, `unit`
-with the `*unknown*` token, `line`/`lineFrom`/`lineTo`, mandatory `action`) and
-hands it to the debugger via `IDebugTarget.SetExceptionRules` in both the launch
-and attach paths.
+`DapServer.ParseExceptionRulesArray` builds the table from an `exceptionRules`
+array (`class`/`classIs` string|array, `code` string|number|array, `message`,
+`messageRegex`, `unit` with the `*unknown*` token, `line`/`lineFrom`/`lineTo`,
+mandatory `action`), and the combined result reaches the debugger via
+`IDebugTarget.SetExceptionRules` in both the launch and attach paths.
 
 #### The precedence chain
 
-Rules come from up to four places. `ApplyExceptionRules` (called once per
-launch/attach) builds them into `FRuleTiers: TArray<TExceptionRuleTier>`, ordered
-narrowest scope first, and the table handed to the engine is simply their rules
-concatenated -- so first-match-wins across the whole chain is the same rule it
-always was, over a longer list:
+Rules come from up to three places, and **every one of them is a FILE**.
+`ApplyExceptionRules` (called once per launch/attach) builds them into
+`FRuleTiers: TArray<TExceptionRuleTier>`, ordered narrowest scope first, and the
+table handed to the engine is simply their rules concatenated -- so
+first-match-wins across the whole chain is the same rule it always was, over a
+longer list:
 
 | # | Tier | Source | Scope |
 |---|---|---|---|
 | 1 | `project (local)` | `<Project>.ExceptionSettings.local.json` | this developer, this machine |
 | 2 | `project (shared)` | `<Project>.ExceptionSettings.json` | the project, shared with its team |
-| 3 | `launch configuration` | `exceptionRules` in launch.json | one launch/attach configuration |
-| 4 | `machine-wide` | `%USERPROFILE%\.DelphiWinDebugger\exceptionRules.json` | every project on the machine |
+| 3 | `machine-wide` | `%USERPROFILE%\.DelphiWinDebugger\exceptionRules.json` | every project on the machine |
 
-Tiers 3 and 4 are the original two, in their original order: a launch
-configuration overrides the shared baseline, which overrides the filters. Tier 4
-is toggled by `useGlobalExceptionRules` (default true) and relocated by
+Tier 3 is the original machine-wide file, unchanged: toggled by
+`useGlobalExceptionRules` (default true) and relocated by
 `globalExceptionRulesPath` (`DefaultGlobalExceptionRulesPath` supplies the
 default). The integration test client passes `useGlobalExceptionRules:false` so
 the dev machine's real file can't perturb the suite;
@@ -3119,35 +3117,50 @@ loaded from and whoever launched the host.
 
 `delphiProjectFile` is optional and is the ONLY thing that turns those two tiers
 on. Absent -- a hand-written launch.json, or a plugin older than the field -- no
-sidecar path is derived and resolution is byte-identical to what it was before
-they existed (`WithoutDelphiProjectFile_TheSidecarsAreNotRead`). A value still
-carrying an unexpanded `${...}` is logged and ignored rather than used as a
-literal directory name.
+sidecar path is derived and the machine-wide file is the whole chain
+(`WithoutDelphiProjectFile_TheSidecarsAreNotRead`). A value still carrying an
+unexpanded `${...}` is logged and ignored rather than used as a literal directory
+name.
 
-All three files (both sidecars and the machine-wide one) go through the same
-`LoadExceptionRulesFile`: strict JSON, either a bare array or an object with an
-`exceptionRules` key, and a missing or malformed file yields no rules instead of
-an error. They are NOT JSONC -- that is launch.json's shape, not theirs.
+**`exceptionRules` inside a launch configuration is NOT a tier and is not read.**
+It was one until this landed, and the consequence was that "Debug X" and "Attach
+to X" -- one project, started two ways -- were free to disagree about which
+exceptions matter. Which rules apply and how the session started are orthogonal,
+so the scope was removed rather than kept beside the ones that mean something.
+Nothing parses the key from a launch request any more; `ParseExceptionRulesArray`
+survives because the FILES use it. Pinned by
+`RulesInTheLaunchRequest_AreNotRead`, which sends the array the old way and
+requires that it change nothing.
+
+All three files go through the same `LoadExceptionRulesFile`: strict JSON, either
+a bare array or an object with an `exceptionRules` key, and a missing or
+malformed file yields no rules instead of an error. They are NOT JSONC -- that is
+launch.json's shape, not theirs.
 
 #### Hot-reload on resume
 
-Every tier that is backed by a file carries the mtime last seen there. The
-continue / step handlers call `ReloadExceptionRuleFilesIfChanged` before posting
-the resume command: each file-backed tier whose mtime moved is reloaded in place,
-the combined table is pushed via `SetExceptionRules`, and each reloaded tier is
-named on the console. The launch-configuration tier has no path and never
-changes. So a user can edit any rules file while stopped and have it take effect
-on resume without restarting the session -- and because an absent file has an
-mtime of its own (0), CREATING a sidecar mid-session counts as a change too
-(`SidecarCreatedMidSession_IsPickedUpOnResume`).
+Every tier carries the mtime last seen at its path. The continue / step handlers
+call `ReloadExceptionRuleFilesIfChanged` before posting the resume command: each
+tier whose mtime moved is reloaded in place, the combined table is pushed via
+`SetExceptionRules`, and each reloaded tier is named on the console. So a user
+can edit any rules file while stopped and have it take effect on resume without
+restarting the session -- and because an absent file has an mtime of its own (0),
+CREATING a sidecar mid-session counts as a change too
+(`SidecarCreatedMidSession_IsPickedUpOnResume`). Now that every tier is a file,
+this covers the whole chain.
 
 Covered by `Test_GlobalExceptionRules_HotReloadOnResume` for the machine-wide
-file and by `TProjectExceptionRulesTests` /
-`TPackageExceptionRulesTests` (`ProjectExceptionRulesTests.pas`) for the project
-tiers -- including each new tier proved in BOTH directions (breaking where the
-wider tier ignores, and ignoring where it breaks), the attach path, the bare-array
-shape, a malformed file, and a rule scoped to `TestPackage.dpk` firing inside a
-host executable that knows nothing about the package.
+file and by `TProjectExceptionRulesTests` / `TPackageExceptionRulesTests`
+(`ProjectExceptionRulesTests.pas`) for the project tiers -- including each seam
+proved in BOTH directions (breaking where the wider tier ignores, and ignoring
+where it breaks), the attach path, the bare-array shape, a malformed file, and a
+rule scoped to `TestPackage.dpk` firing inside a host executable that knows
+nothing about the package.
+
+The integration client's `TDapClient.LaunchWithRules` delivers its rules through
+a project sidecar in a scratch directory of its own, since a launch request is no
+longer a channel for them. Tests about the rule ENGINE rather than about scoping
+therefore did not change.
 
 In `HandleException` the class/message/description are decoded unconditionally;
 the filter selection yields a fallback `eaBreak`/`eaIgnore`; then if any rules

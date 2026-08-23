@@ -29,6 +29,9 @@ type
     FDataEvent:   TEvent;
     FReader:      TThread;
     FDead:        Boolean;
+    // Scratch directory holding the project file (never opened) and the shared
+    // rules sidecar LaunchWithRules writes into it. Removed on destroy.
+    FRulesScratchDir: string;
 
     function  NextSeq: Integer;
     procedure WriteMsg(const Body: string);
@@ -55,6 +58,10 @@ type
     // it. Same rule as above: every launch AND attach variant carries it, since
     // the project-scoped rule files must be reachable from both.
     procedure MaybeAddDelphiProjectFile(Req: TJSONObject);
+    // Writes LaunchWithRules' rules where a project's shared rules file would be
+    // and points the session at that project. Uses FRulesScratchDir, created on
+    // first use and removed on destroy.
+    procedure StageRulesSidecar(const RulesJson: string);
 
   public
     // Set before Launch to exercise the adapter's raw stack sweep.
@@ -89,12 +96,24 @@ type
                   StopAtEntry: Boolean;
                   const Args: TArray<string>;
                   const Modules: TArray<TArray<string>>): TJSONObject; overload;
-    // Launch with a launch.json `exceptionRules` array, supplied as a JSON
-    // array literal (e.g. '[{"class":"EAbort","action":"ignore"}]').
+    // Launch with these exception rules in effect, supplied as a JSON array
+    // literal (e.g. '[{"class":"EAbort","action":"ignore"}]').
+    //
+    // They are delivered through a PROJECT's shared rules file, in a scratch
+    // directory of this client's own: a launch configuration cannot carry rules
+    // any more, so a rules file is the only channel there is. Tests that care
+    // about the rule ENGINE rather than about where rules come from should keep
+    // using this and ignore the delivery.
     function    LaunchWithRules(const TargetExe, MapFile, RsmFile, SourceRoot: string;
                   const Args: TArray<string>;
                   const RulesJson: string;
                   const Modules: TArray<TArray<string>> = nil): TJSONObject;
+    // Puts an `exceptionRules` array in the launch REQUEST itself, the way
+    // launch.json used to. It exists to prove that the adapter no longer reads
+    // it; nothing else should call it.
+    function    LaunchWithRulesInTheRequest(const TargetExe, MapFile, RsmFile,
+                  SourceRoot: string; const Args: TArray<string>;
+                  const RulesJson: string): TJSONObject;
     // Launch enabling the shared machine-wide rules file at an explicit path
     // (sets useGlobalExceptionRules + globalExceptionRulesPath). No project rules.
     function    LaunchWithGlobalRules(const TargetExe, MapFile, RsmFile, SourceRoot: string;
@@ -261,6 +280,9 @@ function FindBpLine(const SourceFile, Marker: string): Integer;
 
 implementation
 
+uses
+  System.IOUtils, TestTempDirs;
+
 { --------------------------------------------------------------------------- }
 { Reader thread }
 { --------------------------------------------------------------------------- }
@@ -307,6 +329,8 @@ end;
 destructor TDapClient.Destroy;
 begin
   Stop;
+  if FRulesScratchDir <> '' then
+    DeleteTempDirWithRetry(FRulesScratchDir);
   FLock.Acquire;
   try
     for var O in FQueue do O.Free;
@@ -640,6 +664,19 @@ begin
     Req.AddPair('rawStackScan', TJSONBool.Create(True));
 end;
 
+// Write the rules where a project's shared rules file would be, and point the
+// session at that project. The project file itself is never opened by anyone --
+// only its directory and base name decide the sidecar's name -- so it does not
+// have to exist.
+procedure TDapClient.StageRulesSidecar(const RulesJson: string);
+begin
+  if FRulesScratchDir = '' then
+    FRulesScratchDir := MakeTestScratchDir('DapClientRules_');
+  var ProjectFile := TPath.Combine(FRulesScratchDir, 'ScopedRules.dpr');
+  TFile.WriteAllText(ChangeFileExt(ProjectFile, '.ExceptionSettings.json'), RulesJson);
+  DelphiProjectFile := ProjectFile;
+end;
+
 function TDapClient.LaunchWithRules(const TargetExe, MapFile, RsmFile, SourceRoot: string;
   const Args: TArray<string>; const RulesJson: string;
   const Modules: TArray<TArray<string>>): TJSONObject;
@@ -648,6 +685,7 @@ var
   ArgArr: TJSONArray;
   Seq:    Integer;
 begin
+  StageRulesSidecar(RulesJson);
   Req := TJSONObject.Create;
   Req.AddPair('program',      TargetExe);
   Req.AddPair('mapFile',      MapFile);
@@ -663,9 +701,6 @@ begin
     for var A in Args do ArgArr.Add(A);
     Req.AddPair('args', ArgArr);
   end;
-  var Rules := TJSONObject.ParseJSONValue(RulesJson) as TJSONArray;
-  if Rules <> nil then
-    Req.AddPair('exceptionRules', Rules);
   if Length(Modules) > 0 then begin
     var ModArr := TJSONArray.Create;
     for var M in Modules do begin
@@ -680,6 +715,31 @@ begin
   end;
   Seq    := SendCmd('launch', Req);
   Result := WaitResp(Seq);
+end;
+
+function TDapClient.LaunchWithRulesInTheRequest(const TargetExe, MapFile, RsmFile,
+  SourceRoot: string; const Args: TArray<string>;
+  const RulesJson: string): TJSONObject;
+var
+  Req: TJSONObject;
+begin
+  Req := TJSONObject.Create;
+  Req.AddPair('program',      TargetExe);
+  Req.AddPair('mapFile',      MapFile);
+  Req.AddPair('rsmFile',      RsmFile);
+  Req.AddPair('sourceRoot',   SourceRoot);
+  Req.AddPair('stopAtEntry',  TJSONBool.Create(False));
+  Req.AddPair('noDebug',      TJSONBool.Create(False));
+  Req.AddPair('useGlobalExceptionRules', TJSONBool.Create(False));
+  if Length(Args) > 0 then begin
+    var ArgArr := TJSONArray.Create;
+    for var A in Args do ArgArr.Add(A);
+    Req.AddPair('args', ArgArr);
+  end;
+  var Rules := TJSONObject.ParseJSONValue(RulesJson) as TJSONArray;
+  if Rules <> nil then
+    Req.AddPair('exceptionRules', Rules);
+  Result := WaitResp(SendCmd('launch', Req));
 end;
 
 function TDapClient.LaunchWithGlobalRules(const TargetExe, MapFile, RsmFile, SourceRoot: string;

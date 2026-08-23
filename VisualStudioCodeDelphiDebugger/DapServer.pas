@@ -124,11 +124,6 @@ begin
   end;
 end;
 
-function ParseExceptionRules(Args: TJSONObject): TArray<TExceptionRule>;
-begin
-  Result := ParseExceptionRulesArray(Args.FindValue('exceptionRules') as TJSONArray);
-end;
-
 // Load exception rules from a JSON file -- the machine-wide shared file or
 // either project sidecar; all three have the same shape. Accepts a bare array or
 // an object with an `exceptionRules` key. Strict JSON, no JSONC: this is not
@@ -276,15 +271,12 @@ type
 
   // One tier of the exception-rule precedence chain. The session holds them in
   // order, most specific first, and the table handed to the engine is simply
-  // their rules concatenated -- first match wins across the whole chain, exactly
-  // as it did when there were only two tiers.
+  // their rules concatenated -- first match wins across the whole chain.
   //
-  // A tier backed by a FILE carries the path and the mtime last seen there, so
-  // the resume path can notice an edit and reload just that tier. The launch
-  // configuration's own `exceptionRules` is a tier with no path: it comes from
-  // the launch request and cannot change while the session runs.
+  // Every tier is a FILE, and carries the mtime last seen there so the resume
+  // path can notice an edit and reload just that tier.
   TExceptionRuleTier = record
-    Path:        string;   // '' = the inline launch-configuration tier
+    Path:        string;
     Description: string;   // how the console log names this tier
     MTime:       TDateTime;
     Rules:       TArray<TExceptionRule>;
@@ -721,7 +713,6 @@ type
     function  ApplyExceptionRules(Args: TJSONObject): TArray<TExceptionRule>;
     function  ResolveDelphiProjectFile(Args: TJSONObject): string;
     procedure AddFileRuleTier(const Path, Description: string);
-    procedure AddInlineRuleTier(const Rules: TArray<TExceptionRule>);
     function  CombinedExceptionRules: TArray<TExceptionRule>;
     procedure ReloadExceptionRuleFilesIfChanged;
     // Value formatting (FormatLocalValue / FormatLocalType / Variant + string
@@ -1746,16 +1737,6 @@ begin
       [Length(Tier.Rules), Description, Path]));
 end;
 
-// The launch configuration's own `exceptionRules`. No path: it arrived with the
-// launch request and is fixed for the session.
-procedure TDapServer.AddInlineRuleTier(const Rules: TArray<TExceptionRule>);
-begin
-  var Tier := Default(TExceptionRuleTier);
-  Tier.Description := 'launch configuration';
-  Tier.Rules       := Rules;
-  FRuleTiers := FRuleTiers + [Tier];
-end;
-
 function TDapServer.CombinedExceptionRules: TArray<TExceptionRule>;
 begin
   Result := nil;
@@ -1773,11 +1754,17 @@ end;
 //
 //   1. <Project>.ExceptionSettings.local.json  this developer, this machine
 //   2. <Project>.ExceptionSettings.json        the project's own, shared by the team
-//   3. the launch configuration's exceptionRules
-//   4. the machine-wide shared file
+//   3. the machine-wide shared file
 //
-// Tiers 1 and 2 exist only when the configuration named a `delphiProjectFile`.
-// Tiers 3 and 4 are unchanged, in the same relative order they have always had.
+// Tiers 1 and 2 exist only when the configuration named a `delphiProjectFile`;
+// with no project named, the machine-wide file is the whole chain.
+//
+// A launch configuration cannot carry rules of its own. It once could, and the
+// result was that debugging the SAME program obeyed different rules depending on
+// whether the session launched it or attached to it -- two configurations for
+// one project, free to disagree. Which rules apply and how the session started
+// are orthogonal, so the launch-configuration scope is gone rather than kept
+// alongside the ones that mean something.
 function TDapServer.ApplyExceptionRules(Args: TJSONObject): TArray<TExceptionRule>;
 begin
   SetLength(FRuleTiers, 0);
@@ -1792,25 +1779,21 @@ begin
     AddFileRuleTier(LocalProjectExceptionRulesPath(FDelphiProjectFile), 'project (local)');
     AddFileRuleTier(ProjectExceptionRulesPath(FDelphiProjectFile),      'project (shared)');
   end;
-  AddInlineRuleTier(ParseExceptionRules(Args));
   if FUseGlobalRules then
     AddFileRuleTier(FGlobalRulesPath, 'machine-wide');
 
   Result := CombinedExceptionRules;
 end;
 
-// Hot-reload: re-read every file-backed tier that changed on disk, so the user
-// can edit rules while stopped and have them apply on resume without restarting.
-// The launch-configuration tier never changes (it came with the launch request).
-// Called from the continue / step handlers.
+// Hot-reload: re-read every tier that changed on disk, so the user can edit
+// rules while stopped and have them apply on resume without restarting. Called
+// from the continue / step handlers.
 procedure TDapServer.ReloadExceptionRuleFilesIfChanged;
 begin
   if FDebugger = nil then
     Exit;
   var Changed := False;
   for var I := 0 to High(FRuleTiers) do begin
-    if FRuleTiers[I].Path = '' then
-      Continue;
     var MTime := ExceptionRulesFileMTime(FRuleTiers[I].Path);
     if MTime = FRuleTiers[I].MTime then
       Continue;

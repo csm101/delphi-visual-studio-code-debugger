@@ -179,38 +179,6 @@ test('a sidecar written through the shared-file writer keeps its shape', () => w
   assert.deepStrictEqual(globalRules.parseGlobalRules(text).rules, [{ class: 'EAbort', action: 'ignore' }]);
 }));
 
-console.log('project rule files - which launch configurations still get an entry');
-
-// The user-visible point of the whole change: with a project on offer, "Debug X"
-// and "Attach to X" stop being two ways to disagree with each other.
-test('a project on offer replaces the per-configuration entries', () => {
-  const configurations = [
-    { name: 'Debug Debugme', exceptionRules: [] },
-    { name: 'Attach to Debugme.exe', exceptionRules: [] }
-  ];
-  const offered = editor.launchTargetsToOffer(configurations, [{ kind: 'projectShared' }]);
-  assert.deepStrictEqual(offered, []);
-});
-
-test('a configuration that already has rules is never hidden', () => {
-  const withRules = { name: 'Debug Debugme', exceptionRules: [{ action: 'ignore' }] };
-  const offered = editor.launchTargetsToOffer(
-    [withRules, { name: 'Attach to Debugme.exe', exceptionRules: [] }],
-    [{ kind: 'projectShared' }]);
-  assert.deepStrictEqual(offered.map((c) => c.name), ['Debug Debugme']);
-});
-
-test('with no project named, the list is exactly what it always was', () => {
-  const configurations = [
-    { name: 'Debug Debugme', exceptionRules: [] },
-    { name: 'Attach to Debugme.exe', exceptionRules: [] }
-  ];
-  assert.deepStrictEqual(editor.launchTargetsToOffer(configurations, []).map((c) => c.name),
-    ['Debug Debugme', 'Attach to Debugme.exe']);
-  assert.deepStrictEqual(editor.launchTargetsToOffer(configurations, undefined).map((c) => c.name),
-    ['Debug Debugme', 'Attach to Debugme.exe']);
-});
-
 console.log('project rule files - how the picker describes them');
 
 function describeKind(kind, overrides) {
@@ -238,15 +206,15 @@ test('the entry names the configurations that use it', () => {
     /used by Debug Debugme, Attach to Debugme/);
 });
 
-test('a launch configuration entry keeps its name and says how far it reaches', () => {
-  const described = editor.describeTarget({
-    kind: 'launch', name: 'Debug Debugme', documentLabel: 'repo/.vscode/launch.json',
-    exceptionRules: [{ action: 'break' }]
-  });
-  assert.strictEqual(described.label, 'Debug Debugme');
-  assert.match(described.detail, /^repo\/\.vscode\/launch\.json/);
-  assert.match(described.detail, /this configuration only/);
-  assert.strictEqual(described.description, '1 rule(s)');
+// launch.json is no longer a place rules can live, so the picker must not offer
+// one entry per configuration -- that was the whole complaint the change answers.
+test('a launch configuration is never a target', () => {
+  const targets = projectRules.collectProjectTargets(
+    [{ name: 'Debug Debugme',     delphiProjectFile: 'C:\repo\Debugme.dproj', workspaceFolder: 'C:\repo' },
+     { name: 'Attach to Debugme', delphiProjectFile: 'C:\repo\Debugme.dproj', workspaceFolder: 'C:\repo' }],
+    { directoryExists: () => true, readRulesFile: () => ({ exists: false, shape: 'empty', rules: [] }) });
+  assert.deepStrictEqual(targets.map((t) => t.kind), ['projectLocal', 'projectShared']);
+  assert.ok(targets.every((t) => t.kind !== 'launch'));
 });
 
 test('the machine-wide entry keeps its own notes', () => {

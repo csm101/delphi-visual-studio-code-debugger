@@ -549,14 +549,17 @@ fixture):
       (`WithoutDelphiProjectFile_TheSidecarsAreNotRead`); an unexpanded `${...}`
       is ignored rather than used literally
       (`UnresolvedMacroInTheProjectPath_IsIgnored`)
-- [x] Precedence proved in BOTH directions at every new seam -- local over
-      shared (`LocalSidecar_IgnoresWhereTheSharedSidecarBreaks`,
-      `LocalSidecar_BreaksWhereTheSharedSidecarIgnores`), shared over the launch
-      configuration (`SharedSidecar_IgnoresWhereTheLaunchConfigurationBreaks`,
-      `SharedSidecar_BreaksWhereTheLaunchConfigurationIgnores`), shared over the
-      machine-wide file (`SharedSidecar_BreaksWhereTheMachineWideFileIgnores`)
-- [x] A non-matching sidecar rule does not shadow the launch configuration's own
-      rules (`LaunchConfigurationStillDecidesWhatNoSidecarMatches`)
+- [x] Precedence proved in BOTH directions at every seam -- local over shared
+      (`LocalSidecar_IgnoresWhereTheSharedSidecarBreaks`,
+      `LocalSidecar_BreaksWhereTheSharedSidecarIgnores`), shared over the
+      machine-wide file (`SharedSidecar_BreaksWhereTheMachineWideFileIgnores`,
+      `SharedSidecar_IgnoresWhereTheMachineWideFileBreaks`)
+- [x] A non-matching sidecar rule does not shadow the machine-wide file's rules
+      (`TheMachineWideFileStillDecidesWhatNoSidecarMatches`)
+- [x] The scope that was REMOVED: an `exceptionRules` array sent in the launch
+      request the way launch.json used to carry it changes nothing at all
+      (`RulesInTheLaunchRequest_AreNotRead`). Without this the removal is pinned
+      by no test and a revival of the field reads as a feature
 - [x] Both file shapes (`SidecarAsBareArray_IsAccepted`) and a malformed file
       costing the rules, not the session (`MalformedSidecar_LeavesDebuggingWorking`)
 - [x] Hot-reload on resume, both for an edit

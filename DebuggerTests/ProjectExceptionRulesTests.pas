@@ -5,12 +5,15 @@ unit ProjectExceptionRulesTests;
 //
 // A launch/attach configuration may name the Delphi project it debugs
 // (`delphiProjectFile`). When it does, two rule files sitting NEXT TO THAT
-// PROJECT join the precedence chain ahead of everything that already existed:
+// PROJECT lead the precedence chain:
 //
 //   1. <Project>.ExceptionSettings.local.json   personal, gitignored
 //   2. <Project>.ExceptionSettings.json         the project's own, committed
-//   3. the launch configuration's `exceptionRules`
-//   4. the machine-wide shared file
+//   3. the machine-wide shared file
+//
+// A launch configuration is NOT a place rules can live. It once was, and the
+// result was that debugging the same program obeyed different rules depending
+// on whether the session launched it or attached to it.
 //
 // First match wins across the whole chain, so each tier is proved BOTH ways
 // round: it must be able to break where a wider tier ignores, and to ignore
@@ -43,7 +46,6 @@ type
     procedure StartAdapter;
     // `--run-exception-test` raises and catches one Exception('exc-test').
     procedure LaunchExceptionTarget;
-    procedure LaunchExceptionTargetWithConfigRules(const RulesJson: string);
     procedure LaunchExceptionTargetWithGlobalFile(const GlobalPath: string);
     procedure AssertStoppedOnExcTest(const Context: string);
     procedure AssertRanToCompletion(const Context: string);
@@ -65,13 +67,14 @@ type
     [Test] procedure LocalSidecar_IgnoresWhereTheSharedSidecarBreaks;
     [Test] procedure LocalSidecar_BreaksWhereTheSharedSidecarIgnores;
     // Tier 2 vs tier 3, both directions.
-    [Test] procedure SharedSidecar_IgnoresWhereTheLaunchConfigurationBreaks;
-    [Test] procedure SharedSidecar_BreaksWhereTheLaunchConfigurationIgnores;
-    // Tier 3 still decides everything the sidecars do not match: the new tiers
-    // are inserted ahead of it, they do not replace it.
-    [Test] procedure LaunchConfigurationStillDecidesWhatNoSidecarMatches;
-    // Tier 2 vs tier 4.
     [Test] procedure SharedSidecar_BreaksWhereTheMachineWideFileIgnores;
+    [Test] procedure SharedSidecar_IgnoresWhereTheMachineWideFileBreaks;
+    // The machine-wide file still decides everything no sidecar matches: the
+    // project tiers lead the chain, they do not replace what follows.
+    [Test] procedure TheMachineWideFileStillDecidesWhatNoSidecarMatches;
+    // The scope that was removed: an `exceptionRules` array in the launch
+    // request is not read at all any more.
+    [Test] procedure RulesInTheLaunchRequest_AreNotRead;
 
     // Same two file shapes the machine-wide file accepts.
     [Test] procedure SidecarAsBareArray_IsAccepted;
@@ -207,14 +210,6 @@ begin
   FClient.ConfigDone.Free;
 end;
 
-procedure TProjectExceptionRulesTests.LaunchExceptionTargetWithConfigRules(
-  const RulesJson: string);
-begin
-  FClient.LaunchWithRules(TargetExe, TargetMap, TargetRsm, TargetDir,
-    ['--run-exception-test'], RulesJson).Free;
-  FClient.ConfigDone.Free;
-end;
-
 procedure TProjectExceptionRulesTests.LaunchExceptionTargetWithGlobalFile(
   const GlobalPath: string);
 begin
@@ -296,39 +291,6 @@ begin
   AssertStoppedOnExcTest('the local sidecar must win over the shared one in this direction too');
 end;
 
-procedure TProjectExceptionRulesTests.SharedSidecar_IgnoresWhereTheLaunchConfigurationBreaks;
-begin
-  WriteSharedSidecar(RuleFile('ignore'));
-  StartAdapter;
-  FClient.DelphiProjectFile := FProjectFile;
-  LaunchExceptionTargetWithConfigRules(
-    Format('[{"message":"%s","action":"break"}]', [EXC_MESSAGE]));
-  AssertRanToCompletion('the project sidecar must win over the launch configuration');
-end;
-
-procedure TProjectExceptionRulesTests.SharedSidecar_BreaksWhereTheLaunchConfigurationIgnores;
-begin
-  WriteSharedSidecar(RuleFile('break'));
-  StartAdapter;
-  FClient.DelphiProjectFile := FProjectFile;
-  LaunchExceptionTargetWithConfigRules(
-    Format('[{"message":"%s","action":"ignore"}]', [EXC_MESSAGE]));
-  AssertStoppedOnExcTest('the project sidecar must win over the launch configuration');
-end;
-
-procedure TProjectExceptionRulesTests.LaunchConfigurationStillDecidesWhatNoSidecarMatches;
-begin
-  // The sidecar names an exception this run never raises, so it matches nothing
-  // and the launch configuration's own rule is what decides.
-  WriteSharedSidecar('{ "exceptionRules": [ {"message": "some-other-exception", "action": "ignore"} ] }');
-  StartAdapter;
-  FClient.DelphiProjectFile := FProjectFile;
-  LaunchExceptionTargetWithConfigRules(
-    Format('[{"message":"%s","action":"break"}]', [EXC_MESSAGE]));
-  AssertStoppedOnExcTest(
-    'a non-matching sidecar rule must not shadow the launch configuration''s rules');
-end;
-
 procedure TProjectExceptionRulesTests.SharedSidecar_BreaksWhereTheMachineWideFileIgnores;
 var
   GlobalFile: string;
@@ -340,6 +302,50 @@ begin
   FClient.DelphiProjectFile := FProjectFile;
   LaunchExceptionTargetWithGlobalFile(GlobalFile);
   AssertStoppedOnExcTest('the project sidecar must win over the machine-wide file');
+end;
+
+procedure TProjectExceptionRulesTests.SharedSidecar_IgnoresWhereTheMachineWideFileBreaks;
+var
+  GlobalFile: string;
+begin
+  GlobalFile := TPath.Combine(FScratch, 'machineWideRules.json');
+  TFile.WriteAllText(GlobalFile, RuleFile('break'));
+  WriteSharedSidecar(RuleFile('ignore'));
+  StartAdapter;
+  FClient.DelphiProjectFile := FProjectFile;
+  LaunchExceptionTargetWithGlobalFile(GlobalFile);
+  AssertRanToCompletion('the project sidecar must win over the machine-wide file');
+end;
+
+procedure TProjectExceptionRulesTests.TheMachineWideFileStillDecidesWhatNoSidecarMatches;
+var
+  GlobalFile: string;
+begin
+  // The sidecar names an exception this run never raises, so it matches nothing
+  // and the machine-wide file is what decides.
+  GlobalFile := TPath.Combine(FScratch, 'machineWideRules.json');
+  TFile.WriteAllText(GlobalFile, RuleFile('break'));
+  WriteSharedSidecar('{ "exceptionRules": [ {"message": "some-other-exception", "action": "ignore"} ] }');
+  StartAdapter;
+  FClient.DelphiProjectFile := FProjectFile;
+  LaunchExceptionTargetWithGlobalFile(GlobalFile);
+  AssertStoppedOnExcTest(
+    'a non-matching sidecar rule must not shadow the machine-wide rules');
+end;
+
+// The removed scope. `exceptionRules` in the launch request used to be a tier of
+// its own; a rule sitting there must now change nothing at all. Without this the
+// removal is pinned by no test, and a well-meaning revival of the field would
+// look like a feature rather than the regression it is.
+procedure TProjectExceptionRulesTests.RulesInTheLaunchRequest_AreNotRead;
+begin
+  StartAdapter;
+  FClient.LaunchWithRulesInTheRequest(TargetExe, TargetMap, TargetRsm, TargetDir,
+    ['--run-exception-test'],
+    Format('[{"message":"%s","action":"break"}]', [EXC_MESSAGE])).Free;
+  FClient.ConfigDone.Free;
+  AssertRanToCompletion(
+    'a launch configuration cannot carry rules any more, so this break rule must do nothing');
 end;
 
 procedure TProjectExceptionRulesTests.SidecarAsBareArray_IsAccepted;
@@ -390,18 +396,19 @@ procedure TProjectExceptionRulesTests.SidecarCreatedMidSession_IsPickedUpOnResum
 var
   Stopped: TJSONObject;
 begin
-  // No sidecar at all when the session starts; the launch configuration breaks
-  // on the first raise. The sidecar is then created and must win on resume.
+  // No sidecar at all when the session starts, so the `delphi` filter breaks on
+  // the first raise. The sidecar is then created and must be found on resume --
+  // "absent" is a state the reload has to be able to see change.
   StartAdapter;
+  FClient.SetExceptionBreakpoints(['delphi', 'unhandled']).Free;
   FClient.DelphiProjectFile := FProjectFile;
-  FClient.LaunchWithRules(TargetExe, TargetMap, TargetRsm, TargetDir,
-    ['--run-reraise'], '[{"message":"reraise-orig","action":"break"}]').Free;
+  FClient.Launch(TargetExe, TargetMap, TargetRsm, TargetDir, False, ['--run-reraise']).Free;
   FClient.ConfigDone.Free;
 
   Stopped := FClient.WaitForStopped(STOP_TIMEOUT_MS);
   try
     Assert.AreEqual('exception', Stopped.GetValue<string>('reason', ''),
-      'the first raise should break on the launch configuration rule');
+      'the first raise should break: there is no rule yet, and the filter is armed');
   finally
     Stopped.Free;
   end;
@@ -409,7 +416,7 @@ begin
   WriteSharedSidecar('{ "exceptionRules": [ {"message": "reraise-orig", "action": "ignore"} ] }');
   FClient.Continue_(1).Free;
   AssertRanToCompletion(
-    'a sidecar that appears mid-session must be picked up, and must outrank the launch configuration');
+    'a sidecar that appears mid-session must be picked up on the next resume');
 end;
 
 procedure TProjectExceptionRulesTests.Attach_HonoursTheSharedSidecar;

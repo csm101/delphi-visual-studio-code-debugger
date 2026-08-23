@@ -401,108 +401,10 @@
                 },
                 "description": "Pre-binds debug-info files (.map / .rsm / .dcp) for DLLs and BPLs the target loads at runtime. Each entry names a module by filename and points the adapter at the matching debug files. Without this, the adapter probes for files alongside the loaded DLL/BPL on disk."
               },
-              "exceptionRules": {
-                "type": "array",
-                "items": {
-                  "type": "object",
-                  "properties": {
-                    "class": {
-                      "description": "Exact match on the runtime exception class (leaf only), or array of names (any-of), case-insensitive.",
-                      "anyOf": [
-                        {
-                          "type": "string"
-                        },
-                        {
-                          "type": "array",
-                          "items": {
-                            "type": "string"
-                          }
-                        }
-                      ]
-                    },
-                    "classIs": {
-                      "description": "Match the runtime class OR any ancestor (Delphi `is` semantics). Single name or array, case-insensitive.",
-                      "anyOf": [
-                        {
-                          "type": "string"
-                        },
-                        {
-                          "type": "array",
-                          "items": {
-                            "type": "string"
-                          }
-                        }
-                      ]
-                    },
-                    "code": {
-                      "description": "Win32 exception code: hexadecimal (\"0xC0000005\", \"$C0000005\") or decimal, one value or an array (any-of). This is the only criterion that can match a NATIVE Windows exception: such an exception has no Delphi object, so class/classIs/message/messageRegex never match it. Example: 0x406D1388, raised by TThread.NameThreadForDebugging.",
-                      "anyOf": [
-                        {
-                          "type": "string"
-                        },
-                        {
-                          "type": "integer"
-                        },
-                        {
-                          "type": "array",
-                          "items": {
-                            "anyOf": [
-                              {
-                                "type": "string"
-                              },
-                              {
-                                "type": "integer"
-                              }
-                            ]
-                          }
-                        }
-                      ]
-                    },
-                    "message": {
-                      "type": "string",
-                      "description": "Case-insensitive substring of the exception message."
-                    },
-                    "messageRegex": {
-                      "type": "string",
-                      "description": "Regular expression matched against the message (ignore-case)."
-                    },
-                    "unit": {
-                      "type": "string",
-                      "description": "Source unit where raised (e.g. \"OracleData\"). Use \"*unknown*\" to match raises with no resolvable source."
-                    },
-                    "line": {
-                      "type": "integer",
-                      "description": "Exact source line where raised."
-                    },
-                    "lineFrom": {
-                      "type": "integer",
-                      "description": "Inclusive lower bound of the source-line range."
-                    },
-                    "lineTo": {
-                      "type": "integer",
-                      "description": "Inclusive upper bound of the source-line range."
-                    },
-                    "action": {
-                      "type": "string",
-                      "enum": [
-                        "ignore",
-                        "log",
-                        "logStack",
-                        "break"
-                      ],
-                      "description": "ignore = resume silently; log = write class:message to the debug console then resume; logStack = log plus call stack; break = pause in the debugger."
-                    }
-                  },
-                  "required": [
-                    "action"
-                  ]
-                },
-                "description": "Per-exception rules, evaluated top-down (first match wins). A matching rule's action overrides the exception filters; with no match the filters decide. Criteria (class/classIs/code/message/messageRegex/unit/line range) are AND-ed; omitted criteria are wildcards."
-              },
               "useGlobalExceptionRules": {
                 "type": "boolean",
                 "default": true,
-                "description": "Also load the shared machine-wide exception rules file (default %USERPROFILE%\\.DelphiWinDebugger\\exceptionRules.json). Project `exceptionRules` are evaluated first, then the shared rules as a fallback."
+                "description": "Also load the shared machine-wide exception rules file (default %USERPROFILE%\\.DelphiWinDebugger\\exceptionRules.json). It is the widest scope: a project's own rule files are evaluated first, then this."
               },
               "globalExceptionRulesPath": {
                 "type": "string",
@@ -510,7 +412,7 @@
               },
               "delphiProjectFile": {
                 "type": "string",
-                "description": "The .dpr / .dpk / .dproj this configuration debugs. Written automatically by the RAD Studio plugin. It enables two project-scoped rule files next to that project -- <Project>.ExceptionSettings.json (shared, commit it) and <Project>.ExceptionSettings.local.json (personal, gitignore it) -- which are evaluated BEFORE this configuration's `exceptionRules` and before the machine-wide file. Omit it and nothing project-scoped is looked for."
+                "description": "The .dpr / .dpk / .dproj this configuration debugs. Written automatically by the RAD Studio plugin. It is where exception rules live: two files next to that project -- <Project>.ExceptionSettings.json (shared, commit it) and <Project>.ExceptionSettings.local.json (personal, gitignore it) -- evaluated before the machine-wide file. Omit it and only the machine-wide file applies."
               }
             }
           },
@@ -604,108 +506,10 @@
                 },
                 "description": "Pre-binds debug-info files (.map / .rsm / .dcp) for DLLs and BPLs the target loads at runtime. Each entry names a module by filename and points the adapter at the matching debug files. Without this, the adapter probes for files alongside the loaded DLL/BPL on disk."
               },
-              "exceptionRules": {
-                "type": "array",
-                "items": {
-                  "type": "object",
-                  "properties": {
-                    "class": {
-                      "description": "Exact match on the runtime exception class (leaf only), or array of names (any-of), case-insensitive.",
-                      "anyOf": [
-                        {
-                          "type": "string"
-                        },
-                        {
-                          "type": "array",
-                          "items": {
-                            "type": "string"
-                          }
-                        }
-                      ]
-                    },
-                    "classIs": {
-                      "description": "Match the runtime class OR any ancestor (Delphi `is` semantics). Single name or array, case-insensitive.",
-                      "anyOf": [
-                        {
-                          "type": "string"
-                        },
-                        {
-                          "type": "array",
-                          "items": {
-                            "type": "string"
-                          }
-                        }
-                      ]
-                    },
-                    "code": {
-                      "description": "Win32 exception code: hexadecimal (\"0xC0000005\", \"$C0000005\") or decimal, one value or an array (any-of). This is the only criterion that can match a NATIVE Windows exception: such an exception has no Delphi object, so class/classIs/message/messageRegex never match it. Example: 0x406D1388, raised by TThread.NameThreadForDebugging.",
-                      "anyOf": [
-                        {
-                          "type": "string"
-                        },
-                        {
-                          "type": "integer"
-                        },
-                        {
-                          "type": "array",
-                          "items": {
-                            "anyOf": [
-                              {
-                                "type": "string"
-                              },
-                              {
-                                "type": "integer"
-                              }
-                            ]
-                          }
-                        }
-                      ]
-                    },
-                    "message": {
-                      "type": "string",
-                      "description": "Case-insensitive substring of the exception message."
-                    },
-                    "messageRegex": {
-                      "type": "string",
-                      "description": "Regular expression matched against the message (ignore-case)."
-                    },
-                    "unit": {
-                      "type": "string",
-                      "description": "Source unit where raised (e.g. \"OracleData\"). Use \"*unknown*\" to match raises with no resolvable source."
-                    },
-                    "line": {
-                      "type": "integer",
-                      "description": "Exact source line where raised."
-                    },
-                    "lineFrom": {
-                      "type": "integer",
-                      "description": "Inclusive lower bound of the source-line range."
-                    },
-                    "lineTo": {
-                      "type": "integer",
-                      "description": "Inclusive upper bound of the source-line range."
-                    },
-                    "action": {
-                      "type": "string",
-                      "enum": [
-                        "ignore",
-                        "log",
-                        "logStack",
-                        "break"
-                      ],
-                      "description": "ignore = resume silently; log = write class:message to the debug console then resume; logStack = log plus call stack; break = pause in the debugger."
-                    }
-                  },
-                  "required": [
-                    "action"
-                  ]
-                },
-                "description": "Per-exception rules, evaluated top-down (first match wins). A matching rule's action overrides the exception filters; with no match the filters decide. Criteria (class/classIs/code/message/messageRegex/unit/line range) are AND-ed; omitted criteria are wildcards."
-              },
               "useGlobalExceptionRules": {
                 "type": "boolean",
                 "default": true,
-                "description": "Also load the shared machine-wide exception rules file (default %USERPROFILE%\\.DelphiWinDebugger\\exceptionRules.json). Project `exceptionRules` are evaluated first, then the shared rules as a fallback."
+                "description": "Also load the shared machine-wide exception rules file (default %USERPROFILE%\\.DelphiWinDebugger\\exceptionRules.json). It is the widest scope: a project's own rule files are evaluated first, then this."
               },
               "globalExceptionRulesPath": {
                 "type": "string",
@@ -713,7 +517,7 @@
               },
               "delphiProjectFile": {
                 "type": "string",
-                "description": "The .dpr / .dpk / .dproj this configuration debugs. Written automatically by the RAD Studio plugin. It enables two project-scoped rule files next to that project -- <Project>.ExceptionSettings.json (shared, commit it) and <Project>.ExceptionSettings.local.json (personal, gitignore it) -- which are evaluated BEFORE this configuration's `exceptionRules` and before the machine-wide file. Omit it and nothing project-scoped is looked for."
+                "description": "The .dpr / .dpk / .dproj this configuration debugs. Written automatically by the RAD Studio plugin. It is where exception rules live: two files next to that project -- <Project>.ExceptionSettings.json (shared, commit it) and <Project>.ExceptionSettings.local.json (personal, gitignore it) -- evaluated before the machine-wide file. Omit it and only the machine-wide file applies."
               },
               "progressLocation": {
                 "type": "string",

@@ -267,16 +267,15 @@ Stepping / control:
   every Delphi raise. The raised class name is read from the
   TypeInfo Kind+ShortString stored at VMT[-168] (Athens 36 layout —
   see `DelphiRtti.pas` for the full table).
-- Per-exception rules (`exceptionRules`), which override the filters on a
-  first-match-wins basis. Four scopes, narrowest first: the two project-scoped
-  sidecar files `<Project>.ExceptionSettings.local.json` and
-  `<Project>.ExceptionSettings.json` next to the `.dpr`/`.dpk`/`.dproj` a
+- Per-exception rules, which override the filters on a first-match-wins basis.
+  Three scopes, narrowest first: `<Project>.ExceptionSettings.local.json` and
+  `<Project>.ExceptionSettings.json`, both next to the `.dpr`/`.dpk`/`.dproj` a
   configuration names via the optional `delphiProjectFile` argument, then the
-  launch configuration's own array, then the machine-wide file. The sidecars are
-  what let a package carry its own rules into whatever host process loads it;
-  without `delphiProjectFile` nothing project-scoped is looked for and resolution
-  is identical to what it was before they existed. Every file-backed scope is
-  re-read on resume, so edits (and newly created files) apply without restarting.
+  machine-wide file. The project files are what let a package carry its own rules
+  into whatever host process loads it; without `delphiProjectFile` only the
+  machine-wide file applies. Every scope is a file and every file is re-read on
+  resume, so edits (and newly created files) apply without restarting.
+  `exceptionRules` inside a launch configuration is NOT a scope and is not read.
   See `DAP_DEBUGGER_ARCHITECTURE.md` -> "The precedence chain".
 - Set Next Statement via DAP `gotoTargets`/`goto`.
 
