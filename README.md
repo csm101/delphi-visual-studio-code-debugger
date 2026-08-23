@@ -1,7 +1,14 @@
-# Delphi Debugger for VS Code (Win32 and Win64)
+# Delphi Debugger for VS Code and AI Agents
 
 Debug Delphi **32-bit and 64-bit** applications outside the Embarcadero IDE — a
 real debugger built on the Windows Debug API, written in Delphi.
+
+**Two front ends, one engine.** A **Debug Adapter Protocol** server makes it a
+first-class debugger inside VS Code. An **MCP server** hands the same engine to
+an **AI agent**: 44 tools to set breakpoints, step, read locals and evaluate
+expressions, so an agent can run your program and read what it actually does
+instead of inferring it from the source. Neither is an afterthought of the
+other; they are two clients of the same `DebuggerCore`.
 
 ### 📖 [Documentation, tutorial and feature tour → mcasoftware.dev](https://mcasoftware.dev/products/delphi-debugger/index.html)
 

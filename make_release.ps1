@@ -218,7 +218,7 @@ Write-Host ''
 $target = (& git -C $repo rev-parse HEAD).Trim()
 Write-Host "=== Creating DRAFT release $tag at $target ==="
 gh release create $tag --draft --target $target `
-    --title "$tag - Delphi Debugger for VS Code (Win32 and Win64)" `
+    --title "$tag - Delphi Debugger for VS Code and AI Agents" `
     --notes-file $notesPath `
     $zip
 if ($LASTEXITCODE -ne 0) { Fail "gh release create failed." }

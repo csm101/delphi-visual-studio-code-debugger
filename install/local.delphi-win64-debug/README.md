@@ -24,6 +24,13 @@ target's PE header decides, and there is nothing to configure.
 The debug type is still called `delphi-win64` because renaming it would break
 every existing `launch.json`. It debugs both platforms.
 
+**The same engine also talks to AI agents.** The download ships an **MCP
+server** alongside this extension: 44 tools that let an agent set breakpoints,
+step, read locals and evaluate expressions in a live Delphi process — the
+debugger's own capabilities, driven by something other than a human. It is
+registered by the installer and needs nothing from this extension; the two are
+independent clients of one debugger.
+
 ---
 
 ## Features
