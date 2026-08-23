@@ -16,6 +16,7 @@
 param(
     [switch]$DryRun,
     [switch]$SkipBuild,
+    [switch]$Verify,
     [string]$Highlights = ''
 )
 
@@ -25,6 +26,55 @@ $repo = $PSScriptRoot
 function Fail([string]$message) {
     Write-Host "ERROR: $message" -ForegroundColor Red
     exit 1
+}
+
+# ------------------------------------------------------------ verify mode --
+# Run AFTER publishing: the tag does not exist until then, because GitHub
+# creates it when the draft is published, not when it is created.
+#
+# This is the check whose absence let one mistake ship four times. `gh release
+# view` reported the notes and the assets, all of them correct, while the tag
+# pointed at a commit eleven days older than the payload -- and nothing compared
+# the two.
+if ($Verify) {
+    $manifestPath = Join-Path $repo 'install\local.delphi-win64-debug\package.json'
+    $version = (Get-Content $manifestPath -Raw | ConvertFrom-Json).version
+    if (-not $version) { Fail "the extension manifest declares no version" }
+    $tag = "v$version"
+
+    $rel = gh release view $tag --json tagName,isDraft,targetCommitish 2>&1 | ConvertFrom-Json
+    if ($LASTEXITCODE -ne 0) { Fail "release $tag not found on GitHub." }
+    if ($rel.isDraft) {
+        Write-Host "NOTE: $tag is still a DRAFT, so no tag exists yet. Publish it first:" -ForegroundColor Yellow
+        Write-Host "  gh release edit $tag --draft=false"
+        exit 0
+    }
+
+    & git -C $repo fetch --tags --quiet origin
+    $tagCommit = (& git -C $repo rev-parse --quiet --verify "$tag^{commit}" 2>$null)
+    if (-not $tagCommit) { Fail "$tag is published but no such tag reached this clone." }
+    $tagCommit = $tagCommit.Trim()
+
+    Write-Host "release $tag"
+    Write-Host "  target recorded on the release : $($rel.targetCommitish)"
+    Write-Host "  commit the tag actually points : $tagCommit"
+
+    # The target is written as a full sha by this script. Anything else means an
+    # older release, or a hand-made one, that named a BRANCH -- which is exactly
+    # how the tag drifts away from the payload.
+    if ($rel.targetCommitish -notmatch '^[0-9a-f]{40}$') {
+        Fail ("$tag records `"$($rel.targetCommitish)`" as its target, which is a branch name, " +
+              "not a commit. GitHub resolved it when the release was published, so the tag " +
+              "describes whatever that branch pointed at THEN -- not necessarily what was shipped.")
+    }
+    if ($tagCommit -ne $rel.targetCommitish) {
+        Fail ("$tag points at $tagCommit but the release was built from $($rel.targetCommitish). " +
+              "The tag and the payload describe different trees.")
+    }
+
+    Write-Host ''
+    Write-Host "OK: $tag points at the commit it was built from." -ForegroundColor Green
+    exit 0
 }
 
 # --------------------------------------------------------------- preflight --
@@ -59,6 +109,20 @@ $unpushed = (git -C $repo log --oneline '@{u}..HEAD' 2>$null | Measure-Object -L
 if ($LASTEXITCODE -eq 0 -and $unpushed -gt 0) {
     Write-Host "WARNING: $unpushed commit(s) not pushed to the upstream branch." -ForegroundColor Yellow
     Write-Host "         The release would point at a commit the remote does not have." -ForegroundColor Yellow
+}
+
+# ...and HEAD in particular is not a matter of judgement: the tag is created at
+# that exact commit, so if the remote does not have it there is nothing for the
+# tag to point at. Commits BEHIND head being unpushed is the caller's call; this
+# one is not.
+if (-not $DryRun) {
+    $head = (& git -C $repo rev-parse HEAD).Trim()
+    & git -C $repo fetch --quiet origin 2>$null
+    & git -C $repo merge-base --is-ancestor $head '@{u}' 2>$null
+    if ($LASTEXITCODE -ne 0) {
+        Fail ("HEAD ($head) is not on the upstream branch. The release is tagged at that " +
+              "exact commit, so push first: git push")
+    }
 }
 
 # ------------------------------------------------------------------- build --
@@ -159,7 +223,20 @@ gh release create $tag --draft --target $target `
     $zip
 if ($LASTEXITCODE -ne 0) { Fail "gh release create failed." }
 
+# Read the target back rather than trusting that it was stored as asked. It is
+# what GitHub will turn into a tag at publish time, and it is the only thing
+# standing between the tag and the payload.
+$draft = gh release view $tag --json targetCommitish 2>&1 | ConvertFrom-Json
+if ($LASTEXITCODE -eq 0 -and $draft.targetCommitish -ne $target) {
+    Fail ("the draft records `"$($draft.targetCommitish)`" as its target, not $target. " +
+          "Publishing it would tag a different tree from the one in the zip. Delete the " +
+          "draft (gh release delete $tag) before anything else.")
+}
+
 Write-Host ''
 Write-Host "Draft created. It is NOT visible to anyone yet." -ForegroundColor Green
 Write-Host "Review it on the Releases tab, then publish with:"
 Write-Host "  gh release edit $tag --draft=false"
+Write-Host "and then CHECK WHERE THE TAG LANDED -- the tag is created at publish time,"
+Write-Host "so this is the first moment it can be verified:"
+Write-Host "  make_release.bat -Verify"

@@ -5,6 +5,8 @@ REM   make_release.bat                          build + draft release
 REM   make_release.bat -DryRun                  render the notes only, change nothing
 REM   make_release.bat -SkipBuild               reuse the zip already in dist\
 REM   make_release.bat -Highlights whatsnew.md  file whose text becomes "What's new"
+REM   make_release.bat -Verify                  AFTER publishing: check that the
+REM                                             tag landed on the built commit
 REM
 REM The version comes from install\local.delphi-win64-debug\package.json.
 REM Nothing is ever published automatically: the release is left as a draft.

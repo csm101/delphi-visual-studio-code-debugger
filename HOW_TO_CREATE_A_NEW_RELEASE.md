@@ -69,9 +69,10 @@ git commit -m "..."
 git push
 ```
 
-The release points at a commit. If it is not on the remote, anyone who clones
-the tag gets a tree that does not exist. The script warns about unpushed commits
-but does not stop — the judgement is yours.
+The release is tagged at the exact commit HEAD is on. If the remote does not
+have that commit there is nothing for the tag to point at, so the script now
+REFUSES rather than warning. Commits behind HEAD being unpushed is still only a
+warning: that one is a judgement call, HEAD is not.
 
 ---
 
@@ -115,7 +116,8 @@ What happens, in order:
 1. checks `gh` is installed and authenticated;
 2. reads the version from the extension manifest;
 3. refuses if a release or draft with that tag already exists;
-4. warns about unpushed commits;
+4. warns about unpushed commits, and REFUSES if HEAD itself is not on the
+   upstream branch — the tag is created at that exact commit;
 5. runs `build_setup_zip.bat` — which rebuilds the adapter, the MCP server, the
    installer, and stages the extension (including `Zydis.dll`, the optional
    disassembly backend, and its MIT licence text — a missing
@@ -135,6 +137,7 @@ Options:
 | `-DryRun` | Render and report only. Nothing is sent to GitHub |
 | `-SkipBuild` | Reuse the zip already in `dist\`. For a second attempt after a notes-only fix |
 | `-Highlights <file>` | The "What's new" text. Omitting it produces a release with no such section, and the script says so |
+| `-Verify` | Run AFTER publishing. Checks the tag landed on the commit the release was built from. Does nothing else |
 
 ---
 
@@ -162,7 +165,30 @@ edit it. Do not paste that URL anywhere; after publishing the address is
 
 ---
 
-## 7. Check what a stranger sees
+## 7. Check where the tag landed
+
+**This is the step that did not exist, and its absence let one mistake ship four
+times.**
+
+```powershell
+cmd /c "C:\Athens\GitHub\Win64Debugger\make_release.bat -Verify"
+```
+
+The tag does not exist until you publish: GitHub creates it then, from the
+release's target. So this is the first moment it can be checked at all, and it
+must be checked here rather than assumed at step 5.
+
+It prints the target recorded on the release and the commit the tag actually
+points at, and fails if they differ — or if the target is a BRANCH NAME rather
+than a commit, which is how the two drift apart. Between 0.5.0 and 0.6.2 the
+script passed `--target main` while releases were being built from another
+branch; every draft, every zip and every set of notes was correct, and all four
+tags landed on the same eleven-day-old commit. `gh release view` showed nothing
+wrong, because it does not compare those two things. Nothing did.
+
+---
+
+## 8. Check what a stranger sees
 
 ```powershell
 gh release view v0.2.4
