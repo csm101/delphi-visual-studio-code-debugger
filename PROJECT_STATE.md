@@ -1410,10 +1410,26 @@ by `DAP_LOG=1` in the environment. One previous generation is kept beside it as
 
 ## Repository and release invariants (recorded 2026-08-08)
 
-- **Branch topology.** `public-main` carries the real lineage (fast-forwarded onto
-  the Win32 branch, 127 commits). `main` is an UNRELATED PRIVATE archive whose last
-  commit sanitised the tree that became the public root — **it must never be
-  merged**.
+- **Branch topology (corrected 2026-08-23).** The branch of record is `main`,
+  locally and on GitHub. There is nothing else.
+
+  It used to say that `public-main` carried the real lineage and that `main` was
+  an unrelated private archive never to be merged — and that sentence conflated
+  two different branches that happen to share a name. The **local** `main` was
+  the unrelated private archive; the **remote** `main` was, and is, the public
+  default branch on the same lineage as everything else. Acting on the note as
+  written, a push on 2026-08-10 created a second remote branch `public-main` and
+  from 2026-08-12 all work went there, while `origin/main` — the repository's
+  DEFAULT branch, and so what every visitor and every `git clone` gets — froze at
+  the 12 August tree. It also silently broke `make_release.ps1`, whose
+  `--target main` had been correct until that day: v0.5.0, v0.6.0, v0.6.1 and
+  v0.6.2 all tagged the frozen commit instead of what they shipped.
+
+  Resolved on 2026-08-23: `public-main` was merged into `main`, pushed, and
+  deleted on both sides. The private archive is the local branch
+  `obsolete-main` (root `5b447d4`, no upstream, never pushed, **never merge
+  it** — it shares no ancestor with anything public). It exists on one disk
+  only; back it up with `git bundle` rather than trusting the branch.
 - **The extension manifest version is the single place the release script reads.**
 - **The debug type id `delphi-win64` and every extension command id are
   deliberately unchanged despite Win32 support**: renaming them breaks every
