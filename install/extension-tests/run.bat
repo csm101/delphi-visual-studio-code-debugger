@@ -19,6 +19,9 @@ echo.
 echo === shared (machine-wide) rules file ===
 node test-global-rules.js || set FAILED=1
 echo.
+echo === project-scoped rules files ===
+node test-project-rules.js || set FAILED=1
+echo.
 echo === delphiProgress status bar ===
 node test-progress.js || set FAILED=1
 echo.

@@ -540,12 +540,19 @@ Two reasons it can be missing there while the palette command still works:
   Breakpoints survives as soon as one breakpoint exists or you have debugged
   once in that workspace, which is why the button lives there as well.
 
-First pick where the rules live:
+First pick where the rules live. The list is ordered the way the debugger
+evaluates them — narrowest scope first:
 
+- **`<Project>` rules (local)** and **`<Project>` rules (shared)** — the two
+  files belonging to the Delphi project the configuration debugs, described
+  under *Rules that belong to a project* below. Offered only when a
+  configuration names its project through `delphiProjectFile`;
 - a `delphi-win64` configuration in `.vscode/launch.json` or in the
-  `.code-workspace` file — the project's own rules;
-- **Shared rules (all projects)** — the machine-wide file described below. It is
-  created, together with its directory, the first time you save to it.
+  `.code-workspace` file — that one configuration's rules;
+- **Shared rules (all projects)** — the machine-wide file described below.
+
+Any of the three files is created, together with its directory, the first time
+you save to it.
 
 The editor then opens with one card per rule, numbered in evaluation order,
 match criteria separated from the action, and up/down buttons to reorder. Rules
@@ -579,10 +586,58 @@ make, pre-filled:
 - ignore it when the message contains this text;
 - open the rules editor on a fully pre-filled rule, to adjust it first.
 
-Then choose the target — the project configuration or the shared file. The new
-rule is inserted **first**, because matching is first-match-wins: a more specific
-rule appended at the bottom would never be reached. As with the editor, the file
-is left open and unsaved for review.
+Then choose the target — one of the project's own files, the launch
+configuration, or the shared file. The new rule is inserted **first**, because
+matching is first-match-wins: a more specific rule appended at the bottom would
+never be reached. As with the editor, the file is left open and unsaved for
+review.
+
+### Rules that belong to a project
+
+A launch configuration is the wrong home for a rule that belongs to a
+**package**. If you maintain one `.dpk` inside a host application that loads
+dozens of them, your rules have nothing to do with which host `.exe` anyone
+launches to test it — and copying them into every configuration that starts that
+host is how they go stale.
+
+So a configuration may name the Delphi project it debugs:
+
+```jsonc
+"delphiProjectFile": "${workspaceFolder}/packages/libTabAnagD29.dpk"
+```
+
+The RAD Studio plugin writes this line for you when it generates the launch
+configuration; there is nothing to maintain by hand. It may name the `.dpr`,
+the `.dpk` or the `.dproj` — only the folder and the base name matter.
+
+Two rule files next to that project then join the chain:
+
+| File | Who it is for |
+|---|---|
+| `<Project>.ExceptionSettings.json` | the project's own rules, **commit them** — every developer on the package gets them |
+| `<Project>.ExceptionSettings.local.json` | your own overrides, **gitignore it** |
+
+Both have the same shape as the shared file (an object with an `exceptionRules`
+array, or a bare array), are hot-reloaded on resume like it, and are ignored if
+missing or malformed.
+
+Without `delphiProjectFile` nothing project-scoped is looked for, and rules
+resolve exactly as they did before this existed — an older launch.json keeps
+working untouched.
+
+### Which rule wins
+
+Rules are evaluated top-down across all four scopes, narrowest first, and the
+**first match wins**:
+
+| # | Scope | Where |
+|---|---|---|
+| 1 | your own, for this project | `<Project>.ExceptionSettings.local.json` |
+| 2 | the project's, shared with its team | `<Project>.ExceptionSettings.json` |
+| 3 | one launch configuration | `exceptionRules` in launch.json |
+| 4 | every project on this machine | the shared file below |
+
+If nothing matches, the exception filters decide.
 
 ### Shared rules across projects
 
@@ -604,10 +659,11 @@ A machine-wide baseline can live in
 | `useGlobalExceptionRules` | Load the shared file. Default `true` |
 | `globalExceptionRulesPath` | Use a different shared-rules file |
 
-A project's own `exceptionRules` are evaluated first, then the shared ones, then
-the filters. A missing or malformed shared file is ignored — it never breaks
-debugging. The shared file is **hot-reloaded**: edit it while stopped, resume,
-and the new rules apply without restarting the session.
+The shared file is the widest scope: everything in the table under *Which rule
+wins* is consulted before it. A missing or malformed shared file is ignored — it
+never breaks debugging. It is **hot-reloaded**, as are the project files: edit
+one while stopped, resume, and the new rules apply without restarting the
+session. Creating a file that was not there when the session started counts too.
 
 The rules editor and the "create a rule for this exception" command can both
 write to this file — pick **Shared rules (all projects)** when they ask for a

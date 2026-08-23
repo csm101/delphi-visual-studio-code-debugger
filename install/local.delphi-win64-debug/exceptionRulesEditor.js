@@ -3,13 +3,22 @@
 /*
  * Webview editor for exception rules.
  *
- * Two kinds of target can be edited:
+ * Three kinds of target can be edited, listed in the order the ADAPTER
+ * evaluates them - most specific first, first match wins:
  *
+ *   - the two files belonging to the Delphi project a configuration names
+ *     through `delphiProjectFile`: `<Project>.ExceptionSettings.local.json`
+ *     (personal) and `<Project>.ExceptionSettings.json` (shared with the team).
+ *     See projectRules.js;
  *   - a `delphi-win64` launch configuration in `.vscode/launch.json` or in a
  *     `.code-workspace` file (the project's own `exceptionRules`);
  *   - the machine-wide shared file, `%USERPROFILE%\.DelphiWinDebugger\
  *     exceptionRules.json` by default, or wherever `globalExceptionRulesPath`
  *     points (see globalRules.js).
+ *
+ * Everything that is a FILE - both project sidecars and the machine-wide one -
+ * is read and written through globalRules.js, because they are the same kind of
+ * file; only the launch configuration needs its own JSONC-preserving path.
  *
  * Writing back is deliberately conservative in both cases. `launch.json` is
  * JSONC and is normally full of the user's own comments; re-serializing the
@@ -30,6 +39,7 @@ const vscode = require('vscode');
 const jsonc = require('./jsonc');
 const rules = require('./rules');
 const globalRules = require('./globalRules');
+const projectRules = require('./projectRules');
 
 const DEBUG_TYPE = 'delphi-win64';
 
@@ -99,6 +109,7 @@ async function findDelphiConfigurations() {
         exceptionRules: Array.isArray(configuration.exceptionRules) ? configuration.exceptionRules : [],
         useGlobalExceptionRules: configuration.useGlobalExceptionRules,
         globalExceptionRulesPath: configuration.globalExceptionRulesPath,
+        delphiProjectFile: configuration.delphiProjectFile,
         workspaceFolder: candidate.workspaceFolder,
         workspaceFolderBasename: candidate.workspaceFolderBasename
       });
@@ -130,16 +141,28 @@ function buildGlobalTarget(configurations) {
   };
 }
 
-/** Everything the user may pick in the target QuickPick. */
+/**
+ * Everything the user may pick in the target QuickPick, ordered the way the
+ * adapter resolves rules: the project's own files first, then the launch
+ * configurations, then the machine-wide file. The order is the feature - a user
+ * choosing where to put a rule is choosing how widely it should reach.
+ */
 async function collectTargets() {
   const scan = await findDelphiConfigurations();
-  const targets = scan.found.slice();
+  const projectTargets = projectRules.collectProjectTargets(scan.found);
+  const targets = projectTargets.concat(scan.found);
   targets.push(buildGlobalTarget(scan.found));
-  return { targets: targets, parseErrors: scan.parseErrors, launchCount: scan.found.length };
+  return {
+    targets: targets,
+    parseErrors: scan.parseErrors,
+    launchCount: scan.found.length,
+    projectCount: projectTargets.length
+  };
 }
 
+/** Icon, plus the trailing notes that say what picking this target commits to. */
 function describeTarget(target) {
-  if (target.kind !== 'global') {
+  if (target.kind === 'launch') {
     return {
       label: target.name,
       description: `${target.exceptionRules.length} rule(s)`,
@@ -150,10 +173,20 @@ function describeTarget(target) {
   const notes = [];
   if (!target.exists) notes.push('will be created');
   if (target.shape === 'invalid') notes.push('unreadable: ' + target.parseError);
-  if (target.overriddenBy) notes.push('path from "' + target.overriddenBy + '"');
-  if (target.disabledEverywhere) notes.push('useGlobalExceptionRules is false in every configuration');
+  if (target.kind === 'projectLocal') {
+    notes.push('yours alone - gitignore it');
+  } else if (target.kind === 'projectShared') {
+    notes.push('travels with the project - commit it');
+  } else {
+    if (target.overriddenBy) notes.push('path from "' + target.overriddenBy + '"');
+    if (target.disabledEverywhere) notes.push('useGlobalExceptionRules is false in every configuration');
+  }
+  if (target.declaredBy && target.declaredBy.length) {
+    notes.push('used by ' + target.declaredBy.join(', '));
+  }
+  const icons = { projectLocal: '$(person)', projectShared: '$(project)', global: '$(globe)' };
   return {
-    label: '$(globe) ' + target.name,
+    label: (icons[target.kind] || '') + ' ' + target.name,
     description: `${target.exceptionRules.length} rule(s)`,
     detail: target.filePath + (notes.length ? '  —  ' + notes.join('; ') : ''),
     target: target
@@ -228,11 +261,12 @@ async function writeLaunchRules(target, newRules) {
 }
 
 /**
- * Same idea for the shared file. It is created first (empty) when missing, so
- * the change goes through the normal document/undo path instead of a blind
- * write to disk.
+ * Same idea for a rules FILE - the machine-wide one or either project sidecar,
+ * which are all the same shape. It is created first (empty) when missing, so the
+ * change goes through the normal document/undo path instead of a blind write to
+ * disk.
  */
-async function writeGlobalRules(target, newRules) {
+async function writeRulesFile(target, newRules) {
   globalRules.ensureGlobalRulesFile(target.filePath);
   const uri = vscode.Uri.file(target.filePath);
   const document = await vscode.workspace.openTextDocument(uri);
@@ -253,12 +287,19 @@ async function applyRangeEdit(uri, document, edit, label) {
 }
 
 function writeRules(target, newRules) {
-  return target.kind === 'global' ? writeGlobalRules(target, newRules) : writeLaunchRules(target, newRules);
+  return target.kind === 'launch' ? writeLaunchRules(target, newRules) : writeRulesFile(target, newRules);
 }
 
 function targetUri(target) {
-  return target.kind === 'global' ? vscode.Uri.file(target.filePath) : target.uri;
+  return target.kind === 'launch' ? target.uri : vscode.Uri.file(target.filePath);
 }
+
+/** What to call the destination in the panel's own buttons and blurbs. */
+const FILE_NOUNS = {
+  global: 'the shared rules file',
+  projectShared: "the project's shared rules file",
+  projectLocal: "the project's local rules file"
+};
 
 /** Opens the webview on a target, optionally with rules it does not have yet. */
 function openEditorPanel(context, target, initialRules) {
@@ -273,18 +314,18 @@ function openEditorPanel(context, target, initialRules) {
       localResourceRoots: [context.extensionUri]
     }
   );
-  const shared = target.kind === 'global';
+  const fileNoun = FILE_NOUNS[target.kind] || 'launch.json';
   panel.webview.html = buildHtml(panel.webview, context.extensionUri, {
     configurationName: target.name,
     documentLabel: target.documentLabel,
     rules: initialRules || target.exceptionRules,
     readOnly: readOnly,
     readOnlyReason: readOnly ? 'This workspace is not trusted, so the rules file cannot be modified.' : '',
-    fileNoun: shared ? 'the shared rules file' : 'launch.json',
-    saveLabel: shared ? 'Save to the shared rules file' : 'Save to launch.json',
-    saveTitle: shared
-      ? 'Write these rules back into the machine-wide shared rules file'
-      : 'Write these rules back into the launch configuration'
+    fileNoun: fileNoun,
+    saveLabel: 'Save to ' + fileNoun,
+    saveTitle: target.kind === 'launch'
+      ? 'Write these rules back into the launch configuration'
+      : 'Write these rules back into ' + target.filePath
   });
 
   // The latest draft the webview has reported as unsaved, or null when it is
@@ -361,6 +402,7 @@ module.exports = {
   findDelphiConfigurations: findDelphiConfigurations,
   collectTargets: collectTargets,
   buildGlobalTarget: buildGlobalTarget,
+  writeRulesFile: writeRulesFile,
   describeTarget: describeTarget,
   pickTarget: pickTarget,
   writeRules: writeRules
