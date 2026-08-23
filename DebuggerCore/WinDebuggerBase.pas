@@ -403,6 +403,29 @@ type
     // plausible-looking stop point.
     function  PlanExceptionStep(Tid: DWORD; out Plan: TExceptionStepPlan;
                 out RefusalReason: string): Boolean; virtual;
+    // The `except` block PC is standing IN, if any -- the question "am I inside
+    // a handler right now", as opposed to PlanExceptionStep's "where will this
+    // exception land". Reads the same x64 `.pdata` / `UNWIND_INFO` / Delphi
+    // scope-table chain (EH_FORMAT_NOTES.md) and answers False for everything
+    // it cannot prove, a non-Delphi language handler included.
+    //
+    // x86 overrides it to a flat False: a 32-bit binary has no `.pdata`, and the
+    // fs:[0] chain describes where an exception WOULD go, not which block the
+    // thread is currently executing.
+    function  TryGetExceptHandlerBlockAt(PC: UInt64;
+                out Blk: TExcHandlerBlock): Boolean; virtual;
+    // The exception alias of the `on <X>: <Class> do` clause PC is standing in,
+    // when the compiler put X somewhere the ordinary locals path cannot see.
+    //
+    // In a procedure the alias is a plain stack local and every symbol reader
+    // already lists it. In a PROGRAM MAIN BLOCK dcc allocates it as a
+    // module-level static instead (measured: `_ZN7Debugme1EE`, an LDATA32 at a
+    // fixed RVA, on BOTH bitnesses), so it is a global to every reader and never
+    // a local of the block -- which is why `evaluate E` answered there while
+    // Locals did not list it. This recovers it, for the extent of the clause
+    // that owns it and no further.
+    function  TryGetHandlerAliasLocal(PC: UInt64;
+                out LV: TLocalValue): Boolean;
     // Shared by both architectures' planners: True when VA is an address in a
     // module with symbols that maps to a real source line, which is what
     // separates a user's own except/finally block from an RTL funclet or a
@@ -7235,8 +7258,257 @@ begin
   end;
 end;
 
+function TWinDebugger.TryGetExceptHandlerBlockAt(PC: UInt64;
+  out Blk: TExcHandlerBlock): Boolean;
+const
+  UNW_FLAG_EHANDLER  = $01;
+  UNW_FLAG_UHANDLER  = $02;
+  UNW_FLAG_CHAININFO = $04;
+  MAX_CHAIN_DEPTH    = 4;
+  MAX_SCOPE_ENTRIES  = 256;
+  MAX_CLAUSES        = 64;
+type
+  // One { Begin, End, Handler, Target } row of Delphi's MSVC-shaped scope
+  // table, kept as read so the block search below can consult all of them.
+  TScopeRow = record
+    BeginRva, EndRva, Handler, Target: UInt32;
+  end;
+  // A block address the table names, before it is known whether PC is in it.
+  TCandidate = record
+    Kind:        TExcHandlerBlockKind;
+    StartRva:    UInt32;
+    ClassVmtRva: UInt32;
+  end;
+var
+  ModBase:    UInt64;
+  Rows:       TArray<TScopeRow>;
+  Candidates: TArray<TCandidate>;
+
+  function ReadU32At(VA: UInt64; out Value: UInt32): Boolean;
+  begin
+    Value  := 0;
+    Result := ReadProcessMemoryAt(VA, @Value, SizeOf(Value));
+  end;
+
+  procedure AddCandidate(Kind: TExcHandlerBlockKind; StartRva, ClassVmtRva: UInt32);
+  begin
+    if StartRva = 0 then Exit;
+    for var Existing in Candidates do
+      if Existing.StartRva = StartRva then Exit;
+    var C: TCandidate;
+    C.Kind        := Kind;
+    C.StartRva    := StartRva;
+    C.ClassVmtRva := ClassVmtRva;
+    Candidates := Candidates + [C];
+  end;
+
+  // DWORD Count; Count x { DWORD ClassVmtRva; DWORD BlockRva } -- one entry per
+  // `on <Class> do` clause of a single `except`.
+  procedure LoadClauseTable(TableRva: UInt32);
+  begin
+    var Count: UInt32;
+    if not ReadU32At(ModBase + TableRva, Count) then Exit;
+    if (Count = 0) or (Count > MAX_CLAUSES) then Exit;
+    for var I := 0 to Integer(Count) - 1 do begin
+      var Pair: array[0..1] of UInt32;
+      if not ReadProcessMemoryAt(ModBase + TableRva + 4 + UInt64(I) * 8,
+               @Pair[0], SizeOf(Pair)) then Exit;
+      AddCandidate(ehbOnClause, Pair[1], Pair[0]);
+    end;
+  end;
+
+  function LoadScopeTable(TableRva, FuncBeginRva, FuncEndRva: UInt32): Boolean;
+  begin
+    Result := False;
+    var Count: UInt32;
+    if not ReadU32At(ModBase + TableRva, Count) then Exit;
+    if (Count = 0) or (Count > MAX_SCOPE_ENTRIES) then Exit;
+    for var I := 0 to Integer(Count) - 1 do begin
+      var E: array[0..3] of UInt32;
+      if not ReadProcessMemoryAt(ModBase + TableRva + 4 + UInt64(I) * 16,
+               @E[0], SizeOf(E)) then Exit;
+      // The same shape check PlanExceptionStep applies: a protected range that
+      // is not inside the routine means this is not the table it looks like,
+      // and decoding on would produce confident nonsense.
+      if (E[0] >= E[1]) or (E[0] < FuncBeginRva) or (E[1] > FuncEndRva) then Exit;
+      var Row: TScopeRow;
+      Row.BeginRva := E[0];
+      Row.EndRva   := E[1];
+      Row.Handler  := E[2];
+      Row.Target   := E[3];
+      Rows := Rows + [Row];
+      if E[2] = 0 then
+        Continue                                 // try .. finally: not a handler
+      else if E[2] <= 2 then
+        AddCandidate(ehbBareExcept, E[3], 0)     // Handler is a flag, Target the block
+      else begin
+        LoadClauseTable(E[2]);
+        // Some entries carry BOTH a clause table and a Target block.
+        if E[3] <> 0 then
+          AddCandidate(ehbBareExcept, E[3], 0);
+      end;
+    end;
+    Result := True;
+  end;
+
+  function LoadFromUnwindInfo(UnwindRva, FuncBeginRva, FuncEndRva: UInt32;
+    Depth: Integer): Boolean;
+  begin
+    Result := False;
+    if Depth > MAX_CHAIN_DEPTH then Exit;
+    var Hdr: array[0..3] of Byte;
+    if not ReadProcessMemoryAt(ModBase + UnwindRva, @Hdr[0], SizeOf(Hdr)) then Exit;
+    var Version := Hdr[0] and 7;
+    if (Version <> 1) and (Version <> 2) then Exit;
+    var Flags   := Hdr[0] shr 3;
+    // The UNWIND_CODE array is padded to an EVEN number of 2-byte slots.
+    var Slots   := (Integer(Hdr[2]) + 1) and not 1;
+    var TailRva := UnwindRva + 4 + UInt32(Slots) * 2;
+
+    if (Flags and (UNW_FLAG_EHANDLER or UNW_FLAG_UHANDLER)) <> 0 then begin
+      var HandlerRva: UInt32;
+      if not ReadU32At(ModBase + TailRva, HandlerRva) then Exit;
+      // Under MSVC's __C_specific_handler the same field is a FILTER function,
+      // not a Delphi scope table, and every ntdll / kernelbase frame is one.
+      var HandlerName := '';
+      if FDebugInfo <> nil then
+        FDebugInfo.RvaToFunctionName(VAToRva(ModBase + HandlerRva), HandlerName);
+      if not ContainsText(HandlerName, 'DelphiExceptionHandler') then Exit;
+      Exit(LoadScopeTable(TailRva + 4, FuncBeginRva, FuncEndRva));
+    end;
+
+    if (Flags and UNW_FLAG_CHAININFO) <> 0 then begin
+      var Chained: TRuntimeFunctionEntry;
+      if not ReadProcessMemoryAt(ModBase + TailRva, @Chained, SizeOf(Chained)) then Exit;
+      Exit(LoadFromUnwindInfo(Chained.UnwindInfoAddress,
+        Chained.BeginAddress, Chained.EndAddress, Depth + 1));
+    end;
+    // No handler and no chain: this routine has no except block at all.
+  end;
+
+  // dcc wraps every handler BODY in a compiler-generated try .. finally -- it is
+  // what calls System.@DoneExcept -- so the block's extent is the narrowest
+  // protected range covering the byte AFTER the block starts. Measured on
+  // Debugme's main block: the `on E:` block at $2FCCE is covered by
+  // [$2FCCE, $2FD6F) and the bare block at $2FD90 by [$2FD91, $2FDF7).
+  //
+  // Taking the byte after the start is what makes the bare form work: its block
+  // address is the PREVIOUS entry's exclusive End, so the block address itself
+  // is not inside the wrapping range.
+  function NarrowestRangeCovering(Rva: UInt32; out EndRva: UInt32): Boolean;
+  begin
+    Result := False;
+    EndRva := 0;
+    var BestWidth: UInt32 := 0;
+    for var Row in Rows do begin
+      if (Rva < Row.BeginRva) or (Rva >= Row.EndRva) then Continue;
+      var Width := Row.EndRva - Row.BeginRva;
+      if (not Result) or (Width < BestWidth) then begin
+        Result    := True;
+        BestWidth := Width;
+        EndRva    := Row.EndRva;
+      end;
+    end;
+  end;
+
+begin
+  Blk    := Default(TExcHandlerBlock);
+  Result := False;
+  if (PC = 0) or (FProcess = 0) then Exit;
+  EnsureSymInitialized;
+  var RF: PRuntimeFunctionEntry := SymFunctionTableAccess64(FProcess, PC);
+  if RF = nil then Exit;
+  ModBase := SymGetModuleBase64(FProcess, PC);
+  if ModBase = 0 then Exit;
+  Rows       := nil;
+  Candidates := nil;
+  if not LoadFromUnwindInfo(RF.UnwindInfoAddress, RF.BeginAddress,
+           RF.EndAddress, 0) then Exit;
+
+  var PcRva := UInt32(PC - ModBase);
+  var BestWidth: UInt32 := 0;
+  for var Cand in Candidates do begin
+    if PcRva < Cand.StartRva then Continue;
+    var EndRva: UInt32;
+    // No wrapping range means the block's end is not derivable. Decline rather
+    // than stretch it to the end of the routine: a handler alias that lingers
+    // past its own block is exactly the confidently-wrong answer this exists
+    // to avoid.
+    if not NarrowestRangeCovering(Cand.StartRva + 1, EndRva) then Continue;
+    if PcRva >= EndRva then Continue;
+    var Width := EndRva - Cand.StartRva;
+    if Result and (Width >= BestWidth) then Continue;   // keep the innermost
+    Result    := True;
+    BestWidth := Width;
+    Blk.Kind    := Cand.Kind;
+    Blk.StartVA := ModBase + Cand.StartRva;
+    Blk.EndVA   := ModBase + EndRva;
+    if Cand.ClassVmtRva <> 0 then
+      Blk.ClassVmtVA := ModBase + Cand.ClassVmtRva
+    else
+      Blk.ClassVmtVA := 0;
+  end;
+end;
+
+function TWinDebugger.TryGetHandlerAliasLocal(PC: UInt64;
+  out LV: TLocalValue): Boolean;
+const
+  // `mov [rip+disp32], rax` -- the alias lives in a module-level static, which
+  // is what dcc emits for a handler in the program main block. Measured on
+  // Debugme.dpr:102 -> `48 89 05 F3 52 01 00`, storing into the LDATA32 `E`.
+  // A `48 89 45 xx` / `48 89 85 xx xx xx xx` (`mov [rbp+disp], rax`) says the
+  // alias is an ordinary stack local, which every symbol reader already lists,
+  // so there is nothing to synthesise for it.
+  MOV_RIPREL_RAX: array[0..2] of Byte = ($48, $89, $05);
+  MOV_RIPREL_LEN = 7;
+begin
+  LV     := Default(TLocalValue);
+  Result := False;
+  if FDebugInfo = nil then Exit;
+  var Blk: TExcHandlerBlock;
+  if not TryGetExceptHandlerBlockAt(PC, Blk) then Exit;
+  if Blk.Kind <> ehbOnClause then Exit;
+
+  var Code: array[0 .. MOV_RIPREL_LEN - 1] of Byte;
+  if not ReadProcessMemoryAt(Blk.StartVA, @Code[0], SizeOf(Code)) then Exit;
+  for var I := Low(MOV_RIPREL_RAX) to High(MOV_RIPREL_RAX) do
+    if Code[I] <> MOV_RIPREL_RAX[I] then Exit;
+  // Until that store has retired the slot still holds whatever the previous
+  // handler left in it. Standing on the `on` line itself is therefore outside
+  // the alias's real lifetime, not merely early in it.
+  if PC < Blk.StartVA + MOV_RIPREL_LEN then Exit;
+
+  var Disp   := PInteger(@Code[3])^;
+  var SlotVA := UInt64(Int64(Blk.StartVA) + MOV_RIPREL_LEN + Disp);
+  var Sym: TGlobalSymbol;
+  if not FDebugInfo.TryGetGlobalAtRva(VAToRva(SlotVA), Sym) then Exit;
+  if Sym.Name = '' then Exit;
+
+  LV.Name        := Sym.Name;
+  LV.TypeHint    := Sym.TypeHint;
+  LV.Address     := SlotVA;
+  LV.Kind        := lkLocal;
+  LV.ParamStatus := spsLocal;
+  LV.RawValue    := 0;
+  if ReadProcessMemoryAt(SlotVA, @LV.RawValue, TargetLayout.PointerSize) then
+    LV.ValueValid := True;
+  DapLog(Format('exception alias "%s" (%s) at $%x, live for the `on` block $%x..$%x',
+    [LV.Name, LV.TypeHint, SlotVA, Blk.StartVA, Blk.EndVA]));
+  Result := True;
+end;
+
 function TWinDebugger.GetLocalValuesForFrame(FrameRBP, FuncEntryVA: UInt64;
   const FuncName: string; FramePcRva: UInt64): TArray<TLocalValue>;
+
+  // True when Name is already among the locals collected for this frame.
+  function AlreadyListed(const Values: TArray<TLocalValue>;
+    const Name: string): Boolean;
+  begin
+    for var V in Values do
+      if SameText(V.Name, Name) then Exit(True);
+    Result := False;
+  end;
+
 begin
   SetLength(Result, 0);
   if (FrameRBP = 0) or (FuncEntryVA = 0) or (FuncName = '') then
@@ -7304,6 +7576,15 @@ begin
     CurRBP      := ParentRBP;
     CurEntry    := ParentEntry;
     CurInnerRva := ParentRva;
+  end;
+
+  // Only the immediate frame carries a PC, and the alias means nothing outside
+  // the block that PC is standing in -- an enclosing frame is somewhere else.
+  if FramePcRva <> 0 then begin
+    var Alias: TLocalValue;
+    if TryGetHandlerAliasLocal(RvaToVA(FramePcRva), Alias) and
+       not AlreadyListed(Result, Alias.Name) then
+      Result := Result + [Alias];
   end;
 end;
 

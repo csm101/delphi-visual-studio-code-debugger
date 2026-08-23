@@ -64,6 +64,9 @@ type
     // PART of it is derivable -- see the body.
     function  PlanExceptionStep(Tid: DWORD; out Plan: TExceptionStepPlan;
                 out RefusalReason: string): Boolean; override;
+    // Declines, always -- see the body.
+    function  TryGetExceptHandlerBlockAt(PC: UInt64;
+                out Blk: TExcHandlerBlock): Boolean; override;
     // Base address of the 32-bit TEB of Tid, which is where fs:[0] points.
     function  Teb32Base(Tid: DWORD; out Base: UInt64; out How: string): Boolean;
 
@@ -854,6 +857,25 @@ end;
 // deliberate choice over the alternative (stop on the stub, whose address does
 // resolve to the `finally` line): a refusal that names what is missing is worth
 // more than a stop that looks right and is not.
+function TWin32Debugger.TryGetExceptHandlerBlockAt(PC: UInt64;
+  out Blk: TExcHandlerBlock): Boolean;
+begin
+  // "Which except block is this PC inside?" is not answerable on a 32-bit
+  // target. There is no `.pdata`, so there is no scope table stating any
+  // block's extent; the fs:[0] registration chain says where an exception
+  // WOULD be dispatched, which is a different question, and the block address
+  // is not even derivable from it for a bare `except` or a `finally`
+  // (EH_FORMAT_NOTES.md, "x86 -- partial, and the negative half is
+  // load-bearing").
+  //
+  // So a 32-bit target gets no synthesised handler alias and no handler-scoped
+  // `$exception`. Everything that does not depend on this -- an `on E:` alias
+  // that the compiler put on the STACK, which is every handler outside a
+  // program main block -- is unaffected, because that path never comes here.
+  Blk    := Default(TExcHandlerBlock);
+  Result := False;
+end;
+
 function TWin32Debugger.PlanExceptionStep(Tid: DWORD;
   out Plan: TExceptionStepPlan; out RefusalReason: string): Boolean;
 const

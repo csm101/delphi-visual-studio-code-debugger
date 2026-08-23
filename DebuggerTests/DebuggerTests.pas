@@ -581,6 +581,25 @@ type
     [Test]
     procedure Test_Hover_ExceptionInHandler_Message;
 
+    // --- exception handlers in the PROGRAM MAIN BLOCK ------------------------
+    // A handler inside `begin .. end.` is not the same case as one inside a
+    // procedure. dcc does not give its `on E:` alias a stack slot: it allocates
+    // a module-level static (measured on both bitnesses), so every symbol
+    // reader calls the alias a global and none of them calls it a local of the
+    // block. The adapter recovers it from the routine's own exception-dispatch
+    // data instead -- and only for the extent of the clause that owns it, which
+    // is what keeps it away from a sibling BARE handler.
+    [Test] procedure Test_MainBlockHandler_AliasListedInLocals;
+    [Test] procedure Test_MainBlockHandler_AliasAbsentInBareHandler;
+    [Test] procedure Test_MainBlockHandler_AliasAbsentOutsideHandler;
+    [Test] procedure Test_MainBlockHandler_AliasMessageEvaluates;
+    [Test] procedure Test_MainBlockHandler_AliasGatesConditionalBreakpoint;
+    [Test] procedure Test_MainBlockHandler_AliasConditionFalse_NeverStops;
+    // The control: inside an ordinary PROCEDURE the alias is a real stack local
+    // and always was listed. Here so that the main-block work above cannot
+    // quietly break the case that already worked.
+    [Test] procedure Test_ProcedureHandler_AliasStillListedInLocals;
+
     // --- expression evaluator: class property (field-backed) via dot syntax ---
     [Test]
     procedure Test_Eval_PropertyDot;
@@ -1260,10 +1279,7 @@ begin
   // it under the BPL scenario with a documented reason. (Tier-2 expression-eval
   // tests that merely used MAIN_GCOUNTER as a running-process anchor have been
   // re-vehicled to the portable EVAL_BODY marker, so they do NOT skip here.)
-  if (Scenario = tsBpl) and
-     (SameText(BpMarker, 'MAIN_FIRST_LINE') or
-      SameText(BpMarker, 'MAIN_GCOUNTER')   or
-      SameText(BpMarker, 'MAIN_AFTER_NESTED')) then
+  if (Scenario = tsBpl) and BpMarker.StartsWith('MAIN_', True) then
     Assert.Pass('SKIP[bpl]: marker ''' + BpMarker + ''' is program-main-block only ' +
       '(no BPL equivalent; a package has no program begin..end. block)');
   BpLine  := Bp(BpMarker);
@@ -3952,6 +3968,155 @@ begin
       'hover on E must expose variablesReference > 0');
   finally
     Resp.Free;
+  end;
+end;
+
+// The alias of a main-block `on E: Exception do` must be a Locals row, not
+// something the user has to know to type into Watch. See the declaration for
+// why the ordinary locals path cannot see it.
+procedure TDebuggerTests.Test_MainBlockHandler_AliasListedInLocals;
+var FrameId, LocalsRef: Integer;
+    ExcVar: TJSONObject;
+begin
+  StartSession('MAIN_EXC_ALIASED', FrameId, LocalsRef, ['--main-exc']);
+  ExcVar := FindLocalByName(FClient, LocalsRef, 'E');
+  try
+    Assert.IsNotNull(ExcVar,
+      'the `on E:` alias of a main-block handler must appear in Locals');
+    Assert.IsTrue(ExcVar.GetValue<string>('type', '').Contains('Exception'),
+      'E should be typed as an Exception, got: ' + ExcVar.GetValue<string>('type', ''));
+    Assert.IsTrue(ExcVar.GetValue<Integer>('variablesReference', 0) > 0,
+      'E must be expandable');
+    Assert.IsFalse(ExcVar.GetValue<string>('value', '').Contains('nil'),
+      'E must hold the live exception, got: ' + ExcVar.GetValue<string>('value', ''));
+  finally
+    ExcVar.Free;
+  end;
+end;
+
+// The sibling BARE `except` in the same main block. Its handler has no alias,
+// so the alias of the OTHER handler must not appear there -- that slot is a
+// module-level static holding a dangling pointer to the already-freed previous
+// exception, which reads as a plausible value and is not one.
+procedure TDebuggerTests.Test_MainBlockHandler_AliasAbsentInBareHandler;
+var FrameId, LocalsRef: Integer;
+    ExcVar: TJSONObject;
+begin
+  StartSession('MAIN_EXC_BARE', FrameId, LocalsRef, ['--main-exc']);
+  ExcVar := FindLocalByName(FClient, LocalsRef, 'E');
+  try
+    Assert.IsNull(ExcVar,
+      'a bare `except` must not borrow the name of another handler''s alias');
+  finally
+    ExcVar.Free;
+  end;
+end;
+
+// And nowhere else in the main block either: before the raise, the static
+// exists and reads nil, which would list a variable the source has not
+// declared at that point.
+procedure TDebuggerTests.Test_MainBlockHandler_AliasAbsentOutsideHandler;
+var FrameId, LocalsRef: Integer;
+    ExcVar: TJSONObject;
+begin
+  StartSession('MAIN_GCOUNTER', FrameId, LocalsRef, ['--main-exc']);
+  ExcVar := FindLocalByName(FClient, LocalsRef, 'E');
+  try
+    Assert.IsNull(ExcVar,
+      'the handler alias must not be listed outside its own `on` clause');
+  finally
+    ExcVar.Free;
+  end;
+end;
+
+// Being a Locals row is not enough: the value has to be the live object, which
+// is what reading a property off it proves.
+procedure TDebuggerTests.Test_MainBlockHandler_AliasMessageEvaluates;
+var FrameId, LocalsRef: Integer;
+    Resp: TJSONObject;
+begin
+  StartSession('MAIN_EXC_ALIASED', FrameId, LocalsRef, ['--main-exc']);
+  Resp := FClient.Evaluate('E.Message', FrameId, 'watch');
+  try
+    Assert.IsTrue(Resp.GetValue<string>('result', '').Contains('main-aliased'),
+      'E.Message should be ''main-aliased'', got: ' + Resp.GetValue<string>('result', ''));
+  finally
+    Resp.Free;
+  end;
+end;
+
+// Requirement 5 of EXCEPTION_HANDLER_SCOPE_PLAN.md: the alias has to work in an
+// arbitrary expression, and a breakpoint condition is the case that proves it
+// -- the condition is evaluated by the adapter while the target is stopped
+// inside the handler, with no Watch panel involved.
+procedure TDebuggerTests.Test_MainBlockHandler_AliasGatesConditionalBreakpoint;
+var BpLine, FrameId, LocalsRef: Integer;
+    Stopped: TJSONObject;
+begin
+  SkipIfBpl('MAIN_EXC_ALIASED is program-main-block only');
+  BpLine := Bp('MAIN_EXC_ALIASED');
+
+  FClient := TDapClient.Create;
+  FClient.Start(AdapterExe);
+  FClient.Initialize.Free;
+  Assert.IsTrue(FClient.WaitForInitialized, 'adapter did not send initialized event');
+  FClient.SetBreakpoints(FBpSourceFile, [BpLine],
+    ['E.Message = ''main-aliased'''], [''], ['']).Free;
+  FClient.SetExceptionBreakpoints([]).Free;
+  LaunchTarget(['--main-exc']).Free;
+  FClient.ConfigDone.Free;
+
+  Stopped := FClient.WaitForStopped;
+  try
+    Assert.AreEqual('breakpoint', Stopped.GetValue<string>('reason', ''),
+      'a condition on the handler alias must let the breakpoint through');
+  finally
+    Stopped.Free;
+  end;
+  FrameId   := FClient.GetFrameId;
+  LocalsRef := FClient.GetLocalsRef(FrameId);
+  Assert.IsTrue(LocalsRef > 0, 'no Locals scope at the conditional stop');
+end;
+
+// The other half of the same claim: a condition that reads the alias and is
+// FALSE must swallow the breakpoint. Without this, a condition that simply
+// fails to evaluate (and falls open) would pass the test above.
+procedure TDebuggerTests.Test_MainBlockHandler_AliasConditionFalse_NeverStops;
+var BpLine: Integer;
+begin
+  SkipIfBpl('MAIN_EXC_ALIASED is program-main-block only');
+  BpLine := Bp('MAIN_EXC_ALIASED');
+
+  FClient := TDapClient.Create;
+  FClient.Start(AdapterExe);
+  FClient.Initialize.Free;
+  Assert.IsTrue(FClient.WaitForInitialized, 'adapter did not send initialized event');
+  FClient.SetBreakpoints(FBpSourceFile, [BpLine],
+    ['E.Message = ''not-this-one'''], [''], ['']).Free;
+  FClient.SetExceptionBreakpoints([]).Free;
+  LaunchTarget(['--main-exc']).Free;
+  FClient.ConfigDone.Free;
+
+  Assert.IsTrue(FClient.WaitForTerminated(20000),
+    'a FALSE condition on the handler alias must swallow the breakpoint; ' +
+    'the target stopped instead of running to exit');
+end;
+
+// Control for the whole group: an `on E:` inside an ordinary procedure gets a
+// real stack slot and has always been listed. It must stay listed.
+procedure TDebuggerTests.Test_ProcedureHandler_AliasStillListedInLocals;
+var FrameId, LocalsRef: Integer;
+    ExcVar: TJSONObject;
+begin
+  StartSession('EXC_HANDLER', FrameId, LocalsRef, ['--run-exception-handler']);
+  ExcVar := FindLocalByName(FClient, LocalsRef, 'E');
+  try
+    Assert.IsNotNull(ExcVar,
+      'the `on E:` alias of a handler inside a procedure must stay in Locals');
+    Assert.IsTrue(ExcVar.GetValue<string>('type', '').Contains('Exception'),
+      'E should be typed as an Exception, got: ' + ExcVar.GetValue<string>('type', ''));
+  finally
+    ExcVar.Free;
   end;
 end;
 

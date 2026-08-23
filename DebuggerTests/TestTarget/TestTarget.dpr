@@ -17,7 +17,8 @@ uses
   // FIRST: installs the silent-failure handlers before any fixture can fault.
   // Deliberate exceptions must not pop a modal dialog in an unattended run.
   TestTargetQuiet in 'TestTargetQuiet.pas',
-  TestTargetCore in 'TestTargetCore.pas';
+  TestTargetCore in 'TestTargetCore.pas',
+  System.SysUtils;
 
 begin
   RunAllScenarios;          // {BP:MAIN_FIRST_LINE}
@@ -51,5 +52,34 @@ begin
   finally
     TheStuff.Free;
     TheWidget.Free;
+  end;
+
+  // Exception handlers that live in the PROGRAM MAIN BLOCK, not in a procedure.
+  // A handler's exception object is reachable from a procedure frame already;
+  // the main block is the case where the RSM main-block locals table is the
+  // only description of the frame, so it needs its own coverage.
+  //
+  // Gated behind a switch so that the ordinary run of this target still raises
+  // nothing from its main block: tests that arm exception filters and then let
+  // the target run would otherwise stop here for reasons that have nothing to
+  // do with what they assert.
+  if FindCmdLineSwitch('main-exc') or FindCmdLineSwitch('-main-exc') then begin
+    try
+      raise Exception.Create('main-aliased');
+    except
+      on E: Exception do begin
+        GSink.Use(['aliased: ', E.Message]);
+        GSink.Use([1]);            // {BP:MAIN_EXC_ALIASED}
+        GSink.Use([2]);
+      end;
+    end;
+
+    try
+      raise Exception.Create('main-bare');
+    except
+      GSink.Use(['bare entered']);
+      GSink.Use([3]);              // {BP:MAIN_EXC_BARE}
+      GSink.Use([4]);
+    end;
   end;
 end.

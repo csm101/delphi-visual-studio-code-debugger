@@ -102,7 +102,7 @@ VS Code  ── DAP (JSON over stdio) ──>  VisualStudioCodeDelphiDebugger.ex
 - `DebuggerTests\`: DUnitX integration test suite. Launches the adapter,
   exercises BPs / locals / step / globals / evaluate.
   Run with `cmd /c "C:\Athens\GitHub\Win64Debugger\DebuggerTests\build_and_run.bat"`.
-  Current status: **1188 found / 1184 pass / 0 fail / 0 leaked / 4 ignored**,
+  Current status: **1282 found / 1278 pass / 0 fail / 0 leaked / 4 ignored**,
   in ~80 s (~12 s build + ~68 s of tests across 8 concurrent worker processes).
   Set `RUNTESTS_JOBS=1` for the sequential path — same results, ~440 s. See
   "Parallel execution" in `CLAUDE.md`.
@@ -1220,6 +1220,22 @@ Architecture / portability:
   Common "noise" first-chance codes seen in large Delphi apps:
   `STATUS_GUARD_PAGE_VIOLATION` ($80000001, fires on every stack/heap page
   growth), C++ SEH probing, CLR internal exceptions.
+- **The `on E:` alias of a handler in a PROGRAM MAIN BLOCK — implemented
+  (x64).** `get_locals` lists it while, and only while, the stop is lexically
+  inside that clause. It is not an ordinary local and never was: dcc gives a
+  main-block alias a module-level static rather than a frame slot (measured on
+  both bitnesses), so every symbol reader files it as a program-wide global —
+  which is why `evaluate E` answered there long before Locals listed it, and why
+  no amount of RSM scope-walking would have found it. The adapter locates the
+  `on`-clause block from the routine's own scope + clause tables, decodes the
+  block's first instruction (the store of the exception object into the alias)
+  to learn the slot, and names it from the globals table.
+  `TWinDebugger.TryGetExceptHandlerBlockAt` / `TryGetHandlerAliasLocal`; formats
+  and the block-extent rule in `EH_FORMAT_NOTES.md`. Withdrawn again at the end
+  of the block, which is what keeps it out of a sibling bare `except`, where the
+  static holds a dangling pointer to the already-freed previous exception.
+  x86 declines (no `.pdata`, so no block extents); a handler inside a PROCEDURE
+  is unaffected on both bitnesses, its alias being a plain stack local.
 - **Pause button** — implemented via `DebugBreakProcess`, which injects a
   temporary thread that executes `INT3`. The resulting `EXCEPTION_BREAKPOINT`
   arrives with an unknown VA (not in our BP list). Detected by `FPauseRequested`

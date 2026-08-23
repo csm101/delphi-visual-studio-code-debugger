@@ -487,6 +487,18 @@ fixture):
       `Test_Hover_ExceptionInHandler_Message`)
 - [x] Expand E in variables view (`Test_Hover_ExceptionInHandler_Expandable`,
       `Test_ExceptionLocal_ShowsExceptionObject`)
+- [x] `on E:` alias inside a PROCEDURE stays a Locals row
+      (`Test_ProcedureHandler_AliasStillListedInLocals`)
+- [x] `on E:` alias inside the PROGRAM MAIN BLOCK is a Locals row -- the
+      compiler puts it in a module-level static, not on the frame
+      (`Test_MainBlockHandler_AliasListedInLocals`), holds the live object
+      (`Test_MainBlockHandler_AliasMessageEvaluates`), and is usable as a
+      breakpoint condition in both directions
+      (`Test_MainBlockHandler_AliasGatesConditionalBreakpoint`,
+      `Test_MainBlockHandler_AliasConditionFalse_NeverStops`)
+- [x] That alias is scoped to its own clause: absent in a sibling bare
+      `except` (`Test_MainBlockHandler_AliasAbsentInBareHandler`) and absent
+      outside any handler (`Test_MainBlockHandler_AliasAbsentOutsideHandler`)
 - [x] Exception class DEFINED in a BPL -- E.ClassName/E.Message in its
       handler via runtime VMT (`Test_BL_Exc_BplDefinedClass`)
 - [x] Re-raise (bare `raise;`) -- second exception stop, propagation to the

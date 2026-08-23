@@ -92,6 +92,30 @@ type
     Description: string;
   end;
 
+  // What an `except` block is, when one has been located from a routine's own
+  // exception-dispatch data.
+  //   ehbOnClause   -- the block of an `on <X>: <Class> do` clause. The alias
+  //                    X names the exception object for the block's extent.
+  //   ehbBareExcept -- a bare `except .. end`. The object has no source-level
+  //                    name at all, which is what `$exception` exists for.
+  // The two are mutually exclusive for one block, and that is load-bearing:
+  // offering both names for the same handler would put a stale alias next to a
+  // live pseudo-variable.
+  TExcHandlerBlockKind = (ehbNone, ehbOnClause, ehbBareExcept);
+
+  // One located `except` block of the routine a PC is standing in.
+  //
+  // [StartVA, EndVA) is the block's real extent, not a guess: dcc wraps every
+  // handler body in a compiler-generated `try .. finally` (it is what calls
+  // System.@DoneExcept), and that finally's scope-table entry is the narrowest
+  // protected range containing the block's second byte. See EH_FORMAT_NOTES.md.
+  TExcHandlerBlock = record
+    Kind:       TExcHandlerBlockKind;
+    StartVA:    UInt64;   // first instruction of the block
+    EndVA:      UInt64;   // one past its last instruction
+    ClassVmtVA: UInt64;   // ehbOnClause only: the VMT the `on` clause names
+  end;
+
   // How one synthetic-call argument has to be materialised in the TARGET.
   //
   // This replaces a plain "is it a float" Boolean, which was sufficient on x64 --

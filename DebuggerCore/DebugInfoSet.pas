@@ -170,6 +170,12 @@ type
                 const FallbackName: string;
                 out Locals: TArray<TLocalSymbol>): Boolean;
     function  GetGlobalsForRva(Rva: UInt64): TArray<TGlobalSymbol>;
+    // The global that LIVES at Rva -- the reverse of FindGlobal, which asks by
+    // name. Used when an address is the only thing known about a variable, e.g.
+    // the compiler-allocated slot an `on E:` clause stores the exception object
+    // into (see EH_FORMAT_NOTES.md). Scoped to the providers that own Rva, so a
+    // multi-module target answers from the right binary.
+    function  TryGetGlobalAtRva(Rva: UInt64; out Global: TGlobalSymbol): Boolean;
     function  FindGlobalForRva(Rva: UInt64; const Name: string;
           out Global: TGlobalSymbol): Boolean;
     function  GetGlobals: TArray<TGlobalSymbol>;
@@ -1284,6 +1290,23 @@ begin
   if Length(Result) > 0 then
     Exit;
   Result := GetGlobals;
+end;
+
+function TDebugInfoSet.TryGetGlobalAtRva(Rva: UInt64;
+  out Global: TGlobalSymbol): Boolean;
+begin
+  Global := Default(TGlobalSymbol);
+  Result := False;
+  if Rva = 0 then Exit;
+  // A linear scan rather than a cached reverse map: the only caller reaches
+  // here at a stop that is lexically inside an `on` clause, which is rare
+  // enough that a per-revision index would cost more to keep correct than the
+  // scan costs to run. GetGlobalsForRva already narrows to the owning binary.
+  for var G in GetGlobalsForRva(Rva) do
+    if G.RVA = Rva then begin
+      Global := G;
+      Exit(True);
+    end;
 end;
 
 function TDebugInfoSet.TryUnitScopedGlobal(const Prov: IGlobalSymbolProvider;

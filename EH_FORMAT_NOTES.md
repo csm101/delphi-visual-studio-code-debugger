@@ -97,6 +97,65 @@ frames above 0 the "frame's own PC" is the **return address** — which is what
                     clause[1] vmt=$1B238 block=$2B92B -> :110   (Exception)
 ```
 
+### Where a handler block ENDS
+
+The scope table names a block's first instruction and never its last. The end is
+still exact, because dcc wraps every handler BODY in a compiler-generated
+`try .. finally` -- that finally is what calls `System.@DoneExcept` -- and that
+wrapper has a scope entry of its own. So:
+
+> a handler block's extent is `[BlockRva, End)` of the **narrowest** scope entry
+> of the same routine that covers `BlockRva + 1`.
+
+The `+ 1` is what makes the bare form work: a bare `except`'s block address is
+the previous entry's EXCLUSIVE `End`, so the block address itself is not inside
+the wrapper, while the byte after it is.
+
+Measured on `Debugme.dpr`'s main block (7 entries, abridged):
+
+```
+[0] Begin=$2FC09 End=$2FCCD Handler=$2FE30 Target=0      try body, clause table
+      clause[0] vmt=$1D748 block=$2FCCE                  the `on E:` block
+[1] Begin=$2FCCE End=$2FD6F Handler=0      Target=$2FE40 wrapper for that block
+[2] Begin=$2FD70 End=$2FD90 Handler=2      Target=$2FD90 bare try; block = End
+[3] Begin=$2FD91 End=$2FDF7 Handler=0      Target=$2FE50 wrapper for THAT block
+```
+
+so the `on E:` block is `[$2FCCE, $2FD6F)` and the bare one `[$2FD90, $2FDF7)` --
+entries `[4]` and `[5]`, the routine-wide finally and except, cover both and lose
+to the narrower ones.
+
+If no entry covers `BlockRva + 1`, the end is NOT derivable and the caller must
+decline. Widening to the end of the routine would keep a handler-scoped name
+alive past its own block, which reads as a live variable and is a dangling one.
+
+### The `on` alias, and where the compiler puts it
+
+`on <X>: <Class> do` allocates X, and the block's FIRST instruction stores the
+exception object (in `RAX`) into it. That instruction is how a debugger learns
+which slot X is:
+
+| first instruction of the block | where the alias lives |
+|---|---|
+| `48 89 45 xx` / `48 89 85 xx xx xx xx` (`mov [rbp+disp], rax`) | an ordinary stack local -- every symbol reader already lists it |
+| `48 89 05 xx xx xx xx` (`mov [rip+disp32], rax`) | a module-level static at `BlockRva + 7 + disp32` |
+
+The second row is not an optimisation artifact: it is what dcc emits for a
+handler in a **program main block**, on both bitnesses. Measured, `Debugme.dpr`
+line 102 -> `48 89 05 F3 52 01 00` -> RVA `$44FC8`, which TD32 carries as the
+LDATA32 `_ZN7Debugme1EE`, sitting immediately after the program's own
+`Debugme.data` and `Debugme.x` globals. `dcc32` does the same
+(`@Testtarget@E`). The static has **no lexical scope in TD32 and no record in
+the RSM main-block table at all**, so to every symbol reader the alias is a
+program-wide global and not a local of the block -- which is why `evaluate E`
+answered there long before `get_locals` listed it.
+
+Consequence for a debugger: the alias of a main-block handler can only be
+surfaced by locating the block first and reading the store, and it must be
+withdrawn again at the block's end. Standing ON the block's first instruction is
+also outside its lifetime -- the store has not retired, and the slot still holds
+a pointer to the PREVIOUS exception, which was freed when its handler finished.
+
 Two attribution details that look like bugs and are not:
 
 - A clause block's first instruction is attributed to the **`on` line**
