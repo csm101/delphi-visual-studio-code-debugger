@@ -90,6 +90,11 @@ button.icon {
   overflow: hidden;
 }
 
+/* Collapsed rules pack tightly: the list is the thing being read. */
+.rule:not(.expanded) {
+  margin-top: 4px;
+}
+
 .rule.invalid {
   border-color: var(--vscode-editorError-foreground);
 }
@@ -100,6 +105,9 @@ button.icon {
   gap: 8px;
   padding: 6px 10px;
   background: var(--vscode-editorWidget-background);
+}
+
+.rule.expanded > .rule-header {
   border-bottom: 1px solid var(--vscode-panel-border);
 }
 
@@ -114,13 +122,65 @@ button.icon {
   color: var(--vscode-badge-foreground);
 }
 
-.rule-summary {
+/*
+ * The disclosure control. It is a button, but it has to read as a row of text:
+ * no border, no background, inheriting the header's alignment, so the affordance
+ * is the pointer and the twisty rather than a second box inside the header.
+ */
+.rule-toggle {
   flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 2px 4px;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  background: none;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.rule-toggle:hover {
+  background: var(--vscode-list-hoverBackground);
+}
+
+.rule-toggle:focus-visible {
+  outline: none;
+  border-color: var(--vscode-focusBorder);
+}
+
+.twisty {
+  flex: none;
+  width: 1em;
+  color: var(--vscode-descriptionForeground);
+}
+
+.rule-criteria {
+  flex: 1;
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
   font-family: var(--vscode-editor-font-family);
   color: var(--vscode-descriptionForeground);
+}
+
+/*
+ * The action never shrinks. A collapsed row whose criteria are too long to fit
+ * still has to answer "and then what?", which is the half a plain ellipsis
+ * would eat first.
+ */
+.action-chip {
+  flex: none;
+  padding: 1px 8px;
+  border-radius: 10px;
+  font-size: 0.85em;
+  font-weight: 600;
+  background: var(--vscode-badge-background);
+  color: var(--vscode-badge-foreground);
 }
 
 .rule-body {

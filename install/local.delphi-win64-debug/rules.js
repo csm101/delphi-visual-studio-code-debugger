@@ -251,8 +251,16 @@ function textToCodes(text) {
   return values;
 }
 
-/** Short plain-English summary shown in each card header. */
-function describeRule(rule) {
+/**
+ * What a rule MATCHES, in plain English, with the criteria it does not set left
+ * out entirely - which is the point: a rule that names a class and a message is
+ * two clauses long, not ten blank fields.
+ *
+ * Separate from the action so a caller with limited width can truncate the
+ * criteria and still show the action in full. In a collapsed card the action is
+ * the half you cannot afford to lose.
+ */
+function describeRuleCriteria(rule) {
   var criteria = [];
   MATCH_FIELDS.forEach(function (field) {
     var value = rule[field.name];
@@ -267,8 +275,12 @@ function describeRule(rule) {
     else if (field.name === 'lineFrom') criteria.push('line >= ' + value);
     else if (field.name === 'lineTo') criteria.push('line <= ' + value);
   });
-  var when = criteria.length ? criteria.join(' AND ') : 'any exception';
-  return when + '  ->  ' + (rule.action || '(no action)');
+  return criteria.length ? criteria.join(' AND ') : 'any exception';
+}
+
+/** Short plain-English summary: what it matches, then what it does. */
+function describeRule(rule) {
+  return describeRuleCriteria(rule) + '  ->  ' + (rule.action || '(no action)');
 }
 
 /** Trims a message to something that fits on one QuickPick line. */
@@ -365,6 +377,7 @@ var api = {
   codesToText: codesToText,
   textToCodes: textToCodes,
   parseExceptionCode: parseExceptionCode,
+  describeRuleCriteria: describeRuleCriteria,
   describeRule: describeRule,
   shortenMessage: shortenMessage,
   suggestRulesForException: suggestRulesForException

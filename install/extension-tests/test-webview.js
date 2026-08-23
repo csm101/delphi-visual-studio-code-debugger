@@ -184,6 +184,19 @@ function lastPosted(view, type) {
   return matches[matches.length - 1];
 }
 
+/**
+ * Opens rule #index for editing. Rules render COLLAPSED, so a test that reaches
+ * for an input has to open its card first -- exactly as a user does. Returns the
+ * toggle so a test can close it again.
+ */
+function expandRule(view, index) {
+  // Cards render in evaluation order, so the Nth toggle is rule N's.
+  const toggles = findAll(view.document, (node) => node.className === 'rule-toggle');
+  assert.ok(toggles[index], 'no rule at index ' + index + ' to open');
+  toggles[index].fire('click');
+  return toggles[index];
+}
+
 const SAMPLE = {
   configurationName: 'Debug SampleApp',
   documentLabel: 'SampleApp/.vscode/launch.json',
@@ -240,6 +253,7 @@ test('delete and duplicate keep the model consistent', () => {
 
 test('typing an invalid regex blocks saving and shows the problem', () => {
   const view = loadWebview(SAMPLE);
+  expandRule(view, 1);
   const input = view.document.querySelector('[data-input-for="1:messageRegex"]');
   input.value = 'ORA-(\\d+';
   input.fire('input');
@@ -252,6 +266,7 @@ test('typing an invalid regex blocks saving and shows the problem', () => {
 
 test('a comma-separated class list becomes an array', () => {
   const view = loadWebview(SAMPLE);
+  expandRule(view, 0);
   const input = view.document.querySelector('[data-input-for="0:class"]');
   input.value = 'EAbort, EMyError';
   input.fire('input');
@@ -266,6 +281,7 @@ test('a native exception code round-trips instead of being dropped on save', () 
   });
   // It must load as a known criterion (not as an "unknown field" to be removed).
   assert.strictEqual(view.document.getElementById('save-button').disabled, false);
+  expandRule(view, 0);
   const input = view.document.querySelector('[data-input-for="0:code"]');
   assert.strictEqual(input.value, '0x406D1388');
   findByTitle(view.document, 'Write these rules back into the launch configuration')[0].fire('click');
@@ -277,6 +293,7 @@ test('a comma-separated code list becomes an array and an invalid code blocks sa
     configurationName: 'X', documentLabel: 'y', readOnly: false,
     rules: [{ action: 'ignore' }]
   });
+  expandRule(view, 0);
   const input = view.document.querySelector('[data-input-for="0:code"]');
   input.value = '0x406D1388, $C0000005';
   input.fire('input');
@@ -292,6 +309,7 @@ test('a comma-separated code list becomes an array and an invalid code blocks sa
 
 test('changing the action updates the model and the help text', () => {
   const view = loadWebview(SAMPLE);
+  expandRule(view, 2);
   const select = view.document.querySelector('[data-input-for="2:action"]');
   select.value = 'log';
   select.fire('change');
@@ -306,8 +324,81 @@ test('unknown fields loaded from launch.json are reported, not silently kept', (
   });
   assert.strictEqual(view.document.getElementById('save-button').disabled, true);
   assert.match(view.document.getElementById('problems').textContent, /unknown field "clazz"/);
+  expandRule(view, 0);
   findByTitle(view.document, 'Drop the unrecognised fields from this rule')[0].fire('click');
   assert.strictEqual(view.document.getElementById('save-button').disabled, false);
+});
+
+// The reason the collapse exists: a rule table is read far more often than it
+// is edited, and ten fields per rule made twenty rules unreadable.
+test('rules render collapsed, with no form fields until one is opened', () => {
+  const view = loadWebview(SAMPLE);
+  assert.strictEqual(view.document.querySelectorAll('[data-input-for]').length, 0,
+    'a collapsed rule must not render its form');
+  const summaries = findAll(view.document, (node) => node.dataset.criteriaFor !== undefined);
+  assert.deepStrictEqual(summaries.map((node) => node.textContent),
+    ['class = EAbort', 'message =~ /ORA-\\d+/i', 'any exception']);
+});
+
+// Truncating the criteria is fine; truncating "what happens" is not, so the
+// action rides in its own chip rather than at the end of one elided line.
+test('a collapsed rule shows its action outside the truncatable summary', () => {
+  const view = loadWebview(SAMPLE);
+  const chips = findAll(view.document, (node) => node.dataset.actionChipFor !== undefined);
+  assert.deepStrictEqual(chips.map((node) => node.textContent), ['ignore', 'logStack', 'break']);
+});
+
+test('opening a rule reveals its form, and closing it hides it again', () => {
+  const view = loadWebview(SAMPLE);
+  expandRule(view, 1);
+  assert.ok(view.document.querySelector('[data-input-for="1:messageRegex"]'),
+    'the opened rule must render its fields');
+  assert.strictEqual(view.document.querySelector('[data-input-for="0:class"]'), null,
+    'opening one rule must not open the others');
+  expandRule(view, 1);
+  assert.strictEqual(view.document.querySelector('[data-input-for="1:messageRegex"]'), null,
+    'clicking again must close it');
+});
+
+// Expansion is remembered per RULE, not per position: reordering shifts every
+// index below, and the card that was open must still be the card that is open.
+test('an open rule stays open when it is moved', () => {
+  const view = loadWebview(SAMPLE);
+  expandRule(view, 0);
+  findByTitle(view.document, 'Move down (evaluated later)')[0].fire('click');
+  assert.strictEqual(view.document.querySelector('[data-input-for="0:messageRegex"]'), null,
+    'the rule that moved UP into slot 0 was not the one that was open');
+  assert.ok(view.document.querySelector('[data-input-for="1:class"]'),
+    'the moved rule must still be open, now at index 1');
+});
+
+test('a new rule opens for editing, because it is empty', () => {
+  const view = loadWebview(SAMPLE);
+  findByTitle(view.document, 'Append a new rule at the end')[0].fire('click');
+  assert.ok(view.document.querySelector('[data-input-for="3:class"]'),
+    'an added rule must be open: there is nothing to read in it yet');
+});
+
+test('expand all opens every rule, and then offers to collapse them again', () => {
+  const view = loadWebview(SAMPLE);
+  findByTitle(view.document, 'Open every rule for editing')[0].fire('click');
+  [0, 1, 2].forEach((index) => {
+    assert.ok(view.document.querySelector('[data-input-for="' + index + ':class"]'),
+      'rule ' + index + ' should be open');
+  });
+  findByTitle(view.document, 'Show every rule as a single line')[0].fire('click');
+  assert.strictEqual(view.document.querySelectorAll('[data-input-for]').length, 0);
+});
+
+// A rule the HOST rejected must be opened, or the footer names a card whose
+// contents cannot be seen -- and the host's verdict must survive that re-render
+// rather than being replaced by the webview's own (which found nothing wrong).
+test('a rejected rule is opened so the reported problem is visible', () => {
+  const view = loadWebview(SAMPLE);
+  view.post({ type: 'saveRejected', problems: [{ index: 2, field: 'action', message: 'nope' }] });
+  assert.ok(view.document.querySelector('[data-input-for="2:action"]'),
+    'the rejected rule must be opened');
+  assert.match(view.document.getElementById('problems').textContent, /Rule #3 - action: nope/);
 });
 
 test('read-only mode disables editing but still allows Copy JSON', () => {

@@ -558,11 +558,17 @@ Launch configurations are **not** in that list. `exceptionRules` inside
 the same project, started two ways — able to disagree about which exceptions
 matter, which is the problem the project files exist to solve.
 
-The editor then opens with one card per rule, numbered in evaluation order,
-match criteria separated from the action, and up/down buttons to reorder. Rules
-are validated as you type — unknown fields, invalid actions, regular expressions
-that do not compile, inverted line ranges — and saving is blocked while the
-table is invalid.
+The editor then opens with **one line per rule**, numbered in evaluation order:
+what the rule matches, and a badge for what it does. Click a line to open that
+rule's form, click it again to close it, or use **Expand all**. A rule form is
+ten fields of which a typical rule fills two, so a table of twenty rules stays
+readable instead of becoming several screens of empty inputs.
+
+Open cards separate the match criteria from the action and carry up/down buttons
+to reorder. Rules are validated as you type — unknown fields, invalid actions,
+regular expressions that do not compile, inverted line ranges — saving is
+blocked while the table is invalid, and any rule with a problem opens itself so
+the complaint is never about something you cannot see.
 
 **Save** replaces only the rule array of the selected target; every other byte of
 the file, comments included, is left untouched, and the shared file keeps its

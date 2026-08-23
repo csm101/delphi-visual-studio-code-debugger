@@ -6,6 +6,11 @@
  * Design intent:
  *  - the evaluation ORDER is semantic (first match wins), so every rule shows
  *    its position and can be moved with the up/down buttons;
+ *  - a rule is COLLAPSED to one line until it is opened. A rule table is read
+ *    far more often than it is edited, and the full form is ten fields of which
+ *    a typical rule fills two: at twenty rules the form-per-rule layout is
+ *    hundreds of empty inputs and no way to see the list at all. Collapsed, the
+ *    line says what the rule matches and what it does, which is the whole rule;
  *  - match criteria and the action live in two visually separate panes so it is
  *    never ambiguous which is which;
  *  - validation runs on every keystroke using the same rules.js module the
@@ -73,6 +78,36 @@
   var problems = [];
   var dirty = false;
   var statusText = '';
+
+  /*
+   * Which rules are open, held as a set of DRAFT OBJECTS rather than of indices.
+   * Moving a rule, deleting the one above it or duplicating it all shift every
+   * index below; object identity is what survives those, so the card that was
+   * opened stays the card that is open.
+   */
+  var expanded = new Set();
+
+  function isExpanded(draft) {
+    return expanded.has(draft);
+  }
+
+  function setExpanded(draft, open) {
+    if (open) expanded.add(draft); else expanded.delete(draft);
+  }
+
+  // A rule whose fields are invalid has to be readable, or the footer says
+  // "3 problems block saving" while the card it names shows nothing at all.
+  function expandRulesWithProblems() {
+    var opened = false;
+    problems.forEach(function (problem) {
+      var draft = drafts[problem.index];
+      if (draft && !expanded.has(draft)) {
+        expanded.add(draft);
+        opened = true;
+      }
+    });
+    return opened;
+  }
 
   function currentRules() {
     return drafts.map(draftToRule);
@@ -186,29 +221,56 @@
   }
 
   function buildRuleCard(draft, index) {
-    var card = element('div', 'rule');
+    var open = isExpanded(draft);
+    var card = element('div', 'rule' + (open ? ' expanded' : ''));
     card.dataset.ruleIndex = String(index);
 
     var header = element('div', 'rule-header');
     header.appendChild(element('span', 'order-badge', '#' + (index + 1)));
-    var summary = element('span', 'rule-summary', R.describeRule(draftToRule(draft)));
-    summary.dataset.summaryFor = String(index);
-    header.appendChild(summary);
+
+    // The summary IS the disclosure control: one target the width of the header
+    // rather than a chevron to aim at. A real <button>, so it is reachable by
+    // keyboard and announces its own state.
+    var toggle = element('button', 'rule-toggle');
+    toggle.type = 'button';
+    toggle.setAttribute('aria-expanded', open ? 'true' : 'false');
+    toggle.title = open ? 'Collapse this rule' : 'Expand this rule to edit it';
+    toggle.appendChild(element('span', 'twisty', open ? '▾' : '▸'));
+    var summaryOf = draftToRule(draft);
+    var criteria = element('span', 'rule-criteria', R.describeRuleCriteria(summaryOf));
+    criteria.dataset.criteriaFor = String(index);
+    toggle.appendChild(criteria);
+    // The action is never truncated away: collapsed, it is the half that says
+    // what actually happens.
+    var actionChip = element('span', 'action-chip', summaryOf.action || '(no action)');
+    actionChip.dataset.actionChipFor = String(index);
+    toggle.appendChild(actionChip);
+    toggle.addEventListener('click', function () {
+      setExpanded(draft, !isExpanded(draft));
+      render();
+    });
+    header.appendChild(toggle);
+
     header.appendChild(button('↑', 'Move up (evaluated earlier)', function () { moveRule(index, index - 1); },
       { disabled: index === 0 || state.readOnly }));
     header.appendChild(button('↓', 'Move down (evaluated later)', function () { moveRule(index, index + 1); },
       { disabled: index === drafts.length - 1 || state.readOnly }));
     header.appendChild(button('⧉', 'Duplicate this rule', function () {
-      drafts.splice(index + 1, 0, JSON.parse(JSON.stringify(draft)));
+      var copy = ruleToDraft(draftToRule(draft));
+      drafts.splice(index + 1, 0, copy);
+      setExpanded(copy, true);   // you duplicated it in order to change it
       markDirty();
       render();
     }, { disabled: state.readOnly }));
     header.appendChild(button('✕', 'Delete this rule', function () {
+      expanded.delete(draft);
       drafts.splice(index, 1);
       markDirty();
       render();
     }, { disabled: state.readOnly }));
     card.appendChild(header);
+
+    if (!open) return card;
 
     var body = element('div', 'rule-body');
     var matchPane = element('div', 'pane match');
@@ -259,13 +321,19 @@
       var invalid = problemsFor(Number(key[0]), key[1]).length > 0;
       input.classList.toggle('invalid', invalid);
     });
-    document.querySelectorAll('[data-summary-for]').forEach(function (node) {
-      var index = Number(node.dataset.summaryFor);
-      node.textContent = R.describeRule(draftToRule(drafts[index]));
-      var card = document.querySelector('[data-rule-index="' + index + '"]');
-      if (card) {
-        card.classList.toggle('invalid', problems.some(function (problem) { return problem.index === index; }));
-      }
+    document.querySelectorAll('[data-criteria-for]').forEach(function (node) {
+      var index = Number(node.dataset.criteriaFor);
+      node.textContent = R.describeRuleCriteria(draftToRule(drafts[index]));
+    });
+    document.querySelectorAll('[data-action-chip-for]').forEach(function (node) {
+      var index = Number(node.dataset.actionChipFor);
+      node.textContent = drafts[index].action || '(no action)';
+    });
+    // Every card carries its own validity, collapsed ones included: a rule you
+    // cannot see is exactly the one that needs to say it is broken.
+    document.querySelectorAll('[data-rule-index]').forEach(function (card) {
+      var index = Number(card.dataset.ruleIndex);
+      card.classList.toggle('invalid', problems.some(function (problem) { return problem.index === index; }));
     });
     updateFooter();
     updateToolbar();
@@ -302,8 +370,16 @@
     if (preview) preview.textContent = R.serializeRules(currentRules(), '', '\n');
   }
 
-  function render() {
-    revalidate();
+  /*
+   * `options.keepProblems` re-renders WITHOUT re-validating. The host validates
+   * again just before writing and can reject a save; its verdict lives in
+   * `problems` and a local revalidate would silently replace it with this
+   * webview's own, which by construction found nothing wrong. Only the
+   * saveRejected path needs it.
+   */
+  function render(options) {
+    var keepProblems = Boolean(options && options.keepProblems);
+    if (!keepProblems) revalidate();
     var app = document.getElementById('app');
     app.textContent = '';
 
@@ -325,11 +401,22 @@
 
     var toolbar = element('div', 'toolbar');
     var addButton = button('+ Add rule', 'Append a new rule at the end', function () {
-      drafts.push(ruleToDraft({ action: 'break' }));
+      var fresh = ruleToDraft({ action: 'break' });
+      drafts.push(fresh);
+      setExpanded(fresh, true);   // it is empty; it exists to be filled in
       markDirty();
       render();
     }, { className: '', disabled: state.readOnly });
     toolbar.appendChild(addButton);
+    if (drafts.length > 1) {
+      var allOpen = drafts.every(isExpanded);
+      toolbar.appendChild(button(allOpen ? 'Collapse all' : 'Expand all',
+        allOpen ? 'Show every rule as a single line' : 'Open every rule for editing',
+        function () {
+          drafts.forEach(function (draft) { setExpanded(draft, !allOpen); });
+          render();
+        }, { className: '' }));
+    }
     toolbar.appendChild(element('span', 'spacer'));
     var status = element('span', 'status', statusText);
     status.id = 'status';
@@ -369,7 +456,7 @@
     preview.appendChild(pre);
     app.appendChild(preview);
 
-    refreshValidation();
+    if (keepProblems) applyValidationToDom(); else refreshValidation();
   }
 
   window.addEventListener('message', function (event) {
@@ -386,7 +473,9 @@
     } else if (message.type === 'saveRejected') {
       problems = message.problems || [];
       statusText = 'The rules were rejected before writing';
-      applyValidationToDom();
+      // Open whatever it complained about, or the message names cards whose
+      // contents the user cannot see.
+      if (expandRulesWithProblems()) render({ keepProblems: true }); else applyValidationToDom();
     }
   });
 

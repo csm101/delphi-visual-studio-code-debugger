@@ -765,12 +765,20 @@ Exception...` also appears as a button in the floating debug toolbar, pre-filled
 from the exception in front of you.
 
 Pick which of the rule files to edit — the project's own two, or the shared one
-— and the editor opens with one card per rule, numbered in evaluation order.
-Each card separates the **match criteria** from the **action**, and the up/down
-buttons reorder rules — order is semantic, because the first match wins. Rules
-are validated as you type (unknown fields, invalid actions, regular expressions
-that do not compile, inverted line ranges); saving is blocked until the table is
-valid.
+— and the editor opens with one line per rule, numbered in evaluation order:
+what it matches, and a badge for what it does. Click a line to open that rule's
+form and edit it; click again to close it. A rule form is ten fields of which a
+typical rule fills two, so a table of twenty rules stays a table you can read.
+
+**Expand all** opens the lot when you would rather scroll one long form.
+Anything invalid opens itself, so a problem is never reported against a card
+whose contents you cannot see.
+
+Each open card separates the **match criteria** from the **action**, and the
+up/down buttons reorder rules — order is semantic, because the first match
+wins. Rules are validated as you type (unknown fields, invalid actions, regular
+expressions that do not compile, inverted line ranges); saving is blocked until
+the table is valid.
 
 **Save** replaces only the rule array; every other byte of the file — a header
 comment, a sibling key — is left untouched, and the file keeps its shape (a bare
