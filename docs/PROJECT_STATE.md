@@ -500,6 +500,12 @@ Call stack:
   `SymUnloadModule64` — without that, a runtime-loaded BPL has no unwind info
   and the walk collapses to a single frame (see DAP_DEBUGGER_ARCHITECTURE.md).
 - Function names per frame, source line per frame when available.
+- Frames in modules NO provider owns — ntdll, kernel32, any DLL shipped without
+  debug info — are named from that module's export directory, read out of the
+  live image and cached per module (`module!Routine+$offset`, e.g.
+  `ntdll.dll!RtlUserThreadStart+$21`). The `!` marks the answer as export-derived:
+  it says where the nearest EXPORTED routine starts, so a non-exported routine is
+  attributed to the export before it, and `Symbols` stays `saNoSymbols`.
 - Caller frames (every frame but frame 0) are symbolicated at the return
   address MINUS 1, so the reported line/function is the call site rather than
   the instruction after it (an `Assert` call no longer reports the next line).
@@ -581,12 +587,14 @@ by RSM's name-keyed format (see `KNOWN_UNKNOWNS.md`).
 ## Open milestones (roadmap)
 
 Debugger features:
-- **External review feedback (Delphi-PRAXiS, 2026-08-26).** Five items from Kas Ob.'s
-  read of the TD32 reader and the call stack: lazy NAMES resolution, naming OS frames
-  from the PE export directory, the C++Builder `FB0A` signature, locating the debug
-  blob from EOF, and mapping only the blob. Filed as issues #2-#6; reasoning and the
-  one deferred item (rebuilding full signatures from Borland mangling) in
-  `FORUM_FEEDBACK_PLAN.md`.
+- **External review feedback (Delphi-PRAXiS, 2026-08-26) -- four of five DONE.**
+  Issues #2 (NAMES spans), #3 (export-table frame naming), #4 (C++Builder FB0A)
+  and #5 (appended CodeView blob) are implemented, tested and measured; #6
+  (map only the blob) is answered with measurements and left undone, with a
+  different trade proposed in its place. Details and numbers in
+  `FORUM_FEEDBACK_PLAN.md`, which also holds the one item still without a plan:
+  rebuilding a full procedure signature from the Borland mangling instead of
+  truncating at `$`, so a frame can read `Increment Proc(var x: Integer)`.
 - **Debug-info format coverage.** JCL debug info (`.jdbg` / linked `JCLDEBUG`
   section) — DONE (`JclDebugReader.pas`, registered below TD32 / above MAP; opt-in
   `JCL_DEBUG` define, default ON). Verified it does NOT carry the `_ZZ` nested-proc

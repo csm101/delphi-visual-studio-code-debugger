@@ -22,6 +22,7 @@ type
   private
     function ExePath: string;
     function BplPath: string;
+    function SyntheticAppendedBlobBinary(UseCppBuilderSignature: Boolean): string;
   public
     // --- Demangler (pure) ---
     // A bare identifier must not resolve to a member of a class-nested enum,
@@ -35,6 +36,17 @@ type
     [Test] procedure Demangle_Initialization_BecomesUnit;
     [Test] procedure Demangle_Finalization_BecomesUnit;
     [Test] procedure Demangle_NonMangled_ReturnsFalse;
+
+    // --- Container location and dialect ---
+    // The blob does not have to live in a `.debug` section: it can be appended
+    // past the image with nothing describing it, in which case only the trailer
+    // at the end of the FILE can find it.
+    [Test] procedure AppendedBlob_WithNoDebugSection_LoadsIdentically;
+    // C++Builder stamps the same container 'FB0A'. No C++Builder binary exists
+    // here, so the dialect is exercised by restamping a Delphi one: this tests
+    // that the signature is ACCEPTED, and claims nothing about demangling.
+    [Test] procedure CppBuilderSignature_IsAccepted;
+    [Test] procedure ContainerSignature_OfDelphiBinary_IsFB09;
 
     // --- Reader against TestTarget.exe ---
     [Test] procedure Loads_TestTargetExe;
@@ -167,6 +179,112 @@ begin
   if not TFile.Exists(Result) then
     Assert.Fail('TestPackage.bpl not found at ' + Result +
                 ' -- run build_target.bat first');
+end;
+
+function TTD32ReaderTests.SyntheticAppendedBlobBinary(UseCppBuilderSignature: Boolean): string;
+// Produces a temporary binary whose CodeView blob is APPENDED past the image,
+// with no section describing it.
+//
+// No file is assembled by hand: in TestTarget.exe the `.debug` section is
+// already the last one and already ends exactly at EOF, so deleting its 40-byte
+// section HEADER (and decrementing NumberOfSections) leaves every byte of debug
+// info exactly where it was. What remains is a binary the section walk cannot
+// find anything in, and that only the trailer at the end of the file can locate
+// -- which is the layout under test.
+const
+  SIG_DELPHI = $39304246;  // 'FB09'
+  SIG_BCB    = $41304246;  // 'FB0A'
+begin
+  var Bytes := TFile.ReadAllBytes(ExePath);
+  var PeOff: Cardinal := PCardinal(@Bytes[$3C])^;
+  var NumSections: PWord := PWord(@Bytes[PeOff + 6]);
+  var OptSize: Word := PWord(@Bytes[PeOff + 20])^;
+  var LastHdr: Cardinal := PeOff + 24 + OptSize + (NumSections^ - 1) * 40;
+
+  var SecName: AnsiString;
+  SetString(SecName, PAnsiChar(@Bytes[LastHdr]), 6);
+  if SecName <> '.debug' then
+    Assert.Fail('TestTarget.exe no longer ends with a .debug section (found "' +
+                string(SecName) + '") -- this test builds its fixture by deleting that header');
+
+  var RawSize: Cardinal := PCardinal(@Bytes[LastHdr + 16])^;
+  var RawOff:  Cardinal := PCardinal(@Bytes[LastHdr + 20])^;
+  Assert.AreEqual(Int64(RawOff) + Int64(RawSize), Int64(Length(Bytes)),
+    'the .debug section is expected to end at EOF for this fixture to be an appended blob');
+
+  FillChar(Bytes[LastHdr], 40, 0);
+  Dec(NumSections^);
+
+  if UseCppBuilderSignature then begin
+    var TrailerSig: PCardinal := PCardinal(@Bytes[Length(Bytes) - 8]);
+    var OffBack: Cardinal := PCardinal(@Bytes[Length(Bytes) - 4])^;
+    Assert.AreEqual(Cardinal(SIG_DELPHI), TrailerSig^, 'expected a Delphi-stamped fixture');
+    TrailerSig^ := SIG_BCB;
+    PCardinal(@Bytes[Cardinal(Length(Bytes)) - OffBack])^ := SIG_BCB;
+  end;
+
+  Result := TPath.Combine(TPath.GetTempPath,
+    'td32_appended_' + TGUID.NewGuid.ToString.Replace('{', '').Replace('}', '') + '.bin');
+  TFile.WriteAllBytes(Result, Bytes);
+end;
+
+procedure TTD32ReaderTests.AppendedBlob_WithNoDebugSection_LoadsIdentically;
+begin
+  var Expected: Integer := 0;
+  var Reference := TTD32FileReader.Create;
+  try
+    Reference.LoadFromFile(ExePath);
+    Expected := Length(Reference.SortedRvas);
+  finally
+    Reference.Free;
+  end;
+  Assert.IsTrue(Expected > 0, 'reference load produced no line table');
+
+  var Fixture := SyntheticAppendedBlobBinary(False);
+  try
+    var Reader := TTD32FileReader.Create;
+    try
+      Reader.LoadFromFile(Fixture);
+      // Not merely "it loaded": the blob is found at the same place, so the
+      // whole line table has to come out identical to the sectioned original.
+      Assert.AreEqual<Integer>(Expected, Length(Reader.SortedRvas),
+        'appended-blob load produced a different line table');
+    finally
+      Reader.Free;
+    end;
+  finally
+    TFile.Delete(Fixture);
+  end;
+end;
+
+procedure TTD32ReaderTests.CppBuilderSignature_IsAccepted;
+begin
+  var Fixture := SyntheticAppendedBlobBinary(True);
+  try
+    var Reader := TTD32FileReader.Create;
+    try
+      Reader.LoadFromFile(Fixture);
+      Assert.AreEqual(Cardinal($41304246), Reader.ContainerSignature,
+        'the reader did not report the C++Builder dialect it just parsed');
+      Assert.IsTrue(Length(Reader.SortedRvas) > 0,
+        'an FB0A-stamped container parsed to an empty line table');
+    finally
+      Reader.Free;
+    end;
+  finally
+    TFile.Delete(Fixture);
+  end;
+end;
+
+procedure TTD32ReaderTests.ContainerSignature_OfDelphiBinary_IsFB09;
+begin
+  var Reader := TTD32FileReader.Create;
+  try
+    Reader.LoadFromFile(ExePath);
+    Assert.AreEqual(Cardinal($39304246), Reader.ContainerSignature);
+  finally
+    Reader.Free;
+  end;
 end;
 
 // --- Demangler -------------------------------------------------------

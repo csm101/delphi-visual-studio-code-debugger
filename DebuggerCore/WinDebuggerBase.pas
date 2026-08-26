@@ -31,6 +31,17 @@ type
     Origin:   TFrameOrigin;   // which mechanism produced it (diagnostic)
   end;
 
+  // One entry of a module's export directory, kept sorted by RVA so an address
+  // can be attributed to the exported routine that starts at or before it.
+  // This is the LAST resort of symbolication: it names code in modules that
+  // carry no debug info of any kind (ntdll, kernel32, a third-party DLL), which
+  // is why the top of every thread's stack used to read as an anonymous address.
+  TExportedSymbol = record
+    Rva:  Cardinal;
+    Name: string;
+  end;
+  TExportSymbolIndex = TArray<TExportedSymbol>;
+
   // Why a single-step exception ($80000004, or $4000001E under WOW64) arrived.
   // The exception code is the same for a completed single step and a hardware
   // watchpoint hit, so only DR6 can separate them:
@@ -278,6 +289,11 @@ type
     // name skip the multi-second indexing-retry below. Invalidated implicitly:
     // a module load bumps Revision, so a stale entry no longer matches.
     FGlobalMissCache: TDictionary<string, UInt64>;
+    // module base -> its exports, sorted by RVA. Built on first miss for that
+    // module and kept: an export directory does not change while the module is
+    // mapped. An empty entry is a valid answer (the module exports nothing) and
+    // stops the walk from being repeated for every frame.
+    FExportIndexes: TDictionary<UInt64, TExportSymbolIndex>;
     // Explicitly-selected call-stack frame (DAP frameId <> 0). When set,
     // GetLocalValues / the expression evaluator read THIS frame's locals
     // instead of the stopped top frame. 0 = top frame.
@@ -312,6 +328,17 @@ type
     // NearestInstructionBoundaryBefore itself.
     function  NearestExportedEntryBefore(VA: UInt64;
                 out BoundaryVA: UInt64): Boolean;
+    // Names an address from the export directory of whichever module contains
+    // it, for modules no debug-info provider owns. Returns the exported routine
+    // that starts at or before VA, plus the distance from its entry.
+    function  ExportedSymbolAt(VA: UInt64; out Name: string;
+                out Offset: UInt64; out EntryVA: UInt64): Boolean;
+    function  ExportIndexOf(ModBase: UInt64): TExportSymbolIndex;
+    procedure NameFromModuleExports(VA: UInt64; AtReturnAddress: Boolean;
+                var Frame: TStackFrame);
+    function  ModuleNameForBase(ModBase: UInt64): string;
+    // True when VA lies in a module that has been mapped into the target.
+    function  ModuleRangeFor(VA: UInt64; out Base, Size: UInt64): Boolean;
     // Entry address of the routine containing VA, as a VA. Lets a descendant
     // ask "are these two addresses in the same routine" without reaching into
     // the debug-info set or doing its own RVA arithmetic.
@@ -798,7 +825,8 @@ function DropAddressCollisions(const Values: TArray<TLocalValue>;
 implementation
 
 uses
-  System.StrUtils;   // ContainsText, for the language-handler name check
+  System.StrUtils,        // ContainsText, for the language-handler name check
+  System.Generics.Defaults;
 
 const
   // Shortest identifier that may be TAIL-MATCHED against unit-qualified global
@@ -931,6 +959,7 @@ begin
   FDllBases      := TDictionary<string, UInt64>.Create;
   FDllSizes      := TDictionary<string, UInt64>.Create;
   FGlobalMissCache := TDictionary<string, UInt64>.Create;
+  FExportIndexes := TDictionary<UInt64, TExportSymbolIndex>.Create;
   InitializeCriticalSection(FQueueLock);
   FFirstBreak             := False;
   FRunning                := False;
@@ -957,6 +986,7 @@ begin
   FDllBases.Free;
   FDllSizes.Free;
   FGlobalMissCache.Free;
+  FExportIndexes.Free;
   DeleteCriticalSection(FQueueLock);
   inherited;
 end;
@@ -1211,38 +1241,38 @@ end;
 // byte stream does not stop meaning anything at a routine boundary, and the
 // caller verifies the result lands exactly on VA regardless of which
 // routine the boundary came from.
+function TWinDebugger.ModuleRangeFor(VA: UInt64; out Base, Size: UInt64): Boolean;
+
+  function InRange(TryBase, TrySize: UInt64): Boolean;
+  begin
+    Result := (TryBase <> 0) and (TrySize <> 0) and
+      (VA >= TryBase) and (VA < TryBase + TrySize);
+  end;
+
+begin
+  Base := 0;
+  Size := 0;
+  if InRange(FImageBase, FImageSize) then begin
+    Base := FImageBase;
+    Size := FImageSize;
+    Exit(True);
+  end;
+  for var KV in FDllBases do begin
+    var DllSize: UInt64 := 0;
+    if FDllSizes.TryGetValue(KV.Key, DllSize) and InRange(KV.Value, DllSize) then begin
+      Base := KV.Value;
+      Size := DllSize;
+      Exit(True);
+    end;
+  end;
+  Result := False;
+end;
+
 function TWinDebugger.NearestExportedEntryBefore(VA: UInt64;
   out BoundaryVA: UInt64): Boolean;
 const
   DIR_LEN = 40;         // sizeof(IMAGE_EXPORT_DIRECTORY)
   PE32_PLUS_MAGIC = $20B;
-
-  function ModuleRangeContaining(TestVA: UInt64; out Base, Size: UInt64): Boolean;
-
-    function InRange(TryBase, TrySize: UInt64): Boolean;
-    begin
-      Result := (TryBase <> 0) and (TrySize <> 0) and
-        (TestVA >= TryBase) and (TestVA < TryBase + TrySize);
-    end;
-
-  begin
-    Base := 0;
-    Size := 0;
-    if InRange(FImageBase, FImageSize) then begin
-      Base := FImageBase;
-      Size := FImageSize;
-      Exit(True);
-    end;
-    for var KV in FDllBases do begin
-      var DllSize: UInt64 := 0;
-      if FDllSizes.TryGetValue(KV.Key, DllSize) and InRange(KV.Value, DllSize) then begin
-        Base := KV.Value;
-        Size := DllSize;
-        Exit(True);
-      end;
-    end;
-    Result := False;
-  end;
 
   function ReadDword(Addr: UInt64; out Value: DWORD): Boolean;
   begin
@@ -1260,7 +1290,7 @@ var
   ModBase, ModSize: UInt64;
 begin
   BoundaryVA := 0;
-  if not ModuleRangeContaining(VA, ModBase, ModSize) then
+  if not ModuleRangeFor(VA, ModBase, ModSize) then
     Exit(False);
 
   var ELfanew: DWORD;
@@ -1321,6 +1351,190 @@ begin
 
   BoundaryVA := ModBase + BestRva;
   Result := True;
+end;
+
+function TWinDebugger.ExportIndexOf(ModBase: UInt64): TExportSymbolIndex;
+// Reads one module's export directory out of the LIVE image and returns its
+// named exports sorted by RVA. Built once per module and cached, including when
+// it comes back empty: a module with no exports must not be re-walked for every
+// frame that lands in it.
+//
+// The whole export data directory is read in ONE ReadProcessMemory call and
+// parsed locally. Walking it with a read per field would mean thousands of
+// round-trips into the debuggee for a module like ntdll, on a path that runs
+// while the target is stopped and a human is waiting for a call stack.
+const
+  PE32_PLUS_MAGIC = $20B;
+var
+  Blob: TBytes;
+  ExportRva, ExportSize: DWORD;
+
+  function ReadDword(Addr: UInt64; out Value: DWORD): Boolean;
+  begin
+    Value := 0;
+    Result := ReadProcessMemoryAt(Addr, @Value, 4);
+  end;
+
+  // Field access relative to the module, served from the one-shot read when the
+  // RVA falls inside the export directory (which is where these arrays live in
+  // every normal image) and from the target otherwise.
+  function DwordAtRva(Rva: Cardinal; out Value: DWORD): Boolean;
+  begin
+    if (Rva >= ExportRva) and (Rva + 4 <= ExportRva + ExportSize) then begin
+      Move(Blob[Rva - ExportRva], Value, 4);
+      Exit(True);
+    end;
+    Result := ReadDword(ModBase + Rva, Value);
+  end;
+
+  function WordAtRva(Rva: Cardinal; out Value: Word): Boolean;
+  begin
+    if (Rva >= ExportRva) and (Rva + 2 <= ExportRva + ExportSize) then begin
+      Move(Blob[Rva - ExportRva], Value, 2);
+      Exit(True);
+    end;
+    Value := 0;
+    Result := ReadProcessMemoryAt(ModBase + Rva, @Value, 2);
+  end;
+
+  function AnsiStringAtRva(Rva: Cardinal): string;
+  begin
+    Result := '';
+    if (Rva < ExportRva) or (Rva >= ExportRva + ExportSize) then
+      Exit;
+    var Stop := Rva - ExportRva;
+    while (Stop < Cardinal(Length(Blob))) and (Blob[Stop] <> 0) do
+      Inc(Stop);
+    var Len := Stop - (Rva - ExportRva);
+    if Len = 0 then
+      Exit;
+    var Raw: AnsiString;
+    SetString(Raw, PAnsiChar(@Blob[Rva - ExportRva]), Len);
+    Result := string(Raw);
+  end;
+
+begin
+  Result := nil;
+  if FExportIndexes.TryGetValue(ModBase, Result) then
+    Exit;
+
+  try
+    var ELfanew: DWORD;
+    if not ReadDword(ModBase + $3C, ELfanew) then Exit;
+    var PESig: DWORD;
+    if not ReadDword(ModBase + ELfanew, PESig) or (PESig <> $00004550) then Exit;
+
+    var OptBase := ModBase + ELfanew + 24;
+    var OptMagic: Word := 0;
+    if not ReadProcessMemoryAt(OptBase, @OptMagic, 2) then Exit;
+    var DataDirBase: UInt64;
+    if OptMagic = PE32_PLUS_MAGIC then
+      DataDirBase := OptBase + 112
+    else
+      DataDirBase := OptBase + 96;
+
+    if not ReadDword(DataDirBase, ExportRva) or
+       not ReadDword(DataDirBase + 4, ExportSize) then Exit;
+    if (ExportRva = 0) or (ExportSize = 0) then Exit;
+
+    SetLength(Blob, ExportSize);
+    if not ReadProcessMemoryAt(ModBase + ExportRva, @Blob[0], ExportSize) then Exit;
+
+    var NumNames, AddrFuncs, AddrNames, AddrOrdinals: DWORD;
+    if not DwordAtRva(ExportRva + 24, NumNames) or
+       not DwordAtRva(ExportRva + 28, AddrFuncs) or
+       not DwordAtRva(ExportRva + 32, AddrNames) or
+       not DwordAtRva(ExportRva + 36, AddrOrdinals) then Exit;
+
+    SetLength(Result, NumNames);
+    var Kept := 0;
+    for var I := 0 to Integer(NumNames) - 1 do begin
+      var NameRva: DWORD;
+      if not DwordAtRva(AddrNames + Cardinal(I) * 4, NameRva) then Continue;
+      var Ordinal: Word;
+      if not WordAtRva(AddrOrdinals + Cardinal(I) * 2, Ordinal) then Continue;
+      var FuncRva: DWORD;
+      if not DwordAtRva(AddrFuncs + Cardinal(Ordinal) * 4, FuncRva) then Continue;
+      if FuncRva = 0 then Continue;
+      // A forwarder's "address" is a string inside the export directory
+      // (`ntdll.RtlAllocateHeap`), not code. Naming an address after one would
+      // be a lie: the code it forwards to lives in another module entirely.
+      if (FuncRva >= ExportRva) and (FuncRva < ExportRva + ExportSize) then Continue;
+      var Name := AnsiStringAtRva(NameRva);
+      if Name = '' then Continue;
+      Result[Kept].Rva  := FuncRva;
+      Result[Kept].Name := Name;
+      Inc(Kept);
+    end;
+    SetLength(Result, Kept);
+
+    TArray.Sort<TExportedSymbol>(Result, TComparer<TExportedSymbol>.Construct(
+      function(const A, B: TExportedSymbol): Integer
+      begin
+        if A.Rva < B.Rva then
+          Result := -1
+        else if A.Rva > B.Rva then
+          Result := 1
+        else
+          Result := 0;
+      end));
+  finally
+    FExportIndexes.AddOrSetValue(ModBase, Result);
+  end;
+end;
+
+function TWinDebugger.ModuleNameForBase(ModBase: UInt64): string;
+// Lowercase file name of a loaded DLL, or '' when the base is the main image
+// (whose path this class never receives -- it only ever sees its base address)
+// or a module the loader never announced.
+begin
+  Result := '';
+  for var KV in FDllBases do
+    if KV.Value = ModBase then
+      Exit(KV.Key);
+end;
+
+function TWinDebugger.ExportedSymbolAt(VA: UInt64; out Name: string;
+  out Offset: UInt64; out EntryVA: UInt64): Boolean;
+// Last-resort naming: the exported routine that starts at or before VA. This is
+// what puts `BaseThreadInitThunk` and `RtlUserThreadStart` on the top frames of
+// every thread stack instead of a bare address, and it names code in any DLL
+// that ships without debug info -- which is the general case the two OS frames
+// are only the most visible instance of.
+begin
+  Name    := '';
+  Offset  := 0;
+  EntryVA := 0;
+  var ModBase, ModSize: UInt64;
+  if not ModuleRangeFor(VA, ModBase, ModSize) then
+    Exit(False);
+  var Index := ExportIndexOf(ModBase);
+  if Length(Index) = 0 then
+    Exit(False);
+  var TargetRva := VA - ModBase;
+  if TargetRva > High(Cardinal) then
+    Exit(False);
+
+  // Rightmost entry with Rva <= TargetRva.
+  var Lo := 0;
+  var Hi := High(Index);
+  var Best := -1;
+  while Lo <= Hi do begin
+    var Mid := (Lo + Hi) div 2;
+    if UInt64(Index[Mid].Rva) <= TargetRva then begin
+      Best := Mid;
+      Lo := Mid + 1;
+    end
+    else
+      Hi := Mid - 1;
+  end;
+  if Best < 0 then
+    Exit(False);
+
+  Name    := Index[Best].Name;
+  Offset  := TargetRva - Index[Best].Rva;
+  EntryVA := ModBase + Index[Best].Rva;
+  Result  := True;
 end;
 
 function TWinDebugger.FunctionEntryOf(VA: UInt64; out EntryVA: UInt64): Boolean;
@@ -3082,6 +3296,42 @@ begin
   var FuncRva: UInt64 := 0;
   if FDebugInfo.RvaToFunctionStart(LookupRva, FuncRva) then
     Frame.FuncEntryVA := RvaToVA(FuncRva);
+  if Frame.FunctionName = '' then
+    NameFromModuleExports(VA, AtReturnAddress, Frame);
+end;
+
+procedure TWinDebugger.NameFromModuleExports(VA: UInt64;
+  AtReturnAddress: Boolean; var Frame: TStackFrame);
+// No debug-info provider owns this address, which is the normal state of
+// affairs for ntdll, kernel32 and any third-party DLL built without debug
+// info. Its export directory still says where each exported routine starts, so
+// the frame can be named `module!Routine+$offset` instead of being left blank
+// for the UI to render as a bare address.
+//
+// The `!` is deliberate and is not cosmetic: it marks a name that came from an
+// export table rather than from debug info. An export tells us where a routine
+// STARTS, nothing more -- a static function between two exports is attributed
+// to the export before it, so the offset can be large and the name can be the
+// wrong routine. A reader has to be able to tell the two kinds of answer apart.
+begin
+  var Lookup := VA;
+  if AtReturnAddress and (Lookup > 0) then
+    Dec(Lookup);
+  var Name: string;
+  var Offset, EntryVA: UInt64;
+  if not ExportedSymbolAt(Lookup, Name, Offset, EntryVA) then
+    Exit;
+  var ModuleName := '';
+  var ModBase, ModSize: UInt64;
+  if ModuleRangeFor(Lookup, ModBase, ModSize) then
+    ModuleName := ModuleNameForBase(ModBase);
+  if ModuleName <> '' then
+    Frame.FunctionName := ModuleName + '!' + Name
+  else
+    Frame.FunctionName := Name;
+  if Offset > 0 then
+    Frame.FunctionName := Frame.FunctionName + Format('+$%x', [Offset]);
+  Frame.FuncEntryVA := EntryVA;
 end;
 
 function TWinDebugger.ResymbolicateFrames(

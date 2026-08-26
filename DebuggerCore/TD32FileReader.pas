@@ -73,7 +73,12 @@ uses
   DebugInfoTypes;
 
 const
-  TD32_SIGNATURE: Cardinal = $39304246; // 'FB09' little-endian
+  // Container signature. Delphi stamps 'FB09'; C++Builder stamps 'FB0A' on a
+  // container that is otherwise identical -- what differs between the two is
+  // name mangling, not layout. Every signature test goes through
+  // IsTD32Signature so a new dialect is one entry, not a new comparison.
+  TD32_SIGNATURE:        Cardinal = $39304246; // 'FB09' little-endian, Delphi
+  TD32_SIGNATURE_BCB:    Cardinal = $41304246; // 'FB0A' little-endian, C++Builder
 
   SST_MODULE         = $120;
   SST_TYPES          = $121;
@@ -90,6 +95,14 @@ type
     ModIndex: Word;
     Offset:   Cardinal;
     Size:     Cardinal;
+  end;
+
+  // Where one entry of the NAMES table lives, relative to the start of the
+  // table. Eight bytes per name instead of a decoded string, which is what
+  // lets the reader index the whole table without allocating for it.
+  TTD32NameSpan = record
+    Offset: Cardinal;
+    Len:    Cardinal;
   end;
 
   TTD32ProcRange = record
@@ -215,6 +228,10 @@ type
 
     // TD32 header position (within .debug).
     FTd32Base:     PByte;
+    // Which container dialect was actually found there: TD32_SIGNATURE (Delphi)
+    // or TD32_SIGNATURE_BCB (C++Builder). The layout is the same either way;
+    // this is kept so name demangling can branch on the producer.
+    FSignature:    Cardinal;
 
     // Directory.
     FDirBase:      PByte;   // first directory block's entries (legacy field,
@@ -224,12 +241,20 @@ type
     FDirEntrySize: Word;
     FDirEntries:   TArray<TTD32DirectoryEntry>;
 
-    // NAMES table, fully decoded during the load (name index -> string). Built
-    // once by LocateNamesSection so the reader is immutable after loading.
+    // NAMES table. The load walks it once and records WHERE each name is, not
+    // what it says: a name index maps to a span in the mapped segment, and
+    // ResolveNameByIndex decodes it on demand. A container holds tens of
+    // thousands of names and a debug session asks for a fraction of them, so
+    // materialising every one cost a managed allocation each (32 bytes minimum
+    // even for a one-letter name) to answer questions nobody asked.
+    //
+    // The spans are built once by LocateNamesSection and never touched again,
+    // which is the property that matters: see the comment there for why the
+    // reader must be immutable once published.
     FNamesBase:    PByte;
     FNamesSize:    Cardinal;
     FNamesCount:   Cardinal;
-    FNamesByIndex: TArray<string>;
+    FNameSpans:    TArray<TTD32NameSpan>;
     FNamesIndexed: Boolean;
 
     // SOURCE_MODULE result tables.
@@ -314,6 +339,7 @@ type
     function  OpenTdsMapping(const TdsPath: string): Int64;
     procedure CloseMappedFile;
     function  FindDebugSection: Boolean;
+    function  FindAppendedDebugBlob: Boolean;
     function  FindTD32Header: Boolean;
     function  ReadDirectory: Boolean;
     function  ReadDirectoryEntry(Index: Integer; out E: TTD32DirectoryEntry): Boolean;
@@ -423,6 +449,15 @@ type
     procedure   LoadFromTdsFile(const TdsPath, ExePath: string; OutputRvaShift: UInt64 = 0);
     // True once debug info was successfully parsed (embedded `.debug` or `.tds`).
     property    Loaded: Boolean read FLoaded;
+    // Container signature found: 'FB09' (Delphi) or 'FB0A' (C++Builder). Zero
+    // until the header is located. C++Builder support is CONTAINER-LEVEL ONLY --
+    // the records parse, but no C++Builder binary has ever been tested against
+    // this reader and C++ name demangling is not implemented. Do not present it
+    // as supported on the strength of this property alone.
+    property    ContainerSignature: Cardinal read FSignature;
+    // How many names the SST_NAMES table declares. Exposed for measurement
+    // (DevTools\Td32LoadBench), not needed by the debugger itself.
+    property    NamesCount: Cardinal read FNamesCount;
 
     // ISourceLineProvider
     function    RvaToSourceLine(Rva: UInt64; out Loc: TSourceLocation): Boolean;
@@ -903,6 +938,11 @@ begin
   end;
 end;
 
+function IsTD32Signature(Value: Cardinal): Boolean;
+begin
+  Result := (Value = TD32_SIGNATURE) or (Value = TD32_SIGNATURE_BCB);
+end;
+
 function TTD32FileReader.FindDebugSection: Boolean;
 begin
   Result := False;
@@ -960,24 +1000,54 @@ begin
   if FDebugRawSize < 16 then Exit;
   var Trailer := FDebugBase + FDebugRawSize - 8;
   var TrailerSig: Cardinal := PCardinal(Trailer)^;
-  if TrailerSig = TD32_SIGNATURE then begin
+  if IsTD32Signature(TrailerSig) then begin
     var OffBack: Cardinal := PCardinal(Trailer + 4)^;
     if (OffBack > 0) and (OffBack <= FDebugRawSize) then begin
       var Candidate := FDebugBase + FDebugRawSize - OffBack;
-      if PCardinal(Candidate)^ = TD32_SIGNATURE then begin
-        FTd32Base := Candidate;
+      if IsTD32Signature(PCardinal(Candidate)^) then begin
+        FTd32Base   := Candidate;
+        FSignature  := PCardinal(Candidate)^;
         Exit(True);
       end;
     end;
   end;
-  // Fallback: linear scan for "FB09" signature in first 256 bytes.
+  // Fallback: linear scan for the signature in the first 256 bytes.
   var Limit := Min(Int64(256), Int64(FDebugRawSize - 4));
   for var I: Int64 := 0 to Limit do begin
-    if PCardinal(FDebugBase + I)^ = TD32_SIGNATURE then begin
-      FTd32Base := FDebugBase + I;
+    if IsTD32Signature(PCardinal(FDebugBase + I)^) then begin
+      FTd32Base  := FDebugBase + I;
+      FSignature := PCardinal(FDebugBase + I)^;
       Exit(True);
     end;
   end;
+end;
+
+function TTD32FileReader.FindAppendedDebugBlob: Boolean;
+// A CodeView blob does not have to live in a `.debug` section: it can simply be
+// appended past the end of the image, with nothing in the section table
+// describing it. The Borland debugger never looks for a section at all -- it
+// seeks to the end of the FILE, reads the trailer (signature + distance back to
+// the start of the blob) and re-checks the signature at the computed start.
+// That is what this does, and it is the only way such a binary can be read.
+//
+// The section walk still runs first, and not only for the embedded case: it is
+// what builds FSegmentVAs / FSecRva* / FImageBase, without which no CodeView
+// offset can be turned into an RVA. So this is a fallback for LOCATING the
+// blob, not a replacement for parsing the PE.
+begin
+  Result := False;
+  if (FBase = nil) or (FSize < 16) then Exit;
+  var Trailer := FBase + FSize - 8;
+  if not IsTD32Signature(PCardinal(Trailer)^) then Exit;
+  var OffBack: Cardinal := PCardinal(Trailer + 4)^;
+  if (OffBack = 0) or (Int64(OffBack) > FSize) then Exit;
+  var StartOff: Int64 := FSize - OffBack;
+  if not IsTD32Signature(PCardinal(FBase + StartOff)^) then Exit;
+  FDebugRawOff  := Cardinal(StartOff);
+  FDebugRawSize := Cardinal(FSize - StartOff);
+  FDebugBase    := FBase + StartOff;
+  FDebugEnd     := FBase + FSize;
+  Result := True;
 end;
 
 function TTD32FileReader.ReadDirectory: Boolean;
@@ -1049,7 +1119,7 @@ begin
   FNamesSize    := 0;
   FNamesCount   := 0;
   FNamesIndexed := False;
-  SetLength(FNamesByIndex, 0);
+  SetLength(FNameSpans, 0);
   for var I := 0 to Integer(FDirCount) - 1 do begin
     var E: TTD32DirectoryEntry;
     if not ReadDirectoryEntry(I, E) then Continue;
@@ -1059,16 +1129,20 @@ begin
       FNamesCount := PCardinal(P)^;
       FNamesBase  := P + 4;
       FNamesSize  := E.Size - 4;
-      // Build the whole names table NOW, during the load, rather than lazily on
-      // the first ResolveNameByIndex. TTD32FileReader has no lock of any kind and
-      // is shared by every consumer of a module's symbols; a lazy build meant the
-      // hot name-resolution path MUTATED the reader (SetLength + element writes +
-      // a dictionary Add) long after publication. Two threads naming addresses in
-      // the same module then raced a dynamic-array realloc, and the cache's
-      // `Add` (not AddOrSetValue) could raise a duplicate-key EListError out of a
-      // stackTrace. Building here makes the reader immutable once loaded, which
-      // is what lets the symbol prefetcher hand a finished reader to the
-      // dispatch thread without any synchronisation at all.
+      // Index the names table NOW, during the load. What is built is the span
+      // table, not the strings: decoding happens per call in ResolveNameByIndex.
+      //
+      // What must NOT move back into the resolution path is the BUILD.
+      // TTD32FileReader has no lock of any kind and is shared by every consumer
+      // of a module's symbols; an earlier lazy version MUTATED the reader from
+      // the hot naming path (SetLength + element writes + a dictionary Add) long
+      // after publication. Two threads naming addresses in the same module raced
+      // a dynamic-array realloc, and the cache's `Add` (not AddOrSetValue) could
+      // raise a duplicate-key EListError out of a stackTrace. Building here
+      // makes the reader immutable once loaded, which is what lets the symbol
+      // prefetcher hand a finished reader to the dispatch thread without any
+      // synchronisation at all. Resolving on demand is safe precisely because it
+      // only READS that finished table.
       BuildNamesIndex;
       Exit;
     end;
@@ -1082,7 +1156,11 @@ begin
   // Walk the names table once. JCL format: each name = <LenByte><Bytes><NUL>.
   // For Len > 255: 255 stored in lenbyte then actual content includes
   // 256-byte chunks until a NUL terminator is reached.
-  SetLength(FNamesByIndex, FNamesCount + 1);
+  //
+  // Only the span is recorded. The walk still has to visit every name, because
+  // an entry can only be found by stepping over the one before it, but it no
+  // longer decodes what it steps over.
+  SetLength(FNameSpans, FNamesCount + 1);
   var P := FNamesBase;
   var Stop := FNamesBase + FNamesSize;
   var I: Cardinal := 1;
@@ -1096,10 +1174,8 @@ begin
       Inc(P, 256);
     var ActualLen: Int64 := P - Start;
     if (Start < Stop) and (ActualLen > 0) and (ActualLen < FNamesSize) then begin
-      var Buf: TBytes;
-      SetLength(Buf, ActualLen);
-      Move(Start^, Buf[0], ActualLen);
-      FNamesByIndex[I] := DecodeTD32Name(Buf);
+      FNameSpans[I].Offset := Cardinal(Start - FNamesBase);
+      FNameSpans[I].Len    := Cardinal(ActualLen);
     end;
     Inc(P);  // past NUL terminator
     Inc(I);
@@ -1109,13 +1185,22 @@ end;
 
 function TTD32FileReader.ResolveNameByIndex(Idx: Cardinal): string;
 begin
-  // Pure read: FNamesByIndex is complete before the reader is published (see
-  // LocateNamesSection). No cache -- an array index is cheaper than the
-  // TDictionary lookup that used to front it, and removing the dictionary is
-  // what makes this method side-effect free.
+  // Pure read: the span table is complete before the reader is published (see
+  // LocateNamesSection) and the mapped segment it points into stays mapped for
+  // the reader's lifetime. Nothing here writes to the instance, which is what
+  // lets several threads name addresses in the same module without a lock.
+  //
+  // No memo cache on purpose: a cache would be exactly the mutation this method
+  // must not perform. Callers that resolve the same name in a loop should hoist
+  // the result, not ask the reader to remember it.
   Result := '';
-  if (Idx >= 1) and (Idx < Cardinal(Length(FNamesByIndex))) then
-    Result := FNamesByIndex[Idx];
+  if (Idx < 1) or (Idx >= Cardinal(Length(FNameSpans))) then Exit;
+  var Span := FNameSpans[Idx];
+  if Span.Len = 0 then Exit;
+  var Buf: TBytes;
+  SetLength(Buf, Span.Len);
+  Move((FNamesBase + Span.Offset)^, Buf[0], Span.Len);
+  Result := DecodeTD32Name(Buf);
 end;
 
 procedure TTD32FileReader.ParseSourceModule(const Entry: TTD32DirectoryEntry);
@@ -2191,10 +2276,15 @@ begin
   FExePath := ExePath;
   FOutputRvaShift := OutputRvaShift;
   OpenMappedFile(ExePath);
+  // The section walk always runs: besides finding an embedded `.debug`, it is
+  // what builds the segment -> RVA tables and the image base. Only when no such
+  // section exists do we fall back to the trailer at the end of the file, which
+  // finds a blob appended past the image with nothing describing it.
   if not FindDebugSection then
-    raise Exception.Create('No .debug section in ' + ExePath);
+    if not FindAppendedDebugBlob then
+      raise Exception.Create('No .debug section and no appended CodeView blob in ' + ExePath);
   if not FindTD32Header then
-    raise Exception.Create('No TD32 signature in .debug');
+    raise Exception.Create('No TD32 signature in ' + ExePath);
   if not ReadDirectory then
     raise Exception.Create('Invalid TD32 directory');
   LocateNamesSection;

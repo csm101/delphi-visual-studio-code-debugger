@@ -17,9 +17,20 @@ mangling — see "Borland demangler" below.
 
 ## Container layout
 
-1. PE section `.debug` (raw offset taken from the section header).
+1. PE section `.debug` (raw offset taken from the section header), or — when no
+   such section exists — the blob appended past the image with nothing
+   describing it. `LoadFromFile` falls back to `FindAppendedDebugBlob`, which
+   seeks the trailer at the end of the FILE (signature + distance back to the
+   start of the blob) and re-checks the signature there. The section walk still
+   always runs: it is what builds the segment → RVA tables and the image base,
+   without which no CodeView offset can be translated, so the PE is not
+   redundant even when the blob is not in a section.
 2. Inside the section: the bytes `46 42 30 39` (`'FB09'` little-endian =
    `$39304246` -- `TD32_SIGNATURE`) mark the start of the TD32 block.
+   C++Builder stamps `'FB0A'` (`$41304246`) on an otherwise identical
+   container; both are accepted (`IsTD32Signature`) and which one was found is
+   kept in `ContainerSignature`. **Container level only** — no C++Builder binary
+   has been tested against this reader and C++ demangling is not implemented.
 3. Header at TD32 base:
 
    | offset | size | meaning                                            |
@@ -76,8 +87,37 @@ Each `name`:
 
 The "stops at NUL after 256-byte chunks" trick lets the format encode
 names longer than 255 bytes without giving up the 1-byte length field.
-`TTD32FileReader.ResolveNameByIndex` walks this once and indexes the
-results.
+
+`BuildNamesIndex` walks the table once at load time and records, per name index,
+**where** the name is (`TTD32NameSpan`: offset + length into the mapped
+segment) — not what it says. `ResolveNameByIndex` decodes on demand. The walk
+must still visit every entry, since an entry can only be found by stepping over
+the one before it, but it no longer allocates a managed string for each: a
+container holds tens of thousands of names (32 599 in the 64-bit TestTarget) and
+a session asks for a fraction of them.
+
+Two properties are load-bearing and must not be traded away for a cache:
+
+- the span table is complete before the reader is published, and
+- `ResolveNameByIndex` only READS it.
+
+An earlier version resolved names lazily by mutating the reader (`SetLength` +
+element writes + a dictionary `Add`) from the naming path. The reader has no
+lock and is shared by every consumer of a module's symbols, so two threads
+naming addresses in the same module raced a dynamic-array realloc and the cache
+raised a duplicate-key `EListError` out of a stack trace. Decoding on demand is
+safe **because** it allocates only into the result.
+
+Measured (mean of 5, this machine), eager strings → spans:
+
+| binary | names | load | working set held |
+|---|---:|---:|---:|
+| TestTarget x64 | 32 599 | 45.6 → 41.0 ms | 15 548 → 12 948 KB |
+| TestTarget x86 | 30 084 | 35.1 → 29.5 ms | 14 716 → 12 272 KB |
+| Debugme x64    | 17 304 | 11.1 → 7.4 ms  | 2 472 → 2 468 KB |
+
+Debugme is the honest counter-example: its load resolves nearly every name it
+holds, so only the time moves. `DevTools\Td32LoadBench.exe` produces this table.
 
 Names are Itanium-mangled, optionally with one of the Borland-specific
 `_ZT?` prefixes:

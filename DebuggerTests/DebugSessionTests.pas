@@ -77,6 +77,12 @@ type
     // fixture can be made to produce on demand. That half is measured against a
     // real BPL-loading application and is guarded here only against regression.
     [Test] procedure Win32_CallStack_ReachesTheOsFramesAndEndsThere;
+    // Reaching the OS frames is half the job; SAYING what they are is the other
+    // half. No debug info exists for ntdll or kernel32 on a machine with no
+    // symbol server, so those frames used to arrive correct and anonymous and
+    // the UI had nothing to show for them but an address. Their export
+    // directories name them, on both bitnesses.
+    [Test] procedure CallStack_OsTailFrames_AreNamedFromExports;
     // A breakpoint placed on a routine's `begin` line resolves to the routine's
     // ENTRY, where the prologue has not spilled Self or the by-register
     // parameters yet, so every local reads the CALLER's frame. Both bitnesses
@@ -3939,8 +3945,13 @@ begin
     var Frames := Session.GetCallStack;
     Assert.IsTrue(Length(Frames) > 0, 'expected at least one frame');
     var Top := Frames[0];
-    Assert.AreEqual('', Top.FunctionName,
-      'a module with no debug info cannot name its frames');
+    // The NAME is no longer asserted to be empty: a module without debug info
+    // still has an export directory, and the frame now reads as the nearest
+    // exported routine plus an offset (`__dbk_fcall_wrapper+$1330` here).
+    // CallStack_OsTailFrames_AreNamedFromExports owns that behaviour. What this
+    // test guards is that a name obtained that way does NOT get mistaken for
+    // symbols: the module and the symbol state below must survive it, or F23
+    // comes back with a nicer-looking label on it.
     Assert.AreEqual('nodebugexe.exe', LowerCase(Top.ModuleName),
       'the owning module must be reported even when the frame cannot be named');
     Assert.AreEqual(Ord(saNoSymbols), Ord(Top.Symbols),
@@ -6617,6 +6628,67 @@ begin
   finally
     Session.Free;
   end;
+end;
+
+procedure TWin32RunControlTests.CallStack_OsTailFrames_AreNamedFromExports;
+
+  function OsFrameNames(const Exe, Map, Rsm: string; Line: Integer): TArray<string>;
+  begin
+    var Session := OpenSessionAtMarker(Exe, Map, Rsm, TargetDir, W32_SOURCE, Line);
+    try
+      Assert.AreEqual(Ord(dsStopped), Ord(Session.State),
+        'did not stop in ' + ExtractFileName(Exe));
+      Result := [];
+      var TargetModule := LowerCase(ExtractFileName(Exe));
+      for var F in Session.GetCallStack do
+        if (F.ModuleName <> '') and not SameText(F.ModuleName, TargetModule) then
+          Result := Result + [F.FunctionName];
+    finally
+      Session.Free;
+    end;
+  end;
+
+  procedure AssertNamed(const Which: string; const Names: TArray<string>;
+    ExpectThreadStarterByName: Boolean);
+  begin
+    Assert.IsTrue(Length(Names) > 0,
+      Which + ': the stack never reached a module outside the target');
+    // The outermost frame is the thread starter -- the frame the report was
+    // about. Anonymous here means the fallback did not run at all.
+    Assert.IsTrue(Names[High(Names)] <> '',
+      Which + ': the outermost OS frame is still unnamed');
+    // And it must be named from the EXPORT table, not by something upstream
+    // that happens to fill the field in: the marker is the `module!name` form,
+    // and the routine a thread bottoms out in is the OS thread starter.
+    Assert.IsTrue(Names[High(Names)].Contains('!'),
+      Which + ': outermost frame "' + Names[High(Names)] +
+      '" was not named from a module export table');
+    // 64-bit ntdll EXPORTS RtlUserThreadStart, so the outermost frame resolves
+    // to it exactly. The 32-bit ntdll of a WOW64 process does not export its
+    // thread starter at all, so the nearest preceding export is a different
+    // routine and the frame reads `ntdll.dll!SomethingElse+$230`. That is the
+    // honest limit of naming code from an export table: it says where the
+    // nearest EXPORTED routine starts, not which routine the address is in.
+    // The `+$offset` is what stops it from being a false claim, and it is why
+    // this half asserts the form rather than the name.
+    if ExpectThreadStarterByName then
+      Assert.IsTrue(Names[High(Names)].ToLower.Contains('threadstart'),
+        Which + ': outermost frame is "' + Names[High(Names)] +
+        '", expected the OS thread starter');
+    var Anonymous := 0;
+    for var Name in Names do
+      if Name = '' then
+        Inc(Anonymous);
+    Assert.AreEqual<Integer>(0, Anonymous,
+      Format('%s: %d of %d OS frames unnamed', [Which, Anonymous, Length(Names)]));
+  end;
+
+begin
+  Assert.IsTrue(FileExists(Win64Exe), '64-bit control target missing');
+  var Line := MarkerLine(W32_SOURCE, W32_MARKER);
+  Assert.IsTrue(Line > 0, 'marker not found: ' + W32_MARKER);
+  AssertNamed('win64', OsFrameNames(Win64Exe, Win64Map, Win64Rsm, Line), True);
+  AssertNamed('win32', OsFrameNames(Win32Exe, Win32Map, Win32Rsm, Line), False);
 end;
 
 procedure TWin32RunControlTests.Win32_StackFrameNames_MatchWin64;

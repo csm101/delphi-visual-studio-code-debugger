@@ -2127,6 +2127,32 @@ without debug info, and a module whose index is still building. The DAP frontend
 emits `moduleId` and names such a frame `0x… (module: reason)`; the MCP frontend
 emits `module` plus a `symbols` field on every frame.
 
+### Naming a frame from the module's export table
+
+When no provider owns the address, `TWinDebugger.SymbolicateAddress` falls back
+to the export directory of the module containing it
+(`NameFromModuleExports` -> `ExportedSymbolAt` -> `ExportIndexOf`). The frame is
+rendered `module!Routine+$offset`, e.g. `ntdll.dll!RtlUserThreadStart+$21`.
+
+- The directory is read out of the **live image** with `ReadProcessMemoryAt`, in
+  a single read of the whole export data directory, then parsed locally. A read
+  per field would mean thousands of round-trips into a stopped debuggee for a
+  module the size of ntdll, on the path a human is waiting on.
+- The result is cached per module base (`FExportIndexes`), **including when it is
+  empty**, so a module without exports is walked once and not once per frame.
+- Forwarders are skipped: their "address" is a string inside the export
+  directory, and the code they name lives in a different module entirely.
+- `Symbols` stays `saNoSymbols`. An export-derived name is not symbols, and the
+  three-way distinction above must survive the frame acquiring a label.
+
+What this can and cannot say is the whole point of the `!` in the rendering: an
+export table records where each **exported** routine starts, so an address inside
+a routine that is not exported is attributed to the exported one before it. On
+x64 that is usually exact for the OS tail (`RtlUserThreadStart` is exported); in
+a WOW64 process the 32-bit ntdll does not export its thread starter, so the same
+frame reads `ntdll.dll!RtlGetAppContainerNamedObjectPath+$230` — coarse, but not
+false, which is what the `+$offset` is there to make clear.
+
 ### Placeholder source for a frame with no source file (DAP)
 
 Naming such a frame is not enough. A DAP `stackFrame` with **no `source` at all**

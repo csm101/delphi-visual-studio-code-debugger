@@ -212,6 +212,18 @@ parses the SOURCE_MODULE entries, reports the total line-pair count, prints the
 first and last five RVA→source:line mappings and one reverse lookup. Run it
 after changing the TD32 reader.
 
+#### Td32LoadBench
+
+```bat
+DevTools\Win64\Debug\Td32LoadBench.exe <exe-or-bpl> [more paths...] [-n <iterations>]
+```
+
+What a TD32 load costs: per file, the number of names the container holds, the
+mean wall time of a load, and the working set a loaded reader holds. Run it on
+the SAME binaries before and after a change to the loader, so a claim about
+memory or load time is a measurement rather than an argument. The numbers behind
+the NAMES-table change are in `docs/TD32_FORMAT_NOTES.md`.
+
 #### LiveSessionProbe
 
 ```bat

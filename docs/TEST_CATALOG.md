@@ -624,6 +624,27 @@ fixture):
       was async, so a deferred module's init could run past the BP before
       the int3 landed. Now planted synchronously in the LOAD_DLL handler.
 - [ ] EXE built with -V- (no debug info) refuses to start session gracefully
+- [x] CodeView blob APPENDED past the image, with no `.debug` section describing
+      it, is found from the file trailer and produces the same line table as the
+      sectioned original (`AppendedBlob_WithNoDebugSection_LoadsIdentically`;
+      fixture is built by deleting the section header from a copy of
+      TestTarget.exe)
+- [x] C++Builder container signature `FB0A` is accepted, and the dialect that
+      was found is reported (`CppBuilderSignature_IsAccepted`,
+      `ContainerSignature_OfDelphiBinary_IsFB09`). Exercised by restamping a
+      Delphi container: **no C++Builder binary is tested anywhere**, and nothing
+      here claims C++ demangling works
+- [x] Frames in a module with NO debug info of any kind are named from its
+      export table, on both bitnesses
+      (`CallStack_OsTailFrames_AreNamedFromExports`), while the module and the
+      `saNoSymbols` state survive that naming
+      (`Frames_NoDebugInfoModule_ReportModuleAndSymbolState`)
+- [~] Export naming says where the nearest EXPORTED routine starts, so an
+      address inside a non-exported routine is attributed to the export before
+      it (a WOW64 target's outermost frame reads
+      `ntdll.dll!RtlGetAppContainerNamedObjectPath+$230`, not
+      `RtlUserThreadStart`). Deriving the true function start from `.pdata` on
+      x64 would fix that half and is not done
 
 ---
 
