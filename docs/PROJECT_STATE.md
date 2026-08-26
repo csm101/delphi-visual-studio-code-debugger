@@ -581,6 +581,12 @@ by RSM's name-keyed format (see `KNOWN_UNKNOWNS.md`).
 ## Open milestones (roadmap)
 
 Debugger features:
+- **External review feedback (Delphi-PRAXiS, 2026-08-26).** Five items from Kas Ob.'s
+  read of the TD32 reader and the call stack: lazy NAMES resolution, naming OS frames
+  from the PE export directory, the C++Builder `FB0A` signature, locating the debug
+  blob from EOF, and mapping only the blob. Filed as issues #2-#6; reasoning and the
+  one deferred item (rebuilding full signatures from Borland mangling) in
+  `FORUM_FEEDBACK_PLAN.md`.
 - **Debug-info format coverage.** JCL debug info (`.jdbg` / linked `JCLDEBUG`
   section) — DONE (`JclDebugReader.pas`, registered below TD32 / above MAP; opt-in
   `JCL_DEBUG` define, default ON). Verified it does NOT carry the `_ZZ` nested-proc
