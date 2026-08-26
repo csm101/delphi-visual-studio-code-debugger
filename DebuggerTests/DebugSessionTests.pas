@@ -83,6 +83,13 @@ type
     // the UI had nothing to show for them but an address. Their export
     // directories name them, on both bitnesses.
     [Test] procedure CallStack_OsTailFrames_AreNamedFromExports;
+    // A WOW64 process has BOTH loaders mapped and the 64-bit debug loop is told
+    // about all of them, so the 64-bit ntdll used to arrive under the same file
+    // name as the 32-bit one the target actually executes and overwrite it in a
+    // name-keyed registry. A 32-bit session keeps only its own bitness; the
+    // 64-bit control must keep everything, since the same test read backwards
+    // would discard a legitimately low-based module.
+    [Test] procedure Modules_Win32Session_ExcludesTheWow64Layer;
     // A breakpoint placed on a routine's `begin` line resolves to the routine's
     // ENTRY, where the prologue has not spilled Self or the by-register
     // parameters yet, so every local reads the CALLER's frame. Both bitnesses
@@ -6689,6 +6696,57 @@ begin
   Assert.IsTrue(Line > 0, 'marker not found: ' + W32_MARKER);
   AssertNamed('win64', OsFrameNames(Win64Exe, Win64Map, Win64Rsm, Line), True);
   AssertNamed('win32', OsFrameNames(Win32Exe, Win32Map, Win32Rsm, Line), False);
+end;
+
+procedure TWin32RunControlTests.Modules_Win32Session_ExcludesTheWow64Layer;
+
+  function ModulesAt(const Exe, Map, Rsm: string; Line: Integer): TArray<TSessionModule>;
+  begin
+    var Session := OpenSessionAtMarker(Exe, Map, Rsm, TargetDir, W32_SOURCE, Line);
+    try
+      Assert.AreEqual(Ord(dsStopped), Ord(Session.State),
+        'did not stop in ' + ExtractFileName(Exe));
+      Result := Session.GetModules;
+    finally
+      Session.Free;
+    end;
+  end;
+
+begin
+  Assert.IsTrue(FileExists(Win64Exe), '64-bit control target missing');
+  var Line := MarkerLine(W32_SOURCE, W32_MARKER);
+  Assert.IsTrue(Line > 0, 'marker not found: ' + W32_MARKER);
+
+  var Modules32 := ModulesAt(Win32Exe, Win32Map, Win32Rsm, Line);
+  Assert.IsTrue(Length(Modules32) > 1, 'the 32-bit session reported no DLLs at all');
+  var NtdllCount := 0;
+  for var M in Modules32 do begin
+    Assert.IsTrue(M.Base <= $FFFFFFFF,
+      Format('a 32-bit session lists %s at $%x, above 4 GB, so it is the 64-bit ' +
+             'WOW64 layer', [M.Name, M.Base]));
+    if SameText(M.Name, 'ntdll.dll') then begin
+      Inc(NtdllCount);
+      // The one that survives must be the one the target executes: two modules
+      // with the same file name in one registry is the defect, and keeping the
+      // WRONG one would pass a count check while breaking every lookup.
+      Assert.IsTrue(M.Path.ToLower.Contains('syswow64'),
+        'the ntdll kept for a 32-bit session is ' + M.Path);
+    end;
+  end;
+  Assert.AreEqual<Integer>(1, NtdllCount,
+    'exactly one ntdll.dll belongs to a 32-bit session');
+
+  // The control. Discarding by "base below 4 GB" would be wrong in a 64-bit
+  // session, so the rule is one-directional -- and a 64-bit session must still
+  // see the modules that live above 4 GB, which is where they normally are.
+  var Modules64 := ModulesAt(Win64Exe, Win64Map, Win64Rsm, Line);
+  var HighBased := 0;
+  for var M in Modules64 do
+    if M.Base > $FFFFFFFF then
+      Inc(HighBased);
+  Assert.IsTrue(HighBased > 0,
+    'the 64-bit control lost every module above 4 GB -- the filter is firing ' +
+    'in the wrong session');
 end;
 
 procedure TWin32RunControlTests.Win32_StackFrameNames_MatchWin64;

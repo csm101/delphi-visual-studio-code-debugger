@@ -366,6 +366,38 @@ The split runs along one line:
   — go in `TTargetLayout`, a plain data record consulted while decoding a buffer
   that has already been read.
 
+### Both loaders are mapped: which modules a WOW64 session keeps
+
+A WOW64 process has BOTH loaders mapped — the 32-bit ntdll the target executes
+(`C:\Windows\SysWOW64\ntdll.dll`, based below 4 GB) and the 64-bit
+ntdll / `wow64.dll` / `wow64cpu.dll` / `wow64win.dll` layer that translates its
+syscalls. The debug loop is 64-bit, so it receives `LOAD_DLL` for all of them.
+
+`IsForeignBitnessModule` drops the 64-bit half at the door in a 32-bit session
+(`HandleLoadDll`), for two reasons:
+
+- Nothing in it is usable: no application code runs there, it never appears in
+  the 32-bit stack this debugger walks, and no breakpoint can be placed in it.
+- Both ntdlls arrive under the file name `ntdll.dll`, and `FDllBases` /
+  `FDllSizes` are keyed by that name, so whichever loaded second silently
+  overwrote the first. Dropping the foreign half removes the collision by
+  construction instead of by convention.
+
+**The test is one-directional on purpose.** "Base above 4 GB means 64-bit" holds
+only because we already know the process is WOW64, where a 32-bit module cannot
+be there. The converse does NOT hold: a 64-bit process can legitimately map an
+image below 4 GB (a DLL with a low preferred base that did not have to be
+relocated), so a symmetric rule would discard a real module in a 64-bit session.
+A 64-bit target has no foreign modules to drop in the first place — the loader
+refuses a machine mismatch — so the guard is a no-op there.
+
+`RegisterModuleWithDbgHelp` still runs for every module, dropped ones included:
+it costs nothing and `StackWalk64`'s requirements are not ours to second-guess.
+
+Guarded by `Modules_Win32Session_ExcludesTheWow64Layer`, which asserts both
+halves — the 32-bit session keeps exactly one `ntdll.dll` and it is the SysWOW64
+one, and the 64-bit control still sees the modules above 4 GB.
+
 ### The architecture seam
 
 `TWin32Debugger` (`DebuggerCore\WinDebuggerX86.pas`) overrides exactly these and

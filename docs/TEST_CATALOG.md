@@ -639,6 +639,11 @@ fixture):
       (`CallStack_OsTailFrames_AreNamedFromExports`), while the module and the
       `saNoSymbols` state survive that naming
       (`Frames_NoDebugInfoModule_ReportModuleAndSymbolState`)
+- [x] A WOW64 session keeps only its own bitness: the 64-bit ntdll and the
+      `wow64*.dll` layer are dropped at `LOAD_DLL`, so the two `ntdll.dll` no
+      longer collide in the name-keyed registry, while the 64-bit control still
+      sees its modules above 4 GB
+      (`Modules_Win32Session_ExcludesTheWow64Layer`)
 - [~] Export naming says where the nearest EXPORTED routine starts, so an
       address inside a non-exported routine is attributed to the export before
       it (a WOW64 target's outermost frame reads

@@ -339,6 +339,10 @@ type
     function  ModuleNameForBase(ModBase: UInt64): string;
     // True when VA lies in a module that has been mapped into the target.
     function  ModuleRangeFor(VA: UInt64; out Base, Size: UInt64): Boolean;
+    // True for a module that belongs to the OTHER bitness: the 64-bit WOW64
+    // layer seen from a 32-bit session. See the implementation for why the test
+    // must not be made symmetric.
+    function  IsForeignBitnessModule(Base: UInt64): Boolean;
     // Entry address of the routine containing VA, as a VA. Lets a descendant
     // ask "are these two addresses in the same routine" without reaching into
     // the debug-info set or doing its own RVA arithmetic.
@@ -1241,6 +1245,28 @@ end;
 // byte stream does not stop meaning anything at a routine boundary, and the
 // caller verifies the result lands exactly on VA regardless of which
 // routine the boundary came from.
+function TWinDebugger.IsForeignBitnessModule(Base: UInt64): Boolean;
+// A WOW64 process has BOTH loaders mapped: the 32-bit ntdll the target actually
+// executes, and the 64-bit ntdll / wow64*.dll layer that translates its
+// syscalls. The debug loop is 64-bit, so it receives LOAD_DLL for all of them.
+//
+// The 64-bit half is not something a 32-bit session can use: no application
+// code runs there, it never appears in the 32-bit stack this debugger walks, and
+// no breakpoint can be placed in it. It is not merely useless either -- both
+// ntdlls arrive under the file name `ntdll.dll`, and the module registry is
+// keyed by name, so whichever loaded second used to silently overwrite the
+// first. Dropping the foreign half at the door removes the collision by
+// construction rather than by convention.
+//
+// The test is ONE-DIRECTIONAL on purpose. Above 4 GB means 64-bit only because
+// we already know we are looking at a WOW64 process, where a 32-bit module
+// cannot be there. The converse is NOT true: a 64-bit process can legitimately
+// map an image below 4 GB (a DLL with a low preferred base and no relocation),
+// so a symmetric rule would discard a real module in a 64-bit session.
+begin
+  Result := (not TargetLayout.Is64Bit) and (Base > $FFFFFFFF);
+end;
+
 function TWinDebugger.ModuleRangeFor(VA: UInt64; out Base, Size: UInt64): Boolean;
 
   function InRange(TryBase, TrySize: UInt64): Boolean;
@@ -4426,7 +4452,15 @@ begin
 
   // dbghelp must learn about this module too, not just our own MAP/RSM/TD32
   // loader: StackWalk64 reads its unwind info through dbghelp's module list.
+  // Registered for EVERY module, including the ones skipped below: it costs
+  // nothing and the walk's requirements are not ours to second-guess.
   RegisterModuleWithDbgHelp(Path, Base, ImageSize);
+
+  if IsForeignBitnessModule(Base) then begin
+    DapLog(Format('LoadDll: ignoring 64-bit %s base=$%x in a 32-bit session',
+                  [Name, Base]));
+    Exit;
+  end;
 
   if Name <> '' then begin
     FDllBases.AddOrSetValue(Name, Base);
