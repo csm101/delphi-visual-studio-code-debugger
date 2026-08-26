@@ -111,7 +111,7 @@ Also from the report, still to be verified before it goes into
 `TD32_FORMAT_NOTES.md`: PDB and TDS can coexist in one PE as long as the TDS
 block stays last.
 
-## #6 — Map the blob, not the whole image — MEASURED, NOT DONE
+## #6 — Map the blob, not the whole image — DECLINED (2026-08-26)
 
 `TTD32FileReader` maps the entire executable and holds the view for its lifetime;
 `RsmFileReader` and `MapFileReader` do the same. The proposed change was to read
@@ -134,12 +134,19 @@ else, in exchange for rebasing every pointer that survives the load
 (`FDebugBase`, `FDebugEnd`, `FTd32Base`, `FNamesBase` — and #2 made the last of
 these load-bearing after the load, not just during it). Not worth it as stated.
 
-**There is an adjacent change that IS worth deciding on**, and it is a different
-trade: copy the blob into a heap buffer and drop the mapping entirely. A mapped
-view keeps the file object alive, so today a loaded reader keeps the debuggee's
-binary locked against rebuilds for as long as it lives. Trading demand-paged
-mapping for a resident copy (~3.8 MB per module for TestTarget) would remove
-that lock. That is a product decision, not a cleanup, so it is not made here.
+The adjacent change it opened up — copy the blob into a heap buffer, drop the
+mapping, and stop holding the debuggee's binary open — was put to the maintainer
+and **declined on purpose, not on cost**: the lock is wanted.
+
+A mapped view keeps the file object alive, so a rebuild cannot overwrite a binary
+while a session holds its symbols. That refusal is the diagnostic. Without it the
+rebuild succeeds underneath a live session and the debugger goes on reading the
+symbols of an image that no longer exists on disk: breakpoints bind to shifted
+lines, locals read constant garbage, and it presents as a debugger defect rather
+than as a stale build (`TRAPS.md` carries this failure because it has already
+cost time once). A refused write is loud, immediate and correct.
+
+So the mapping stays exactly as it is, on both counts.
 
 ## Not filed: rebuild the full signature from the Borland mangling
 

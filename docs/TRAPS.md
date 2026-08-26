@@ -88,6 +88,15 @@ absurdly.
   `RunTests.exe` links `DebuggerCore` statically. Rebuild EVERY consumer before
   trusting any measurement — stale binaries have produced at least four wrong
   conclusions in this project.
+- **A DEBUGGEE rebuilt behind a live session is read with the symbols of the
+  image that is gone.** Breakpoints bind to shifted lines and locals read
+  constant garbage, and it presents as a debugger defect rather than as a stale
+  build. First check: compare the source's mtime against the `.exe` / `.map` /
+  `.rsm`. This is why the readers keep the binary MAPPED for the reader's
+  lifetime and the file therefore stays locked — the refused write is the
+  diagnostic, and dropping the lock was declined for that reason
+  (`FORUM_FEEDBACK_PLAN.md` #6). A rebuild that fails with F2039 while a session
+  is open is the mechanism working; kill the session, do not work around it.
 - **The adapter builds `-$Q+ -$R+`; `RunTests.cfg` and DevTools do not.** A defect
   that exists only under overflow/range checking passes the suite. Pin the
   directive in the unit source for arithmetic on debuggee-supplied addresses.
