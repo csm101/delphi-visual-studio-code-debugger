@@ -114,8 +114,11 @@ block stays last.
 ## #6 — Map the blob, not the whole image — DECLINED (2026-08-26)
 
 `TTD32FileReader` maps the entire executable and holds the view for its lifetime;
-`RsmFileReader` and `MapFileReader` do the same. The proposed change was to read
-the header conventionally, locate the blob per #5, and map only that region.
+`RsmFileReader` and `MapFileReader` do the same. **What the report objected to was
+memory**: wasted virtual memory, pressure on the allocator, fragmentation. The
+suggested remedies were a read-then-unmap-then-remap, or a 16-32 MB sliding
+window. The lock discussed at the end of this section is NOT part of that
+objection and must not be read as an answer to it.
 
 What the numbers say, before writing any of it:
 
@@ -134,9 +137,12 @@ else, in exchange for rebasing every pointer that survives the load
 (`FDebugBase`, `FDebugEnd`, `FTd32Base`, `FNamesBase` — and #2 made the last of
 these load-bearing after the load, not just during it). Not worth it as stated.
 
-The adjacent change it opened up — copy the blob into a heap buffer, drop the
-mapping, and stop holding the debuggee's binary open — was put to the maintainer
-and **declined on purpose, not on cost**: the lock is wanted.
+### A separate question, ours and not the report's
+
+Nothing below answers Kas Ob.; it was noticed while measuring for him. Copying
+the blob into a heap buffer would let the mapping be dropped, and with it the
+hold on the debuggee's binary. That was put to the maintainer and **declined on
+purpose, not on cost**: the lock is wanted.
 
 A mapped view keeps the file object alive, so a rebuild cannot overwrite a binary
 while a session holds its symbols. That refusal is the diagnostic. Without it the
