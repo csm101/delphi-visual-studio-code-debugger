@@ -217,6 +217,14 @@ the session to be stopped.
   `get_exception_details`,
   `get_debuggee_output` (program stdout), `get_debugger_output` (logpoint
   messages and debugger notices).
+- `get_threads` — every thread at the stop, and per thread its `lastError` (the
+  TEB `LastErrorValue`, i.e. what `GetLastError` would return in THAT thread) and
+  `lastStatus` (the NTSTATUS underneath it, usually the half that says why).
+  Answers "which thread failed and with what" without adding logging and
+  rebuilding. Both fields are omitted when the TEB could not be read, so an
+  absent field never reads as a zero — and a zero is a real answer meaning the
+  last call succeeded. The same two values are available for the stopped thread
+  through `evaluate_expression` as `$lasterror` / `$laststatus`.
 - `get_loaded_modules` — every image mapped in the debuggee (executable first,
   then each DLL / runtime package) with `base`, `size`, `symbols` and
   `formats`. `symbols` uses the same vocabulary as the frames (`loaded`,

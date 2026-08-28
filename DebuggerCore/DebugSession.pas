@@ -2824,6 +2824,12 @@ begin
     Result[I].Name       := FDebugger.GetThreadName(Ids[I]);
     Result[I].IsStopped  := FState = dsStopped;
     Result[I].IsCurrent  := Ids[I] = FStopTid;
+    // Per thread, not just for the stopped one: "which thread failed" is
+    // exactly the question a multi-threaded stop raises, and the TEB of every
+    // frozen thread is readable at the same moment.
+    var Reason: string;
+    Result[I].HasLastError := FDebugger.TryGetThreadLastError(Ids[I],
+      Result[I].LastError, Result[I].LastStatus, Reason);
   end;
 end;
 

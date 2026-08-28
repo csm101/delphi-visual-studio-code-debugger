@@ -237,6 +237,14 @@ begin
     // that is the retargeted main thread, not the injected one). Pass its id as
     // get_call_stack's threadId to walk any other thread.
     O.AddPair('isCurrent', TJSONBool.Create(T.IsCurrent));
+    // The thread's TEB values. Emitted only when they were actually read: a
+    // LastError of 0 means "the last call succeeded", so an absent field and a
+    // zero must not look the same. lastStatus is the NTSTATUS underneath the
+    // Win32 code and is usually the half that says why.
+    if T.HasLastError then begin
+      O.AddPair('lastError', TJSONNumber.Create(Int64(T.LastError)));
+      O.AddPair('lastStatus', TJSONNumber.Create(Int64(T.LastStatus)));
+    end;
     Result.Add(O);
   end;
 end;

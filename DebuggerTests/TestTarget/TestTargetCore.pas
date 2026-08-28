@@ -510,6 +510,13 @@ var
   GDataBpThreadWatched: Integer;
   GDataBpThreadLate:    Integer;
 
+  // What the target itself saw after a deliberate API failure. The debugger
+  // reads the same value out of the thread's TEB from outside; the test
+  // compares the two. Ground truth has to come from inside the target because
+  // a WOW64 process has two TEBs and only its own code knows which one it
+  // writes to.
+  GLastErrorSeen: Cardinal;
+
 procedure ComputeNested(var X: Integer);
 procedure RunAllScenarios;
 
@@ -2276,6 +2283,27 @@ begin
   GSink.Use(['databp local end ', V]);                  // {BP:DATABPLOCAL_END}
 end;
 
+// LastError / LastStatus fixture. A call that is certain to fail sets both
+// halves: the Win32 wrapper stores the error code, the native call underneath
+// it stores the NTSTATUS that caused it. The routine then captures the Win32
+// half in a global, so a test can compare what the debugger read out of the TEB
+// against what the target itself saw -- which is the only trustworthy ground
+// truth for a WOW64 target, where two TEBs exist and only the running code
+// knows which one it writes.
+//
+// Nothing that could call an API sits between the capture and the marker: any
+// intervening call could set an error of its own and the test would be chasing
+// it instead.
+procedure RunLastErrorFixture;
+begin
+  var H := CreateFile(PChar('C:\__no_such_directory__\__no_such_file__'),
+                      GENERIC_READ, 0, nil, OPEN_EXISTING, 0, 0);
+  if H <> INVALID_HANDLE_VALUE then
+    CloseHandle(H);
+  GLastErrorSeen := GetLastError;
+  GSink.Use(['lasterror ', GLastErrorSeen]);            // {BP:LASTERROR_BODY}
+end;
+
 procedure RunDataBpLocalFixture;
 begin
   GDataBpOther := 0;
@@ -2417,6 +2445,9 @@ begin
 
   if FindCmdLineSwitch('run-databp-local') or FindCmdLineSwitch('-run-databp-local') then
     RunDataBpLocalFixture;
+
+  if FindCmdLineSwitch('run-lasterror') or FindCmdLineSwitch('-run-lasterror') then
+    RunLastErrorFixture;
 
   if FindCmdLineSwitch('run-databp-buffer') or FindCmdLineSwitch('-run-databp-buffer') then
     RunDataBpBufferFixture;

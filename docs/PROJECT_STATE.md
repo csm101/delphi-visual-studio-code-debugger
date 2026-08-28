@@ -371,6 +371,12 @@ Class-member resolution (RSM-driven, `RsmFileReader.ParseClassMemberSection`):
 Evaluate / watch:
 - Qualified identifiers (e.g. `Increment.d1`).
 - Registers, address-of, memory dereference, literals.
+- `$lasterror` / `$laststatus` — the stopped thread's TEB values (what
+  `GetLastError` would return in that thread, and the NTSTATUS underneath it),
+  also emitted per thread by MCP `get_threads`. The TEB is located per bitness
+  and self-checked through `NtTib.Self`, because a WOW64 thread has two TEBs and
+  the one the OS reports to a 64-bit debugger is not the one the target writes
+  to (`DAP_DEBUGGER_ARCHITECTURE.md`).
 - Pascal grammar with DELPHI's precedence: comparison (`=` `<>` `<` `<=`
   `>` `>=` `in` `is` `as`) < add (`+` `-` `or` `xor`) < mul (`*` `/`
   `div` `mod` `and` `shl` `shr`) < unary (`-` `not` `@` `[]`) < primary.

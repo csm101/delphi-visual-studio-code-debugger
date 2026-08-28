@@ -260,6 +260,7 @@ type
     // class-typed operand, so `$exception.Message` and
     // `$exception is EMyError` are expressions like any other.
     function  ResolveCurrentException: TExprValue;
+    function  ResolveThreadLastError(WantStatus: Boolean): TExprValue;
     function  TryGetRegister(const Regs: TRegisterSnapshot; const Name: string;
                 out Val: UInt64): Boolean;
 
@@ -530,6 +531,30 @@ begin
   if LV.TypeHint = '' then
     LV.TypeHint := 'Exception';
   Result := LocalToExpr(LV);
+end;
+
+function TExprEvaluator.ResolveThreadLastError(WantStatus: Boolean): TExprValue;
+// `$lasterror` / `$laststatus`: the stopped thread's TEB values, as a Cardinal.
+//
+// Exposed through the evaluator rather than as a panel because that is the
+// cheapest place that reaches everything at once -- Watch, hover, breakpoint
+// conditions and the MCP evaluate tool all go through here, with no UI to add.
+begin
+  var LastError, LastStatus: Cardinal;
+  var Reason: string;
+  if not FDebugger.TryGetThreadLastError(0, LastError, LastStatus, Reason) then begin
+    if Reason = '' then
+      Reason := 'unavailable';
+    Exit(InvalidValue('<' + Reason + '>'));
+  end;
+  Result          := Default(TExprValue);
+  Result.IsValid  := True;
+  Result.Size     := 4;
+  Result.TypeHint := 'Cardinal';
+  if WantStatus then
+    Result.RawValue := LastStatus
+  else
+    Result.RawValue := LastError;
 end;
 
 function TExprEvaluator.LocalToExpr(const L: TLocalValue): TExprValue;
@@ -4439,6 +4464,14 @@ begin
   // string before the parser ever saw it, and never in a breakpoint condition.
   if MatchKeyword('$exception') then
     Exit(ResolveCurrentException);
+
+  // Same treatment for the two TEB values, and for the same reason: `$l` is not
+  // a hex digit, but keeping every `$pseudo` on one path means the next one
+  // added cannot fall into the literal scanner by accident.
+  if MatchKeyword('$lasterror') then
+    Exit(ResolveThreadLastError(False));
+  if MatchKeyword('$laststatus') then
+    Exit(ResolveThreadLastError(True));
 
   // Integer literal (decimal, $HEX, 0xHEX)
   if CharInSet(FExpr[FPos], ['0'..'9', '$']) then begin

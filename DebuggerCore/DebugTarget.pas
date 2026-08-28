@@ -422,6 +422,18 @@ type
     function  TryGetHandlerException(out Kind: TExcHandlerBlockKind;
                 out ObjVA: UInt64; out Reason: string): Boolean;
 
+    // The thread's last Win32 error and last NTSTATUS, read out of its TEB.
+    // TID = 0 means the stopped thread.
+    //
+    // Two values rather than one because they answer different halves of the
+    // same question: LastError is what a Win32 wrapper stored, LastStatus is
+    // what the native call underneath it returned, and the second is usually
+    // the one that says WHY. Reason names what is missing when the answer is
+    // False -- an unknown thread, a TEB that failed its own self-check -- so a
+    // caller can say so instead of showing a zero that means nothing.
+    function  TryGetThreadLastError(TID: DWORD; out LastError, LastStatus: DWORD;
+                out Reason: string): Boolean;
+
     // Memory I/O.
     function  ReadProcessMemoryAt(VA: UInt64; Buf: Pointer; Size: NativeUInt): Boolean;
     function  WriteMemoryAt(VA: UInt64; Buf: Pointer; Size: NativeUInt): Boolean;

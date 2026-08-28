@@ -3238,6 +3238,46 @@ emit to the console (stack via `FormatCallStackText`) then pass through;
 raise — the code rule must break on the first and leave the second to the
 filters) and `Test_ExceptionRule_Code_Decimal_BreaksOnNative`.
 
+### `$lasterror` / `$laststatus` pseudo-variables
+
+The stopped thread's `LastErrorValue` and `LastStatusValue`, read out of its TEB
+(`IDebugTarget.TryGetThreadLastError`). "Which error did that call fail with" is
+otherwise a question you answer by adding logging and rebuilding, and the value
+is sitting in the target the whole time.
+
+Two values because they answer different halves: `LastError` is what a Win32
+wrapper stored, `LastStatus` is the NTSTATUS the native call underneath it
+returned, and the second is usually the one that explains the first.
+
+**Finding the TEB is the part that needed care.**
+`NtQueryInformationThread(ThreadBasicInformation)` answers in the DEBUGGER's
+bitness: for a WOW64 thread it reports the 64-bit TEB, which is not where the
+32-bit code stores its error. `TWin32Debugger` overrides `TryGetThreadTeb` to
+step to the 32-bit TEB at `TEB64 + $2000`, and the offsets travel with it
+(`LastErrorOffset` / `LastStatusOffset`: `$68` / `$1250` on x64, `$34` / `$BF4`
+on x86) — the three are virtual as a group so one cannot be overridden without
+the others.
+
+Neither TEB is trusted on the strength of a documented offset: each is
+self-checked through `NtTib.Self`, which must point back at the TEB it was found
+at. If a future Windows moves the structure, the lookup fails and says so
+instead of returning a plausible number read out of the wrong place. That check
+is also what makes the `+$2000` convention safe to rely on at all.
+
+Surfaced through the expression evaluator rather than as a panel, because that
+is the cheapest place that reaches everything at once: Watch, hover, breakpoint
+conditions and MCP `evaluate_expression`, with no UI to add. MCP `get_threads`
+carries `lastError` / `lastStatus` per thread as well — "which thread failed" is
+exactly the question a multi-threaded stop raises — and omits both fields when
+the TEB could not be read, so an absent field never looks like a zero (a zero
+`LastError` is a real answer: the last call succeeded).
+
+Guarded by `LastError_MatchesWhatTheTargetItselfSaw`, whose fixture makes an API
+fail and records `GetLastError` in a global from inside the target. The test then
+requires the debugger's cross-process read to equal it. That comparison is the
+whole point on a WOW64 target: only the running code knows which of its two TEBs
+it writes to.
+
 ### `$exception` pseudo-variable
 
 Two sources, tried in this order.

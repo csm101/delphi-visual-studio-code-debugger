@@ -48,6 +48,11 @@ type
     function EnsureFpuCaptureStub: Boolean;
   protected
     function  StackWalkMachineType: DWORD; override;
+    // The 32-bit TEB, which is not the one the OS reports for a WOW64 thread.
+    function  TryGetThreadTeb(TID: DWORD; out TebVA: UInt64;
+                out Reason: string): Boolean; override;
+    function  LastErrorOffset: Cardinal; override;
+    function  LastStatusOffset: Cardinal; override;
 
     function  ReadThreadRegisters(TID: DWORD; out Regs: TRegisterSnapshot): Boolean; override;
     function  SetThreadPc(TID: DWORD; VA: UInt64): Boolean; override;
@@ -122,6 +127,50 @@ end;
 function TWin32Debugger.StackWalkMachineType: DWORD;
 begin
   Result := IMAGE_FILE_MACHINE_I386;
+end;
+
+function TWin32Debugger.LastErrorOffset: Cardinal;
+begin
+  Result := $34;   // TEB32.LastErrorValue
+end;
+
+function TWin32Debugger.LastStatusOffset: Cardinal;
+begin
+  Result := $BF4;  // TEB32.LastStatusValue
+end;
+
+function TWin32Debugger.TryGetThreadTeb(TID: DWORD; out TebVA: UInt64;
+  out Reason: string): Boolean;
+// A WOW64 thread has TWO TEBs: the 64-bit one the OS reports to a 64-bit
+// debugger, and the 32-bit one the target's own code actually writes to. Asking
+// the base class and reading LastError out of the answer would read the wrong
+// structure and return a number that looks plausible and is not the target's.
+//
+// The 32-bit TEB sits immediately after the 64-bit one, at TEB64 + $2000. That
+// is a layout convention, not a contract, so nothing here trusts it: the
+// candidate is accepted only if the 32-bit NtTib.Self at +$18 points back at the
+// candidate. If Microsoft ever moves it, this reports False and says why,
+// instead of handing out a plausible-looking wrong value.
+const
+  WOW64_TEB32_FROM_TEB64 = $2000;
+  TEB32_SELF_OFFSET      = $18;
+begin
+  TebVA := 0;
+  if not inherited TryGetThreadTeb(TID, TebVA, Reason) then
+    Exit(False);
+  var Candidate := TebVA + WOW64_TEB32_FROM_TEB64;
+  var SelfPtr: DWORD := 0;
+  if not ReadProcessMemoryAt(Candidate + TEB32_SELF_OFFSET, @SelfPtr, SizeOf(SelfPtr)) then begin
+    Reason := Format('the 32-bit TEB candidate at $%x could not be read', [Candidate]);
+    Exit(False);
+  end;
+  if UInt64(SelfPtr) <> Candidate then begin
+    Reason := Format('32-bit TEB self-check failed at $%x (NtTib.Self = $%x)',
+                     [Candidate, SelfPtr]);
+    Exit(False);
+  end;
+  TebVA  := Candidate;
+  Result := True;
 end;
 
 { ---------------------------------------------------------- register access -- }

@@ -154,6 +154,13 @@ type
     Name:       string;
     IsStopped:  Boolean;
     IsCurrent:  Boolean;
+    // The thread's TEB values: what the last Win32 call stored, and the
+    // NTSTATUS underneath it. HasLastError is False when they could not be
+    // read -- a zero LastError is a real answer ("the last call succeeded")
+    // and must not be confused with not knowing.
+    HasLastError: Boolean;
+    LastError:    Cardinal;
+    LastStatus:   Cardinal;
   end;
 
   TSessionEvalResult = record

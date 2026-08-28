@@ -120,6 +120,14 @@ absurdly.
   DISAGREEMENT between JCL and TD32 rather than as a timeout — which looks like a
   reader bug and is not one. Re-verified the hard way in 2026-08; the sequential
   re-check does not rescue you, because a stale fixture is not load-sensitive.
+  **When `build_and_run.bat` itself cannot run** — typically `F2039` on
+  `DelphiDebuggerMcp.exe` because MCP servers from live editor sessions hold it
+  open — do NOT fall back to `build_target.bat` alone. Either kill those servers,
+  or run the same chain by hand, in this order and in full:
+  `build_package.bat`, `build_host.bat`, `build_target.bat`, `build_jdbg.bat`,
+  `build_runner.bat`. Skipping any one of them costs a full suite run to find
+  out which: that is two runs of ~90 s plus the time spent reading the failure
+  as a code defect, twice, in 2026-08.
 - **Killing a suite mid-run leaves the adapter and `TestHost` alive**, holding the
   adapter exe open; the next build fails with `F2039 Could not create output
   file`. Kill them and move on — there is nothing to investigate.

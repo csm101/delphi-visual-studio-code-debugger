@@ -339,6 +339,13 @@ type
     function  ModuleNameForBase(ModBase: UInt64): string;
     // True when VA lies in a module that has been mapped into the target.
     function  ModuleRangeFor(VA: UInt64; out Base, Size: UInt64): Boolean;
+    // TEB lookup and the two offsets into it. Virtual as a group: a WOW64 target
+    // needs a different TEB *and* different offsets, and splitting them would
+    // let one be overridden without the other.
+    function  TryGetThreadTeb(TID: DWORD; out TebVA: UInt64;
+                out Reason: string): Boolean; virtual;
+    function  LastErrorOffset: Cardinal; virtual;
+    function  LastStatusOffset: Cardinal; virtual;
     // True for a module that belongs to the OTHER bitness: the 64-bit WOW64
     // layer seen from a 32-bit session. See the implementation for why the test
     // must not be made symmetric.
@@ -799,6 +806,8 @@ type
     function  LastExceptionIsDelphiRaise: Boolean;
     function  LastExceptionMessage: string;
     function  CurrentExceptionObject: UInt64;
+    function  TryGetThreadLastError(TID: DWORD; out LastError, LastStatus: DWORD;
+                out Reason: string): Boolean;
     function  TryGetHandlerException(out Kind: TExcHandlerBlockKind;
                 out ObjVA: UInt64; out Reason: string): Boolean;
     // The VA of a routine a module MAPPED IN THE DEBUGGEE exports by name.
@@ -839,6 +848,29 @@ const
   // Three is the shortest length at which a Delphi global name carries enough
   // signal to be worth the risk; anything shorter must be written qualified.
   MIN_TAILMATCH_NAME_LEN = 3;
+
+{ ntdll binding: the TEB address of a thread in another process }
+
+type
+  TThreadBasicInformation = record
+    ExitStatus:     LongInt;
+    TebBaseAddress: Pointer;
+    ClientId: record
+      UniqueProcess: THandle;
+      UniqueThread:  THandle;
+    end;
+    AffinityMask:   ULONG_PTR;
+    Priority:       LongInt;
+    BasePriority:   LongInt;
+  end;
+
+const
+  ThreadBasicInformation = 0;
+
+function NtQueryInformationThread(ThreadHandle: THandle;
+  ThreadInformationClass: DWORD; ThreadInformation: Pointer;
+  ThreadInformationLength: ULONG; ReturnLength: PULONG): LongInt; stdcall;
+  external 'ntdll.dll';
 
 { DbgHelp bindings for StackWalk64 }
 
@@ -1597,6 +1629,90 @@ function TWinDebugger.ThreadHandle(TID: DWORD): THandle;
 begin
   if not FThreads.TryGetValue(TID, Result) then
     Result := 0;
+end;
+
+function TWinDebugger.TryGetThreadTeb(TID: DWORD; out TebVA: UInt64;
+  out Reason: string): Boolean;
+// The TEB of a thread in the TARGET, as the target's own code sees it.
+//
+// `NtQueryInformationThread(ThreadBasicInformation)` answers in the debugger's
+// own bitness: for a WOW64 thread it reports the 64-bit TEB, which is NOT where
+// the 32-bit code stores its last error. TWin32Debugger overrides this to cross
+// that gap, which is why the whole lookup is one virtual method rather than an
+// offset table.
+//
+// The result is self-checked rather than trusted: NtTib.Self inside the TEB
+// must point back at the TEB. A layout that has moved, or a thread that has
+// exited underneath us, then produces False instead of a plausible number read
+// out of the wrong place.
+const
+  TEB64_SELF_OFFSET = $30;
+begin
+  TebVA  := 0;
+  Reason := '';
+  var H := ThreadHandle(TID);
+  if H = 0 then begin
+    Reason := Format('thread %d is not known to this session', [TID]);
+    Exit(False);
+  end;
+  var Info := Default(TThreadBasicInformation);
+  var Returned: ULONG := 0;
+  if NtQueryInformationThread(H, ThreadBasicInformation, @Info,
+       SizeOf(Info), @Returned) < 0 then begin
+    Reason := 'NtQueryInformationThread failed';
+    Exit(False);
+  end;
+  var Candidate := UInt64(Info.TebBaseAddress);
+  if Candidate = 0 then begin
+    Reason := 'the thread reports no TEB';
+    Exit(False);
+  end;
+  var SelfPtr: UInt64 := 0;
+  if not ReadProcessMemoryAt(Candidate + TEB64_SELF_OFFSET, @SelfPtr, SizeOf(SelfPtr)) then begin
+    Reason := 'the TEB could not be read';
+    Exit(False);
+  end;
+  if SelfPtr <> Candidate then begin
+    Reason := Format('TEB self-check failed at $%x (NtTib.Self = $%x)', [Candidate, SelfPtr]);
+    Exit(False);
+  end;
+  TebVA  := Candidate;
+  Result := True;
+end;
+
+function TWinDebugger.TryGetThreadLastError(TID: DWORD;
+  out LastError, LastStatus: DWORD; out Reason: string): Boolean;
+// LastErrorValue and LastStatusValue live at fixed offsets in the TEB. The
+// offsets differ per bitness, so the pair travels with the TEB lookup that knows
+// which TEB it just found (LastErrorOffset / LastStatusOffset, overridden by
+// TWin32Debugger alongside TryGetThreadTeb).
+begin
+  LastError  := 0;
+  LastStatus := 0;
+  if TID = 0 then
+    TID := GetStoppedThreadId;
+  var TebVA: UInt64;
+  if not TryGetThreadTeb(TID, TebVA, Reason) then
+    Exit(False);
+  if not ReadProcessMemoryAt(TebVA + LastErrorOffset, @LastError, SizeOf(LastError)) then begin
+    Reason := 'the TEB was located but LastError could not be read';
+    Exit(False);
+  end;
+  // A failure to read the status is not a failure of the call: the error is the
+  // value callers ask for, and the two live far apart in the TEB.
+  if not ReadProcessMemoryAt(TebVA + LastStatusOffset, @LastStatus, SizeOf(LastStatus)) then
+    LastStatus := 0;
+  Result := True;
+end;
+
+function TWinDebugger.LastErrorOffset: Cardinal;
+begin
+  Result := $68;    // TEB64.LastErrorValue
+end;
+
+function TWinDebugger.LastStatusOffset: Cardinal;
+begin
+  Result := $1250;  // TEB64.LastStatusValue
 end;
 
 function TWinDebugger.FindBreakpointByVA(VA: UInt64): Integer;

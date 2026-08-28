@@ -132,6 +132,8 @@ type
     function  CurrentExceptionObject: UInt64;
     function  TryGetHandlerException(out Kind: TExcHandlerBlockKind;
                 out ObjVA: UInt64; out Reason: string): Boolean;
+    function  TryGetThreadLastError(TID: DWORD; out LastError, LastStatus: DWORD;
+                out Reason: string): Boolean;
     function  WriteMemoryAt(VA: UInt64; Buf: Pointer; Size: NativeUInt): Boolean;
     function  WriteMemoryPartial(VA: UInt64; Buf: Pointer; Size: NativeUInt): NativeUInt;
     function  RvaToVA(Rva: UInt64): UInt64;
@@ -282,6 +284,14 @@ begin
   ObjVA  := 0;
   Reason := 'this fake target has no exception dispatch data';
   Result := False;
+end;
+function  TFakeMemTarget.TryGetThreadLastError(TID: DWORD; out LastError, LastStatus: DWORD;
+  out Reason: string): Boolean;
+begin
+  LastError  := 0;
+  LastStatus := 0;
+  Reason     := 'this fake target has no threads';
+  Result     := False;
 end;
 function  TFakeMemTarget.WriteMemoryAt(VA: UInt64; Buf: Pointer; Size: NativeUInt): Boolean; begin Result := False; end;
 function  TFakeMemTarget.WriteMemoryPartial(VA: UInt64; Buf: Pointer; Size: NativeUInt): NativeUInt; begin Result := 0; end;

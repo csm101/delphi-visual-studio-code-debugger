@@ -90,6 +90,13 @@ type
     // 64-bit control must keep everything, since the same test read backwards
     // would discard a legitimately low-based module.
     [Test] procedure Modules_Win32Session_ExcludesTheWow64Layer;
+    // `$lasterror` / `$laststatus` come out of the stopped thread's TEB. The
+    // fixture makes an API fail and records the Win32 half itself, so the test
+    // compares the debugger's cross-process read against what the target saw.
+    // That comparison is the point on a WOW64 target, where two TEBs exist and
+    // the one the OS reports for the thread is NOT the one the 32-bit code
+    // writes to.
+    [Test] procedure LastError_MatchesWhatTheTargetItselfSaw;
     // A breakpoint placed on a routine's `begin` line resolves to the routine's
     // ENTRY, where the prologue has not spilled Self or the by-register
     // parameters yet, so every local reads the CALLER's frame. Both bitnesses
@@ -6696,6 +6703,51 @@ begin
   Assert.IsTrue(Line > 0, 'marker not found: ' + W32_MARKER);
   AssertNamed('win64', OsFrameNames(Win64Exe, Win64Map, Win64Rsm, Line), True);
   AssertNamed('win32', OsFrameNames(Win32Exe, Win32Map, Win32Rsm, Line), False);
+end;
+
+procedure TWin32RunControlTests.LastError_MatchesWhatTheTargetItselfSaw;
+const
+  LASTERROR_SOURCE = 'TestTargetCore.pas';
+  LASTERROR_MARKER = 'LASTERROR_BODY';
+
+  procedure CheckOneBitness(const Which, Exe, Map, Rsm: string);
+  begin
+    var Line := MarkerLine(LASTERROR_SOURCE, LASTERROR_MARKER);
+    Assert.IsTrue(Line > 0, 'marker not found: ' + LASTERROR_MARKER);
+    var Session := OpenSessionAtMarker(Exe, Map, Rsm, TargetDir,
+      LASTERROR_SOURCE, Line, '--run-lasterror');
+    try
+      Assert.AreEqual(Ord(dsStopped), Ord(Session.State), Which + ': did not stop');
+
+      var Seen := Session.Evaluate('GLastErrorSeen');
+      Assert.IsTrue(Seen.Success, Which + ': cannot read the fixture''s own capture: ' +
+        Seen.ErrorText);
+      Assert.IsTrue(Seen.RawValue <> 0,
+        Which + ': the fixture recorded no error, so the API it calls stopped failing');
+
+      var Err := Session.Evaluate('$lasterror');
+      Assert.IsTrue(Err.Success, Which + ': $lasterror failed: ' + Err.ErrorText);
+      Assert.AreEqual<UInt64>(Seen.RawValue, Err.RawValue,
+        Which + ': the TEB read disagrees with what the target itself saw, so the ' +
+        'wrong TEB was read (fixture ' + Seen.Value + ', debugger ' + Err.Value + ')');
+
+      // The status is the half with no in-process API to check it against, so
+      // this asserts only what is structurally true of a failure NTSTATUS: the
+      // severity bits are set. A zero here would mean the offset is wrong.
+      var Status := Session.Evaluate('$laststatus');
+      Assert.IsTrue(Status.Success, Which + ': $laststatus failed: ' + Status.ErrorText);
+      Assert.IsTrue(Status.RawValue >= $C0000000,
+        Which + ': $laststatus is ' + Status.Value + ', which is not a failure NTSTATUS');
+    finally
+      Session.Terminate;
+      Session.Free;
+    end;
+  end;
+
+begin
+  Assert.IsTrue(FileExists(Win64Exe), '64-bit control target missing');
+  CheckOneBitness('win64', Win64Exe, Win64Map, Win64Rsm);
+  CheckOneBitness('win32', Win32Exe, Win32Map, Win32Rsm);
 end;
 
 procedure TWin32RunControlTests.Modules_Win32Session_ExcludesTheWow64Layer;

@@ -406,7 +406,14 @@ begin
     'List the debuggee''s threads at the current stop (id, name, isStopped, isCurrent). ' +
     'isCurrent marks the thread the debugger reports for this stop -- after a pause that is ' +
     'the main application thread, not the transient thread the OS injected to break in. ' +
-    'Pass another thread''s id to get_call_stack to inspect it.', []));
+    'Pass another thread''s id to get_call_stack to inspect it. Each thread also carries ' +
+    '`lastError` (its TEB LastErrorValue, i.e. what GetLastError would return in THAT ' +
+    'thread) and `lastStatus` (the NTSTATUS underneath it, which usually says why) -- ' +
+    'the answer to "which thread failed and with what" without adding logging and ' +
+    'rebuilding. Both fields are absent when the TEB could not be read, so an absent ' +
+    'field and a zero (meaning the last call succeeded) stay distinguishable. The same ' +
+    'two values are available to evaluate_expression as `$lasterror` and `$laststatus` ' +
+    'for the stopped thread.', []));
 
   Result.Add(MakeTool('set_exception_filters',
     'Change which exceptions break, on the LIVE session (also settable at launch via ' +

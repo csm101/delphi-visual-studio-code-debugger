@@ -639,6 +639,15 @@ fixture):
       (`CallStack_OsTailFrames_AreNamedFromExports`), while the module and the
       `saNoSymbols` state survive that naming
       (`Frames_NoDebugInfoModule_ReportModuleAndSymbolState`)
+- [x] `$lasterror` / `$laststatus` read the stopped thread's TEB and agree with
+      what the target itself recorded, on both bitnesses
+      (`LastError_MatchesWhatTheTargetItselfSaw`, fixture `--run-lasterror`).
+      The 32-bit half is the one that matters: a WOW64 thread has two TEBs and
+      the one the OS reports to a 64-bit debugger is not the one the target
+      writes to
+- [ ] Constant NAMES for the error codes (`ERROR_PATH_NOT_FOUND` rather than 3).
+      The number is there; naming needs a table, and the NTSTATUS side has
+      undocumented values with no complete SDK list
 - [x] A WOW64 session keeps only its own bitness: the 64-bit ntdll and the
       `wow64*.dll` layer are dropped at `LOAD_DLL`, so the two `ntdll.dll` no
       longer collide in the name-keyed registry, while the 64-bit control still
