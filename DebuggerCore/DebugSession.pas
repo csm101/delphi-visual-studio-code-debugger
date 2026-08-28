@@ -289,6 +289,7 @@ type
     function  TryFindClosureSelf(out SelfAddr: UInt64; out ClassName: string): Boolean;
     procedure AppendClosureCapturedLocals(var Locals: TArray<TSessionVariable>);
     procedure AppendFrameArguments(var Frames: TArray<TSessionFrame>);
+    function  DeclaredSignatureOf(const F: TSessionFrame): string;
     procedure RestoreFrameSelection;
     procedure AppendBareHandlerException(var Vars: TArray<TSessionVariable>);
     // Surface the anon method's own declared parameters (arg1..argN) from the
@@ -2749,11 +2750,45 @@ begin
           Break;
         end;
       end;
-      Frames[I].Arguments := string.Join(', ', Parts);
+      if Length(Parts) > 0 then
+        Frames[I].Arguments := string.Join(', ', Parts)
+      else
+        Frames[I].Arguments := DeclaredSignatureOf(Frames[I]);
     end;
   finally
     RestoreFrameSelection;
   end;
+end;
+
+function TDebugSession.DeclaredSignatureOf(const F: TSessionFrame): string;
+// What the routine DECLARES, for a frame whose stack slots no local/parameter
+// record describes -- a module built without local debug info still has type
+// records. `Increment(Integer)` beats `Increment`: it says the routine takes an
+// argument at all, and distinguishes overloads that otherwise render alike.
+//
+// Types only, deliberately: a CV ARGLIST is a bare list of type ids and carries
+// no parameter names. Inventing `arg1`, `arg2` would dress a positional list up
+// as source it is not. `Self` is left out for the same reason it is left out of
+// a declaration.
+//
+// The two shapes stay distinguishable on sight: values render as `N: 3`,
+// declared types as a bare `Integer`.
+begin
+  Result := '';
+  if (FDebugInfo = nil) or (F.FuncEntryVA = 0) or (FDebugger = nil) then
+    Exit;
+  var Params: TArray<TMethodParam>;
+  var HasSelf: Boolean;
+  if not FDebugInfo.TryGetProcSignatureByRva(FDebugger.VAToRva(F.FuncEntryVA),
+       Params, HasSelf) then
+    Exit;
+  var Parts: TArray<string> := [];
+  for var P in Params do
+    if P.TypeName <> '' then
+      Parts := Parts + [P.TypeName]
+    else
+      Parts := Parts + ['?'];
+  Result := string.Join(', ', Parts);
 end;
 
 procedure TDebugSession.RestoreFrameSelection;

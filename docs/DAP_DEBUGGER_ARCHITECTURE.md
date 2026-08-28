@@ -2201,6 +2201,20 @@ On x86 the register-passed parameters are spilled to negative offsets among the
 body locals, and only the stack-passed tail is positive. A sign test would be
 right on x64 and confidently wrong on x86.
 
+**When a frame has no parameter symbols at all**, the label falls back to the
+routine's DECLARED parameter list, read from its own signature record
+(`TryGetProcSignatureByRva`: `LF_PROCEDURE` argList at payload+8, or
+`LF_MFUNCTION` at payload+16 with `Self` implied by a nonzero `thisType`). A
+module built without local symbols still carries type records, so a frame there
+reads `NoLocalsAdd(Integer, Integer)` instead of a bare name — which at least
+says the routine takes arguments, and separates overloads that otherwise render
+alike.
+
+Types only, and no invented names: a CV ARGLIST is a list of type ids and holds
+no parameter names, so `arg1`, `arg2` would dress a positional list up as source
+it is not. The two shapes stay distinguishable on sight — values render as
+`N: 3`, declared types as a bare `Integer`.
+
 The merge in `DebugInfoSet` is **upgrade-only** for this field: a provider
 claiming "parameter" is stating a positive finding, while one claiming "local"
 may only mean that its format cannot tell. RSM tags nothing but `var`/`out`

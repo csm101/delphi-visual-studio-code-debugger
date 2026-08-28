@@ -353,6 +353,20 @@ more parameters than the routine has symbols it marks none: a routine shaped
 unlike this understanding is better left unclassified than labelled
 confidently and wrongly.
 
+A routine's DECLARED parameter list is a separate question with a separate
+answer, and it survives where the symbols do not: `LF_PROCEDURE` holds its
+argList id at payload+8, `LF_MFUNCTION` at payload+16 (with `Self` implied by a
+nonzero `thisType` at payload+8), and both point at the same Borland ARGLIST —
+`count` (u16) followed by that many type ids.
+`TryGetProcSignatureByRva` decodes it. Types only: an ARGLIST carries no
+parameter names at all.
+
+Measured while looking for a fixture, and worth recording because it is the
+obvious thing to try: **`{$LOCALSYMBOLS OFF}` does not remove the BPREL32
+records** when the build passes `-V`. A unit compiled with that directive still
+reported its parameters and locals through the reader, so "type records without
+local symbols" cannot be produced on demand from source.
+
 RSM, for contrast, tags only `var`/`out` parameters ($22/$23 records) and calls
 every by-value parameter a local, which is why the merge in `DebugInfoSet` takes
 a "parameter" claim from any provider but never lets a "local" claim overwrite

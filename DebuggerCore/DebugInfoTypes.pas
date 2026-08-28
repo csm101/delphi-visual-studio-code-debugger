@@ -439,6 +439,17 @@ type
     // False when the name is not a known free proc or its signature is absent.
     function TryGetFreeFunctionParamCount(const FuncName: string;
       out Count: Integer): Boolean;
+    // The DECLARED parameter list of whatever routine owns this RVA, free
+    // procedure or method alike, from its own signature record. Answers for a
+    // frame whose stack slots no local/param record describes -- a routine
+    // built without local debug info still has a type record, so the stack can
+    // say `Increment(Integer)` where it would otherwise say `Increment` and
+    // leave the reader guessing whether it takes arguments at all.
+    //
+    // Names are NOT available and are not invented: a CV ARGLIST is a bare list
+    // of type ids. Self is excluded from Params and reported by HasSelf.
+    function TryGetProcSignatureByRva(Rva: UInt64;
+      out Params: TArray<TMethodParam>; out HasSelf: Boolean): Boolean;
   end;
 
 implementation

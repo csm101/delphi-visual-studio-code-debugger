@@ -483,6 +483,10 @@ type
     function  NearestExportedEntryBefore(VA: UInt64;
                 out BoundaryVA: UInt64): Boolean;
     function  RvaToVA(Rva: UInt64): UInt64;
+    // The inverse, for a caller holding a live address that has to be looked up
+    // in debug info keyed by RVA (a frame's entry, say). Only the debugger knows
+    // where the image landed.
+    function  VAToRva(VA: UInt64): UInt64;
     // Memory layout of the TARGET's address space. Callers decoding target
     // structures must take strides and header offsets from here rather than
     // from SizeOf(Pointer), which describes the debugger and not the debuggee.

@@ -48,6 +48,13 @@ type
     [Test] procedure CppBuilderSignature_IsAccepted;
     [Test] procedure ContainerSignature_OfDelphiBinary_IsFB09;
 
+    // --- Declared signatures (type table, not symbols) ---
+    // The parameter list a routine DECLARES, decoded from its own signature
+    // record. Independent of whether the routine has local symbols, which is
+    // the point: it answers for frames the BPREL32 records do not describe.
+    [Test] procedure ProcSignature_FreeFunction_ReportsDeclaredParams;
+    [Test] procedure ProcSignature_Method_ReportsSelfSeparately;
+
     // --- Reader against TestTarget.exe ---
     [Test] procedure Loads_TestTargetExe;
     [Test] procedure LineTable_HasEntries;
@@ -282,6 +289,49 @@ begin
   try
     Reader.LoadFromFile(ExePath);
     Assert.AreEqual(Cardinal($39304246), Reader.ContainerSignature);
+  finally
+    Reader.Free;
+  end;
+end;
+
+// --- Declared signatures ---------------------------------------------
+
+procedure TTD32ReaderTests.ProcSignature_FreeFunction_ReportsDeclaredParams;
+begin
+  var Reader := TTD32FileReader.Create;
+  try
+    Reader.LoadFromFile(ExePath);
+    var Rva: UInt64;
+    Assert.IsTrue(Reader.NameToRva('EdgeFactorial', Rva), 'EdgeFactorial not found');
+    var Params: TArray<TMethodParam>;
+    var HasSelf: Boolean;
+    Assert.IsTrue(Reader.TryGetProcSignatureByRva(Rva, Params, HasSelf),
+      'no signature record for a plain function');
+    Assert.IsFalse(HasSelf, 'a free function has no Self');
+    Assert.AreEqual<Integer>(1, Length(Params), 'EdgeFactorial(N: Integer) takes one parameter');
+    Assert.AreEqual('Integer', Params[0].TypeName);
+  finally
+    Reader.Free;
+  end;
+end;
+
+procedure TTD32ReaderTests.ProcSignature_Method_ReportsSelfSeparately;
+begin
+  var Reader := TTD32FileReader.Create;
+  try
+    Reader.LoadFromFile(ExePath);
+    var Rva: UInt64;
+    Assert.IsTrue(Reader.NameToRva('TWidget.Sum5', Rva), 'TWidget.Sum5 not found');
+    var Params: TArray<TMethodParam>;
+    var HasSelf: Boolean;
+    Assert.IsTrue(Reader.TryGetProcSignatureByRva(Rva, Params, HasSelf),
+      'no signature record for a method');
+    // Self is reported as a flag, never as a parameter: a declaration does not
+    // list it, and a caller counting ABI slots needs the two facts apart.
+    Assert.IsTrue(HasSelf, 'an instance method takes a Self');
+    Assert.AreEqual<Integer>(5, Length(Params), 'Sum5(A, B, C, D, E: Integer)');
+    for var P in Params do
+      Assert.AreEqual('Integer', P.TypeName);
   finally
     Reader.Free;
   end;

@@ -194,6 +194,10 @@ type
                 out Params: TArray<TMethodParam>; out HasSelf: Boolean): Boolean;
     function  TryGetFreeFunctionParamCount(const FuncName: string;
                 out Count: Integer): Boolean;
+    // Declared parameter list of the routine owning an RVA (first provider that
+    // answers; TD32). Types only -- an ARGLIST carries no names.
+    function  TryGetProcSignatureByRva(Rva: UInt64;
+                out Params: TArray<TMethodParam>; out HasSelf: Boolean): Boolean;
     function  GetTypeSize(const TypeName: string; out Size: Integer): Boolean;
     // Delphi TTypeKind of what a POINTER type id leads to; 0 when unknown or
     // not a pointer. The only way to separate a dynamic array from a plain
@@ -1516,6 +1520,19 @@ begin
   // First provider that recognises the free proc wins. Only TD32 implements it.
   for var P in FSigProviders do
     if P.TryGetFreeFunctionParamCount(FuncName, Count) then
+      Exit(True);
+end;
+
+function TDebugInfoSet.TryGetProcSignatureByRva(Rva: UInt64;
+  out Params: TArray<TMethodParam>; out HasSelf: Boolean): Boolean;
+begin
+  Result  := False;
+  Params  := nil;
+  HasSelf := False;
+  // First provider that owns the RVA and can decode its signature wins. Only
+  // TD32 implements it: RSM has no procedure-signature records at all.
+  for var P in FSigProviders do
+    if P.TryGetProcSignatureByRva(Rva, Params, HasSelf) then
       Exit(True);
 end;
 

@@ -513,6 +513,11 @@ type
                   out Params: TArray<TMethodParam>; out HasSelf: Boolean): Boolean;
     function    TryGetFreeFunctionParamCount(const FuncName: string;
                   out Count: Integer): Boolean;
+    // IMethodSignatureProvider -- declared parameter list of the routine owning
+    // an RVA, free procedure or method alike. Types only: an ARGLIST holds no
+    // names.
+    function    TryGetProcSignatureByRva(Rva: UInt64;
+                  out Params: TArray<TMethodParam>; out HasSelf: Boolean): Boolean;
     // ITypePointeeKindProvider -- what a pointer type id leads to, which is the
     // only way to tell a dynamic array from a plain pointer (both read `^T`).
     function    PointeeKindById(TypeId: Cardinal): Byte;
@@ -4015,6 +4020,64 @@ begin
   if FTypes[Idx].Kind <> tkProcedure then Exit;
   if (FTypes[Idx].PayloadPtr = nil) or (FTypes[Idx].PayloadLen < 8) then Exit;
   Count  := PWord(FTypes[Idx].PayloadPtr + 6)^;
+  Result := True;
+end;
+
+function TTD32FileReader.TryGetProcSignatureByRva(Rva: UInt64;
+  out Params: TArray<TMethodParam>; out HasSelf: Boolean): Boolean;
+// The declared parameter list of the routine owning Rva, from its own signature
+// record: LF_PROCEDURE (argList at payload+8) or LF_MFUNCTION (argList at
+// payload+16, Self implied by a nonzero thisType at payload+8). Both point at
+// the same Borland ARGLIST shape: count(u16) followed by count type ids.
+//
+// Complements the symbol-derived parameters: those carry NAMES and live VALUES
+// but exist only where the routine has BPREL32 records, while this exists
+// wherever the type table does.
+begin
+  Result  := False;
+  Params  := nil;
+  HasSelf := False;
+  var ProcIdx := FindProcIndex(Rva);
+  if (ProcIdx < 0) or (ProcIdx >= Length(FProcs)) then Exit;
+  var Tid := FProcs[ProcIdx].TypeId;
+  if Tid < $1000 then Exit;
+  var Idx: Integer;
+  if not FTypeIdToRecord.TryGetValue(Tid, Idx) then Exit;
+  if (Idx < 0) or (Idx >= Length(FTypes)) then Exit;
+
+  var Rec := FTypes[Idx];
+  if Rec.PayloadPtr = nil then Exit;
+  var ArgListId: Cardinal;
+  case Rec.Kind of
+    tkProcedure:
+      begin
+        if Rec.PayloadLen < 12 then Exit;
+        ArgListId := PCardinal(Rec.PayloadPtr + 8)^;
+      end;
+    tkMFunction:
+      begin
+        if Rec.PayloadLen < 20 then Exit;
+        HasSelf   := PCardinal(Rec.PayloadPtr + 8)^ <> 0;
+        ArgListId := PCardinal(Rec.PayloadPtr + 16)^;
+      end;
+  else
+    Exit;
+  end;
+
+  // A signature with no argument list is a valid answer -- a parameterless
+  // routine -- not a failure to decode one.
+  var AP: PByte;
+  var AL: Integer;
+  if not GetTypeRecordPayload(ArgListId, AP, AL) or (AL < 2) then
+    Exit(True);
+  var N := PWord(AP)^;
+  for var I := 0 to Integer(N) - 1 do begin
+    if 2 + I * 4 + 4 > AL then Break;
+    var Prm := Default(TMethodParam);
+    Prm.TypeId   := PCardinal(AP + 2 + I * 4)^;
+    Prm.TypeName := GetTypeName(Prm.TypeId);
+    Params := Params + [Prm];
+  end;
   Result := True;
 end;
 

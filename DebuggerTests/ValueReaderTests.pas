@@ -137,6 +137,7 @@ type
     function  WriteMemoryAt(VA: UInt64; Buf: Pointer; Size: NativeUInt): Boolean;
     function  WriteMemoryPartial(VA: UInt64; Buf: Pointer; Size: NativeUInt): NativeUInt;
     function  RvaToVA(Rva: UInt64): UInt64;
+    function  VAToRva(VA: UInt64): UInt64;
     function  GetThreadIds: TArray<DWORD>;
     function  GetThreadName(TID: DWORD): string;
     function  GetStoppedThreadId: DWORD;
@@ -296,6 +297,7 @@ end;
 function  TFakeMemTarget.WriteMemoryAt(VA: UInt64; Buf: Pointer; Size: NativeUInt): Boolean; begin Result := False; end;
 function  TFakeMemTarget.WriteMemoryPartial(VA: UInt64; Buf: Pointer; Size: NativeUInt): NativeUInt; begin Result := 0; end;
 function  TFakeMemTarget.RvaToVA(Rva: UInt64): UInt64; begin Result := Rva; end;
+function  TFakeMemTarget.VAToRva(VA: UInt64): UInt64; begin Result := VA; end;
 function  TFakeMemTarget.GetThreadIds: TArray<DWORD>; begin Result := nil; end;
 function  TFakeMemTarget.GetThreadName(TID: DWORD): string; begin Result := ''; end;
 function  TFakeMemTarget.GetStoppedThreadId: DWORD; begin Result := 0; end;

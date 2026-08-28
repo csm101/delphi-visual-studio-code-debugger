@@ -209,6 +209,16 @@ real implementation. Run summary shows the live count
       fixture, where every frame is the same routine and only the argument tells
       them apart — so a frame handed the TOP frame's locals (what a missing
       frame switch looks like, and it reads as plausible) fails the test
+- [x] A routine's DECLARED parameter list decodes from its own signature record,
+      for a free function and for a method with its implicit Self reported
+      separately (`ProcSignature_FreeFunction_ReportsDeclaredParams`,
+      `ProcSignature_Method_ReportsSelfSeparately`)
+- [ ] The call stack's fallback to that declared list, for a frame whose symbols
+      describe no parameters, has NO fixture: `{$LOCALSYMBOLS OFF}` was tried and
+      does not remove the BPREL32 records (measured -- the parameters were still
+      there), so a "types but no locals" module cannot be produced on demand
+      here. The decoder it depends on is covered by the two tests above; the
+      wiring is exercised only against real modules built without local symbols
 - [~] Which symbols count as parameters comes from the declared parameter count
       plus declaration order (`MarkParametersByDeclaredCount`). Covered for
       free procs and methods; a routine whose symbol count disagrees with its

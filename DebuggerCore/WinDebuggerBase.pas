@@ -303,7 +303,6 @@ type
     FActiveFramePC:      UInt64;  // selected frame's instruction pointer (VA),
                                   // for lexical-block scope filtering of locals
 
-    function  VAToRva(VA: UInt64): UInt64;
     function  ReadByte(VA: UInt64; out B: Byte): Boolean;
     function  WriteByte(VA: UInt64; B: Byte): Boolean;
   protected
@@ -703,6 +702,7 @@ type
     function  LookupEnumInfo(const TypeName: string; out Info: TRsmEnumInfo): Boolean;
     // RVA (from MAP file) to actual virtual address in the running process.
     function  RvaToVA(Rva: UInt64): UInt64;
+    function  VAToRva(VA: UInt64): UInt64;
     // Memory layout of the debuggee's address space. Fixed at 64-bit here; the
     // x86 implementation reports its own, and callers decoding target
     // structures must consult this rather than SizeOf(Pointer).

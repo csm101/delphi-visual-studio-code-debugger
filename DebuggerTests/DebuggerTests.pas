@@ -1339,6 +1339,26 @@ begin
 end;
 
 // Strip display suffix like "  (0x2A)" or " (0x2, u=2)" from debugger-formatted values.
+// The routine part of a DAP frame label, without the argument list a frame now
+// carries (`StepHelper(X: 1)` -> `StepHelper`). Tests asking this want to know
+// WHERE execution stopped, which is a question about the routine; the values
+// have their own coverage in CallStack_Frames_CarryTheirArgumentValues.
+//
+// Only an argument list is stripped, not every parenthesis: it is appended
+// directly to the name, so its `(` has a non-space character before it. Labels
+// that legitimately contain parentheses -- `0x7ff... (kernel32.dll: no
+// symbols)` and friends -- put a space there and survive unchanged.
+function RoutinePartOfFrameLabel(const FrameLabel: string): string;
+begin
+  Result := FrameLabel;
+  if not Result.EndsWith(')') then
+    Exit;
+  var Open := Result.IndexOf('(');
+  if (Open <= 0) or (Result.Chars[Open - 1] = ' ') then
+    Exit;
+  Result := Result.Substring(0, Open);
+end;
+
 function ExtractDisplayValue(const S: string): string;
 var
   P: Integer;
@@ -9369,7 +9389,11 @@ begin
     Assert.IsNotNull(Frames);
     for var I := 0 to Frames.Count - 1 do begin
       var Fr := Frames.Items[I] as TJSONObject;
-      if not SameText(Fr.GetValue<string>('name', ''), 'EdgeFactorial') then Continue;
+      // The label now carries the frame's arguments (`EdgeFactorial(N: 3)`);
+      // this test is about reading N from the frame's LOCALS, so it matches on
+      // the routine part.
+      if not SameText(RoutinePartOfFrameLabel(Fr.GetValue<string>('name', '')),
+                      'EdgeFactorial') then Continue;
       var Fid := Fr.GetValue<Integer>('id', -1);
       var NVal := ExtractDisplayValue(NonRttiResult(FClient, Fid, 'N'));
       if NVal = '1' then SeenN1 := True;
@@ -9625,7 +9649,8 @@ begin
   try
     Frames := ST.GetValue('stackFrames') as TJSONArray;
     if (Frames <> nil) and (Frames.Count > 0) then
-      Result := (Frames.Items[0] as TJSONObject).GetValue<string>('name', '');
+      Result := RoutinePartOfFrameLabel(
+        (Frames.Items[0] as TJSONObject).GetValue<string>('name', ''));
   finally ST.Free; end;
 end;
 
