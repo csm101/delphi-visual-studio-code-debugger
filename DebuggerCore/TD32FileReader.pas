@@ -575,6 +575,9 @@ type
     // Answers "why is global X not captured?" -- e.g. on SampleApp it showed the
     // main exe's TD32 covers only ~33 units (GlobalsU is not one; its `Globals`
     // lives in libSharedFormsD29.bpl, where the same scan finds it at RVA $6F198).
+    // Per-structure memory estimate of a loaded reader, for deciding WHICH
+    // table is worth making lazy (issue #7). Diagnostic only.
+    function    DiagMemoryReport: TArray<string>;
     function    DiagFindSymbolRecords(const NameFilter: string): TArray<string>;
     // Diagnostic: every type whose RAW name is owner-qualified, i.e. declared
     // inside a class or record. Exists because that is how nesting had to be
@@ -2520,6 +2523,93 @@ begin
     Result[I] := KV.Key;
     Inc(I);
   end;
+end;
+
+function TTD32FileReader.DiagMemoryReport: TArray<string>;
+// What a loaded reader is actually holding, structure by structure.
+//
+// Written because "the loader uses too much memory" is not an actionable
+// statement: on the 530 MB single-exe build a load holds 1.77 GB, and which of
+// a dozen tables that is decides whether anything is worth making lazy and
+// which one first. Sizes are estimates of the same order as the truth, not
+// allocator accounting: element size times count, plus the heap cost of each
+// managed string it owns, which is where a symbol table's memory usually goes.
+const
+  // A Delphi UnicodeString: 12-byte header (refcount, length, elemsize/codepage)
+  // + 2 bytes per character + terminator, then rounded by the allocator. Close
+  // enough to compare tables against each other.
+  STRING_OVERHEAD = 16;
+
+  function StringBytes(const S: string): Int64;
+  begin
+    if S = '' then
+      Exit(0);
+    Result := STRING_OVERHEAD + Int64(Length(S)) * SizeOf(Char);
+  end;
+
+  function Line(const Name: string; Count: Integer; Bytes: Int64): string;
+  begin
+    Result := Format('  %-22s %10d entries  %10.1f MB', [Name, Count, Bytes / (1024 * 1024)]);
+  end;
+
+begin
+  Result := [];
+  var Total: Int64 := 0;
+
+  var ProcBytes: Int64 := Int64(Length(FProcs)) * SizeOf(TTD32ProcRange);
+  for var P in FProcs do
+    ProcBytes := ProcBytes + StringBytes(P.Name);
+  Result := Result + [Line('procs (name+range)', Length(FProcs), ProcBytes)];
+  Total := Total + ProcBytes;
+
+  var LocalBytes: Int64 := Int64(Length(FLocalsStore)) * SizeOf(TLocalSymbol);
+  for var I := 0 to FLocalsCount - 1 do
+    LocalBytes := LocalBytes + StringBytes(FLocalsStore[I].Name) +
+                  StringBytes(FLocalsStore[I].TypeHint);
+  Result := Result + [Line('locals store', FLocalsCount, LocalBytes)];
+  Total := Total + LocalBytes;
+
+  var TypeBytes: Int64 := Int64(Length(FTypes)) * SizeOf(TTD32TypeRecord);
+  for var T in FTypes do
+    TypeBytes := TypeBytes + StringBytes(T.Name);
+  Result := Result + [Line('type records', Length(FTypes), TypeBytes)];
+  Total := Total + TypeBytes;
+
+  var GlobalBytes: Int64 := Int64(Length(FGlobals)) * SizeOf(TGlobalSymbol);
+  for var G in FGlobals do
+    GlobalBytes := GlobalBytes + StringBytes(G.Name) + StringBytes(G.TypeHint);
+  Result := Result + [Line('globals', Length(FGlobals), GlobalBytes)];
+  Total := Total + GlobalBytes;
+
+  var NameSpanBytes: Int64 := Int64(Length(FNameSpans)) * SizeOf(TTD32NameSpan);
+  Result := Result + [Line('name spans (#2)', Length(FNameSpans), NameSpanBytes)];
+  Total := Total + NameSpanBytes;
+
+  // The line tables: one dictionary entry per RVA, and one keyed by a
+  // `file:line` STRING, which is why the second is the expensive one.
+  var RvaToLocBytes: Int64 := Int64(FRvaToLoc.Count) * (SizeOf(UInt64) + SizeOf(TSourceLocation) + 32);
+  for var KV in FRvaToLoc do
+    RvaToLocBytes := RvaToLocBytes + StringBytes(KV.Value.SourceFile);
+  Result := Result + [Line('rva -> source line', FRvaToLoc.Count, RvaToLocBytes)];
+  Total := Total + RvaToLocBytes;
+
+  var LineToRvaBytes: Int64 := Int64(FLineToRva.Count) * (SizeOf(UInt64) + 32);
+  for var KV in FLineToRva do
+    LineToRvaBytes := LineToRvaBytes + StringBytes(KV.Key);
+  Result := Result + [Line('source line -> rva', FLineToRva.Count, LineToRvaBytes)];
+  Total := Total + LineToRvaBytes;
+
+  var NameToRvaBytes: Int64 := Int64(FNameToRva.Count) * (SizeOf(UInt64) + 32);
+  for var KV in FNameToRva do
+    NameToRvaBytes := NameToRvaBytes + StringBytes(KV.Key);
+  Result := Result + [Line('name -> rva', FNameToRva.Count, NameToRvaBytes)];
+  Total := Total + NameToRvaBytes;
+
+  var SortedBytes: Int64 := Int64(Length(FSortedRvas)) * SizeOf(UInt64);
+  Result := Result + [Line('sorted rvas', Length(FSortedRvas), SortedBytes)];
+  Total := Total + SortedBytes;
+
+  Result := Result + [Format('  %-22s %10s  %10.1f MB', ['TOTAL (estimated)', '', Total / (1024 * 1024)])];
 end;
 
 function TTD32FileReader.DiagFindSymbolRecords(const NameFilter: string): TArray<string>;

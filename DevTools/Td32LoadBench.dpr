@@ -96,6 +96,18 @@ begin
   Writeln(Format('  names in container : %d', [NamesCount]));
   Writeln(Format('  load time          : %.1f ms (mean of %d)', [TotalMs / Iterations, Iterations]));
   Writeln(Format('  working set growth : %d KB while loaded', [HeldKB]));
+
+  // Where that memory went. The total above says whether there is a problem;
+  // this says which table to attack, which is the only actionable half.
+  var Reader := TTD32FileReader.Create;
+  try
+    Reader.LoadFromFile(Path);
+    Writeln('  held by structure:');
+    for var L in Reader.DiagMemoryReport do
+      Writeln(L);
+  finally
+    Reader.Free;
+  end;
 end;
 
 procedure Run;
