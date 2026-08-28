@@ -105,6 +105,19 @@ type
     Len:    Cardinal;
   end;
 
+  // One line-table entry: which source file, which line. The file is an INDEX
+  // into the reader's interned file list, not a string.
+  //
+  // A large binary has millions of these and a few thousand distinct source
+  // files, so storing the name per entry stored the same handful of paths over
+  // and over: measured at 305 MB for one 530 MB image (DiagMemoryReport). Eight
+  // bytes per entry, and the name is materialised only when a caller asks for a
+  // location.
+  TTD32LineEntry = record
+    FileId: Integer;
+    Line:   Integer;
+  end;
+
   TTD32ProcRange = record
     StartRva: UInt64;
     EndRva:   UInt64;
@@ -257,10 +270,22 @@ type
     FNameSpans:    TArray<TTD32NameSpan>;
     FNamesIndexed: Boolean;
 
-    // SOURCE_MODULE result tables.
-    FRvaToLoc:     TDictionary<UInt64, TSourceLocation>;
-    FLineToRva:    TDictionary<string, UInt64>;
+    // SOURCE_MODULE result tables. Neither stores a file NAME: both key on an
+    // index into FSourceFiles, because a binary holds millions of line entries
+    // and only a few thousand distinct files.
+    FRvaToLoc:     TDictionary<UInt64, TTD32LineEntry>;
+    // (fileId, line) -> first RVA. The key is the pair packed into one UInt64
+    // (file in the high half, line in the low half) rather than a `file:line`
+    // string: the string form meant one heap allocation per entry, measured at
+    // 242 MB for a single large image.
+    FLineToRva:    TDictionary<UInt64, UInt64>;
     FSortedRvas:   TArray<UInt64>;
+
+    // Interned source file names, as first seen (base name, no path).
+    // FSourceFileIds maps the lowercased name to its index, which is also how a
+    // by-name lookup finds its id.
+    FSourceFiles:   TArray<string>;
+    FSourceFileIds: TDictionary<string, Integer>;
 
     // Proc symbol tables (built from ALIGN_SYMBOLS LPROC32/GPROC32 records).
     FProcs:         TArray<TTD32ProcRange>;   // sorted by StartRva ascending
@@ -429,7 +454,9 @@ type
     procedure SortAndIndexProcs;
     function  FindProcIndex(Rva: UInt64): Integer;
     procedure RebuildSortedRvas;
-    class function LineKey(const FileName: string; Line: Integer): string;
+    class function LineKey(FileId, Line: Integer): UInt64; static;
+    function  InternSourceFile(const BaseName: string): Integer;
+    function  SourceFileName(FileId: Integer): string;
   public
     // Itanium-style demangler tuned for Delphi mangled names. Public so the
     // unit-test suite can exercise it directly.
@@ -658,8 +685,9 @@ begin
   FTdsFileHandle    := INVALID_HANDLE_VALUE;
   FTdsMappingHandle := 0;
   FTdsBase          := nil;
-  FRvaToLoc      := TDictionary<UInt64, TSourceLocation>.Create;
-  FLineToRva     := TDictionary<string, UInt64>.Create;
+  FRvaToLoc      := TDictionary<UInt64, TTD32LineEntry>.Create;
+  FLineToRva     := TDictionary<UInt64, UInt64>.Create;
+  FSourceFileIds := TDictionary<string, Integer>.Create;
   FNameToRva     := TDictionary<string, UInt64>.Create;
   FInnerToParent := TDictionary<string, string>.Create;
   FRvaToParentName := TDictionary<UInt64, string>.Create;
@@ -681,6 +709,7 @@ begin
   CloseMappedFile;
   FRvaToLoc.Free;
   FLineToRva.Free;
+  FSourceFileIds.Free;
   FNameToRva.Free;
   FInnerToParent.Free;
   FRvaToParentName.Free;
@@ -1250,6 +1279,9 @@ begin
     if SrcFileName = '' then
       SrcFileName := Format('mod_%d', [Entry.ModIndex]);
     var BaseName := ExtractFileName(SrcFileName);
+    // Intern it once here: every line entry below refers to this file by index,
+    // so the name is stored once per FILE rather than once per LINE.
+    var FileId := InternSourceFile(BaseName);
     // Record module-index -> owning unit (basename, no ext) for per-module
     // global attribution. First file entry wins (one file per module on Athens).
     if not FModIndexUnit.ContainsKey(Entry.ModIndex) then
@@ -1277,11 +1309,11 @@ begin
         var LineNum: Word := PWord(LinesArr + 2 * P)^;
         if (Offs = 0) or (LineNum = 0) then Continue;
         var Rva: UInt64 := SegOffsetToRva(SegIdx, Offs);
-        var Loc: TSourceLocation;
-        Loc.SourceFile := BaseName;
-        Loc.Line       := LineNum;
-        FRvaToLoc.AddOrSetValue(Rva, Loc);
-        var Key := LineKey(BaseName, LineNum);
+        var LineEntry: TTD32LineEntry;
+        LineEntry.FileId := FileId;
+        LineEntry.Line   := LineNum;
+        FRvaToLoc.AddOrSetValue(Rva, LineEntry);
+        var Key := LineKey(FileId, LineNum);
         // Keep the FIRST RVA seen for any (file,line) pair, matching MAP
         // file behavior: stable breakpoint placement at the line's earliest
         // emitted instruction.
@@ -1313,9 +1345,33 @@ begin
   TArray.Sort<UInt64>(FSortedRvas);
 end;
 
-class function TTD32FileReader.LineKey(const FileName: string; Line: Integer): string;
+class function TTD32FileReader.LineKey(FileId, Line: Integer): UInt64;
+// (file, line) as one integer: file in the high half, line in the low half.
+// Replaced a `file:line` string, which cost a heap allocation for every line in
+// the binary -- 2.4 million of them, 242 MB, on one 530 MB image.
 begin
-  Result := AnsiLowerCase(FileName) + ':' + IntToStr(Line);
+  Result := (UInt64(Cardinal(FileId)) shl 32) or UInt64(Cardinal(Line));
+end;
+
+function TTD32FileReader.InternSourceFile(const BaseName: string): Integer;
+// Index of BaseName in FSourceFiles, adding it on first sight. Matching is
+// case-insensitive, as the old string key was, so the same unit spelled two
+// ways stays one file.
+begin
+  var Key := AnsiLowerCase(BaseName);
+  if FSourceFileIds.TryGetValue(Key, Result) then
+    Exit;
+  Result := Length(FSourceFiles);
+  FSourceFiles := FSourceFiles + [BaseName];
+  FSourceFileIds.Add(Key, Result);
+end;
+
+function TTD32FileReader.SourceFileName(FileId: Integer): string;
+begin
+  if (FileId >= 0) and (FileId < Length(FSourceFiles)) then
+    Result := FSourceFiles[FileId]
+  else
+    Result := '';
 end;
 
 // Borland-style mangling, which is what dcc32 emits where dcc64 uses the
@@ -2587,17 +2643,19 @@ begin
 
   // The line tables: one dictionary entry per RVA, and one keyed by a
   // `file:line` STRING, which is why the second is the expensive one.
-  var RvaToLocBytes: Int64 := Int64(FRvaToLoc.Count) * (SizeOf(UInt64) + SizeOf(TSourceLocation) + 32);
-  for var KV in FRvaToLoc do
-    RvaToLocBytes := RvaToLocBytes + StringBytes(KV.Value.SourceFile);
+  var RvaToLocBytes: Int64 := Int64(FRvaToLoc.Count) * (SizeOf(UInt64) + SizeOf(TTD32LineEntry) + 32);
   Result := Result + [Line('rva -> source line', FRvaToLoc.Count, RvaToLocBytes)];
   Total := Total + RvaToLocBytes;
 
-  var LineToRvaBytes: Int64 := Int64(FLineToRva.Count) * (SizeOf(UInt64) + 32);
-  for var KV in FLineToRva do
-    LineToRvaBytes := LineToRvaBytes + StringBytes(KV.Key);
+  var LineToRvaBytes: Int64 := Int64(FLineToRva.Count) * (SizeOf(UInt64) * 2 + 32);
   Result := Result + [Line('source line -> rva', FLineToRva.Count, LineToRvaBytes)];
   Total := Total + LineToRvaBytes;
+
+  var FileBytes: Int64 := Int64(Length(FSourceFiles)) * SizeOf(Pointer);
+  for var F in FSourceFiles do
+    FileBytes := FileBytes + StringBytes(F) * 2;   // the name, plus its lowercased key
+  Result := Result + [Line('interned file names', Length(FSourceFiles), FileBytes)];
+  Total := Total + FileBytes;
 
   var NameToRvaBytes: Int64 := Int64(FNameToRva.Count) * (SizeOf(UInt64) + 32);
   for var KV in FNameToRva do
@@ -2925,8 +2983,12 @@ var
   Cand: UInt64;
 begin
   Loc := Default(TSourceLocation);
-  if FRvaToLoc.TryGetValue(Rva, Loc) then
+  var Entry: TTD32LineEntry;
+  if FRvaToLoc.TryGetValue(Rva, Entry) then begin
+    Loc.SourceFile := SourceFileName(Entry.FileId);
+    Loc.Line       := Entry.Line;
     Exit(True);
+  end;
   Result := False;
   if Length(FSortedRvas) = 0 then Exit;
   // Find largest entry <= Rva.
@@ -2953,13 +3015,24 @@ begin
   // Fallback for a candidate with no covering proc record: don't propagate a hit
   // across a large gap. 4 KB is well above any typical inter-line gap.
   if (Rva - Cand) > 4096 then Exit;
-  Result := FRvaToLoc.TryGetValue(Cand, Loc);
+  var CandEntry: TTD32LineEntry;
+  Result := FRvaToLoc.TryGetValue(Cand, CandEntry);
+  if Result then begin
+    Loc.SourceFile := SourceFileName(CandEntry.FileId);
+    Loc.Line       := CandEntry.Line;
+  end;
 end;
 
 function TTD32FileReader.SourceLineToRva(const FileName: string; Line: Integer;
   out Rva: UInt64): Boolean;
 begin
-  Result := FLineToRva.TryGetValue(LineKey(ExtractFileName(FileName), Line), Rva);
+  Rva := 0;
+  // A file this reader never saw has no id, which is already the answer: no
+  // line in it can have an RVA here.
+  var FileId: Integer;
+  if not FSourceFileIds.TryGetValue(AnsiLowerCase(ExtractFileName(FileName)), FileId) then
+    Exit(False);
+  Result := FLineToRva.TryGetValue(LineKey(FileId, Line), Rva);
 end;
 
 function TTD32FileReader.SortedRvas: TArray<UInt64>;
@@ -2984,22 +3057,21 @@ begin
 end;
 
 function TTD32FileReader.GetSourceFiles: TArray<string>;
-var
-  Seen: TDictionary<string, Boolean>;
+// The distinct source files this reader knows, lowercased.
+//
+// This used to sweep the whole RVA->line table de-duplicating names, which was
+// the only way to find them while every entry carried its own copy. The interned
+// list IS that answer, already de-duplicated, so the sweep is gone: on a large
+// image it walked millions of entries to produce a few thousand names.
+//
+// One boundary shifted with it: a file whose line pairs were all rejected as
+// malformed is now listed, because interning happens when the file entry is
+// read rather than when its first line survives. A file with no usable lines is
+// still a file of this module, so listing it is not wrong.
 begin
-  SetLength(Result, 0);
-  Seen := TDictionary<string, Boolean>.Create;
-  try
-    for var Pair in FRvaToLoc do begin
-      var Key := AnsiLowerCase(Pair.Value.SourceFile);
-      if (Key <> '') and not Seen.ContainsKey(Key) then begin
-        Seen.Add(Key, True);
-        Result := Result + [Key];
-      end;
-    end;
-  finally
-    Seen.Free;
-  end;
+  SetLength(Result, Length(FSourceFiles));
+  for var I := 0 to High(FSourceFiles) do
+    Result[I] := AnsiLowerCase(FSourceFiles[I]);
 end;
 
 { --------------------- TYPES / GLOBAL_TYPES section ---------------------

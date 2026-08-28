@@ -132,6 +132,34 @@ Names are Itanium-mangled, optionally with one of the Borland-specific
 embedded `_ZN...E` form goes through the standard Itanium demangler
 already used for symbol names.
 
+### How the line tables are stored — and what they used to cost
+
+Two tables come out of `SST_SOURCE_MODULE`: RVA → (file, line), and
+(file, line) → first RVA. Neither stores a file NAME. A binary holds millions of
+line entries and only a few thousand distinct files — 2 791 210 entries against
+7 298 files on one 530 MB image — so a name per entry stored the same handful of
+paths over and over.
+
+- Files are interned once (`InternSourceFile`), and an entry holds the index.
+- The reverse table's key is the pair packed into one `UInt64` (file in the high
+  half, line in the low half), not a `file:line` string. The string form meant a
+  heap allocation for every line in the binary.
+
+Measured on that image (`DevTools\Td32LoadBench`), before → after:
+
+| | before | after |
+|---|---:|---:|
+| rva → source line | 305.5 MB | 127.8 MB |
+| source line → rva | 241.6 MB | 109.4 MB |
+| interned file names | — | 1.0 MB (7 298 files) |
+| all structures | 990.4 MB | 681.5 MB |
+| working set held | 1 772 MB | 1 513 MB |
+| load time | 6.6 s | 4.7 s |
+
+Nothing became lazy and no cache was introduced: the tables are still built
+eagerly and are still immutable once the reader is published, which is the
+property the whole reader depends on (see the NAMES section above).
+
 ## Type table (`SST_TYPES` / `SST_GLOBAL_TYPES`)
 
 Both subsections share the same layout. `SST_TYPES` is emitted per
