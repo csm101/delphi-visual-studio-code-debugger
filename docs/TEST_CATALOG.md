@@ -209,6 +209,16 @@ real implementation. Run summary shows the live count
       fixture, where every frame is the same routine and only the argument tells
       them apart — so a frame handed the TOP frame's locals (what a missing
       frame switch looks like, and it reads as plausible) fails the test
+- [x] One reader, several threads, every answer matched against a
+      single-threaded baseline: locals + type names
+      (`Concurrent_LocalsAndTypes_AgreeWithSingleThreaded`) and line lookups in
+      both directions (`Concurrent_LineLookups_AgreeWithSingleThreaded`). These
+      guard the property the whole reader rests on -- immutable once published,
+      no lock anywhere -- and were verified to FAIL against a deliberately
+      unsafe cache before the deferred-name change landed. The baseline uses a
+      SEPARATE reader instance and the threads start on one gate in the same
+      order; both were measured to be necessary, since either alone lets the
+      race window close before a second thread arrives
 - [x] A routine's DECLARED parameter list decodes from its own signature record,
       for a free function and for a method with its implicit Self reported
       separately (`ProcSignature_FreeFunction_ReportsDeclaredParams`,

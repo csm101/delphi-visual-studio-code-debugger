@@ -161,6 +161,22 @@ type
     // from an embedded section (proves the -VT address convention handling).
     [Test] procedure Tds_ResolvesFunctionAndLine;
     [Test] procedure Tds_NameToRva_RoundTrips;
+
+    // --- Concurrent readers ---
+    // ONE reader instance, several threads asking it questions at once, every
+    // answer compared against a single-threaded baseline. The reader has no
+    // lock of any kind: it is shared by every consumer of a module's symbols
+    // and handed to the dispatch thread by the symbol prefetcher on the
+    // strength of being immutable once loaded.
+    //
+    // These exist to FAIL if that stops being true. A lookup path that starts
+    // filling something in on first use -- a memoised name, a decoded record, a
+    // cache dictionary -- reintroduces exactly the defect the NAMES table
+    // comment records: two threads racing a dynamic-array realloc, and an `Add`
+    // raising a duplicate key out of a stack trace. Written BEFORE making
+    // anything lazy, so they are a net rather than a description.
+    [Test] procedure Concurrent_LocalsAndTypes_AgreeWithSingleThreaded;
+    [Test] procedure Concurrent_LineLookups_AgreeWithSingleThreaded;
   end;
 
 implementation
@@ -169,6 +185,7 @@ uses
   System.SysUtils,
   System.Classes,
   System.IOUtils,
+  System.SyncObjs,
   TD32FileReader,
   DebugInfoTypes;
 
@@ -291,6 +308,258 @@ begin
     Assert.AreEqual(Cardinal($39304246), Reader.ContainerSignature);
   finally
     Reader.Free;
+  end;
+end;
+
+// --- Concurrent readers ----------------------------------------------
+
+type
+  // Runs one closure on N threads and collects whatever went wrong. An
+  // exception inside a thread is a RESULT here, not a crash: a race in the
+  // reader surfaces as EListError or an access violation on a reallocated
+  // array, and a test that let those escape would report "runner died" instead
+  // of naming the defect.
+  TParallelProbe = class
+  private
+    FFailures: TStringList;
+    FLock:     TObject;
+  public
+    constructor Create;
+    destructor Destroy; override;
+    procedure Fail(const Msg: string);
+    procedure RunOnThreads(Count: Integer; const Work: TProc<Integer>);
+    function  FailureText: string;
+    function  FailureCount: Integer;
+  end;
+
+constructor TParallelProbe.Create;
+begin
+  inherited;
+  FFailures := TStringList.Create;
+  FLock     := TObject.Create;
+end;
+
+destructor TParallelProbe.Destroy;
+begin
+  FFailures.Free;
+  FLock.Free;
+  inherited;
+end;
+
+procedure TParallelProbe.Fail(const Msg: string);
+begin
+  TMonitor.Enter(FLock);
+  try
+    // Keep the first few only: a race usually produces thousands of identical
+    // lines and the message has to stay readable.
+    if FFailures.Count < 10 then
+      FFailures.Add(Msg);
+  finally
+    TMonitor.Exit(FLock);
+  end;
+end;
+
+function TParallelProbe.FailureText: string;
+begin
+  TMonitor.Enter(FLock);
+  try
+    Result := FFailures.Text;
+  finally
+    TMonitor.Exit(FLock);
+  end;
+end;
+
+function TParallelProbe.FailureCount: Integer;
+begin
+  TMonitor.Enter(FLock);
+  try
+    Result := FFailures.Count;
+  finally
+    TMonitor.Exit(FLock);
+  end;
+end;
+
+procedure TParallelProbe.RunOnThreads(Count: Integer; const Work: TProc<Integer>);
+// Every thread waits on one gate and is released together. Staggered starts
+// were measured to hide the very defect this is for: the first thread warms
+// whatever a lazy path fills in, and the others then only read it, so the race
+// window closes before the second thread arrives.
+begin
+  var Gate := TEvent.Create(nil, {ManualReset=}True, {InitialState=}False, '');
+  try
+    var Threads: TArray<TThread> := [];
+    for var I := 0 to Count - 1 do begin
+      var Index := I;
+      var T := TThread.CreateAnonymousThread(
+        procedure
+        begin
+          Gate.WaitFor(INFINITE);
+          try
+            Work(Index);
+          except
+            on E: Exception do
+              Fail(Format('thread %d raised %s: %s', [Index, E.ClassName, E.Message]));
+          end;
+        end);
+      T.FreeOnTerminate := False;
+      Threads := Threads + [T];
+    end;
+    for var T in Threads do
+      T.Start;
+    Gate.SetEvent;          // release them all at once
+    try
+      for var T in Threads do
+        T.WaitFor;
+    finally
+      for var T in Threads do
+        T.Free;
+    end;
+  finally
+    Gate.Free;
+  end;
+end;
+
+procedure TTD32ReaderTests.Concurrent_LocalsAndTypes_AgreeWithSingleThreaded;
+const
+  THREADS    = 6;
+  ITERATIONS = 8;
+  ROUTINES   = 400;  // thousands of first-touch lookups, so a cold window exists
+begin
+  // TWO readers on purpose. The baseline pass would otherwise warm every
+  // deferred lookup in the instance the threads then hammer, so a lazy path
+  // that fills something in on first use would already be full by the time the
+  // race could happen -- and the test would pass while being blind to exactly
+  // the defect it exists for (measured: it did).
+  var Baseline := TTD32FileReader.Create;
+  var Reader   := TTD32FileReader.Create;
+  var Probe    := TParallelProbe.Create;
+  try
+    Baseline.ExposeLocals := True;
+    Baseline.LoadFromFile(ExePath);
+    Reader.ExposeLocals := True;
+    Reader.LoadFromFile(ExePath);
+
+    // Baseline, single-threaded, on the instance the threads never touch.
+    var Names := Baseline.AllProcedureNames;
+    Assert.IsTrue(Length(Names) > ROUTINES, 'not enough routines to probe');
+    var Subjects: TArray<string> := [];
+    var Expected: TArray<string> := [];
+    for var I := 0 to Length(Names) - 1 do begin
+      if Length(Subjects) >= ROUTINES then
+        Break;
+      var Locals: TArray<TLocalSymbol>;
+      if not Baseline.GetLocalsForFunction(Names[I], Locals) or (Length(Locals) = 0) then
+        Continue;
+      var Rendered := '';
+      for var L in Locals do
+        Rendered := Rendered + Format('%s|%s|%d|%d;',
+          [L.Name, L.TypeHint, L.RbpOffset, Ord(L.ParamStatus)]);
+      Subjects := Subjects + [Names[I]];
+      Expected := Expected + [Rendered];
+    end;
+    Assert.IsTrue(Length(Subjects) >= 10,
+      Format('expected routines with locals, found %d', [Length(Subjects)]));
+
+    // Now the same questions from several threads at once, each comparing
+    // against its own copy of the baseline. Threads start at different points
+    // in the list so they are not walking in lockstep.
+    Probe.RunOnThreads(THREADS,
+      procedure(ThreadIndex: Integer)
+      begin
+        for var Iteration := 0 to ITERATIONS - 1 do
+          for var K := 0 to High(Subjects) do begin
+            // Same order in every thread, deliberately: colliding on the SAME
+            // key at the same moment is what a first-touch race needs.
+            var Idx := K;
+            var Locals: TArray<TLocalSymbol>;
+            if not Reader.GetLocalsForFunction(Subjects[Idx], Locals) then begin
+              Probe.Fail(Format('"%s" resolved single-threaded but not concurrently',
+                [Subjects[Idx]]));
+              Continue;
+            end;
+            var Rendered := '';
+            for var L in Locals do
+              Rendered := Rendered + Format('%s|%s|%d|%d;',
+                [L.Name, L.TypeHint, L.RbpOffset, Ord(L.ParamStatus)]);
+            if Rendered <> Expected[Idx] then
+              Probe.Fail(Format('"%s": expected [%s] got [%s]',
+                [Subjects[Idx], Expected[Idx], Rendered]));
+          end;
+      end);
+
+    Assert.AreEqual<Integer>(0, Probe.FailureCount,
+      'concurrent readers disagreed with the single-threaded answers:' +
+      sLineBreak + Probe.FailureText);
+  finally
+    Probe.Free;
+    Reader.Free;
+    Baseline.Free;
+  end;
+end;
+
+procedure TTD32ReaderTests.Concurrent_LineLookups_AgreeWithSingleThreaded;
+const
+  THREADS    = 6;
+  ITERATIONS = 30;
+  SAMPLES    = 400;
+begin
+  // Same two-reader split as the locals probe: the baseline must not warm the
+  // instance the threads race on.
+  var Baseline := TTD32FileReader.Create;
+  var Reader   := TTD32FileReader.Create;
+  var Probe    := TParallelProbe.Create;
+  try
+    Baseline.LoadFromFile(ExePath);
+    Reader.LoadFromFile(ExePath);
+
+    var Rvas := Baseline.SortedRvas;
+    Assert.IsTrue(Length(Rvas) > SAMPLES, 'not enough line entries to probe');
+    var Step := Length(Rvas) div SAMPLES;
+    var Sample: TArray<UInt64> := [];
+    var Expected: TArray<string> := [];
+    var I := 0;
+    while (I < Length(Rvas)) and (Length(Sample) < SAMPLES) do begin
+      var Loc: TSourceLocation;
+      if Baseline.RvaToSourceLine(Rvas[I], Loc) then begin
+        Sample   := Sample + [Rvas[I]];
+        Expected := Expected + [Format('%s:%d', [Loc.SourceFile, Loc.Line])];
+      end;
+      Inc(I, Step);
+    end;
+    Assert.IsTrue(Length(Sample) > 50, 'too few resolvable RVAs sampled');
+
+    Probe.RunOnThreads(THREADS,
+      procedure(ThreadIndex: Integer)
+      begin
+        for var Iteration := 0 to ITERATIONS - 1 do
+          for var K := 0 to High(Sample) do begin
+            var Idx := (K + ThreadIndex * 13 + Iteration) mod Length(Sample);
+            var Loc: TSourceLocation;
+            if not Reader.RvaToSourceLine(Sample[Idx], Loc) then begin
+              Probe.Fail(Format('$%x resolved single-threaded but not concurrently',
+                [Sample[Idx]]));
+              Continue;
+            end;
+            var Got := Format('%s:%d', [Loc.SourceFile, Loc.Line]);
+            if Got <> Expected[Idx] then
+              Probe.Fail(Format('$%x: expected [%s] got [%s]',
+                [Sample[Idx], Expected[Idx], Got]));
+            // The reverse direction shares the file table with the forward one,
+            // so it belongs in the same race.
+            var Back: UInt64;
+            if not Reader.SourceLineToRva(Loc.SourceFile, Loc.Line, Back) then
+              Probe.Fail(Format('%s:%d has no RVA concurrently',
+                [Loc.SourceFile, Loc.Line]));
+          end;
+      end);
+
+    Assert.AreEqual<Integer>(0, Probe.FailureCount,
+      'concurrent line lookups disagreed with the single-threaded answers:' +
+      sLineBreak + Probe.FailureText);
+  finally
+    Probe.Free;
+    Reader.Free;
+    Baseline.Free;
   end;
 end;
 

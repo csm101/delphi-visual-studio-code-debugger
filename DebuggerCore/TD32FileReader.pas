@@ -337,6 +337,9 @@ type
     FLocalsCount:      Integer;
     FLocalNextByName:  TArray<Integer>;       // next-in-chain for FProcLocalChains
     FLocalNextByRva:   TArray<Integer>;       // next-in-chain for FRvaLocalChains
+    // Parallel to FLocalsStore: the NAMES index of each symbol, so the store can
+    // hold ids instead of strings (see AddLocalToStore).
+    FLocalNameIdx:     TArray<Cardinal>;
     FProcLocalChains:  TDictionary<string, TTD32LocalChain>;  // lcase name -> locals
     // Per-RVA locals: disambiguates same-named procs across units. Keyed
     // by the proc's body StartRva (the one stored in TTD32ProcRange).
@@ -370,6 +373,7 @@ type
     function  ReadDirectoryEntry(Index: Integer; out E: TTD32DirectoryEntry): Boolean;
     procedure LocateNamesSection;
     procedure BuildNamesIndex;
+    function  HasNameAt(Idx: Cardinal): Boolean;
     function  ResolveNameByIndex(Idx: Cardinal): string;
     // True when a RAW type name says the type is declared inside a class or
     // record. Consults the type table, not just the shape of the name.
@@ -395,7 +399,7 @@ type
                                out NewProcRva: UInt64;
                                OwningModIndex: Integer = -1);
     // Appends L to the flat store and returns its index (amortised O(1)).
-    function  AddLocalToStore(const L: TLocalSymbol): Integer;
+    function  AddLocalToStore(const L: TLocalSymbol; NameIdx: Cardinal): Integer;
     // Links store entry Index at the END of the chain that Key maps to.
     procedure LinkLocalToChain<TKey>(Chains: TDictionary<TKey, TTD32LocalChain>;
                             const Key: TKey; var NextLink: TArray<Integer>;
@@ -409,7 +413,7 @@ type
     // body for why the offsets cannot answer this.
     procedure MarkParametersByDeclaredCount(ProcRva: UInt64;
                             var Locals: TArray<TLocalSymbol>);
-    procedure AppendLocalToScope(const L: TLocalSymbol;
+    procedure AppendLocalToScope(const L: TLocalSymbol; NameIdx: Cardinal;
                                  const ScopeName: string; ScopeRva: UInt64);
     procedure HandlePub32(Payload: PByte; PayloadEnd: PByte);
     procedure HandleGData32(Payload: PByte; PayloadEnd: PByte;
@@ -1225,6 +1229,18 @@ begin
   FNamesIndexed := True;
 end;
 
+function TTD32FileReader.HasNameAt(Idx: Cardinal): Boolean;
+// Whether a name index refers to a non-empty name, WITHOUT building the string.
+//
+// The parse paths need this and nothing more: a symbol whose name is missing is
+// skipped, and asking ResolveNameByIndex would decode and then throw away a
+// string for every symbol in the binary -- which is most of what deferring the
+// names was meant to avoid.
+begin
+  Result := (Idx >= 1) and (Idx < Cardinal(Length(FNameSpans))) and
+            (FNameSpans[Idx].Len > 0);
+end;
+
 function TTD32FileReader.ResolveNameByIndex(Idx: Cardinal): string;
 begin
   // Pure read: the span table is complete before the reader is published (see
@@ -1236,7 +1252,7 @@ begin
   // must not perform. Callers that resolve the same name in a loop should hoist
   // the result, not ask the reader to remember it.
   Result := '';
-  if (Idx < 1) or (Idx >= Cardinal(Length(FNameSpans))) then Exit;
+  if not HasNameAt(Idx) then Exit;
   var Span := FNameSpans[Idx];
   if Span.Len = 0 then Exit;
   var Buf: TBytes;
@@ -1978,7 +1994,16 @@ begin
     FNameToRva.Add(Key, Rva);
 end;
 
-function TTD32FileReader.AddLocalToStore(const L: TLocalSymbol): Integer;
+function TTD32FileReader.AddLocalToStore(const L: TLocalSymbol;
+  NameIdx: Cardinal): Integer;
+// The stored symbol keeps NEITHER its name nor its type name: the name index
+// goes in a parallel array and the type id is already on the record, and
+// CollectChain builds both when a caller actually asks for the routine.
+//
+// A binary holds a million of these and a session reads the symbols of a few
+// dozen routines. Materialising every name and running GetTypeName on every
+// type id at load time cost 124 MB and a large share of the load on the 530 MB
+// image (DiagMemoryReport), to answer questions nobody asks.
 begin
   if FLocalsCount = Length(FLocalsStore) then begin
     var NewCapacity := Length(FLocalsStore) * 2;
@@ -1987,9 +2012,13 @@ begin
     SetLength(FLocalsStore, NewCapacity);
     SetLength(FLocalNextByName, NewCapacity);
     SetLength(FLocalNextByRva, NewCapacity);
+    SetLength(FLocalNameIdx, NewCapacity);
   end;
   Result := FLocalsCount;
   FLocalsStore[Result]     := L;
+  FLocalsStore[Result].Name     := '';   // rebuilt by CollectChain
+  FLocalsStore[Result].TypeHint := '';   // ditto
+  FLocalNameIdx[Result]    := NameIdx;
   FLocalNextByName[Result] := -1;
   FLocalNextByRva[Result]  := -1;
   Inc(FLocalsCount);
@@ -2010,6 +2039,13 @@ end;
 
 function TTD32FileReader.CollectChain(Head: Integer;
   const NextLink: TArray<Integer>): TArray<TLocalSymbol>;
+// Materialises one routine's symbols: the stored records carry ids, and the
+// name and type name are built here, into the RESULT.
+//
+// Nothing is written back. That is the whole discipline: this runs on whatever
+// thread asked for the routine, on a reader shared without a lock, so a memo
+// cache here would be the exact defect the NAMES section comment records.
+// Concurrent_LocalsAndTypes_AgreeWithSingleThreaded exists to catch it.
 begin
   var Count := 0;
   var Idx := Head;
@@ -2020,19 +2056,21 @@ begin
   SetLength(Result, Count);
   Idx := Head;
   for var I := 0 to Count - 1 do begin
-    Result[I] := FLocalsStore[Idx];
+    Result[I]          := FLocalsStore[Idx];
+    Result[I].Name     := ResolveNameByIndex(FLocalNameIdx[Idx]);
+    Result[I].TypeHint := GetTypeName(Cardinal(Result[I].TypeId));
     Idx := NextLink[Idx];
   end;
 end;
 
-procedure TTD32FileReader.AppendLocalToScope(const L: TLocalSymbol;
+procedure TTD32FileReader.AppendLocalToScope(const L: TLocalSymbol; NameIdx: Cardinal;
   const ScopeName: string; ScopeRva: UInt64);
 begin
   // Maintain both indexes: by-name (what the legacy lookup path uses) and the
   // RVA-keyed one that the adapter uses to disambiguate same-named procs across
   // units. Both accumulate, in parse order.
   if (ScopeName = '') and (ScopeRva = 0) then Exit;
-  var Index := AddLocalToStore(L);
+  var Index := AddLocalToStore(L, NameIdx);
   if ScopeName <> '' then
     LinkLocalToChain<string>(FProcLocalChains, ScopeName, FLocalNextByName, Index);
   if ScopeRva <> 0 then
@@ -2052,10 +2090,9 @@ begin
   var Offs: Integer  := PInteger(Payload)^;
   var Typ:  Cardinal := PCardinal(Payload + 4)^;
   var Nm:   Cardinal := PCardinal(Payload + 8)^;
-  var LocalName := ResolveNameByIndex(Nm);
-  if LocalName = '' then Exit;
+  // Emptiness is checked without building the name: CollectChain builds it.
+  if not HasNameAt(Nm) then Exit;
   var L: TLocalSymbol;
-  L.Name      := LocalName;
   L.RbpOffset := Offs;
   L.TypeId    := Integer(Typ);
   // TD32 does not distinguish var-parameter (lkVarParam) from value
@@ -2073,11 +2110,16 @@ begin
   // declaration order, Self first where there is one -- so the classification
   // is made in MarkParametersByDeclaredCount, against the parameter count in
   // the routine's own type record.
-  L.TypeHint        := GetTypeName(Typ);
-  // Resolve the type questions HERE, where the id is meaningful. The name alone
-  // cannot answer them: TD32 spells a dynamic array and a pointer to its
-  // element identically (`^Integer`), and only the graph -- pointer to an array
-  // descriptor -- separates them.
+  // TypeHint is NOT resolved here. GetTypeName on every symbol in the binary
+  // is a large share of the load, and the answer is a string per symbol that a
+  // session mostly never reads; CollectChain builds it for the routines that
+  // are actually asked for.
+  //
+  // These two stay, and the difference is the point: they are single BYTES, and
+  // they answer type questions the name alone cannot -- TD32 spells a dynamic
+  // array and a pointer to its element identically (`^Integer`), and only the
+  // graph, pointer to an array descriptor, separates them. Cheap to store,
+  // impossible to reconstruct later from what is stored.
   L.PointeeKind     := PointeeKindById(Typ);
   L.TypeKind        := TypeKindById(Typ);
   // TD32 BPREL32 offsets in Delphi follow the same RSM-encoded
@@ -2089,7 +2131,7 @@ begin
   L.UseDirectOffset := False;
   L.BlockStartRva   := BlockStartRva;
   L.BlockEndRva     := BlockEndRva;
-  AppendLocalToScope(L, ScopeName, ScopeRva);
+  AppendLocalToScope(L, Nm, ScopeName, ScopeRva);
 end;
 
 procedure TTD32FileReader.HandleRegister(Payload, PayloadEnd: PByte;
@@ -2110,21 +2152,19 @@ begin
   var Typ:   Cardinal := PCardinal(Payload + 0)^;
   var RegId: Word     := PWord(Payload + 4)^;
   var Nm:    Cardinal := PCardinal(Payload + 6)^;
-  var LocalName := ResolveNameByIndex(Nm);
-  if LocalName = '' then Exit;
+  if not HasNameAt(Nm) then Exit;   // name built by CollectChain
   var L: TLocalSymbol;
-  L.Name            := LocalName;
   L.RbpOffset       := 0;
   L.TypeId          := Integer(Typ);
   L.Kind            := lkLocal;
-  L.TypeHint        := GetTypeName(Typ);
+  // Type name deferred to CollectChain, as in HandleBpRel32.
   L.PointeeKind     := PointeeKindById(Typ);   // see HandleBpRel32
   L.TypeKind        := TypeKindById(Typ);
   L.UseDirectOffset := False;
   L.RegId           := RegId;
   L.BlockStartRva   := BlockStartRva;
   L.BlockEndRva     := BlockEndRva;
-  AppendLocalToScope(L, ScopeName, ScopeRva);
+  AppendLocalToScope(L, Nm, ScopeName, ScopeRva);
 end;
 
 procedure TTD32FileReader.ParseSymbolStream(SubsecBase, Base, Stop: PByte;

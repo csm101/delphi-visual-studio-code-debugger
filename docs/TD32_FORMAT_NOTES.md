@@ -132,6 +132,41 @@ Names are Itanium-mangled, optionally with one of the Borland-specific
 embedded `_ZN...E` form goes through the standard Itanium demangler
 already used for symbol names.
 
+### What a stored local symbol holds
+
+The locals store keeps ids, not text: the type id is on the record and the NAMES
+index sits in a parallel array (`FLocalNameIdx`), and `CollectChain` builds the
+name and the type name into the RESULT when a caller asks for a routine.
+
+The parse paths need to know only whether a symbol HAS a name, which
+`HasNameAt` answers from the span table without decoding a string — the guard
+that used to call `ResolveNameByIndex` and throw the result away was, on its
+own, most of what deferring the names was meant to avoid.
+
+Measured on the 530 MB image: locals store 124.2 MB → 55.4 MB, load 4.7 s →
+4.2 s. A binary holds a million symbols and a session reads the symbols of a few
+dozen routines.
+
+**Nothing is written back on the read path**, and that is the whole discipline.
+The reader has no lock; it is shared by every consumer of a module's symbols and
+handed to the dispatch thread by the symbol prefetcher on the strength of being
+immutable once loaded. A memo cache in `CollectChain` or `ResolveNameByIndex`
+would reintroduce the historical defect exactly: two threads racing a
+dynamic-array realloc, and `Add` raising a duplicate key out of a stack trace.
+
+`Concurrent_LocalsAndTypes_AgreeWithSingleThreaded` and
+`Concurrent_LineLookups_AgreeWithSingleThreaded` are the net, and they were
+built to bite before the change landed. Two details are what make them bite, and
+both were measured, not assumed:
+
+- the baseline runs on a SEPARATE reader instance, because a baseline pass on
+  the same instance warms every deferred lookup and closes the race window;
+- the threads start together on one gate and walk the SAME order, because
+  staggered starts let the first thread warm what the others then only read.
+
+With a deliberate unsafe cache added to `ResolveNameByIndex`, the locals probe
+fails with `EListError: Duplicates not allowed`. Without it, both pass.
+
 ### How the line tables are stored — and what they used to cost
 
 Two tables come out of `SST_SOURCE_MODULE`: RVA → (file, line), and
