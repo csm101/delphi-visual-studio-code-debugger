@@ -102,6 +102,9 @@ begin
   var Reader := TTD32FileReader.Create;
   try
     Reader.LoadFromFile(Path);
+    Writeln('  load phases:');
+    for var L in Reader.DiagLoadPhases do
+      Writeln(L);
     Writeln('  held by structure:');
     for var L in Reader.DiagMemoryReport do
       Writeln(L);

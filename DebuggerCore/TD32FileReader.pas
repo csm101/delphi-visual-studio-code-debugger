@@ -68,7 +68,7 @@ interface
 
 uses
   System.SysUtils, System.Classes, System.Generics.Collections,
-  System.SyncObjs, System.IOUtils,
+  System.SyncObjs, System.IOUtils, System.Diagnostics,
   Winapi.Windows,
   DebugInfoTypes;
 
@@ -307,6 +307,7 @@ type
     // by-name lookup finds its id.
     FSourceFiles:   TArray<string>;
     FSourceFileIds: TDictionary<string, Integer>;
+    FPhaseMs:       TArray<string>;   // per-phase load timings (diagnostic)
 
     // Proc symbol tables (built from ALIGN_SYMBOLS LPROC32/GPROC32 records).
     FProcs:         TArray<TTD32ProcRange>;   // sorted by StartRva ascending
@@ -480,6 +481,7 @@ type
     function  FindProcIndex(Rva: UInt64): Integer;
     procedure RebuildSortedRvas;
     function  FindLineRow(Rva: UInt64): Integer;
+    procedure NotePhase(const Name: string; var Clock: TStopwatch);
     class function LineKey(FileId, Line: Integer): UInt64; static;
     function  InternSourceFile(const BaseName: string): Integer;
     function  SourceFileName(FileId: Integer): string;
@@ -630,6 +632,8 @@ type
     // lives in libSharedFormsD29.bpl, where the same scan finds it at RVA $6F198).
     // Per-structure memory estimate of a loaded reader, for deciding WHICH
     // table is worth making lazy (issue #7). Diagnostic only.
+    // Per-phase load timings, in order. Diagnostic only.
+    function    DiagLoadPhases: TArray<string>;
     function    DiagMemoryReport: TArray<string>;
     function    DiagFindSymbolRecords(const NameFilter: string): TArray<string>;
     // Diagnostic: every type whose RAW name is owner-qualified, i.e. declared
@@ -2516,17 +2520,29 @@ begin
     raise Exception.Create('No TD32 signature in ' + ExePath);
   if not ReadDirectory then
     raise Exception.Create('Invalid TD32 directory');
+  // Each phase is timed into FPhaseMs. Diagnostic only -- one clock read per
+  // phase against a multi-second load -- but "which part of the load is
+  // expensive" is otherwise a guess, and it is the question that decides
+  // whether a table is worth restructuring.
+  var Clock := TStopwatch.StartNew;
   LocateNamesSection;
+  NotePhase('names section', Clock);
   ParseAllTypeTables;     // build FTypes / FTypeIdToRecord / FNameToTypeIdx first;
                           // ParseAllAlignSymbols then back-fills TypeHint on
                           // globals and locals using the populated tables.
+  NotePhase('type tables', Clock);
   ParseAllSourceModules;
+  NotePhase('source modules', Clock);
   ParseAllAlignSymbols;
+  NotePhase('align symbols', Clock);
   ParseImportTable;       // adds external DLL imports (kernel32.GetTickCount64
                           // etc.) to FNameToRva so the adapter can resolve
                           // them without falling back to the MAP file.
+  NotePhase('import table', Clock);
   SortAndIndexProcs;
+  NotePhase('sort procs', Clock);
   RebuildSortedRvas;
+  NotePhase('freeze line tables', Clock);
   FLoaded := True;
 end;
 
@@ -2728,6 +2744,17 @@ begin
     Result[I] := KV.Key;
     Inc(I);
   end;
+end;
+
+procedure TTD32FileReader.NotePhase(const Name: string; var Clock: TStopwatch);
+begin
+  FPhaseMs := FPhaseMs + [Format('  %-22s %8.1f ms', [Name, Clock.Elapsed.TotalMilliseconds])];
+  Clock := TStopwatch.StartNew;
+end;
+
+function TTD32FileReader.DiagLoadPhases: TArray<string>;
+begin
+  Result := FPhaseMs;
 end;
 
 function TTD32FileReader.DiagMemoryReport: TArray<string>;
