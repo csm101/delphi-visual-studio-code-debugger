@@ -322,6 +322,42 @@ And recognises (advances past, no semantic):
 | `$0201` | S_LDATA32         | local data symbol                           |
 | `$0206` | S_THUNK32         | thunk                                       |
 
+#### Telling a routine's PARAMETERS from its body locals — confirmed
+
+S_BPREL32 does not say which it is, and the offset cannot be made to say it
+either. Measured on `TWidget.Sum5(A, B, C, D, E: Integer)` with
+`DevTools\LocalsLookupProbe`:
+
+| | Self | A | B | C | D | E | Result |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| x64 | +16 | +24 | +32 | +40 | +48 | +56 | −4 |
+| x86 | −4 | −8 | −12 | +16 | +12 | +8 | −16 |
+
+On x64 every parameter is positive and the result negative, which is what makes
+a sign test look correct. On x86 the register-passed parameters (`Self`, `A`,
+`B` in EAX/EDX/ECX) are spilled to NEGATIVE offsets sitting among the body
+locals, and only the stack-passed tail stays positive.
+
+Two things ARE reliable on both, and together they answer it:
+
+- the declared parameter **count**, from the routine's own signature record —
+  `LF_PROCEDURE` `parmCount` at payload+6, or `LF_MFUNCTION` `parmCount` at
+  payload+14 with an implicit `Self` whenever `thisType` (payload+8) is nonzero;
+- the **order** of the symbol stream, which emits a routine's symbols in
+  declaration order: `Self`, the declared parameters, then the body locals and
+  the function `Result`.
+
+`TTD32FileReader.MarkParametersByDeclaredCount` marks the first
+`parmCount + Ord(HasSelf)` symbols and nothing else. When the signature claims
+more parameters than the routine has symbols it marks none: a routine shaped
+unlike this understanding is better left unclassified than labelled
+confidently and wrongly.
+
+RSM, for contrast, tags only `var`/`out` parameters ($22/$23 records) and calls
+every by-value parameter a local, which is why the merge in `DebugInfoSet` takes
+a "parameter" claim from any provider but never lets a "local" claim overwrite
+one.
+
 #### S_GPROC32 / S_LPROC32 record layout (Borland)
 
 The fields the walker reads (offsets are from the record payload start, i.e.

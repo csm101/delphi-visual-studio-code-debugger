@@ -2159,6 +2159,55 @@ without debug info, and a module whose index is still building. The DAP frontend
 emits `moduleId` and names such a frame `0x… (module: reason)`; the MCP frontend
 emits `module` plus a `symbols` field on every frame.
 
+### Argument values on a frame
+
+A frame reads `EdgeFactorial(N: 3)`, not just `EdgeFactorial`. Which call went
+wrong is a question about the values; the routine names only say the route.
+
+`TDebugSession.AppendFrameArguments` fills `TSessionFrame.Arguments` after the
+stack is built. Per frame it makes that frame active
+(`SetActiveFrame` with its RBP / entry / IP — the same call `SelectFrame` makes),
+reads its locals, and keeps the ones marked `spsParameter`.
+
+This is the only part of the stack path that costs debuggee round trips, so it
+is bounded on three axes and the bounds are visible rather than silent: the top
+**16 frames** (the ones a human reads), **8 arguments** per frame with a
+trailing `...` when there are more, and **40 characters** per value. The hex
+echo the shared formatter appends to integers (`1  (0x1)`) is stripped — right
+in the Variables panel, twice the width in a label whose whole purpose is the
+value.
+
+`RestoreFrameSelection` puts back whatever frame the client had selected.
+Walking the stack must not move the frame the Variables panel is showing.
+
+**Which symbols are the parameters** is decided in the TD32 reader
+(`MarkParametersByDeclaredCount`), and neither half of it is guessed: the COUNT
+comes from the routine's own signature record (`LF_PROCEDURE` / `LF_MFUNCTION`
+`parmCount`, plus the implicit `Self` when `thisType` is set), and the ORDER
+comes from the symbol stream, which emits a routine's symbols in declaration
+order. If the signature claims more parameters than the routine has symbols,
+nothing is marked — confident wrong labels on real variables are worse than
+none.
+
+The offsets cannot answer it, which is worth stating because it looks like they
+should. Measured on `TWidget.Sum5` (`DevTools\LocalsLookupProbe`):
+
+| | Self | A | B | C | D | E | Result |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| x64 | +16 | +24 | +32 | +40 | +48 | +56 | −4 |
+| x86 | −4 | −8 | −12 | +16 | +12 | +8 | −16 |
+
+On x86 the register-passed parameters are spilled to negative offsets among the
+body locals, and only the stack-passed tail is positive. A sign test would be
+right on x64 and confidently wrong on x86.
+
+The merge in `DebugInfoSet` is **upgrade-only** for this field: a provider
+claiming "parameter" is stating a positive finding, while one claiming "local"
+may only mean that its format cannot tell. RSM tags nothing but `var`/`out`
+parameters, so before this rule an RSM augment silently downgraded every
+by-value argument TD32 had correctly identified — and the arguments came out
+empty, which reads as "this frame has none".
+
 ### Naming a frame from the module's export table
 
 When no provider owns the address, `TWinDebugger.SymbolicateAddress` falls back

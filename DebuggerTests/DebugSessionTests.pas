@@ -97,6 +97,11 @@ type
     // the one the OS reports for the thread is NOT the one the 32-bit code
     // writes to.
     [Test] procedure LastError_MatchesWhatTheTargetItselfSaw;
+    // A frame says `EdgeFactorial(N: 3)`, not just `EdgeFactorial`. Asserted on
+    // the recursion fixture because it is the shape where the VALUES are the
+    // whole content of the stack: every frame is the same routine, and only its
+    // argument tells them apart.
+    [Test] procedure CallStack_Frames_CarryTheirArgumentValues;
     // A breakpoint placed on a routine's `begin` line resolves to the routine's
     // ENTRY, where the prologue has not spilled Self or the by-register
     // parameters yet, so every local reads the CALLER's frame. Both bitnesses
@@ -6703,6 +6708,48 @@ begin
   Assert.IsTrue(Line > 0, 'marker not found: ' + W32_MARKER);
   AssertNamed('win64', OsFrameNames(Win64Exe, Win64Map, Win64Rsm, Line), True);
   AssertNamed('win32', OsFrameNames(Win32Exe, Win32Map, Win32Rsm, Line), False);
+end;
+
+procedure TWin32RunControlTests.CallStack_Frames_CarryTheirArgumentValues;
+
+  procedure CheckOneBitness(const Which, Exe, Map, Rsm: string);
+  begin
+    var Line := MarkerLine(W32_SOURCE, W32_MARKER);
+    Assert.IsTrue(Line > 0, 'marker not found: ' + W32_MARKER);
+    var Session := OpenSessionAtMarker(Exe, Map, Rsm, TargetDir, W32_SOURCE, Line);
+    try
+      Assert.AreEqual(Ord(dsStopped), Ord(Session.State), Which + ': did not stop');
+      var Frames := Session.GetCallStack;
+
+      // EdgeFactorial recurses down to N = 1, so the stack holds one frame per
+      // depth and each must report ITS OWN argument. Collect them in order.
+      var Args: TArray<string> := [];
+      for var F in Frames do
+        if F.FunctionName.ToLower.Contains('edgefactorial') then
+          Args := Args + [F.Arguments];
+      Assert.IsTrue(Length(Args) >= 3,
+        Format('%s: expected several EdgeFactorial frames, got %d', [Which, Length(Args)]));
+
+      // The innermost frame is the base case.
+      Assert.AreEqual('N: 1', Args[0],
+        Which + ': the base-case frame does not carry its argument');
+
+      // And each caller holds the next value up. This is the assertion that
+      // would catch every frame being handed the TOP frame's locals, which is
+      // what a missing frame switch looks like and reads as plausible.
+      for var I := 1 to High(Args) do
+        Assert.AreEqual(Format('N: %d', [I + 1]), Args[I],
+          Format('%s: frame %d of the recursion reports "%s"', [Which, I, Args[I]]));
+    finally
+      Session.Terminate;
+      Session.Free;
+    end;
+  end;
+
+begin
+  Assert.IsTrue(FileExists(Win64Exe), '64-bit control target missing');
+  CheckOneBitness('win64', Win64Exe, Win64Map, Win64Rsm);
+  CheckOneBitness('win32', Win32Exe, Win32Map, Win32Rsm);
 end;
 
 procedure TWin32RunControlTests.LastError_MatchesWhatTheTargetItselfSaw;

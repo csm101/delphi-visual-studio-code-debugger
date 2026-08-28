@@ -1049,15 +1049,21 @@ begin
           if IsBetterHint(A.TypeHint, Locals[Idx].TypeHint) then
             Locals[Idx].TypeHint := A.TypeHint;
           // Being a PARAMETER is a fact about the source, not about a format, so
-          // whichever provider records it is right and the others simply do not
-          // know. RSM tags it on the record; TD32 does not distinguish parameters
-          // from body locals at all and calls everything lkLocal.
+          // whichever provider records it is right. But the two disagree about
+          // what they can SEE: RSM tags only var/out parameters on the record
+          // and calls every by-value parameter a local, while TD32 derives the
+          // set from the routine's declared parameter count. So a "parameter"
+          // claim is a positive finding and is taken; a "local" claim may be
+          // nothing more than a format that cannot tell, and must not overwrite
+          // a positive finding from the one that can.
           //
-          // It cannot be recovered from the offset sign either: parameters sit at
-          // POSITIVE offsets on x64 (`A` at +24) but at NEGATIVE ones on x86
-          // (`A` at -4, among body locals at -20 and -24), so a sign test would
-          // be right on one target and silently wrong on the other.
-          if A.ParamStatus <> spsUnknown then
+          // The offset sign cannot arbitrate: parameters sit at POSITIVE offsets
+          // on x64 (`A` at +24) but on x86 the register-passed ones are spilled
+          // to NEGATIVE offsets among the body locals (`Self`/`A`/`B` at -4/-8/-12
+          // with only the stack-passed tail positive), so a sign test would be
+          // right on one target and silently wrong on the other.
+          if (A.ParamStatus = spsParameter) or
+             ((A.ParamStatus <> spsUnknown) and (Locals[Idx].ParamStatus = spsUnknown)) then
             Locals[Idx].ParamStatus := A.ParamStatus;
           // Same reasoning for the resolved type kinds: only the provider that
           // owns the type table can answer, and 0 means "this one could not",
@@ -1166,13 +1172,17 @@ begin
       for var Idx := 0 to High(Locals) do
         for var A in Augment do
           if SameText(A.Name, Locals[Idx].Name) then begin
-            // Being a PARAMETER is a fact about the source, so whichever
-            // provider records it is right and the others simply do not know:
-            // RSM tags it, TD32 calls every symbol a local. Merged before the
-            // ambiguity guard below, which is about which TYPE HINT to trust
-            // and says nothing about this. See the sibling merge in
+            // Being a PARAMETER is a fact about the source, but the providers
+            // differ in what they can SEE: RSM tags only var/out parameters and
+            // calls every by-value parameter a local, while TD32 derives the
+            // whole set from the routine's declared parameter count. So a
+            // "parameter" claim is taken, and a "local" claim -- which may just
+            // mean "this format cannot tell" -- never overwrites one. Merged
+            // before the ambiguity guard below, which is about which TYPE HINT
+            // to trust and says nothing about this. See the sibling merge in
             // GetLocalsForFunction for why the offset sign cannot substitute.
-            if A.ParamStatus <> spsUnknown then
+            if (A.ParamStatus = spsParameter) or
+               ((A.ParamStatus <> spsUnknown) and (Locals[Idx].ParamStatus = spsUnknown)) then
               Locals[Idx].ParamStatus := A.ParamStatus;
             // Being a BY-REFERENCE parameter is likewise a source fact only one
             // provider records: RSM tags it, TD32 calls every symbol a local.

@@ -379,6 +379,11 @@ type
     // of GetLocalsForFunction* expects.
     function  CollectChain(Head: Integer;
                             const NextLink: TArray<Integer>): TArray<TLocalSymbol>;
+    // Classifies a routine's collected symbols into parameters and body locals,
+    // using the declared parameter count from its signature record. See the
+    // body for why the offsets cannot answer this.
+    procedure MarkParametersByDeclaredCount(ProcRva: UInt64;
+                            var Locals: TArray<TLocalSymbol>);
     procedure AppendLocalToScope(const L: TLocalSymbol;
                                  const ScopeName: string; ScopeRva: UInt64);
     procedure HandlePub32(Payload: PByte; PayloadEnd: PByte);
@@ -1993,6 +1998,17 @@ begin
   // parameters; treat everything as lkLocal. Positive offsets are
   // parameter slots, negative offsets are locals -- caller distinguishes.
   L.Kind            := lkLocal;
+  // Parameter or body local is NOT decided here: the record does not say, and
+  // the offset's sign cannot be made to say it either. Measured on TWidget.Sum5
+  // (DevTools\LocalsLookupProbe): on x64 the parameters sit at +16..+56 and the
+  // result at -4, but on x86 the register-passed ones are spilled to -4, -8,
+  // -12, among body locals, while only the stack-passed tail is positive. A
+  // sign test would be right on one target and confidently wrong on the other.
+  //
+  // What IS reliable on both is ORDER -- the routine's symbols arrive in
+  // declaration order, Self first where there is one -- so the classification
+  // is made in MarkParametersByDeclaredCount, against the parameter count in
+  // the routine's own type record.
   L.TypeHint        := GetTypeName(Typ);
   // Resolve the type questions HERE, where the id is meaningful. The name alone
   // cannot answer them: TD32 spells a dynamic array and a pointer to its
@@ -2690,6 +2706,69 @@ begin
   Result := Result + Lines;
 end;
 
+procedure TTD32FileReader.MarkParametersByDeclaredCount(ProcRva: UInt64;
+  var Locals: TArray<TLocalSymbol>);
+// Says which of a routine's symbols are its PARAMETERS, so a caller can render
+// a frame's arguments without guessing.
+//
+// Neither half of the answer is guessed. The COUNT comes from the routine's own
+// signature record (LF_PROCEDURE / LF_MFUNCTION `parmCount`, plus the implicit
+// Self of a method), and the ORDER comes from the symbol stream, which emits a
+// routine's symbols in declaration order -- Self, then the declared parameters,
+// then the body locals and the function result. Verified on both bitnesses
+// against TWidget.Sum5 (Self, A..E, Result) and EdgeFactorial (N, Result).
+//
+// Offsets are deliberately not consulted: see HandleBpRel for the measurement
+// that rules them out.
+//
+// Anything the type record cannot answer for is left spsUnknown rather than
+// guessed at, so a consumer can tell "not a parameter" from "nobody knows".
+begin
+  var ProcIdx := FindProcIndex(ProcRva);
+  if (ProcIdx < 0) or (ProcIdx >= Length(FProcs)) then Exit;
+  var Tid := FProcs[ProcIdx].TypeId;
+  if Tid < $1000 then Exit;
+  var Idx: Integer;
+  if not FTypeIdToRecord.TryGetValue(Tid, Idx) then Exit;
+  if (Idx < 0) or (Idx >= Length(FTypes)) then Exit;
+  var Rec := FTypes[Idx];
+  if Rec.PayloadPtr = nil then Exit;
+
+  var ParamCount := 0;
+  var HasSelf    := False;
+  case Rec.Kind of
+    tkProcedure:
+      begin
+        // retType u32, callConv u8, funcAttr u8, parmCount u16.
+        if Rec.PayloadLen < 8 then Exit;
+        ParamCount := PWord(Rec.PayloadPtr + 6)^;
+      end;
+    tkMFunction:
+      begin
+        // retType u32, classType u32, thisType u32, callConv u8, funcAttr u8,
+        // parmCount u16. A zero thisType is a class (static) method, which has
+        // no Self to account for.
+        if Rec.PayloadLen < 16 then Exit;
+        ParamCount := PWord(Rec.PayloadPtr + 14)^;
+        HasSelf    := PCardinal(Rec.PayloadPtr + 8)^ <> 0;
+      end;
+  else
+    Exit;
+  end;
+
+  var Total := ParamCount + Ord(HasSelf);
+  if Total > Length(Locals) then
+    // The signature claims more parameters than the routine has symbols. That
+    // is not a routine we understand, and marking the first N anyway would put
+    // confident wrong labels on real variables.
+    Exit;
+  for var I := 0 to High(Locals) do
+    if I < Total then
+      Locals[I].ParamStatus := spsParameter
+    else
+      Locals[I].ParamStatus := spsLocal;
+end;
+
 function TTD32FileReader.GetLocalsForFunction(const FunctionName: string;
   out Locals: TArray<TLocalSymbol>): Boolean;
 begin
@@ -2699,6 +2778,9 @@ begin
   var Chain: TTD32LocalChain;
   if not FProcLocalChains.TryGetValue(AnsiLowerCase(FunctionName), Chain) then Exit;
   Locals := CollectChain(Chain.Head, FLocalNextByName);
+  var Rva: UInt64;
+  if FNameToRva.TryGetValue(AnsiLowerCase(FunctionName), Rva) then
+    MarkParametersByDeclaredCount(Rva, Locals);
   Result := True;
 end;
 
@@ -2711,6 +2793,7 @@ begin
   var Chain: TTD32LocalChain;
   if not FRvaLocalChains.TryGetValue(InnerRva, Chain) then Exit;
   Locals := CollectChain(Chain.Head, FLocalNextByRva);
+  MarkParametersByDeclaredCount(InnerRva, Locals);
   Result := True;
 end;
 

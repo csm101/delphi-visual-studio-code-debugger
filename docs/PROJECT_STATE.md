@@ -506,6 +506,13 @@ Call stack:
   `SymUnloadModule64` — without that, a runtime-loaded BPL has no unwind info
   and the walk collapses to a single frame (see DAP_DEBUGGER_ARCHITECTURE.md).
 - Function names per frame, source line per frame when available.
+- **Argument VALUES per frame** — `EdgeFactorial(N: 3)`, not just the routine
+  name. Bounded on purpose (top 16 frames, 8 arguments each, 40 characters per
+  value) because it is the only part of the stack path that reads debuggee
+  memory. Which symbols are parameters comes from the routine's declared
+  parameter count plus the symbol stream's declaration order, never from the
+  offset sign — on x86 the register-passed parameters are spilled among the body
+  locals (`TD32_FORMAT_NOTES.md`).
 - Frames in modules NO provider owns — ntdll, kernel32, any DLL shipped without
   debug info — are named from that module's export directory, read out of the
   live image and cached per module (`module!Routine+$offset`, e.g.

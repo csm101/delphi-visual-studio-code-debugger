@@ -42,8 +42,16 @@ begin
     // RegId matters: a REGISTER-allocated local legitimately has frame offset 0
     // (its value is not on the frame at all), so offset 0 alone does not mean
     // "no location". Only offset 0 AND RegId 0 does.
-    Writeln(Format('      %-26s off=%-6d reg=%-4d typeId=%-6d hint="%s"',
-      [L.Name, L.RbpOffset, L.RegId, L.TypeId, L.TypeHint]));
+    // ParamStatus is printed because "which of these are the ARGUMENTS" is a
+    // separate question from where they live, and the two readers answer it
+    // from different evidence (see TD32's MarkParametersByDeclaredCount).
+    var Status := 'unknown';
+    case L.ParamStatus of
+      spsLocal:     Status := 'local';
+      spsParameter: Status := 'PARAM';
+    end;
+    Writeln(Format('      %-26s off=%-6d reg=%-4d typeId=%-6d %-7s hint="%s"',
+      [L.Name, L.RbpOffset, L.RegId, L.TypeId, Status, L.TypeHint]));
     Inc(Shown);
     if Shown >= 30 then begin
       Writeln(Format('      ... (%d more)', [Length(Locals) - Shown]));

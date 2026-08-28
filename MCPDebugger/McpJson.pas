@@ -198,6 +198,14 @@ begin
     var O := TJSONObject.Create;
     O.AddPair('index', TJSONNumber.Create(F.Index));
     O.AddPair('function', F.FunctionName);
+    // The frame's arguments, formatted and truncated (`x: 42, Name: 'hi'`).
+    // Emitted as its own field rather than folded into `function`, so an agent
+    // can compare routine names across frames without parsing them out again.
+    // Absent when the frame has none, when its symbols do not identify the
+    // parameter slots, or when it is deeper than the depth arguments are read
+    // for -- reading them costs a round trip per value.
+    if F.Arguments <> '' then
+      O.AddPair('arguments', F.Arguments);
     O.AddPair('sourceFile', F.SourceFile);
     O.AddPair('line', TJSONNumber.Create(F.SourceLine));
     // Address + owning module give a frame with no source (system / RTL / a

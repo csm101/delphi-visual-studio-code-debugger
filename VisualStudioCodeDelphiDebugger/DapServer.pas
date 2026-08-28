@@ -1126,6 +1126,12 @@ begin
   else
     Result := Name;
   end;
+  // Arguments go on the NAME, because DAP has nowhere else to put them: a
+  // stackFrame carries one label and no structured argument list. Only where
+  // the label is a routine name -- appending them to a `file:line` label or to
+  // an address would read as a call that is not there.
+  if (F.Arguments <> '') and (Name = F.FunctionName) then
+    Result := Result + '(' + F.Arguments + ')';
 end;
 
 procedure TDapServer.ParseRawStackScan(Args: TJSONObject);

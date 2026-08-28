@@ -93,6 +93,11 @@ type
     Symbols:      TSymbolAvailability;
     // Raw selection data carried from TStackFrame so a frontend can re-root
     // locals/evaluate on this frame via TDebugSession.SelectFrame(Index).
+    // The frame's arguments, already formatted and truncated, e.g.
+    // `x: 42, Name: 'hello'`. Empty when the frame has none, when its symbols
+    // do not say which slots are parameters, or when it sits past the depth
+    // this is computed for (reading them costs a memory round trip per value).
+    Arguments:    string;
     FrameRBP:     UInt64;   // this frame's RBP (for BPREL local/param decode)
     FuncEntryVA:  UInt64;   // VA of the frame's function entry (prolog read)
     // Which unwind mechanism produced this frame. Diagnostic: a stack is

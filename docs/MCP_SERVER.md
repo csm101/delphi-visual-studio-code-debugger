@@ -207,6 +207,11 @@ the session to be stopped.
   condition could not be evaluated (one round trip). Without that last field the
   stop looks unconditional, which is the one thing this snapshot could not
   otherwise tell you — see "Breakpoint conditions" below.
+- `get_call_stack` frames carry an `arguments` field — the frame's parameters
+  already formatted (`N: 3`, `Self: TWidget($...), A: 1`). Its own field rather
+  than folded into `function`, so routine names stay comparable across frames.
+  Absent when the frame has none, when its symbols do not identify the parameter
+  slots, or when the frame is deeper than the 16 the values are read for.
 - `get_current_source_location`, `get_call_stack`, `get_locals`,
   `get_variable` (`name` — one named variable, with an expansion handle when it is
   a local class/record/array), `evaluate_expression` (`expression` — Pascal,

@@ -204,6 +204,15 @@ real implementation. Run summary shows the live count
 
 ## C. Frame layout and call kinds
 
+- [x] Every frame carries its own ARGUMENT VALUES, on both bitnesses
+      (`CallStack_Frames_CarryTheirArgumentValues`). Asserted on the recursion
+      fixture, where every frame is the same routine and only the argument tells
+      them apart — so a frame handed the TOP frame's locals (what a missing
+      frame switch looks like, and it reads as plausible) fails the test
+- [~] Which symbols count as parameters comes from the declared parameter count
+      plus declaration order (`MarkParametersByDeclaredCount`). Covered for
+      free procs and methods; a routine whose symbol count disagrees with its
+      signature is deliberately left unclassified and has no fixture
 - [x] Top-level free proc (`Test_Eval_FreeProc_IntegerReturn`,
       `Test_Eval_FreeProc_StringReturn`)
 - [x] Class method (Self visible) (`StepInto_Method_ReportsSpilledSelfAndParams`,

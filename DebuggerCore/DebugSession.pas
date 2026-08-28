@@ -77,6 +77,9 @@ type
     // True while a call-stack frame is explicitly selected (SelectFrame).
     // Guards the DEFAULT frame below, so an explicit selection always wins.
     FFrameSelected:      Boolean;
+    // Which frame that selection names, so a stack walk that has to make other
+    // frames active for a moment (AppendFrameArguments) can put it back.
+    FSelectedFrameIndex: Integer;
     // Index into FLastFrames of the frame the session serves when the client has
     // selected none. See DefaultFrameIndexFor for what decides it, and
     // docs/DAP_DEBUGGER_ARCHITECTURE.md "Frames versus the active frame" for why the
@@ -285,6 +288,8 @@ type
     // an $ActRec activation record with debug-info members. False when not found.
     function  TryFindClosureSelf(out SelfAddr: UInt64; out ClassName: string): Boolean;
     procedure AppendClosureCapturedLocals(var Locals: TArray<TSessionVariable>);
+    procedure AppendFrameArguments(var Frames: TArray<TSessionFrame>);
+    procedure RestoreFrameSelection;
     procedure AppendBareHandlerException(var Vars: TArray<TSessionVariable>);
     // Surface the anon method's own declared parameters (arg1..argN) from the
     // decoded signature + Win64 ABI home slots (no provider carries their slots).
@@ -2096,6 +2101,7 @@ procedure TDebugSession.HandleTargetStopped(Reason: TStopReason;
 begin
   var Guard := InteractiveWait;  // bound symbol-index waits during the stop (F14)
   FFrameSelected := False;       // a fresh stop clears any prior frame selection
+  FSelectedFrameIndex := -1;
   if FDebugger <> nil then
     FDebugger.ClearActiveFrame;
   SetLength(FLastFrames, 0);
@@ -2672,6 +2678,99 @@ begin
   SetLength(Result, Length(Frames));
   for var I := 0 to High(Frames) do
     Result[I] := FrameToSession(Frames[I], I);
+  AppendFrameArguments(Result);
+end;
+
+procedure TDebugSession.AppendFrameArguments(var Frames: TArray<TSessionFrame>);
+// Fills in each frame's ARGUMENTS, so a stack reads `Increment(x: 42)` rather
+// than `Increment`. Which call went wrong is usually a question about the
+// values, not about the route.
+//
+// This is the one place in the stack path that costs debuggee round trips: each
+// frame has to be made active and its parameter slots read. Hence the depth
+// bound -- the frames a human reads are at the top, and a 200-frame recursion
+// must not turn every stop into hundreds of reads.
+//
+// The frame's own selection state is restored afterwards. Walking the stack
+// must not move the frame the Variables panel is showing.
+const
+  MAX_FRAMES_WITH_ARGUMENTS = 16;
+  MAX_ARGUMENTS_PER_FRAME   = 8;
+  MAX_VALUE_CHARS           = 40;
+
+  // The shared value formatter echoes every integer in hex (`1  (0x1)`), which
+  // is right in the Variables panel and wrong in a frame label: it doubles the
+  // width of the one thing the label is for. Drop the echo -- and only the
+  // echo, which is a fixed shape the formatter owns: two spaces, `(0x`, hex,
+  // `)`, at the very end.
+  function WithoutHexEcho(const S: string): string;
+  begin
+    Result := S;
+    if not S.EndsWith(')') then
+      Exit;
+    var Marker := S.LastIndexOf('  (0x');
+    if Marker > 0 then
+      Result := Copy(S, 1, Marker);
+  end;
+
+  function Rendered(const LV: TLocalValue): string;
+  begin
+    Result := WithoutHexEcho(Readers.FormatLocalValue(LV));
+    // One line, whatever the value was: a multi-line rendering would break the
+    // frame label it is going into.
+    Result := Result.Replace(#13, ' ').Replace(#10, ' ');
+    if Length(Result) > MAX_VALUE_CHARS then
+      Result := Copy(Result, 1, MAX_VALUE_CHARS - 3) + '...';
+    Result := LV.Name + ': ' + Result;
+  end;
+
+begin
+  if (FDebugger = nil) or (FState <> dsStopped) then
+    Exit;
+  var Depth := Length(Frames);
+  if Depth > MAX_FRAMES_WITH_ARGUMENTS then
+    Depth := MAX_FRAMES_WITH_ARGUMENTS;
+  try
+    for var I := 0 to Depth - 1 do begin
+      if (Frames[I].FrameRBP = 0) or (Frames[I].FunctionName = '') then
+        Continue;
+      FDebugger.SetActiveFrame(Frames[I].FrameRBP, Frames[I].FuncEntryVA,
+        Frames[I].FunctionName, Frames[I].IP);
+      var Parts: TArray<string> := [];
+      for var LV in FDebugger.GetLocalValues do begin
+        if LV.ParamStatus <> spsParameter then
+          Continue;
+        Parts := Parts + [Rendered(LV)];
+        if Length(Parts) >= MAX_ARGUMENTS_PER_FRAME then begin
+          // Say that the list was cut rather than present a partial one as
+          // complete: a frame with nine arguments must not read like a frame
+          // with eight.
+          Parts := Parts + ['...'];
+          Break;
+        end;
+      end;
+      Frames[I].Arguments := string.Join(', ', Parts);
+    end;
+  finally
+    RestoreFrameSelection;
+  end;
+end;
+
+procedure TDebugSession.RestoreFrameSelection;
+// Puts back whatever frame was active before something walked the stack. With
+// no explicit selection that is "none", which is what the default-frame logic
+// in GetLocals expects to find.
+begin
+  if FDebugger = nil then
+    Exit;
+  FDebugger.ClearActiveFrame;
+  if FFrameSelected and (FSelectedFrameIndex >= 0) and
+     (FSelectedFrameIndex < Length(FLastFrames)) and
+     (FLastFrames[FSelectedFrameIndex].FrameRBP <> 0) then
+    FDebugger.SetActiveFrame(FLastFrames[FSelectedFrameIndex].FrameRBP,
+      FLastFrames[FSelectedFrameIndex].FuncEntryVA,
+      FLastFrames[FSelectedFrameIndex].FunctionName,
+      FLastFrames[FSelectedFrameIndex].IP);
 end;
 
 // The formats a runtime module actually registered, read off the provider
@@ -2893,11 +2992,13 @@ begin
   // through to a frame the caller never asked for. An index the cache cannot
   // resolve at all is not a selection and leaves the default in charge.
   FFrameSelected := (Index >= 0) and (Index < Length(FLastFrames));
+  FSelectedFrameIndex := Index;
 end;
 
 procedure TDebugSession.ClearFrame;
 begin
   FFrameSelected := False;
+  FSelectedFrameIndex := -1;
   if FDebugger <> nil then
     FDebugger.ClearActiveFrame;
 end;
