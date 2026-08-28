@@ -180,16 +180,34 @@ paths over and over.
   half, line in the low half), not a `file:line` string. The string form meant a
   heap allocation for every line in the binary.
 
-Measured on that image (`DevTools\Td32LoadBench`), before → after:
+Both tables are also **dictionaries only while parsing**. Entries arrive in no
+order and the first/last-wins rules need a keyed structure, but once the parse
+is over the tables are read-only for the reader's whole life — and a hash table
+is the wrong shape for that. `RebuildSortedRvas` freezes them into sorted arrays
+of 16-byte rows and frees the dictionaries; both lookups bisect, which the
+forward one already did for its nearest-line fallback.
 
-| | before | after |
-|---|---:|---:|
-| rva → source line | 305.5 MB | 127.8 MB |
-| source line → rva | 241.6 MB | 109.4 MB |
-| interned file names | — | 1.0 MB (7 298 files) |
-| all structures | 990.4 MB | 681.5 MB |
-| working set held | 1 772 MB | 1 513 MB |
-| load time | 6.6 s | 4.7 s |
+The two sorts cost about 0.9 s on that image, which is what the change trades
+for its 312 MB. Hand-written quicksorts with direct field comparisons were
+written and measured against the generic sort: they recovered 0.35 s of it,
+which does not pay for ninety lines of hand-rolled sorting inside a symbol
+reader, so the generic sort stayed. The result is verified sorted with one
+linear pass, because a bisection over a mis-sorted array does not fail — it
+returns a plausible wrong line for some addresses and not others.
+
+Measured on that image (`DevTools\Td32LoadBench`), across the three steps:
+
+| | before | interned + packed key | + sorted arrays |
+|---|---:|---:|---:|
+| rva → source line | 305.5 MB | 127.8 MB | 42.6 MB |
+| source line → rva | 241.6 MB | 109.4 MB | 36.5 MB |
+| interned file names | — | 1.0 MB (7 298 files) | 1.0 MB |
+| all structures | 990.4 MB | 681.5 MB | 454.7 MB |
+| working set held | 1 772 MB | 1 513 MB | 1 136 MB |
+| load time | 6.6 s | 4.7 s | 5.1 s |
+
+(The middle column also carries the deferred local names; the load time in the
+last column pays for the two sorts.)
 
 Nothing became lazy and no cache was introduced: the tables are still built
 eagerly and are still immutable once the reader is published, which is the
