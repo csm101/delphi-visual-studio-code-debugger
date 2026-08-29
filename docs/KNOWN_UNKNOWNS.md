@@ -1689,7 +1689,8 @@ type and fell back to reading it as an object pointer -- the same "symbol not
 there yet" gap as above, but returning a confident wrong answer instead of a
 blank. Two things follow: the missing guard is worth more than the raised cap,
 and whatever fills it should make an unresolved type FAIL rather than degrade
-into a pointer render.
+into a pointer render. That second half is issue #11, tracked on its own because
+it is a defect in the evaluate path rather than an open question about load.
 
 Measured while turning the symbol prefetcher on by default; it is NOT attributed
 to the prefetcher (seven runs on, one occurrence; three runs off, none -- far too
