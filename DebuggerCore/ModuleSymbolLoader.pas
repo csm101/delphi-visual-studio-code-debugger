@@ -190,19 +190,32 @@ type
 
 // Master switch for the background symbol prefetcher.
 //
-// DEFAULT: OFF. The prefetcher below is complete and its concurrency design
-// has been reviewed and documented, but with it enabled the full test suite
-// reproducibly loses ONE-to-THREE requests per run to a 30 s response timeout,
-// always in the BPL fixture (TDebuggerTestsBpl), always on the first request
-// after a stop, and never in isolation. That is the same signature that got
-// the previous background loader disabled and it is NOT yet explained --
-// proven to be the prefetcher rather than the rest of this change set by
-// running the identical build with the prefetcher off (clean, 0 errored).
+// DEFAULT: ON. `SYMBOL_PREFETCH=0`, or SetSymbolPrefetchEnabled(False), turns
+// it off; that is the first thing to try if symbol behaviour ever looks
+// timing-dependent again.
 //
-// Everything else in this change set (the reader-level concurrency fixes, the
-// single-load-path claim protocol, the publication plumbing) is live and
-// green. Set SYMBOL_PREFETCH=1, or call SetSymbolPrefetchEnabled(True), to
-// turn the prefetcher on for further investigation.
+// It shipped DISABLED for a while. With it enabled the suite used to lose ONE
+// to THREE requests per run to a 30 s response timeout, always in the BPL
+// fixture (TDebuggerTestsBpl), always on the first request after a stop, never
+// in isolation -- the same signature that had already got an earlier background
+// loader disabled, and never explained at the time.
+//
+// It no longer reproduces. Three consecutive full parallel runs (1332 tests, 8
+// workers, ~2500 adapter launches) came back clean with the prefetcher on: 409
+// modules parsed on the worker in the instrumented run, 42 dispatch-thread
+// loads declined because the worker held the claim (all of them testsubject.bpl,
+// which is exactly where the timeouts used to land), 380 drains, and one single
+// operation anywhere above 500 ms. What most likely closed it is the reader work
+// that landed in between rather than anything here: TTD32FileReader stopped
+// materialising names and type names at parse time and stopped holding the line
+// tables in dictionaries, so a prefetched module now allocates a fraction of
+// what it used to while the dispatch thread is reading a sibling reader.
+//
+// The diagnostics that establish that are permanent, not scaffolding: every
+// prefetch parse, every drain and every declined load is logged, and the DAP
+// loop reports any request or pump turn over 500 ms (DapServer's SLOW_OP_MS).
+// If the timeout ever comes back, DAP_LOG=1 gives each adapter its own log
+// (DAP_LOG_PATH) and the answer is in it.
 procedure SetSymbolPrefetchEnabled(Value: Boolean);
 
 // Where a package's `.dcp` is, given the package itself: beside it, or in
@@ -411,7 +424,7 @@ end;
 function SymbolPrefetchEnabled: Boolean;
 begin
   if GPrefetchEnabled < 0 then
-    SetSymbolPrefetchEnabled(GetEnvironmentVariable('SYMBOL_PREFETCH') = '1');
+    SetSymbolPrefetchEnabled(GetEnvironmentVariable('SYMBOL_PREFETCH') <> '0');
   Result := GPrefetchEnabled = 1;
 end;
 
@@ -482,6 +495,7 @@ begin
   Result := Outcome;
   if (Req.FullPath = '') or not FileExists(Req.FullPath) then
     Exit;
+  var ParseStart := GetTickCount64;
 
   {$Q-}
   var Shift: UInt64 := Req.Base - Req.ImageBase;
@@ -606,6 +620,11 @@ begin
       end;
     end;
   end;
+  // How long the worker held this module's claim. While it is held the dispatch
+  // thread must decline the module, so this number is the exact window in which
+  // a frame can come back nameless -- and the first thing to look at when a
+  // request is answered late.
+  Note(Format('DLL prefetch parsed %s in %d ms', [Req.Name, GetTickCount64 - ParseStart]));
   Result := Outcome;
 end;
 
@@ -1587,6 +1606,11 @@ begin
     Module.PrefetchInFlight := False;
     Exit;
   end;
+  // Logged because this is the only point where the prefetcher changes what the
+  // caller gets back: the answer to THIS request is built without this module's
+  // symbols. Rare and harmless in the design; a burst of them around a late
+  // response would say the design is not holding.
+  Log('DLL prefetch claim held by the worker -- load declined this turn: ' + Module.Name);
   Result := True;
 end;
 
@@ -1745,10 +1769,20 @@ begin
   Result := False;
   if FPrefetch = nil then
     Exit;
+  var DrainStart := GetTickCount64;
+  var PublishedCount := 0;
   var Outcome: TPrefetchOutcome;
-  while FPrefetch.Pop(Outcome) do
+  while FPrefetch.Pop(Outcome) do begin
     if PublishPrefetch(Outcome) then
       Result := True;
+    Inc(PublishedCount);
+  end;
+  // Publication runs on the dispatch thread, inside the pump, between the client
+  // and its answer. Its cost therefore belongs to whatever request comes next,
+  // which is why it is measured rather than assumed to be small.
+  if PublishedCount > 0 then
+    Log(Format('DLL prefetch drained %d module(s) in %d ms',
+      [PublishedCount, GetTickCount64 - DrainStart]));
 end;
 
 procedure TModuleSymbolLoader.ShutdownPrefetch;

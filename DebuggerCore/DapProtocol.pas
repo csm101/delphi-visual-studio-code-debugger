@@ -372,6 +372,13 @@ initialization
   // wrote nowhere even when explicitly enabled. Diagnostics that vanish
   // depending on which frontend is running are worse than none.
   GLogPath := GetEnvironmentVariable('TEMP') + '\dap_adapter.log';
+  // Env-var override: DAP_LOG_PATH gives this process a log of its own. Needed
+  // whenever several adapters run at once -- the parallel test suite runs up to
+  // eight -- because otherwise they interleave, and rotate, one shared file, and
+  // an interleaved log is worth nothing when the diagnosis depends on the order
+  // of one adapter's own lines.
+  if GetEnvironmentVariable('DAP_LOG_PATH') <> '' then
+    GLogPath := GetEnvironmentVariable('DAP_LOG_PATH');
   // Env-var override: DAP_LOG=1 forces logging on regardless of launch.json.
   if SameText(GetEnvironmentVariable('DAP_LOG'), '1') then
     GLogEnabled := True;

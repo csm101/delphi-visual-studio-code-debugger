@@ -4082,8 +4082,9 @@ procedure TDebugSessionTests.Prefetch_NoBreakpoints_LoadsRuntimePackageSymbols;
 // so the .bpl unlocks for a rebuild, which is the opposite of parsing a dead
 // process's file (see NaturalExit_ReleasesTheBplFileLock).
 begin
-  // The prefetcher ships DISABLED (see SetSymbolPrefetchEnabled); this test is
-  // what exercises it, so it turns it on for its own scope.
+  // The prefetcher ships enabled, but this test is the one that exercises it
+  // deliberately, so it does not depend on the default or on the environment:
+  // it turns it on for its own scope and restores whatever was there before.
   var WasEnabled := SymbolPrefetchEnabled;
   SetSymbolPrefetchEnabled(True);
   var Session := TDebugSession.Create;

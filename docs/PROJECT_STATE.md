@@ -292,9 +292,8 @@ Symbol / source resolution:
 - ASLR: actual `ImageBase` from `CREATE_PROCESS_DEBUG_INFO` vs preferred base.
 - Delphi RTL/VCL source resolution via `sourceSearchPaths` config and the
   `BDS` env var. No hardcoded Delphi install paths.
-- Background symbol PREFETCH -- BUILT BUT DISABLED BY DEFAULT
-  (`SetSymbolPrefetchEnabled` / `SYMBOL_PREFETCH=1`; see TASK_RESUME for why).
-  (`TSymbolPrefetcher` in
+- Background symbol PREFETCH -- ON BY DEFAULT since 2026-08-29
+  (`SYMBOL_PREFETCH=0` turns it off). (`TSymbolPrefetcher` in
   `DebuggerCore\ModuleSymbolLoader.pas`, shared by both frontends). A module's
   readers are built on a worker thread at its LOAD_DLL event and registered on
   the dispatch thread at the next stop, instead of being parsed synchronously by
@@ -304,7 +303,10 @@ Symbol / source resolution:
   and no `EnsureModule*` ever parses a claimed module. Provider registration
   stays single-threaded, so `TDebugInfoSet` still needs no lock. Design rules
   and the reason behind each are in `DAP_DEBUGGER_ARCHITECTURE.md` -> "Symbol
-  prefetcher". `NO_SYMBOL_PREFETCH=1` restores the purely lazy behaviour.
+  prefetcher". `SYMBOL_PREFETCH=0` restores the purely lazy behaviour.
+  It was disabled for a period over an unexplained intermittent request timeout
+  in the BPL fixture; that stopped reproducing after the TD32 reader work, and
+  three consecutive clean full parallel runs are what turned it back on.
 - DAP emits `invalidated(stacks)` when prefetched symbols register while
   stopped, so a stack drawn with nameless frames refills without user action.
 

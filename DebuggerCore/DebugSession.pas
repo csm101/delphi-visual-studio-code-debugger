@@ -1104,7 +1104,11 @@ begin
     Exit;
   // ONE repost for the whole drain, not one per module: a drain can publish a
   // dozen modules at once and each repost rewrites every spec.
+  var RepostStart := GetTickCount64;
   RepostBreakpoints;
+  var RepostMs := GetTickCount64 - RepostStart;
+  if (RepostMs >= 200) and Assigned(FLoader.OnLog) then
+    FLoader.OnLog(Format('Repost after a prefetch drain took %d ms', [RepostMs]));
   if Assigned(FOnSymbolsArrived) then
     FOnSymbolsArrived(Self);
 end;

@@ -987,12 +987,29 @@ half-way) and cleared it when its own scope ended (disarming F14 protection in
 the middle of a stop). Covered by
 `RsmReaderTests.InteractiveDeadline_IsPerThread`.
 
-## Symbol prefetcher (built, DISABLED by default)
+## Symbol prefetcher (ON by default)
 
-**Status:** `SetSymbolPrefetchEnabled` defaults to False; `SYMBOL_PREFETCH=1`
-enables it. With it on, the full suite intermittently loses a request to a 30 s
-timeout in the BPL fixture -- unexplained, see TASK_RESUME. The rules below are
-the design as built and must be preserved by whoever finishes it.
+**Status:** enabled. `SYMBOL_PREFETCH=0`, or `SetSymbolPrefetchEnabled(False)`,
+turns it off, and that is the first thing to try if symbol behaviour ever looks
+timing-dependent again.
+
+It shipped disabled for a period: with it on, the full suite intermittently lost
+one to three requests per run to a 30 s response timeout, always in the BPL
+fixture, always on the first request after a stop, never in isolation. That no
+longer reproduces -- three consecutive full parallel runs (1332 tests, 8 workers,
+~2500 adapter launches) came back clean, with 409 modules parsed on the worker,
+42 dispatch-thread loads correctly declined while the worker held a claim, 380
+drains, and a single operation anywhere above 500 ms. The likeliest cause of the
+change is the TD32 reader work that landed in between (names and type names no
+longer materialised at parse time, line tables no longer held in dictionaries),
+which cut what a prefetched module allocates while the dispatch thread reads a
+sibling reader.
+
+The diagnostics that establish this are permanent. Every prefetch parse, drain
+and declined load is logged; the DAP loop reports any request or pump turn over
+`SLOW_OP_MS` (500 ms); and `DAP_LOG=1` gives each adapter a log of its own
+(`DAP_LOG_PATH`), without which the eight adapters a parallel run keeps alive
+interleave into one useless file.
 
 `TSymbolPrefetcher`, inside `DebuggerCore\ModuleSymbolLoader.pas`, so BOTH
 frontends get it (the earlier, shelved, environment-variable-gated loader lived
@@ -1058,7 +1075,7 @@ Rules, each of which is load-bearing:
   `CheckSynchronize` but the MCP loop does not, so a `TThread.Queue` handoff
   would pass every DAP test and never register anything under MCP.
 
-`SYMBOL_PREFETCH=1` enables it; it is off otherwise.
+On by default; `SYMBOL_PREFETCH=0` turns it off.
 
 ## Main loop
 

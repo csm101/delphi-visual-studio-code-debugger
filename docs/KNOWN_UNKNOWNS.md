@@ -1677,6 +1677,29 @@ arrives labelled: a `load-sensitive` count above zero in a report IS this
 question recurring, and the re-check log
 (`DebuggerTests\Win64\Debug\RunTests_recheck.log`) says which tests.
 
+**2026-08-29 — seen once at EIGHT workers, and it names a wrong type rather than
+a missing one.** `NestedTypeNames_ResolveOnBothBitnesses` failed one run in seven
+and passed the sequential re-check, with:
+
+    x86 EmptyCols -> $134720 (EVariantInvalidNullOpError)  [EVariantInvalidNullOpError]
+
+`EmptyCols` is an empty SET. Rendered as an address plus the class that happens to
+live there, it says the evaluate path could not resolve the variable's declared
+type and fell back to reading it as an object pointer -- the same "symbol not
+there yet" gap as above, but returning a confident wrong answer instead of a
+blank. Two things follow: the missing guard is worth more than the raised cap,
+and whatever fills it should make an unresolved type FAIL rather than degrade
+into a pointer render.
+
+Measured while turning the symbol prefetcher on by default; it is NOT attributed
+to the prefetcher (seven runs on, one occurrence; three runs off, none -- far too
+small a sample to separate). The prefetcher does not touch the main executable's
+symbols, which is what this test reads.
+
+The per-adapter logging this question's "next step" asks for now exists:
+`DAP_LOG=1` on the runner gives every adapter its own file via `DAP_LOG_PATH`,
+and the timeout messages name it.
+
 ## Large-project scale (SampleApp / 780 MB RSM)
 
 - **Cold-start scan duration — MEASURED 2026-08-03.** On

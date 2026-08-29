@@ -195,6 +195,16 @@ absurdly.
 - **`DAP_LOG=1` is set at USER env level on this machine**, so adapter logging
   (synchronous `WriteFile` per line) is always on. `setx DAP_LOG 0` before
   measuring latency; re-enable only while diagnosing.
+- **One adapter log is worthless while several adapters are running.** A parallel
+  suite run keeps up to eight alive and they all append to
+  `%TEMP%\dap_adapter.log`, interleaved and rotating each other out. Set
+  `DAP_LOG_PATH` per process -- the test client does it automatically when the
+  runner has `DAP_LOG=1`, and names the file in its timeout messages.
+- **When symbol behaviour looks timing-dependent, try `SYMBOL_PREFETCH=0`
+  first.** It disables the background prefetcher (on by default), which is the
+  one thing in the loader that parses off the dispatch thread. If the symptom
+  goes away, the answer is in the claim/publish protocol; if it does not, the
+  prefetcher is not involved and the time is better spent elsewhere.
 - **Validate any instruction-length decoder against a LARGE real binary.** 70 476
   spans showed zero unknown opcodes; 2 354 868 spans surfaced 61, one a real gap
   (AVX in `System.Move`). Trivial targets hide decoding gaps entirely.

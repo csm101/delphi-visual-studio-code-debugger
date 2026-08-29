@@ -22,6 +22,14 @@ uses
   SafeCallPolicy,
   ExprEval, ValueEncoders, Disassembler, ZydisDisassembler;
 
+const
+  // Anything on the adapter's single dispatch loop that takes longer than this
+  // is logged with what it was doing. A client only ever sees "the response was
+  // late", so the adapter has to be the one that says which turn of the loop
+  // ate the time. Well above a normal request (a stackTrace with symbol loads
+  // is tens of ms) and well below any test's response timeout.
+  SLOW_OP_MS = 500;
+
 // Full definition lives in the disassemble section further down (it is the
 // same helper HandleDisassemble uses to locate Zydis.dll); needed earlier by
 // TDapServer.BuildPlaceholderDisassembly (docs/ASSEMBLY_LEVEL_DEBUGGING.md
@@ -5348,12 +5356,19 @@ begin
           FQuit := True;
           Break;
         end;
+        var RequestName: string;
+        if not Msg.TryGetValue<string>('command', RequestName) then
+          RequestName := '<no command>';
+        var RequestStart := GetTickCount64;
         try
           ProcessRequest(Msg);
         except
           on E: Exception do
             DapLog('EXCEPTION in ProcessRequest: ' + E.ClassName + ': ' + E.Message);
         end;
+        var RequestMs := GetTickCount64 - RequestStart;
+        if RequestMs >= SLOW_OP_MS then
+          DapLog(Format('SLOW request: %s took %d ms', [RequestName, RequestMs]));
         Msg.Free;
         DidWork := True;
       until False;
@@ -5367,7 +5382,11 @@ begin
       // the idle Sleep below prevents a 100% CPU busy-spin. Pump stays on THIS
       // (launch/dispatch) thread -- WaitForDebugEvent is thread-affine.
       if FLaunched and (FDebugger <> nil) then begin
+        var PumpStart := GetTickCount64;
         FSession.Pump;
+        var PumpMs := GetTickCount64 - PumpStart;
+        if PumpMs >= SLOW_OP_MS then
+          DapLog(Format('SLOW pump: %d ms', [PumpMs]));
         DidWork := True;
       end;
 

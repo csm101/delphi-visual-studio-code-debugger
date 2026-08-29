@@ -32,6 +32,12 @@ type
     // Scratch directory holding the project file (never opened) and the shared
     // rules sidecar LaunchWithRules writes into it. Removed on destroy.
     FRulesScratchDir: string;
+    // What each seq was, so a timeout can name the request instead of a number,
+    // and where THIS adapter's diagnostic log went, so the message can point at
+    // the file that has the answer. Under parallel workers there are up to eight
+    // adapters alive at once; a message naming only a seq identifies nothing.
+    FSeqCommands:     TDictionary<Integer, string>;
+    FAdapterLogPath:  string;
 
     function  NextSeq: Integer;
     procedure WriteMsg(const Body: string);
@@ -46,6 +52,12 @@ type
                 TimeoutMs: Integer; out Msg: TJSONObject): Boolean;
 
     function  SendCmd(const Cmd: string; Args: TJSONObject): Integer;
+    // What to say when a response never arrives: which request it was, and
+    // which adapter log to open.
+    function  TimeoutDetail(Seq: Integer): string;
+    // Points the adapter about to be spawned at a log file nobody else writes.
+    // No-op unless the runner itself has DAP_LOG=1.
+    procedure GiveThisAdapterItsOwnLog;
     function  WaitResp(Seq: Integer; TimeoutMs: Integer = 30000): TJSONObject;
     // Returns the full response message (no `success` check, no raise except
     // on timeout). Caller owns the result.
@@ -281,7 +293,7 @@ function FindBpLine(const SourceFile, Marker: string): Integer;
 implementation
 
 uses
-  System.IOUtils, TestTempDirs;
+  System.IOUtils, System.StrUtils, TestTempDirs;
 
 { --------------------------------------------------------------------------- }
 { Reader thread }
@@ -324,6 +336,7 @@ begin
   FStdoutR:= INVALID_HANDLE_VALUE;
   FSeq    := 0;
   FDead   := False;
+  FSeqCommands := TDictionary<Integer, string>.Create;
 end;
 
 destructor TDapClient.Destroy;
@@ -341,6 +354,7 @@ begin
   FQueue.Free;
   FLock.Free;
   FDataEvent.Free;
+  FSeqCommands.Free;
   inherited;
 end;
 
@@ -378,6 +392,12 @@ begin
   var CmdLine := '"' + AdapterExe + '"';
   if ExtraArgs <> '' then
     CmdLine := CmdLine + ' ' + ExtraArgs;
+  // When the runner was started with DAP_LOG=1, give this adapter a log file of
+  // its own and remember where it is. The child inherits the environment, so
+  // setting the variable here is what routes it; without a distinct path all the
+  // adapters a parallel run has alive at once write into one file, and the one
+  // interleaved log answers no question about any of them.
+  GiveThisAdapterItsOwnLog;
   Win32Check(CreateProcess(nil, PChar(CmdLine), nil, nil, True,
     CREATE_NO_WINDOW, nil, nil, SI, PI));
 
@@ -564,6 +584,7 @@ begin
     Req.AddPair('seq',     TJSONNumber.Create(Result));
     Req.AddPair('type',    'request');
     Req.AddPair('command', Cmd);
+    FSeqCommands.AddOrSetValue(Result, Cmd);
     if Args <> nil then
       Req.AddPair('arguments', Args)
     else
@@ -572,6 +593,35 @@ begin
   finally
     Req.Free;
   end;
+end;
+
+var
+  // Distinguishes the adapters one runner spawns over its lifetime; the process
+  // id distinguishes the runners. Together they name a file uniquely across a
+  // parallel run without any coordination between the workers.
+  GAdapterLogSerial: Integer = 0;
+
+procedure TDapClient.GiveThisAdapterItsOwnLog;
+begin
+  FAdapterLogPath := '';
+  if not SameText(GetEnvironmentVariable('DAP_LOG'), '1') then begin
+    SetEnvironmentVariable('DAP_LOG_PATH', nil);
+    Exit;
+  end;
+  Inc(GAdapterLogSerial);
+  FAdapterLogPath := Format('%s\dap_adapter_%d_%d.log',
+    [GetEnvironmentVariable('TEMP'), GetCurrentProcessId, GAdapterLogSerial]);
+  SetEnvironmentVariable('DAP_LOG_PATH', PChar(FAdapterLogPath));
+end;
+
+function TDapClient.TimeoutDetail(Seq: Integer): string;
+begin
+  var Cmd: string;
+  if not FSeqCommands.TryGetValue(Seq, Cmd) then
+    Cmd := 'unknown request';
+  Result := Format('seq=%d (%s)', [Seq, Cmd]);
+  if FAdapterLogPath <> '' then
+    Result := Result + ' -- adapter log: ' + FAdapterLogPath;
 end;
 
 function TDapClient.WaitResp(Seq, TimeoutMs: Integer): TJSONObject;
@@ -585,7 +635,7 @@ begin
       var S := O.GetValue<Integer>('request_seq', -1);
       Result := (T = 'response') and (S = Seq);
     end, TimeoutMs, Msg) then
-    raise EDapError.CreateFmt('Timeout waiting for response to seq=%d', [Seq]);
+    raise EDapError.CreateFmt('Timeout after %d ms waiting for response to %s', [TimeoutMs, TimeoutDetail(Seq)]);
 
   if not Msg.GetValue<Boolean>('success', False) then begin
     var Err := Msg.GetValue<string>('message', 'unknown error');
@@ -612,7 +662,7 @@ begin
       var S := O.GetValue<Integer>('request_seq', -1);
       Result := (T = 'response') and (S = Seq);
     end, TimeoutMs, Msg) then
-    raise EDapError.CreateFmt('Timeout waiting for response to seq=%d', [Seq]);
+    raise EDapError.CreateFmt('Timeout after %d ms waiting for response to %s', [TimeoutMs, TimeoutDetail(Seq)]);
   // Hand back a private copy of the whole message; caller inspects success.
   Result := TJSONObject.ParseJSONValue(Msg.ToJSON) as TJSONObject;
   Msg.Free;
@@ -1376,7 +1426,8 @@ begin
       Result := (O.GetValue<string>('type', '') = 'event') and
                 (O.GetValue<string>('event', '') = 'stopped');
     end, TimeoutMs, Msg) then
-    raise EDapError.Create('Timeout waiting for stopped event');
+    raise EDapError.Create('Timeout waiting for stopped event' +
+      IfThen(FAdapterLogPath <> '', ' -- adapter log: ' + FAdapterLogPath));
 
   var Body := Msg.GetValue('body') as TJSONObject;
   if Body <> nil then
