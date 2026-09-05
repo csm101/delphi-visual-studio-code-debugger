@@ -601,6 +601,40 @@ by RSM's name-keyed format (see `KNOWN_UNKNOWNS.md`).
 
 ## Open milestones (roadmap)
 
+Integration with delphi-devkit (DDK), in this order:
+- **DDK as the source of project knowledge (NEXT).** Proposal posted on issue #1
+  of this repository (2026-09-05). DDK grows a neutral, debugger-agnostic
+  "debug target" query (CLI `--json` / MCP / LSP / VS Code command): project file,
+  kind, executable or host application, config / platform / bitness,
+  `.map` / `.rsm` / `.dcp` / `.bpl`, source root and search paths (dproj unit +
+  include path, IDE Library and Browsing Path, `$(BDS)\source`), modules, fused
+  run parameters, staleness warnings. This repository consumes it: the extension
+  resolves `{ "type": "delphi", "request": "launch"|"attach", "ddkProject": "<name>" }`
+  by asking DDK (VS Code command when DDK is installed, else `ddk.exe`), the MCP
+  server gains `launch_project` / `attach_to_project`, and `delphiProjectFile`
+  comes from DDK so project-scoped exception rules apply automatically. Attach
+  keeps the existing process picker, filtered to the project's executable, when
+  more than one instance runs. Both halves are written here; the DDK half goes
+  upstream as a pull request. Decided 2026-09-05: DDK's DelphiLSP integration is
+  treated as gone (upstream's `lsp` branch removes it), so the registry and macro
+  helpers the query needs are written fresh against upstream `main`, not reused.
+  Also planned alongside: a real Marketplace publisher and a `delphi` debug type
+  with `delphi-win64` kept as an alias.
+- **Custom IDE registry key (`bds.exe -r<Key>`) — LATER, separate PR, not in use
+  today.** RAD Studio can run against `HKCU\Software\Embarcadero\<Key>\<ver>`
+  instead of `...\BDS\<ver>` (`-r` switch), giving one installation several
+  independent Library / Browsing Path / known-package sets — the way to work on
+  several Vega branches with different component versions without them treading
+  on each other. Everything that reads the IDE's registry must then take the key
+  as an input instead of assuming `BDS`: DDK (library/browsing paths,
+  environment-variable overrides — most naturally a property of a DDK compiler
+  configuration, so a workspace picks "Delphi 12 / branch X"), the launch
+  configuration (an attribute naming the key, for a debugger run without DDK),
+  and the RAD Studio plugin, which already resolves paths through
+  `IOTAServices.GetBaseRegistryKey` of the running instance and only needs to
+  write that key down. Keep the door open in the debug-target design (the key
+  is one more field of the target); build it after the DDK integration lands.
+
 Debugger features:
 - **External review feedback (Delphi-PRAXiS, 2026-08-26) -- four of five DONE.**
   Issues #2 (NAMES spans), #3 (export-table frame naming), #4 (C++Builder FB0A)
