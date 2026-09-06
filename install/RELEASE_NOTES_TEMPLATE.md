@@ -13,29 +13,40 @@ application is debugged across the WOW64 boundary, so the debugger does not work
 inside a 32-bit address space, which is where a large project's symbol data
 would otherwise run out of room.
 
-## Important: set up your project with the companion Delphi IDE plugin
+## Important: let something that knows your project describe it
 
 To debug your own application, VS Code must first know about your project —
-launch configuration, LSP settings, workspace layout. The
-[EditInVsCodeDelphiPlugin](https://github.com/csm101/EditInVsCodeDelphiPlugin)
-generates all of that from inside the Delphi IDE, so install it first:
+the executable (or the host application of a package), the symbol files, the
+source search paths, the packages. Two things can supply that:
 
-1. `git clone https://github.com/csm101/EditInVsCodeDelphiPlugin`
-2. Open `EditInVSCode.dpk` in the Delphi IDE
-3. Right-click the project in the Project Manager and choose **Install**
-
-Once installed, choose **Tools → Edit in Visual Studio Code** from the Delphi
-IDE: your project opens in VS Code already configured for this debugger.
+- **[delphi-devkit (DDK)](https://marketplace.visualstudio.com/items?itemName=Snowcaloid.delphi-devkit)**,
+  from inside VS Code. With DDK installed there is no `launch.json` to write:
+  right-click a project in DDK's tree and choose **Debug** or **Attach
+  Debugger**, or write the two-line configuration
+  `{ "type": "delphi", "request": "launch", "ddkProject": "MyApp" }`.
+- The **[EditInVsCodeDelphiPlugin](https://github.com/csm101/EditInVsCodeDelphiPlugin)**,
+  from inside the Delphi IDE: `git clone` it, open `EditInVSCode.dpk`, install
+  it from the Project Manager, then **Tools → Edit in Visual Studio Code**
+  opens your project in VS Code already configured for this debugger.
 
 {{HIGHLIGHTS}}
 
 ## Install
 
 1. Download `delphi-win64-debugger-setup-v{{VERSION}}.zip` below and extract it anywhere.
-2. Run `Setup.exe`. It packages the extension into a `.vsix` and installs it
-   through the VS Code CLI, updating any previous version in place, then offers
-   to register the MCP debug server with Claude Code and VS Code.
+2. Run `Setup.exe`. It installs the bundled `.vsix` through the VS Code CLI
+   (`code --install-extension`), updating any previous version in place, then
+   offers to register the MCP debug server with Claude Code and VS Code.
 3. Reload VS Code.
+
+**The extension is now `mca-software.delphi-debugger`.** Earlier releases
+installed it under the id `local.delphi-win64-debug`; the two must not coexist,
+because both contribute the same debug types and VS Code would ask which one to
+use at every session start. `Setup.exe` uninstalls the old copy and deletes any
+leftover folder before installing the new one. If you install the `.vsix` by
+hand instead, remove the old copy first:
+`code --uninstall-extension local.delphi-win64-debug`. The extension also
+detects a leftover copy on activation and offers to remove it.
 
 **Windows will warn you**: these executables are not code-signed, so SmartScreen
 shows "Windows protected your PC". Choose *More info -> Run anyway*, or build the
@@ -72,9 +83,10 @@ symbols. To step into the RTL and VCL, also enable *Use debug .dcus*.
 | | |
 |---|---|
 | `Setup.exe` | Installer and updater |
-| `mca-software.delphi-debugger/` | The VS Code extension plus the DAP adapter |
-| `DelphiDebuggerMcp.exe` | MCP server — {{MCP_TOOL_COUNT}} tools that let an agent set breakpoints, step, and read locals |
-| `scripts/register-mcp.ps1` | Registers or unregisters the MCP server |
+| `mca-software.delphi-debugger-{{VERSION}}.vsix` | The VS Code extension, packaged: the DAP adapter, the MCP server and the extension code. What `Setup.exe` installs; also attached to this release on its own |
+| `mca-software.delphi-debugger/` | The same, as a folder (`Setup.exe` packages it itself when no `.vsix` is next to it) |
+| `DelphiDebuggerMcp.exe` | MCP server — {{MCP_TOOL_COUNT}} tools that let an agent set breakpoints, step, and read locals; installed to `%LOCALAPPDATA%\DelphiWin64Debugger` and registered as `delphi-debugger` |
+| `register-mcp.ps1` | Registers or unregisters the MCP server |
 
 SHA-256 of the zip:
 `{{SHA256}}`

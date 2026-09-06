@@ -146,6 +146,7 @@ Options:
 | `-DryRun` | Render and report only. Nothing is sent to GitHub |
 | `-SkipBuild` | Reuse the zip already in `dist\`. For a second attempt after a notes-only fix |
 | `-Highlights <file>` | The "What's new" text. Omitting it produces a release with no such section, and the script says so |
+| `-PreRelease` | Mark the draft as a pre-release: listed as such on GitHub, never "Latest", not announced by the extension's update check. For a release that changes something structural and deserves a prudence flag |
 | `-Verify` | Run AFTER publishing. Checks the tag landed on the commit the release was built from. Does nothing else |
 
 ---

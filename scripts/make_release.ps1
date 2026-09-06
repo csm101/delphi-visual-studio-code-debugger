@@ -18,6 +18,11 @@ param(
     [switch]$DryRun,
     [switch]$SkipBuild,
     [switch]$Verify,
+    # Marks the draft as a pre-release: it is listed as such on GitHub and never
+    # becomes "Latest", so the update check in the extension does not announce
+    # it either. For a release that changes something structural (an extension
+    # id, a debug type) and deserves a prudence flag for a while.
+    [switch]$PreRelease,
     [string]$Highlights = ''
 )
 
@@ -223,8 +228,10 @@ Write-Host ''
 # commit, and none of them describes the tree that was actually shipped.
 # Pin the exact commit that was built.
 $target = (& git -C $repo rev-parse HEAD).Trim()
-Write-Host "=== Creating DRAFT release $tag at $target ==="
-gh release create $tag --draft --target $target `
+$flags = @('--draft')
+if ($PreRelease) { $flags += '--prerelease' }
+Write-Host "=== Creating DRAFT release $tag at $target$(if ($PreRelease) { ' (pre-release)' }) ==="
+gh release create $tag @flags --target $target `
     --title "$tag - Delphi Debugger for VS Code and AI Agents" `
     --notes-file $notesPath `
     $zip $vsix

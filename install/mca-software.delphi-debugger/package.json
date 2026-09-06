@@ -2,7 +2,7 @@
   "name": "delphi-debugger",
   "displayName": "Delphi Debugger",
   "description": "Debug Delphi Win32/Win64 applications in VS Code, outside the RAD Studio IDE; also an MCP server for AI agents",
-  "version": "0.6.4",
+  "version": "0.7.0",
   "publisher": "mca-software",
   "license": "MIT",
   "author": "Carlo Sirna",
