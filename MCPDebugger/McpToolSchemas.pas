@@ -195,6 +195,17 @@ begin
      Prop('workspaceFolder', 'string', 'Base for ${workspaceFolder}. Defaults to the launch.json''s parent directory.'),
      Prop('killOnDetach', 'boolean', 'Terminate the target on session end; default false.')]));
 
+  Result.Add(MakeTool('set_step_isolation_release',
+    'Switch the step-isolation deadlock detector for the rest of the session. A step keeps every ' +
+    'other thread frozen; with auto-release ON (the default) the frozen threads are released when ' +
+    'the stepped thread is found waiting on one of them (at once when the lock''s owner is known, ' +
+    'after releaseMs of an unowned wait otherwise). OFF = strict isolation: other threads stay frozen ' +
+    'for the whole step even if the stepped-over call waits on one of them - use pause_execution to ' +
+    'break in. Applies to a step already in flight. The current state is also in ' +
+    'get_debug_session_status.stepIsolation.',
+    [Prop('enabled', 'boolean', 'true = auto-release on (the configured threshold, or releaseMs); false = strict isolation.', True),
+     Prop('releaseMs', 'integer', 'Optional: the unowned-wait threshold in ms to use while enabled (replaces the configured value for this session).')]));
+
   Result.Add(MakeTool('detach_debugger',
     'Detach from the debuggee, leaving the process RUNNING. Only meaningful for an ' +
     'attached session that did not request killOnDetach.', []));

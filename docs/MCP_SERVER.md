@@ -144,7 +144,16 @@ To attach to processes owned by another user or elevated targets, run the client
 - `detach_debugger` — leave the process running.
 - `terminate_debuggee` — kill it.
 - `stop_debugging` — detach an attached session, terminate a launched one.
-- `get_debug_session_status` — state + current location when stopped.
+- `get_debug_session_status` — state + current location when stopped, plus
+  `stepIsolation` (`frozenPerStep`, `autoRelease`, `releaseMs`, `text`).
+- `set_step_isolation_release` — `enabled` (required), `releaseMs` (optional):
+  the step-isolation deadlock detector for the rest of the session. A step
+  keeps every other thread frozen; with auto-release ON (the default) they are
+  released when the stepped thread is found waiting on one of them. OFF = strict
+  isolation, for debugging exactly that contention one thread at a time — a
+  stepped-over call that waits on a frozen thread then waits until
+  `pause_execution`. Applies to a step already in flight. Returns the resulting
+  state in the same shape as the status.
 
 ### Breakpoints
 - `set_breakpoint` — `sourceFile`, `line`, plus optional `condition` (stop only

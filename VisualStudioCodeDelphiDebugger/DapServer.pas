@@ -489,6 +489,9 @@ type
     procedure ParseRawStackScan(Args: TJSONObject);
     // Custom request: flips the raw stack sweep mid-session (Call Stack toggle).
     procedure HandleSetRawStackScan(Seq: Integer; Args: TJSONObject);
+    // Custom request delphiSetStepIsolationRelease: {enabled?, releaseMs?}; no
+    // enabled = toggle. Replies with the resulting state and its one-line text.
+    procedure HandleSetStepIsolationRelease(Seq: Integer; Args: TJSONObject);
     // `diagnosticsLocation` -> FDiagnosticsToOutputChannel.
     procedure ParseDiagnosticsLocation(Args: TJSONObject);
     // Emits one diagnostic line to wherever diagnostics currently go.
@@ -1186,6 +1189,32 @@ end;
 // an `invalidated` event follows: VS Code caches the call stack and will not
 // re-request it because a setting changed, so without this the toggle appears
 // to do nothing until the next step.
+procedure TDapServer.HandleSetStepIsolationRelease(Seq: Integer; Args: TJSONObject);
+begin
+  var Current := FSession.GetStepIsolationState;
+  var Enabled := not Current.AutoRelease;   // no argument = toggle
+  var ReleaseMs := 0;
+  if Args <> nil then begin
+    if Args.GetValue('enabled') <> nil then
+      Enabled := Args.GetValue<Boolean>('enabled', Enabled);
+    ReleaseMs := Args.GetValue<Integer>('releaseMs', 0);
+  end;
+  FSession.SetStepIsolationAutoRelease(Enabled, ReleaseMs);
+  var State := FSession.GetStepIsolationState;
+  var Text := DescribeStepIsolation(State);
+  DapLog('delphiSetStepIsolationRelease -> ' + Text);
+  var Body := TJSONObject.Create;
+  try
+    Body.AddPair('enabled', TJSONBool.Create(State.AutoRelease));
+    Body.AddPair('releaseMs', TJSONNumber.Create(State.ReleaseMs));
+    Body.AddPair('frozenPerStep', TJSONBool.Create(State.FrozenPerStep));
+    Body.AddPair('text', Text);
+    FIO.SendResponse(Seq, 'delphiSetStepIsolationRelease', True, Body);
+  finally
+    Body.Free;
+  end;
+end;
+
 procedure TDapServer.HandleSetRawStackScan(Seq: Integer; Args: TJSONObject);
 begin
   var Enabled := FRawStackScan;
@@ -5260,6 +5289,7 @@ begin
     else if Cmd = 'disconnect'        then HandleDisconnect(Seq)
     else if Cmd = 'modules'           then HandleModules(Seq, Args)
     else if Cmd = 'delphiSetRawStackScan' then HandleSetRawStackScan(Seq, Args)
+    else if Cmd = 'delphiSetStepIsolationRelease' then HandleSetStepIsolationRelease(Seq, Args)
     else if Cmd = 'delphiMemoryExtent'    then HandleMemoryExtent(Seq, Args)
     else if Cmd.StartsWith('delphiSafelist') then HandleSafelist(Seq, Cmd, Args)
     // `cancel` is the one command worth tolerating as a no-op: the client is

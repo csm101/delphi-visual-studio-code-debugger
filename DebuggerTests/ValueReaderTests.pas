@@ -194,6 +194,8 @@ type
     function  LookupEnumInfo(const TypeName: string; out Info: TRsmEnumInfo): Boolean;
     procedure SetExceptionFilters(Filters: TExceptionFilters);
     procedure SetStepIsolation(ReleaseMs: Integer);
+    procedure SetStepIsolationAutoRelease(Enabled: Boolean; ReleaseMs: Integer = 0);
+    function  GetStepIsolationState: TStepIsolationState;
     procedure SetDelphiClassFilter(const ClassNames: string);
     procedure SetExceptionRules(const Rules: TArray<TExceptionRule>);
     procedure Launch(const ExePath: string; StopAtEntry: Boolean);
@@ -387,6 +389,8 @@ begin
 end;
 procedure TFakeMemTarget.SetExceptionFilters(Filters: TExceptionFilters); begin end;
 procedure TFakeMemTarget.SetStepIsolation(ReleaseMs: Integer); begin end;
+procedure TFakeMemTarget.SetStepIsolationAutoRelease(Enabled: Boolean; ReleaseMs: Integer); begin end;
+function  TFakeMemTarget.GetStepIsolationState: TStepIsolationState; begin Result := Default(TStepIsolationState); end;
 procedure TFakeMemTarget.SetDelphiClassFilter(const ClassNames: string); begin end;
 procedure TFakeMemTarget.SetExceptionRules(const Rules: TArray<TExceptionRule>); begin end;
 procedure TFakeMemTarget.Launch(const ExePath: string; StopAtEntry: Boolean); begin end;

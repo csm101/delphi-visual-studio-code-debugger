@@ -192,6 +192,8 @@ type
     FStepFreezeActive: Boolean;      // True while other threads are frozen for a step
     FStepFrozenTids:   TList<DWORD>; // threads we explicitly suspended for the current step
     FStepIsolationReleaseMs: Integer; // SetStepIsolation; < 0 = never freeze
+    FStepIsolationAutoRelease: Boolean; // the session-time switch (SetStepIsolationAutoRelease)
+    FStepIsolationOverrideMs:  Integer; // a threshold the switch set; 0 = the configured one
     FStepIsoQuietSince: UInt64;      // when the stepping thread last consumed CPU
     FStepIsoCpuAtQuiet: UInt64;      // its CPU time at that moment (100 ns units)
     FStepIsoLastProbe:  UInt64;      // last CheckStepIsolation, to pace the probes
@@ -662,6 +664,10 @@ type
     procedure Attach(ProcessId: Cardinal; KillOnDetach: Boolean);
     procedure SetExceptionFilters(Filters: TExceptionFilters);
     procedure SetStepIsolation(ReleaseMs: Integer);
+    procedure SetStepIsolationAutoRelease(Enabled: Boolean; ReleaseMs: Integer = 0);
+    function  GetStepIsolationState: TStepIsolationState;
+    // The wait-state threshold in force right now: 0 when the detector is off.
+    function  EffectiveStepReleaseMs: Integer;
     procedure SetDelphiClassFilter(const ClassNames: string);
     procedure ProcessOneEvent; // returns immediately if no event in 10ms
     property  Running:   Boolean read FRunning;
@@ -1149,7 +1155,8 @@ begin
   FPendingContinueStatus  := DBG_CONTINUE;
   FIsStopped              := False;
   FExceptionFilters       := DEFAULT_EXCEPTION_FILTERS;
-  FStepIsolationReleaseMs := DEFAULT_STEP_ISOLATION_RELEASE_MS;
+  FStepIsolationReleaseMs   := DEFAULT_STEP_ISOLATION_RELEASE_MS;
+  FStepIsolationAutoRelease := True;
   FPauseRequested         := False;
   FWatchArmedSlots        := 0;
   FWatchHitCount          := 0;
@@ -2043,7 +2050,9 @@ end;
 
 procedure TWinDebugger.SetStepIsolation(ReleaseMs: Integer);
 begin
-  FStepIsolationReleaseMs := ReleaseMs;
+  FStepIsolationReleaseMs   := ReleaseMs;
+  FStepIsolationAutoRelease := ReleaseMs <> 0;   // 0 = strict: the switch starts OFF
+  FStepIsolationOverrideMs  := 0;
   if ReleaseMs < 0 then
     DapLog('Step isolation: off (other threads run during a step)')
   else if ReleaseMs = 0 then
@@ -2072,6 +2081,43 @@ begin
   FStepIsoCpuAtQuiet := ThreadCpuTime100ns(StepTid);
   DapLog(Format('FreezeThreadsForStep: stepping tid=%d, froze %d other thread(s)',
     [StepTid, FStepFrozenTids.Count]));
+end;
+
+// What the switch turns ON to: a threshold it set itself, else the configured
+// one, else the default (a configuration of 0 starts OFF and turns on to 3 s).
+function TWinDebugger.EffectiveStepReleaseMs: Integer;
+begin
+  if not FStepIsolationAutoRelease then
+    Exit(0);
+  if FStepIsolationOverrideMs > 0 then
+    Exit(FStepIsolationOverrideMs);
+  if FStepIsolationReleaseMs > 0 then
+    Exit(FStepIsolationReleaseMs);
+  Result := DEFAULT_STEP_ISOLATION_RELEASE_MS;
+end;
+
+procedure TWinDebugger.SetStepIsolationAutoRelease(Enabled: Boolean; ReleaseMs: Integer);
+begin
+  FStepIsolationAutoRelease := Enabled;
+  if ReleaseMs > 0 then
+    FStepIsolationOverrideMs := ReleaseMs;
+  if Enabled then
+    DapLog(Format('Step isolation auto-release: ON (release after %d ms of an unowned wait)',
+      [EffectiveStepReleaseMs]))
+  else
+    DapLog('Step isolation auto-release: OFF (other threads stay frozen for the whole step)');
+end;
+
+function TWinDebugger.GetStepIsolationState: TStepIsolationState;
+begin
+  Result.FrozenPerStep := FStepIsolationReleaseMs >= 0;
+  Result.AutoRelease   := FStepIsolationAutoRelease;
+  if FStepIsolationOverrideMs > 0 then
+    Result.ReleaseMs := FStepIsolationOverrideMs
+  else if FStepIsolationReleaseMs > 0 then
+    Result.ReleaseMs := FStepIsolationReleaseMs
+  else
+    Result.ReleaseMs := DEFAULT_STEP_ISOLATION_RELEASE_MS;
 end;
 
 function TWinDebugger.ThreadCpuTime100ns(Tid: DWORD): UInt64;
@@ -2109,8 +2155,8 @@ end;
 
 procedure TWinDebugger.ReleaseStepIsolation(const Why: string);
 begin
-  var Waited := (GetTickCount64 - FStepIsoQuietSince) / 1000;
-  var Msg := Format('Step isolation released after %.1f s: the stepped-over call is waiting on %s; ' +
+  var Waited := FormatFloat('0.0', (GetTickCount64 - FStepIsoQuietSince) / 1000, TFormatSettings.Invariant);
+  var Msg := Format('Step isolation released after %s s: the stepped-over call is waiting on %s; ' +
     'other threads are running until the step lands', [Waited, Why]);
   ResumeStepFrozenThreads(Why);
   DapLog(Msg);
@@ -2121,6 +2167,12 @@ end;
 procedure TWinDebugger.CheckStepIsolation;
 begin
   if not FStepFreezeActive or (FStepTid = 0) then
+    Exit;
+  // Strict isolation (configured 0, or the switch OFF): no detection at all.
+  // The user who chose it is debugging the contention itself; Pause is the
+  // way out, and a toggle to ON applies from the next probe.
+  var ReleaseMs := EffectiveStepReleaseMs;
+  if ReleaseMs = 0 then
     Exit;
   var Now := GetTickCount64;
   if Now - FStepIsoLastProbe < STEP_ISOLATION_PROBE_MS then
@@ -2144,7 +2196,7 @@ begin
     FStepIsoQuietSince := Now;
     Exit;
   end;
-  if (FStepIsolationReleaseMs > 0) and (Now - FStepIsoQuietSince >= UInt64(FStepIsolationReleaseMs)) then
+  if Now - FStepIsoQuietSince >= UInt64(ReleaseMs) then
     ReleaseStepIsolation('an object with no owner the debugger can name (an event, a semaphore, I/O)');
 end;
 

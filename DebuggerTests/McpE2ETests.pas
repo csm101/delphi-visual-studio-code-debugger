@@ -49,6 +49,9 @@ type
     // one; only DDK's project knowledge is faked.
     [Test] procedure LaunchProject_ViaStubDdk_StopsAndCarriesWarnings;
     [Test] procedure LaunchProject_DdkErrors_VerbatimAndNotFoundNamesWhatToInstall;
+    // set_step_isolation_release: switches the live session and the state is
+    // visible in get_debug_session_status.
+    [Test] procedure StepIsolationRelease_ToolSwitchesTheSessionAndStatusShowsIt;
     [Test] procedure Relaunch_AfterTerminate_Succeeds;
     [Test] procedure Evaluate_Object_IsExpandable;
     [Test] procedure Locals_FrameIndex_ReadsCallerFrame;
@@ -1379,6 +1382,88 @@ begin
       SetEnvironmentVariable('DDK_EXE', PChar(SavedEnv));
     SetEnvironmentVariable('PATH', PChar(SavedPath));
     SetEnvironmentVariable('USERPROFILE', PChar(SavedProfile));
+  end;
+end;
+
+procedure TMcpE2ETests.StepIsolationRelease_ToolSwitchesTheSessionAndStatusShowsIt;
+
+  function StatusAutoRelease(C: TMcpTestClient): Boolean;
+  begin
+    var S := C.CallTool('get_debug_session_status', nil);
+    try
+      var Iso := (S as TJSONObject).GetValue('stepIsolation') as TJSONObject;
+      Assert.IsNotNull(Iso, 'no stepIsolation in the status: ' + S.ToJSON);
+      Result := Iso.GetValue<Boolean>('autoRelease', not Result);
+    finally
+      S.Free;
+    end;
+  end;
+
+  function RunToAndStepOver(C: TMcpTestClient; const Marker: string): Integer;
+  begin
+    var BpArgs := TJSONObject.Create;
+    BpArgs.AddPair('sourceFile', 'TestTargetCore.pas');
+    BpArgs.AddPair('line', TJSONNumber.Create(MarkerLine('TestTargetCore.pas', Marker)));
+    C.CallTool('set_breakpoint', BpArgs).Free;
+    var At := C.CallTool('continue_and_wait', nil);
+    try
+      Assert.AreEqual('stopped', (At as TJSONObject).GetValue<string>('state', ''), 'did not reach ' + Marker);
+    finally
+      At.Free;
+    end;
+    var Started := GetTickCount64;
+    var After := C.CallTool('step_over', nil);
+    try
+      Assert.AreEqual('stopped', (After as TJSONObject).GetValue<string>('state', ''), 'step_over did not land: ' + After.ToJSON);
+    finally
+      After.Free;
+    end;
+    Result := Integer(GetTickCount64 - Started);
+  end;
+
+begin
+  var C := TMcpTestClient.Start(McpExe);
+  try
+    C.Call('initialize', nil).Free;
+    var LaunchArgs := TJSONObject.Create;
+    LaunchArgs.AddPair('program', TargetExe);
+    LaunchArgs.AddPair('sourceRoot', TargetDir);
+    LaunchArgs.AddPair('args', '--run-step-wait-bounded');
+    LaunchArgs.AddPair('stepIsolationReleaseMs', TJSONNumber.Create(300));
+    C.CallTool('launch_debuggee', LaunchArgs).Free;
+
+    var Off := TJSONObject.Create;
+    Off.AddPair('enabled', TJSONBool.Create(False));
+    var Reply := C.CallTool('set_step_isolation_release', Off);
+    try
+      Assert.IsTrue(Reply is TJSONObject, 'set_step_isolation_release errored: ' + Reply.ToJSON);
+      Assert.IsFalse(TJSONObject(Reply).GetValue<Boolean>('autoRelease', True));
+      Assert.IsTrue(TJSONObject(Reply).GetValue<string>('text', '').Contains('OFF'), Reply.ToJSON);
+    finally
+      Reply.Free;
+    end;
+    Assert.IsFalse(StatusAutoRelease(C), 'the status does not show the switch OFF');
+
+    var Elapsed := RunToAndStepOver(C, 'STEPWAIT_CALL');
+    Assert.IsTrue(Elapsed >= 1400, Format('OFF: the step landed after %d ms; the 1.5 s wait should have run out', [Elapsed]));
+
+    var Onn := TJSONObject.Create;
+    Onn.AddPair('enabled', TJSONBool.Create(True));
+    C.CallTool('set_step_isolation_release', Onn).Free;
+    Assert.IsTrue(StatusAutoRelease(C), 'the status does not show the switch ON');
+
+    Elapsed := RunToAndStepOver(C, 'STEPWAIT_CALL2');
+    Assert.IsTrue(Elapsed < 1400, Format('ON: the step took %d ms; the worker should have been released at 300 ms', [Elapsed]));
+
+    var Missing := C.CallTool('set_step_isolation_release', TJSONObject.Create);
+    try
+      Assert.IsTrue(Missing is TJSONString, 'a call without "enabled" must be refused');
+    finally
+      Missing.Free;
+    end;
+    C.CallTool('terminate_debuggee', nil).Free;
+  finally
+    C.Free;
   end;
 end;
 

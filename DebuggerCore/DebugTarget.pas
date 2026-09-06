@@ -384,6 +384,13 @@ type
 
   // Abstract debug-target contract. Implementations: TWinDebugger today,
   // future TWin32Debugger / TAttachedDebugger / TRemoteDebugger.
+  // The step isolation as it stands in a live session.
+  TStepIsolationState = record
+    FrozenPerStep: Boolean;   // False under stepIsolation "none": nothing is ever frozen
+    AutoRelease:   Boolean;   // the deadlock detector may release the frozen threads
+    ReleaseMs:     Integer;   // the wait-state threshold that applies while AutoRelease
+  end;
+
   IDebugTarget = interface
     ['{C9F2A1B0-4D3E-44F8-8A22-9F5D8E0C7311}']
     // Process state.
@@ -719,6 +726,12 @@ type
     // the stepped thread sits in a wait with no owner the debugger can see.
     // 0 = never release; STEP_ISOLATION_NONE = never freeze at all.
     procedure SetStepIsolation(ReleaseMs: Integer);
+    // Session-time switch for the deadlock detector ("Toggle Auto-Release of
+    // Frozen Threads" / set_step_isolation_release). Off = strict isolation
+    // for the rest of the session; on = the configured threshold, or ReleaseMs
+    // when > 0. Applies to a step already in flight.
+    procedure SetStepIsolationAutoRelease(Enabled: Boolean; ReleaseMs: Integer = 0);
+    function  GetStepIsolationState: TStepIsolationState;
     // Per-class refinement of the `delphi` filter. When non-empty, a
     // first-chance Delphi raise only stops if the raised class name (read
     // via the standard EObject.ClassName lookup) appears in this comma-

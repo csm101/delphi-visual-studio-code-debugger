@@ -1386,6 +1386,20 @@ channel and MCP `get_debugger_output`), and `ckPause` releases everything
 before `DebugBreakProcess` (`HandleCreateThread` also leaves the break-in
 thread alone while a pause is pending). After a release the threads are frozen
 again when the step's resume breakpoint lands and single-stepping continues.
+**The switch.** The detector can be turned off for the rest of a session --
+the user who is debugging the contention itself wants the others to stay
+frozen -- through the custom request `delphiSetStepIsolationRelease`
+({`enabled`?, `releaseMs`?}; no `enabled` = toggle; the reply carries the
+resulting `enabled` / `releaseMs` / `frozenPerStep` and a one-line `text`),
+wired to the command **Toggle Auto-Release of Frozen Threads** next to the
+raw-stack toggle, and through the MCP tool `set_step_isolation_release` (state
+in `get_debug_session_status.stepIsolation`). OFF = `EffectiveStepReleaseMs` 0:
+`CheckStepIsolation` runs neither tier. ON = the configured threshold, or one
+given with the switch, or the default when the configuration was strict (0
+starts OFF). `stepIsolation: "none"` leaves the switch meaningless and the
+text says so. The switch is read on every probe, so turning it ON during a
+stalled strict step releases that step. `DescribeStepIsolation` (DebugSession)
+is the one sentence per state both frontends show.
 The freeze was never what scoped the LANDING: `FStepTid` does -- a transient
 step breakpoint or the step's target one-shot reached by another thread is
 stepped off and re-armed (`StepTargetHitByOtherThread` →

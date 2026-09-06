@@ -495,6 +495,9 @@ var
   GStepWaitNever: THandle;   // never set: a call that blocks until the debugger pauses
   GStepWaitBound: DWORD;     // the handshake's wait bound (30 s; 1.5 s with --run-step-wait-bounded)
   GStepWaitResult: DWORD;    // what the stepped-over call's wait returned (WAIT_TIMEOUT = the worker never ran)
+  GStepWaitGo2:    THandle;  // the second round, on its own pair of events
+  GStepWaitDone2:  THandle;
+  GStepWaitResult2: DWORD;
   // Step isolation across a CPU-bound callee (see RunStepCpuFixture): a
   // spinner thread that would advance if the step released it.
   GStepCpuSpin: Int64;
@@ -2144,11 +2147,17 @@ end;
 // target to raise the break-in; a debugger that suspends every thread born
 // during a step suspends that one too, and the pause never lands.
 
+// Two rounds on two distinct event pairs, so a test can step over the FIRST
+// handshake with one isolation setting and the SECOND with another: a round
+// the worker was not allowed to answer in time is left behind, not carried
+// over into the next one.
 function StepWaitWorker(Param: Pointer): DWORD; stdcall;
 begin
   NameCurrentThread('StepWaitWorker');
   WaitForSingleObject(GStepWaitGo, 30000);
   SetEvent(GStepWaitDone);
+  WaitForSingleObject(GStepWaitGo2, 30000);
+  SetEvent(GStepWaitDone2);
   Result := 0;
 end;
 
@@ -2156,6 +2165,12 @@ procedure StepWaitHandshake;
 begin
   SetEvent(GStepWaitGo);
   GStepWaitResult := WaitForSingleObject(GStepWaitDone, GStepWaitBound);
+end;
+
+procedure StepWaitHandshake2;
+begin
+  SetEvent(GStepWaitGo2);
+  GStepWaitResult2 := WaitForSingleObject(GStepWaitDone2, GStepWaitBound);
 end;
 
 procedure StepWaitForever;
@@ -2174,18 +2189,24 @@ begin
     GStepWaitBound := 1500;
   GStepWaitGo    := CreateEvent(nil, True, False, nil);
   GStepWaitDone  := CreateEvent(nil, True, False, nil);
+  GStepWaitGo2   := CreateEvent(nil, True, False, nil);
+  GStepWaitDone2 := CreateEvent(nil, True, False, nil);
   GStepWaitNever := CreateEvent(nil, True, False, nil);
   HW := CreateThread(nil, 0, @StepWaitWorker, nil, 0, IdW);
   Sleep(50);                                   // the worker is inside its wait
   GSink.Use(['step-wait ready']);              // {BP:STEPWAIT_MAIN}
   StepWaitHandshake;                           // {BP:STEPWAIT_CALL}
   GSink.Use(['step-wait done']);               // {BP:STEPWAIT_NEXT}
+  StepWaitHandshake2;                          // {BP:STEPWAIT_CALL2}
+  GSink.Use(['step-wait done twice']);         // {BP:STEPWAIT_NEXT2}
   if FindCmdLineSwitch('run-step-wait-forever') or FindCmdLineSwitch('-run-step-wait-forever') then
     StepWaitForever;                           // {BP:STEPWAIT_FOREVER}
   WaitForSingleObject(HW, 5000);
   CloseHandle(HW);
   CloseHandle(GStepWaitGo);
   CloseHandle(GStepWaitDone);
+  CloseHandle(GStepWaitGo2);
+  CloseHandle(GStepWaitDone2);
   CloseHandle(GStepWaitNever);
 end;
 

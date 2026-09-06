@@ -40,6 +40,9 @@ echo.
 echo === DDK configuration provider and the old sideloaded copy ===
 node test-ddk-provider.js || set FAILED=1
 echo.
+echo === step isolation: the auto-release toggle ===
+node test-step-isolation.js || set FAILED=1
+echo.
 echo === MCP server distribution: stable copy, VS Code registry, Claude Code ===
 node test-mcp-distribution.js || set FAILED=1
 echo.

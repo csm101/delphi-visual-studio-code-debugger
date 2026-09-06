@@ -718,6 +718,9 @@ type
     // long -- or never returns -- otherwise shows the variables text for its
     // whole duration.
     [Test] procedure Test_StepProgress_SupersedesAnOpenVariablesBusyPeriod;
+    // The delphiSetStepIsolationRelease custom request: applied to the live
+    // session at once, and the reply states the resulting behaviour.
+    [Test] procedure Test_StepIsolationRelease_CustomRequest_SwitchesTheLiveSession;
 
     // --- conditional / hit-count / log-point breakpoints + hover eval ---
     [Test] procedure Test_BP_Conditional;
@@ -5760,6 +5763,84 @@ begin
   end;
   Assert.IsTrue(SawStepTitle,
     'the spinner never carried the step''s title after the step began; last text: "' + LastText + '"');
+end;
+
+procedure TDebuggerTests.Test_StepIsolationRelease_CustomRequest_SwitchesTheLiveSession;
+var
+  FrameId, LocalsRef: Integer;
+
+  function Switch(const ArgsJson: string): TJSONObject;
+  begin
+    var Seq := FClient.SendRequest('delphiSetStepIsolationRelease', ArgsJson);
+    var Resp := FClient.WaitRawResponse(Seq, 10000);
+    try
+      var Body := Resp.GetValue<TJSONObject>('body');
+      Assert.IsNotNull(Body, 'delphiSetStepIsolationRelease returned no body');
+      Result := TJSONObject.ParseJSONValue(Body.ToJSON) as TJSONObject;
+    finally
+      Resp.Free;
+    end;
+  end;
+
+  function StepAndMeasure: Integer;
+  begin
+    var Started := GetTickCount64;
+    FClient.StepOver.Free;
+    FClient.WaitForStopped(15000).Free;
+    Result := Integer(GetTickCount64 - Started);
+  end;
+
+  function GlobalValue(const Name: string): string;
+  begin
+    // WaitResp already unwraps the response body.
+    var R := FClient.Evaluate(Name, FClient.GetFrameId);
+    try
+      Result := R.GetValue<string>('result', '');
+    finally
+      R.Free;
+    end;
+  end;
+
+begin
+  StartSession('STEPWAIT_CALL', FrameId, LocalsRef, ['--run-step-wait-bounded']);
+
+  // A short threshold, then OFF: the first handshake must time out (1.5 s).
+  var Reply := Switch('{"enabled":true,"releaseMs":300}');
+  try
+    Assert.IsTrue(Reply.GetValue<Boolean>('enabled', False));
+    Assert.AreEqual(300, Reply.GetValue<Integer>('releaseMs', 0));
+    Assert.IsTrue(Reply.GetValue<string>('text', '').StartsWith('Auto-release of frozen threads: ON'), Reply.ToJSON);
+  finally
+    Reply.Free;
+  end;
+  Reply := Switch('{"enabled":false}');
+  try
+    Assert.IsFalse(Reply.GetValue<Boolean>('enabled', True));
+    var Text := Reply.GetValue<string>('text', '');
+    Assert.IsTrue(Text.StartsWith('Auto-release of frozen threads: OFF'), Text);
+    Assert.IsTrue(Text.Contains('Pause'), 'the OFF text must name Pause: ' + Text);
+  finally
+    Reply.Free;
+  end;
+  var Elapsed := StepAndMeasure;
+  Assert.IsTrue(Elapsed >= 1400, Format('OFF: the step landed after %d ms; the 1.5 s wait should have run out', [Elapsed]));
+  var WaitResult := GlobalValue('GStepWaitResult');
+  Assert.IsTrue(WaitResult.Contains('258'), 'OFF: the worker answered the handshake; GStepWaitResult = ' + WaitResult);
+
+  // No argument = toggle, back ON: the second handshake completes early.
+  Reply := Switch('{}');
+  try
+    Assert.IsTrue(Reply.GetValue<Boolean>('enabled', False), 'a bare request must toggle back ON');
+  finally
+    Reply.Free;
+  end;
+  var Call2 := Bp('STEPWAIT_CALL2');
+  Assert.IsTrue(Call2 > 0, 'marker STEPWAIT_CALL2 not found');
+  FClient.SetBreakpoints(FBpSourceFile, [Call2]).Free;
+  FClient.Continue_(1).Free;
+  FClient.WaitForStopped(15000).Free;
+  Elapsed := StepAndMeasure;
+  Assert.IsTrue(Elapsed < 1400, Format('ON: the step took %d ms; the worker should have been released at 300 ms', [Elapsed]));
 end;
 
 // While stopped on the MAIN thread (THREADS_READY), the call stack of a

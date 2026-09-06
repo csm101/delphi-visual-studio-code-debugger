@@ -189,6 +189,29 @@ async function warnAboutOldCopy(deps) {
   return true;
 }
 
+/**
+ * The status-bar text for the auto-release switch, from the adapter's reply to
+ * delphiSetStepIsolationRelease ({ enabled, releaseMs, frozenPerStep, text }).
+ * The adapter's own sentence is used when it sends one (the same text the MCP
+ * tool reports); the fallback composes it, so both states stay explicit and the
+ * OFF text names Pause as the escape hatch.
+ */
+function stepIsolationReleaseText(reply) {
+  const r = reply || {};
+  if (typeof r.text === 'string' && r.text.trim() !== '') return r.text;
+  if (r.frozenPerStep === false) {
+    return 'Auto-release of frozen threads: not applicable - this session never freezes other ' +
+      'threads for a step (stepIsolation "none")';
+  }
+  if (r.enabled) {
+    const seconds = (Number(r.releaseMs) > 0 ? Number(r.releaseMs) / 1000 : 3).toFixed(1);
+    return 'Auto-release of frozen threads: ON - a step-over that waits on a thread this step ' +
+      'froze is released after ' + seconds + " s, or at once when the lock's owner is known";
+  }
+  return 'Auto-release of frozen threads: OFF - other threads stay frozen for the whole step, ' +
+    'even if the stepped-over call waits on one of them; use Pause to break in';
+}
+
 function truncate(text, limit) {
   if (text.length <= limit) return text;
   return text.slice(0, limit - 1) + '…';
@@ -685,6 +708,30 @@ function activate(context) {
     })
   );
 
+  // The step-isolation deadlock detector, switched for the rest of the session.
+  // A step keeps every other thread frozen; the detector releases them when the
+  // stepped thread is found waiting on one of them. Someone debugging exactly
+  // that contention, one thread at a time, turns it OFF -- and the message
+  // states what is selected NOW, with Pause named as the way out of a strict
+  // step that waits forever.
+  context.subscriptions.push(
+    vscode.commands.registerCommand('delphi-win64.toggleStepIsolationRelease', async () => {
+      const session = vscode.debug.activeDebugSession;
+      if (!isDelphiSession(session)) {
+        vscode.window.showInformationMessage(
+          'Auto-release of frozen threads applies to a running Delphi debug session.');
+        return;
+      }
+      try {
+        const reply = await session.customRequest('delphiSetStepIsolationRelease', {});
+        vscode.window.setStatusBarMessage('Delphi: ' + stepIsolationReleaseText(reply), 10000);
+      } catch (err) {
+        vscode.window.showWarningMessage(
+          'Could not switch the auto-release of frozen threads: ' + (err && err.message ? err.message : String(err)));
+      }
+    })
+  );
+
   // Same language ids the breakpoint contribution uses.
   //
   // Guarded, and not out of superstition: this extension is installed into every
@@ -917,5 +964,6 @@ module.exports = {
   RESUME_REQUESTS: RESUME_REQUESTS,
   // Exported for tests: the hover-expression rule is plain text in, span out.
   pascalExpressionSpan: pascalExpressionSpan,
+  stepIsolationReleaseText: stepIsolationReleaseText,
   checkForUpdate: checkForUpdate
 };

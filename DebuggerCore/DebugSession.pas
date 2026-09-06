@@ -425,6 +425,12 @@ type
     function  StepInstruction(Kind: TInstructionStepKind; ThreadId: DWORD;
                 out RefusalReason: string): Boolean;
     procedure Pause;
+    // The step-isolation deadlock detector, switched at session time (the
+    // "Toggle Auto-Release of Frozen Threads" command / the
+    // set_step_isolation_release tool). Needs a live engine; before launch it
+    // is a no-op and the state reports the defaults.
+    procedure SetStepIsolationAutoRelease(Enabled: Boolean; ReleaseMs: Integer = 0);
+    function  GetStepIsolationState: TStepIsolationState;
 
     // Breakpoints.
     function  SetBreakpoints(const SourceFile: string;
@@ -696,6 +702,8 @@ type
     // nobody set a breakpoint in still had its symbols ready at the first stop.
     function ModuleSymbolState(const ModuleName: string): TSymbolAvailability;
   end;
+
+function DescribeStepIsolation(const S: TStepIsolationState): string;
 
 implementation
 
@@ -1230,6 +1238,37 @@ begin
   Result := FDebugger.StepInstruction(Kind, ThreadId, RefusalReason);
   if Result then
     SetState(dsRunning);
+end;
+
+procedure TDebugSession.SetStepIsolationAutoRelease(Enabled: Boolean; ReleaseMs: Integer);
+begin
+  if FDebugger <> nil then
+    FDebugger.SetStepIsolationAutoRelease(Enabled, ReleaseMs);
+end;
+
+function TDebugSession.GetStepIsolationState: TStepIsolationState;
+begin
+  if FDebugger <> nil then
+    Exit(FDebugger.GetStepIsolationState);
+  Result.FrozenPerStep := True;
+  Result.AutoRelease   := True;
+  Result.ReleaseMs     := DEFAULT_STEP_ISOLATION_RELEASE_MS;
+end;
+
+// One sentence per state, shared by the status bar (DAP custom request) and the
+// MCP tool, so the two never describe the same setting differently.
+function DescribeStepIsolation(const S: TStepIsolationState): string;
+begin
+  if not S.FrozenPerStep then
+    Exit('Auto-release of frozen threads: not applicable - this session never freezes other ' +
+      'threads for a step (stepIsolation "none")');
+  if S.AutoRelease then
+    Exit('Auto-release of frozen threads: ON - a step-over that waits on a thread this step ' +
+      'froze is released after ' + FormatFloat('0.0', S.ReleaseMs / 1000, TFormatSettings.Invariant) +
+      ' s, or at once when the lock''s owner is known')
+  else
+    Exit('Auto-release of frozen threads: OFF - other threads stay frozen for the whole step, even ' +
+      'if the stepped-over call waits on one of them; use Pause to break in');
 end;
 
 procedure TDebugSession.Pause;

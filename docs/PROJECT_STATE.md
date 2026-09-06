@@ -194,8 +194,11 @@ regression):
   Traversal on the stepping thread ending on a frozen thread (released at
   once, lock and thread named), or a CPU-idle wait on an unowned object lasting
   `stepIsolationReleaseMs` (default 3000; `0` never releases; `stepIsolation:
-  "none"` never freezes). Pause releases everything before the break-in. Every
-  release is announced in the debugger output. Tests:
+  "none"` never freezes). The detector can be switched off and on during a
+  session (command "Toggle Auto-Release of Frozen Threads", custom request
+  `delphiSetStepIsolationRelease`, MCP `set_step_isolation_release`, state in
+  `get_debug_session_status`). Pause releases everything before the break-in.
+  Every release is announced in the debugger output. Tests:
   `StepOver_CallWaitingOnAnotherThread_Completes` (x64 + Win32),
   `StepOver_CpuBoundCallee_KeepsOtherThreadsFrozen`,
   `StepOver_CalleeBlockedOnHeldCriticalSection_ReleasedByWaitChain`,

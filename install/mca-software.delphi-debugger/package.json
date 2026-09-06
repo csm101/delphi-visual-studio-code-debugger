@@ -53,6 +53,12 @@
         "icon": "$(search-fuzzy)"
       },
       {
+        "command": "delphi-win64.toggleStepIsolationRelease",
+        "title": "Toggle Auto-Release of Frozen Threads",
+        "category": "Delphi Debugger",
+        "icon": "$(unlock)"
+      },
+      {
         "command": "delphi-win64.createRuleForException",
         "title": "Create a Rule for This Exception...",
         "category": "Delphi Debugger",
@@ -142,6 +148,10 @@
         },
         {
           "command": "delphi-win64.toggleRawStackScan",
+          "when": "(debugType == 'delphi' || debugType == 'delphi-win64')"
+        },
+        {
+          "command": "delphi-win64.toggleStepIsolationRelease",
           "when": "(debugType == 'delphi' || debugType == 'delphi-win64')"
         },
         {
@@ -246,6 +256,11 @@
           "command": "delphi-win64.toggleRawStackScan",
           "when": "view == workbench.debug.callStackView && (debugType == 'delphi' || debugType == 'delphi-win64')",
           "group": "navigation@98"
+        },
+        {
+          "command": "delphi-win64.toggleStepIsolationRelease",
+          "when": "view == workbench.debug.callStackView && (debugType == 'delphi' || debugType == 'delphi-win64')",
+          "group": "navigation@97"
         },
         {
           "command": "delphi-win64.filterModules",

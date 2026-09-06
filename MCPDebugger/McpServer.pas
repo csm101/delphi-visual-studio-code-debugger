@@ -747,6 +747,17 @@ begin
       Exit;
     end;
 
+    // ---- step isolation switch ----
+    if Name = 'set_step_isolation_release' then begin
+      if (Args = nil) or (Args.FindValue('enabled') = nil) then begin
+        SendToolError(IdJson, '"enabled" (true | false) is required.');
+        Exit;
+      end;
+      FSession.SetStepIsolationAutoRelease(ArgBool('enabled'), ArgInt('releaseMs', 0));
+      SendToolJson(IdJson, McpJson.StepIsolationToJson(FSession));
+      Exit;
+    end;
+
     // ---- lifecycle ----
     if Name = 'detach_debugger' then begin
       FSession.Detach;

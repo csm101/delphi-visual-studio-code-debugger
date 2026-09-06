@@ -157,6 +157,15 @@ so the walk ends at the first routine compiled without a frame pointer. It also
 happens on 64-bit in any application assembled largely from packages that were
 not built with debug information.
 
+**Toggle Auto-Release of Frozen Threads** (the unlock icon next to it) switches
+the step-isolation deadlock detector for the rest of the session. A step keeps
+every other thread frozen so only the stepped one runs; the detector releases
+them when the stepped thread is found waiting on one of them (at once when the
+lock's owner is known, after `stepIsolationReleaseMs` — 3 s by default — for a
+wait nobody owns). Turn it OFF to debug exactly that contention one thread at a
+time: the others then stay frozen for the whole step, and Pause is the way to
+break in. The status bar states the behaviour selected after each toggle.
+
 **Press `Toggle Raw Stack Scan`** in the **Call Stack** title bar (the magnifier
 icon; also `Delphi Debugger: Toggle Raw Stack Scan` in the Command Palette). The
 debugger sweeps the thread's stack word by word for values that could be return

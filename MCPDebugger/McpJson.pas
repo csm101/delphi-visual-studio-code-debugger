@@ -21,6 +21,8 @@ function ArchName(A: TProcessArch): string;
 
 function ProcessListToJson(const Procs: TArray<TProcessInfo>): TJSONArray;
 function StatusToJson(Session: TDebugSession): TJSONObject;
+// {frozenPerStep, autoRelease, releaseMs, text}: the step isolation as it stands.
+function StepIsolationToJson(Session: TDebugSession): TJSONObject;
 function BreakpointListToJson(const Bps: TArray<TSessionBreakpoint>): TJSONArray;
 function LocationToJson(const FnName, SrcFile: string; Line: Integer): TJSONObject;
 function FrameListToJson(const Frames: TArray<TSessionFrame>): TJSONArray;
@@ -159,6 +161,17 @@ begin
     if Session.GetCurrentLocation(Fn, Src, Ln) then
       Result.AddPair('location', LocationToJson(Fn, Src, Ln));
   end;
+  Result.AddPair('stepIsolation', StepIsolationToJson(Session));
+end;
+
+function StepIsolationToJson(Session: TDebugSession): TJSONObject;
+begin
+  var S := Session.GetStepIsolationState;
+  Result := TJSONObject.Create;
+  Result.AddPair('frozenPerStep', TJSONBool.Create(S.FrozenPerStep));
+  Result.AddPair('autoRelease', TJSONBool.Create(S.AutoRelease));
+  Result.AddPair('releaseMs', TJSONNumber.Create(S.ReleaseMs));
+  Result.AddPair('text', DescribeStepIsolation(S));
 end;
 
 function BreakpointListToJson(const Bps: TArray<TSessionBreakpoint>): TJSONArray;

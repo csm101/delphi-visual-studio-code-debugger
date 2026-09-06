@@ -503,6 +503,13 @@ type
     [Test] procedure StepOver_StrictIsolation_NeverReleases;
     [Test] procedure StepOver_IsolationNone_NeverFreezes;
     [Test] procedure StepIsolation_AttributeResolution;
+    // The session-time switch: OFF makes the cross-thread handshake time out
+    // where it completed before, ON makes the next one complete; turning it ON
+    // during a stalled strict step releases that step; the reported state
+    // follows the configuration and the switch.
+    [Test] procedure StepIsolationRelease_ToggledOffThenOn_ChangesWhetherTheWaitTimesOut;
+    [Test] procedure StepIsolationRelease_TurnedOnDuringAStalledStep_ReleasesIt;
+    [Test] procedure StepIsolationState_FollowsConfigurationAndSwitch;
     // Hardware watchpoints share the single-step exception with the stepping
     // engine; these pin both directions of telling them apart. See the shared
     // scenario helpers for what each one exercises.
@@ -3321,6 +3328,135 @@ begin
     var After := EvalGlobalInt(Session, 'GStepCpuSpin');
     Assert.IsTrue(After > Before,
       Format('the spinner did not advance (%d -> %d) although isolation was off', [Before, After]));
+  finally
+    Session.Terminate;
+    Session.Free;
+  end;
+end;
+
+procedure TDebugSessionTests.StepIsolationRelease_ToggledOffThenOn_ChangesWhetherTheWaitTimesOut;
+const
+  STEP_SOURCE  = 'TestTargetCore.pas';
+  WAIT_TIMEOUT = 258;
+begin
+  var CallLine  := MarkerLine(STEP_SOURCE, 'STEPWAIT_CALL');
+  var CallLine2 := MarkerLine(STEP_SOURCE, 'STEPWAIT_CALL2');
+  Assert.IsTrue((CallLine > 0) and (CallLine2 > 0), 'STEPWAIT markers not found');
+
+  // Configured to release after 300 ms; the switch then decides.
+  var Session := OpenSessionAtMarker(TargetExe, TargetMap, TargetRsm, TargetDir,
+    STEP_SOURCE, CallLine, '--run-step-wait-bounded', False, 300);
+  try
+    Assert.AreEqual(Ord(dsStopped), Ord(Session.State), 'did not stop at STEPWAIT_CALL');
+    Session.DrainDebuggerOutput;
+
+    Session.SetStepIsolationAutoRelease(False);
+    Assert.IsFalse(Session.GetStepIsolationState.AutoRelease, 'the switch did not turn off');
+    var Started := GetTickCount64;
+    Session.StepOver;
+    PumpUntilStop(Session, 8000);
+    var Elapsed := GetTickCount64 - Started;
+    Assert.AreEqual(Ord(dsStopped), Ord(Session.State), 'the bounded handshake did not return');
+    Assert.IsTrue(Elapsed >= 1400, Format('OFF: the step landed after %d ms; the 1.5 s wait should have run out', [Elapsed]));
+    Assert.AreEqual(Int64(WAIT_TIMEOUT), EvalGlobalInt(Session, 'GStepWaitResult'),
+      'OFF: the worker answered the handshake, so it was released');
+    var Output := JoinedDebuggerOutput(Session);
+    Assert.IsFalse(Output.Contains('Step isolation released'), 'OFF: a release was announced: ' + Output);
+
+    // Back ON for the second round.
+    Session.SetStepIsolationAutoRelease(True);
+    var State := Session.GetStepIsolationState;
+    Assert.IsTrue(State.AutoRelease, 'the switch did not turn on');
+    Assert.AreEqual(300, State.ReleaseMs, 'ON returns to the configured threshold');
+    var Spec := Default(TBpLineSpec);
+    Spec.Line := CallLine2;
+    Session.SetBreakpoints(STEP_SOURCE, [Spec]);
+    Session.ContinueExecution;
+    PumpUntilStop(Session, 8000);
+    Assert.AreEqual(Ord(dsStopped), Ord(Session.State), 'did not reach STEPWAIT_CALL2');
+
+    Started := GetTickCount64;
+    Session.StepOver;
+    PumpUntilStop(Session, 8000);
+    Elapsed := GetTickCount64 - Started;
+    Assert.AreEqual(Ord(dsStopped), Ord(Session.State), 'ON: the second handshake did not return');
+    Assert.IsTrue(Elapsed < 1400, Format('ON: the step took %d ms; the worker should have been released at 300 ms', [Elapsed]));
+    Assert.AreEqual(Int64(0), EvalGlobalInt(Session, 'GStepWaitResult2'), 'ON: the worker did not answer the second handshake');
+    Output := JoinedDebuggerOutput(Session);
+    Assert.Contains(Output, 'Step isolation released', 'ON: no release announced: ' + Output);
+  finally
+    Session.Terminate;
+    Session.Free;
+  end;
+end;
+
+procedure TDebugSessionTests.StepIsolationRelease_TurnedOnDuringAStalledStep_ReleasesIt;
+const
+  STEP_SOURCE = 'TestTargetCore.pas';
+begin
+  var CallLine := MarkerLine(STEP_SOURCE, 'STEPWAIT_CALL');
+  Assert.IsTrue(CallLine > 0, 'STEPWAIT_CALL marker not found');
+
+  // The 30 s handshake: strict isolation would hold it for all of that.
+  var Session := OpenSessionAtMarker(TargetExe, TargetMap, TargetRsm, TargetDir,
+    STEP_SOURCE, CallLine, '--run-step-wait', False, 300);
+  try
+    Assert.AreEqual(Ord(dsStopped), Ord(Session.State), 'did not stop at STEPWAIT_CALL');
+    Session.SetStepIsolationAutoRelease(False);
+    Session.StepOver;
+    PumpUntilStop(Session, 700);
+    Assert.AreEqual(Ord(dsRunning), Ord(Session.State), 'the strict step landed by itself; nothing to prove');
+
+    var Started := GetTickCount64;
+    Session.SetStepIsolationAutoRelease(True);
+    PumpUntilStop(Session, 5000);
+    Assert.AreEqual(Ord(dsStopped), Ord(Session.State),
+      Format('turning auto-release ON during the stalled step did not release it within %d ms', [GetTickCount64 - Started]));
+    Assert.Contains(JoinedDebuggerOutput(Session), 'Step isolation released');
+  finally
+    Session.Terminate;
+    Session.Free;
+  end;
+end;
+
+procedure TDebugSessionTests.StepIsolationState_FollowsConfigurationAndSwitch;
+const
+  STEP_SOURCE = 'TestTargetCore.pas';
+begin
+  var Line := MarkerLine(STEP_SOURCE, 'STEPWAIT_MAIN');
+  Assert.IsTrue(Line > 0, 'STEPWAIT_MAIN marker not found');
+
+  // Configured strict (0): the switch starts OFF and turns ON to the default.
+  var Session := OpenSessionAtMarker(TargetExe, TargetMap, TargetRsm, TargetDir,
+    STEP_SOURCE, Line, '--run-step-wait-bounded', False, 0);
+  try
+    var S := Session.GetStepIsolationState;
+    Assert.IsTrue(S.FrozenPerStep);
+    Assert.IsFalse(S.AutoRelease, 'stepIsolationReleaseMs 0 must start with auto-release OFF');
+    Assert.Contains(DescribeStepIsolation(S), 'OFF');
+    Assert.Contains(DescribeStepIsolation(S), 'Pause');
+    Session.SetStepIsolationAutoRelease(True);
+    S := Session.GetStepIsolationState;
+    Assert.IsTrue(S.AutoRelease);
+    Assert.AreEqual(DEFAULT_STEP_ISOLATION_RELEASE_MS, S.ReleaseMs, 'ON from a strict configuration uses the default');
+    Assert.Contains(DescribeStepIsolation(S), 'ON');
+    Assert.Contains(DescribeStepIsolation(S), '3.0 s');
+    Session.SetStepIsolationAutoRelease(True, 750);
+    Assert.AreEqual(750, Session.GetStepIsolationState.ReleaseMs, 'a threshold given with the switch replaces the configured one');
+  finally
+    Session.Terminate;
+    Session.Free;
+  end;
+
+  // Configured "none": never frozen, and the text says so whatever the switch.
+  Session := OpenSessionAtMarker(TargetExe, TargetMap, TargetRsm, TargetDir,
+    STEP_SOURCE, Line, '--run-step-wait-bounded', False, STEP_ISOLATION_NONE);
+  try
+    var S := Session.GetStepIsolationState;
+    Assert.IsFalse(S.FrozenPerStep);
+    Assert.Contains(DescribeStepIsolation(S), 'never freezes');
+    Session.SetStepIsolationAutoRelease(False);
+    Assert.Contains(DescribeStepIsolation(Session.GetStepIsolationState), 'never freezes');
   finally
     Session.Terminate;
     Session.Free;
