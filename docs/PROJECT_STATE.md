@@ -676,6 +676,19 @@ Integration with delphi-devkit (DDK), in this order:
   helpers the query needs are written fresh against upstream `main`, not reused.
   Also planned alongside: a real Marketplace publisher and a `delphi` debug type
   with `delphi-win64` kept as an alias.
+- **Setup zip: ship each binary once (0.7.1).** The 0.7.0 zip carries the same
+  binaries three times: the loose extension folder (adapter + MCP server +
+  Zydis.dll), the VSIX (the same files again), and a root copy of
+  `DelphiDebuggerMcp.exe` + `Zydis.dll` for the `%LOCALAPPDATA%` install —
+  27 MB unpacked, 11.3 MB zipped, against 5 MB for 0.6.4. Target layout:
+  `Setup.exe` + the VSIX + `register-mcp.ps1` + `INSTALL_INSTRUCTIONS.md`,
+  about 6.5 MB. `Setup.exe` then takes the MCP server and `Zydis.dll` for the
+  stable copy from INSIDE the VSIX (it is a zip: `System.Zip`, the unit it
+  already uses), and the "package the folder itself when no VSIX is bundled"
+  fallback in `Install.dpr` goes, together with the loose folder in
+  `scripts/build_setup_zip.bat`. Repository mode keeps building from the
+  staged folder. Decided 2026-09-06 for the release after 0.7.0; no change to
+  the staged 0.7.0.
 - **Custom IDE registry key (`bds.exe -r<Key>`) — LATER, separate PR, not in use
   today.** RAD Studio can run against `HKCU\Software\Embarcadero\<Key>\<ver>`
   instead of `...\BDS\<ver>` (`-r` switch), giving one installation several
