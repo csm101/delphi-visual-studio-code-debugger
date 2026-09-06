@@ -5,18 +5,23 @@ param([string]$RepoRoot)
 # up on the next debug session with NO copy and NO re-install.
 #
 # This PATCHES the VSIX-installed extension folder(s) in place
-# (local.delphi-win64-debug-<version>). That is robust on VS Code 1.96+, which
+# (mca-software.delphi-debugger-<version>). That is robust on VS Code 1.96+, which
 # only loads VSIX-registered extensions and ignores raw folder copies dropped
 # into the extensions directory. (The old approach -- creating an unversioned
 # local.delphi-win64-debug folder -- was silently ignored on 1.96+ and could
 # double-register the `delphi-win64` debug type on older builds.)
+#
+# The extension is looked up by its Marketplace id (mca-software.delphi-debugger);
+# a leftover of the sideloaded id (local.delphi-win64-debug) is reported, since
+# two installs contributing the same debug types make every session start ask
+# which one to use.
 
 $RepoRoot = $RepoRoot.Trim('"').TrimEnd('\', '/')
 
 # Write package.json WITHOUT a byte-order mark. `Set-Content -Encoding UTF8`
 # emits one under Windows PowerShell 5.1, which is what install-dev.bat invokes,
 # and VS Code's extension-manifest parser rejects a BOM outright: the extension
-# then shows as "delphi-win64-debug ... is not valid JSON" and loses its display
+# then shows as "delphi-debugger ... is not valid JSON" and loses its display
 # name, its icon and every contribution. The staged file in the repository has no
 # BOM; only this script was adding one.
 function Write-Utf8NoBom([string]$Path, [string]$Text) {
@@ -30,10 +35,15 @@ if (-not (Test-Path $adapterExe)) {
 }
 
 $extRoot = Join-Path $env:USERPROFILE '.vscode\extensions'
-$targets = @(Get-ChildItem -Path $extRoot -Directory -Filter 'local.delphi-win64-debug*' -ErrorAction SilentlyContinue)
+$targets = @(Get-ChildItem -Path $extRoot -Directory -Filter 'mca-software.delphi-debugger*' -ErrorAction SilentlyContinue)
 if ($targets.Count -eq 0) {
-    Write-Error "No installed 'local.delphi-win64-debug*' extension found under $extRoot.`nRun install\Install.exe (or the distributed Setup.exe) once first, then re-run install-dev."
+    Write-Error "No installed 'mca-software.delphi-debugger*' extension found under $extRoot.`nRun install\Install.exe (or the distributed Setup.exe) once first, then re-run install-dev."
     exit 1
+}
+$leftovers = @(Get-ChildItem -Path $extRoot -Directory -Filter 'local.delphi-win64-debug*' -ErrorAction SilentlyContinue)
+if ($leftovers.Count -gt 0) {
+    Write-Host "WARNING: the old sideloaded extension is still installed ($($leftovers.Name -join ', '))." -ForegroundColor Yellow
+    Write-Host "         Both contribute the same debug types. Remove it: code --uninstall-extension local.delphi-win64-debug" -ForegroundColor Yellow
 }
 
 # VS Code accepts forward slashes on Windows and they need no JSON escaping.
@@ -45,7 +55,7 @@ $adapterJson = $adapterExe -replace '\\', '/'
 # stay invisible until the next full Install.exe. Mirror the staged extension
 # files into the installed folder first, then patch the manifest below.
 # The adapter exe is skipped on purpose -- `program` points at the build output.
-$stageDir = Join-Path $RepoRoot 'install\local.delphi-win64-debug'
+$stageDir = Join-Path $RepoRoot 'install\mca-software.delphi-debugger'
 if (-not (Test-Path $stageDir)) {
     Write-Error "Extension source folder not found: $stageDir"
     exit 1

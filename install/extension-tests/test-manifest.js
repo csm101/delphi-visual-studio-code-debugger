@@ -13,7 +13,7 @@ const assert = require('assert');
 const fs = require('fs');
 const path = require('path');
 
-const extensionDir = path.join(__dirname, '..', 'local.delphi-win64-debug');
+const extensionDir = path.join(__dirname, '..', 'mca-software.delphi-debugger');
 const manifestPath = path.join(extensionDir, 'package.json');
 
 let passed = 0;
@@ -43,16 +43,87 @@ const contextKey = /EXCEPTION_CONTEXT_KEY = '([^']+)'/.exec(extensionSource)[1];
 
 console.log('manifest');
 
-test('package.json parses and keeps its identity', () => {
+test('package.json parses and keeps its Marketplace identity', () => {
   assert.strictEqual(manifest.main, './extension.js');
   assert.ok(manifest.version);
-  // The two debug-type events are what make the extension exist at all. The
-  // view event is what lets the modules tree populate when it is opened with no
-  // session running -- without it the view renders and stays permanently empty,
-  // because nothing has activated the extension that provides its data.
+  // The id VS Code and the Marketplace know the extension by. Changing either
+  // half makes every installed copy a different extension.
+  assert.strictEqual(manifest.publisher, 'mca-software');
+  assert.strictEqual(manifest.name, 'delphi-debugger');
+  assert.strictEqual(manifest.displayName, 'Delphi Debugger');
+  // What vsce refuses to package without, or warns about.
+  assert.ok(manifest.description && manifest.description.length < 200, 'a one-line description');
+  assert.strictEqual(manifest.license, 'MIT');
+  assert.strictEqual(manifest.icon, 'icon.png');
+  assert.ok(fs.existsSync(path.join(extensionDir, 'icon.png')));
+  assert.ok(fs.existsSync(path.join(extensionDir, 'LICENSE')), 'vsce wants the licence text in the package');
+  assert.match(manifest.repository.url, /github\.com/);
+  assert.deepStrictEqual(manifest.categories, ['Debuggers']);
+  ['delphi', 'pascal', 'debugger', 'mcp'].forEach((k) => assert.ok(manifest.keywords.indexOf(k) !== -1, 'keyword ' + k));
+  // The debug-type events are what make the extension exist at all -- for BOTH
+  // types, or the alias would never activate it. The view event is what lets
+  // the modules tree populate when it is opened with no session running --
+  // without it the view renders and stays permanently empty, because nothing
+  // has activated the extension that provides its data.
   assert.deepStrictEqual(manifest.activationEvents,
-    ['onDebugResolve:delphi-win64', 'onDebugDynamicConfigurations:delphi-win64',
+    ['onDebugResolve:delphi', 'onDebugDynamicConfigurations:delphi',
+     'onDebugResolve:delphi-win64', 'onDebugDynamicConfigurations:delphi-win64',
      'onView:delphiModules']);
+});
+
+test('the .vscodeignore keeps the tests out of the package and the runtime files in', () => {
+  const ignore = fs.readFileSync(path.join(extensionDir, '.vscodeignore'), 'utf8');
+  assert.match(ignore, /^test\/\*\*$/m, 'the unit tests do not ship');
+  assert.match(ignore, /^\*\.old\*$/m, 'nothing parked by the MCP refresh ships');
+  ['VisualStudioCodeDelphiDebugger.exe', 'DelphiDebuggerMcp.exe', 'Zydis.dll', 'media', 'icon.png']
+    .forEach((needed) => assert.ok(!new RegExp('^' + needed.replace('.', '\\.') + '$', 'm').test(ignore),
+      needed + ' must ship'));
+});
+
+test('the debug types: delphi is primary, delphi-win64 stays as the alias, both on the same adapter', () => {
+  const types = contributes.debuggers.map((d) => d.type);
+  assert.deepStrictEqual(types, ['delphi', 'delphi-win64']);
+  const programs = contributes.debuggers.map((d) => d.program);
+  assert.strictEqual(programs[0], './VisualStudioCodeDelphiDebugger.exe');
+  assert.strictEqual(programs[1], programs[0]);
+  contributes.debuggers.forEach((d) => {
+    ['launch', 'attach'].forEach((request) => {
+      const props = d.configurationAttributes[request].properties;
+      assert.ok(props.ddkProject, d.type + ' ' + request + ' lacks ddkProject');
+      assert.match(props.ddkProject.description, /DDK project reference: id, name or project-file path/);
+    });
+    // A launch names its target one of three ways; `program` alone is no
+    // longer required, or a DDK entry would be flagged in the editor.
+    assert.strictEqual(d.configurationAttributes.launch.required, undefined);
+    assert.deepStrictEqual(d.configurationAttributes.launch.anyOf,
+      [{ required: ['program'] }, { required: ['ddkProject'] }, { required: ['delphiProjectFile'] }]);
+  });
+  // Snippets and initial configurations live on the primary type only, or the
+  // "Add configuration" list shows every entry twice.
+  assert.ok(contributes.debuggers[0].configurationSnippets.length >= 4);
+  assert.strictEqual(contributes.debuggers[1].configurationSnippets, undefined);
+  assert.strictEqual(contributes.debuggers[1].initialConfigurations, undefined);
+  contributes.debuggers[0].configurationSnippets.forEach((s) => assert.strictEqual(s.body.type, 'delphi'));
+  contributes.debuggers[0].initialConfigurations.forEach((c) => assert.strictEqual(c.type, 'delphi'));
+  const ddkSnippet = contributes.debuggers[0].configurationSnippets.find((s) => /DDK project/.test(s.label));
+  assert.ok(ddkSnippet && ddkSnippet.body.ddkProject && !ddkSnippet.body.program, 'the DDK snippet is the two-line form');
+});
+
+test('every when-clause that gates on the debug type accepts both types', () => {
+  const clauses = [];
+  Object.keys(contributes.menus || {}).forEach((menu) => contributes.menus[menu].forEach((e) => { if (e.when) clauses.push(e.when); }));
+  (contributes.views.debug || []).forEach((v) => { if (v.when) clauses.push(v.when); });
+  const gated = clauses.filter((when) => /debugType ==/.test(when));
+  assert.ok(gated.length > 5);
+  gated.forEach((when) => {
+    assert.ok(when.indexOf("debugType == 'delphi'") !== -1 && when.indexOf("debugType == 'delphi-win64'") !== -1,
+      'gates on one type only: ' + when);
+  });
+});
+
+test('the MCP server is contributed to the editor MCP registry under a stable id', () => {
+  assert.deepStrictEqual(contributes.mcpServerDefinitionProviders, [{ id: 'delphi-debugger', label: 'Delphi Debugger' }]);
+  assert.ok(declaredCommands.indexOf('delphi-win64.registerMcpWithClaude') !== -1);
 });
 
 test('every command used by the extension is declared', () => {
@@ -143,6 +214,7 @@ test('the rules editor stays out of other extensions\' debug sessions', () => {
       'the button must survive with no session at all: ' + entry.when);
     assert.match(entry.when, /debugType == 'delphi-win64'/,
       'and must not appear during another debug type: ' + entry.when);
+    assert.match(entry.when, /debugType == 'delphi'/, 'nor be missing from the primary type');
   });
 });
 

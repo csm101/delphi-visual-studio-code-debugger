@@ -86,7 +86,7 @@ The tool surface is documented at
 
 ## Installation from source
 
-The `local.delphi-win64-debug` folder must contain the built
+The `mca-software.delphi-debugger` folder must contain the built
 `VisualStudioCodeDelphiDebugger.exe`. From a clean checkout, build and stage it
 first by running `scripts/update-install.bat` at the repository root (or use the
 interactive installer below, which builds and stages for you).
@@ -108,7 +108,7 @@ Choose one of:
 - **Manual VSIX** — `code --install-extension "<path-to>.vsix" --force` using the
   `.vsix` that `Install.exe` writes to your `%TEMP%` directory.
 - **Manual folder copy (legacy, may be ignored by VS Code 1.96+)** — copy the
-  entire `local.delphi-win64-debug` folder into `%USERPROFILE%\.vscode\extensions\`.
+  entire `mca-software.delphi-debugger` folder into `%USERPROFILE%\.vscode\extensions\`.
 
 Then **reload VS Code** (Ctrl+Shift+P → "Developer: Reload Window").
 
@@ -182,7 +182,7 @@ The extension was not loaded. On VS Code 1.96+ a folder copy is not enough — t
 extension must be installed from a VSIX so it is registered in the extensions
 cache. Re-run `Setup.exe`/`Install.exe` (which installs via `code --install-extension`),
 or run `code --install-extension "<path-to>.vsix" --force` manually, then reload
-VS Code. Confirm a versioned `local.delphi-win64-debug-<version>` folder exists
+VS Code. Confirm a versioned `mca-software.delphi-debugger-<version>` folder exists
 under `%USERPROFILE%\.vscode\extensions\`.
 
 **Breakpoints not hit**

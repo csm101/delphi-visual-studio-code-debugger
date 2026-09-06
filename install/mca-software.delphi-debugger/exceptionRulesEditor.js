@@ -34,7 +34,8 @@ const rules = require('./rules');
 const globalRules = require('./globalRules');
 const projectRules = require('./projectRules');
 
-const DEBUG_TYPE = 'delphi-win64';
+// Both debug types the extension contributes (`delphi`, and `delphi-win64` as the alias).
+const DEBUG_TYPES = ['delphi', 'delphi-win64'];
 
 /** Files that may declare launch configurations, with the path to reach them. */
 function launchDocumentCandidates() {
@@ -94,7 +95,7 @@ async function findDelphiConfigurations() {
     configurationsNode.children.forEach((configurationNode, index) => {
       if (configurationNode.type !== 'object') return;
       const configuration = jsonc.getNodeValue(configurationNode);
-      if (configuration.type !== DEBUG_TYPE) return;
+      if (DEBUG_TYPES.indexOf(configuration.type) === -1) return;
       found.push({
         documentLabel: candidate.label,
         name: configuration.name || `configuration #${index + 1}`,

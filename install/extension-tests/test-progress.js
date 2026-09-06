@@ -102,7 +102,7 @@ Module._load = function (request, parent, isMain) {
   return originalLoad.call(this, request, parent, isMain);
 };
 
-const extensionDir = path.join(__dirname, '..', 'local.delphi-win64-debug');
+const extensionDir = path.join(__dirname, '..', 'mca-software.delphi-debugger');
 const extension = require(path.join(extensionDir, 'extension.js'));
 
 // ------------------------------------------------------------------ tests --

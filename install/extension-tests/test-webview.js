@@ -16,7 +16,7 @@ const fs = require('fs');
 const path = require('path');
 const vm = require('vm');
 
-const extensionDir = path.join(__dirname, '..', 'local.delphi-win64-debug');
+const extensionDir = path.join(__dirname, '..', 'mca-software.delphi-debugger');
 
 // ---------------------------------------------------------------- DOM stub --
 

@@ -415,7 +415,7 @@ Relevant files:
 - `DelphiDebuggerProj.code-workspace`
 - `Debugme.delphilsp.json`
 - `.vscode/launch.json`
-- `install\local.delphi-win64-debug\package.json` (the single canonical extension manifest)
+- `install\mca-software.delphi-debugger\package.json` (the single canonical extension manifest)
 
 Required extension:
 
@@ -436,27 +436,35 @@ Optional, and no longer needed for memory inspection:
 Local debugger extension folder:
 
 ```text
-%USERPROFILE%\.vscode\extensions\local.delphi-win64-debug\
+%USERPROFILE%\.vscode\extensions\mca-software.delphi-debugger-<version>\
 ```
 
 Install (build first, then one of):
 
-- `install\Install.exe` — interactive: builds if needed, packages the extension
-  into a `.vsix` and installs it into every detected VS Code-family editor
-  (VS Code, Insiders, Cursor, Windsurf, VSCodium, Trae) via that editor's
+- The Marketplace: `mca-software.delphi-debugger`, the ordinary route. VS Code
+  updates it; the old sideloaded copy (`local.delphi-win64-debug`) is detected on
+  activation and removed on request.
+- `install\Install.exe` — interactive: builds if needed, installs the `.vsix`
+  packaged by `scripts\build_vsix.bat` (or packages the folder itself when no
+  `.vsix` is bundled) into every detected VS Code-family editor (VS Code,
+  Insiders, Cursor, Windsurf, VSCodium, Trae) via that editor's
   `<cli> --install-extension` (required on 1.96+; a plain folder copy is no
-  longer loaded). Per editor it falls back to a folder copy only when the editor
-  is present but its CLI is not on PATH. When no editor is detected it prints
-  download links and the manual install command instead of blocking on a prompt
-  (the `FamilyEditors` table in `Install.dpr` is the editor list).
+  longer loaded), after uninstalling the old sideloaded id. Per editor it falls
+  back to a folder copy only when the editor is present but its CLI is not on
+  PATH. When no editor is detected it prints download links and the manual
+  install command instead of blocking on a prompt (the `FamilyEditors` table in
+  `Install.dpr` is the editor list).
 - `scripts/install-dev.bat` — development: builds, then points the extension `program`
   directly at the build output (no copy; fastest iteration).
 
-`install\local.delphi-win64-debug\package.json` is the single source of truth
-for the extension manifest. It registers the `delphi-win64` debug type, declares
+`install\mca-software.delphi-debugger\package.json` is the single source of truth
+for the extension manifest (Marketplace id `mca-software.delphi-debugger`). It
+registers the `delphi` debug type, with `delphi-win64` kept as an alias, declares
 the full launch-config schema, and references the adapter via the relative path
-`./VisualStudioCodeDelphiDebugger.exe`. It has no `main`, so no `extension.js`
-is needed (a pure debug-type contribution that launches the external adapter).
+`./VisualStudioCodeDelphiDebugger.exe`. `extension.js` (its `main`) adds the
+status-bar progress, the exception-rule editor, the process picker, the DDK
+configuration provider and the MCP server distribution; the debug types
+themselves work without it.
 
 # Symbol/debug-info notes
 

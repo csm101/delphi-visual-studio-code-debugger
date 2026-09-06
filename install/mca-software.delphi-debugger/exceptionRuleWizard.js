@@ -23,7 +23,8 @@ const vscode = require('vscode');
 const rules = require('./rules');
 const editor = require('./exceptionRulesEditor');
 
-const DEBUG_TYPE = 'delphi-win64';
+// Both debug types the extension contributes (`delphi`, and `delphi-win64` as the alias).
+const DEBUG_TYPES = ['delphi', 'delphi-win64'];
 
 function unitNameFromSource(source) {
   if (!source) return '';
@@ -123,7 +124,7 @@ async function pickSuggestion(context) {
  */
 async function createRuleForCurrentException(context, hintThreadId) {
   const session = vscode.debug.activeDebugSession;
-  if (!session || session.type !== DEBUG_TYPE) {
+  if (!session || DEBUG_TYPES.indexOf(session.type) === -1) {
     vscode.window.showErrorMessage(
       'No Delphi Win64 debug session is active. This command works while stopped on an exception.');
     return undefined;

@@ -1,9 +1,9 @@
 {
-  "name": "delphi-win64-debug",
-  "displayName": "Delphi Debugger (Win32 and Win64)",
-  "description": "Debug Delphi Win32 and Win64 applications in VS Code - breakpoints, stepping, call stacks, watches and exception rules, without the Embarcadero IDE. The same engine is also an MCP server, so an AI agent can drive the debugger and read a running program's real state. The debug adapter is always a 64-bit process, so a 32-bit target is debugged without the address-space ceiling a 32-bit debugger works under.",
+  "name": "delphi-debugger",
+  "displayName": "Delphi Debugger",
+  "description": "Debug Delphi Win32/Win64 applications in VS Code, outside the RAD Studio IDE; also an MCP server for AI agents",
   "version": "0.6.4",
-  "publisher": "local",
+  "publisher": "mca-software",
   "license": "MIT",
   "author": "Carlo Sirna",
   "repository": {
@@ -25,14 +25,15 @@
     "delphi",
     "pascal",
     "debugger",
+    "mcp",
     "win64",
     "win32",
-    "32-bit",
-    "64-bit",
     "dap"
   ],
   "main": "./extension.js",
   "activationEvents": [
+    "onDebugResolve:delphi",
+    "onDebugDynamicConfigurations:delphi",
     "onDebugResolve:delphi-win64",
     "onDebugDynamicConfigurations:delphi-win64",
     "onView:delphiModules"
@@ -109,6 +110,12 @@
         "title": "Forget Evaluation Decision (Delphi)",
         "category": "Delphi Debugger",
         "icon": "$(discard)"
+      },
+      {
+        "command": "delphi-win64.registerMcpWithClaude",
+        "title": "Register MCP Server with Claude Code",
+        "category": "Delphi",
+        "icon": "$(plug)"
       }
     ],
     "views": {
@@ -116,7 +123,7 @@
         {
           "id": "delphiModules",
           "name": "Delphi Modules",
-          "when": "debugType == 'delphi-win64'"
+          "when": "(debugType == 'delphi' || debugType == 'delphi-win64')"
         }
       ]
     },
@@ -135,23 +142,23 @@
         },
         {
           "command": "delphi-win64.toggleRawStackScan",
-          "when": "debugType == 'delphi-win64'"
+          "when": "(debugType == 'delphi' || debugType == 'delphi-win64')"
         },
         {
           "command": "delphi-win64.viewMemory",
-          "when": "debugType == 'delphi-win64'"
+          "when": "(debugType == 'delphi' || debugType == 'delphi-win64')"
         },
         {
           "command": "delphi-win64.refreshModules",
-          "when": "debugType == 'delphi-win64'"
+          "when": "(debugType == 'delphi' || debugType == 'delphi-win64')"
         },
         {
           "command": "delphi-win64.filterModules",
-          "when": "debugType == 'delphi-win64'"
+          "when": "(debugType == 'delphi' || debugType == 'delphi-win64')"
         },
         {
           "command": "delphi-win64.clearModulesFilter",
-          "when": "debugType == 'delphi-win64'"
+          "when": "(debugType == 'delphi' || debugType == 'delphi-win64')"
         },
         {
           "command": "delphi-win64.safelistAllow",
@@ -168,6 +175,9 @@
         {
           "command": "delphi-win64.copyModulePath",
           "when": "false"
+        },
+        {
+          "command": "delphi-win64.registerMcpWithClaude"
         }
       ],
       "view/item/context": [
@@ -180,61 +190,61 @@
       "debug/variables/context": [
         {
           "command": "delphi-win64.viewMemory",
-          "when": "debugType == 'delphi-win64'",
+          "when": "(debugType == 'delphi' || debugType == 'delphi-win64')",
           "group": "inline"
         },
         {
           "command": "delphi-win64.safelistAllow",
-          "when": "debugType == 'delphi-win64'",
+          "when": "(debugType == 'delphi' || debugType == 'delphi-win64')",
           "group": "2_delphi@1"
         },
         {
           "command": "delphi-win64.safelistDeny",
-          "when": "debugType == 'delphi-win64'",
+          "when": "(debugType == 'delphi' || debugType == 'delphi-win64')",
           "group": "2_delphi@2"
         },
         {
           "command": "delphi-win64.safelistForget",
-          "when": "debugType == 'delphi-win64'",
+          "when": "(debugType == 'delphi' || debugType == 'delphi-win64')",
           "group": "2_delphi@3"
         }
       ],
       "debug/watch/context": [
         {
           "command": "delphi-win64.viewMemory",
-          "when": "debugType == 'delphi-win64'",
+          "when": "(debugType == 'delphi' || debugType == 'delphi-win64')",
           "group": "inline"
         },
         {
           "command": "delphi-win64.safelistAllow",
-          "when": "debugType == 'delphi-win64'",
+          "when": "(debugType == 'delphi' || debugType == 'delphi-win64')",
           "group": "2_delphi@1"
         },
         {
           "command": "delphi-win64.safelistDeny",
-          "when": "debugType == 'delphi-win64'",
+          "when": "(debugType == 'delphi' || debugType == 'delphi-win64')",
           "group": "2_delphi@2"
         },
         {
           "command": "delphi-win64.safelistForget",
-          "when": "debugType == 'delphi-win64'",
+          "when": "(debugType == 'delphi' || debugType == 'delphi-win64')",
           "group": "2_delphi@3"
         }
       ],
       "view/title": [
         {
           "command": "delphi-win64.editExceptionRules",
-          "when": "view == workbench.debug.breakPointsView && (!debugType || debugType == 'delphi-win64')",
+          "when": "view == workbench.debug.breakPointsView && (!debugType || (debugType == 'delphi' || debugType == 'delphi-win64'))",
           "group": "navigation@99"
         },
         {
           "command": "delphi-win64.editExceptionRules",
-          "when": "view == workbench.debug.callStackView && (!debugType || debugType == 'delphi-win64')",
+          "when": "view == workbench.debug.callStackView && (!debugType || (debugType == 'delphi' || debugType == 'delphi-win64'))",
           "group": "navigation@99"
         },
         {
           "command": "delphi-win64.toggleRawStackScan",
-          "when": "view == workbench.debug.callStackView && debugType == 'delphi-win64'",
+          "when": "view == workbench.debug.callStackView && (debugType == 'delphi' || debugType == 'delphi-win64')",
           "group": "navigation@98"
         },
         {
@@ -256,7 +266,7 @@
       "debug/toolBar": [
         {
           "command": "delphi-win64.createRuleForException",
-          "when": "debugType == 'delphi-win64' && delphiWin64StoppedOnException",
+          "when": "(debugType == 'delphi' || debugType == 'delphi-win64') && delphiWin64StoppedOnException",
           "group": "navigation@99"
         }
       ]
@@ -272,7 +282,7 @@
         "delphi-win64.checkForUpdates": {
           "type": "boolean",
           "default": true,
-          "description": "Check GitHub once a day for a newer release and show a notification with a download link. This extension is installed by an installer rather than from a marketplace, so nothing else would tell you a new version exists. The check fails silently when GitHub is unreachable, and 'Skip this version' is remembered."
+          "description": "Check GitHub once a day for a newer release and show a notification with a download link. A Marketplace install is updated by VS Code itself; this check is for installs made from the setup zip, which nothing else would tell about a new version. The check fails silently when GitHub is unreachable, and 'Skip this version' is remembered."
         }
       }
     },
@@ -289,7 +299,7 @@
     ],
     "debuggers": [
       {
-        "type": "delphi-win64",
+        "type": "delphi",
         "label": "Delphi (Win32/Win64)",
         "program": "./VisualStudioCodeDelphiDebugger.exe",
         "languages": [
@@ -298,10 +308,11 @@
         ],
         "configurationAttributes": {
           "launch": {
-            "required": [
-              "program"
-            ],
             "properties": {
+              "ddkProject": {
+                "type": "string",
+                "description": "DDK project reference: id, name or project-file path; the rest of the configuration is filled from DDK's debug target"
+              },
               "program": {
                 "type": "string",
                 "description": "Path to the .exe to debug"
@@ -414,10 +425,31 @@
                 "type": "string",
                 "description": "The .dpr / .dpk / .dproj this configuration debugs. Written automatically by the RAD Studio plugin. It is where exception rules live: two files next to that project -- <Project>.ExceptionSettings.json (shared, commit it) and <Project>.ExceptionSettings.local.json (personal, gitignore it) -- evaluated before the machine-wide file. Omit it and only the machine-wide file applies."
               }
-            }
+            },
+            "anyOf": [
+              {
+                "required": [
+                  "program"
+                ]
+              },
+              {
+                "required": [
+                  "ddkProject"
+                ]
+              },
+              {
+                "required": [
+                  "delphiProjectFile"
+                ]
+              }
+            ]
           },
           "attach": {
             "properties": {
+              "ddkProject": {
+                "type": "string",
+                "description": "DDK project reference: id, name or project-file path; the rest of the configuration is filled from DDK's debug target"
+              },
               "processId": {
                 "type": [
                   "number",
@@ -542,7 +574,7 @@
         },
         "initialConfigurations": [
           {
-            "type": "delphi-win64",
+            "type": "delphi",
             "request": "launch",
             "name": "Debug Delphi Win64",
             "program": "${workspaceFolder}/Win64/Debug/${workspaceFolderBasename}.exe",
@@ -551,10 +583,20 @@
         ],
         "configurationSnippets": [
           {
+            "label": "Delphi: Debug a DDK project",
+            "description": "Launch a project known to delphi-devkit (DDK); executable, symbols, sources, packages and arguments come from DDK",
+            "body": {
+              "type": "delphi",
+              "request": "launch",
+              "name": "Debug ${1:MyProject} (DDK)",
+              "ddkProject": "${1:MyProject}"
+            }
+          },
+          {
             "label": "Delphi: Launch (Win64)",
             "description": "Launch a 64-bit Delphi executable under the debugger",
             "body": {
-              "type": "delphi-win64",
+              "type": "delphi",
               "request": "launch",
               "name": "Debug Delphi Win64",
               "program": "^\"\\${workspaceFolder}/Win64/Debug/\\${workspaceFolderBasename}.exe\"",
@@ -565,7 +607,7 @@
             "label": "Delphi: Launch (Win32)",
             "description": "Launch a 32-bit Delphi executable under the debugger. The adapter stays 64-bit and debugs the target across the WOW64 boundary; build with optimisation off, or locals will be unavailable",
             "body": {
-              "type": "delphi-win64",
+              "type": "delphi",
               "request": "launch",
               "name": "Debug Delphi Win32",
               "program": "^\"\\${workspaceFolder}/Win32/Debug/\\${workspaceFolderBasename}.exe\"",
@@ -576,7 +618,7 @@
             "label": "Delphi: Attach (pick a process)",
             "description": "Attach to a running Delphi process, 32-bit or 64-bit, choosing it from a list at start",
             "body": {
-              "type": "delphi-win64",
+              "type": "delphi",
               "request": "attach",
               "name": "Attach to a Delphi process",
               "processId": "^\"\\${command:delphi-win64.pickProcess}\"",
@@ -587,15 +629,306 @@
             "label": "Delphi: Attach (pick an instance of one executable)",
             "description": "Attach to a named executable; when several instances are running, choose between them by command line",
             "body": {
-              "type": "delphi-win64",
+              "type": "delphi",
               "request": "attach",
               "name": "Attach to ${1:MyApp.exe}",
               "processName": "^\"${1:MyApp.exe}\"",
               "processId": "^\"\\${command:delphi-win64.pickProcess}\"",
               "sourceRoot": "^\"\\${workspaceFolder}\""
             }
+          },
+          {
+            "label": "Delphi: Attach to a DDK project",
+            "description": "Attach to the running executable of a project known to delphi-devkit (DDK); with several instances running, pick one by command line",
+            "body": {
+              "type": "delphi",
+              "request": "attach",
+              "name": "Attach to ${1:MyProject} (DDK)",
+              "ddkProject": "${1:MyProject}"
+            }
           }
         ]
+      },
+      {
+        "type": "delphi-win64",
+        "label": "Delphi (Win32/Win64) - legacy type name",
+        "program": "./VisualStudioCodeDelphiDebugger.exe",
+        "languages": [
+          "objectpascal",
+          "pascal"
+        ],
+        "configurationAttributes": {
+          "launch": {
+            "properties": {
+              "ddkProject": {
+                "type": "string",
+                "description": "DDK project reference: id, name or project-file path; the rest of the configuration is filled from DDK's debug target"
+              },
+              "program": {
+                "type": "string",
+                "description": "Path to the .exe to debug"
+              },
+              "mapFile": {
+                "type": "string",
+                "description": "Path to the .map file (default: same as program with .map extension)"
+              },
+              "rsmFile": {
+                "type": "string",
+                "description": "Path to the .rsm file (default: same as program with .rsm extension). Needed for local variable inspection."
+              },
+              "sourceRoot": {
+                "type": "string",
+                "description": "Root directory for source file lookup"
+              },
+              "sourceSearchPaths": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "Extra directories (searched two levels deep) for resolving unit source files when stopped outside the project — typically used to point at the Delphi installation's source tree, e.g. \"${env:BDS}/source\". If the BDS environment variable is set, its \"source\" subdirectory is also searched automatically."
+              },
+              "stopAtEntry": {
+                "type": "boolean",
+                "default": false,
+                "description": "Stop at the program's entry point as soon as it starts, before any of your code runs. Use it to set breakpoints in initialization sections, or in units of a package the program loads early. Launch only: an attach joins a process that is already past its entry point."
+              },
+              "rawStackScan": {
+                "type": "boolean",
+                "default": false,
+                "description": "Append a brute-force sweep of the thread's stack below the real call stack, marked \"[raw]\" and greyed out. Use it when the call stack ends inside code with no debug information and you need to find which of your own routines is underneath: 32-bit targets carry no unwind data, so the walk stops at the first routine built without a frame pointer. \"[raw]\" means the instruction ending at that address was decoded and is a call; \"[raw?]\" means there was no line table to decode from. NEITHER means the frame is still live — a call that has already returned leaves its return address behind — so treat these as positions on the stack, not as callers."
+              },
+              "progressLocation": {
+                "type": "string",
+                "enum": [
+                  "statusBar",
+                  "notification"
+                ],
+                "enumDescriptions": [
+                  "Show long-running operations in the status bar (requires this extension; the adapter emits the custom `delphiProgress` event).",
+                  "Show long-running operations as notification toasts using the standard DAP progress events."
+                ],
+                "default": "statusBar",
+                "description": "Where the adapter reports long-running operations (symbol loading, evaluation, stepping). \"statusBar\" keeps them out of the way in the status bar; \"notification\" uses the standard DAP progress events, which VS Code renders as toasts. Only one of the two mechanisms is used at a time."
+              },
+              "diagnosticLog": {
+                "type": "boolean",
+                "default": false,
+                "description": "Write a detailed adapter log to %TEMP%\\dap_adapter.log. Verbose: every DAP request/response, every debug event (LoadDll, Exception, Output, Breakpoint), every command queued and processed. Use only for diagnosing adapter behavior issues; off by default."
+              },
+              "diagnosticsLocation": {
+                "type": "string",
+                "enum": [
+                  "outputChannel",
+                  "debugConsole"
+                ],
+                "enumDescriptions": [
+                  "Send the debugger's own messages to the \"Delphi Debugger\" channel in the Output panel, keeping the Debug Console for your program's output and your logpoint messages.",
+                  "Print the debugger's own messages in the Debug Console, mixed in with the program's output (the behaviour before this setting existed)."
+                ],
+                "default": "outputChannel",
+                "description": "Where the DEBUGGER's own messages go — symbol loading, modules without debug info, warnings. Your program's output and your logpoint messages always go to the Debug Console, whichever you choose. A multi-package application emits hundreds of \"no debug info\" lines before it prints anything of its own, which is why they are separated by default."
+              },
+              "args": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "Command-line arguments passed to the debuggee."
+              },
+              "modules": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "name": {
+                      "type": "string",
+                      "description": "DLL/BPL filename (e.g. MyPackage.bpl)"
+                    },
+                    "map": {
+                      "type": "string",
+                      "description": "Path to the DLL/BPL .map file"
+                    },
+                    "rsm": {
+                      "type": "string",
+                      "description": "Path to the DLL/BPL .rsm file"
+                    },
+                    "dcp": {
+                      "type": "string",
+                      "description": "Path to the .dcp file (Delphi compiled package -- used for BPL locals)"
+                    }
+                  },
+                  "required": [
+                    "name"
+                  ]
+                },
+                "description": "Pre-binds debug-info files (.map / .rsm / .dcp) for DLLs and BPLs the target loads at runtime. Each entry names a module by filename and points the adapter at the matching debug files. Without this, the adapter probes for files alongside the loaded DLL/BPL on disk."
+              },
+              "useGlobalExceptionRules": {
+                "type": "boolean",
+                "default": true,
+                "description": "Also load the shared machine-wide exception rules file (default %USERPROFILE%\\.DelphiWinDebugger\\exceptionRules.json). It is the widest scope: a project's own rule files are evaluated first, then this."
+              },
+              "globalExceptionRulesPath": {
+                "type": "string",
+                "description": "Override the shared exception-rules file location (default %USERPROFILE%\\.DelphiWinDebugger\\exceptionRules.json). JSON object with an `exceptionRules` array (or a bare array)."
+              },
+              "delphiProjectFile": {
+                "type": "string",
+                "description": "The .dpr / .dpk / .dproj this configuration debugs. Written automatically by the RAD Studio plugin. It is where exception rules live: two files next to that project -- <Project>.ExceptionSettings.json (shared, commit it) and <Project>.ExceptionSettings.local.json (personal, gitignore it) -- evaluated before the machine-wide file. Omit it and only the machine-wide file applies."
+              }
+            },
+            "anyOf": [
+              {
+                "required": [
+                  "program"
+                ]
+              },
+              {
+                "required": [
+                  "ddkProject"
+                ]
+              },
+              {
+                "required": [
+                  "delphiProjectFile"
+                ]
+              }
+            ]
+          },
+          "attach": {
+            "properties": {
+              "ddkProject": {
+                "type": "string",
+                "description": "DDK project reference: id, name or project-file path; the rest of the configuration is filled from DDK's debug target"
+              },
+              "processId": {
+                "type": [
+                  "number",
+                  "string"
+                ],
+                "description": "PID of the running process to attach to. Use processName instead to match by executable name, or \"${command:delphi-win64.pickProcess}\" to choose from a list of running processes each time the session starts. When processName is also set, the picker lists only the instances of that executable — with their command lines, so two instances can be told apart — and skips the prompt entirely if there is just one.",
+                "default": 0
+              },
+              "processName": {
+                "type": "string",
+                "description": "Executable name of the process to attach to, e.g. \"MyApp.exe\". Used when processId is not given: the one running instance is attached to without asking, and when several are running the extension shows them with their command lines so you can pick. Set processId as well to name a fixed PID and skip that.",
+                "default": ""
+              },
+              "program": {
+                "type": "string",
+                "description": "Optional path to the target executable. Only needed when the debugger cannot derive the symbol files (.map/.rsm/TD32) from the running process image.",
+                "default": ""
+              },
+              "killOnDetach": {
+                "type": "boolean",
+                "description": "When stopping the debug session, terminate the attached process instead of leaving it running. Default false: detaching leaves the application alive.",
+                "default": false
+              },
+              "mapFile": {
+                "type": "string",
+                "description": "Path to the .map file (default: same as program with .map extension)"
+              },
+              "rsmFile": {
+                "type": "string",
+                "description": "Path to the .rsm file (default: same as program with .rsm extension). Needed for local variable inspection."
+              },
+              "sourceRoot": {
+                "type": "string",
+                "description": "Root directory for source file lookup"
+              },
+              "sourceSearchPaths": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "Extra directories (searched two levels deep) for resolving unit source files when stopped outside the project — typically used to point at the Delphi installation's source tree, e.g. \"${env:BDS}/source\". If the BDS environment variable is set, its \"source\" subdirectory is also searched automatically."
+              },
+              "rawStackScan": {
+                "type": "boolean",
+                "default": false,
+                "description": "Append a brute-force sweep of the thread's stack below the real call stack, marked \"[raw]\" and greyed out. Use it when the call stack ends inside code with no debug information and you need to find which of your own routines is underneath: 32-bit targets carry no unwind data, so the walk stops at the first routine built without a frame pointer. \"[raw]\" means the instruction ending at that address was decoded and is a call; \"[raw?]\" means there was no line table to decode from. NEITHER means the frame is still live — a call that has already returned leaves its return address behind — so treat these as positions on the stack, not as callers."
+              },
+              "diagnosticsLocation": {
+                "type": "string",
+                "enum": [
+                  "outputChannel",
+                  "debugConsole"
+                ],
+                "enumDescriptions": [
+                  "Send the debugger's own messages to the \"Delphi Debugger\" channel in the Output panel, keeping the Debug Console for your program's output and your logpoint messages.",
+                  "Print the debugger's own messages in the Debug Console, mixed in with the program's output (the behaviour before this setting existed)."
+                ],
+                "default": "outputChannel",
+                "description": "Where the DEBUGGER's own messages go — symbol loading, modules without debug info, warnings. Your program's output and your logpoint messages always go to the Debug Console, whichever you choose. A multi-package application emits hundreds of \"no debug info\" lines before it prints anything of its own, which is why they are separated by default."
+              },
+              "modules": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "name": {
+                      "type": "string",
+                      "description": "DLL/BPL filename (e.g. MyPackage.bpl)"
+                    },
+                    "map": {
+                      "type": "string",
+                      "description": "Path to the DLL/BPL .map file"
+                    },
+                    "rsm": {
+                      "type": "string",
+                      "description": "Path to the DLL/BPL .rsm file"
+                    },
+                    "dcp": {
+                      "type": "string",
+                      "description": "Path to the .dcp file (Delphi compiled package -- used for BPL locals)"
+                    }
+                  },
+                  "required": [
+                    "name"
+                  ]
+                },
+                "description": "Pre-binds debug-info files (.map / .rsm / .dcp) for DLLs and BPLs the target loads at runtime. Each entry names a module by filename and points the adapter at the matching debug files. Without this, the adapter probes for files alongside the loaded DLL/BPL on disk."
+              },
+              "useGlobalExceptionRules": {
+                "type": "boolean",
+                "default": true,
+                "description": "Also load the shared machine-wide exception rules file (default %USERPROFILE%\\.DelphiWinDebugger\\exceptionRules.json). It is the widest scope: a project's own rule files are evaluated first, then this."
+              },
+              "globalExceptionRulesPath": {
+                "type": "string",
+                "description": "Override the shared exception-rules file location (default %USERPROFILE%\\.DelphiWinDebugger\\exceptionRules.json). JSON object with an `exceptionRules` array (or a bare array)."
+              },
+              "delphiProjectFile": {
+                "type": "string",
+                "description": "The .dpr / .dpk / .dproj this configuration debugs. Written automatically by the RAD Studio plugin. It is where exception rules live: two files next to that project -- <Project>.ExceptionSettings.json (shared, commit it) and <Project>.ExceptionSettings.local.json (personal, gitignore it) -- evaluated before the machine-wide file. Omit it and only the machine-wide file applies."
+              },
+              "progressLocation": {
+                "type": "string",
+                "enum": [
+                  "statusBar",
+                  "notification"
+                ],
+                "enumDescriptions": [
+                  "Show long-running operations in the status bar (requires this extension; the adapter emits the custom `delphiProgress` event).",
+                  "Show long-running operations as notification toasts using the standard DAP progress events."
+                ],
+                "default": "statusBar",
+                "description": "Where the adapter reports long-running operations (symbol loading, evaluation, stepping). \"statusBar\" keeps them out of the way in the status bar; \"notification\" uses the standard DAP progress events, which VS Code renders as toasts. Only one of the two mechanisms is used at a time."
+              },
+              "diagnosticLog": {
+                "type": "boolean",
+                "default": false,
+                "description": "Write a detailed adapter log to %TEMP%\\dap_adapter.log. Verbose: every DAP request/response, every debug event (LoadDll, Exception, Output, Breakpoint), every command queued and processed. Use only for diagnosing adapter behavior issues; off by default."
+              }
+            }
+          }
+        }
+      }
+    ],
+    "mcpServerDefinitionProviders": [
+      {
+        "id": "delphi-debugger",
+        "label": "Delphi Debugger"
       }
     ]
   }

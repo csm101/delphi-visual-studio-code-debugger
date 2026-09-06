@@ -1,4 +1,5 @@
-# Builds the distributable zip and creates a DRAFT GitHub release for it.
+# Builds the distributable zip and the Marketplace VSIX, and creates a DRAFT
+# GitHub release with both attached.
 #
 # Called through make_release.bat. Never publishes: it leaves a draft so the
 # notes can be read once with fresh eyes before anything becomes visible.
@@ -37,7 +38,7 @@ function Fail([string]$message) {
 # pointed at a commit eleven days older than the payload -- and nothing compared
 # the two.
 if ($Verify) {
-    $manifestPath = Join-Path $repo 'install\local.delphi-win64-debug\package.json'
+    $manifestPath = Join-Path $repo 'install\mca-software.delphi-debugger\package.json'
     $version = (Get-Content $manifestPath -Raw | ConvertFrom-Json).version
     if (-not $version) { Fail "the extension manifest declares no version" }
     $tag = "v$version"
@@ -85,7 +86,7 @@ if (-not (Get-Command gh -ErrorAction SilentlyContinue)) {
 gh auth status 2>&1 | Out-Null
 if ($LASTEXITCODE -ne 0) { Fail "gh is installed but not authenticated. Run 'gh auth login'." }
 
-$manifestPath = Join-Path $repo 'install\local.delphi-win64-debug\package.json'
+$manifestPath = Join-Path $repo 'install\mca-software.delphi-debugger\package.json'
 if (-not (Test-Path $manifestPath)) { Fail "extension manifest not found: $manifestPath" }
 $version = (Get-Content $manifestPath -Raw | ConvertFrom-Json).version
 if (-not $version) { Fail "the extension manifest declares no version" }
@@ -99,7 +100,7 @@ $tag = "v$version"
 gh release view $tag --json tagName 2>&1 | Out-Null
 if ($LASTEXITCODE -eq 0) {
     if (-not $DryRun) {
-        Fail "release $tag already exists. Bump `"version`" in install\local.delphi-win64-debug\package.json first."
+        Fail "release $tag already exists. Bump `"version`" in install\mca-software.delphi-debugger\package.json first."
     }
     Write-Host "NOTE: release $tag already exists; a real run would refuse to overwrite it." -ForegroundColor Yellow
 }
@@ -128,6 +129,10 @@ if (-not $DryRun) {
 # ------------------------------------------------------------------- build --
 
 $zip = Join-Path $repo "dist\delphi-win64-debugger-setup-v$version.zip"
+# Packaged by `npx @vscode/vsce package` inside build_setup_zip.bat (build_vsix.bat).
+# No publisher token is involved anywhere: publishing is a manual upload of this
+# file on the Marketplace management page, documented in HOW_TO_CREATE_A_NEW_RELEASE.md.
+$vsix = Join-Path $repo "dist\mca-software.delphi-debugger-$version.vsix"
 
 if ($SkipBuild) {
     if (-not (Test-Path $zip)) { Fail "-SkipBuild was given but $zip does not exist." }
@@ -139,6 +144,7 @@ else {
     if ($LASTEXITCODE -ne 0) { Fail "build_setup_zip.bat failed." }
     if (-not (Test-Path $zip)) { Fail "the build did not produce $zip" }
 }
+if (-not (Test-Path $vsix)) { Fail "the build did not produce $vsix (is Node on PATH? build_vsix.bat needs npx)" }
 
 # Hashed through .NET rather than Get-FileHash: that cmdlet is missing on older
 # Windows PowerShell hosts, and this script must not depend on which engine the
@@ -196,6 +202,7 @@ Set-Content -LiteralPath $notesPath -Value $notes -Encoding UTF8 -NoNewline
 Write-Host ''
 Write-Host "version:  $version"
 Write-Host "zip:      $zip  ($([math]::Round((Get-Item $zip).Length / 1MB, 2)) MB)"
+Write-Host "vsix:     $vsix  ($([math]::Round((Get-Item $vsix).Length / 1MB, 2)) MB)"
 Write-Host "sha256:   $sha"
 Write-Host "mcp tools: $toolCount"
 Write-Host "notes:    $notesPath"
@@ -220,7 +227,7 @@ Write-Host "=== Creating DRAFT release $tag at $target ==="
 gh release create $tag --draft --target $target `
     --title "$tag - Delphi Debugger for VS Code and AI Agents" `
     --notes-file $notesPath `
-    $zip
+    $zip $vsix
 if ($LASTEXITCODE -ne 0) { Fail "gh release create failed." }
 
 # Read the target back rather than trusting that it was stored as asked. It is
@@ -240,3 +247,9 @@ Write-Host "  gh release edit $tag --draft=false"
 Write-Host "and then CHECK WHERE THE TAG LANDED -- the tag is created at publish time,"
 Write-Host "so this is the first moment it can be verified:"
 Write-Host "  make_release.bat -Verify"
+Write-Host ''
+Write-Host "The Marketplace is a separate, MANUAL step: upload the VSIX on the management page" -ForegroundColor Yellow
+Write-Host "(opening now, with the folder that holds it):"
+Write-Host "  $vsix"
+Start-Process 'https://marketplace.visualstudio.com/manage'
+Start-Process 'explorer.exe' -ArgumentList "/select,`"$vsix`""

@@ -16,7 +16,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 
-const extensionDir = path.join(__dirname, '..', 'local.delphi-win64-debug');
+const extensionDir = path.join(__dirname, '..', 'mca-software.delphi-debugger');
 const globalRules = require(path.join(extensionDir, 'globalRules.js'));
 
 let passed = 0;

@@ -1,5 +1,7 @@
-# Registers (or removes) the Delphi Win64 MCP debug server with Claude Code and
-# VS Code. Shared by install-dev.bat (points at the build output) and the
+# Registers (or removes) the Delphi MCP debug server with Claude Code and
+# VS Code, under the name `delphi-debugger`. A registration under the earlier
+# name `delphi-win64-debugger` is removed when found, so two names never point
+# at two copies of the same server. Shared by install-dev.bat (points at the build output) and the
 # installer / setup zip (points at the installed copy). Idempotent -- safe to
 # re-run; -Unregister removes the registration.
 #
@@ -15,7 +17,8 @@ param(
 )
 
 $ErrorActionPreference = 'Continue'
-$ServerName = 'delphi-win64-debugger'
+$ServerName = 'delphi-debugger'
+$LegacyServerName = 'delphi-win64-debugger'
 
 if (-not $Unregister) {
     if ($McpExe -eq '' -or -not (Test-Path $McpExe)) {
@@ -35,7 +38,9 @@ function Register-ClaudeCode {
         }
         return
     }
-    # Remove first so re-runs update in place (no-op if not present).
+    # Remove first so re-runs update in place (no-op if not present), and the
+    # registration made under the old name with it.
+    & claude mcp remove $LegacyServerName -s user 2>$null | Out-Null
     & claude mcp remove $ServerName -s user 2>$null | Out-Null
     if ($Unregister) {
         Write-Host "  Claude Code: removed $ServerName."
@@ -70,8 +75,10 @@ function Update-VsCodeMcp([string]$Display, [string]$UserDataDir) {
     if (-not ($root.PSObject.Properties.Name -contains 'servers')) {
         $root | Add-Member -NotePropertyName servers -NotePropertyValue ([pscustomobject]@{}) -Force
     }
-    if ($root.servers.PSObject.Properties.Name -contains $ServerName) {
-        $root.servers.PSObject.Properties.Remove($ServerName)
+    foreach ($name in @($LegacyServerName, $ServerName)) {
+        if ($root.servers.PSObject.Properties.Name -contains $name) {
+            $root.servers.PSObject.Properties.Remove($name)
+        }
     }
     if (-not $Unregister) {
         $srv = [pscustomobject]@{ type = 'stdio'; command = $McpExe; args = @() }

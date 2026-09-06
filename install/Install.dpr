@@ -2,14 +2,23 @@ program Install;
 
 // Interactive installer for the Delphi Debugger (Win32/Win64) VS Code extension.
 // Resolves the repository root from its own location, ensures the DAP adapter
-// executable is built, stages it next to the extension manifest, then packages
-// the extension into a .vsix and installs it into every detected VS Code-family
-// editor (VS Code, Insiders, Cursor, Windsurf, VSCodium, Trae) through that
-// editor's CLI (<cli> --install-extension). Recent builds (1.96+) no longer load
+// executable is built, stages it next to the extension manifest, then installs
+// the extension into every detected VS Code-family editor (VS Code, Insiders,
+// Cursor, Windsurf, VSCodium, Trae) through that editor's CLI
+// (<cli> --install-extension). The .vsix installed is the one vsce packaged
+// (scripts\build_vsix.bat, bundled next to this exe in the setup zip) - the
+// same file that goes to the Marketplace - and only when none is bundled does
+// the installer package the folder itself. Recent builds (1.96+) no longer load
 // extensions merely copied into the extensions directory, so a real VSIX install
 // is preferred; a folder copy is used only when an editor is present but its CLI
 // is not on PATH. When no editor is detected the installer prints download links
 // and the manual install command instead of blocking on a prompt.
+//
+// The extension used to be sideloaded under the id `local.delphi-win64-debug`;
+// it is now `mca-software.delphi-debugger`. Two installs contributing the same
+// debug types make every session start ask which one to use, so the old id is
+// uninstalled through the editor's CLI and any leftover folder deleted before
+// the new one goes in.
 
 {$APPTYPE CONSOLE}
 
@@ -18,6 +27,7 @@ uses
   System.IOUtils,
   System.Classes,
   System.Zip,
+  System.Generics.Collections,
   System.JSON,
   Winapi.Windows;
 
@@ -43,6 +53,12 @@ type
   end;
 
 const
+  EXTENSION_FOLDER = 'mca-software.delphi-debugger';
+  EXTENSION_ID     = 'mca-software.delphi-debugger';
+  OLD_EXTENSION_ID = 'local.delphi-win64-debug';
+  // Aligned with the extension's own command and with register-mcp.ps1.
+  MCP_SERVER_NAME  = 'delphi-debugger';
+
   FamilyEditors: array[0..5] of TEditorTarget = (
     (DisplayName: 'Visual Studio Code'; Cli: 'code';          ExtSubdir: '.vscode';          DownloadUrl: 'https://code.visualstudio.com/'),
     (DisplayName: 'VS Code Insiders';   Cli: 'code-insiders';  ExtSubdir: '.vscode-insiders'; DownloadUrl: 'https://code.visualstudio.com/insiders/'),
@@ -64,7 +80,19 @@ end;
 
 function StageDir: string;
 begin
-  Result := TPath.Combine(ExeDir, 'local.delphi-win64-debug');
+  Result := TPath.Combine(ExeDir, EXTENSION_FOLDER);
+end;
+
+// The .vsix vsce packaged, when the setup zip bundles one next to this exe.
+// Empty when none: the installer then packages the staged folder itself.
+function BundledVsixPath: string;
+begin
+  Result := '';
+  var Candidates := TDirectory.GetFiles(ExeDir, EXTENSION_ID + '-*.vsix');
+  if Length(Candidates) = 0 then
+    Exit;
+  TArray.Sort<string>(Candidates);
+  Result := Candidates[High(Candidates)];
 end;
 
 function AdapterExePath: string;
@@ -269,7 +297,7 @@ begin
   var Script := RegisterScriptPath;
   if not TFile.Exists(Script) then begin
     Writeln('scripts/register-mcp.ps1 not found; skipping automatic registration.');
-    Writeln('Register manually:  claude mcp add delphi-win64-debugger -s user -- "' + Dest + '"');
+    Writeln('Register manually:  claude mcp add ' + MCP_SERVER_NAME + ' -s user -- "' + Dest + '"');
     Exit;
   end;
   RunAndWait(Format('cmd.exe /c powershell -NoProfile -ExecutionPolicy Bypass -File "%s" "%s"',
@@ -370,8 +398,10 @@ begin
       [XmlEscape(Info.Name), XmlEscape(Info.Version), XmlEscape(Info.Publisher)]) +
     Format('    <DisplayName>%s</DisplayName>'#13#10, [XmlEscape(Info.DisplayName)]) +
     Format('    <Description xml:space="preserve">%s</Description>'#13#10, [XmlEscape(Info.Description)]) +
-    '    <Tags></Tags>'#13#10 +
+    '    <Tags>delphi,pascal,debugger,mcp</Tags>'#13#10 +
     '    <Categories>Debuggers</Categories>'#13#10 +
+    '    <License>extension/LICENSE</License>'#13#10 +
+    '    <Icon>extension/icon.png</Icon>'#13#10 +
     '    <Properties>'#13#10 +
     Format('      <Property Id="Microsoft.VisualStudio.Code.Engine" Value="%s" />'#13#10,
       [XmlEscape(Info.Engine)]) +
@@ -469,17 +499,37 @@ end;
 // `delphi-win64.stockMemoryView` back on can install it themselves; the setting
 // says so.
 
-// Removes a legacy folder-copy install (an un-versioned
-// "local.delphi-win64-debug" directory) from one editor's extensions dir. A
-// real VSIX install creates a version-suffixed folder instead, and a leftover
-// un-versioned copy would contribute the same debug type twice.
-procedure RemoveStaleFolderInstall(const AExtensionsDir: string);
+// Deletes every folder under one editor's extensions dir that belongs to the
+// old sideloaded id (`local.delphi-win64-debug`, versioned or not) or is an
+// un-versioned folder copy of the new one. A real VSIX install creates a
+// version-suffixed folder, and anything else left there would contribute the
+// same debug types twice.
+procedure RemoveLeftoverFolders(const AExtensionsDir: string);
 begin
-  var Stale := TPath.Combine(AExtensionsDir, 'local.delphi-win64-debug');
-  if TDirectory.Exists(Stale) then begin
-    TDirectory.Delete(Stale, True);
-    Writeln('Removed stale folder install: ' + Stale);
+  if not TDirectory.Exists(AExtensionsDir) then
+    Exit;
+  var Leftovers := TDirectory.GetDirectories(AExtensionsDir, OLD_EXTENSION_ID + '*');
+  var Unversioned := TPath.Combine(AExtensionsDir, EXTENSION_FOLDER);
+  if TDirectory.Exists(Unversioned) then
+    Leftovers := Leftovers + [Unversioned];
+  for var Folder in Leftovers do begin
+    try
+      TDirectory.Delete(Folder, True);
+      Writeln('Removed leftover extension folder: ' + Folder);
+    except
+      on E: Exception do
+        Writeln('Could not remove ' + Folder + ' (' + E.Message + '); close the editor and delete it by hand.');
+    end;
   end;
+end;
+
+// The old sideloaded id, uninstalled through the editor's own CLI so its
+// registry (extensions.json) forgets it too. The command fails harmlessly when
+// nothing is installed under that id.
+procedure UninstallOldSideloadedCopy(const ACli: string);
+begin
+  if RunAndWait(Format('cmd.exe /c %s --uninstall-extension %s >nul 2>nul', [ACli, OLD_EXTENSION_ID])) = 0 then
+    Writeln('Uninstalled the old sideloaded extension (' + OLD_EXTENSION_ID + ').');
 end;
 
 // Printed when no VS Code-family editor is found: list download links and the
@@ -524,7 +574,7 @@ end;
 procedure InstallInto(const ExtensionsDir: string);
 begin
   TDirectory.CreateDirectory(ExtensionsDir);
-  var Target := TPath.Combine(ExtensionsDir, 'local.delphi-win64-debug');
+  var Target := TPath.Combine(ExtensionsDir, EXTENSION_FOLDER);
   var Updating := TDirectory.Exists(Target);
   if Updating then begin
     if not AskYesNo('Update existing installation at ' + Target + '?', True) then begin
@@ -547,18 +597,19 @@ procedure InstallForEditor(const Target: TEditorTarget; const AVsixPath: string)
 begin
   Writeln('--- ' + Target.DisplayName + ' ---');
   if CommandOnPath(Target.Cli) then begin
-    if InstallViaCli(Target.Cli, AVsixPath) then
-      RemoveStaleFolderInstall(EditorExtensionsDir(Target))
-    else
+    UninstallOldSideloadedCopy(Target.Cli);
+    RemoveLeftoverFolders(EditorExtensionsDir(Target));
+    if not InstallViaCli(Target.Cli, AVsixPath) then
       Writeln('CLI install failed for ' + Target.DisplayName + '.');
     Exit;
   end;
 
   Writeln(Format('%s CLI not on PATH; falling back to folder copy.', [Target.Cli]));
   Writeln('Recent builds may ignore folder-copied extensions. If the debug type');
-  Writeln('"delphi-win64" is still reported as unsupported, put the editor CLI on');
+  Writeln('"delphi" is still reported as unsupported, put the editor CLI on');
   Writeln('PATH and run:');
   Writeln(Format('  %s --install-extension "%s" --force', [Target.Cli, AVsixPath]));
+  RemoveLeftoverFolders(EditorExtensionsDir(Target));
   InstallInto(EditorExtensionsDir(Target));
 end;
 
@@ -575,14 +626,19 @@ begin
     end;
     // Idempotent either way: portable mode's StageDir already carries
     // Zydis.dll from the zip (scripts/build_setup_zip.bat stages it into
-    // local.delphi-win64-debug before zipping); repository mode needs it
-    // copied here since StageFiles above only staged the adapter exe.
+    // the extension folder before zipping); repository mode needs it copied
+    // here since StageFiles above only staged the adapter exe.
     CopyZydisIfAvailable(StageDir);
     Writeln('');
 
-    var Info := ReadVsixInfo;
-    var VsixPath := BuildVsix(Info);
-    Writeln('Built VSIX: ' + VsixPath);
+    var VsixPath := BundledVsixPath;
+    if VsixPath <> '' then
+      Writeln('Using the packaged VSIX: ' + VsixPath)
+    else begin
+      var Info := ReadVsixInfo;
+      VsixPath := BuildVsix(Info);
+      Writeln('Built VSIX: ' + VsixPath);
+    end;
     Writeln('');
 
     var Detected := DetectedEditors;

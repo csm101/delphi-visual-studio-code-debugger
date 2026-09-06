@@ -36,6 +36,25 @@
  *    configuration which names a `processName` but no `processId` - the shape
  *    every previously generated or hand-written attach entry has (see
  *    resolveAttachTarget).
+ *
+ * 6. The same provider fills in a configuration that names a delphi-devkit
+ *    (DDK) project - `{ "type": "delphi", "request": "launch", "ddkProject":
+ *    "MyApp" }` - from DDK's debug target: executable or host application,
+ *    symbols, sources, packages, arguments (see ddkTarget.js). It runs after
+ *    variable substitution, so a hand-written entry may still use `${...}`.
+ *
+ * 7. Distribution of the MCP server: a VS Code MCP registration on the bundled
+ *    exe, a stable copy for agents outside VS Code, and a command that
+ *    registers that copy with Claude Code (see mcpServer.js).
+ *
+ * 8. A one-time warning when the old sideloaded copy of this extension
+ *    (`local.delphi-win64-debug`) is still installed beside the Marketplace
+ *    one - both would contribute the same debug types.
+ *
+ * Two debug types are contributed: `delphi`, the primary one, and
+ * `delphi-win64`, the original name kept as an alias so every existing
+ * launch.json and the RAD Studio plugin's output keep working. They share the
+ * adapter, the trackers, the provider and every command.
  */
 
 const vscode = require('vscode');
@@ -44,8 +63,20 @@ const wizard = require('./exceptionRuleWizard');
 const processPicker = require('./processPicker');
 const memoryView = require('./memoryView');
 const modulesView = require('./modulesView');
+const ddkTarget = require('./ddkTarget');
+const mcpServer = require('./mcpServer');
 
-const DEBUG_TYPE = 'delphi-win64';
+const DEBUG_TYPE = 'delphi';
+const LEGACY_DEBUG_TYPE = 'delphi-win64';
+const DEBUG_TYPES = [DEBUG_TYPE, LEGACY_DEBUG_TYPE];
+// The id the sideloaded extension had before it was published under
+// `mca-software.delphi-debugger`. Install.exe removes it; a Marketplace install
+// cannot, so activation checks for it.
+const OLD_EXTENSION_ID = 'local.delphi-win64-debug';
+
+function isDelphiSession(session) {
+  return !!session && DEBUG_TYPES.indexOf(session.type) !== -1;
+}
 const PROGRESS_EVENT = 'delphiProgress';
 const MAX_STATUS_TEXT = 60;
 const EXCEPTION_CONTEXT_KEY = 'delphiWin64StoppedOnException';
@@ -99,6 +130,63 @@ async function resolveAttachTarget(config, pick) {
   if (pid === undefined) return undefined;
 
   return Object.assign({}, config, { processId: Number(pid) });
+}
+
+/**
+ * The second provider pass, after variable substitution: a configuration that
+ * names a DDK project is completed from DDK's debug target, then - for an
+ * attach - goes through the process picker like any other attach entry (the
+ * first pass saw no `processName` yet, DDK has just supplied it). A failure
+ * is shown and the session is aborted (`undefined`): starting the adapter
+ * with a half-empty configuration would only produce a less clear error.
+ */
+async function resolveDdkTarget(config, deps) {
+  const d = deps || {};
+  const vs = d.vscode || vscode;
+  if (!ddkTarget.needsDebugTarget(config)) return config;
+  let resolved;
+  try {
+    resolved = await ddkTarget.resolveDdkConfiguration(config, {
+      vscode: vs,
+      execFile: d.execFile,
+      showWarning: (text) => vs.window.showWarningMessage('Delphi Debugger (DDK): ' + text)
+    });
+  } catch (error) {
+    vs.window.showErrorMessage('Delphi Debugger: ' + (error && error.message ? error.message : String(error)));
+    return undefined;
+  }
+  return resolveAttachTarget(resolved, d.pick || ((argument) => processPicker.pickProcess(argument)));
+}
+
+/**
+ * A Marketplace install cannot remove the sideloaded copy the way Install.exe
+ * does, and two extensions contributing `delphi-win64` means every session
+ * start asks which one to use. So: one warning, with the fix on a button.
+ * Nothing is uninstalled without that click.
+ */
+async function warnAboutOldCopy(deps) {
+  const d = deps || {};
+  const vs = d.vscode || vscode;
+  if (!vs.extensions || typeof vs.extensions.getExtension !== 'function') return false;
+  if (!vs.extensions.getExtension(OLD_EXTENSION_ID)) return false;
+  const remove = 'Remove old version';
+  const choice = await vs.window.showWarningMessage(
+    'An older copy of this debugger (' + OLD_EXTENSION_ID + ') is still installed; both contribute ' +
+    'the same debug types. Remove the old one and keep the Marketplace version.',
+    remove);
+  if (choice !== remove) return true;
+  try {
+    await vs.commands.executeCommand('workbench.extensions.uninstallExtension', OLD_EXTENSION_ID);
+  } catch (error) {
+    vs.window.showErrorMessage('Could not uninstall ' + OLD_EXTENSION_ID + ': ' +
+      (error && error.message ? error.message : String(error)));
+    return true;
+  }
+  const reload = 'Reload Window';
+  const next = await vs.window.showInformationMessage(
+    'Removed ' + OLD_EXTENSION_ID + '. Reload the window to finish.', reload);
+  if (next === reload) vs.commands.executeCommand('workbench.action.reloadWindow');
+  return true;
 }
 
 function truncate(text, limit) {
@@ -510,7 +598,8 @@ function adapterExecutablePath(context) {
   try {
     const manifest = require(path.join(context.extensionPath, 'package.json'));
     const debuggers = (manifest.contributes && manifest.contributes.debuggers) || [];
-    const entry = debuggers.find((d) => d && d.type === DEBUG_TYPE);
+    // Both debug types name the same adapter; the first that names one wins.
+    const entry = debuggers.find((d) => d && DEBUG_TYPES.indexOf(d.type) !== -1 && d.program);
     if (entry && entry.program) program = entry.program;
   } catch (err) {
     // Fall through to the relative default: an unreadable manifest is not a
@@ -538,7 +627,7 @@ function activate(context) {
   context.subscriptions.push(
     vscode.debug.onDidReceiveDebugSessionCustomEvent((event) => {
       if (event.event !== DIAGNOSTIC_EVENT) return;
-      if (!event.session || event.session.type !== DEBUG_TYPE) return;
+      if (!isDelphiSession(event.session)) return;
       appendDiagnostic(event.body && event.body.text);
     })
   );
@@ -547,6 +636,7 @@ function activate(context) {
   // failure here is not the user's problem. Any error is swallowed for the same
   // reason -- an update check that reports its own troubles is a nuisance.
   checkForUpdate(context).catch(() => {});
+  warnAboutOldCopy().catch(() => {});
 
   // Launching the adapter ourselves is the only way to pass it a command-line
   // switch: the manifest's `program` takes no arguments. Guarded like the hover
@@ -554,13 +644,15 @@ function activate(context) {
   // call would throw out of activate() and take the debug-type registration with
   // it, trading a redundant memory pane for a debugger that cannot start.
   if (vscode.debug.registerDebugAdapterDescriptorFactory && vscode.DebugAdapterExecutable) {
-    context.subscriptions.push(
-      vscode.debug.registerDebugAdapterDescriptorFactory(DEBUG_TYPE, {
+    DEBUG_TYPES.forEach((type) => context.subscriptions.push(
+      vscode.debug.registerDebugAdapterDescriptorFactory(type, {
         createDebugAdapterDescriptor: () =>
           new vscode.DebugAdapterExecutable(adapterExecutablePath(context), adapterArguments())
       })
-    );
+    ));
   }
+
+  setUpMcpServerDistribution(context, appendDiagnostic);
 
   // Raw stack sweep, from the Call Stack title bar. It used to be a launch-time
   // flag only, which meant editing launch.json and restarting for something you
@@ -574,7 +666,7 @@ function activate(context) {
   context.subscriptions.push(
     vscode.commands.registerCommand('delphi-win64.toggleRawStackScan', async () => {
       const session = vscode.debug.activeDebugSession;
-      if (!session || session.type !== DEBUG_TYPE) {
+      if (!isDelphiSession(session)) {
         vscode.window.showInformationMessage(
           'Raw stack scan applies to a running Delphi Win64 debug session.');
         return;
@@ -613,8 +705,8 @@ function activate(context) {
     vscode.commands.executeCommand('setContext', EXCEPTION_CONTEXT_KEY, value));
   exceptionStops.initialize();
 
-  context.subscriptions.push(
-    vscode.debug.registerDebugAdapterTrackerFactory(DEBUG_TYPE, {
+  DEBUG_TYPES.forEach((type) => context.subscriptions.push(
+    vscode.debug.registerDebugAdapterTrackerFactory(type, {
       createDebugAdapterTracker(session) {
         return {
           onWillReceiveMessage: (message) => exceptionStops.handleClientMessage(session.id, message),
@@ -641,12 +733,12 @@ function activate(context) {
         };
       }
     })
-  );
+  ));
 
   context.subscriptions.push(
     vscode.debug.onDidReceiveDebugSessionCustomEvent((event) => {
       if (event.event !== PROGRESS_EVENT) return;
-      if (!event.session || event.session.type !== DEBUG_TYPE) return;
+      if (!isDelphiSession(event.session)) return;
       progress.handleCustomEvent(event.session, event.body);
     })
   );
@@ -677,7 +769,7 @@ function activate(context) {
   function safelistAction(verdict) {
     return async (commandArgument) => {
       const session = vscode.debug.activeDebugSession;
-      if (!session || session.type !== DEBUG_TYPE) return;
+      if (!isDelphiSession(session)) return;
       // evaluateName, NOT a custom field: VS Code propagates a variable's
       // standard DAP fields into a context-menu command but drops the ones the
       // adapter added, so delphiSafelistKey never arrives here. The expression
@@ -740,14 +832,68 @@ function activate(context) {
       (commandArgument) => processPicker.pickProcess(commandArgument))
   );
 
-  context.subscriptions.push(
-    vscode.debug.registerDebugConfigurationProvider(DEBUG_TYPE, {
+  // Two passes on purpose. The attach picker runs BEFORE variable substitution
+  // (a `${command:...}` processId must stay unexpanded, or it would prompt
+  // twice); the DDK step runs AFTER it, so `${workspaceFolder}` and friends in
+  // a hand-written `ddkProject` or `delphiProjectFile` are already resolved.
+  DEBUG_TYPES.forEach((type) => context.subscriptions.push(
+    vscode.debug.registerDebugConfigurationProvider(type, {
       resolveDebugConfiguration: (folder, config) =>
-        resolveAttachTarget(config, (argument) => processPicker.pickProcess(argument))
+        resolveAttachTarget(config, (argument) => processPicker.pickProcess(argument)),
+      resolveDebugConfigurationWithSubstitutedVariables: (folder, config) =>
+        resolveDdkTarget(config)
     })
-  );
+  ));
 
   return { exceptionStops: exceptionStops };
+}
+
+/**
+ * The MCP server as shipped inside the extension: registered with VS Code's
+ * own MCP registry (bundled exe, updates with the extension), mirrored to the
+ * stable per-user folder for agents outside VS Code, and a command to register
+ * that copy with Claude Code. Every part is guarded: none of this may cost the
+ * debug type.
+ */
+function setUpMcpServerDistribution(context, appendDiagnostic) {
+  const path = require('path');
+  const version = (context.extension && context.extension.packageJSON && context.extension.packageJSON.version) || '';
+  const describe = (error) => (error && error.message ? error.message : String(error));
+
+  // No extension path means no bundled exe to distribute (the unit tests
+  // activate with a bare context); the Claude command is still registered.
+  if (typeof context.extensionPath === 'string' && context.extensionPath !== '') {
+    try {
+      const outcome = mcpServer.refreshStableCopy({
+        bundledDir: context.extensionPath,
+        stableDir: mcpServer.stableInstallDir(process.env)
+      });
+      appendDiagnostic(mcpServer.describeOutcome(outcome));
+    } catch (error) {
+      appendDiagnostic('MCP server: stable copy not refreshed: ' + describe(error));
+    }
+
+    try {
+      const bundledExe = path.join(context.extensionPath, mcpServer.SERVER_EXE);
+      const registration = mcpServer.registerDefinitionProvider(vscode, bundledExe, version);
+      if (registration) context.subscriptions.push(registration);
+    } catch (error) {
+      appendDiagnostic('MCP server: VS Code registration failed: ' + describe(error));
+    }
+  }
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand('delphi-win64.registerMcpWithClaude', () => {
+      const childProcess = require('child_process');
+      return mcpServer.registerWithClaudeCode(mcpServer.stableServerPath(process.env), {
+        hasClaude: () => new Promise((resolve) =>
+          childProcess.exec('where claude', (error) => resolve(!error))),
+        exec: (commandLine, callback) => childProcess.exec(commandLine, { windowsHide: true }, callback),
+        showInformation: (text) => vscode.window.showInformationMessage(text),
+        showWarning: (text) => vscode.window.showWarningMessage(text)
+      });
+    })
+  );
 }
 
 function deactivate() {
@@ -762,7 +908,11 @@ module.exports = {
   ProgressStatusBar: ProgressStatusBar,
   ExceptionStopTracker: ExceptionStopTracker,
   resolveAttachTarget: resolveAttachTarget,
+  resolveDdkTarget: resolveDdkTarget,
+  warnAboutOldCopy: warnAboutOldCopy,
   hasExplicitProcessId: hasExplicitProcessId,
+  DEBUG_TYPES: DEBUG_TYPES,
+  OLD_EXTENSION_ID: OLD_EXTENSION_ID,
   EXCEPTION_CONTEXT_KEY: EXCEPTION_CONTEXT_KEY,
   RESUME_REQUESTS: RESUME_REQUESTS,
   // Exported for tests: the hover-expression rule is plain text in, span out.

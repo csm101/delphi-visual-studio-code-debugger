@@ -72,7 +72,7 @@ symbols. To step into the RTL and VCL, also enable *Use debug .dcus*.
 | | |
 |---|---|
 | `Setup.exe` | Installer and updater |
-| `local.delphi-win64-debug/` | The VS Code extension plus the DAP adapter |
+| `mca-software.delphi-debugger/` | The VS Code extension plus the DAP adapter |
 | `DelphiDebuggerMcp.exe` | MCP server — {{MCP_TOOL_COUNT}} tools that let an agent set breakpoints, step, and read locals |
 | `scripts/register-mcp.ps1` | Registers or unregisters the MCP server |
 

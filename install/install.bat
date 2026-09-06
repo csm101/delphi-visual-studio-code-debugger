@@ -1,7 +1,7 @@
 @echo off
 setlocal
 
-set EXT_NAME=local.delphi-win64-debug
+set EXT_NAME=mca-software.delphi-debugger
 set SOURCE_DIR=%~dp0%EXT_NAME%
 set TARGET_DIR=%USERPROFILE%\.vscode\extensions\%EXT_NAME%
 

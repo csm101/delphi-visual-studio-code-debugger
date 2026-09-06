@@ -111,7 +111,8 @@ function moduleDetails(module) {
 
 const vscode = require('vscode');
 
-const DEBUG_TYPE = 'delphi-win64';
+// Both debug types the extension contributes (`delphi`, and `delphi-win64` as the alias).
+const DEBUG_TYPES = ['delphi', 'delphi-win64'];
 
 class DelphiModulesProvider {
   constructor() {
@@ -144,7 +145,7 @@ class DelphiModulesProvider {
 
   refresh() {
     const session = vscode.debug.activeDebugSession;
-    if (!session || session.type !== DEBUG_TYPE) {
+    if (!session || DEBUG_TYPES.indexOf(session.type) === -1) {
       this.modules = [];
       this.error = '';
       this._emitter.fire();

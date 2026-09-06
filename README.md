@@ -5,7 +5,7 @@ real debugger built on the Windows Debug API, written in Delphi.
 
 **Two front ends, one engine.** A **Debug Adapter Protocol** server makes it a
 first-class debugger inside VS Code. An **MCP server** hands the same engine to
-an **AI agent**: 44 tools to set breakpoints, step, read locals and evaluate
+an **AI agent**: 46 tools to set breakpoints, step, read locals and evaluate
 expressions, so an agent can run your program and read what it actually does
 instead of inferring it from the source. Neither is an afterthought of the
 other; they are two clients of the same `DebuggerCore`.
@@ -37,7 +37,7 @@ The repository contains **three programs** that share one debugger engine:
 |---|---|---|
 | **Debug adapter** | A **Debug Adapter Protocol (DAP)** server. This is the debugger itself: breakpoints, stepping, call stacks, variables, expression evaluation. Any DAP client can drive it. | `VisualStudioCodeDelphiDebugger\` |
 | **VS Code extension** | The client that makes it usable in the editor: the `delphi-win64` debug type, the process picker for attaching, status-bar progress, and an editor for the exception rules. | `install\local.delphi-win64-debug\` |
-| **MCP server** | The same engine exposed to an **AI agent** over the Model Context Protocol — 44 tools (`set_breakpoint`, `step_into`, `get_locals`, `evaluate_expression`, `get_call_stack`, `read_memory`, …). It lets an agent run a program, stop it, and read its actual state instead of guessing from the source. | `MCPDebugger\` |
+| **MCP server** | The same engine exposed to an **AI agent** over the Model Context Protocol — 46 tools (`set_breakpoint`, `step_into`, `get_locals`, `evaluate_expression`, `get_call_stack`, `read_memory`, …). It lets an agent run a program, stop it, and read its actual state instead of guessing from the source. | `MCPDebugger\` |
 
 The rest of the tree:
 
@@ -57,6 +57,16 @@ The rest of the tree:
 > Delphi project carries a couple of hundred search paths, and nobody wants to
 > write that by hand. The debugger works without it if you write `launch.json`
 > yourself, but the plugin is what makes it practical — install it first.
+>
+> **Or use [delphi-devkit (DDK)](https://marketplace.visualstudio.com/items?itemName=Snowcaloid.delphi-devkit)**,
+> which knows the same things about a project from inside VS Code. With DDK
+> installed, `launch.json` is optional: right-click a project in DDK's tree and
+> choose **Debug** or **Attach Debugger**, pick the project from the debug
+> dropdown, or write the two-line configuration
+> `{ "type": "delphi", "request": "launch", "ddkProject": "MyApp" }` — the
+> executable (or the Host Application of a package), the symbols, the sources,
+> the packages and the run arguments are asked from DDK when the session
+> starts. See [Launch configuration](#launch-configuration).
 
 > ⚠️ **Compile the program you want to debug with full debug information, or
 > most of this will not work.** A debugger can only show what the compiler
@@ -109,6 +119,7 @@ The rest of the tree:
 | **Delphi 10.3 Rio or later** (`dcc64` in PATH after `rsvars.bat`) | Compiling the adapter and the debug target |
 | **VS Code** | The editor the extension plugs into |
 | **[Delphi IDE plugin](https://github.com/csm101/EditInVsCodeDelphiPlugin)** | Generates the workspace and launch configuration from a Delphi project. Not strictly required, but see the note above |
+| **[delphi-devkit](https://marketplace.visualstudio.com/items?itemName=Snowcaloid.delphi-devkit)** (`Snowcaloid.delphi-devkit`) | The alternative to the plugin: describes a project's debug target from inside VS Code, so a configuration is one line (`ddkProject`) and Debug / Attach are on the project's context menu |
 | **DelphiLSP extension** (`embarcaderotechnologies.delphilsp`) | Delphi language support in VS Code (syntax, autocomplete). A separate Embarcadero extension; this one only debugs |
 | **Hex Editor extension** (`ms-vscode.hexeditor`, no longer needed) | Only if you want VS Code's own **View Binary Data** pane back — set `"delphi-win64.stockMemoryView": true` as well. Memory inspection is otherwise part of this extension: the memory icon on a Variables or Watch row opens a view that scrolls before the value, marks the bytes belonging to it and highlights what changed since the last stop, none of which the built-in pane can do |
 | **JCL sources** (optional) | Only for the default JCL debug-info support; build with `JCL_DEBUG_OFF` to omit it — see [Optional: JCL debug-info support](#optional-jcl-debug-info-support) |
@@ -323,7 +334,18 @@ see `DevTools\README.md`.
 
 ## VS Code extension setup
 
-The extension lives in a local directory under VS Code's extension folder. It is **not** published to the marketplace.
+The extension is published on the VS Code Marketplace as
+**`mca-software.delphi-debugger`** ("Delphi Debugger"). For ordinary use,
+install it from there: VS Code keeps it updated, and the MCP server comes with
+it (see [MCP server](#mcp-server-debugging-from-an-ai-agent)). Everything below
+is for working on the debugger from a source checkout, or for a machine that
+cannot reach the Marketplace (the setup zip).
+
+The extension used to be sideloaded under the id `local.delphi-win64-debug`.
+The two must not coexist — both contribute the same debug types, and VS Code
+would ask which one to use at every session start — so the Marketplace version
+detects the old copy on activation and offers to remove it, and `Install.exe`
+uninstalls it before installing the new one.
 
 ### Recommended: the installer
 
@@ -335,33 +357,37 @@ install\Install.exe
 ```
 
 `Install.exe` stages the freshly built adapter next to the extension
-manifest, detects your VS Code installation(s), and copies the extension
-into `%USERPROFILE%\.vscode\extensions\local.delphi-win64-debug\`. If a
-previous version is already installed it updates it in place (after
-confirmation). Reload VS Code afterwards.
+manifest, packages the extension into a `.vsix` (or uses the one
+`scripts\build_vsix.bat` produced with `vsce`, when it sits next to the
+installer), detects your VS Code-family editors, uninstalls the old sideloaded
+id, and installs the `.vsix` through each editor's CLI
+(`code --install-extension`). Reload VS Code afterwards.
 
 ### Scripted alternative
 
 ```bat
-:: build the adapter and stage it into install\local.delphi-win64-debug\
+:: build the adapter and the MCP server, stage both into install\mca-software.delphi-debugger\
 call scripts\update-install.bat
-:: copy the staged folder into your VS Code extensions directory
-call install\install.bat
+:: package with vsce into dist\mca-software.delphi-debugger-<version>.vsix (needs Node)
+call scripts\build_vsix.bat
+code --install-extension dist\mca-software.delphi-debugger-<version>.vsix --force
 ```
 
 ### Manual
 
-1. Build the adapter (`scripts/build_dap.bat`).
-2. Create the folder
-   `%USERPROFILE%\.vscode\extensions\local.delphi-win64-debug\`.
-3. Copy `install\local.delphi-win64-debug\package.json` and the built
-   `VisualStudioCodeDelphiDebugger.exe`
-   (`VisualStudioCodeDelphiDebugger\Win64\Debug\`) into it.
+1. Build the adapter (`scripts/build_dap.bat`) and the MCP server
+   (`scripts/build_mcp.bat`).
+2. Copy both executables into `install\mca-software.delphi-debugger\`
+   (`scripts/update-install.bat` does exactly this).
+3. Package and install as in the scripted alternative. A plain folder copy into
+   `%USERPROFILE%\.vscode\extensions\` is no longer loaded by VS Code 1.96+.
 4. Reload VS Code (`Ctrl+Shift+P` → *Developer: Reload Window*).
 
-The bundled `package.json` registers the `delphi-win64` debug type and
-points at the adapter via the relative path `./VisualStudioCodeDelphiDebugger.exe`,
-so no path editing is needed as long as the executable sits beside it.
+The bundled `package.json` registers the `delphi` debug type — and
+`delphi-win64`, the original name, as an alias so every existing
+`launch.json` keeps working — and points at the adapter via the relative path
+`./VisualStudioCodeDelphiDebugger.exe`, so no path editing is needed as long
+as the executable sits beside it.
 
 ### Where the adapter executable ends up
 
@@ -370,8 +396,8 @@ The build, the staging step and the install each hold a copy:
 | Stage | Location |
 |---|---|
 | Build output | `VisualStudioCodeDelphiDebugger\Win64\Debug\VisualStudioCodeDelphiDebugger.exe` |
-| Staging (gitignored, inside the repo) | `install\local.delphi-win64-debug\VisualStudioCodeDelphiDebugger.exe` |
-| Installed (what VS Code launches) | `%USERPROFILE%\.vscode\extensions\local.delphi-win64-debug\VisualStudioCodeDelphiDebugger.exe` |
+| Staging (gitignored, inside the repo) | `install\mca-software.delphi-debugger\VisualStudioCodeDelphiDebugger.exe` |
+| Installed (what VS Code launches) | `%USERPROFILE%\.vscode\extensions\mca-software.delphi-debugger-<version>\VisualStudioCodeDelphiDebugger.exe` |
 
 ### Distributable zip (no repo, no Delphi on the target)
 
@@ -386,15 +412,20 @@ It builds the adapter, builds the portable installer, and bundles everything int
 `dist\delphi-win64-debugger-setup-v<version>.zip`:
 
 ```text
-Setup.exe                     ← portable installer / updater
-local.delphi-win64-debug\     ← the extension (manifest + prebuilt adapter exe)
+Setup.exe                                   ← portable installer / updater
+mca-software.delphi-debugger\               ← the extension (manifest + adapter + MCP server)
+mca-software.delphi-debugger-<version>.vsix ← the same, packaged by vsce (what Setup.exe installs)
+DelphiDebuggerMcp.exe, register-mcp.ps1     ← the MCP server for agents outside VS Code
 INSTALL_INSTRUCTIONS.md
 ```
 
 On the target machine: extract the zip anywhere and run `Setup.exe`. It detects
-the local VS Code installation(s) and copies the extension; **if a previous
+the local VS Code-family editors, removes the old sideloaded extension when
+present, and installs the `.vsix` through the editor's CLI; **if a previous
 version is already installed it updates it in place**. No build step is needed —
-the adapter is already compiled inside the zip.
+everything is already compiled inside the zip. This is the route for a machine
+without Marketplace access, and for Claude Desktop or any agent that needs the
+MCP server without VS Code.
 
 `Setup.exe` is the same program as `install\Install.exe`. It auto-detects its
 context: with the adapter already staged beside it (the zip layout) it runs in
@@ -439,9 +470,9 @@ arrives; the script says so when the two differ. To move to a new version, run
 `install\Install.exe` once, which installs the `.vsix` through VS Code and lets
 it retire the previous folder itself.
 
-Both modes use the same `local.delphi-win64-debug` folder, so switching is just a
-matter of re-running `scripts/install-dev.bat` (dev) or `install\Install.exe`
-(distribution copy).
+Both modes use the same `mca-software.delphi-debugger-<version>` folder, so
+switching is just a matter of re-running `scripts/install-dev.bat` (dev) or
+`install\Install.exe` (distribution copy).
 
 | Mode | `program` points at | After a fix |
 |---|---|---|
@@ -453,7 +484,31 @@ matter of re-running `scripts/install-dev.bat` (dev) or `install\Install.exe`
 
 ## Launch configuration
 
-`.vscode/launch.json` for the project being debugged:
+The debug type is `delphi`. The original name, `delphi-win64`, is kept as an
+alias with the same attributes, so a `launch.json` written for it — by hand or
+by the RAD Studio plugin — needs no change.
+
+**With delphi-devkit (DDK) installed**, a configuration is one attribute:
+
+```json
+{ "type": "delphi", "request": "launch", "name": "Debug MyApp", "ddkProject": "MyApp" }
+```
+
+`ddkProject` is a DDK project name, id, or a path to a `.dproj` / `.dpr` /
+`.dpk`. When the session starts, the extension asks DDK for the project's debug
+target and fills in `program` (for a package or DLL project, its Host
+Application), `mapFile` / `rsmFile`, `sourceRoot`, `sourceSearchPaths`,
+`modules` (the project's own `.bpl` / `.dll` with their symbols), `args`
+and `delphiProjectFile`. Any of those you write yourself stays as written.
+`"request": "attach"` attaches to the running executable, through the process
+picker when several instances run. DDK's warnings (a stale `.rsm`, a package
+not built) are shown as notifications; a project on a non-Windows platform is
+refused. DDK starts exactly this configuration from its **Debug** / **Attach
+Debugger** context-menu entries and from the debug dropdown, so nothing has to
+be written at all. Without the DDK extension, `ddk.exe` is used when it is on
+PATH or named by the `DDK_EXE` environment variable.
+
+**Without DDK**, `.vscode/launch.json` for the project being debugged:
 
 ```json
 {
@@ -461,7 +516,7 @@ matter of re-running `scripts/install-dev.bat` (dev) or `install\Install.exe`
   "configurations": [
     {
       "name": "Debug Delphi Win64",
-      "type": "delphi-win64",
+      "type": "delphi",
       "request": "launch",
       "program": "${workspaceFolder}/Win64/Debug/MyApp.exe",
       "mapFile": "${workspaceFolder}/Win64/Debug/MyApp.map",
@@ -474,7 +529,8 @@ matter of re-running `scripts/install-dev.bat` (dev) or `install\Install.exe`
 
 | Property | Default | Description |
 |---|---|---|
-| `program` | *(required)* | Path to the `.exe` to debug |
+| `ddkProject` | *(empty)* | DDK project reference (id, name or project-file path); the rest of the configuration is filled from DDK's debug target |
+| `program` | *(required unless `ddkProject` or `delphiProjectFile` names the project)* | Path to the `.exe` to debug |
 | `mapFile` | same path as `program` with `.map` extension | Delphi MAP file |
 | `sourceRoot` | *(empty)* | Root directory for source file lookup |
 | `stopAtEntry` | `false` | Break at the process entry point before any user code runs |
@@ -821,30 +877,53 @@ The same engine is exposed over the **Model Context Protocol**, so an agent can
 debug a Delphi program the way a developer does — run it, stop it, and read the
 real state — instead of inferring behaviour from the source.
 
+One server, three ways to get it:
+
+- **From the Marketplace extension.** The extension bundles
+  `DelphiDebuggerMcp.exe`. Inside VS Code it is registered with the editor's
+  own MCP registry (VS Code 1.101+), so Copilot and other VS Code-hosted agents
+  see it as `delphi-debugger` with no `mcp.json` edits, and it updates with the
+  extension. For agents outside VS Code the extension keeps a copy at a stable
+  path, `%LOCALAPPDATA%\DelphiWin64Debugger\DelphiDebuggerMcp.exe`, refreshed
+  silently whenever the bundled exe is newer. The command **Delphi: Register
+  MCP Server with Claude Code** registers that copy with the `claude` CLI
+  (user scope); it says so and does nothing when the CLI is not on PATH.
+- **From the setup zip** (`Setup.exe`): the same stable folder, registered
+  with Claude Code and with VS Code's user `mcp.json` by `register-mcp.ps1`.
+  The route for a machine without VS Code, for Claude Desktop, and for offline
+  installs.
+- **From source:**
+
 ```powershell
 cmd /c scripts\build_mcp.bat
 powershell -ExecutionPolicy Bypass -File scripts/register-mcp.ps1 MCPDebugger\Win64\Debug\DelphiDebuggerMcp.exe
 ```
 
-The script registers the server as `delphi-win64-debugger` with Claude Code (via
-the `claude` CLI, user scope) and with VS Code by merging the user `mcp.json`.
-It is idempotent, and `-Unregister` removes it. `install\Install.exe` offers the
+The script registers the server as `delphi-debugger` with Claude Code (via the
+`claude` CLI, user scope) and with VS Code by merging the user `mcp.json`; a
+registration under the earlier name `delphi-win64-debugger` is removed. It is
+idempotent, and `-Unregister` removes it. `install\Install.exe` offers the
 same registration at the end of an install.
 
-The 44 tools cover the debugging cycle:
+The 46 tools cover the debugging cycle:
 
 | Group | Tools |
 |---|---|
-| Session | `launch_debuggee`, `launch_from_config`, `attach_to_process`, `attach_from_config`, `list_debuggable_processes`, `detach_debugger`, `terminate_debuggee`, `stop_debugging`, `get_debug_session_status` |
+| Session | `launch_project`, `attach_to_project` (a delphi-devkit project: everything else comes from DDK), `launch_debuggee`, `launch_from_config`, `attach_to_process`, `attach_from_config`, `list_debuggable_processes`, `detach_debugger`, `terminate_debuggee`, `stop_debugging`, `get_debug_session_status` |
 | Breakpoints | `set_breakpoint`, `set_breakpoints`, `list_breakpoints`, `remove_all_breakpoints`, `set_exception_filters` |
 | Execution | `continue_and_wait`, `step_over`, `step_into`, `step_out`, `pause_execution`, `wait_until_stopped` |
 | State | `get_call_stack`, `get_threads`, `get_locals`, `get_variable`, `expand_variable`, `evaluate_expression`, `get_current_source_location`, `get_exception_details`, `get_compact_debug_snapshot` |
 | Memory | `read_memory`, `write_memory` |
 | Output | `get_debuggee_output`, `get_debugger_output` |
 
-`launch_from_config` and `attach_from_config` read the `launch.json` the IDE
-plugin generated, so an agent starts a session with the project's real symbol
-and source paths rather than a hand-built approximation.
+`launch_project` and `attach_to_project` ask delphi-devkit for the project's
+debug target (`ddk.exe debug-target … --json`), so an agent starts a session
+from a project name alone, with the real executable or host application,
+symbols, sources and packages; DDK's warnings come back in the reply. When DDK
+is not installed, `launch_from_config` and `attach_from_config` read the
+`launch.json` the IDE plugin generated instead. Either way the session starts
+with the project's real symbol and source paths rather than a hand-built
+approximation.
 `get_compact_debug_snapshot` returns location, stack and locals in one call,
 which is usually what an agent wants after a stop and costs far fewer tokens
 than three round trips.
@@ -875,7 +954,7 @@ symbol resolution reaches both.
 |---|---|
 | `DebuggerCore\` | The debugger proper: Windows debug loop, symbol readers (`.rsm`, TD32, `.map`, `.dcp`, JCL), expression evaluator, exception rules |
 | `VisualStudioCodeDelphiDebugger\` | DAP server: reads DAP from stdin, drives the engine |
-| `MCPDebugger\` | MCP server: the same engine as 44 tools an agent can call |
+| `MCPDebugger\` | MCP server: the same engine as 46 tools an agent can call |
 | `install\local.delphi-win64-debug\` | VS Code extension: registers the `delphi-win64` debug type, the attach picker and the exception-rules editor, and bundles the adapter |
 | `Debugme.dpr` | A small program used as a debug target while developing the debugger |
 

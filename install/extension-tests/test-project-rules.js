@@ -21,7 +21,7 @@ const os = require('os');
 const path = require('path');
 const Module = require('module');
 
-const extensionDir = path.join(__dirname, '..', 'local.delphi-win64-debug');
+const extensionDir = path.join(__dirname, '..', 'mca-software.delphi-debugger');
 
 // describeTarget needs no vscode API, but the module it lives in requires the
 // module at load time.

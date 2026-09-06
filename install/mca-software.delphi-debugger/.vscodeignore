@@ -1,0 +1,6 @@
+test/**
+.vscodeignore
+*.vsix
+*.old*
+**/*.map
+**/.DS_Store

@@ -14,7 +14,7 @@
 const assert = require('assert');
 const path = require('path');
 
-const extensionDir = path.join(__dirname, '..', 'local.delphi-win64-debug');
+const extensionDir = path.join(__dirname, '..', 'mca-software.delphi-debugger');
 const jsonc = require(path.join(extensionDir, 'jsonc.js'));
 const rules = require(path.join(extensionDir, 'rules.js'));
 

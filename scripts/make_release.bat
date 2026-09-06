@@ -8,7 +8,7 @@ REM   make_release.bat -Highlights whatsnew.md  file whose text becomes "What's 
 REM   make_release.bat -Verify                  AFTER publishing: check that the
 REM                                             tag landed on the built commit
 REM
-REM The version comes from install\local.delphi-win64-debug\package.json.
+REM The version comes from install\mca-software.delphi-debugger\package.json.
 REM Nothing is ever published automatically: the release is left as a draft.
 REM PowerShell 7 when present, Windows PowerShell otherwise. The script itself
 REM avoids cmdlets that are missing on older hosts, so either works.

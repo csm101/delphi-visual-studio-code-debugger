@@ -1,9 +1,10 @@
 # How to create a new release
 
-Everything is driven by `scripts/make_release.bat`. It builds the distributable zip,
-renders the release notes from a template and creates a **draft** release on
-GitHub with the zip attached. It never publishes: the last step is always a
-human reading the draft.
+Everything is driven by `scripts/make_release.bat`. It builds the distributable zip
+and the Marketplace VSIX, renders the release notes from a template and creates
+a **draft** release on GitHub with both attached. It never publishes: the last
+step is always a human reading the draft — and, for the Marketplace, a human
+uploading the VSIX.
 
 ---
 
@@ -13,6 +14,9 @@ You need:
 
 - the Delphi toolchain on PATH (`rsvars.bat`, `dcc64`) — the release is built
   from source, not from whatever is lying in `dist\`;
+- Node.js on PATH: the VSIX is packaged with `npx @vscode/vsce package`, the
+  Marketplace's own tool, so the file uploaded there and the one inside the zip
+  are the same artefact. No publisher token is needed anywhere;
 - the GitHub CLI, authenticated: `gh auth login`. The script checks this before
   building, so an expired login costs you a message rather than a wasted build;
 - push rights on `csm101/delphi-visual-studio-code-debugger`.
@@ -26,7 +30,7 @@ Nothing else. The script refuses to start rather than half-produce a release.
 The version lives in **one** place:
 
 ```
-install\local.delphi-win64-debug\package.json  ->  "version": "0.2.3"
+install\mca-software.delphi-debugger\package.json  ->  "version": "0.2.3"
 ```
 
 Bump it there and nowhere else. The script reads it from that file, so the tag,
@@ -119,16 +123,21 @@ What happens, in order:
 4. warns about unpushed commits, and REFUSES if HEAD itself is not on the
    upstream branch — the tag is created at that exact commit;
 5. runs `scripts/build_setup_zip.bat` — which rebuilds the adapter, the MCP server, the
-   installer, and stages the extension (including `Zydis.dll`, the optional
+   installer, stages the extension (including `Zydis.dll`, the optional
    disassembly backend, and its MIT licence text — a missing
    `ThirdParty\Zydis\bin\x64\Zydis.dll` at build time is a printed warning,
    not a failed build, since disassembly degrades to unavailable without it
-   rather than blocking anything else);
+   rather than blocking anything else), and packages
+   `dist\mca-software.delphi-debugger-<version>.vsix` with `vsce`
+   (`scripts/build_vsix.bat`); the VSIX is also bundled inside the zip, where
+   `Setup.exe` installs it in preference to packaging the folder itself;
 6. computes the zip's SHA-256;
 7. renders the template, substituting the version, the hash, the MCP tool count
    (read from `MCPDebugger\McpToolSchemas.pas`) and your "What's new";
 8. refuses to continue if any `{{PLACEHOLDER}}` survived;
-9. creates the **draft** release and uploads the zip.
+9. creates the **draft** release and uploads the zip and the VSIX;
+10. opens the Marketplace management page and the folder holding the VSIX, for
+    step 8.
 
 Options:
 
@@ -188,7 +197,24 @@ wrong, because it does not compare those two things. Nothing did.
 
 ---
 
-## 8. Check what a stranger sees
+## 8. Upload the VSIX to the Marketplace
+
+The Marketplace is a separate publication and it is **manual**: no publisher
+token is stored anywhere, and the script does not talk to the Marketplace. On
+<https://marketplace.visualstudio.com/manage> (publisher `mca-software`), open
+the **Delphi Debugger** extension's menu, choose **Update**, and upload
+`dist\mca-software.delphi-debugger-<version>.vsix` — the very file attached to
+the GitHub release. The script opens both the page and the folder at the end so
+this is not forgotten. Verification takes a few minutes; the version then shows
+on <https://marketplace.visualstudio.com/items?itemName=mca-software.delphi-debugger>.
+
+Do this after the GitHub release is published, not before: the extension's own
+update check points users at the GitHub release, and a Marketplace version with
+no matching release page is a dead link.
+
+---
+
+## 9. Check what a stranger sees
 
 ```powershell
 gh release view v0.2.4
