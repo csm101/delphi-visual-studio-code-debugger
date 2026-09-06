@@ -41,6 +41,10 @@ type
     IdJson:   string;
     Baseline: UInt64;
     Deadline: UInt64;
+    // Fields merged into the deferred snapshot reply, owned here until sent:
+    // launch_project / attach_to_project put DDK's warnings there, so a stale
+    // .rsm or a missing package reaches the caller with the entry stop.
+    Extra:    TJSONObject;
   end;
 
   TMcpServer = class
@@ -49,6 +53,9 @@ type
     FSession: TDebugSession;
     FQuit:    Boolean;
     FWait:    TPendingWait;
+    // `--ddk-exe <path>`: where ddk.exe is when it is on neither PATH nor DDK_EXE
+    // (see DdkTarget.LocateDdkExe for the full order).
+    FDdkExe:  string;
 
     // Data breakpoints (watchpoints; increment 5 of docs/DATA_BREAKPOINTS_PLAN.md).
     // TDebugSession.SetDataBreakpoints replaces the WHOLE set on every call
@@ -71,14 +78,20 @@ type
     procedure DispatchToolsCall(const IdJson: string; Params: TJSONObject);
     // Shared attach flow: resolve pid (from a name, rejecting ambiguity), gate on
     // architecture, default the program path, attach, and arm the entry-break wait.
+    // Extra rides into the deferred reply (see TPendingWait.Extra); owned here
+    // from the call on, freed on every refusal.
     procedure PerformAttach(const IdJson: string; Pid: Cardinal; const PName: string;
-                KillOnDetach: Boolean; Opts: TAttachOptions);
+                KillOnDetach: Boolean; Opts: TAttachOptions; Extra: TJSONObject = nil);
     // Recreate FSession when the previous debuggee has ended so a new launch/attach
     // is not refused forever by a lingering terminal-state session.
     procedure EnsureFreshSessionForStart;
 
-    procedure ArmWait(const IdJson: string; TimeoutMs: Integer);
+    procedure ArmWait(const IdJson: string; TimeoutMs: Integer; Extra: TJSONObject = nil);
     procedure FulfilPendingWait;
+    // launch_project / attach_to_project: DDK's debug target as the launch or
+    // attach request, through the same path launch_debuggee / attach_to_process use.
+    procedure HandleLaunchProject(const IdJson: string; Args: TJSONObject);
+    procedure HandleAttachToProject(const IdJson: string; Args: TJSONObject);
     procedure CheckWaitTimeout;
     procedure HandleReadMemory(const IdJson, AddrStr: string; Count: Integer);
     procedure HandleWriteMemory(const IdJson, AddrStr, HexBytes: string);
@@ -110,14 +123,20 @@ type
     constructor Create;
     destructor Destroy; override;
     procedure Run;
+    property DdkExe: string read FDdkExe write FDdkExe;
   end;
+
+// Reads the server's own switches from the command line (`--ddk-exe <path>`).
+// Unknown switches are ignored: an MCP client may pass arguments this server
+// does not know, and refusing to start over one would take every tool with it.
+function DdkExeFromCommandLine: string;
 
 procedure RunMcpServer;
 
 implementation
 
 uses
-  System.IOUtils, McpToolSchemas, McpJson, LaunchConfig,
+  System.IOUtils, McpToolSchemas, McpJson, LaunchConfig, DdkTarget,
   Disassembler, ZydisDisassembler;
 
 var
@@ -238,6 +257,7 @@ end;
 
 destructor TMcpServer.Destroy;
 begin
+  FWait.Extra.Free;
   FSession.Free;
   FIO.Free;
   inherited;
@@ -272,7 +292,13 @@ end;
 
 procedure TMcpServer.SendSnapshotResult(const IdJson: string);
 begin
-  SendToolJson(IdJson, McpJson.SnapshotToJson(FSession.Snapshot));
+  var Snapshot := McpJson.SnapshotToJson(FSession.Snapshot);
+  if FWait.Extra <> nil then begin
+    for var Pair in FWait.Extra do
+      Snapshot.AddPair(Pair.JsonString.Value, Pair.JsonValue.Clone as TJSONValue);
+    FreeAndNil(FWait.Extra);
+  end;
+  SendToolJson(IdJson, Snapshot);
 end;
 
 procedure TMcpServer.EnsureFreshSessionForStart;
@@ -323,12 +349,111 @@ begin
   Result := False;
 end;
 
-procedure TMcpServer.ArmWait(const IdJson: string; TimeoutMs: Integer);
+procedure TMcpServer.ArmWait(const IdJson: string; TimeoutMs: Integer; Extra: TJSONObject);
 begin
   FWait.Active   := True;
   FWait.IdJson   := IdJson;
   FWait.Baseline := FSession.StopGeneration;
   FWait.Deadline := GetTickCount64 + UInt64(TimeoutMs);
+  FWait.Extra.Free;
+  FWait.Extra    := Extra;
+end;
+
+// ---- delphi-devkit (DDK) as the source of the launch / attach request ----
+//
+// `project` is what DDK resolves: a project id, a name, or a .dproj/.dpr/.dpk
+// path (an unmanaged path is described ad hoc; `compiler` picks its compiler).
+// Everything ddk.exe reports as an error (ambiguous name, unknown project, not
+// installed) comes back verbatim as the tool error. The DDK warnings ride along
+// in the reply as `ddkWarnings`, next to the entry-stop snapshot.
+
+function WarningsPayload(const Target: TDdkDebugTarget): TJSONObject;
+begin
+  Result := TJSONObject.Create;
+  Result.AddPair('ddkProject', Target.Project);
+  Result.AddPair('ddkProjectFile', Target.ProjectFile);
+  Result.AddPair('ddkKind', Target.Kind);
+  Result.AddPair('ddkWarnings', McpJson.StringListToJson(Target.Warnings));
+end;
+
+procedure TMcpServer.HandleLaunchProject(const IdJson: string; Args: TJSONObject);
+begin
+  var ProjectRef := '';
+  var Compiler := '';
+  if Args <> nil then begin
+    ProjectRef := Args.GetValue<string>('project', '');
+    Compiler   := Args.GetValue<string>('compiler', '');
+  end;
+  if ProjectRef.Trim = '' then begin
+    SendToolError(IdJson, '"project" is required: a DDK project id, a project name, or a .dproj/.dpr/.dpk path.');
+    Exit;
+  end;
+  var Target: TDdkDebugTarget;
+  var Err: string;
+  if not DdkTarget.FetchDebugTarget(FDdkExe, ProjectRef.Trim, Compiler.Trim, Target, Err) then begin
+    SendToolError(IdJson, Err);
+    Exit;
+  end;
+  var Opts: TLaunchOptions;
+  if not DdkTarget.LaunchOptionsFromTarget(Target, Opts, Err) then begin
+    SendToolError(IdJson, Err);
+    Exit;
+  end;
+  // An explicit `args` overrides DDK's fused run parameters, as `program` and
+  // `args` in a launch.json entry override what the RAD Studio plugin wrote.
+  if (Args <> nil) and (Args.FindValue('args') <> nil) then
+    Opts.Args := Args.GetValue<string>('args', '');
+  var ExcFilters: TArray<string> := nil;
+  if Args <> nil then begin
+    var V := Args.FindValue('exceptionFilters');
+    if V is TJSONArray then
+      for var Item in TJSONArray(V) do
+        ExcFilters := ExcFilters + [Item.Value];
+  end;
+  if Length(ExcFilters) > 0 then begin
+    Opts.ExceptionFilters    := TDebugSession.ParseExceptionFilters(ExcFilters);
+    Opts.ExceptionFiltersSet := True;
+    Opts.DelphiClassFilter   := Args.GetValue<string>('delphiExceptionClasses', '');
+  end;
+  EnsureFreshSessionForStart;
+  // Same rule as launch_debuggee: always park at entry, so breakpoints can be
+  // set before any user code runs (stopAtEntry is accepted, never honoured as false).
+  Opts.StopAtEntry := True;
+  FSession.Launch(Opts);
+  ArmWait(IdJson, 30000, WarningsPayload(Target));
+end;
+
+procedure TMcpServer.HandleAttachToProject(const IdJson: string; Args: TJSONObject);
+begin
+  var ProjectRef := '';
+  var Compiler := '';
+  var Pid: Cardinal := 0;
+  var KillOnDetach := False;
+  if Args <> nil then begin
+    ProjectRef   := Args.GetValue<string>('project', '');
+    Compiler     := Args.GetValue<string>('compiler', '');
+    Pid          := Cardinal(Args.GetValue<Integer>('processId', 0));
+    KillOnDetach := Args.GetValue<Boolean>('killOnDetach', False);
+  end;
+  if ProjectRef.Trim = '' then begin
+    SendToolError(IdJson, '"project" is required: a DDK project id, a project name, or a .dproj/.dpr/.dpk path.');
+    Exit;
+  end;
+  var Target: TDdkDebugTarget;
+  var Err: string;
+  if not DdkTarget.FetchDebugTarget(FDdkExe, ProjectRef.Trim, Compiler.Trim, Target, Err) then begin
+    SendToolError(IdJson, Err);
+    Exit;
+  end;
+  var Opts: TAttachOptions;
+  var PName: string;
+  if not DdkTarget.AttachOptionsFromTarget(Target, Opts, PName, Err) then begin
+    SendToolError(IdJson, Err);
+    Exit;
+  end;
+  // A pid disambiguates several running instances; otherwise the name goes
+  // through the same single-instance / candidate-list rule attach_to_process has.
+  PerformAttach(IdJson, Pid, PName, KillOnDetach, Opts, WarningsPayload(Target));
 end;
 
 procedure TMcpServer.FulfilPendingWait;
@@ -373,21 +498,28 @@ begin
 end;
 
 procedure TMcpServer.PerformAttach(const IdJson: string; Pid: Cardinal;
-  const PName: string; KillOnDetach: Boolean; Opts: TAttachOptions);
+  const PName: string; KillOnDetach: Boolean; Opts: TAttachOptions; Extra: TJSONObject);
+
+  procedure Refuse(const Msg: string);
+  begin
+    Extra.Free;
+    SendToolError(IdJson, Msg);
+  end;
+
 begin
   EnsureFreshSessionForStart;
   if Pid = 0 then begin
     if PName = '' then begin
-      SendToolError(IdJson, 'Provide processId or processName (or a config with one).');
+      Refuse('Provide processId or processName (or a config with one).');
       Exit;
     end;
     var Matches := ProcessEnum.FindProcessesByName(PName);
     if Length(Matches) = 0 then begin
-      SendToolError(IdJson, Format('No running process matches "%s".', [PName]));
+      Refuse(Format('No running process matches "%s".', [PName]));
       Exit;
     end;
     if Length(Matches) > 1 then begin
-      SendToolError(IdJson, 'Ambiguous: ' + IntToStr(Length(Matches)) +
+      Refuse('Ambiguous: ' + IntToStr(Length(Matches)) +
         ' processes match "' + PName + '". Pick a pid: ' +
         McpJson.ProcessListToJson(Matches).ToJSON);
       Exit;
@@ -397,18 +529,18 @@ begin
 
   var Info: TProcessInfo;
   if not ProcessEnum.GetProcessInfo(Pid, Info) then begin
-    SendToolError(IdJson, Format('Process %d not found (it may have exited).', [Pid]));
+    Refuse(Format('Process %d not found (it may have exited).', [Pid]));
     Exit;
   end;
   var Reason: string;
   if not ProcessEnum.CanDebug(Info, Reason) then begin
-    SendToolError(IdJson, 'Cannot attach: ' + Reason);
+    Refuse('Cannot attach: ' + Reason);
     Exit;
   end;
   if Opts.ProgramPath = '' then
     Opts.ProgramPath := Info.ExePath;
   FSession.Attach(Pid, KillOnDetach, Opts);
-  ArmWait(IdJson, 30000);  // wait for the initial attach-break
+  ArmWait(IdJson, 30000, Extra);  // wait for the initial attach-break
 end;
 
 procedure TMcpServer.DispatchToolsCall(const IdJson: string; Params: TJSONObject);
@@ -546,6 +678,16 @@ begin
       Opts.StopAtEntry := True;
       FSession.Launch(Opts);
       ArmWait(IdJson, 30000);
+      Exit;
+    end;
+
+    // ---- launch / attach a delphi-devkit (DDK) project ----
+    if Name = 'launch_project' then begin
+      HandleLaunchProject(IdJson, Args);
+      Exit;
+    end;
+    if Name = 'attach_to_project' then begin
+      HandleAttachToProject(IdJson, Args);
       Exit;
     end;
 
@@ -1389,10 +1531,19 @@ begin
   end;
 end;
 
+function DdkExeFromCommandLine: string;
+begin
+  Result := '';
+  for var I := 1 to ParamCount - 1 do
+    if SameText(ParamStr(I), '--ddk-exe') then
+      Exit(ParamStr(I + 1));
+end;
+
 procedure RunMcpServer;
 begin
   var Server := TMcpServer.Create;
   try
+    Server.DdkExe := DdkExeFromCommandLine;
     Server.Run;
   finally
     Server.Free;

@@ -24,22 +24,50 @@ call scripts\build_mcp.bat
 Output: `MCPDebugger\Win64\Debug\DelphiDebuggerMcp.exe`.
 (The full test pipeline `DebuggerTests\build_and_run.bat` also builds it.)
 
-## Register (automatic)
+## Distribution: one release, three channels
 
-The installer and the dev-install register the MCP server for you, in **both
-Claude Code and VS Code** (stable + Insiders):
+The server is registered under the name **`delphi-debugger`** everywhere (the
+earlier name `delphi-win64-debugger` is removed wherever a registration step
+finds it).
 
-- **From the distributable zip:** run `Setup.exe` and accept "Also install and
-  register the MCP debug server?". It copies `DelphiDebuggerMcp.exe` to
-  `%LOCALAPPDATA%\DelphiWin64Debugger\` and registers that stable path.
-- **From source (dev):** `scripts/install-dev.bat` builds the MCP server and registers
-  the build-output exe (so a `scripts/build_mcp.bat` rebuild is picked up on restart).
-- **Directly:** `powershell -ExecutionPolicy Bypass -File scripts/register-mcp.ps1
-  <path-to-DelphiDebuggerMcp.exe>` — idempotent; `-Unregister` removes it.
+- **The Marketplace extension** (`mca-software.delphi-debugger`) bundles
+  `DelphiDebuggerMcp.exe` next to the adapter. On activation the extension
+  registers it with VS Code's own MCP registry through
+  `vscode.lm.registerMcpServerDefinitionProvider` (VS Code 1.101+; the API's
+  absence is tolerated), so VS Code-hosted agents see it with no `mcp.json` and
+  it updates with the extension. For agents outside VS Code the path must be
+  stable, so the extension also keeps a copy at
+  `%LOCALAPPDATA%\DelphiWin64Debugger\DelphiDebuggerMcp.exe` — the folder
+  `Setup.exe` uses — and refreshes it when the bundled exe is newer. Windows
+  refuses to overwrite or delete a running exe but allows renaming it, so the
+  running file is renamed to the first free `.oldN` name, the new one copied
+  under the original name, and every `*.old*` deleted where possible (a locked
+  one goes at a later activation). All of it silent: at most a line in the
+  "Delphi Debugger" output channel. The command **Delphi: Register MCP Server
+  with Claude Code** runs `claude mcp add delphi-debugger -s user -- "<stable
+  path>"` and skips with a message when the `claude` CLI is not on PATH.
+- **The setup zip** (`Setup.exe`, `scripts/build_setup_zip.bat`): run it and
+  accept "Also install and register the MCP debug server?". It copies
+  `DelphiDebuggerMcp.exe` to the same stable folder and `register-mcp.ps1`
+  registers it with **Claude Code** (`claude mcp add … -s user`) and with **VS
+  Code / Insiders** (user `mcp.json`). The route for machines without VS Code,
+  Claude Desktop, and offline installs.
+- **From source:** `scripts/install-dev.bat` builds the MCP server and registers
+  the build-output exe (so a `scripts/build_mcp.bat` rebuild is picked up on
+  restart), or directly `powershell -ExecutionPolicy Bypass -File
+  scripts/register-mcp.ps1 <path-to-DelphiDebuggerMcp.exe>` — idempotent;
+  `-Unregister` removes it.
 
-Registration writes the Claude Code user config via `claude mcp add … -s user`
-and merges each VS Code user `mcp.json`. Restart Claude Code / reload VS Code to
-pick it up.
+Restart Claude Code / reload VS Code to pick a registration up. WinGet (a stable,
+on-PATH install of adapter + server) is the planned follow-up once the first
+Marketplace release is out.
+
+## Command line
+
+`DelphiDebuggerMcp.exe [--ddk-exe <path>]`. The one switch names `ddk.exe` for
+`launch_project` / `attach_to_project` when it is on neither PATH nor `DDK_EXE`;
+unknown switches are ignored, so a client that passes its own arguments does not
+lose the server.
 
 ## Register manually
 
@@ -67,6 +95,30 @@ To attach to processes owned by another user or elevated targets, run the client
 ## Tool surface
 
 ### Session & process
+- `launch_project` — **prefer this over `launch_debuggee` / `launch_from_config`
+  when delphi-devkit (DDK) is present.** Args: `project` (required: a DDK
+  project id, a project name, or a `.dproj` / `.dpr` / `.dpk` path; a path DDK
+  does not manage is described ad hoc, `compiler` picking its compiler), `args`
+  (overrides the run parameters DDK reports), `stopAtEntry`,
+  `exceptionFilters`, `delphiExceptionClasses` as in `launch_debuggee`. The
+  server runs `ddk.exe debug-target <project> --json` (located through
+  `--ddk-exe`, then `DDK_EXE`, then PATH, then the packaged DDK extension's
+  bundled copy), maps the reply onto the same launch request `launch_from_config`
+  builds — executable or Host Application, `.map` / `.rsm`, source root and
+  search paths, the project's own modules that exist on disk with their
+  `.map` / `.rsm` / `.dcp`, the fused run arguments — and launches through the
+  existing path. **Always stops at entry**, like `launch_debuggee`. The reply is
+  the entry-stop snapshot plus `ddkProject`, `ddkProjectFile`, `ddkKind` and
+  `ddkWarnings` (missing or stale `.map` / `.rsm`, a package not built).
+  Errors from DDK — an ambiguous reference with its candidate list, an unknown
+  project, `ddk.exe` not found — come back verbatim as the tool error. A
+  project on a non-Windows platform (DDK reports `bitness: null`) is refused
+  with DDK's warning text.
+- `attach_to_project` — the same, for a running instance of the project's
+  executable (the program, or the Host Application of a package / DLL). Args:
+  `project`, `compiler`, `processId` (to pick one of several running
+  instances; otherwise one instance attaches directly and several fail with the
+  candidate list, as `attach_to_process` does), `killOnDetach`.
 - `list_debuggable_processes` — pid, exe name/path, command line, parent pid,
   start time, architecture. Optional `nameFilter`.
 - `launch_debuggee` — start a target under the debugger. **Always stops at entry**

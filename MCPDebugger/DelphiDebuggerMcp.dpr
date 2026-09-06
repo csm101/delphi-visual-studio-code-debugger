@@ -14,6 +14,7 @@ uses
   McpJson in 'McpJson.pas',
   McpToolSchemas in 'McpToolSchemas.pas',
   LaunchConfig in 'LaunchConfig.pas',
+  DdkTarget in 'DdkTarget.pas',
   DebugSession in '..\DebuggerCore\DebugSession.pas',
   DebugSessionTypes in '..\DebuggerCore\DebugSessionTypes.pas',
   SourceResolver in '..\DebuggerCore\SourceResolver.pas',

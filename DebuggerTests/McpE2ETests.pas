@@ -42,6 +42,13 @@ type
     [Test] procedure Bpl_Breakpoint_Stops;
     [Test] procedure SetBreakpointsPlural_Stops;
     [Test] procedure LaunchFromConfig_Stops;
+    // launch_project: DDK's debug target as the launch request. A stand-in
+    // ddk (a .cmd printing a fixture describing TestTarget) is named through
+    // the server's --ddk-exe switch, so the whole path - switch, process run,
+    // JSON parse, mapping, launch, the warnings in the reply - is the shipped
+    // one; only DDK's project knowledge is faked.
+    [Test] procedure LaunchProject_ViaStubDdk_StopsAndCarriesWarnings;
+    [Test] procedure LaunchProject_DdkErrors_VerbatimAndNotFoundNamesWhatToInstall;
     [Test] procedure Relaunch_AfterTerminate_Succeeds;
     [Test] procedure Evaluate_Object_IsExpandable;
     [Test] procedure Locals_FrameIndex_ReadsCallerFrame;
@@ -162,7 +169,9 @@ type
     procedure WriteLine(const S: string);
     function  ReadLine(TimeoutMs: Cardinal): string;
   public
-    constructor Start(const ExePath: string);
+    // ExtraArgs is appended to the command line (e.g. '--ddk-exe "<path>"');
+    // the working directory is the exe's own, whatever the arguments hold.
+    constructor Start(const ExePath: string; const ExtraArgs: string = '');
     destructor Destroy; override;
     function Call(const Method: string; Params: TJSONObject): TJSONObject; // caller frees
     procedure Notify(const Method: string; Params: TJSONObject);
@@ -170,7 +179,7 @@ type
     function CallTool(const Name: string; Args: TJSONObject): TJSONValue;
   end;
 
-constructor TMcpTestClient.Start(const ExePath: string);
+constructor TMcpTestClient.Start(const ExePath: string; const ExtraArgs: string);
 var
   Sec: TSecurityAttributes;
   ChildIn, ChildOut: THandle;
@@ -196,7 +205,11 @@ begin
   SI.hStdOutput := ChildOut;
   SI.hStdError  := ChildOut;
 
-  if not CreateProcess(nil, PChar(ExePath), nil, nil, True,
+  var CommandLine := '"' + ExePath + '"';
+  if ExtraArgs <> '' then
+    CommandLine := CommandLine + ' ' + ExtraArgs;
+  UniqueString(CommandLine);
+  if not CreateProcess(nil, PChar(CommandLine), nil, nil, True,
        CREATE_NO_WINDOW, nil, PChar(ExtractFileDir(ExePath)), SI, FProc) then
     RaiseLastOSError;
 
@@ -1230,6 +1243,142 @@ begin
     C.CallTool('terminate_debuggee', nil).Free;
   finally
     C.Free;
+  end;
+end;
+
+procedure TMcpE2ETests.LaunchProject_ViaStubDdk_StopsAndCarriesWarnings;
+begin
+  var Line := MarkerLine(EVAL_SOURCE, EVAL_MARKER);
+  var Scratch := TPath.Combine(TPath.GetTempPath, Format('mcp_ddk_%d', [GetCurrentProcessId]));
+  TDirectory.CreateDirectory(Scratch);
+  // What ddk.exe would say about TestTarget: forward slashes, snake_case, a
+  // warning to carry, and the symbols next to the exe.
+  var Slashed := StringReplace(TargetExe, '\', '/', [rfReplaceAll]);
+  var Target :=
+    '{ "project_id": 7, "project": "TestTarget", "kind": "program",' +
+    '  "project_file": "' + StringReplace(TargetDir, '\', '/', [rfReplaceAll]) + 'TestTarget.dproj",' +
+    '  "executable": "' + Slashed + '", "host_application": null,' +
+    '  "platform": "Win64", "bitness": 64,' +
+    '  "symbols": { "map": "' + ChangeFileExt(Slashed, '.map') + '", "rsm": "' + ChangeFileExt(Slashed, '.rsm') + '" },' +
+    '  "source_root": "' + StringReplace(ExcludeTrailingPathDelimiter(TargetDir), '\', '/', [rfReplaceAll]) + '",' +
+    '  "source_search_paths": [], "modules": [], "args": [],' +
+    '  "warnings": ["fixture warning: carried into the reply"] }';
+  var Fixture := TPath.Combine(Scratch, 'target.json');
+  TFile.WriteAllText(Fixture, Target);
+  var Stub := TPath.Combine(Scratch, 'ddk.cmd');
+  TFile.WriteAllText(Stub, '@echo off' + sLineBreak + 'type "' + Fixture + '"' + sLineBreak);
+
+  var C := TMcpTestClient.Start(McpExe, '--ddk-exe "' + Stub + '"');
+  try
+    C.Call('initialize', nil).Free;
+
+    var LaunchArgs := TJSONObject.Create;
+    LaunchArgs.AddPair('project', 'TestTarget');
+    var LR := C.CallTool('launch_project', LaunchArgs);
+    try
+      Assert.IsTrue(LR is TJSONObject, 'launch_project errored: ' + LR.ToJSON);
+      var Reply := TJSONObject(LR);
+      Assert.AreEqual('stopped', Reply.GetValue<string>('state', ''), 'expected the entry stop: ' + Reply.ToJSON);
+      Assert.AreEqual('TestTarget', Reply.GetValue<string>('ddkProject', ''));
+      Assert.AreEqual('program', Reply.GetValue<string>('ddkKind', ''));
+      var Warnings := Reply.GetValue('ddkWarnings') as TJSONArray;
+      Assert.IsNotNull(Warnings, 'ddkWarnings missing from the reply: ' + Reply.ToJSON);
+      Assert.AreEqual(1, Warnings.Count);
+      Assert.AreEqual('fixture warning: carried into the reply', Warnings.Items[0].Value);
+    finally
+      LR.Free;
+    end;
+
+    var BpArgs := TJSONObject.Create;
+    BpArgs.AddPair('sourceFile', EVAL_SOURCE);
+    BpArgs.AddPair('line', TJSONNumber.Create(Line));
+    C.CallTool('set_breakpoint', BpArgs).Free;
+
+    var Snap := C.CallTool('continue_and_wait', nil);
+    try
+      var S := TJSONObject(Snap);
+      Assert.AreEqual('stopped', S.GetValue<string>('state', ''),
+        'launch_project did not reach the breakpoint: ' + S.ToJSON);
+      Assert.AreEqual(EVAL_SOURCE,
+        ExtractFileName((S.GetValue('location') as TJSONObject).GetValue<string>('sourceFile', '')),
+        'wrong source file');
+      Assert.IsNull(S.GetValue('ddkWarnings'), 'the warnings belong to the launch reply only');
+    finally
+      Snap.Free;
+    end;
+
+    C.CallTool('terminate_debuggee', nil).Free;
+  finally
+    C.Free;
+  end;
+end;
+
+procedure TMcpE2ETests.LaunchProject_DdkErrors_VerbatimAndNotFoundNamesWhatToInstall;
+begin
+  var Scratch := TPath.Combine(TPath.GetTempPath, Format('mcp_ddk_err_%d', [GetCurrentProcessId]));
+  TDirectory.CreateDirectory(Scratch);
+  var Stub := TPath.Combine(Scratch, 'ddk.cmd');
+  TFile.WriteAllText(Stub, '@echo off' + sLineBreak +
+    'echo Error: No project matches "%~2". Use `list` to see available projects. 1>&2' + sLineBreak +
+    'exit /b 1' + sLineBreak);
+
+  var C := TMcpTestClient.Start(McpExe, '--ddk-exe "' + Stub + '"');
+  try
+    C.Call('initialize', nil).Free;
+    var LaunchArgs := TJSONObject.Create;
+    LaunchArgs.AddPair('project', 'Nope');
+    var LR := C.CallTool('launch_project', LaunchArgs);
+    try
+      Assert.IsTrue(LR is TJSONString, 'expected a tool error, got: ' + LR.ToJSON);
+      Assert.AreEqual('Error: No project matches "Nope". Use `list` to see available projects.', LR.Value);
+    finally
+      LR.Free;
+    end;
+
+    // No project at all is refused before ddk is even asked.
+    var Missing := C.CallTool('launch_project', TJSONObject.Create);
+    try
+      Assert.IsTrue(Missing is TJSONString);
+      Assert.Contains(Missing.Value, '"project" is required');
+    finally
+      Missing.Free;
+    end;
+  finally
+    C.Free;
+  end;
+
+  // A server pointed at a ddk that does not exist, with nothing else to find:
+  // the error names what to install rather than failing to start a process.
+  var SavedEnv := GetEnvironmentVariable('DDK_EXE');
+  var SavedPath := GetEnvironmentVariable('PATH');
+  var SavedProfile := GetEnvironmentVariable('USERPROFILE');
+  try
+    SetEnvironmentVariable('DDK_EXE', nil);
+    SetEnvironmentVariable('PATH', PChar(Scratch));
+    SetEnvironmentVariable('USERPROFILE', PChar(Scratch));
+    var C2 := TMcpTestClient.Start(McpExe, '--ddk-exe "' + TPath.Combine(Scratch, 'absent.exe') + '"');
+    try
+      C2.Call('initialize', nil).Free;
+      var LaunchArgs := TJSONObject.Create;
+      LaunchArgs.AddPair('project', 'Anything');
+      var LR := C2.CallTool('launch_project', LaunchArgs);
+      try
+        Assert.IsTrue(LR is TJSONString, 'expected a tool error, got: ' + LR.ToJSON);
+        Assert.Contains(LR.Value, 'Snowcaloid.delphi-devkit');
+        Assert.Contains(LR.Value, '--ddk-exe');
+      finally
+        LR.Free;
+      end;
+    finally
+      C2.Free;
+    end;
+  finally
+    if SavedEnv = '' then
+      SetEnvironmentVariable('DDK_EXE', nil)
+    else
+      SetEnvironmentVariable('DDK_EXE', PChar(SavedEnv));
+    SetEnvironmentVariable('PATH', PChar(SavedPath));
+    SetEnvironmentVariable('USERPROFILE', PChar(SavedProfile));
   end;
 end;
 

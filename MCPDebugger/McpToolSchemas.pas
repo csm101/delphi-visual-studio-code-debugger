@@ -148,6 +148,35 @@ begin
      Prop('workspaceFolder', 'string', 'Base for resolving ${workspaceFolder} in the paths above.'),
      Prop('killOnDetach', 'boolean', 'If true, terminate the target when the debug session ends; default false (leave it running).')]));
 
+  Result.Add(MakeTool('launch_project',
+    'Launch a project known to delphi-devkit (DDK) under the debugger. PREFER THIS over ' +
+    'launch_debuggee / launch_from_config when DDK is installed: DDK supplies the executable ' +
+    '(for a package or DLL project, its Host Application), the .map/.rsm, the source root and ' +
+    'search paths (dproj + IDE library/browsing paths), the project''s own .bpl/.dll with their ' +
+    'symbols, and the run arguments - nothing to restate, no launch.json needed. Stops at entry; ' +
+    'then set breakpoints and continue_and_wait. The reply carries ddkProject, ddkProjectFile, ' +
+    'ddkKind and ddkWarnings (missing or stale .map/.rsm, a package not built) next to the ' +
+    'snapshot. Errors from DDK (ambiguous reference with its candidate list, unknown project, ' +
+    'ddk.exe not found) are returned verbatim.',
+    [Prop('project', 'string', 'DDK project reference: a project id, a project name, or a path to a .dproj/.dpr/.dpk (a path DDK does not manage is described ad hoc).', True),
+     Prop('compiler', 'string', 'Compiler configuration for an ad-hoc project path: a key like "12.0" or a product name like "Delphi 12". Ignored for a managed project.'),
+     Prop('args', 'string', 'Command-line arguments for the target, overriding the run parameters DDK reports (dproj Debugger_RunParams fused with DDK Start Parameters).'),
+     Prop('stopAtEntry', 'boolean', 'Accepted for compatibility; the launch always stops at entry.'),
+     ArrayProp('exceptionFilters', 'Exception filter ids to enable, as in launch_debuggee.', ItemsOfType('string')),
+     Prop('delphiExceptionClasses', 'string', 'Delphi exception class filter, as in launch_debuggee.')]));
+
+  Result.Add(MakeTool('attach_to_project',
+    'Attach to the running executable of a project known to delphi-devkit (DDK): the program, ' +
+    'or the Host Application of a package/DLL project. DDK supplies the executable name, the ' +
+    'symbols, the sources and the project''s modules, exactly as launch_project does. One ' +
+    'running instance is attached to directly; several instances fail with the candidate list ' +
+    'unless processId names one. The reply carries ddkProject, ddkProjectFile, ddkKind and ' +
+    'ddkWarnings next to the snapshot; DDK errors are returned verbatim.',
+    [Prop('project', 'string', 'DDK project reference: a project id, a project name, or a path to a .dproj/.dpr/.dpk.', True),
+     Prop('compiler', 'string', 'Compiler configuration for an ad-hoc project path (see launch_project).'),
+     Prop('processId', 'integer', 'PID to attach to when several instances of the executable are running.'),
+     Prop('killOnDetach', 'boolean', 'If true, terminate the target when the debug session ends; default false (leave it running).')]));
+
   Result.Add(MakeTool('attach_from_config',
     'Attach using an existing VS Code launch.json "attach" configuration (same file ' +
     'the DAP debugger uses): it supplies the process selector (processId/processName), ' +

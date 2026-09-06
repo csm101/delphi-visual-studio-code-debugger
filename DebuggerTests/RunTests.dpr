@@ -42,6 +42,8 @@ uses
   SourceResolver  in '..\DebuggerCore\SourceResolver.pas',
   DebugSession    in '..\DebuggerCore\DebugSession.pas',
   LaunchConfig    in '..\MCPDebugger\LaunchConfig.pas',
+  DdkTarget       in '..\MCPDebugger\DdkTarget.pas',
+  DdkTargetTests  in 'DdkTargetTests.pas',
   DebugSessionTests in 'DebugSessionTests.pas',
   McpE2ETests     in 'McpE2ETests.pas',
   ValueReaderTests in 'ValueReaderTests.pas',
