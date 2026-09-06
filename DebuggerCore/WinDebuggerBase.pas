@@ -174,8 +174,20 @@ type
     // reported stop thaws them. This is what makes stepping truly per-thread:
     // only the stepped thread's single-step / one-shot INT3 can fire (also makes
     // step-over/step-out more robust, since no other thread can race a step BP).
+    //
+    // The freeze is for the single-stepping phases only. The moment a step
+    // becomes a full-speed run -- to a call's return address, to a step-out's
+    // return address, to a callee's body start -- the frozen threads are
+    // resumed: the stepped-over call may be waiting for one of them (an
+    // Application.Initialize that hands work to a worker and waits, a lock
+    // another thread holds), and a frozen waiter turns the step into a deadlock
+    // the user cannot even Pause out of. A grace timer (STEP_FREEZE_GRACE_MS)
+    // covers whatever phase is still frozen when a single step stalls. Thread
+    // scoping of the landing is kept by FStepTid instead: a step breakpoint hit
+    // by another thread is stepped off and re-armed (RearmStepBpAfterForeignHit).
     FStepTid:          DWORD;        // thread targeted by the in-flight step (0 = none)
     FStepFreezeActive: Boolean;      // True while other threads are frozen for a step
+    FStepFreezeSince:  UInt64;       // GetTickCount64 when the current freeze began
     FStepFrozenTids:   TList<DWORD>; // threads we explicitly suspended for the current step
     FCachedFrames:    TArray<TStackFrame>; // call stack cached per stop (keyed by TID+RIP+RSP)
     FCachedFramesTID: DWORD;               // thread the cached frames belong to (0 = none)
@@ -580,6 +592,15 @@ type
     // Freeze every thread except StepTid for the duration of a step; thaw them
     // at the next reported stop. Idempotent-safe (never stacks two freezes).
     procedure FreezeThreadsForStep(StepTid: DWORD);
+    // Resumes the frozen threads but keeps the step targeted at FStepTid: the
+    // step is still in flight, only its isolation is given up.
+    procedure ResumeStepFrozenThreads(const Why: string);
+    // The grace timer: a frozen step that has produced no event for
+    // STEP_FREEZE_GRACE_MS is waiting on something, and the something is
+    // probably a frozen thread.
+    procedure ThawStepFreezeIfStalled;
+    // A step breakpoint reached by a thread the step does not target.
+    function  StepTargetHitByOtherThread(Tid: DWORD): Boolean;
     procedure ThawStepFrozenThreads;
     function  ReadDelphiExceptionClass(ObjAddr: UInt64): string;
     function  ReadDelphiExceptionClassChain(ObjAddr: UInt64): TArray<string>;
@@ -1744,6 +1765,13 @@ begin
   DapLog(Format('UnpatchBpAtRip: removed INT3 at $%x, will rearm at next stop', [RIP]));
 end;
 
+const
+  // How long a step may keep the other threads frozen without producing a
+  // debug event. A single-stepped instruction retires in microseconds; a step
+  // that has gone quiet for this long is inside a call that is waiting for
+  // something, and the something is likely one of the frozen threads.
+  STEP_FREEZE_GRACE_MS = 100;
+
 procedure TWinDebugger.FreezeThreadsForStep(StepTid: DWORD);
 begin
   // Never stack two freezes: a fresh step always starts from a thawed baseline.
@@ -1757,16 +1785,17 @@ begin
   end;
   FStepTid          := StepTid;
   FStepFreezeActive := True;
+  FStepFreezeSince  := GetTickCount64;
   DapLog(Format('FreezeThreadsForStep: stepping tid=%d, froze %d other thread(s)',
     [StepTid, FStepFrozenTids.Count]));
 end;
 
-procedure TWinDebugger.ThawStepFrozenThreads;
+procedure TWinDebugger.ResumeStepFrozenThreads(const Why: string);
 begin
-  if not FStepFreezeActive and (FStepFrozenTids.Count = 0) then begin
-    FStepTid := 0;
+  if not FStepFreezeActive and (FStepFrozenTids.Count = 0) then
     Exit;
-  end;
+  if FStepFrozenTids.Count > 0 then
+    DapLog(Format('ResumeStepFrozenThreads: %d thread(s), %s', [FStepFrozenTids.Count, Why]));
   for var Tid in FStepFrozenTids do begin
     // Re-resolve the handle: a thread that exited mid-step was removed from
     // FThreads (handle closed), so ThreadHandle() returns 0 and we skip it.
@@ -1776,7 +1805,26 @@ begin
   end;
   FStepFrozenTids.Clear;
   FStepFreezeActive := False;
-  FStepTid          := 0;
+end;
+
+procedure TWinDebugger.ThawStepFreezeIfStalled;
+begin
+  if not FStepFreezeActive then
+    Exit;
+  if GetTickCount64 - FStepFreezeSince < STEP_FREEZE_GRACE_MS then
+    Exit;
+  ResumeStepFrozenThreads('the step has not landed within the grace period');
+end;
+
+function TWinDebugger.StepTargetHitByOtherThread(Tid: DWORD): Boolean;
+begin
+  Result := (FStepTid <> 0) and (Tid <> FStepTid);
+end;
+
+procedure TWinDebugger.ThawStepFrozenThreads;
+begin
+  ResumeStepFrozenThreads('stop reported');
+  FStepTid := 0;
 end;
 
 // For $0EEDFADE Delphi exceptions: ExcInfo0 = ExceptionInformation[0] =
@@ -2573,6 +2621,9 @@ begin
       FStepResumeSP := CurSP + UInt64(TargetLayout.PointerSize);
       {$Q+}
       PlantStepBp(RetTop);
+      // The callee runs at full speed from here and may wait on another
+      // thread; a frozen one would never let it return.
+      ResumeStepFrozenThreads('running to the return address of a stepped-over call');
       ContinueDebugEvent(FProcessId, Tid, DBG_CONTINUE);
       Exit;
     end;
@@ -4197,6 +4248,7 @@ begin
             PlantInt3(BP);
             FBreakpoints.Add(BP);
           end;
+          ResumeStepFrozenThreads('running to the return address of a stepped-over call');
           ReleasePendingEvent(ContStatus);
           Exit;
         end;
@@ -4253,6 +4305,7 @@ begin
             PlantInt3(BP);
             FBreakpoints.Add(BP);
           end;
+          ResumeStepFrozenThreads('running to the return address for a step-out');
           ReleasePendingEvent(ContStatus);
           Exit;
         end;
@@ -4273,6 +4326,11 @@ begin
       ckPause:
         if (FProcess <> 0) and not FIsStopped then begin
           FPauseRequested := True;
+          // A pause gives up the step's isolation: the break-in has to run, and
+          // whatever the stepped thread is waiting for has to be allowed to
+          // happen. DebugBreakProcess raises the break on a thread it creates
+          // inside the target, which HandleCreateThread must not suspend either.
+          ResumeStepFrozenThreads('pause requested');
           DebugBreakProcess(FProcess);
           DapLog('ckPause: DebugBreakProcess called');
         end;
@@ -4445,7 +4503,7 @@ begin
   // A thread born while a per-thread step is in flight must also be frozen, else
   // it would run free alongside the single stepped thread. It is thawed with the
   // rest at the next reported stop.
-  if FStepFreezeActive and (Ev.CreateThread.hThread <> 0) and
+  if FStepFreezeActive and (not FPauseRequested) and (Ev.CreateThread.hThread <> 0) and
      (Ev.dwThreadId <> FStepTid) then
     if SuspendThread(Ev.CreateThread.hThread) <> DWORD(-1) then
       FStepFrozenTids.Add(Ev.dwThreadId);
@@ -4478,7 +4536,7 @@ begin
   // If the thread being stepped exits mid-step, its single-step can never land;
   // thaw everyone so the process is not left with all other threads frozen and
   // nothing runnable (deadlock), and drop the now-orphaned step mode.
-  if FStepFreezeActive and (Ev.dwThreadId = FStepTid) then begin
+  if (FStepTid <> 0) and (Ev.dwThreadId = FStepTid) then begin
     ThawStepFrozenThreads;
     FStepMode := smNone;
   end;
@@ -4880,6 +4938,14 @@ begin
         for var SV in FStepBpVAs do
           if SV = BpVA then begin IsStepBp := True; Break; end;
         if (FStepMode = smOver) and IsStepBp then begin
+          // Another thread reached a transient step breakpoint: the threads are
+          // no longer frozen while a callee runs, so this is reachable. Step it
+          // off, re-arm, and leave the step to the thread that owns it.
+          if StepTargetHitByOtherThread(Ev.dwThreadId) then begin
+            RearmStepBpAfterForeignHit(BpVA, Ev.dwThreadId);
+            ContinueDebugEvent(Ev.dwProcessId, Ev.dwThreadId, DBG_CONTINUE);
+            Exit;
+          end;
           if BpVA = FStepResumeVA then begin
             // The run-to-return resume BP: we are back in the stepped function
             // just after a call (or returned from a recursive self-call).
@@ -4913,8 +4979,10 @@ begin
               ReportStopped(srStep, BpVA);
               Exit;
             end;
-            // Same line (call returned mid-line): resume single-stepping.
+            // Same line (call returned mid-line): resume single-stepping, with
+            // the other threads frozen again for the single-stepped phase.
             FStepPrevSP := CurrentRSP(Ev.dwThreadId);
+            FreezeThreadsForStep(Ev.dwThreadId);
             SetTrapFlag(Ev.dwThreadId, True);
             ContinueDebugEvent(Ev.dwProcessId, Ev.dwThreadId, DBG_CONTINUE);
             Exit;
@@ -4929,8 +4997,15 @@ begin
           ReportStopped(srStep, BpVA);
           Exit;
         end;
-        // If this was a step-over/step-out target: report step
+        // If this was a step-over/step-out target: report step -- for the
+        // thread being stepped. Another thread returning through the same
+        // address is stepped off it and the one-shot re-armed.
         if (FStepMode in [smOver, smOut]) and (BpVA = FStepOverVA) then begin
+          if StepTargetHitByOtherThread(Ev.dwThreadId) then begin
+            RearmStepBpAfterForeignHit(BpVA, Ev.dwThreadId);
+            ContinueDebugEvent(Ev.dwProcessId, Ev.dwThreadId, DBG_CONTINUE);
+            Exit;
+          end;
           FStepOverVA := 0;
           ReportStopped(srStep, BpVA);
           Exit;
@@ -4960,9 +5035,14 @@ begin
         // carried a user breakpoint: PlantStepBp leaves an occupied address
         // alone, so the hit arrives here. The landing is the same one.
         var ExcStepLanded := ExcStepLandedAt(BpVA, Ev.dwThreadId);
+        // A user breakpoint at the step's own target, hit by the stepped
+        // thread, is the step landing; hit by another thread it is that
+        // thread's breakpoint and goes through the ordinary path.
+        var StepTargetLanded := (FStepMode in [smOver, smOut]) and (BpVA = FStepOverVA) and
+          not StepTargetHitByOtherThread(Ev.dwThreadId);
         var ShouldStop := True;
-        if Assigned(FOnBpHit) and not InstrStepLanded and not ExcStepLanded and not (
-            (FStepMode in [smOver, smOut]) and (BpVA = FStepOverVA)) then
+        if Assigned(FOnBpHit) and not InstrStepLanded and not ExcStepLanded and
+           not StepTargetLanded then
           ShouldStop := FOnBpHit(BP);
         if not ShouldStop then begin
           ContinueDebugEvent(Ev.dwProcessId, Ev.dwThreadId, DBG_CONTINUE);
@@ -4974,7 +5054,7 @@ begin
         end else if ExcStepLanded then begin
           EndExceptionStep;
           ReportStopped(srStep, BpVA);
-        end else if (FStepMode in [smOver, smOut]) and (BpVA = FStepOverVA) then begin
+        end else if StepTargetLanded then begin
           FStepOverVA := 0;
           ReportStopped(srStep, BpVA);
         end else begin
@@ -5158,6 +5238,7 @@ begin
               PlantInt3(BP);
               FBreakpoints.Add(BP);
             end;
+            ResumeStepFrozenThreads('running to the start of the callee body');
             ContinueDebugEvent(Ev.dwProcessId, Ev.dwThreadId, DBG_CONTINUE);
             Exit;
           end;
@@ -5191,6 +5272,7 @@ begin
               PlantInt3(BP);
               FBreakpoints.Add(BP);
             end;
+            ResumeStepFrozenThreads('running out of sourceless code to the caller');
             ContinueDebugEvent(Ev.dwProcessId, Ev.dwThreadId, DBG_CONTINUE);
             Exit;
           end;
@@ -5496,8 +5578,10 @@ var
 begin
   ProcessCommandQueue;
 
-  if not WaitForDebugEvent(Ev, 10) then
+  if not WaitForDebugEvent(Ev, 10) then begin
+    ThawStepFreezeIfStalled;
     Exit;
+  end;
 
   ContStatus := DBG_CONTINUE;
   case Ev.dwDebugEventCode of

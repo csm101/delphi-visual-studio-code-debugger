@@ -1345,13 +1345,38 @@ the MCP `step_*` tools read a `threadId` arg; both pass it through
 (`Cmd.ThreadId` else `FStoppedTid`) and reads RIP/RSP, arms TF, and computes the
 return address for THAT thread. `FreezeThreadsForStep(StepTid)` then
 `SuspendThread`s every other thread before the resume, so only the stepped thread
-runs (its single-step / one-shot step BP is the only trap that can fire) — the
-Win32 debug API resumes all threads on `ContinueDebugEvent`, but the explicit
-suspend survives it. `ReportStopped` is the single choke point that thaws them
+runs during the single-stepped (trap-flag) phases — the Win32 debug API resumes
+all threads on `ContinueDebugEvent`, but the explicit suspend survives it.
+`ReportStopped` is the single choke point that thaws them
 (`ThawStepFrozenThreads`) on every stop path. Threads born mid-step are frozen
 (`HandleCreateThread`); a thread that exits is dropped from the freeze set, and if
 the stepped thread itself exits mid-step everything is thawed to avoid an
-all-frozen deadlock. The persistent-BP re-arm carries the owning thread
+all-frozen deadlock.
+
+**The freeze ends where the full-speed run begins.** A stepped-over call may
+wait for another thread (`Application.Initialize` handing work to a worker, a
+lock another thread holds); keeping that thread frozen turned the step into a
+process-wide deadlock, and Pause could not break in because `DebugBreakProcess`
+raises the break on a thread it creates inside the target — which the freeze
+suspended as well (found 2026-09-06; the freeze had behaved this way since the
+initial import). So `ResumeStepFrozenThreads` runs at every transition from
+single-stepping to a run-to-breakpoint: the return address of a call left by
+the range-based step-over (`HandleSmOverStep`), the step-out and import-thunk
+return addresses, the callee-body one-shot and the sourceless pivot of a
+step-into. The threads are frozen again when the resume breakpoint lands and
+single-stepping continues. Whatever is still frozen when a step goes quiet is
+released by a grace timer in `ProcessOneEvent` (`STEP_FREEZE_GRACE_MS`, 100 ms
+without a debug event), and `ckPause` releases everything before the break-in
+(`HandleCreateThread` also leaves the break-in thread alone while a pause is
+pending). The isolation the freeze provided is therefore a property of the
+single-stepped instructions only; the LANDING stays thread-scoped by
+`FStepTid`: a transient step breakpoint or the step's target one-shot reached
+by another thread is stepped off and re-armed (`StepTargetHitByOtherThread` →
+`RearmStepBpAfterForeignHit`), and a persistent user breakpoint at the step's
+target hit by another thread is that thread's breakpoint, not the step landing.
+Fixtures and tests: `RunStepWaitFixture` in `TestTargetCore.pas`,
+`StepOver_CallWaitingOnAnotherThread_Completes` (x64 and Win32),
+`Pause_DuringStepOverThatNeverReturns_BreaksIn`. The persistent-BP re-arm carries the owning thread
 (`FReactivateTid`) and both re-arm checks are gated on it, so stepping a different
 thread neither steals nor drops another thread's pending re-arm. After the step,
 the single-step handler sets `FStoppedTid := StepTid`, so run control keeps

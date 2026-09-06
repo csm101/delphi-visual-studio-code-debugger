@@ -460,6 +460,30 @@ absurdly.
 - The same hazard applies to every other by-name RTL lookup in the engine
   (`@UStrAsg` and friends in `SetStringVariable`). Not yet re-measured there.
 
+## Per-thread stepping
+
+- **Never keep other threads frozen while a stepped-over call runs at full
+  speed.** The freeze that makes single-stepping per-thread (every other thread
+  `SuspendThread`'d) turned `F10` on `Application.Initialize;` into a
+  process-wide deadlock: the call waits on a worker, the worker is frozen, the
+  step never lands — and Pause could not break in either, because
+  `DebugBreakProcess` raises the break on a NEW thread inside the target and
+  `HandleCreateThread` suspended that one too. Not a regression: the freeze was
+  in the initial import (2026-07-21) and had always done this; it surfaced on
+  2026-09-06 during the DDK live verification. The rule now: freeze only for the
+  trap-flag phases, `ResumeStepFrozenThreads` at every transition to a
+  run-to-breakpoint (call return, step-out return, callee body start, sourceless
+  pivot), a 100 ms grace timer in `ProcessOneEvent` for anything still frozen
+  that has gone quiet, and a thaw on `ckPause`. The landing stays thread-scoped
+  through `StepTargetHitByOtherThread` + `RearmStepBpAfterForeignHit`, not
+  through the freeze. Fixtures: `RunStepWaitFixture` (`--run-step-wait`,
+  `--run-step-wait-forever`); tests `StepOver_CallWaitingOnAnotherThread_Completes`
+  (both bitnesses) and `Pause_DuringStepOverThatNeverReturns_BreaksIn`.
+- **The `Test_Threads_*` / `PerThreadStep_*` fixtures prove isolation only for
+  single-stepped instructions.** A step that includes a call now lets the other
+  threads run while the callee executes; do not write a test that expects a
+  spinner's counter to hold still across a stepped-over call.
+
 ## Synthetic calls into the debuggee
 
 - **Aborting a call does not give the thread back.** The abort hijacks RIP to the

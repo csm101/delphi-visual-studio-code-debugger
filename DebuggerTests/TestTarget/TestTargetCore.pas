@@ -487,6 +487,12 @@ var
   GStepIsoStop: Boolean;
   GStepIsoB:    Int64;
   GStepIsoC:    Int64;
+  // Step-over across a cross-thread wait (see RunStepWaitFixture): the call the
+  // main thread steps over cannot return until a WORKER thread runs. A debugger
+  // that keeps every other thread frozen for the whole step deadlocks here.
+  GStepWaitGo:    THandle;   // set by the main thread: the worker may proceed
+  GStepWaitDone:  THandle;   // set by the worker: the stepped-over call may return
+  GStepWaitNever: THandle;   // never set: a call that blocks until the debugger pauses
   // Hardware-watchpoint fixture (see RunDataBpStepFixture). Integer, so the
   // cell is 4 bytes and naturally 4-aligned -- the alignment a debug register
   // requires, and the reason not to make it a Boolean or an Int64.
@@ -2113,6 +2119,63 @@ begin
 end;
 
 // --- Per-thread stepping isolation fixture --------------------------------
+// --- Step-over across a cross-thread wait ------------------------------------
+// The shape of `Application.Initialize` on a real application: the main thread
+// steps over a call that waits for something ANOTHER thread has to do first.
+// The worker waits for the main thread's go signal, then signals done; the
+// stepped-over call sets go and waits for done. Both waits are bounded (30 s),
+// so a debugger that has frozen the worker for the step hangs the step for that
+// long instead of forever -- long enough for a test to notice, short enough for
+// the target to still exit on its own.
+//
+// With `--run-step-wait-forever` the fixture then calls a routine that waits on
+// an event nobody ever sets: the case where a stepped-over call never returns
+// and the user presses Pause. DebugBreakProcess creates a thread inside the
+// target to raise the break-in; a debugger that suspends every thread born
+// during a step suspends that one too, and the pause never lands.
+
+function StepWaitWorker(Param: Pointer): DWORD; stdcall;
+begin
+  NameCurrentThread('StepWaitWorker');
+  WaitForSingleObject(GStepWaitGo, 30000);
+  SetEvent(GStepWaitDone);
+  Result := 0;
+end;
+
+procedure StepWaitHandshake;
+begin
+  SetEvent(GStepWaitGo);
+  WaitForSingleObject(GStepWaitDone, 30000);
+end;
+
+procedure StepWaitForever;
+begin
+  WaitForSingleObject(GStepWaitNever, 120000);
+end;
+
+procedure RunStepWaitFixture;
+var
+  HW: THandle;
+  IdW: DWORD;
+begin
+  NameCurrentThread('StepWaitMain');
+  GStepWaitGo    := CreateEvent(nil, True, False, nil);
+  GStepWaitDone  := CreateEvent(nil, True, False, nil);
+  GStepWaitNever := CreateEvent(nil, True, False, nil);
+  HW := CreateThread(nil, 0, @StepWaitWorker, nil, 0, IdW);
+  Sleep(50);                                   // the worker is inside its wait
+  GSink.Use(['step-wait ready']);              // {BP:STEPWAIT_MAIN}
+  StepWaitHandshake;                           // {BP:STEPWAIT_CALL}
+  GSink.Use(['step-wait done']);               // {BP:STEPWAIT_NEXT}
+  if FindCmdLineSwitch('run-step-wait-forever') or FindCmdLineSwitch('-run-step-wait-forever') then
+    StepWaitForever;                           // {BP:STEPWAIT_FOREVER}
+  WaitForSingleObject(HW, 5000);
+  CloseHandle(HW);
+  CloseHandle(GStepWaitGo);
+  CloseHandle(GStepWaitDone);
+  CloseHandle(GStepWaitNever);
+end;
+
 // Two worker threads spin incrementing their OWN counter until GStepIsoStop.
 // The main thread stops at STEPISO_MAIN with both spinners live (frozen by the
 // stop). A test then single-steps ONE spinner and asserts only its counter moved
@@ -2436,6 +2499,10 @@ begin
 
   if FindCmdLineSwitch('run-per-thread-step') or FindCmdLineSwitch('-run-per-thread-step') then
     RunPerThreadStepFixture;
+
+  if FindCmdLineSwitch('run-step-wait') or FindCmdLineSwitch('-run-step-wait') or
+     FindCmdLineSwitch('run-step-wait-forever') or FindCmdLineSwitch('-run-step-wait-forever') then
+    RunStepWaitFixture;
 
   if FindCmdLineSwitch('run-databp-step') or FindCmdLineSwitch('-run-databp-step') then
     RunDataBpStepFixture;

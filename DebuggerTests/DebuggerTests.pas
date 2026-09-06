@@ -713,6 +713,11 @@ type
     [Test] procedure Test_Threads_ExceptionInWorker;
     [Test] procedure Test_Threads_NameThreadForDebugging_SurfacesLive;
     [Test] procedure Test_Threads_NameAnnouncement_NeverStops_WithAllFilter;
+    // A step that begins while a "reading variables..." busy period is still
+    // open must retitle the status-bar item: a stepped-over call that takes
+    // long -- or never returns -- otherwise shows the variables text for its
+    // whole duration.
+    [Test] procedure Test_StepProgress_SupersedesAnOpenVariablesBusyPeriod;
 
     // --- conditional / hit-count / log-point breakpoints + hover eval ---
     [Test] procedure Test_BP_Conditional;
@@ -5723,6 +5728,38 @@ begin
 
   Assert.AreEqual(1, CountThreadsNamed(FClient, 'DelphiNamedWorker'),
     'the announcement was consumed but its name was not recorded');
+end;
+
+procedure TDebuggerTests.Test_StepProgress_SupersedesAnOpenVariablesBusyPeriod;
+var
+  FrameId, LocalsRef: Integer;
+begin
+  StartSession('STEPWAIT_FOREVER', FrameId, LocalsRef, ['--run-step-wait-forever']);
+  // The post-stop burst: a variables request arms the busy period...
+  FClient.Variables(LocalsRef).Free;
+  // ...and the step follows inside the debounce window, into a call that never
+  // returns, so the spinner is shown and stays shown.
+  FClient.StepOverRaw(1, '').Free;
+
+  var SawStepTitle := False;
+  var LastText := '';
+  var Deadline := GetTickCount64 + 4000;
+  while (not SawStepTitle) and (GetTickCount64 < Deadline) do begin
+    var Body: TJSONObject;
+    if not FClient.TryWaitForEvent('delphiProgress', 500, Body) then
+      Continue;
+    try
+      if (Body <> nil) and (Body.GetValue<string>('id', '') = 'op') and
+         (Body.GetValue<string>('state', '') <> 'end') then begin
+        LastText := Body.GetValue<string>('text', '');
+        SawStepTitle := LastText.Contains('step over');
+      end;
+    finally
+      Body.Free;
+    end;
+  end;
+  Assert.IsTrue(SawStepTitle,
+    'the spinner never carried the step''s title after the step began; last text: "' + LastText + '"');
 end;
 
 // While stopped on the MAIN thread (THREADS_READY), the call stack of a

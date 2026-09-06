@@ -1302,11 +1302,20 @@ begin
     FLastBusyTick := GetTickCount64;
     // Arm a new busy period (debounce START -- the watchdog shows the spinner
     // only if this period lasts > ~200ms, so fast steps never pop a toast). The
-    // title is taken from whatever started the period.
+    // title is taken from whatever started the period -- except that a step or
+    // a continue supersedes it: a period begun by a variables request just
+    // before the user pressed F10 would otherwise show "reading variables..."
+    // for as long as the step runs, which for a call that never returns is
+    // forever, and says nothing about what is actually going on.
     if not FBusyArmed then begin
       FBusyArmed   := True;
       FBusySince   := FLastBusyTick;
       FOpBusyTitle := ATitle;
+    end
+    else if StepPending and (FOpBusyTitle <> ATitle) then begin
+      FOpBusyTitle := ATitle;
+      if FOpProgressActive then
+        EmitProgress('op', 'update', ATitle);
     end;
   finally
     LeaveCriticalSection(FOpLock);

@@ -187,6 +187,20 @@ module you are standing in carries debug information at all.
 
 ## Implemented features
 
+Stepping across a cross-thread wait (2026-09-06, found during the DDK live
+verification, not a regression):
+- **A stepped-over call that waits on another thread completes**, and Pause
+  breaks into one that never returns. The per-thread freeze is kept for the
+  single-stepped phases only; every transition to a full-speed run resumes the
+  other threads, a 100 ms grace timer releases whatever is still frozen when a
+  step goes quiet, and a pause releases everything before `DebugBreakProcess`.
+  The landing stays thread-scoped by `FStepTid` (foreign hits are stepped off
+  and re-armed). A step also retitles an open "reading variables..." spinner.
+  Tests: `StepOver_CallWaitingOnAnotherThread_Completes` (x64 + Win32),
+  `Pause_DuringStepOverThatNeverReturns_BreaksIn`,
+  `Test_StepProgress_SupersedesAnOpenVariablesBusyPeriod`; mechanism in
+  `DAP_DEBUGGER_ARCHITECTURE.md` "Stepping", rule in `TRAPS.md`.
+
 Project knowledge from delphi-devkit (DDK):
 - **A configuration names a DDK project and nothing else** (`ddkProject`, or
   `delphiProjectFile` without `program`). The extension's configuration

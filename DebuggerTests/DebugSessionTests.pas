@@ -51,6 +51,9 @@ type
     // regression, a stack-walk regression and a symbol-resolution regression
     // without asserting any hardcoded name.
     [Test] procedure Win32_StackFrameNames_MatchWin64;
+    // The freeze-for-step lives in the shared base class, so the cross-thread
+    // wait deadlock is checked on this bitness too.
+    [Test] procedure Win32_StepOver_CallWaitingOnAnotherThread_Completes;
     // Structural invariants of the walk itself: a frame's PC is CODE and a
     // caller's frame sits at a HIGHER address than its callee's. dbghelp's i386
     // unwind broke both in the field, returning a stack address as the caller's
@@ -485,6 +488,11 @@ type
     // Step-0 superset additions (frontend-neutral core superset of the DAP needs).
     [Test] procedure Threads_StoppedThreadIsCurrent;
     [Test] procedure PerThreadStep_StepsOnlySelectedThread;
+    // A stepped-over call that waits on ANOTHER thread must still return: the
+    // step may not keep that thread frozen while the call runs. And when a
+    // stepped-over call never returns, Pause must still break in.
+    [Test] procedure StepOver_CallWaitingOnAnotherThread_Completes;
+    [Test] procedure Pause_DuringStepOverThatNeverReturns_BreaksIn;
     // Hardware watchpoints share the single-step exception with the stepping
     // engine; these pin both directions of telling them apart. See the shared
     // scenario helpers for what each one exercises.
@@ -3074,6 +3082,79 @@ begin
         Assert.IsTrue(T.IsStopped, 'the current thread should be marked stopped');
       end;
     Assert.IsTrue(FoundCurrent, 'no thread marked IsCurrent at a stop');
+  finally
+    Session.Terminate;
+    Session.Free;
+  end;
+end;
+
+// Shared by the x64 and the Win32 fixture. Stops at STEPWAIT_CALL, steps over
+// the handshake call -- which cannot return until the worker thread runs -- and
+// expects the step to land on the next line well inside the fixture's own 30 s
+// wait bound. Under a step that keeps every other thread frozen, the worker
+// never signals and the step hangs for those 30 s.
+procedure RunStepOverCrossThreadWaitScenario(const ExePath, MapPath, RsmPath, SourceDir: string);
+const
+  STEP_SOURCE = 'TestTargetCore.pas';
+begin
+  var CallLine := MarkerLineIn(SourceDir + STEP_SOURCE, 'STEPWAIT_CALL');
+  var NextLine := MarkerLineIn(SourceDir + STEP_SOURCE, 'STEPWAIT_NEXT');
+  Assert.IsTrue((CallLine > 0) and (NextLine > 0), 'STEPWAIT markers not found');
+
+  var Session := OpenSessionAtMarker(ExePath, MapPath, RsmPath, SourceDir,
+    STEP_SOURCE, CallLine, '--run-step-wait');
+  try
+    Assert.AreEqual(Ord(dsStopped), Ord(Session.State), 'did not stop at STEPWAIT_CALL');
+
+    var Started := GetTickCount64;
+    Session.StepOver;
+    PumpUntilStop(Session, 8000);
+    Assert.AreEqual(Ord(dsStopped), Ord(Session.State),
+      Format('step-over of a call that waits on another thread did not complete within %d ms: ' +
+        'the worker it waits for was kept frozen for the step', [GetTickCount64 - Started]));
+
+    var Fn, Src: string;
+    var Line: Integer;
+    Assert.IsTrue(Session.GetCurrentLocation(Fn, Src, Line), 'no location after the step');
+    Assert.AreEqual(NextLine, Line, 'step-over did not land on the next line');
+  finally
+    Session.Terminate;
+    Session.Free;
+  end;
+end;
+
+procedure TDebugSessionTests.StepOver_CallWaitingOnAnotherThread_Completes;
+begin
+  RunStepOverCrossThreadWaitScenario(TargetExe, TargetMap, TargetRsm, TargetDir);
+end;
+
+// A stepped-over call that never returns (a wait nobody satisfies): Pause must
+// still produce a stop. DebugBreakProcess raises the break-in on a thread it
+// creates inside the target; if the step's freeze suspends threads born during
+// the step, that thread never runs and every Pause is silently lost.
+procedure TDebugSessionTests.Pause_DuringStepOverThatNeverReturns_BreaksIn;
+const
+  STEP_SOURCE = 'TestTargetCore.pas';
+begin
+  var ForeverLine := MarkerLine(STEP_SOURCE, 'STEPWAIT_FOREVER');
+  Assert.IsTrue(ForeverLine > 0, 'marker STEPWAIT_FOREVER not found');
+
+  var Session := OpenSessionAtMarker(TargetExe, TargetMap, TargetRsm, TargetDir,
+    STEP_SOURCE, ForeverLine, '--run-step-wait-forever');
+  try
+    Assert.AreEqual(Ord(dsStopped), Ord(Session.State), 'did not stop at STEPWAIT_FOREVER');
+
+    Session.StepOver;
+    // The call blocks: no stop arrives for as long as we care to wait.
+    PumpUntilStop(Session, 700);
+    Assert.AreEqual(Ord(dsRunning), Ord(Session.State),
+      'the fixture call returned by itself; the scenario proves nothing');
+
+    Session.Pause;
+    PumpUntilStop(Session, 8000);
+    Assert.AreEqual(Ord(dsStopped), Ord(Session.State),
+      'Pause during a step-over that never returns did not break in');
+    Assert.IsTrue(Length(Session.GetCallStack) > 0, 'the pause stop has no call stack');
   finally
     Session.Terminate;
     Session.Free;
@@ -7403,6 +7484,11 @@ begin
   finally
     Session.Free;
   end;
+end;
+
+procedure TWin32RunControlTests.Win32_StepOver_CallWaitingOnAnotherThread_Completes;
+begin
+  RunStepOverCrossThreadWaitScenario(Win32Exe, Win32Map, Win32Rsm, TargetDir);
 end;
 
 procedure TWin32RunControlTests.Win32_StepOver_AdvancesWithinTheSameFrame;
