@@ -1391,15 +1391,23 @@ the user who is debugging the contention itself wants the others to stay
 frozen -- through the custom request `delphiSetStepIsolationRelease`
 ({`enabled`?, `releaseMs`?}; no `enabled` = toggle; the reply carries the
 resulting `enabled` / `releaseMs` / `frozenPerStep` and a one-line `text`),
-wired to the command **Toggle Auto-Release of Frozen Threads** next to the
-raw-stack toggle, and through the MCP tool `set_step_isolation_release` (state
+wired to the Call Stack title-bar button next to the raw-stack toggle, and
+through the MCP tool `set_step_isolation_release` (state
 in `get_debug_session_status.stepIsolation`). OFF = `EffectiveStepReleaseMs` 0:
 `CheckStepIsolation` runs neither tier. ON = the configured threshold, or one
 given with the switch, or the default when the configuration was strict (0
 starts OFF). `stepIsolation: "none"` leaves the switch meaningless and the
 text says so. The switch is read on every probe, so turning it ON during a
 stalled strict step releases that step. `DescribeStepIsolation` (DebugSession)
-is the one sentence per state both frontends show.
+is the one sentence per state both frontends show. The button shows the state
+itself: a VS Code command has one icon and one title, so there is one command
+per state (`toggleStepIsolationRelease` while ON, unlock icon;
+`enableStepIsolationRelease` while OFF, lock icon; `stepIsolationNoneInfo`
+under "none", crossed circle), and the manifest picks the visible one by the
+context key `delphiStepAutoRelease` (`'on'` | `'off'` | `'none'`), which the
+extension's `StepIsolationTracker` publishes from the adapter's custom event
+`delphiStepIsolation` -- sent when a launch or attach succeeds and after every
+change -- and from the reply to a toggle.
 The freeze was never what scoped the LANDING: `FStepTid` does -- a transient
 step breakpoint or the step's target one-shot reached by another thread is
 stepped off and re-armed (`StepTargetHitByOtherThread` →

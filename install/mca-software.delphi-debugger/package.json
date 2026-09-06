@@ -54,9 +54,24 @@
       },
       {
         "command": "delphi-win64.toggleStepIsolationRelease",
-        "title": "Toggle Auto-Release of Frozen Threads",
+        "title": "Auto-Release of Frozen Threads: ON - a stepped-over call that waits on a frozen thread releases the others (click to keep every other thread frozen for the whole step)",
+        "shortTitle": "Auto-Release: ON",
         "category": "Delphi Debugger",
         "icon": "$(unlock)"
+      },
+      {
+        "command": "delphi-win64.enableStepIsolationRelease",
+        "title": "Auto-Release of Frozen Threads: OFF - other threads stay frozen for the whole step; Pause breaks in (click to let a deadlocked step release them)",
+        "shortTitle": "Auto-Release: OFF",
+        "category": "Delphi Debugger",
+        "icon": "$(lock)"
+      },
+      {
+        "command": "delphi-win64.stepIsolationNoneInfo",
+        "title": "Step Isolation: none - this session never freezes other threads for a step",
+        "shortTitle": "Step Isolation: none",
+        "category": "Delphi Debugger",
+        "icon": "$(circle-slash)"
       },
       {
         "command": "delphi-win64.createRuleForException",
@@ -152,7 +167,15 @@
         },
         {
           "command": "delphi-win64.toggleStepIsolationRelease",
-          "when": "(debugType == 'delphi' || debugType == 'delphi-win64')"
+          "when": "(debugType == 'delphi' || debugType == 'delphi-win64') && delphiStepAutoRelease == 'on'"
+        },
+        {
+          "command": "delphi-win64.enableStepIsolationRelease",
+          "when": "(debugType == 'delphi' || debugType == 'delphi-win64') && delphiStepAutoRelease == 'off'"
+        },
+        {
+          "command": "delphi-win64.stepIsolationNoneInfo",
+          "when": "false"
         },
         {
           "command": "delphi-win64.viewMemory",
@@ -259,7 +282,17 @@
         },
         {
           "command": "delphi-win64.toggleStepIsolationRelease",
-          "when": "view == workbench.debug.callStackView && (debugType == 'delphi' || debugType == 'delphi-win64')",
+          "when": "view == workbench.debug.callStackView && (debugType == 'delphi' || debugType == 'delphi-win64') && delphiStepAutoRelease == 'on'",
+          "group": "navigation@97"
+        },
+        {
+          "command": "delphi-win64.enableStepIsolationRelease",
+          "when": "view == workbench.debug.callStackView && (debugType == 'delphi' || debugType == 'delphi-win64') && delphiStepAutoRelease == 'off'",
+          "group": "navigation@97"
+        },
+        {
+          "command": "delphi-win64.stepIsolationNoneInfo",
+          "when": "view == workbench.debug.callStackView && (debugType == 'delphi' || debugType == 'delphi-win64') && delphiStepAutoRelease == 'none'",
           "group": "navigation@97"
         },
         {

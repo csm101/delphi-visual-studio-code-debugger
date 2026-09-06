@@ -492,6 +492,10 @@ type
     // Custom request delphiSetStepIsolationRelease: {enabled?, releaseMs?}; no
     // enabled = toggle. Replies with the resulting state and its one-line text.
     procedure HandleSetStepIsolationRelease(Seq: Integer; Args: TJSONObject);
+    // Custom event delphiStepIsolation {enabled, releaseMs, frozenPerStep, text}:
+    // the state as it stands, sent when a session starts and whenever the
+    // switch changes, so the client can show it on the button itself.
+    procedure SendStepIsolationEvent;
     // `diagnosticsLocation` -> FDiagnosticsToOutputChannel.
     procedure ParseDiagnosticsLocation(Args: TJSONObject);
     // Emits one diagnostic line to wherever diagnostics currently go.
@@ -1210,6 +1214,22 @@ begin
     Body.AddPair('frozenPerStep', TJSONBool.Create(State.FrozenPerStep));
     Body.AddPair('text', Text);
     FIO.SendResponse(Seq, 'delphiSetStepIsolationRelease', True, Body);
+  finally
+    Body.Free;
+  end;
+  SendStepIsolationEvent;
+end;
+
+procedure TDapServer.SendStepIsolationEvent;
+begin
+  var State := FSession.GetStepIsolationState;
+  var Body := TJSONObject.Create;
+  try
+    Body.AddPair('enabled', TJSONBool.Create(State.AutoRelease));
+    Body.AddPair('releaseMs', TJSONNumber.Create(State.ReleaseMs));
+    Body.AddPair('frozenPerStep', TJSONBool.Create(State.FrozenPerStep));
+    Body.AddPair('text', DescribeStepIsolation(State));
+    FIO.SendEvent('delphiStepIsolation', Body);
   finally
     Body.Free;
   end;
@@ -2498,6 +2518,7 @@ begin
     end;
   end;
   FLaunched := True;
+  SendStepIsolationEvent;
   // Addresses from a previous run mean nothing in this one (a fresh process,
   // rebased modules, a different stack), so no view carries over.
   SetLength(FMemoryViews, 0);
@@ -2596,6 +2617,7 @@ begin
   end;
   DapLog('Launch succeeded');
   FLaunched := True;
+  SendStepIsolationEvent;
   // Addresses from a previous run mean nothing in this one (a fresh process,
   // rebased modules, a different stack), so no view carries over.
   SetLength(FMemoryViews, 0);

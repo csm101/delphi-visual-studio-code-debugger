@@ -537,9 +537,10 @@ PATH or named by the `DDK_EXE` environment variable.
 | `stepIsolationReleaseMs` | `3000` | A step freezes every other thread so only the stepped one runs, stepped-over calls included. When the stepped thread waits on a lock a frozen thread holds, the others are released at once (and the debugger output says which lock); when it waits on an object nobody owns (an event, a semaphore, I/O) they are released after this many milliseconds. `0` = never release; a negative value = never freeze |
 | `stepIsolation` | `"auto"` | `"none"` never freezes other threads for a step (the RAD Studio IDE's behaviour) |
 
-The auto-release can also be switched during a session: **Toggle Auto-Release of
-Frozen Threads** sits next to *Toggle Raw Stack Scan* in the Call Stack title bar
-and in the Command Palette. OFF keeps every other thread frozen for the whole
+The auto-release can also be switched during a session: the **Auto-Release of
+Frozen Threads** button sits next to *Toggle Raw Stack Scan* in the Call Stack
+title bar (an open lock while ON, a closed lock while OFF, a crossed circle when
+the session never freezes; the hint states the state) and in the Command Palette. OFF keeps every other thread frozen for the whole
 step even if the stepped-over call waits on one of them, which is exactly what
 you want when the contention itself is the bug; Pause breaks in. The status bar
 states the behaviour selected after each toggle. The MCP tool

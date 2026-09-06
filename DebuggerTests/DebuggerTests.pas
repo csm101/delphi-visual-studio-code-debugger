@@ -5822,6 +5822,22 @@ begin
   finally
     Reply.Free;
   end;
+  // The button reads the state from an event, not from the reply it may never
+  // have seen: every change is announced as delphiStepIsolation.
+  var EventBody: TJSONObject;
+  var Announced := False;
+  var Deadline := GetTickCount64 + 3000;
+  while (not Announced) and (GetTickCount64 < Deadline) do begin
+    if not FClient.TryWaitForEvent('delphiStepIsolation', 500, EventBody) then
+      Continue;
+    try
+      Announced := (EventBody <> nil) and not EventBody.GetValue<Boolean>('enabled', True) and
+        EventBody.GetValue<Boolean>('frozenPerStep', False);
+    finally
+      EventBody.Free;
+    end;
+  end;
+  Assert.IsTrue(Announced, 'no delphiStepIsolation event announced the switch turning OFF');
   var Elapsed := StepAndMeasure;
   Assert.IsTrue(Elapsed >= 1400, Format('OFF: the step landed after %d ms; the 1.5 s wait should have run out', [Elapsed]));
   var WaitResult := GlobalValue('GStepWaitResult');

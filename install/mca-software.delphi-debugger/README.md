@@ -157,8 +157,12 @@ so the walk ends at the first routine compiled without a frame pointer. It also
 happens on 64-bit in any application assembled largely from packages that were
 not built with debug information.
 
-**Toggle Auto-Release of Frozen Threads** (the unlock icon next to it) switches
-the step-isolation deadlock detector for the rest of the session. A step keeps
+**Auto-Release of Frozen Threads** (the button next to it) switches the
+step-isolation deadlock detector for the rest of the session, and the button
+itself shows the state: an open lock while auto-release is ON, a closed lock
+while it is OFF, a crossed circle when the session never freezes threads at
+all (`stepIsolation: "none"`); its hint spells the state out and says what a
+click does. A step keeps
 every other thread frozen so only the stepped one runs; the detector releases
 them when the stepped thread is found waiting on one of them (at once when the
 lock's owner is known, after `stepIsolationReleaseMs` — 3 s by default — for a

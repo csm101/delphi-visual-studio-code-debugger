@@ -78,6 +78,10 @@ function isDelphiSession(session) {
   return !!session && DEBUG_TYPES.indexOf(session.type) !== -1;
 }
 const PROGRESS_EVENT = 'delphiProgress';
+// The step-isolation switch as the adapter reports it, and the context key the
+// Call Stack button reads to show the CURRENT state: 'on' | 'off' | 'none'.
+const STEP_ISOLATION_EVENT = 'delphiStepIsolation';
+const STEP_ISOLATION_CONTEXT_KEY = 'delphiStepAutoRelease';
 const MAX_STATUS_TEXT = 60;
 const EXCEPTION_CONTEXT_KEY = 'delphiWin64StoppedOnException';
 
@@ -187,6 +191,59 @@ async function warnAboutOldCopy(deps) {
     'Removed ' + OLD_EXTENSION_ID + '. Reload the window to finish.', reload);
   if (next === reload) vs.commands.executeCommand('workbench.action.reloadWindow');
   return true;
+}
+
+/** 'none' when this session never freezes, else 'on' / 'off' for the switch. */
+function stepIsolationContextValue(body) {
+  const b = body || {};
+  if (b.frozenPerStep === false) return 'none';
+  return b.enabled ? 'on' : 'off';
+}
+
+/**
+ * Publishes the auto-release state of the ACTIVE session as the context key
+ * the Call Stack button is chosen by: one command per state, each with its
+ * own icon and hint, so the button itself says what is selected. State comes
+ * from the adapter's delphiStepIsolation event (session start, every change)
+ * and from the reply to a toggle, never from what the client assumed.
+ */
+class StepIsolationTracker {
+  constructor(setContext) {
+    this.setContext = setContext;
+    this.states = new Map();   // sessionId -> 'on' | 'off' | 'none'
+    this.activeId = undefined;
+    this.published = undefined;
+  }
+
+  handleEvent(sessionId, body) {
+    this.states.set(sessionId, stepIsolationContextValue(body));
+    if (this.activeId === undefined) this.activeId = sessionId;
+    this.sync();
+  }
+
+  setActive(sessionId) {
+    this.activeId = sessionId;
+    this.sync();
+  }
+
+  endSession(sessionId) {
+    this.states.delete(sessionId);
+    if (this.activeId === sessionId) this.activeId = undefined;
+    this.sync();
+  }
+
+  stateFor(sessionId) {
+    return this.states.get(sessionId);
+  }
+
+  sync() {
+    let value = this.activeId !== undefined ? this.states.get(this.activeId) : undefined;
+    if (value === undefined && this.states.size === 1) value = this.states.values().next().value;
+    value = value || '';
+    if (value === this.published) return;
+    this.published = value;
+    this.setContext(value);
+  }
 }
 
 /**
@@ -711,25 +768,39 @@ function activate(context) {
   // The step-isolation deadlock detector, switched for the rest of the session.
   // A step keeps every other thread frozen; the detector releases them when the
   // stepped thread is found waiting on one of them. Someone debugging exactly
-  // that contention, one thread at a time, turns it OFF -- and the message
-  // states what is selected NOW, with Pause named as the way out of a strict
-  // step that waits forever.
+  // that contention, one thread at a time, turns it OFF -- and the button
+  // itself states what is selected NOW: one command per state (the manifest
+  // picks it by the context key), each with its own icon and hint, plus the
+  // status-bar sentence, which names Pause as the way out of a strict step
+  // that waits forever.
+  const stepIsolation = new StepIsolationTracker((value) =>
+    vscode.commands.executeCommand('setContext', STEP_ISOLATION_CONTEXT_KEY, value));
+  const toggleStepIsolationRelease = async () => {
+    const session = vscode.debug.activeDebugSession;
+    if (!isDelphiSession(session)) {
+      vscode.window.showInformationMessage(
+        'Auto-release of frozen threads applies to a running Delphi debug session.');
+      return;
+    }
+    try {
+      const reply = await session.customRequest('delphiSetStepIsolationRelease', {});
+      stepIsolation.handleEvent(session.id, reply);
+      vscode.window.setStatusBarMessage('Delphi: ' + stepIsolationReleaseText(reply), 10000);
+    } catch (err) {
+      vscode.window.showWarningMessage(
+        'Could not switch the auto-release of frozen threads: ' + (err && err.message ? err.message : String(err)));
+    }
+  };
   context.subscriptions.push(
-    vscode.commands.registerCommand('delphi-win64.toggleStepIsolationRelease', async () => {
-      const session = vscode.debug.activeDebugSession;
-      if (!isDelphiSession(session)) {
-        vscode.window.showInformationMessage(
-          'Auto-release of frozen threads applies to a running Delphi debug session.');
-        return;
-      }
-      try {
-        const reply = await session.customRequest('delphiSetStepIsolationRelease', {});
-        vscode.window.setStatusBarMessage('Delphi: ' + stepIsolationReleaseText(reply), 10000);
-      } catch (err) {
-        vscode.window.showWarningMessage(
-          'Could not switch the auto-release of frozen threads: ' + (err && err.message ? err.message : String(err)));
-      }
-    })
+    // Shown while ON (unlock icon): click to turn OFF.
+    vscode.commands.registerCommand('delphi-win64.toggleStepIsolationRelease', toggleStepIsolationRelease),
+    // Shown while OFF (lock icon): click to turn ON.
+    vscode.commands.registerCommand('delphi-win64.enableStepIsolationRelease', toggleStepIsolationRelease),
+    // Shown when this session never freezes (stepIsolation "none"): nothing to switch.
+    vscode.commands.registerCommand('delphi-win64.stepIsolationNoneInfo', () =>
+      vscode.window.showInformationMessage(stepIsolationReleaseText({ frozenPerStep: false }))),
+    vscode.debug.onDidChangeActiveDebugSession((session) =>
+      stepIsolation.setActive(session && isDelphiSession(session) ? session.id : undefined))
   );
 
   // Same language ids the breakpoint contribution uses.
@@ -759,6 +830,9 @@ function activate(context) {
           onWillReceiveMessage: (message) => exceptionStops.handleClientMessage(session.id, message),
           onDidSendMessage: (message) => {
             exceptionStops.handleAdapterMessage(session.id, message);
+            if (message && message.type === 'event' && message.event === STEP_ISOLATION_EVENT) {
+              stepIsolation.handleEvent(session.id, message.body);
+            }
             // Both are "the bytes on screen may be from before": a stop means
             // the target ran, and `memory` is the adapter reporting a write it
             // performed itself (setVariable, writeMemory).
@@ -774,8 +848,10 @@ function activate(context) {
             }
           },
           onWillStopSession: () => { exceptionStops.endSession(session.id);
+                                     stepIsolation.endSession(session.id);
                                      memoryView.closeSession(session.id); },
           onExit: () => { exceptionStops.endSession(session.id);
+                          stepIsolation.endSession(session.id);
                           memoryView.closeSession(session.id); }
         };
       }
@@ -965,5 +1041,9 @@ module.exports = {
   // Exported for tests: the hover-expression rule is plain text in, span out.
   pascalExpressionSpan: pascalExpressionSpan,
   stepIsolationReleaseText: stepIsolationReleaseText,
+  stepIsolationContextValue: stepIsolationContextValue,
+  StepIsolationTracker: StepIsolationTracker,
+  STEP_ISOLATION_EVENT: STEP_ISOLATION_EVENT,
+  STEP_ISOLATION_CONTEXT_KEY: STEP_ISOLATION_CONTEXT_KEY,
   checkForUpdate: checkForUpdate
 };
