@@ -3433,6 +3433,84 @@ is not under the roots, so each one triggers a full root scan that fails — ~1.
 across ~20 frames, repeated for every `stackTrace`. The cache makes every stop
 after the first instant.
 
+## DDK integration (project knowledge from delphi-devkit)
+
+A launch or attach needs a dozen things the debugger cannot know on its own: the
+executable — or, for a package / DLL project, the Host Application that loads
+it — the `.map` / `.rsm`, the source root and a couple of hundred search paths
+(dproj unit and include paths, the IDE's Library and Browsing Path,
+`$(BDS)\source`), the project's own `.bpl` / `.dll` with their `.map` / `.rsm`
+/ `.dcp`, and the run arguments. Two things know them: the RAD Studio plugin,
+which writes them into `launch.json`, and **delphi-devkit (DDK)**
+(`Snowcaloid.delphi-devkit`), which describes a project's *debug target* in a
+debugger-agnostic JSON:
+
+```json
+{ "project_id": 596, "project": "libAboutD29", "project_file": ".../libAboutD29.dproj",
+  "kind": "package", "executable": ".../Hydra2.exe", "host_application": ".../Hydra2.exe",
+  "platform": "Win64", "bitness": 64, "symbols": { "map": "...", "rsm": "..." },
+  "source_root": "...", "source_search_paths": [ "..." ],
+  "modules": [ { "name": "libAboutD29.bpl", "binary": "...", "map": "...", "rsm": "...", "dcp": "..." } ],
+  "args": [], "warnings": [ "..." ] }
+```
+
+Three ways to obtain it, and both frontends consume it:
+
+| Consumer | Where the target comes from | Where the mapping lives |
+|---|---|---|
+| VS Code extension, a configuration with `ddkProject` (or `delphiProjectFile` and no `program`) | the DDK extension's `ddk.debug.getDebugTarget` command when installed (activated on demand); else `ddk.exe debug-target <ref> --json`, located through `DDK_EXE`, PATH, then `%USERPROFILE%\.vscode\extensions\snowcaloid.delphi-devkit-*\server\ddk.exe`; else an error naming what to install | `ddkTarget.js`, pure `configurationFromDebugTarget(config, target)` |
+| MCP `launch_project` / `attach_to_project` | `ddk.exe`, located as above with `--ddk-exe <path>` first | `DdkTarget.pas`, `LaunchOptionsFromTarget` / `AttachOptionsFromTarget` onto the same `TLaunchOptions` / `TAttachOptions` the launch.json reader produces |
+
+DDK itself starts sessions with the two-line configuration
+`{ "type": "delphi", "request": "launch" | "attach", "ddkProject": "<name or id>" }`
+(context menu, palette, Ctrl+Alt+F9, one dynamic entry per project in the debug
+dropdown) and writes no launch.json; the extension owning the `delphi` type
+resolves it. That resolution runs in
+`resolveDebugConfigurationWithSubstitutedVariables`, AFTER VS Code's variable
+substitution, so a hand-written `ddkProject` may still use `${...}`; the attach
+picker keeps running in the first pass (`resolveDebugConfiguration`), before
+substitution, because a `${command:...}` processId must stay unexpanded there
+or it would prompt twice — and it runs again on the DDK-filled configuration,
+since DDK is what supplies `processName`.
+
+**Precedence.** A value the user wrote in the configuration is never overwritten
+by DDK's, whatever it is: `program`, `args`, `sourceSearchPaths` (an explicit
+empty array included), any of them. DDK fills only what is absent: `program` =
+`executable`; `mapFile` / `rsmFile` = `symbols`; `sourceRoot`;
+`sourceSearchPaths`; `modules` = the modules that have a `binary` (null
+sidecars omitted rather than passed as null, so the session probes next to the
+module as usual); `args`; `delphiProjectFile` = `project_file` (so
+project-scoped exception rules apply automatically, scoped to the PACKAGE
+project for a package, not to its host); for an attach, `processName` =
+basename(`executable`) and `program` = `executable`, after which the existing
+single-instance / picker semantics apply. `ddkProject` takes precedence over
+`delphiProjectFile` as the reference; the latter is passed as a path reference
+otherwise. `bitness: null` (a non-Windows platform) is a refusal carrying DDK's
+warning text; every other warning is a non-blocking notification (extension) or
+the `ddkWarnings` array in the tool reply (MCP). Errors from DDK — an ambiguous
+reference with its candidate list, an unknown project, no `ddk.exe` — are shown
+or returned verbatim, never rephrased.
+
+**The alias.** The Marketplace extension (`mca-software.delphi-debugger`)
+contributes `delphi` as the primary debug type and `delphi-win64` — the original
+name — as a second entry with the same adapter and the same attributes, so
+every existing `launch.json` and the RAD Studio plugin's output keep working
+unchanged. Both types share the adapter descriptor factory, the tracker
+factories, the configuration provider and every command; `when` clauses accept
+either. Command ids (`delphi-win64.*`) and setting keys are unchanged on
+purpose: `${command:delphi-win64.pickProcess}` is referenced from generated
+launch.json files.
+
+**The MCP server's three channels.** It ships inside the VSIX (registered with
+VS Code's MCP registry through `vscode.lm.registerMcpServerDefinitionProvider`
+under the id `delphi-debugger`, and mirrored to
+`%LOCALAPPDATA%\DelphiWin64Debugger\DelphiDebuggerMcp.exe` by a rename-then-copy
+that tolerates a running server — `mcpServer.js`), in the setup zip
+(`Setup.exe` + `register-mcp.ps1`, same folder, same name), and from source.
+The tests: `install/extension-tests/test-ddk-target.js`, `test-ddk-provider.js`,
+`test-mcp-distribution.js`; `DebuggerTests\DdkTargetTests.pas`;
+`McpE2ETests.LaunchProject_*` (a stand-in `ddk.cmd` through `--ddk-exe`).
+
 ## DAP capabilities advertised
 
 | Capability                              | Value |

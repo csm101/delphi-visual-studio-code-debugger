@@ -187,6 +187,28 @@ module you are standing in carries debug information at all.
 
 ## Implemented features
 
+Project knowledge from delphi-devkit (DDK):
+- **A configuration names a DDK project and nothing else** (`ddkProject`, or
+  `delphiProjectFile` without `program`). The extension's configuration
+  provider (after variable substitution) obtains the debug target from the DDK
+  extension's command, else from `ddk.exe` (`DDK_EXE`, PATH, the packaged
+  extension's bundled copy), and fills `program` (the Host Application for a
+  package / DLL), `mapFile` / `rsmFile`, `sourceRoot`, `sourceSearchPaths`,
+  `modules` (only those with a binary), `args`, `delphiProjectFile`, and for
+  an attach `processName` (then the existing picker). A value the user wrote is
+  never overwritten; a non-Windows target is refused with DDK's warning text;
+  other warnings are notifications. Pure mapping in `ddkTarget.js`, tested in
+  `install/extension-tests/test-ddk-target.js`; the provider and the old-copy
+  warning in `test-ddk-provider.js`.
+- **MCP `launch_project` / `attach_to_project`** run `ddk.exe debug-target`
+  and map the reply through `MCPDebugger\DdkTarget.pas` onto the same
+  `TLaunchOptions` / `TAttachOptions` the launch.json reader produces
+  (`DdkTargetTests.pas` on the fixture; `McpE2ETests.LaunchProject_*` end to
+  end through a stand-in `ddk.cmd` named with `--ddk-exe`). DDK's warnings ride
+  in the reply as `ddkWarnings`; DDK's errors are the tool error verbatim.
+  Project-scoped exception rules are not applied on the MCP side (the rule-file
+  loader lives in the DAP adapter; the MCP server has never read rule files).
+
 Target architecture:
 - **Win32 (32-bit / WOW64) targets — SHIPPED.** One 64-bit adapter binary
   debugs both bitnesses; a 64-bit process can debug a 32-bit one, and the
@@ -602,7 +624,21 @@ by RSM's name-keyed format (see `KNOWN_UNKNOWNS.md`).
 ## Open milestones (roadmap)
 
 Integration with delphi-devkit (DDK), in this order:
-- **DDK as the source of project knowledge (NEXT).** Proposal posted on issue #1
+- **DDK as the source of project knowledge — debugger half DONE (2026-09-06,
+  branch `feat/ddk-integration`); the DDK half is on DDK's `feat/debug-target`
+  branch, going upstream as a pull request.** What landed here: the
+  extension is `mca-software.delphi-debugger` on the Marketplace with the
+  `delphi` debug type (`delphi-win64` kept as an alias); `ddkProject` in a
+  configuration is resolved through DDK's `ddk.debug.getDebugTarget` command
+  or `ddk.exe debug-target --json` (`ddkTarget.js`, never overwriting what the
+  user wrote); the MCP server has `launch_project` / `attach_to_project` on
+  the same target (`DdkTarget.pas`, `--ddk-exe`); the MCP server ships in the
+  VSIX, is registered with VS Code's MCP registry, mirrored to
+  `%LOCALAPPDATA%\DelphiWin64Debugger` and registered with Claude Code on
+  command, under the name `delphi-debugger`. Remaining: **WinGet** — a
+  stable, on-PATH install of adapter + MCP server for machines without the
+  Marketplace — once the first Marketplace release is out. The original plan,
+  for the record: proposal posted on issue #1
   of this repository (2026-09-05). DDK grows a neutral, debugger-agnostic
   "debug target" query (CLI `--json` / MCP / LSP / VS Code command): project file,
   kind, executable or host application, config / platform / bitness,
@@ -1508,7 +1544,17 @@ by `DAP_LOG=1` in the environment. One previous generation is kept beside it as
   it** — it shares no ancestor with anything public). It exists on one disk
   only; back it up with `git bundle` rather than trusting the branch.
 - **The extension manifest version is the single place the release script reads.**
-- **The debug type id `delphi-win64` and every extension command id are
-  deliberately unchanged despite Win32 support**: renaming them breaks every
-  existing `launch.json`. Only the diagnostics output channel was renamed
-  (`Delphi Debug` -> `Delphi Debugger`) to match the command category.
+- **The debug type is `delphi` since the Marketplace release; `delphi-win64` is
+  an alias with identical attributes and is never removed**: renaming it breaks
+  every existing `launch.json` and the RAD Studio plugin's output. The
+  extension command ids (`delphi-win64.*`) and setting keys stay as they are
+  for the same reason (`${command:delphi-win64.pickProcess}` is referenced
+  from generated launch.json files). Only the diagnostics output channel was
+  renamed (`Delphi Debug` -> `Delphi Debugger`) to match the command category.
+- **The extension id is `mca-software.delphi-debugger`; the old sideloaded id
+  `local.delphi-win64-debug` must never be installed beside it** (two
+  contributors of one debug type make VS Code ask at every session start).
+  The extension warns and offers the removal; `Install.exe` uninstalls it.
+- **The MCP server's registered name is `delphi-debugger`** in every channel
+  (extension command, `register-mcp.ps1`, VS Code's MCP registry); the old
+  `delphi-win64-debugger` registration is removed by each of them.
