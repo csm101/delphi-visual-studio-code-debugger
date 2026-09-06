@@ -42,6 +42,9 @@ if errorlevel 1 (
 
 set DIST=%REPO%\dist
 set STAGE=%DIST%\delphi-win64-debugger-setup
+set VER=
+for /f "usebackq delims=" %%V in (`powershell -NoProfile -Command "(Get-Content -Raw '%REPO%\install\mca-software.delphi-debugger\package.json' | ConvertFrom-Json).version"`) do set VER=%%V
+if "%VER%"=="" set VER=0.0.0
 if exist "%STAGE%" rmdir /s /q "%STAGE%"
 mkdir "%STAGE%"
 
@@ -56,7 +59,9 @@ if errorlevel 1 (
   exit /b 1
 )
 copy /Y "%REPO%\install\INSTALL_INSTRUCTIONS.md" "%STAGE%\INSTALL_INSTRUCTIONS.md" >nul
-if exist "%DIST%\mca-software.delphi-debugger-*.vsix" copy /Y "%DIST%\mca-software.delphi-debugger-*.vsix" "%STAGE%\" >nul
+rem Only THIS version's VSIX: a leftover from an earlier build in dist\ must not
+rem ride along, or Setup.exe has two to choose from.
+if exist "%DIST%\mca-software.delphi-debugger-%VER%.vsix" copy /Y "%DIST%\mca-software.delphi-debugger-%VER%.vsix" "%STAGE%\" >nul
 
 rem MCP server exe + its registration script (Setup.exe installs + registers them).
 copy /Y "%REPO%\MCPDebugger\Win64\Debug\DelphiDebuggerMcp.exe" "%STAGE%\DelphiDebuggerMcp.exe" >nul
@@ -81,9 +86,6 @@ if exist "%REPO%\ThirdParty\Zydis\bin\x64\Zydis.dll" (
 
 echo.
 echo === [3/3] Compress to zip ===
-set VER=
-for /f "usebackq delims=" %%V in (`powershell -NoProfile -Command "(Get-Content -Raw '%REPO%\install\mca-software.delphi-debugger\package.json' | ConvertFrom-Json).version"`) do set VER=%%V
-if "%VER%"=="" set VER=0.0.0
 set ZIP=%DIST%\delphi-win64-debugger-setup-v%VER%.zip
 if exist "%ZIP%" del /q "%ZIP%"
 powershell -NoProfile -Command "Compress-Archive -Path '%STAGE%\*' -DestinationPath '%ZIP%' -Force"
