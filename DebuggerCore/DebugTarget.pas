@@ -715,6 +715,10 @@ type
     // Exception-filter UI: which categories of debuggee exceptions surface
     // as user-visible stops. Default is DEFAULT_EXCEPTION_FILTERS.
     procedure SetExceptionFilters(Filters: TExceptionFilters);
+    // Step isolation: how long a step may keep every other thread frozen while
+    // the stepped thread sits in a wait with no owner the debugger can see.
+    // 0 = never release; STEP_ISOLATION_NONE = never freeze at all.
+    procedure SetStepIsolation(ReleaseMs: Integer);
     // Per-class refinement of the `delphi` filter. When non-empty, a
     // first-chance Delphi raise only stops if the raised class name (read
     // via the standard EObject.ClassName lookup) appears in this comma-
@@ -748,6 +752,10 @@ type
     procedure SetOnExited(const Value: TOnExited);
     function  GetOnOutput: TOnOutput;
     procedure SetOnOutput(const Value: TOnOutput);
+    // Lines the DEBUGGER says about itself (a step's isolation released, ...),
+    // as opposed to OnOutput, which carries the debuggee's output.
+    function  GetOnNotice: TOnOutput;
+    procedure SetOnNotice(const Value: TOnOutput);
     function  GetOnDllLoaded: TOnDllLoaded;
     procedure SetOnDllLoaded(const Value: TOnDllLoaded);
     function  GetOnDllUnloaded: TOnDllUnloaded;
@@ -758,6 +766,7 @@ type
     property OnStopped:     TOnStopped     read GetOnStopped     write SetOnStopped;
     property OnExited:      TOnExited      read GetOnExited      write SetOnExited;
     property OnOutput:      TOnOutput      read GetOnOutput      write SetOnOutput;
+    property OnNotice:      TOnOutput      read GetOnNotice      write SetOnNotice;
     property OnDllLoaded:   TOnDllLoaded   read GetOnDllLoaded   write SetOnDllLoaded;
     property OnDllUnloaded: TOnDllUnloaded read GetOnDllUnloaded write SetOnDllUnloaded;
     property OnBpHit:       TOnBpHit       read GetOnBpHit       write SetOnBpHit;

@@ -193,6 +193,7 @@ type
                 out IntResult, FloatResultLow: UInt64): Boolean;
     function  LookupEnumInfo(const TypeName: string; out Info: TRsmEnumInfo): Boolean;
     procedure SetExceptionFilters(Filters: TExceptionFilters);
+    procedure SetStepIsolation(ReleaseMs: Integer);
     procedure SetDelphiClassFilter(const ClassNames: string);
     procedure SetExceptionRules(const Rules: TArray<TExceptionRule>);
     procedure Launch(const ExePath: string; StopAtEntry: Boolean);
@@ -206,6 +207,8 @@ type
     procedure SetOnExited(const Value: TOnExited);
     function  GetOnOutput: TOnOutput;
     procedure SetOnOutput(const Value: TOnOutput);
+    function  GetOnNotice: TOnOutput;
+    procedure SetOnNotice(const Value: TOnOutput);
     function  GetOnDllLoaded: TOnDllLoaded;
     procedure SetOnDllLoaded(const Value: TOnDllLoaded);
     function  GetOnDllUnloaded: TOnDllUnloaded;
@@ -383,6 +386,7 @@ begin
   if Result then Info := FEnumInfo;
 end;
 procedure TFakeMemTarget.SetExceptionFilters(Filters: TExceptionFilters); begin end;
+procedure TFakeMemTarget.SetStepIsolation(ReleaseMs: Integer); begin end;
 procedure TFakeMemTarget.SetDelphiClassFilter(const ClassNames: string); begin end;
 procedure TFakeMemTarget.SetExceptionRules(const Rules: TArray<TExceptionRule>); begin end;
 procedure TFakeMemTarget.Launch(const ExePath: string; StopAtEntry: Boolean); begin end;
@@ -396,6 +400,8 @@ function  TFakeMemTarget.GetOnExited: TOnExited; begin Result := FOnExited; end;
 procedure TFakeMemTarget.SetOnExited(const Value: TOnExited); begin FOnExited := Value; end;
 function  TFakeMemTarget.GetOnOutput: TOnOutput; begin Result := FOnOutput; end;
 procedure TFakeMemTarget.SetOnOutput(const Value: TOnOutput); begin FOnOutput := Value; end;
+function  TFakeMemTarget.GetOnNotice: TOnOutput; begin Result := nil; end;
+procedure TFakeMemTarget.SetOnNotice(const Value: TOnOutput); begin end;
 function  TFakeMemTarget.GetOnDllLoaded: TOnDllLoaded; begin Result := FOnDllLoaded; end;
 procedure TFakeMemTarget.SetOnDllLoaded(const Value: TOnDllLoaded); begin FOnDllLoaded := Value; end;
 function  TFakeMemTarget.GetOnDllUnloaded: TOnDllUnloaded; begin Result := FOnDllUnloaded; end;

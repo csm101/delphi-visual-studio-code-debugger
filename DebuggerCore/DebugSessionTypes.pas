@@ -427,6 +427,9 @@ type
     ExceptionFilters:    TExceptionFilters;
     ExceptionFiltersSet: Boolean;
     DelphiClassFilter:   string;
+    // Step isolation (see ResolveStepIsolation): applied only when Set.
+    StepIsolationReleaseMs: Integer;
+    StepIsolationSet:       Boolean;
   end;
 
   TAttachOptions = record
@@ -440,8 +443,30 @@ type
     ExceptionFilters:    TExceptionFilters;
     ExceptionFiltersSet: Boolean;
     DelphiClassFilter:   string;
+    StepIsolationReleaseMs: Integer;
+    StepIsolationSet:       Boolean;
   end;
 
+const
+  // How long a stepped-over call may sit in a kernel wait with no owner the
+  // debugger can see before the other threads are released (see the engine's
+  // step isolation). Deliberately high: a stepped-over call may legitimately
+  // wait on a slow external event, and releasing early makes "one thread at a
+  // time" untrue for ordinary steps.
+  DEFAULT_STEP_ISOLATION_RELEASE_MS = 3000;
+  // The value that means "never freeze other threads for a step".
+  STEP_ISOLATION_NONE = -1;
+
+// The two spellings a client may use, resolved into one number: the release
+// threshold in ms (0 = never release, strict isolation), or STEP_ISOLATION_NONE
+// (never freeze, the IDE's behaviour). Mode is the stepIsolation attribute
+// ("auto" | "none" | ''), ReleaseMs the stepIsolationReleaseMs attribute when
+// HasReleaseMs. Returns False when neither was given, so the engine default
+// stays in force.
+function ResolveStepIsolation(const Mode: string; HasReleaseMs: Boolean;
+  ReleaseMs: Integer; out Setting: Integer): Boolean;
+
+type
   TBpLineSpec = record
     Line:         Integer;
     Condition:    string;
@@ -450,5 +475,26 @@ type
   end;
 
 implementation
+
+uses
+  System.SysUtils;
+
+function ResolveStepIsolation(const Mode: string; HasReleaseMs: Boolean;
+  ReleaseMs: Integer; out Setting: Integer): Boolean;
+begin
+  Setting := DEFAULT_STEP_ISOLATION_RELEASE_MS;
+  if SameText(Trim(Mode), 'none') then begin
+    Setting := STEP_ISOLATION_NONE;
+    Exit(True);
+  end;
+  if HasReleaseMs then begin
+    if ReleaseMs < 0 then
+      Setting := STEP_ISOLATION_NONE
+    else
+      Setting := ReleaseMs;
+    Exit(True);
+  end;
+  Result := False;
+end;
 
 end.

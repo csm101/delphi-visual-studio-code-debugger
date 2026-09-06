@@ -120,6 +120,8 @@ begin
      Prop('sourceRoot', 'string', 'Primary root directory to resolve source files against.'),
      ArrayProp('sourceSearchPaths', 'Additional source roots (array of paths; each may be ;-separated and use ${env:VAR}). Searched when a file is not under sourceRoot.', ItemsOfType('string')),
      Prop('workspaceFolder', 'string', 'Base for resolving ${workspaceFolder} in the paths above.'),
+     Prop('stepIsolationReleaseMs', 'integer', 'Step isolation: how long (ms) a step may keep every other thread frozen while the stepped thread waits on an object with no owner (an event, a semaphore, I/O) before the others are released; a wait on a lock a frozen thread holds is released at once. Default 3000. 0 = never release (strict); negative = never freeze.'),
+     Prop('stepIsolation', 'string', '"auto" (default: freeze other threads for each step, release on a detected deadlock) or "none" (never freeze; the IDE''s behaviour).'),
      ArrayProp('exceptionFilters', 'Which exceptions break: any of "delphi" (first-chance Delphi raises), "av" (access violations), "all" (every first-chance), "unhandled" (second-chance). Omit for the default [delphi, av, unhandled]; pass [] or e.g. ["unhandled"] to stop breaking on first-chance exceptions in a noisy app.', ItemsOfType('string')),
      Prop('delphiExceptionClasses', 'string', 'Comma/semicolon-separated class names to narrow the "delphi" filter (e.g. "EAccessViolation, EConvertError"). Empty = all Delphi raises.'),
      Prop('stopAtEntry', 'boolean', 'Stop at the program entry point instead of running to the first breakpoint.')]));
@@ -146,6 +148,8 @@ begin
      Prop('sourceRoot', 'string', 'Primary root directory to resolve source files against.'),
      ArrayProp('sourceSearchPaths', 'Additional source roots (array of paths; each may be ;-separated and use ${env:VAR}).', ItemsOfType('string')),
      Prop('workspaceFolder', 'string', 'Base for resolving ${workspaceFolder} in the paths above.'),
+     Prop('stepIsolationReleaseMs', 'integer', 'Step isolation: how long (ms) a step may keep every other thread frozen while the stepped thread waits on an object with no owner (an event, a semaphore, I/O) before the others are released; a wait on a lock a frozen thread holds is released at once. Default 3000. 0 = never release (strict); negative = never freeze.'),
+     Prop('stepIsolation', 'string', '"auto" (default: freeze other threads for each step, release on a detected deadlock) or "none" (never freeze; the IDE''s behaviour).'),
      Prop('killOnDetach', 'boolean', 'If true, terminate the target when the debug session ends; default false (leave it running).')]));
 
   Result.Add(MakeTool('launch_project',
@@ -162,6 +166,8 @@ begin
      Prop('compiler', 'string', 'Compiler configuration for an ad-hoc project path: a key like "12.0" or a product name like "Delphi 12". Ignored for a managed project.'),
      Prop('args', 'string', 'Command-line arguments for the target, overriding the run parameters DDK reports (dproj Debugger_RunParams fused with DDK Start Parameters).'),
      Prop('stopAtEntry', 'boolean', 'Accepted for compatibility; the launch always stops at entry.'),
+     Prop('stepIsolationReleaseMs', 'integer', 'Step isolation: how long (ms) a step may keep every other thread frozen while the stepped thread waits on an object with no owner (an event, a semaphore, I/O) before the others are released; a wait on a lock a frozen thread holds is released at once. Default 3000. 0 = never release (strict); negative = never freeze.'),
+     Prop('stepIsolation', 'string', '"auto" (default: freeze other threads for each step, release on a detected deadlock) or "none" (never freeze; the IDE''s behaviour).'),
      ArrayProp('exceptionFilters', 'Exception filter ids to enable, as in launch_debuggee.', ItemsOfType('string')),
      Prop('delphiExceptionClasses', 'string', 'Delphi exception class filter, as in launch_debuggee.')]));
 
@@ -175,6 +181,8 @@ begin
     [Prop('project', 'string', 'DDK project reference: a project id, a project name, or a path to a .dproj/.dpr/.dpk.', True),
      Prop('compiler', 'string', 'Compiler configuration for an ad-hoc project path (see launch_project).'),
      Prop('processId', 'integer', 'PID to attach to when several instances of the executable are running.'),
+     Prop('stepIsolationReleaseMs', 'integer', 'Step isolation: how long (ms) a step may keep every other thread frozen while the stepped thread waits on an object with no owner (an event, a semaphore, I/O) before the others are released; a wait on a lock a frozen thread holds is released at once. Default 3000. 0 = never release (strict); negative = never freeze.'),
+     Prop('stepIsolation', 'string', '"auto" (default: freeze other threads for each step, release on a detected deadlock) or "none" (never freeze; the IDE''s behaviour).'),
      Prop('killOnDetach', 'boolean', 'If true, terminate the target when the debug session ends; default false (leave it running).')]));
 
   Result.Add(MakeTool('attach_from_config',

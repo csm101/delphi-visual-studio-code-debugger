@@ -295,6 +295,8 @@ Press `F5`. Set breakpoints in the gutter of any `.pas` file.
 | `sourceRoot` | Root directory for source-file lookup |
 | `sourceSearchPaths` | Extra directories (searched two levels deep) for units outside the project — typically the Delphi source tree, e.g. `"${env:BDS}/source"`. If `BDS` is set, its `source` subdirectory is searched automatically |
 | `stopAtEntry` | Break at the process entry point. Default `false` |
+| `stepIsolationReleaseMs` | A step freezes every other thread so only the stepped one runs, stepped-over calls included. When the stepped thread waits on a lock a frozen thread holds, the others are released at once (the debugger output names the lock); when it waits on an object nobody owns (an event, a semaphore, I/O), they are released after this many milliseconds. Default `3000`. `0` = never release; a negative value = never freeze |
+| `stepIsolation` | `"auto"` (default) or `"none"`: never freeze other threads for a step, the RAD Studio IDE's behaviour |
 | `modules` | Pre-bind debug info for DLLs/BPLs — see below |
 | `progressLocation` | `statusBar` (default) or `notification` |
 | `diagnosticLog` | Write a verbose adapter log to `%TEMP%\dap_adapter.log`. Default `false` |

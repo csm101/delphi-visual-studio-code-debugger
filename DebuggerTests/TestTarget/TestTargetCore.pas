@@ -493,6 +493,16 @@ var
   GStepWaitGo:    THandle;   // set by the main thread: the worker may proceed
   GStepWaitDone:  THandle;   // set by the worker: the stepped-over call may return
   GStepWaitNever: THandle;   // never set: a call that blocks until the debugger pauses
+  GStepWaitBound: DWORD;     // the handshake's wait bound (30 s; 1.5 s with --run-step-wait-bounded)
+  GStepWaitResult: DWORD;    // what the stepped-over call's wait returned (WAIT_TIMEOUT = the worker never ran)
+  // Step isolation across a CPU-bound callee (see RunStepCpuFixture): a
+  // spinner thread that would advance if the step released it.
+  GStepCpuSpin: Int64;
+  GStepCpuStop: Boolean;
+  // Step across a call blocked on a critical section a WORKER holds (see
+  // RunStepCsFixture): the case Wait Chain Traversal can name.
+  GStepCs:      TRTLCriticalSection;
+  GStepCsReady: THandle;
   // Hardware-watchpoint fixture (see RunDataBpStepFixture). Integer, so the
   // cell is 4 bytes and naturally 4-aligned -- the alignment a debug register
   // requires, and the reason not to make it a Boolean or an Int64.
@@ -2145,7 +2155,7 @@ end;
 procedure StepWaitHandshake;
 begin
   SetEvent(GStepWaitGo);
-  WaitForSingleObject(GStepWaitDone, 30000);
+  GStepWaitResult := WaitForSingleObject(GStepWaitDone, GStepWaitBound);
 end;
 
 procedure StepWaitForever;
@@ -2159,6 +2169,9 @@ var
   IdW: DWORD;
 begin
   NameCurrentThread('StepWaitMain');
+  GStepWaitBound := 30000;
+  if FindCmdLineSwitch('run-step-wait-bounded') or FindCmdLineSwitch('-run-step-wait-bounded') then
+    GStepWaitBound := 1500;
   GStepWaitGo    := CreateEvent(nil, True, False, nil);
   GStepWaitDone  := CreateEvent(nil, True, False, nil);
   GStepWaitNever := CreateEvent(nil, True, False, nil);
@@ -2174,6 +2187,89 @@ begin
   CloseHandle(GStepWaitGo);
   CloseHandle(GStepWaitDone);
   CloseHandle(GStepWaitNever);
+end;
+
+// --- Step isolation across a CPU-bound callee ---------------------------------
+// The stepped-over call burns CPU for 1.5 s while a spinner thread increments
+// its counter whenever it is allowed to run. With isolation, the counter must
+// not move across the step -- the callee is busy, not waiting, so nothing may
+// release the other threads; without isolation ("none") it must.
+
+function StepCpuSpinner(Param: Pointer): DWORD; stdcall;
+begin
+  NameCurrentThread('StepCpuSpinner');
+  while not GStepCpuStop do
+    Inc(GStepCpuSpin);
+  Result := 0;
+end;
+
+procedure StepCpuBurn;
+begin
+  var Until_ := GetTickCount64 + 1500;
+  var X: Int64 := 0;
+  while GetTickCount64 < Until_ do
+    Inc(X);
+  GSink.Use([X]);
+end;
+
+procedure RunStepCpuFixture;
+var
+  HS: THandle;
+  IdS: DWORD;
+begin
+  NameCurrentThread('StepCpuMain');
+  GStepCpuStop := False;
+  GStepCpuSpin := 0;
+  HS := CreateThread(nil, 0, @StepCpuSpinner, nil, 0, IdS);
+  Sleep(100);                                  // the spinner is inside its loop
+  GSink.Use(['step-cpu ready ', GStepCpuSpin]); // {BP:STEPCPU_MAIN}
+  StepCpuBurn;                                 // {BP:STEPCPU_CALL}
+  GSink.Use(['step-cpu done ', GStepCpuSpin]);  // {BP:STEPCPU_NEXT}
+  GStepCpuStop := True;
+  WaitForSingleObject(HS, 5000);
+  CloseHandle(HS);
+end;
+
+// --- Step across a call blocked on a critical section a worker holds ---------
+// The worker takes the critical section, signals that it holds it, keeps it
+// for 2.5 s and releases it. The main thread's stepped-over call then blocks in
+// EnterCriticalSection: a wait whose OWNER the OS can name, which is what Wait
+// Chain Traversal reports -- the debugger must release the frozen worker at
+// once, not after its timer, and say which lock it was.
+
+function StepCsHolder(Param: Pointer): DWORD; stdcall;
+begin
+  NameCurrentThread('StepCsHolder');
+  EnterCriticalSection(GStepCs);
+  SetEvent(GStepCsReady);
+  Sleep(2500);
+  LeaveCriticalSection(GStepCs);
+  Result := 0;
+end;
+
+procedure StepEnterHeldCs;
+begin
+  EnterCriticalSection(GStepCs);
+  LeaveCriticalSection(GStepCs);
+end;
+
+procedure RunStepCsFixture;
+var
+  HH: THandle;
+  IdH: DWORD;
+begin
+  NameCurrentThread('StepCsMain');
+  InitializeCriticalSection(GStepCs);
+  GStepCsReady := CreateEvent(nil, True, False, nil);
+  HH := CreateThread(nil, 0, @StepCsHolder, nil, 0, IdH);
+  WaitForSingleObject(GStepCsReady, 5000);     // the holder owns the section
+  GSink.Use(['step-cs ready']);                // {BP:STEPCS_MAIN}
+  StepEnterHeldCs;                             // {BP:STEPCS_CALL}
+  GSink.Use(['step-cs done']);                 // {BP:STEPCS_NEXT}
+  WaitForSingleObject(HH, 5000);
+  CloseHandle(HH);
+  CloseHandle(GStepCsReady);
+  DeleteCriticalSection(GStepCs);
 end;
 
 // Two worker threads spin incrementing their OWN counter until GStepIsoStop.
@@ -2501,8 +2597,15 @@ begin
     RunPerThreadStepFixture;
 
   if FindCmdLineSwitch('run-step-wait') or FindCmdLineSwitch('-run-step-wait') or
-     FindCmdLineSwitch('run-step-wait-forever') or FindCmdLineSwitch('-run-step-wait-forever') then
+     FindCmdLineSwitch('run-step-wait-forever') or FindCmdLineSwitch('-run-step-wait-forever') or
+     FindCmdLineSwitch('run-step-wait-bounded') or FindCmdLineSwitch('-run-step-wait-bounded') then
     RunStepWaitFixture;
+
+  if FindCmdLineSwitch('run-step-cpu') or FindCmdLineSwitch('-run-step-cpu') then
+    RunStepCpuFixture;
+
+  if FindCmdLineSwitch('run-step-cs') or FindCmdLineSwitch('-run-step-cs') then
+    RunStepCsFixture;
 
   if FindCmdLineSwitch('run-databp-step') or FindCmdLineSwitch('-run-databp-step') then
     RunDataBpStepFixture;

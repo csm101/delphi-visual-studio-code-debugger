@@ -315,6 +315,7 @@ type
                 SourceLine: Integer);
     procedure HandleTargetExited(ExitCode: Integer);
     procedure HandleTargetOutput(const Text: string);
+    procedure HandleEngineNotice(const Text: string);
     function  HandleBpHit(const BP: TBreakpointRec): Boolean;
     procedure HandleDllLoaded(const Name, Path: string; Base, ImageSize: UInt64);
     procedure HandleDllUnloaded(const Name: string; Base: UInt64);
@@ -940,6 +941,7 @@ begin
   FDebugger.OnStopped     := HandleTargetStopped;
   FDebugger.OnExited      := HandleTargetExited;
   FDebugger.OnOutput      := HandleTargetOutput;
+  FDebugger.OnNotice      := HandleEngineNotice;
   FDebugger.OnBpHit       := HandleBpHit;
   FDebugger.OnDllLoaded   := HandleDllLoaded;
   FDebugger.OnDllUnloaded := HandleDllUnloaded;
@@ -984,6 +986,8 @@ begin
   BuildAndWireDebugger(PreferredBase);
   ApplyExceptionConfig(Opts.ExceptionFiltersSet, Opts.ExceptionFilters,
     Opts.DelphiClassFilter, Opts.ExceptionRules);
+  if Opts.StepIsolationSet then
+    FDebugger.SetStepIsolation(Opts.StepIsolationReleaseMs);
 
   var CmdLine := '"' + FExePath + '"';
   if Opts.Args <> '' then
@@ -1028,6 +1032,8 @@ begin
   BuildAndWireDebugger(ReadPEPreferredBase(FExePath));
   ApplyExceptionConfig(Opts.ExceptionFiltersSet, Opts.ExceptionFilters,
     Opts.DelphiClassFilter, Opts.ExceptionRules);
+  if Opts.StepIsolationSet then
+    FDebugger.SetStepIsolation(Opts.StepIsolationReleaseMs);
   try
     FDebugger.Attach(Pid, KillOnDetach);
   except
@@ -2196,6 +2202,15 @@ begin
   FDebuggeeOutput.Add(Text);
   if Assigned(FOnOutput) then
     FOnOutput(okDebuggee, Text);
+end;
+
+// What the engine says about itself (a step's isolation released, ...): the
+// debugger's own output, never the program's.
+procedure TDebugSession.HandleEngineNotice(const Text: string);
+begin
+  FDebuggerOutput.Add(Text);
+  if Assigned(FOnOutput) then
+    FOnOutput(okNotice, Text);
 end;
 
 // Called by the engine when a planted breakpoint fires. Delegates the condition /

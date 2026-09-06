@@ -493,6 +493,16 @@ type
     // stepped-over call never returns, Pause must still break in.
     [Test] procedure StepOver_CallWaitingOnAnotherThread_Completes;
     [Test] procedure Pause_DuringStepOverThatNeverReturns_BreaksIn;
+    // Step isolation holds across the stepped-over call by default: a busy
+    // callee keeps the other threads frozen for its whole duration, a callee
+    // blocked on a lock a frozen thread holds is released at once by Wait Chain
+    // Traversal (and the log names the lock), 0 never releases, "none" never
+    // freezes. The attribute resolution is pure and pinned separately.
+    [Test] procedure StepOver_CpuBoundCallee_KeepsOtherThreadsFrozen;
+    [Test] procedure StepOver_CalleeBlockedOnHeldCriticalSection_ReleasedByWaitChain;
+    [Test] procedure StepOver_StrictIsolation_NeverReleases;
+    [Test] procedure StepOver_IsolationNone_NeverFreezes;
+    [Test] procedure StepIsolation_AttributeResolution;
     // Hardware watchpoints share the single-step exception with the stepping
     // engine; these pin both directions of telling them apart. See the shared
     // scenario helpers for what each one exercises.
@@ -765,10 +775,16 @@ end;
 // session reports a stop (event-driven; the per-event 10 ms wait paces it -- no
 // arbitrary sleeps). Bounded by a wall-clock deadline so a hang fails the test
 // rather than blocking forever. The caller owns Session.Free.
+const
+  // OpenSessionAtMarker's "leave the engine default alone" value for the step
+  // isolation threshold (a real setting is >= -1).
+  STEP_ISOLATION_UNSET = Low(Integer);
+
 function OpenSessionAtMarker(const ExePath, MapPath, RsmPath, SourceRoot,
   SourceBaseName: string; Line: Integer;
   const TargetArgs: string = '';
-  SilenceExceptionFilters: Boolean = False): TDebugSession;
+  SilenceExceptionFilters: Boolean = False;
+  StepIsolationReleaseMs: Integer = STEP_ISOLATION_UNSET): TDebugSession;
 begin
   Result := TDebugSession.Create;
   var Opts: TLaunchOptions;
@@ -778,6 +794,10 @@ begin
   Opts.RsmPath     := RsmPath;
   Opts.SourceRoot  := SourceRoot;
   Opts.StopAtEntry := False;
+  if StepIsolationReleaseMs <> STEP_ISOLATION_UNSET then begin
+    Opts.StepIsolationSet       := True;
+    Opts.StepIsolationReleaseMs := StepIsolationReleaseMs;
+  end;
   // Several TestTarget scenarios only run behind a command-line switch, so
   // without this a breakpoint inside one verifies and then never hits.
   Opts.Args        := TargetArgs;
@@ -3088,39 +3108,241 @@ begin
   end;
 end;
 
+// The integer value of a global as the debugger renders it (digits only, so a
+// decorated display such as "5  (0x5)" reads as 5).
+function EvalGlobalInt(Session: TDebugSession; const Expr: string): Int64;
+begin
+  var R := Session.Evaluate(Expr);
+  Assert.IsTrue(R.Success, Format('evaluate %s failed: %s', [Expr, R.ErrorText]));
+  var Digits := '';
+  for var Ch in R.Value do
+    if CharInSet(Ch, ['0'..'9']) then
+      Digits := Digits + Ch
+    else if Digits <> '' then
+      Break;
+  Assert.IsTrue(Digits <> '', 'no number in the value of ' + Expr + ': ' + R.Value);
+  Result := StrToInt64(Digits);
+end;
+
+function JoinedDebuggerOutput(Session: TDebugSession): string;
+begin
+  Result := string.Join(sLineBreak, Session.DrainDebuggerOutput);
+end;
+
 // Shared by the x64 and the Win32 fixture. Stops at STEPWAIT_CALL, steps over
 // the handshake call -- which cannot return until the worker thread runs -- and
 // expects the step to land on the next line well inside the fixture's own 30 s
-// wait bound. Under a step that keeps every other thread frozen, the worker
-// never signals and the step hangs for those 30 s.
+// wait bound. The handshake waits on an EVENT, an object with no owner the OS
+// can name, so the only thing that can release the frozen worker is the
+// wait-state timer: configured short here (300 ms), and the step must take at
+// least that long -- an earlier release would mean the isolation was given up
+// before the threshold.
 procedure RunStepOverCrossThreadWaitScenario(const ExePath, MapPath, RsmPath, SourceDir: string);
 const
   STEP_SOURCE = 'TestTargetCore.pas';
+  RELEASE_MS  = 300;
 begin
   var CallLine := MarkerLineIn(SourceDir + STEP_SOURCE, 'STEPWAIT_CALL');
   var NextLine := MarkerLineIn(SourceDir + STEP_SOURCE, 'STEPWAIT_NEXT');
   Assert.IsTrue((CallLine > 0) and (NextLine > 0), 'STEPWAIT markers not found');
 
   var Session := OpenSessionAtMarker(ExePath, MapPath, RsmPath, SourceDir,
-    STEP_SOURCE, CallLine, '--run-step-wait');
+    STEP_SOURCE, CallLine, '--run-step-wait', False, RELEASE_MS);
   try
     Assert.AreEqual(Ord(dsStopped), Ord(Session.State), 'did not stop at STEPWAIT_CALL');
+    Session.DrainDebuggerOutput;
 
     var Started := GetTickCount64;
     Session.StepOver;
     PumpUntilStop(Session, 8000);
+    var Elapsed := GetTickCount64 - Started;
     Assert.AreEqual(Ord(dsStopped), Ord(Session.State),
       Format('step-over of a call that waits on another thread did not complete within %d ms: ' +
-        'the worker it waits for was kept frozen for the step', [GetTickCount64 - Started]));
+        'the worker it waits for was kept frozen for the step', [Elapsed]));
+    Assert.IsTrue(Elapsed >= RELEASE_MS - 50,
+      Format('the isolation was released after %d ms, before the %d ms threshold', [Elapsed, RELEASE_MS]));
 
     var Fn, Src: string;
     var Line: Integer;
     Assert.IsTrue(Session.GetCurrentLocation(Fn, Src, Line), 'no location after the step');
     Assert.AreEqual(NextLine, Line, 'step-over did not land on the next line');
+
+    var Output := JoinedDebuggerOutput(Session);
+    Assert.Contains(Output, 'Step isolation released', 'the release was not announced: ' + Output);
+    Assert.Contains(Output, 'no owner', 'an event wait must be reported as an unowned wait: ' + Output);
   finally
     Session.Terminate;
     Session.Free;
   end;
+end;
+
+// The stepped-over call burns CPU for 1.5 s; a spinner thread would advance if
+// the step released it. With the threshold set well below the burn, the only
+// thing keeping the spinner frozen is the CPU criterion: a busy thread is not
+// waiting, so nothing may release the others.
+procedure TDebugSessionTests.StepOver_CpuBoundCallee_KeepsOtherThreadsFrozen;
+const
+  STEP_SOURCE = 'TestTargetCore.pas';
+begin
+  var CallLine := MarkerLine(STEP_SOURCE, 'STEPCPU_CALL');
+  var NextLine := MarkerLine(STEP_SOURCE, 'STEPCPU_NEXT');
+  Assert.IsTrue((CallLine > 0) and (NextLine > 0), 'STEPCPU markers not found');
+
+  var Session := OpenSessionAtMarker(TargetExe, TargetMap, TargetRsm, TargetDir,
+    STEP_SOURCE, CallLine, '--run-step-cpu', False, 300);
+  try
+    Assert.AreEqual(Ord(dsStopped), Ord(Session.State), 'did not stop at STEPCPU_CALL');
+    var Before := EvalGlobalInt(Session, 'GStepCpuSpin');
+    Assert.IsTrue(Before > 0, 'the spinner never ran before the stop');
+
+    var Started := GetTickCount64;
+    Session.StepOver;
+    PumpUntilStop(Session, 10000);
+    var Elapsed := GetTickCount64 - Started;
+    Assert.AreEqual(Ord(dsStopped), Ord(Session.State), 'step-over of the CPU-bound call did not complete');
+    Assert.IsTrue(Elapsed >= 1400, Format('the burn took %d ms; expected ~1500', [Elapsed]));
+
+    var Fn, Src: string;
+    var Line: Integer;
+    Assert.IsTrue(Session.GetCurrentLocation(Fn, Src, Line), 'no location after the step');
+    Assert.AreEqual(NextLine, Line, 'step-over did not land on the next line');
+
+    var After := EvalGlobalInt(Session, 'GStepCpuSpin');
+    Assert.AreEqual(Before, After,
+      Format('the spinner advanced from %d to %d during a step over a busy callee: ' +
+        'the isolation was released although the stepped thread was not waiting', [Before, After]));
+    var Output := JoinedDebuggerOutput(Session);
+    Assert.IsFalse(Output.Contains('Step isolation released'), 'a release was announced: ' + Output);
+  finally
+    Session.Terminate;
+    Session.Free;
+  end;
+end;
+
+// The stepped-over call blocks in EnterCriticalSection on a section a worker
+// holds: a wait the OS can attribute to its owner. Wait Chain Traversal must
+// find that the owner is a thread this step froze and release at once -- well
+// before the timer, which is set far beyond the fixture's 2.5 s hold here -- and
+// the announcement must name the lock.
+procedure TDebugSessionTests.StepOver_CalleeBlockedOnHeldCriticalSection_ReleasedByWaitChain;
+const
+  STEP_SOURCE = 'TestTargetCore.pas';
+begin
+  var CallLine := MarkerLine(STEP_SOURCE, 'STEPCS_CALL');
+  var NextLine := MarkerLine(STEP_SOURCE, 'STEPCS_NEXT');
+  Assert.IsTrue((CallLine > 0) and (NextLine > 0), 'STEPCS markers not found');
+
+  var Session := OpenSessionAtMarker(TargetExe, TargetMap, TargetRsm, TargetDir,
+    STEP_SOURCE, CallLine, '--run-step-cs', False, 20000);
+  try
+    Assert.AreEqual(Ord(dsStopped), Ord(Session.State), 'did not stop at STEPCS_CALL');
+    Session.DrainDebuggerOutput;
+
+    var Started := GetTickCount64;
+    Session.StepOver;
+    PumpUntilStop(Session, 8000);
+    var Elapsed := GetTickCount64 - Started;
+    Assert.AreEqual(Ord(dsStopped), Ord(Session.State),
+      Format('step-over of a call blocked on a critical section held by a frozen thread did not ' +
+        'complete within %d ms (the timer was set to 20 s, so only Wait Chain Traversal could release)', [Elapsed]));
+
+    var Fn, Src: string;
+    var Line: Integer;
+    Assert.IsTrue(Session.GetCurrentLocation(Fn, Src, Line), 'no location after the step');
+    Assert.AreEqual(NextLine, Line, 'step-over did not land on the next line');
+
+    var Output := JoinedDebuggerOutput(Session);
+    Assert.Contains(Output, 'Step isolation released', 'the release was not announced: ' + Output);
+    Assert.Contains(Output, 'critical section', 'the announcement must name the lock: ' + Output);
+    Assert.Contains(Output, 'held by thread', 'the announcement must name the owning thread: ' + Output);
+  finally
+    Session.Terminate;
+    Session.Free;
+  end;
+end;
+
+// stepIsolationReleaseMs = 0: the other threads stay frozen no matter how long
+// the stepped thread waits. The bounded fixture's handshake gives up after
+// 1.5 s, so the step lands -- with the wait reporting a timeout, which is the
+// proof that the worker was never allowed to run.
+procedure TDebugSessionTests.StepOver_StrictIsolation_NeverReleases;
+const
+  STEP_SOURCE  = 'TestTargetCore.pas';
+  WAIT_TIMEOUT = 258;
+begin
+  var CallLine := MarkerLine(STEP_SOURCE, 'STEPWAIT_CALL');
+  var NextLine := MarkerLine(STEP_SOURCE, 'STEPWAIT_NEXT');
+  Assert.IsTrue((CallLine > 0) and (NextLine > 0), 'STEPWAIT markers not found');
+
+  var Session := OpenSessionAtMarker(TargetExe, TargetMap, TargetRsm, TargetDir,
+    STEP_SOURCE, CallLine, '--run-step-wait-bounded', False, 0);
+  try
+    Assert.AreEqual(Ord(dsStopped), Ord(Session.State), 'did not stop at STEPWAIT_CALL');
+    Session.DrainDebuggerOutput;
+
+    var Started := GetTickCount64;
+    Session.StepOver;
+    PumpUntilStop(Session, 8000);
+    var Elapsed := GetTickCount64 - Started;
+    Assert.AreEqual(Ord(dsStopped), Ord(Session.State), 'the bounded handshake did not return');
+    Assert.IsTrue(Elapsed >= 1400, Format('the step landed after %d ms; the 1.5 s wait should have run out', [Elapsed]));
+
+    var Fn, Src: string;
+    var Line: Integer;
+    Assert.IsTrue(Session.GetCurrentLocation(Fn, Src, Line), 'no location after the step');
+    Assert.AreEqual(NextLine, Line, 'step-over did not land on the next line');
+    Assert.AreEqual(Int64(WAIT_TIMEOUT), EvalGlobalInt(Session, 'GStepWaitResult'),
+      'the worker signalled the handshake, so it was released during a strict-isolation step');
+    var Output := JoinedDebuggerOutput(Session);
+    Assert.IsFalse(Output.Contains('Step isolation released'), 'a release was announced: ' + Output);
+  finally
+    Session.Terminate;
+    Session.Free;
+  end;
+end;
+
+// stepIsolation "none" (a negative threshold): nothing is frozen, so the spinner
+// advances while the busy callee runs -- the IDE's behaviour.
+procedure TDebugSessionTests.StepOver_IsolationNone_NeverFreezes;
+const
+  STEP_SOURCE = 'TestTargetCore.pas';
+begin
+  var CallLine := MarkerLine(STEP_SOURCE, 'STEPCPU_CALL');
+  Assert.IsTrue(CallLine > 0, 'STEPCPU_CALL marker not found');
+
+  var Session := OpenSessionAtMarker(TargetExe, TargetMap, TargetRsm, TargetDir,
+    STEP_SOURCE, CallLine, '--run-step-cpu', False, STEP_ISOLATION_NONE);
+  try
+    Assert.AreEqual(Ord(dsStopped), Ord(Session.State), 'did not stop at STEPCPU_CALL');
+    var Before := EvalGlobalInt(Session, 'GStepCpuSpin');
+    Session.StepOver;
+    PumpUntilStop(Session, 10000);
+    Assert.AreEqual(Ord(dsStopped), Ord(Session.State), 'step-over of the CPU-bound call did not complete');
+    var After := EvalGlobalInt(Session, 'GStepCpuSpin');
+    Assert.IsTrue(After > Before,
+      Format('the spinner did not advance (%d -> %d) although isolation was off', [Before, After]));
+  finally
+    Session.Terminate;
+    Session.Free;
+  end;
+end;
+
+procedure TDebugSessionTests.StepIsolation_AttributeResolution;
+begin
+  var Setting: Integer;
+  Assert.IsFalse(ResolveStepIsolation('', False, 0, Setting), 'nothing given: not set');
+  Assert.AreEqual(DEFAULT_STEP_ISOLATION_RELEASE_MS, Setting, 'the default survives when nothing is given');
+  Assert.IsFalse(ResolveStepIsolation('auto', False, 0, Setting), '"auto" alone changes nothing');
+  Assert.IsTrue(ResolveStepIsolation('', True, 750, Setting));
+  Assert.AreEqual(750, Setting);
+  Assert.IsTrue(ResolveStepIsolation('', True, 0, Setting));
+  Assert.AreEqual(0, Setting, '0 = strict, never release');
+  Assert.IsTrue(ResolveStepIsolation('', True, -5, Setting));
+  Assert.AreEqual(STEP_ISOLATION_NONE, Setting, 'a negative value = never freeze');
+  Assert.IsTrue(ResolveStepIsolation('none', True, 3000, Setting));
+  Assert.AreEqual(STEP_ISOLATION_NONE, Setting, '"none" wins over a threshold');
+  Assert.IsTrue(ResolveStepIsolation('NONE', False, 0, Setting), 'case-insensitive');
+  Assert.AreEqual(STEP_ISOLATION_NONE, Setting);
 end;
 
 procedure TDebugSessionTests.StepOver_CallWaitingOnAnotherThread_Completes;

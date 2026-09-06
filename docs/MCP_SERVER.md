@@ -125,7 +125,13 @@ To attach to processes owned by another user or elevated targets, run the client
   so you can set breakpoints before any user code runs; then `continue_and_wait`.
   Args: `program` (required), `args`, `mapFile`, `rsmFile`, `sourceRoot`,
   `sourceSearchPaths` (array of additional source roots — `;`-separated and
-  `${env:VAR}` supported), `workspaceFolder`.
+  `${env:VAR}` supported), `workspaceFolder`, `stepIsolationReleaseMs` /
+  `stepIsolation` (a step keeps every other thread frozen, stepped-over calls
+  included; released at once when the stepped thread waits on a lock a frozen
+  thread holds, after this many ms — default 3000 — when it waits on an
+  unowned object; `0` never releases, `"none"` never freezes; each release is
+  reported by `get_debugger_output`). The same two arguments exist on
+  `launch_project`, `attach_to_process` and `attach_to_project`.
 - `launch_from_config` — launch from an existing VS Code `launch.json` (the same
   file the DAP debugger uses), so you need not restate program / map / rsm / source
   paths. Reads a `delphi-win64` configuration; JSONC (comments, trailing commas)

@@ -187,19 +187,22 @@ module you are standing in carries debug information at all.
 
 ## Implemented features
 
-Stepping across a cross-thread wait (2026-09-06, found during the DDK live
-verification, not a regression):
-- **A stepped-over call that waits on another thread completes**, and Pause
-  breaks into one that never returns. The per-thread freeze is kept for the
-  single-stepped phases only; every transition to a full-speed run resumes the
-  other threads, a 100 ms grace timer releases whatever is still frozen when a
-  step goes quiet, and a pause releases everything before `DebugBreakProcess`.
-  The landing stays thread-scoped by `FStepTid` (foreign hits are stepped off
-  and re-armed). A step also retitles an open "reading variables..." spinner.
-  Tests: `StepOver_CallWaitingOnAnotherThread_Completes` (x64 + Win32),
-  `Pause_DuringStepOverThatNeverReturns_BreaksIn`,
+Step isolation (2026-09-06, found during the DDK live verification, not a
+regression):
+- **A step keeps every other thread frozen for the whole step, stepped-over
+  calls included, and releases them only on a detected deadlock**: Wait Chain
+  Traversal on the stepping thread ending on a frozen thread (released at
+  once, lock and thread named), or a CPU-idle wait on an unowned object lasting
+  `stepIsolationReleaseMs` (default 3000; `0` never releases; `stepIsolation:
+  "none"` never freezes). Pause releases everything before the break-in. Every
+  release is announced in the debugger output. Tests:
+  `StepOver_CallWaitingOnAnotherThread_Completes` (x64 + Win32),
+  `StepOver_CpuBoundCallee_KeepsOtherThreadsFrozen`,
+  `StepOver_CalleeBlockedOnHeldCriticalSection_ReleasedByWaitChain`,
+  `StepOver_StrictIsolation_NeverReleases`, `StepOver_IsolationNone_NeverFreezes`,
+  `StepIsolation_AttributeResolution`, `Pause_DuringStepOverThatNeverReturns_BreaksIn`,
   `Test_StepProgress_SupersedesAnOpenVariablesBusyPeriod`; mechanism in
-  `DAP_DEBUGGER_ARCHITECTURE.md` "Stepping", rule in `TRAPS.md`.
+  `DAP_DEBUGGER_ARCHITECTURE.md` "Stepping", rules in `TRAPS.md`.
 
 Project knowledge from delphi-devkit (DDK):
 - **A configuration names a DDK project and nothing else** (`ddkProject`, or

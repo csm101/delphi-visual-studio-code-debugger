@@ -193,6 +193,22 @@ begin
       Exit(False);
 end;
 
+// The step-isolation attributes of a launch / attach configuration:
+// `stepIsolationReleaseMs` (number) and `stepIsolation` ("auto" | "none").
+// Returns True when either was given; Setting then carries the resolved value.
+function StepIsolationFromArgs(Args: TJSONObject; out Setting: Integer): Boolean;
+begin
+  Setting := DEFAULT_STEP_ISOLATION_RELEASE_MS;
+  if Args = nil then
+    Exit(False);
+  var ReleaseValue := Args.FindValue('stepIsolationReleaseMs');
+  var HasRelease := ReleaseValue is TJSONNumber;
+  var ReleaseMs := 0;
+  if HasRelease then
+    ReleaseMs := TJSONNumber(ReleaseValue).AsInt;
+  Result := ResolveStepIsolation(Args.GetValue<string>('stepIsolation', ''), HasRelease, ReleaseMs, Setting);
+end;
+
 function NormalizeModuleName(const Name: string): string;
 begin
   // Extract the basename robustly across separator styles. ExtractFileName only
@@ -2440,6 +2456,7 @@ begin
   Opts.ExceptionFilters    := FExceptionFilters;
   Opts.ExceptionFiltersSet := FExceptionFiltersSet;
   Opts.DelphiClassFilter   := FDelphiClassFilter;
+  Opts.StepIsolationSet    := StepIsolationFromArgs(Args, Opts.StepIsolationReleaseMs);
 
   try
     FSession.Attach(Pid, KillOnDetach, Opts);
@@ -2535,6 +2552,7 @@ begin
   Opts.ExceptionFilters    := FExceptionFilters;
   Opts.ExceptionFiltersSet := FExceptionFiltersSet;
   Opts.DelphiClassFilter   := FDelphiClassFilter;
+  Opts.StepIsolationSet    := StepIsolationFromArgs(Args, Opts.StepIsolationReleaseMs);
 
   DapLog('Launching via session');
   try

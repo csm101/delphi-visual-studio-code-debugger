@@ -367,6 +367,21 @@ end;
 // installed) comes back verbatim as the tool error. The DDK warnings ride along
 // in the reply as `ddkWarnings`, next to the entry-stop snapshot.
 
+// The step-isolation arguments of a tool call (see the launch.json attributes
+// of the same names). Shared by the four launch / attach tools.
+function StepIsolationFromJson(Args: TJSONObject; out Setting: Integer): Boolean;
+begin
+  Setting := DEFAULT_STEP_ISOLATION_RELEASE_MS;
+  if Args = nil then
+    Exit(False);
+  var V := Args.FindValue('stepIsolationReleaseMs');
+  var HasRelease := V is TJSONNumber;
+  var ReleaseMs := 0;
+  if HasRelease then
+    ReleaseMs := TJSONNumber(V).AsInt;
+  Result := ResolveStepIsolation(Args.GetValue<string>('stepIsolation', ''), HasRelease, ReleaseMs, Setting);
+end;
+
 function WarningsPayload(const Target: TDdkDebugTarget): TJSONObject;
 begin
   Result := TJSONObject.Create;
@@ -415,6 +430,7 @@ begin
     Opts.ExceptionFiltersSet := True;
     Opts.DelphiClassFilter   := Args.GetValue<string>('delphiExceptionClasses', '');
   end;
+  Opts.StepIsolationSet := StepIsolationFromJson(Args, Opts.StepIsolationReleaseMs);
   EnsureFreshSessionForStart;
   // Same rule as launch_debuggee: always park at entry, so breakpoints can be
   // set before any user code runs (stopAtEntry is accepted, never honoured as false).
@@ -451,6 +467,7 @@ begin
     SendToolError(IdJson, Err);
     Exit;
   end;
+  Opts.StepIsolationSet := StepIsolationFromJson(Args, Opts.StepIsolationReleaseMs);
   // A pid disambiguates several running instances; otherwise the name goes
   // through the same single-instance / candidate-list rule attach_to_process has.
   PerformAttach(IdJson, Pid, PName, KillOnDetach, Opts, WarningsPayload(Target));
@@ -583,6 +600,12 @@ var
   begin
     Result := FSession.State = dsStopped;
   end;
+  // `stepIsolationReleaseMs` / `stepIsolation` on every launch / attach tool, with
+  // the same meaning as the launch.json attributes.
+  function StepIsolationArg(out Setting: Integer): Boolean;
+  begin
+    Result := StepIsolationFromJson(Args, Setting);
+  end;
 
   // F18: read locals/variables in a CALLER frame, or in a frame of another
   // thread, instead of always the top frame of the stopped thread. After a pause
@@ -651,6 +674,7 @@ begin
         Opts.ExceptionFiltersSet := True;
         Opts.DelphiClassFilter   := ArgStr('delphiExceptionClasses');
       end;
+      Opts.StepIsolationSet := StepIsolationArg(Opts.StepIsolationReleaseMs);
       // Always stop at entry so breakpoints can be set BEFORE any user code runs.
       // Without this the Run loop would pump past the entry point (and any not-yet-
       // set breakpoint) before the agent's set_breakpoint call arrives. The agent
@@ -700,6 +724,7 @@ begin
       Opts.RsmPath          := ArgStr('rsmFile');
       Opts.SourceRoot       := ArgStr('sourceRoot');
       Opts.ExtraSourcePaths := LaunchConfig.ExpandSearchPaths(ArgStrArray('sourceSearchPaths'), ArgStr('workspaceFolder'));
+      Opts.StepIsolationSet := StepIsolationArg(Opts.StepIsolationReleaseMs);
       PerformAttach(IdJson, Cardinal(ArgInt('processId', 0)), ArgStr('processName'),
         ArgBool('killOnDetach'), Opts);
       Exit;

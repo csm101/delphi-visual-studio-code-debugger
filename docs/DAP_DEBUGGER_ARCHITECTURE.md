@@ -1353,30 +1353,52 @@ all threads on `ContinueDebugEvent`, but the explicit suspend survives it.
 the stepped thread itself exits mid-step everything is thawed to avoid an
 all-frozen deadlock.
 
-**The freeze ends where the full-speed run begins.** A stepped-over call may
-wait for another thread (`Application.Initialize` handing work to a worker, a
-lock another thread holds); keeping that thread frozen turned the step into a
-process-wide deadlock, and Pause could not break in because `DebugBreakProcess`
-raises the break on a thread it creates inside the target — which the freeze
-suspended as well (found 2026-09-06; the freeze had behaved this way since the
-initial import). So `ResumeStepFrozenThreads` runs at every transition from
-single-stepping to a run-to-breakpoint: the return address of a call left by
-the range-based step-over (`HandleSmOverStep`), the step-out and import-thunk
-return addresses, the callee-body one-shot and the sourceless pivot of a
-step-into. The threads are frozen again when the resume breakpoint lands and
-single-stepping continues. Whatever is still frozen when a step goes quiet is
-released by a grace timer in `ProcessOneEvent` (`STEP_FREEZE_GRACE_MS`, 100 ms
-without a debug event), and `ckPause` releases everything before the break-in
-(`HandleCreateThread` also leaves the break-in thread alone while a pause is
-pending). The isolation the freeze provided is therefore a property of the
-single-stepped instructions only; the LANDING stays thread-scoped by
-`FStepTid`: a transient step breakpoint or the step's target one-shot reached
-by another thread is stepped off and re-armed (`StepTargetHitByOtherThread` →
+**The freeze holds for the whole step; a detected deadlock releases it.** The
+freeze covers stepped-over calls too -- a callee that computes for seconds
+keeps the other threads frozen for those seconds, which is the contract "one
+thread at a time". It is given up only when the stepped thread is shown to be
+waiting for a frozen one, in two tiers checked from `ProcessOneEvent` whenever
+a frozen step produces no event (`CheckStepIsolation`, every 250 ms):
+
+1. *Precise* -- Wait Chain Traversal (`advapi32`: `OpenThreadWaitChainSession`
+   / `GetThreadWaitChain`, out-of-process, critical sections included) on the
+   stepping thread. If the chain ends on a thread this step froze, the freeze
+   is the deadlock: released at once, and the announcement names the lock kind
+   and the thread ("a critical section held by thread N, which this step
+   froze"). The call runs on a helper thread (`TWctProbe`) because it was
+   measured to block for a minute on a thread that is just waking up; the pump
+   asks and reads, never waits.
+2. *Heuristic* -- a wait with no owner the OS can name (an event, a semaphore,
+   I/O): once the stepping thread has consumed no CPU (`GetThreadTimes`) for
+   `stepIsolationReleaseMs` -- default 3000, deliberately high because a
+   stepped-over call may legitimately wait on a slow external event -- the
+   others are released. A CPU-bound callee keeps accruing time and never
+   triggers this.
+
+Configuration: the launch/attach attributes `stepIsolationReleaseMs` (number;
+`0` = never release, strict; negative = never freeze) and `stepIsolation`
+(`"auto"` | `"none"`, the IDE's behaviour), the same names as MCP arguments
+of `launch_debuggee` / `launch_project` / `attach_to_process` /
+`attach_to_project`; resolved by `ResolveStepIsolation` (`DebugSessionTypes`)
+into `TWinDebugger.SetStepIsolation`. Every release is announced once through
+the engine's `OnNotice` event (the debugger's own output: the "Delphi Debugger"
+channel and MCP `get_debugger_output`), and `ckPause` releases everything
+before `DebugBreakProcess` (`HandleCreateThread` also leaves the break-in
+thread alone while a pause is pending). After a release the threads are frozen
+again when the step's resume breakpoint lands and single-stepping continues.
+The freeze was never what scoped the LANDING: `FStepTid` does -- a transient
+step breakpoint or the step's target one-shot reached by another thread is
+stepped off and re-armed (`StepTargetHitByOtherThread` →
 `RearmStepBpAfterForeignHit`), and a persistent user breakpoint at the step's
 target hit by another thread is that thread's breakpoint, not the step landing.
-Fixtures and tests: `RunStepWaitFixture` in `TestTargetCore.pas`,
-`StepOver_CallWaitingOnAnotherThread_Completes` (x64 and Win32),
-`Pause_DuringStepOverThatNeverReturns_BreaksIn`. The persistent-BP re-arm carries the owning thread
+Found 2026-09-06 as `F10` on `Application.Initialize;` hanging forever (the
+callee waits on a worker the step froze; Pause could not break in because the
+break-in thread was frozen as well); the freeze had behaved this way since the
+initial import. Fixtures: `RunStepWaitFixture`, `RunStepCpuFixture`,
+`RunStepCsFixture` in `TestTargetCore.pas`; tests `StepOver_*` in
+`DebugSessionTests.pas` (x64 and Win32).
+
+The persistent-BP re-arm carries the owning thread
 (`FReactivateTid`) and both re-arm checks are gated on it, so stepping a different
 thread neither steals nor drops another thread's pending re-arm. After the step,
 the single-step handler sets `FStoppedTid := StepTid`, so run control keeps

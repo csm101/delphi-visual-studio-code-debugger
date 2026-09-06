@@ -424,6 +424,24 @@
               "delphiProjectFile": {
                 "type": "string",
                 "description": "The .dpr / .dpk / .dproj this configuration debugs. Written automatically by the RAD Studio plugin. It is where exception rules live: two files next to that project -- <Project>.ExceptionSettings.json (shared, commit it) and <Project>.ExceptionSettings.local.json (personal, gitignore it) -- evaluated before the machine-wide file. Omit it and only the machine-wide file applies."
+              },
+              "stepIsolationReleaseMs": {
+                "type": "number",
+                "default": 3000,
+                "description": "Step isolation: a step freezes every other thread so only the stepped one runs (\"one thread at a time\"), including while a stepped-over call executes. When the stepped thread is found waiting on a lock a frozen thread holds (Wait Chain Traversal), the others are released at once; when it waits on an object with no owner the debugger can name (an event, a semaphore, I/O), they are released after this many milliseconds. A CPU-bound call never releases. 0 = never release (strict isolation; a call that needs another thread then hangs until Pause); a negative value = never freeze (the IDE's behaviour, same as \"stepIsolation\": \"none\"). Every release is announced in the Delphi Debugger output channel."
+              },
+              "stepIsolation": {
+                "type": "string",
+                "enum": [
+                  "auto",
+                  "none"
+                ],
+                "default": "auto",
+                "enumDescriptions": [
+                  "Freeze the other threads for each step; release them only on a detected deadlock (see stepIsolationReleaseMs).",
+                  "Never freeze other threads for a step -- the RAD Studio IDE's behaviour. Steps still land on the stepped thread."
+                ],
+                "description": "Whether a step keeps the other threads frozen. \"auto\" (default) isolates the stepped thread and releases the others only when it is found waiting for one of them; \"none\" lets everything run during a step."
               }
             },
             "anyOf": [
@@ -568,6 +586,24 @@
                 "type": "boolean",
                 "default": false,
                 "description": "Write a detailed adapter log to %TEMP%\\dap_adapter.log. Verbose: every DAP request/response, every debug event (LoadDll, Exception, Output, Breakpoint), every command queued and processed. Use only for diagnosing adapter behavior issues; off by default."
+              },
+              "stepIsolationReleaseMs": {
+                "type": "number",
+                "default": 3000,
+                "description": "Step isolation: a step freezes every other thread so only the stepped one runs (\"one thread at a time\"), including while a stepped-over call executes. When the stepped thread is found waiting on a lock a frozen thread holds (Wait Chain Traversal), the others are released at once; when it waits on an object with no owner the debugger can name (an event, a semaphore, I/O), they are released after this many milliseconds. A CPU-bound call never releases. 0 = never release (strict isolation; a call that needs another thread then hangs until Pause); a negative value = never freeze (the IDE's behaviour, same as \"stepIsolation\": \"none\"). Every release is announced in the Delphi Debugger output channel."
+              },
+              "stepIsolation": {
+                "type": "string",
+                "enum": [
+                  "auto",
+                  "none"
+                ],
+                "default": "auto",
+                "enumDescriptions": [
+                  "Freeze the other threads for each step; release them only on a detected deadlock (see stepIsolationReleaseMs).",
+                  "Never freeze other threads for a step -- the RAD Studio IDE's behaviour. Steps still land on the stepped thread."
+                ],
+                "description": "Whether a step keeps the other threads frozen. \"auto\" (default) isolates the stepped thread and releases the others only when it is found waiting for one of them; \"none\" lets everything run during a step."
               }
             }
           }
@@ -775,6 +811,24 @@
               "delphiProjectFile": {
                 "type": "string",
                 "description": "The .dpr / .dpk / .dproj this configuration debugs. Written automatically by the RAD Studio plugin. It is where exception rules live: two files next to that project -- <Project>.ExceptionSettings.json (shared, commit it) and <Project>.ExceptionSettings.local.json (personal, gitignore it) -- evaluated before the machine-wide file. Omit it and only the machine-wide file applies."
+              },
+              "stepIsolationReleaseMs": {
+                "type": "number",
+                "default": 3000,
+                "description": "Step isolation: a step freezes every other thread so only the stepped one runs (\"one thread at a time\"), including while a stepped-over call executes. When the stepped thread is found waiting on a lock a frozen thread holds (Wait Chain Traversal), the others are released at once; when it waits on an object with no owner the debugger can name (an event, a semaphore, I/O), they are released after this many milliseconds. A CPU-bound call never releases. 0 = never release (strict isolation; a call that needs another thread then hangs until Pause); a negative value = never freeze (the IDE's behaviour, same as \"stepIsolation\": \"none\"). Every release is announced in the Delphi Debugger output channel."
+              },
+              "stepIsolation": {
+                "type": "string",
+                "enum": [
+                  "auto",
+                  "none"
+                ],
+                "default": "auto",
+                "enumDescriptions": [
+                  "Freeze the other threads for each step; release them only on a detected deadlock (see stepIsolationReleaseMs).",
+                  "Never freeze other threads for a step -- the RAD Studio IDE's behaviour. Steps still land on the stepped thread."
+                ],
+                "description": "Whether a step keeps the other threads frozen. \"auto\" (default) isolates the stepped thread and releases the others only when it is found waiting for one of them; \"none\" lets everything run during a step."
               }
             },
             "anyOf": [
@@ -919,6 +973,24 @@
                 "type": "boolean",
                 "default": false,
                 "description": "Write a detailed adapter log to %TEMP%\\dap_adapter.log. Verbose: every DAP request/response, every debug event (LoadDll, Exception, Output, Breakpoint), every command queued and processed. Use only for diagnosing adapter behavior issues; off by default."
+              },
+              "stepIsolationReleaseMs": {
+                "type": "number",
+                "default": 3000,
+                "description": "Step isolation: a step freezes every other thread so only the stepped one runs (\"one thread at a time\"), including while a stepped-over call executes. When the stepped thread is found waiting on a lock a frozen thread holds (Wait Chain Traversal), the others are released at once; when it waits on an object with no owner the debugger can name (an event, a semaphore, I/O), they are released after this many milliseconds. A CPU-bound call never releases. 0 = never release (strict isolation; a call that needs another thread then hangs until Pause); a negative value = never freeze (the IDE's behaviour, same as \"stepIsolation\": \"none\"). Every release is announced in the Delphi Debugger output channel."
+              },
+              "stepIsolation": {
+                "type": "string",
+                "enum": [
+                  "auto",
+                  "none"
+                ],
+                "default": "auto",
+                "enumDescriptions": [
+                  "Freeze the other threads for each step; release them only on a detected deadlock (see stepIsolationReleaseMs).",
+                  "Never freeze other threads for a step -- the RAD Studio IDE's behaviour. Steps still land on the stepped thread."
+                ],
+                "description": "Whether a step keeps the other threads frozen. \"auto\" (default) isolates the stepped thread and releases the others only when it is found waiting for one of them; \"none\" lets everything run during a step."
               }
             }
           }

@@ -534,6 +534,8 @@ PATH or named by the `DDK_EXE` environment variable.
 | `mapFile` | same path as `program` with `.map` extension | Delphi MAP file |
 | `sourceRoot` | *(empty)* | Root directory for source file lookup |
 | `stopAtEntry` | `false` | Break at the process entry point before any user code runs |
+| `stepIsolationReleaseMs` | `3000` | A step freezes every other thread so only the stepped one runs, stepped-over calls included. When the stepped thread waits on a lock a frozen thread holds, the others are released at once (and the debugger output says which lock); when it waits on an object nobody owns (an event, a semaphore, I/O) they are released after this many milliseconds. `0` = never release; a negative value = never freeze |
+| `stepIsolation` | `"auto"` | `"none"` never freezes other threads for a step (the RAD Studio IDE's behaviour) |
 | `delphiProjectFile` | *(empty)* | The `.dpr` / `.dpk` / `.dproj` this configuration debugs. It is where per-exception rules live — see [Rules that belong to a project](#rules-that-belong-to-a-project) |
 | `useGlobalExceptionRules` | `true` | Also load the shared machine-wide rules file — see [Shared rules across projects](#shared-rules-across-projects) |
 | `globalExceptionRulesPath` | `%USERPROFILE%\.DelphiWinDebugger\exceptionRules.json` | Custom location for the shared rules file |

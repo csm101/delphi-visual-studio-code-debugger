@@ -175,20 +175,31 @@ type
     // only the stepped thread's single-step / one-shot INT3 can fire (also makes
     // step-over/step-out more robust, since no other thread can race a step BP).
     //
-    // The freeze is for the single-stepping phases only. The moment a step
-    // becomes a full-speed run -- to a call's return address, to a step-out's
-    // return address, to a callee's body start -- the frozen threads are
-    // resumed: the stepped-over call may be waiting for one of them (an
-    // Application.Initialize that hands work to a worker and waits, a lock
-    // another thread holds), and a frozen waiter turns the step into a deadlock
-    // the user cannot even Pause out of. A grace timer (STEP_FREEZE_GRACE_MS)
-    // covers whatever phase is still frozen when a single step stalls. Thread
-    // scoping of the landing is kept by FStepTid instead: a step breakpoint hit
-    // by another thread is stepped off and re-armed (RearmStepBpAfterForeignHit).
+    // The freeze holds for the WHOLE step, stepped-over calls included -- that
+    // is what "one thread at a time" means -- and is given up only when the
+    // stepped thread is found to be waiting for something a frozen thread has
+    // to do (an Application.Initialize handing work to a worker, a critical
+    // section another thread holds): first precisely, by Wait Chain Traversal
+    // on the stepping thread (CheckStepIsolation); then, for waits with no
+    // owner the OS can name (events, semaphores, I/O), by a timer that fires
+    // once the thread has consumed no CPU for FStepIsolationReleaseMs. A
+    // CPU-bound callee never releases. Thread scoping of the LANDING never
+    // depended on the freeze: a step breakpoint hit by another thread is
+    // stepped off and re-armed (StepTargetHitByOtherThread /
+    // RearmStepBpAfterForeignHit), so a released step still lands on its
+    // own thread.
     FStepTid:          DWORD;        // thread targeted by the in-flight step (0 = none)
     FStepFreezeActive: Boolean;      // True while other threads are frozen for a step
-    FStepFreezeSince:  UInt64;       // GetTickCount64 when the current freeze began
     FStepFrozenTids:   TList<DWORD>; // threads we explicitly suspended for the current step
+    FStepIsolationReleaseMs: Integer; // SetStepIsolation; < 0 = never freeze
+    FStepIsoQuietSince: UInt64;      // when the stepping thread last consumed CPU
+    FStepIsoCpuAtQuiet: UInt64;      // its CPU time at that moment (100 ns units)
+    FStepIsoLastProbe:  UInt64;      // last CheckStepIsolation, to pace the probes
+    // The Wait Chain Traversal probe runs on its own thread (TWctProbe): a
+    // GetThreadWaitChain on a thread that is just waking from its wait was
+    // measured to block for a minute, and the event pump cannot afford that.
+    FWctProbe:          TObject;     // a TWctProbe (declared in the implementation)
+    FWctProbeRef:       IInterface;  // keeps FWctProbe alive for as long as we use it
     FCachedFrames:    TArray<TStackFrame>; // call stack cached per stop (keyed by TID+RIP+RSP)
     FCachedFramesTID: DWORD;               // thread the cached frames belong to (0 = none)
     FCachedFramesRIP: UInt64;              // RIP the cached frames belong to (0 = none)
@@ -276,6 +287,7 @@ type
     FOnStopped:          TOnStopped;
     FOnExited:           TOnExited;
     FOnOutput:           TOnOutput;
+    FOnNotice:           TOnOutput;
     FOnDllLoaded:        TOnDllLoaded;
     FOnDllUnloaded:      TOnDllUnloaded;
     FOnBpHit:            TOnBpHit;
@@ -595,10 +607,17 @@ type
     // Resumes the frozen threads but keeps the step targeted at FStepTid: the
     // step is still in flight, only its isolation is given up.
     procedure ResumeStepFrozenThreads(const Why: string);
-    // The grace timer: a frozen step that has produced no event for
-    // STEP_FREEZE_GRACE_MS is waiting on something, and the something is
-    // probably a frozen thread.
-    procedure ThawStepFreezeIfStalled;
+    // Run while a frozen step is quiet: releases the isolation when the
+    // stepping thread is found waiting on a frozen thread (Wait Chain
+    // Traversal) or has waited, CPU-idle, for FStepIsolationReleaseMs.
+    procedure CheckStepIsolation;
+    // Wait Chain Traversal on the stepping thread: True when its chain ends on
+    // a thread this step froze, with a description of the lock and the thread.
+    // Consumes the helper thread's last answer (True + Description when the
+    // chain ended on a frozen thread) and, when it is idle, asks for the next one.
+    function  StepThreadBlockedOnFrozenThread(out Description: string): Boolean;
+    function  ThreadCpuTime100ns(Tid: DWORD): UInt64;
+    procedure ReleaseStepIsolation(const Why: string);
     // A step breakpoint reached by a thread the step does not target.
     function  StepTargetHitByOtherThread(Tid: DWORD): Boolean;
     procedure ThawStepFrozenThreads;
@@ -642,6 +661,7 @@ type
     procedure Launch(const ExePath: string; StopAtEntry: Boolean);
     procedure Attach(ProcessId: Cardinal; KillOnDetach: Boolean);
     procedure SetExceptionFilters(Filters: TExceptionFilters);
+    procedure SetStepIsolation(ReleaseMs: Integer);
     procedure SetDelphiClassFilter(const ClassNames: string);
     procedure ProcessOneEvent; // returns immediately if no event in 10ms
     property  Running:   Boolean read FRunning;
@@ -812,6 +832,7 @@ type
     function  GetOnStopped:     TOnStopped;     procedure SetOnStopped(const V: TOnStopped);
     function  GetOnExited:      TOnExited;      procedure SetOnExited(const V: TOnExited);
     function  GetOnOutput:      TOnOutput;      procedure SetOnOutput(const V: TOnOutput);
+    function  GetOnNotice:      TOnOutput;      procedure SetOnNotice(const V: TOnOutput);
     function  GetOnDllLoaded:   TOnDllLoaded;   procedure SetOnDllLoaded(const V: TOnDllLoaded);
     function  GetOnDllUnloaded: TOnDllUnloaded; procedure SetOnDllUnloaded(const V: TOnDllUnloaded);
     function  GetOnBpHit:       TOnBpHit;       procedure SetOnBpHit(const V: TOnBpHit);
@@ -845,6 +866,7 @@ type
     property  OnStopped:      TOnStopped     read GetOnStopped     write SetOnStopped;
     property  OnExited:       TOnExited      read GetOnExited      write SetOnExited;
     property  OnOutput:       TOnOutput      read GetOnOutput      write SetOnOutput;
+    property  OnNotice:       TOnOutput      read GetOnNotice      write SetOnNotice;
     property  OnDllLoaded:    TOnDllLoaded   read GetOnDllLoaded   write SetOnDllLoaded;
     property  OnDllUnloaded:  TOnDllUnloaded read GetOnDllUnloaded write SetOnDllUnloaded;
     property  OnBpHit:        TOnBpHit       read GetOnBpHit       write SetOnBpHit;
@@ -860,7 +882,111 @@ implementation
 
 uses
   System.StrUtils,        // ContainsText, for the language-handler name check
-  System.Generics.Defaults;
+  System.Generics.Defaults,
+  System.SyncObjs,        // TCriticalSection, for the wait-chain probe
+  DebugSessionTypes;      // DEFAULT_STEP_ISOLATION_RELEASE_MS
+
+// ---- Wait Chain Traversal (advapi32, Vista+) --------------------------------
+// Used to find out WHY a frozen step is not landing: the stepping thread's wait
+// chain names the lock it is blocked on and the thread that owns it, and if
+// that thread is one this step froze, the freeze is the deadlock.
+const
+  WCT_MAX_NODE_COUNT       = 16;
+  WCT_OBJNAME_LENGTH       = 128;
+  WCT_OUT_OF_PROC_FLAG     = $1;
+  WCT_OUT_OF_PROC_CS_FLAG  = $4;
+  // WCT_OBJECT_TYPE
+  WctCriticalSectionType   = 1;
+  WctSendMessageType       = 2;
+  WctMutexType             = 3;
+  WctAlpcType              = 4;
+  WctComType               = 5;
+  WctThreadWaitType        = 6;
+  WctProcessWaitType       = 7;
+  WctThreadType            = 8;
+  WctComActivationType     = 9;
+  WctUnknownType           = 10;
+  WctSocketIoType          = 11;
+  WctSmbIoType             = 12;
+  // How often the stepping thread's wait chain is examined while a frozen
+  // step is quiet. The call walks kernel objects and reads target memory, so
+  // it is not free; four times a second is plenty to catch a deadlock early.
+  STEP_ISOLATION_PROBE_MS  = 250;
+
+type
+  TWaitChainNodeInfo = record
+    ObjectType:   DWORD;
+    ObjectStatus: DWORD;
+    case Integer of
+      0: (ObjectName: array[0..WCT_OBJNAME_LENGTH - 1] of WideChar;
+          Timeout:    Int64;
+          Alertable:  BOOL);
+      1: (ProcessId, ThreadId, WaitTime, ContextSwitches: DWORD);
+  end;
+  PWaitChainNodeInfo = ^TWaitChainNodeInfo;
+
+{$IF SizeOf(TWaitChainNodeInfo) <> 280}
+  {$MESSAGE ERROR 'TWaitChainNodeInfo must match WAITCHAIN_NODE_INFO (280 bytes)'}
+{$IFEND}
+
+function OpenThreadWaitChainSession(Flags: DWORD; Callback: Pointer): THandle; stdcall;
+  external 'advapi32.dll' name 'OpenThreadWaitChainSession';
+function GetThreadWaitChain(WctHandle: THandle; Context: NativeUInt; Flags: DWORD;
+  ThreadId: DWORD; var NodeCount: DWORD; NodeInfoArray: PWaitChainNodeInfo;
+  var IsCycle: BOOL): BOOL; stdcall; external 'advapi32.dll' name 'GetThreadWaitChain';
+procedure CloseThreadWaitChainSession(WctHandle: THandle); stdcall;
+  external 'advapi32.dll' name 'CloseThreadWaitChainSession';
+
+type
+  IWctProbeKeepAlive = interface
+    ['{7E0B2C6A-8F1D-4B5E-9C3A-2D4F6E8A0B15}']
+  end;
+
+  TWctProbe = class(TInterfacedObject, IWctProbeKeepAlive)
+  private
+    FProcessId: DWORD;
+    FLock:      TCriticalSection;
+    FRequest:   THandle;
+    FSession:   THandle;
+    FStop:      Boolean;
+    FFailed:    Boolean;
+    FBusy:      Boolean;
+    FTid:       DWORD;
+    FFrozen:    TArray<DWORD>;
+    FReady:     Boolean;
+    FFound:     Boolean;
+    FText:      string;
+    procedure Examine;
+  public
+    constructor Create(AProcessId: DWORD);
+    destructor Destroy; override;
+    procedure StartThread(const Keep: IInterface);
+    procedure Shutdown;
+    // False when a probe is already in flight (or WCT is unavailable).
+    function  Ask(Tid: DWORD; const Frozen: TArray<DWORD>): Boolean;
+    // True once per answer; Found + Description say what the chain showed.
+    function  TakeResult(out Found: Boolean; out Description: string): Boolean;
+    function  Busy: Boolean;
+  end;
+
+function WctObjectTypeName(ObjectType: DWORD): string;
+begin
+  case ObjectType of
+    WctCriticalSectionType: Result := 'a critical section';
+    WctSendMessageType:     Result := 'a SendMessage';
+    WctMutexType:           Result := 'a mutex';
+    WctAlpcType:            Result := 'an ALPC port';
+    WctComType,
+    WctComActivationType:   Result := 'a COM call';
+    WctThreadWaitType:      Result := 'a thread wait';
+    WctProcessWaitType:     Result := 'a process wait';
+    WctSocketIoType:        Result := 'socket I/O';
+    WctSmbIoType:           Result := 'SMB I/O';
+  else
+    Result := 'an object';
+  end;
+end;
+
 
 const
   // Shortest identifier that may be TAIL-MATCHED against unit-qualified global
@@ -1023,6 +1149,7 @@ begin
   FPendingContinueStatus  := DBG_CONTINUE;
   FIsStopped              := False;
   FExceptionFilters       := DEFAULT_EXCEPTION_FILTERS;
+  FStepIsolationReleaseMs := DEFAULT_STEP_ISOLATION_RELEASE_MS;
   FPauseRequested         := False;
   FWatchArmedSlots        := 0;
   FWatchHitCount          := 0;
@@ -1038,6 +1165,9 @@ begin
   FThreads.Free;
   FThreadNames.Free;
   FStepFrozenTids.Free;
+  if FWctProbe <> nil then
+    TWctProbe(FWctProbe).Shutdown;   // the helper frees the probe when it is done with it
+  FWctProbeRef := nil;
   FBreakpoints.Free;
   FCommandQueue.Free;
   FDllBases.Free;
@@ -1765,17 +1895,170 @@ begin
   DapLog(Format('UnpatchBpAtRip: removed INT3 at $%x, will rearm at next stop', [RIP]));
 end;
 
-const
-  // How long a step may keep the other threads frozen without producing a
-  // debug event. A single-stepped instruction retires in microseconds; a step
-  // that has gone quiet for this long is inside a call that is waiting for
-  // something, and the something is likely one of the frozen threads.
-  STEP_FREEZE_GRACE_MS = 100;
+{ TWctProbe }
+
+// Shared between the engine (which asks and reads) and one helper thread
+// (which calls the API). Ref-counted through IInterface so that whichever of
+// the two finishes last frees it: the engine may be destroyed while the helper
+// is still inside a blocked GetThreadWaitChain.
+constructor TWctProbe.Create(AProcessId: DWORD);
+begin
+  inherited Create;
+  FProcessId := AProcessId;
+  FLock      := TCriticalSection.Create;
+  FRequest   := CreateEvent(nil, False, False, nil);
+end;
+
+destructor TWctProbe.Destroy;
+begin
+  if FSession <> 0 then
+    CloseThreadWaitChainSession(FSession);
+  CloseHandle(FRequest);
+  FLock.Free;
+  inherited;
+end;
+
+procedure TWctProbe.StartThread(const Keep: IInterface);
+begin
+  // The closure holds a reference for the helper's lifetime.
+  TThread.CreateAnonymousThread(
+    procedure
+    var
+      Ref: IInterface;
+    begin
+      Ref := Keep;
+      while True do begin
+        WaitForSingleObject(FRequest, INFINITE);
+        if FStop then
+          Break;
+        Examine;
+      end;
+    end).Start;
+end;
+
+procedure TWctProbe.Shutdown;
+begin
+  FStop := True;
+  SetEvent(FRequest);
+end;
+
+function TWctProbe.Ask(Tid: DWORD; const Frozen: TArray<DWORD>): Boolean;
+begin
+  FLock.Enter;
+  try
+    if FBusy or FFailed then
+      Exit(False);
+    FBusy   := True;
+    FTid    := Tid;
+    FFrozen := Copy(Frozen);
+  finally
+    FLock.Leave;
+  end;
+  SetEvent(FRequest);
+  Result := True;
+end;
+
+function TWctProbe.TakeResult(out Found: Boolean; out Description: string): Boolean;
+begin
+  FLock.Enter;
+  try
+    Result := FReady;
+    Found  := FFound;
+    Description := FText;
+    FReady := False;
+  finally
+    FLock.Leave;
+  end;
+end;
+
+function TWctProbe.Busy: Boolean;
+begin
+  FLock.Enter;
+  try
+    Result := FBusy;
+  finally
+    FLock.Leave;
+  end;
+end;
+
+// Runs on the helper thread. Nodes[0] is the examined thread itself; what
+// follows alternates lock objects and their owning threads. The first owner
+// that belongs to the target process and is on the frozen list is the deadlock.
+procedure TWctProbe.Examine;
+var
+  Nodes: array[0..WCT_MAX_NODE_COUNT - 1] of TWaitChainNodeInfo;
+begin
+  var Found := False;
+  var Text  := '';
+  try
+    if FSession = 0 then begin
+      FSession := OpenThreadWaitChainSession(0, nil);
+      if FSession = 0 then begin
+        DapLog('Step isolation: Wait Chain Traversal unavailable (' +
+          SysErrorMessage(GetLastError) + '); only the wait-state timer can release a step');
+        FLock.Enter;
+        FFailed := True;
+        FLock.Leave;
+        Exit;
+      end;
+    end;
+    var Count: DWORD := WCT_MAX_NODE_COUNT;
+    var IsCycle: BOOL := False;
+    if not GetThreadWaitChain(FSession, 0, WCT_OUT_OF_PROC_FLAG or WCT_OUT_OF_PROC_CS_FLAG,
+         FTid, Count, @Nodes[0], IsCycle) then begin
+      // Transient failures happen (the thread is mid-transition); the next
+      // probe tries again and the timer is unaffected.
+      DapLog('Step isolation: GetThreadWaitChain failed: ' + SysErrorMessage(GetLastError));
+      Exit;
+    end;
+    var Chain := '';
+    for var I := 0 to Integer(Count) - 1 do
+      if Nodes[I].ObjectType = WctThreadType then
+        Chain := Chain + Format(' thread(%d,st=%d)', [Nodes[I].ThreadId, Nodes[I].ObjectStatus])
+      else
+        Chain := Chain + Format(' %s(st=%d)', [WctObjectTypeName(Nodes[I].ObjectType), Nodes[I].ObjectStatus]);
+    DapLog(Format('Step isolation probe: tid=%d chain:%s', [FTid, Chain]));
+    var LastLock := 'an object';
+    for var I := 1 to Integer(Count) - 1 do begin
+      var Node := Nodes[I];
+      if Node.ObjectType = WctThreadType then begin
+        if (Node.ProcessId = FProcessId) and TArray.Contains<DWORD>(FFrozen, Node.ThreadId) then begin
+          Text  := Format('%s held by thread %d, which this step froze', [LastLock, Node.ThreadId]);
+          Found := True;
+          Break;
+        end;
+      end
+      else
+        LastLock := WctObjectTypeName(Node.ObjectType);
+    end;
+  finally
+    FLock.Enter;
+    FBusy  := False;
+    FReady := True;
+    FFound := Found;
+    FText  := Text;
+    FLock.Leave;
+  end;
+end;
+
+procedure TWinDebugger.SetStepIsolation(ReleaseMs: Integer);
+begin
+  FStepIsolationReleaseMs := ReleaseMs;
+  if ReleaseMs < 0 then
+    DapLog('Step isolation: off (other threads run during a step)')
+  else if ReleaseMs = 0 then
+    DapLog('Step isolation: strict (other threads stay frozen for the whole step)')
+  else
+    DapLog(Format('Step isolation: release after %d ms of an unowned wait', [ReleaseMs]));
+end;
 
 procedure TWinDebugger.FreezeThreadsForStep(StepTid: DWORD);
 begin
   // Never stack two freezes: a fresh step always starts from a thawed baseline.
   ThawStepFrozenThreads;
+  FStepTid := StepTid;
+  if FStepIsolationReleaseMs < 0 then
+    Exit;   // isolation off: the landing is still thread-scoped through FStepTid
   for var KV in FThreads do begin
     if KV.Key = StepTid then
       Continue;
@@ -1783,11 +2066,86 @@ begin
     if (KV.Value <> 0) and (SuspendThread(KV.Value) <> DWORD(-1)) then
       FStepFrozenTids.Add(KV.Key);
   end;
-  FStepTid          := StepTid;
-  FStepFreezeActive := True;
-  FStepFreezeSince  := GetTickCount64;
+  FStepFreezeActive  := True;
+  FStepIsoQuietSince := GetTickCount64;
+  FStepIsoLastProbe  := FStepIsoQuietSince;
+  FStepIsoCpuAtQuiet := ThreadCpuTime100ns(StepTid);
   DapLog(Format('FreezeThreadsForStep: stepping tid=%d, froze %d other thread(s)',
     [StepTid, FStepFrozenTids.Count]));
+end;
+
+function TWinDebugger.ThreadCpuTime100ns(Tid: DWORD): UInt64;
+var
+  Creation, Exit_, Kernel, User: TFileTime;
+begin
+  Result := 0;
+  var TH := ThreadHandle(Tid);
+  if (TH = 0) or not GetThreadTimes(TH, Creation, Exit_, Kernel, User) then
+    Exit;
+  Result := (UInt64(Kernel.dwHighDateTime) shl 32 or Kernel.dwLowDateTime) +
+            (UInt64(User.dwHighDateTime)   shl 32 or User.dwLowDateTime);
+end;
+
+function TWinDebugger.StepThreadBlockedOnFrozenThread(out Description: string): Boolean;
+begin
+  Result      := False;
+  Description := '';
+  if FWctProbe = nil then begin
+    var Probe := TWctProbe.Create(FProcessId);
+    FWctProbeRef := Probe;
+    FWctProbe    := Probe;
+    Probe.StartThread(FWctProbeRef);
+  end;
+  var Probe := TWctProbe(FWctProbe);
+  var Found := False;
+  var Text := '';
+  if Probe.TakeResult(Found, Text) and Found then begin
+    Description := Text;
+    Exit(True);
+  end;
+  if not Probe.Busy then
+    Probe.Ask(FStepTid, FStepFrozenTids.ToArray);
+end;
+
+procedure TWinDebugger.ReleaseStepIsolation(const Why: string);
+begin
+  var Waited := (GetTickCount64 - FStepIsoQuietSince) / 1000;
+  var Msg := Format('Step isolation released after %.1f s: the stepped-over call is waiting on %s; ' +
+    'other threads are running until the step lands', [Waited, Why]);
+  ResumeStepFrozenThreads(Why);
+  DapLog(Msg);
+  if Assigned(FOnNotice) then
+    FOnNotice(Msg);
+end;
+
+procedure TWinDebugger.CheckStepIsolation;
+begin
+  if not FStepFreezeActive or (FStepTid = 0) then
+    Exit;
+  var Now := GetTickCount64;
+  if Now - FStepIsoLastProbe < STEP_ISOLATION_PROBE_MS then
+    Exit;
+  FStepIsoLastProbe := Now;
+
+  // Precise tier: the OS knows the owner of the object the thread waits on.
+  var Blocker: string;
+  if StepThreadBlockedOnFrozenThread(Blocker) then begin
+    ReleaseStepIsolation(Blocker);
+    Exit;
+  end;
+
+  // Heuristic tier: a thread that consumes no CPU is in a kernel wait. A
+  // compute-bound callee keeps accruing time and never triggers this; a wait
+  // on an event, a semaphore or I/O -- objects with no owner to name -- does,
+  // once it has lasted FStepIsolationReleaseMs. 0 means never.
+  var Cpu := ThreadCpuTime100ns(FStepTid);
+  if Cpu <> FStepIsoCpuAtQuiet then begin
+    FStepIsoCpuAtQuiet := Cpu;
+    FStepIsoQuietSince := Now;
+    Exit;
+  end;
+  if (FStepIsolationReleaseMs > 0) and (Now - FStepIsoQuietSince >= UInt64(FStepIsolationReleaseMs)) then
+    ReleaseStepIsolation('an object with no owner the debugger can name (an event, a semaphore, I/O)');
 end;
 
 procedure TWinDebugger.ResumeStepFrozenThreads(const Why: string);
@@ -1805,15 +2163,6 @@ begin
   end;
   FStepFrozenTids.Clear;
   FStepFreezeActive := False;
-end;
-
-procedure TWinDebugger.ThawStepFreezeIfStalled;
-begin
-  if not FStepFreezeActive then
-    Exit;
-  if GetTickCount64 - FStepFreezeSince < STEP_FREEZE_GRACE_MS then
-    Exit;
-  ResumeStepFrozenThreads('the step has not landed within the grace period');
 end;
 
 function TWinDebugger.StepTargetHitByOtherThread(Tid: DWORD): Boolean;
@@ -2621,9 +2970,6 @@ begin
       FStepResumeSP := CurSP + UInt64(TargetLayout.PointerSize);
       {$Q+}
       PlantStepBp(RetTop);
-      // The callee runs at full speed from here and may wait on another
-      // thread; a frozen one would never let it return.
-      ResumeStepFrozenThreads('running to the return address of a stepped-over call');
       ContinueDebugEvent(FProcessId, Tid, DBG_CONTINUE);
       Exit;
     end;
@@ -4248,7 +4594,6 @@ begin
             PlantInt3(BP);
             FBreakpoints.Add(BP);
           end;
-          ResumeStepFrozenThreads('running to the return address of a stepped-over call');
           ReleasePendingEvent(ContStatus);
           Exit;
         end;
@@ -4305,7 +4650,6 @@ begin
             PlantInt3(BP);
             FBreakpoints.Add(BP);
           end;
-          ResumeStepFrozenThreads('running to the return address for a step-out');
           ReleasePendingEvent(ContStatus);
           Exit;
         end;
@@ -4330,6 +4674,8 @@ begin
           // whatever the stepped thread is waiting for has to be allowed to
           // happen. DebugBreakProcess raises the break on a thread it creates
           // inside the target, which HandleCreateThread must not suspend either.
+          if FStepFreezeActive then
+            DapLog('ckPause: releasing the step isolation for the break-in');
           ResumeStepFrozenThreads('pause requested');
           DebugBreakProcess(FProcess);
           DapLog('ckPause: DebugBreakProcess called');
@@ -4979,10 +5325,11 @@ begin
               ReportStopped(srStep, BpVA);
               Exit;
             end;
-            // Same line (call returned mid-line): resume single-stepping, with
-            // the other threads frozen again for the single-stepped phase.
+            // Same line (call returned mid-line): resume single-stepping. If
+            // the isolation was released while the call ran, freeze again.
             FStepPrevSP := CurrentRSP(Ev.dwThreadId);
-            FreezeThreadsForStep(Ev.dwThreadId);
+            if not FStepFreezeActive then
+              FreezeThreadsForStep(Ev.dwThreadId);
             SetTrapFlag(Ev.dwThreadId, True);
             ContinueDebugEvent(Ev.dwProcessId, Ev.dwThreadId, DBG_CONTINUE);
             Exit;
@@ -5238,7 +5585,6 @@ begin
               PlantInt3(BP);
               FBreakpoints.Add(BP);
             end;
-            ResumeStepFrozenThreads('running to the start of the callee body');
             ContinueDebugEvent(Ev.dwProcessId, Ev.dwThreadId, DBG_CONTINUE);
             Exit;
           end;
@@ -5272,7 +5618,6 @@ begin
               PlantInt3(BP);
               FBreakpoints.Add(BP);
             end;
-            ResumeStepFrozenThreads('running out of sourceless code to the caller');
             ContinueDebugEvent(Ev.dwProcessId, Ev.dwThreadId, DBG_CONTINUE);
             Exit;
           end;
@@ -5579,7 +5924,7 @@ begin
   ProcessCommandQueue;
 
   if not WaitForDebugEvent(Ev, 10) then begin
-    ThawStepFreezeIfStalled;
+    CheckStepIsolation;
     Exit;
   end;
 
@@ -7021,6 +7366,8 @@ function  TWinDebugger.GetOnExited:      TOnExited;      begin Result := FOnExit
 procedure TWinDebugger.SetOnExited(const V: TOnExited);  begin FOnExited := V;           end;
 function  TWinDebugger.GetOnOutput:      TOnOutput;      begin Result := FOnOutput;      end;
 procedure TWinDebugger.SetOnOutput(const V: TOnOutput);  begin FOnOutput := V;           end;
+function  TWinDebugger.GetOnNotice:      TOnOutput;      begin Result := FOnNotice;      end;
+procedure TWinDebugger.SetOnNotice(const V: TOnOutput);  begin FOnNotice := V;           end;
 function  TWinDebugger.GetOnDllLoaded:   TOnDllLoaded;   begin Result := FOnDllLoaded;   end;
 procedure TWinDebugger.SetOnDllLoaded(const V: TOnDllLoaded);   begin FOnDllLoaded := V;   end;
 function  TWinDebugger.GetOnDllUnloaded: TOnDllUnloaded; begin Result := FOnDllUnloaded; end;

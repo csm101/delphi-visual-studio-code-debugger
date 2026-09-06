@@ -462,27 +462,39 @@ absurdly.
 
 ## Per-thread stepping
 
-- **Never keep other threads frozen while a stepped-over call runs at full
-  speed.** The freeze that makes single-stepping per-thread (every other thread
-  `SuspendThread`'d) turned `F10` on `Application.Initialize;` into a
-  process-wide deadlock: the call waits on a worker, the worker is frozen, the
-  step never lands — and Pause could not break in either, because
-  `DebugBreakProcess` raises the break on a NEW thread inside the target and
-  `HandleCreateThread` suspended that one too. Not a regression: the freeze was
-  in the initial import (2026-07-21) and had always done this; it surfaced on
-  2026-09-06 during the DDK live verification. The rule now: freeze only for the
-  trap-flag phases, `ResumeStepFrozenThreads` at every transition to a
-  run-to-breakpoint (call return, step-out return, callee body start, sourceless
-  pivot), a 100 ms grace timer in `ProcessOneEvent` for anything still frozen
-  that has gone quiet, and a thaw on `ckPause`. The landing stays thread-scoped
-  through `StepTargetHitByOtherThread` + `RearmStepBpAfterForeignHit`, not
-  through the freeze. Fixtures: `RunStepWaitFixture` (`--run-step-wait`,
-  `--run-step-wait-forever`); tests `StepOver_CallWaitingOnAnotherThread_Completes`
-  (both bitnesses) and `Pause_DuringStepOverThatNeverReturns_BreaksIn`.
-- **The `Test_Threads_*` / `PerThreadStep_*` fixtures prove isolation only for
-  single-stepped instructions.** A step that includes a call now lets the other
-  threads run while the callee executes; do not write a test that expects a
-  spinner's counter to hold still across a stepped-over call.
+- **A step freezes every other thread for the WHOLE step, stepped-over calls
+  included, and gives the isolation up only when it can show the stepped thread
+  is waiting for a frozen one.** "One thread at a time" is the contract; a call
+  that takes seconds of CPU keeps the others frozen for those seconds. What
+  releases them: Wait Chain Traversal on the stepping thread ending on a thread
+  this step froze (a critical section, a mutex, a SendMessage, a thread wait --
+  released at once, the lock and thread named in the Delphi Debugger output),
+  or a kernel wait with no owner the OS can name (an event, a semaphore, I/O)
+  that has lasted `stepIsolationReleaseMs` (default 3000) with the thread
+  consuming no CPU. A CPU-bound stall never releases. `0` never releases;
+  `stepIsolation: "none"` (or a negative value) never freezes. Every release
+  is announced once. Found on 2026-09-06: `F10` on `Application.Initialize;`
+  hung forever and Pause could not break in, because `DebugBreakProcess`
+  raises the break on a NEW thread inside the target and the freeze suspended
+  that one too -- not a regression, the freeze had done this since the initial
+  import (2026-07-21). Pause now releases everything before the break-in and
+  `HandleCreateThread` leaves the break-in thread alone.
+- **Never call `GetThreadWaitChain` from the event pump.** Out-of-process, on
+  a thread that is just waking from its wait, it was measured to block for a
+  full minute; the pump missed the step's landing for that long and a strict-
+  isolation test read it as "the wait never returned". The probe runs on its
+  own thread (`TWctProbe`), the pump only asks and reads.
+- **The landing of a step never depended on the freeze.** `FStepTid` scopes
+  it: a transient step breakpoint or the step's target one-shot reached by
+  another thread is stepped off and re-armed (`StepTargetHitByOtherThread` +
+  `RearmStepBpAfterForeignHit`), so a released step still lands on its own
+  thread. Keep both guards whenever other threads may run.
+- **The `PerThreadStep_*` / `StepOver_CpuBoundCallee_*` tests prove that
+  other threads hold still across a step; the `StepOver_*Wait*` tests prove a
+  release.** Fixtures: `RunStepWaitFixture` (`--run-step-wait`, `-forever`,
+  `-bounded`), `RunStepCpuFixture`, `RunStepCsFixture`. A new isolation test
+  must state which of the two it is proving and configure the threshold
+  explicitly rather than relying on the 3 s default.
 
 ## Synthetic calls into the debuggee
 
