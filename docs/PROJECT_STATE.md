@@ -720,25 +720,15 @@ Debugger features:
   is unchanged; JCL is a MAP-equivalent line/proc fallback for TD32/MAP-less
   modules. Remaining: DCU debug info, `.dcp`-linked (likely already covered), and
   external `.tds`. Full plan + decisions in `DEBUG_INFO_FORMATS_TODO.md`.
-- **Continue from a step stop that sits on a breakpoint re-reports that
-  breakpoint — OPEN (found 2026-09-21).** Step onto a line that carries a
-  breakpoint, then continue: the session stops again at once, on the same
-  address, as a breakpoint hit, having executed nothing. Seen on both bitnesses
-  in `MapOnlyBigText` (step-into from `MapOnlyBigText.dpr` lands on
-  `MapOnlyBigTextTarget.pas:20`; with a breakpoint there, `ContinueExecution`
-  stops with `srBreakpoint` at the same IP). Not MAP-related: the reader only
-  answers line lookups. The IDE executes the line instead. Likely cause: the
-  resume path steps over the INT3 at the current PC only after a breakpoint
-  stop, not after a step stop. Needs a dedicated test; the live MAP test avoids
-  it by placing its breakpoint on the next line.
-- **The MCP server keeps a debuggee's image locked after `stop_debugging` —
-  OPEN, observation (2026-09-21).** After two sessions on `MapOnlyBigText`
-  ended with state `terminated`, rebuilding the fixture failed with `F2039`
-  until `DelphiDebuggerMcp.exe` was killed; no debuggee process was left. The
-  `hFile` handles of the process and DLL debug events are closed
-  (`WinDebuggerBase.pas`), so the holder is something else — probably the
-  symbol readers, which map the binary for the reader's lifetime by design
-  (TRAPS.md, "stale build"), outliving the session in the MCP server.
+- **The MCP server keeps a debuggee's image locked after the session ends —
+  OPEN, observation (2026-09-21, seen twice).** After sessions on
+  `MapOnlyBigText` ended (state `terminated`, and once `exited` after the
+  program ran to its end), rebuilding the fixture failed with `F2039` until
+  `DelphiDebuggerMcp.exe` was killed. No debuggee process was left. The `hFile`
+  handles of the process and DLL debug events are closed (`WinDebuggerBase.pas`),
+  so the holder is something else. Probably the symbol readers, which map the
+  binary for the reader's lifetime by design (TRAPS.md, "stale build"), outlive
+  the session in the MCP server.
 - PE import-table reader so MAP can be dropped entirely.
 - Child process tracking.
 - **Data breakpoints / watchpoints ("stop when this address is written") — DONE,
@@ -1151,6 +1141,17 @@ Architecture / portability:
 
 ## Important technical discoveries
 
+- **Two stops can share thread, RIP and RSP (2026-09-21).** One routine called
+  from two sites of the same frame reaches a breakpoint inside it at the same
+  RIP and RSP; only the return address above the frame differs. The engine's
+  per-stop frames cache (`GetStackFrames`) was keyed by exactly those three and
+  never cleared between stops, on the assumption that "any step/continue
+  changes RIP or RSP". So the second stop showed the first call site as its
+  caller, for every debug-info format. `ReportStopped` now clears the cache
+  (`CallStack_SameRoutineFromTwoCallSites_ShowsEachCaller`). The stale stack
+  first looked like a different defect — "continue after stepping onto a
+  breakpoint re-stops on it" — until the frame-1 return address showed the
+  second stop was the SECOND call, correctly reached.
 - **A MAP's `SSSS:XXXXXXXX` is a linear address only in the segment table
   (2026-09-21, GitHub issue #12).** Everything after it uses the same notation
   for segment-relative offsets. The segment-table scan relied on those offsets

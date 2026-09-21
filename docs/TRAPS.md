@@ -670,6 +670,12 @@ absurdly.
 
 - **Read `%TEMP%\dap_adapter.log` FIRST.** It is append-only and survives the
   session; three defects were diagnosed from it without re-running anything.
+- **"It stopped at the same place again" is not a diagnosis until the RETURN
+  ADDRESS says so.** Two stops can share thread, RIP and RSP: one routine
+  called from two sites of the same frame. Compare frame 1's IP against the
+  call sites in the line table before concluding that execution re-trapped.
+  A stale frames cache made a correct second-call stop look like a re-trap,
+  and a day went to hunting a resume defect that did not exist.
 - **When a step hangs, first distinguish**: the process RUNS but never stops (a
   breakpoint planted at the wrong address — grep the log for `PlantStepBp`) versus
   everything FREEZES (main-thread deadlock, see the MCP findings).

@@ -31,11 +31,14 @@ begin
     RunFiller;
 end;
 
-// The test steps INTO RunTarget from here: on Win32 the filler's `end.` record
-// lies 4 bytes inside RunTarget, and a step-into used to stop there showing the
-// filler.
+// The tests step INTO the first RunTarget call: on Win32 the filler's `end.`
+// record lies 4 bytes inside RunTarget, and a step-into used to stop there
+// showing the filler. The two calls reach any breakpoint in RunTarget with the
+// same thread, RIP and RSP -- only the return address differs -- which is what
+// the engine's frames cache got wrong.
 begin
   KeepFillerLinked;
   GMainReached := GetCurrentProcessId;   // {BP:MAPBIG_MAIN}
   RunTarget(GMainReached);               // {BP:MAPBIG_CALL}
+  RunTarget(GMainReached + 1);           // {BP:MAPBIG_CALL2}
 end.

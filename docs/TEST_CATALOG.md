@@ -659,8 +659,12 @@ fixture):
       the lookup waits for the index instead of recording a permanent miss
       (`SourceLineToRva_RightAfterLoad_WaitsForTheIndex`, on the MapOnlyBigText
       MAP; the live test also passes from the sidecar path)
-- [ ] Continue from a step stop that sits on a breakpoint must not re-stop at
-      that breakpoint (open, see `PROJECT_STATE.md`)
+- [x] Continue from a step that landed on a breakpoint runs on to the next
+      breakpoint -- after a step over, after a step into, and after a repost
+      while stopped there (`ContinueFromAStepThatLandedOnABreakpoint_RunsOn`)
+- [x] One routine called from two sites of the same frame: each stop at a
+      breakpoint inside it shows its own caller, although both stops share
+      thread, RIP and RSP (`CallStack_SameRoutineFromTwoCallSites_ShowsEachCaller`)
 - [x] BPL TD32 -- BP hits (`Test_Bpl_BreakpointHits`,
       `Bpl_Breakpoint_InPackageUnit_Stops`)
 - [x] BPL TD32-only BP hits (`Test_Bpl_Td32Only_BpHits`,

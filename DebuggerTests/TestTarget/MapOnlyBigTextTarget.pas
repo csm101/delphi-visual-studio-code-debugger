@@ -17,7 +17,7 @@ var
 
 procedure RunTarget(Seed: Integer);
 begin
-  GTargetSink := Seed + 1;
+  GTargetSink := Seed + 1;   // {BP:MAPBIG_ENTRY}
   if GTargetSink = 0 then    // {BP:MAPBIG_TARGET}
     ExitProcess(3);
 end;

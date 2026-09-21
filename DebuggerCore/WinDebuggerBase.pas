@@ -202,7 +202,7 @@ type
     // measured to block for a minute, and the event pump cannot afford that.
     FWctProbe:          TObject;     // a TWctProbe (declared in the implementation)
     FWctProbeRef:       IInterface;  // keeps FWctProbe alive for as long as we use it
-    FCachedFrames:    TArray<TStackFrame>; // call stack cached per stop (keyed by TID+RIP+RSP)
+    FCachedFrames:    TArray<TStackFrame>; // this stop's call stack (ReportStopped clears it; keyed by TID+RIP+RSP)
     FCachedFramesTID: DWORD;               // thread the cached frames belong to (0 = none)
     FCachedFramesRIP: UInt64;              // RIP the cached frames belong to (0 = none)
     FCachedFramesRSP: UInt64;              // RSP too: same RIP at a different recursion depth
@@ -4797,6 +4797,13 @@ begin
   FSteppingOffStepBp     := False;
   FIsStopped             := True;
   FPendingContinueStatus := DBG_CONTINUE;
+  // A new stop, a new stack. The frames cache is keyed by TID+RIP+RSP, and two
+  // stops can share all three: one routine called from two sites of the same
+  // frame reaches its breakpoint at the same RIP and RSP, with a different
+  // return address above it. The second stop served the first one's frames and
+  // named the first call site as its caller.
+  FCachedFrames    := nil;
+  FCachedFramesTID := 0;
   if FRearmAfterStopVA <> 0 then begin
     var RearmIdx := FindBreakpointByVA(FRearmAfterStopVA);
     if (RearmIdx >= 0) and not FBreakpoints[RearmIdx].IsOneShot and
@@ -6084,10 +6091,12 @@ begin
   // Per-stop cache, keyed by RIP+RSP: VS Code issues stackTrace twice per stop
   // and scopes/evaluate also need the frames. Recomputing a deep stack
   // (StackWalk64 across every module) is the dominant post-stop cost on a real
-  // app, so serve repeats from the cache. The key auto-invalidates: any
-  // step/goto/continue changes RIP or RSP, so the next call recomputes. RSP is
-  // part of the key because a recursive function can stop at the same RIP at
-  // different depths -- same instruction, different stack.
+  // app, so serve repeats from the cache. It lives for ONE stop: ReportStopped
+  // clears it. The key alone does not change between stops -- a routine called
+  // from two sites of one frame stops at the same RIP and RSP, and served the
+  // previous stop's caller. RSP is in the key for a goto or register write
+  // within a stop, and because a recursive function can stop at the same RIP
+  // at different depths.
   // ...but a walk made while a provider is still building its index produces
   // names that are missing only because the answer was not ready YET. Caching
   // that outcome PINS it for the whole stop: every later stackTrace in the same
