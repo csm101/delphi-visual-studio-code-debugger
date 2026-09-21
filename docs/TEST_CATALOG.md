@@ -662,6 +662,10 @@ fixture):
 - [x] Continue from a step that landed on a breakpoint runs on to the next
       breakpoint -- after a step over, after a step into, and after a repost
       while stopped there (`ContinueFromAStepThatLandedOnABreakpoint_RunsOn`)
+- [x] Once the debuggee is gone -- ran to its end, or terminated -- the still
+      alive session releases the `.exe`, `.map` and `.rsm`, on a MAP-only and
+      a TD32 build, both bitnesses; each fixture is debugged as a private copy
+      (`SessionEnd_ReleasesTheDebuggeeFiles`)
 - [x] One routine called from two sites of the same frame: each stop at a
       breakpoint inside it shows its own caller, although both stops share
       thread, RIP and RSP (`CallStack_SameRoutineFromTwoCallSites_ShowsEachCaller`)

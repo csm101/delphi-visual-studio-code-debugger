@@ -388,6 +388,10 @@ type
     // Maps a standalone `.tds` read-only into FTdsBase; returns its byte size.
     function  OpenTdsMapping(const TdsPath: string): Int64;
     procedure CloseMappedFile;
+    // The parse behind LoadFromFile / LoadFromTdsFile, once the files are
+    // mapped. Raises on anything that is not usable TD32; the callers unmap.
+    procedure ParseMappedDebugInfo;
+    procedure ParseTdsDebugInfo(const TdsPath: string);
     function  FindDebugSection: Boolean;
     function  FindAppendedDebugBlob: Boolean;
     function  FindTD32Header: Boolean;
@@ -2509,15 +2513,29 @@ begin
   FExePath := ExePath;
   FOutputRvaShift := OutputRvaShift;
   OpenMappedFile(ExePath);
+  try
+    ParseMappedDebugInfo;
+  except
+    // A failed load must not keep the file mapped. The reader is then never
+    // registered as a provider, so nothing else would ever release it: on an
+    // exe with no TD32 (a MAP-only build) the mapping outlived the session and
+    // locked the .exe against a rebuild until the whole process exited.
+    CloseMappedFile;
+    raise;
+  end;
+end;
+
+procedure TTD32FileReader.ParseMappedDebugInfo;
+begin
   // The section walk always runs: besides finding an embedded `.debug`, it is
   // what builds the segment -> RVA tables and the image base. Only when no such
   // section exists do we fall back to the trailer at the end of the file, which
   // finds a blob appended past the image with nothing describing it.
   if not FindDebugSection then
     if not FindAppendedDebugBlob then
-      raise Exception.Create('No .debug section and no appended CodeView blob in ' + ExePath);
+      raise Exception.Create('No .debug section and no appended CodeView blob in ' + FExePath);
   if not FindTD32Header then
-    raise Exception.Create('No TD32 signature in ' + ExePath);
+    raise Exception.Create('No TD32 signature in ' + FExePath);
   if not ReadDirectory then
     raise Exception.Create('Invalid TD32 directory');
   // Each phase is timed into FPhaseMs. Diagnostic only -- one clock read per
@@ -2574,6 +2592,17 @@ begin
   // -VT binary has NO embedded `.debug`, so its result is ignored -- the CodeView
   // blob comes from the `.tds` mapped below.
   OpenMappedFile(ExePath);
+  try
+    ParseTdsDebugInfo(TdsPath);
+  except
+    // As in LoadFromFile: a failed load must not keep either file mapped.
+    CloseMappedFile;
+    raise;
+  end;
+end;
+
+procedure TTD32FileReader.ParseTdsDebugInfo(const TdsPath: string);
+begin
   FindDebugSection;
   // External `.tds` CodeView offsets are stored relative to (segment - ImageBase)
   // (empirically verified: they are ImageBase lower than the embedded `.debug`

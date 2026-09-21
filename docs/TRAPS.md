@@ -676,6 +676,14 @@ absurdly.
   call sites in the line table before concluding that execution re-trapped.
   A stale frames cache made a correct second-call stop look like a re-trap,
   and a day went to hunting a resume defect that did not exist.
+- **A debuggee file locked RIGHT at the end of a session is not yet a leak.**
+  The kernel releases an exited process's image section a moment after its
+  last debug event. Poll for a second or so before hunting a holder. When a
+  lock does persist, `DevTools\SessionEndLockProbe` lists the views and handles
+  this process holds on the files. It can also show that nothing in the
+  process holds them any more, which proves the lock is kernel teardown.
+  handle.exe prints a handle to an exited process as `<Non-existent Process>`,
+  not by name.
 - **When a step hangs, first distinguish**: the process RUNS but never stops (a
   breakpoint planted at the wrong address — grep the log for `PlantStepBp`) versus
   everything FREEZES (main-thread deadlock, see the MCP findings).

@@ -964,6 +964,28 @@ repeated small values, or pairs of in-image addresses.
 
 ### Live process and adapter
 
+#### SessionEndLockProbe
+
+```bat
+DevTools\Win64\Debug\SessionEndLockProbe.exe <fixture.exe> [end|terminate]
+```
+
+Finds what keeps a debuggee's files locked after its debug session ended. It
+debugs a copy of the exe (with its `.map` / `.rsm`) in a fresh folder, ends
+the session (the program runs to its end, or is terminated at its entry stop),
+and with the session object still alive reports:
+
+- which files cannot be opened for exclusive writing;
+- every view of them mapped into this process (`IMAGE` or `MAPPED`);
+- this process's handles on them and on the debuggee's process and threads,
+  via Sysinternals `handle.exe` when it is on the PATH;
+- how long the `.exe` takes to become free.
+
+It repeats the report after freeing the session, which separates what the
+session holds from what outlives it. A lock with no view and no handle, that
+clears within a second, is the kernel tearing the exited process down, not a
+leak (`docs/TRAPS.md`).
+
 #### ProcessEnumProbe
 
 ```bat

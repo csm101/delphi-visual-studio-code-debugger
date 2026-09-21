@@ -285,6 +285,12 @@ type
     // engine's per-stop frames cache -- and the second stop served the first
     // one's frames, naming the FIRST call site as its caller.
     [Test] procedure CallStack_SameRoutineFromTwoCallSites_ShowsEachCaller;
+    // The MCP server keeps an ended session until the next launch, so whatever
+    // the session holds open stays open: rebuilding the target failed with
+    // F2039 until the server was killed. A session must let go of the
+    // debuggee's files once the debuggee is gone -- after it runs to its end and
+    // after it is terminated -- while the session object itself lives on.
+    [Test] procedure SessionEnd_ReleasesTheDebuggeeFiles;
     // A routine name is not a variable: there is nothing at its address to read
     // as a value, only its machine code. Reading it anyway produced numbers like
     // 1796744703 -- which is `FF 25 18 6B`, the first four bytes of an import
@@ -7159,6 +7165,133 @@ begin
     end);
   Assert.AreEqual('', Failures,
     'each stop must show its own caller, also when two stops share thread, RIP and RSP -- ' + Failures);
+end;
+
+// A copy of a fixture's files in a fresh folder, so that an exclusive open
+// cannot collide with another worker debugging the shared build. Returns the
+// copied .exe.
+function CopyFixtureToTempFolder(const SourceDir, BaseName: string): string;
+begin
+  var Folder := TPath.Combine(TPath.GetTempPath, 'SessionEnd-' + TGUID.NewGuid.ToString);
+  TDirectory.CreateDirectory(Folder);
+  for var Ext in ['.exe', '.map', '.rsm'] do
+    if TFile.Exists(SourceDir + BaseName + Ext) then
+      TFile.Copy(SourceDir + BaseName + Ext, TPath.Combine(Folder, BaseName + Ext));
+  Result := TPath.Combine(Folder, BaseName + '.exe');
+end;
+
+procedure DeleteFolderIfPossible(const Folder: string);
+begin
+  try
+    TDirectory.Delete(Folder, True);
+  except
+    // A folder whose files are still locked is what the caller reports.
+  end;
+end;
+
+// True unless Path opens for exclusive writing within a grace period. The
+// kernel releases an exited process's image section a moment AFTER its last
+// debug event, so a lock seen at that instant is not yet a holder in this
+// process (measured with DevTools\SessionEndLockProbe: free well within a
+// second). A real holder keeps it locked for the session's whole life.
+function StaysLocked(const Path: string): Boolean;
+const
+  GRACE_MS = 5000;
+begin
+  var Deadline := GetTickCount64 + GRACE_MS;
+  repeat
+    var Handle := CreateFile(PChar(Path), GENERIC_WRITE, 0, nil, OPEN_EXISTING, 0, 0);
+    if Handle <> INVALID_HANDLE_VALUE then begin
+      CloseHandle(Handle);
+      Exit(False);
+    end;
+    Sleep(20);
+  until GetTickCount64 > Deadline;
+  Result := True;
+end;
+
+// The debuggee's files a rebuild would have to overwrite and cannot: '' when
+// every one of them opens for exclusive writing.
+function LockedDebuggeeFiles(const ExePath: string): string;
+begin
+  Result := '';
+  for var Ext in ['.exe', '.map', '.rsm'] do begin
+    var Path := ChangeFileExt(ExePath, Ext);
+    if TFile.Exists(Path) and StaysLocked(Path) then
+      Result := Result + ExtractFileName(Path) + ' ';
+  end;
+end;
+
+procedure TWin32RunControlTests.SessionEnd_ReleasesTheDebuggeeFiles;
+type
+  TSessionEnding = (seRanToEnd, seTerminated);
+const
+  ENDING_NAMES: array[TSessionEnding] of string = ('ran to its end', 'terminated');
+  FIXTURES: array[0..1] of string = ('MapOnlyGlobals', 'NestedEnumSample');
+
+  function EndSession(Session: TDebugSession; Ending: TSessionEnding): string;
+  begin
+    if Ending = seTerminated then begin
+      PumpUntilStop(Session, 30000);
+      if Session.State <> dsStopped then
+        Exit('never stopped at entry');
+      Session.Terminate;
+      Exit('');
+    end;
+    PumpUntilStoppedOrExited(Session, 30000);
+    if not Session.HasExited then
+      Exit('did not run to its end');
+    Result := '';
+  end;
+
+  function RunScenario(const ExePath: string; Ending: TSessionEnding): string;
+  begin
+    var Session := TDebugSession.Create;
+    try
+      var Opts := Default(TLaunchOptions);
+      Opts.ExePath     := ExePath;
+      Opts.MapPath     := ChangeFileExt(ExePath, '.map');
+      if TFile.Exists(ChangeFileExt(ExePath, '.rsm')) then
+        Opts.RsmPath   := ChangeFileExt(ExePath, '.rsm');
+      Opts.SourceRoot  := TargetDir;
+      Opts.StopAtEntry := Ending = seTerminated;
+      Assert.IsTrue(Session.Launch(Opts), 'Launch returned False');
+      Result := EndSession(Session, Ending);
+      if Result <> '' then
+        Exit;
+      // The session object is still alive, exactly as the MCP server keeps it.
+      var Locked := LockedDebuggeeFiles(ExePath);
+      if Locked <> '' then
+        Result := 'still locked: ' + Locked.Trim;
+    finally
+      Session.Free;
+    end;
+  end;
+
+  // Every ending, each on its own fresh copy of the fixture.
+  function CheckFixture(const SourceDir, Fixture, Caption: string): string;
+  begin
+    Result := '';
+    for var Ending := Low(TSessionEnding) to High(TSessionEnding) do begin
+      var ExePath := CopyFixtureToTempFolder(SourceDir, Fixture);
+      var Problem := RunScenario(ExePath, Ending);
+      if Problem <> '' then
+        Result := Result + Format('%s, %s: %s; ', [Caption, ENDING_NAMES[Ending], Problem]);
+      DeleteFolderIfPossible(ExtractFileDir(ExePath));
+    end;
+  end;
+
+begin
+  var Failures := '';
+  for var PlatformDir in ['Win32', 'Win64'] do
+    for var Fixture in FIXTURES do begin
+      var SourceDir := TargetDir + PlatformDir + '\Debug\';
+      Assert.IsTrue(FileExists(SourceDir + Fixture + '.exe'),
+        PlatformDir + ' ' + Fixture + ' fixture missing -- run build_target.bat');
+      Failures := Failures + CheckFixture(SourceDir, Fixture, PlatformDir + ' ' + Fixture);
+    end;
+  Assert.AreEqual('', Failures,
+    'once the debuggee is gone, the session must release its files -- ' + Failures);
 end;
 
 procedure TWin32RunControlTests.ThreadVar_IsNeverSilentlyWrongOnBothBitnesses;

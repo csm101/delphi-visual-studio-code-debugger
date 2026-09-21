@@ -345,14 +345,14 @@ type
     procedure EnsureMainJcl;
     procedure LoadMainMap;
     procedure LoadMainModule(const AExePath, AMapPath, ARsmPath: string);
-    // Releases the main exe's embedded-TD32 (/.tds) memory mapping so the file
-    // is no longer locked on disk. Called when the debuggee exits: TD32 lives
-    // INSIDE the exe, and the reader keeps it mapped for the loader's whole life
-    // -- which, on an attach, outlives the target and blocks a rebuild until the
-    // server exits. The main reader is main-thread only (the worker touches only
-    // runtime modules), so this is race-free at exit. The next LoadMainModule
-    // (fired on every launch/attach) reloads a fresh reader; RSM/MAP/JCL are
-    // latched and untouched.
+    // Releases every main-exe reader -- embedded TD32 (/.tds), MAP, RSM, JCL --
+    // so none of the exe's build outputs stays locked on disk. Called when the
+    // debuggee exits: each reader keeps its file mapped for the loader's whole
+    // life, which in an MCP server or on an attach outlives the target and
+    // blocks a rebuild (F2039) until the server exits. The main readers are
+    // main-thread only (the worker touches only runtime modules), so this is
+    // race-free at exit. The next LoadMainModule (fired on every launch/attach)
+    // loads them all again.
     procedure ReleaseMainSymbolMapping;
     // The runtime-module counterpart: every loaded BPL/DLL keeps its own binary
     // mapped (embedded TD32) exactly like the main exe, so each stays locked on
@@ -1150,28 +1150,60 @@ procedure TModuleSymbolLoader.ReleaseMainSymbolMapping;
     FMainFormats := Kept;
   end;
 
-  // Reader is TInterfacedObject, owned solely by the provider ref FDebugInfo
+  function IsMainFormat(const Fmt: string): Boolean;
+  begin
+    for var F in FMainFormats do
+      if SameText(F, Fmt) then
+        Exit(True);
+    Result := False;
+  end;
+
+  // Readers are TInterfacedObject, owned solely by the provider ref FDebugInfo
   // holds (see Destroy). Removing that ref drops the count to zero, so the
   // object destroys itself -- and its destructor unmaps the file, freeing the
-  // on-disk lock. The field then dangles, so reseat it with a fresh empty
-  // reader that the next LoadMainTD32/LoadMainTds will populate. Untouched when
-  // never loaded (refcount 0, no provider): leave the existing empty instance.
-  procedure ReleaseOne(var Reader: TTD32FileReader; const Fmt: string);
+  // on-disk lock. The caller then reseats its field with a fresh empty reader.
+  procedure ForgetProvider(const Provider: IInterface; const Fmt: string);
   begin
-    if (Reader = nil) or not Reader.Loaded then
-      Exit;
-    FDebugInfo.RemoveProvider(Reader as IInterface);
+    FDebugInfo.RemoveProvider(Provider);
     if FMainProviderCount > 0 then
       Dec(FMainProviderCount);
     ExcludeFormat(Fmt);
+  end;
+
+  // Untouched when never loaded (refcount 0, no provider): leave the existing
+  // empty instance.
+  procedure ReleaseTd32(var Reader: TTD32FileReader; const Fmt: string);
+  begin
+    if (Reader = nil) or not Reader.Loaded then
+      Exit;
+    ForgetProvider(Reader as IInterface, Fmt);
     Reader := TTD32FileReader.Create;
   end;
 
 begin
   if FDebugInfo = nil then
     Exit;
-  ReleaseOne(FMainTD32, 'td32');
-  ReleaseOne(FMainTds, 'tds');
+  ReleaseTd32(FMainTD32, 'td32');
+  ReleaseTd32(FMainTds, 'tds');
+  // The .map and .rsm are build outputs too, rewritten by every rebuild just
+  // like the .exe. Their readers keep them mapped, so an ended session that the
+  // MCP server holds on to blocked the rebuild on them (F2039).
+  if FMainMapRegistered then begin
+    ForgetProvider(FMainMap as IInterface, 'map');
+    FMainMap := TMapFile.Create;
+    FMainMapRegistered := False;
+  end;
+  if IsMainFormat('rsm') then begin
+    ForgetProvider(FMainRsm as IInterface, 'rsm');
+    FMainRsm := TRsmFile.Create;
+  end;
+  if FMainJcl <> nil then begin
+    ForgetProvider(FMainJcl, 'jdbg');
+    FMainJcl := nil;
+  end;
+  // Unlatched, so the next LoadMainModule loads them again.
+  FMainRsmLoaded := False;
+  FMainJclLoaded := False;
 end;
 
 procedure TModuleSymbolLoader.ReleaseModuleSymbolMappings;

@@ -720,15 +720,6 @@ Debugger features:
   is unchanged; JCL is a MAP-equivalent line/proc fallback for TD32/MAP-less
   modules. Remaining: DCU debug info, `.dcp`-linked (likely already covered), and
   external `.tds`. Full plan + decisions in `DEBUG_INFO_FORMATS_TODO.md`.
-- **The MCP server keeps a debuggee's image locked after the session ends —
-  OPEN, observation (2026-09-21, seen twice).** After sessions on
-  `MapOnlyBigText` ended (state `terminated`, and once `exited` after the
-  program ran to its end), rebuilding the fixture failed with `F2039` until
-  `DelphiDebuggerMcp.exe` was killed. No debuggee process was left. The `hFile`
-  handles of the process and DLL debug events are closed (`WinDebuggerBase.pas`),
-  so the holder is something else. Probably the symbol readers, which map the
-  binary for the reader's lifetime by design (TRAPS.md, "stale build"), outlive
-  the session in the MCP server.
 - PE import-table reader so MAP can be dropped entirely.
 - Child process tracking.
 - **Data breakpoints / watchpoints ("stop when this address is written") — DONE,
@@ -1141,6 +1132,22 @@ Architecture / portability:
 
 ## Important technical discoveries
 
+- **An ended session must not hold the debuggee's build outputs (2026-09-21).**
+  The MCP server keeps an ended `TDebugSession` until the next launch, so
+  anything it holds stays locked, and rebuilding the target failed with
+  `F2039` until the server was killed. `DevTools\SessionEndLockProbe` found two
+  holders.
+  (1) `TTD32FileReader.LoadFromFile` maps the exe BEFORE finding out it has no
+  TD32, and raised without unmapping. On a MAP-only exe the reader is then never
+  registered, so nothing released it, and the exe stayed locked even after the
+  session was freed, until the process exited. It now unmaps on any failed load
+  (both `LoadFromFile` and `LoadFromTdsFile`).
+  (2) At a natural exit the session released only the TD32 readers
+  (`ReleaseMainSymbolMapping`). The MAP, RSM and JCL readers kept the `.map` and
+  `.rsm` mapped; they are released too now, and re-latched for a reload.
+  What remains right at the end is the kernel tearing the exited process down:
+  the image section goes a moment AFTER the last debug event, well within a
+  second (`SessionEnd_ReleasesTheDebuggeeFiles` allows a grace period for it).
 - **Two stops can share thread, RIP and RSP (2026-09-21).** One routine called
   from two sites of the same frame reaches a breakpoint inside it at the same
   RIP and RSP; only the return address above the frame differs. The engine's
