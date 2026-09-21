@@ -854,6 +854,59 @@ whitespace or end of line. `MAP_SIDECAR_MAGIC` was bumped `MIX2` → `MIX3` at t
 same time: sidecars written by an earlier build baked `MinRva` values computed
 from an empty segment table and must not be reused.
 
+The segment table is the ONLY place in a MAP where `SSSS:XXXXXXXX` is a linear
+address. The detailed map of segments, the publics and the line numbers that
+follow it use the same notation for segment-RELATIVE offsets, with 8 hex digits
+on both bitnesses. `ParseSegmentTableEager` used to scan a 512 KB prefix and
+separate the two with `linear >= preferred base`, which holds only while every
+offset stays below the preferred base. Once `.text` passes 4 MB, a detailed-map
+row (`0001:063EF864 000587E8 C=CODE ... M=Unit`) clears that test and the last
+one read overwrites segment 1's base. Every `.text` RVA is then wrong while the
+line lookup still succeeds, so every breakpoint reports verified and the plant
+fails at an unmapped address (GitHub issue #12). The parse now stops at the
+first blank line after a table row: the table is one contiguous block on both
+bitnesses. `MAP_SIDECAR_MAGIC` went `MIX4` → `MIX6`, because the sidecar bakes
+`MinRva = segment base + offset` and a big image's sidecar had the corrupted
+base in it.
+
+One source file owns several `Line numbers for` sections: its unit's `.text`
+and `.itext` (initialization/finalization, a program's main block) are separate
+sections, and every unit that instantiates a generic gets a section of its own
+for the generic's source file (`UnitX(System.Generics.Collections.pas)`). The
+unit index (`FUnitSections`) keeps a list of sections per upper-cased file name,
+and loading a file parses all of them in MAP order. With first-wins, a line in
+a later section had no address and an address in one had no line. The sidecar
+stores one record per section, so a file name may repeat in it; that change
+shares the `MIX6` bump (`MIX5` was an unreleased intermediate layout).
+
+Sections of different files **interleave in address**. A unit's generic
+instantiations, its `.inc` files and C files `#include`d into one another sit
+between the unit's own lines. The address → line lookup (`RvaToSourceLine`)
+therefore cannot load just "the section that starts closest before the
+address". Each section carries `MinRva` and `MaxRva` (its first and last
+record). A section lists its records in ascending address order: 0 exceptions
+in 167k sections of the two Hydra2 MAPs, counted by `DevTools\MapLineRvaProbe`.
+`FSectionsByRva` is sorted by `MinRva` and carries a prefix maximum of `MaxRva`.
+`UnitKeysNearRva` walks back from the last section starting at or before the
+address, loading every file whose section can hold a record within
+`MAX_LINE_SPAN` (512 bytes) of it. It stops once the prefix maximum falls below
+that window. Only then is the nearest preceding record looked up. The old
+"answer from what is loaded, load only on a miss" returned a neighbouring file's
+line whenever one happened to be loaded, so the answer depended on what had been
+looked up before.
+
+Two sections can also hold a record at the **same** address. On a real MAP this
+happens at a unit boundary: a unit's section ends with a record at the unit's
+end address, which is the next unit's first record. The later section in the
+MAP wins (`StoreLineRecord`). Sections are listed in link order, so that is the
+unit whose code starts there. Each loaded record keeps its section's
+`DataOffset` for exactly this comparison.
+
+`FSortedRvas` (the sorted keys of `FRvaToLoc`) is maintained by merging each
+batch of newly loaded RVAs into it (`MergePendingRvas`), not by re-sorting
+everything loaded after every file. On a 139 MB MAP the re-sort had made single
+lookups take ~2 s once enough files were loaded.
+
 `ReadPEPreferredBase` must read the right field for the right magic: PE32+ keeps
 `ImageBase` at optional header `+$18` as 8 bytes, PE32 at `+$1C` as 4 bytes
 (PE32+ widened the field and dropped the preceding `BaseOfData`). Falling back

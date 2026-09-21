@@ -326,6 +326,17 @@ absurdly.
   behave identically.
 - **The live-attach test is gated by `HaveDebugPrivilege` and silently SKIPS when
   not elevated.** A green run does not prove attach was exercised.
+- **The MAP reader's behaviour on a LARGE real image is outside every fixture.**
+  `MapOnlyBigText` covers a `.text` past 4 MB, but no fixture has tens of
+  thousands of line sections, interleaved sections of different files, or
+  generics instantiated across hundreds of units. For GitHub issue #12 the
+  synthetic tests and the whole suite were green while
+  `DevTools\MapLineRvaProbe` on the real 139 MB Hydra2 MAP found three more
+  defects: lines in a file's later sections were never indexed, `RvaToSourceLine`
+  answered from whatever happened to be loaded (wrong file, order-dependent), and
+  a full re-sort after every file load made single lookups take ~2 s. After any
+  `MapFileReader` change, run the probe against a large real MAP on both
+  bitnesses, twice (the second run reads the sidecar).
 
 ## Cleanup that silently never happens
 

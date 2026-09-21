@@ -24,6 +24,14 @@ set MAPONLY64_ERR=%errorlevel%
 if not exist Win32\Debug md Win32\Debug
 dcc32 -$O- -GD -E.\Win32\Debug -NU.\Win32\Debug MapOnlyGlobals.dpr 2>&1
 set MAPONLY32_ERR=%errorlevel%
+rem MAP-only again, with more than 4 MB of .text in front of MapOnlyBigTextTarget
+rem (GitHub issue #12: past the preferred base, the detailed map's unit offsets
+rem used to corrupt the MAP segment table). The filler is include-generated, so
+rem each build takes a few seconds.
+dcc64 -$O- -GD -E.\Win64\Debug -NU.\Win64\Debug MapOnlyBigText.dpr 2>&1
+set MAPBIG64_ERR=%errorlevel%
+dcc32 -$O- -GD -E.\Win32\Debug -NU.\Win32\Debug MapOnlyBigText.dpr 2>&1
+set MAPBIG32_ERR=%errorlevel%
 rem Nested-enum fixture: embedded TD32 (-V) so the tests can read how the
 rem compiler records a class-nested type versus a unit-level or routine-local
 rem one. Separate target on purpose -- adding declarations to TestTarget shifts
@@ -78,6 +86,8 @@ if not "%EXE_ERR%"=="0" exit /b %EXE_ERR%
 if not "%TDS_ERR%"=="0" exit /b %TDS_ERR%
 if not "%MAPONLY64_ERR%"=="0" exit /b %MAPONLY64_ERR%
 if not "%MAPONLY32_ERR%"=="0" exit /b %MAPONLY32_ERR%
+if not "%MAPBIG64_ERR%"=="0" exit /b %MAPBIG64_ERR%
+if not "%MAPBIG32_ERR%"=="0" exit /b %MAPBIG32_ERR%
 if not "%NESTED64_ERR%"=="0" exit /b %NESTED64_ERR%
 if not "%NESTED32_ERR%"=="0" exit /b %NESTED32_ERR%
 if not "%NOSRC64_ERR%"=="0" exit /b %NOSRC64_ERR%

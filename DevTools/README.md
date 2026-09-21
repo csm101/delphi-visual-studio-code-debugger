@@ -435,6 +435,29 @@ It also replays the old fixed-16-hex-digit parse, so the two can be compared
 side by side. Reach for this when MAP-derived addresses are off by a constant,
 or when adding support for a new image format.
 
+#### MapLineRvaProbe
+
+```bat
+DevTools\Win64\Debug\MapLineRvaProbe.exe <image.exe|dll|bpl> <file.map> [maxSamples]
+```
+
+Checks `TMapFile`'s line ↔ RVA mapping against the PE section table, on a real
+MAP of any size. The truth for a `line SSSS:offset` record is the
+`VirtualAddress` of the PE section named like segment SSSS plus the offset,
+derived without `TMapFile`. The probe samples the first record of sections
+spread over the whole MAP (default 300, always including the farthest section
+of each segment) and requires both `RvaToSourceLine(expected)` to give back that
+file and line, and `SourceLineToRva(file, line)` to give an RVA that maps back
+to them. It also counts sections whose records are not in ascending address
+order, which `TMapFile` relies on to bound a section by its first and last
+records. Exit code 0 = all agreed, 1 = a mismatch, 2 = bad input.
+
+Like the adapter, `TMapFile` writes `<map>.idx` beside the MAP, so a second run
+exercises the sidecar fast path. **Run it against a large real MAP after any
+`MapFileReader` change.** Synthetic tests cannot build a `.text` past 4 MB, and
+on the 139 MB Hydra2 MAP this probe found three defects that every synthetic
+test and the whole suite had passed (see `docs/TRAPS.md`).
+
 ### PE / raw binary
 
 #### DumpFunc

@@ -1,0 +1,26 @@
+// Generated filler for MapOnlyBigText (see MapOnlyBigTextFiller.pas). Never executed.
+GFillSink := GFillSink * 31 + GFillSink div 7 - 1;
+GFillSink := GFillSink * 31 + GFillSink div 7 - 2;
+GFillSink := GFillSink * 31 + GFillSink div 7 - 3;
+GFillSink := GFillSink * 31 + GFillSink div 7 - 4;
+GFillSink := GFillSink * 31 + GFillSink div 7 - 5;
+GFillSink := GFillSink * 31 + GFillSink div 7 - 6;
+GFillSink := GFillSink * 31 + GFillSink div 7 - 7;
+GFillSink := GFillSink * 31 + GFillSink div 7 - 8;
+GFillSink := GFillSink * 31 + GFillSink div 7 - 9;
+GFillSink := GFillSink * 31 + GFillSink div 7 - 10;
+GFillSink := GFillSink * 31 + GFillSink div 7 - 11;
+GFillSink := GFillSink * 31 + GFillSink div 7 - 12;
+GFillSink := GFillSink * 31 + GFillSink div 7 - 13;
+GFillSink := GFillSink * 31 + GFillSink div 7 - 14;
+GFillSink := GFillSink * 31 + GFillSink div 7 - 15;
+GFillSink := GFillSink * 31 + GFillSink div 7 - 16;
+GFillSink := GFillSink * 31 + GFillSink div 7 - 17;
+GFillSink := GFillSink * 31 + GFillSink div 7 - 18;
+GFillSink := GFillSink * 31 + GFillSink div 7 - 19;
+GFillSink := GFillSink * 31 + GFillSink div 7 - 20;
+GFillSink := GFillSink * 31 + GFillSink div 7 - 21;
+GFillSink := GFillSink * 31 + GFillSink div 7 - 22;
+GFillSink := GFillSink * 31 + GFillSink div 7 - 23;
+GFillSink := GFillSink * 31 + GFillSink div 7 - 24;
+GFillSink := GFillSink * 31 + GFillSink div 7 - 25;

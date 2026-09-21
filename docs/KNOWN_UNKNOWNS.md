@@ -1701,6 +1701,30 @@ The per-adapter logging this question's "next step" asks for now exists:
 `DAP_LOG=1` on the runner gives every adapter its own file via `DAP_LOG_PATH`,
 and the timeout messages name it.
 
+## MAP ghost line records — where do they come from?
+
+Measured 2026-09-21 on the Win32 Hydra2SingleEXE MAP (build of 2026-08-03). A
+unit that instantiates a generic (e.g. `dbConn.Pkg<TPkgGiri>` in
+`frmTABEsclusioneGiriPVU`) often has NO `.text` section for the generic's file.
+It has only a one-record `.itext` section of that file (`Oracle.pas` line 1321,
+the generic's `end;`), at an address outside the unit's own range: 531 of 538
+foreign-file `.itext` sections. The fix that does not depend on the answer is
+planned in `PROJECT_STATE.md`, "MAP reader: drop ghost line records".
+
+**Hypothesis (unverified):** the linker keeps one copy of each duplicate generic
+instantiation and discards the others. A discarded copy leaves behind its last
+line record, at whatever offset the discarded code would have had. Every ghost
+line is a line of generic code (`Pkg<T>`'s `end;`, the anonymous method in
+`TList<T>.Pack`, the abstract methods of `TComparer<T>` / `TEqualityComparer<T>`),
+which fits.
+
+**What would settle it:** a fixture with two units that both instantiate the
+same generic method with the same type argument, plus a third unit that
+instantiates it with a different one. Build it with a detailed MAP and check
+which units keep a `.text` section for the generic's file and where the others'
+records land. Also open: whether Win64 has the same ghosts in `.text` (it has no
+`.itext`; its MAP showed only 4 shared addresses).
+
 ## Large-project scale (SampleApp / 780 MB RSM)
 
 - **Cold-start scan duration — MEASURED 2026-08-03.** On
