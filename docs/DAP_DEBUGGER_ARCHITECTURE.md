@@ -907,6 +907,50 @@ batch of newly loaded RVAs into it (`MergePendingRvas`), not by re-sorting
 everything loaded after every file. On a 139 MB MAP the re-sort had made single
 lookups take ~2 s once enough files were loaded.
 
+**Not every line record is where it claims to be.** The "Detailed map of
+segments" says which unit's code each address belongs to (`ReadUnitCodeRanges`
+turns its CODE / ICODE rows into RVA ranges). Checked against it, a MAP holds
+"ghost" records that lie in ANOTHER unit's code. There are two kinds:
+
+- a Win32 unit's final `end.` sits 4–7 bytes past the unit, inside the next
+  unit's first routine (1410 of 6594 units on the Win32 Hydra2 MAP; none on the
+  Win64 TestTarget MAP);
+- a unit that instantiates a generic whose code it does not keep gets a
+  one-record `.itext` section of the generic's file at an unrelated address
+  (531 on the same MAP: `Oracle.pas` `Pkg<T>`, `System.Generics.*`; the
+  linker mechanism is open in `KNOWN_UNKNOWNS.md`).
+
+In all, `DevTools\MapLineRvaProbe` counts 2062 ghost records on the Win32
+Hydra2 MAP and 740 on the Win64 one.
+
+Taken at face value they put another unit's line on an address. The live
+symptom: a step-into on Win32 stopped 4 bytes into a routine and showed the
+previous unit's `end.`. `ParseUnitSectionAt` therefore drops a record that
+falls outside its own section's unit, and binding a breakpoint to such a line
+fails, since it has no code. A unit the detailed map does not list, or a MAP
+without one, is not checked. That is why each section in the index (and the
+sidecar, `MIX7`) carries its `UnitName`.
+
+The nearest-preceding-record search is also bounded to the unit containing the
+address (`NearestRecordIsInSameUnit`). A Win32 unit initialization typically
+opens with a ~12-byte prologue before its first record, and the nearest record
+before those bytes is the previous unit's last line. "No line" is the answer
+there.
+
+**Binding waits for the index; address lookups do not.** `EnsureUnitByKey`
+used to record a file as loaded even when the background index was not yet
+published, so a miss stuck, and it read `FUnitSections` while the worker was
+still filling it. A breakpoint set right after launch (VS Code sends
+`setBreakpoints` at once) stayed unverified for the whole session, and nothing
+re-asks when the MAP finishes indexing. It became systematic once the sidecar
+held one record per section: on a 5.8 MB `.text` fixture the sidecar took ~100 ms
+to read against a 50 ms wait. Now nothing is recorded before `FIndexReady`,
+and `SourceLineToRva` waits for the index (`WaitForIndexUpTo`, 15 s bound; a
+359 MB MAP is ready in under 3 s). It stops waiting at once when no worker
+exists or the worker ended without publishing. Address → line keeps the 50 ms
+wait: a stack walk made while indexing is pending is redone, not cached. The
+sidecar is read through a `TBufferedFileStream`.
+
 `ReadPEPreferredBase` must read the right field for the right magic: PE32+ keeps
 `ImageBase` at optional header `+$18` as 8 bytes, PE32 at `+$1C` as 4 bytes
 (PE32+ widened the field and dropped the preceding `BaseOfData`). Falling back

@@ -442,15 +442,25 @@ DevTools\Win64\Debug\MapLineRvaProbe.exe <image.exe|dll|bpl> <file.map> [maxSamp
 ```
 
 Checks `TMapFile`'s line ↔ RVA mapping against the PE section table, on a real
-MAP of any size. The truth for a `line SSSS:offset` record is the
+MAP of any size. The address of a `line SSSS:offset` record is the
 `VirtualAddress` of the PE section named like segment SSSS plus the offset,
-derived without `TMapFile`. The probe samples the first record of sections
-spread over the whole MAP (default 300, always including the farthest section
-of each segment) and requires both `RvaToSourceLine(expected)` to give back that
-file and line, and `SourceLineToRva(file, line)` to give an RVA that maps back
-to them. It also counts sections whose records are not in ascending address
-order, which `TMapFile` relies on to bound a section by its first and last
-records. Exit code 0 = all agreed, 1 = a mismatch, 2 = bad input.
+derived without `TMapFile`. The owner of every address comes from the MAP's
+"Detailed map of segments". A record lying in another unit's code is a
+**ghost**, which `TMapFile` drops.
+
+What it checks:
+- The first record of sections spread over the whole MAP (default 300, always
+  including the farthest section of each segment) and every address carrying
+  several records. `RvaToSourceLine` must return one of the real records there.
+  For a single record, `SourceLineToRva(file, line)` must return an RVA that
+  maps back to it.
+- Every ghost address. `RvaToSourceLine` must not return the ghost.
+- The first byte of every unit's code. `RvaToSourceLine` must return a real
+  record at that very address, or nothing when there is none.
+
+It also counts sections whose records are not in ascending address order,
+which `TMapFile` relies on to bound a section by its first and last records.
+Exit code: 0 = all agreed, 1 = a mismatch, 2 = bad input.
 
 Like the adapter, `TMapFile` writes `<map>.idx` beside the MAP, so a second run
 exercises the sidecar fast path. **Run it against a large real MAP after any

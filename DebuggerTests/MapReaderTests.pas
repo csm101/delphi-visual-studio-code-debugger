@@ -62,6 +62,25 @@ type
     // the files were loaded in. It used to be whichever was loaded first.
     [Test]
     procedure RvaToSourceLine_SharedAddressAtAUnitBoundary_GoesToTheLaterSection;
+    // A Win32 unit's final `end.` record often lies a few bytes past the unit,
+    // inside the next unit's first routine (1410 of 6594 units on a real MAP).
+    // Taken at face value it made a step-into there stop and show the previous
+    // unit's `end.`. The detailed map says whose code that is: the record must
+    // be ignored, both for address -> line and for binding a breakpoint.
+    [Test]
+    procedure RvaToSourceLine_UnitEndRecordPastItsUnit_IsNotUsed;
+    // Bytes at the start of a unit with no line of their own (an
+    // initialization prologue) must have no line, not the previous unit's
+    // last one, which is the nearest preceding record.
+    [Test]
+    procedure RvaToSourceLine_UnitPrologueBeforeItsFirstLine_HasNoLine;
+    // A breakpoint is bound right after the MAP starts indexing. The lookup
+    // gave up after 50 ms, recorded the file as loaded although the index was
+    // not there yet, and never looked again: the breakpoint stayed unverified
+    // for the whole session. Seen live on the MapOnlyBigText fixture whenever
+    // its sidecar took longer than 50 ms to load.
+    [Test]
+    procedure SourceLineToRva_RightAfterLoad_WaitsForTheIndex;
   end;
 
 implementation
@@ -139,9 +158,9 @@ begin
   Result := string.Join(#13#10, Lines);
 end;
 
-// A small PE32 image (.text at RVA $1000) whose MAP carries the given
-// "Line numbers for" sections, each a header plus one data line.
-function SmallImageMapText(const Sections: array of string): string;
+// A small PE32 image (.text at RVA $1000) whose MAP has the given detailed-map
+// rows and "Line numbers for" sections (each a header plus one data line).
+function SmallImageMapTextWithUnits(const UnitRows, Sections: array of string): string;
 begin
   var Lines: TArray<string> := [
     '',
@@ -151,8 +170,10 @@ begin
     '',
     '',
     'Detailed map of segments',
-    '',
-    ' 0001:00000000 00010000 C=CODE     S=.text    G=(none)   M=System   ACBP=A9',
+    ''];
+  for var UnitRow in UnitRows do
+    Lines := Lines + [UnitRow];
+  Lines := Lines + [
     '',
     '',
     '  Address             Publics by Value',
@@ -166,6 +187,32 @@ begin
   end;
   Lines := Lines + ['', 'Bound resource files', ''];
   Result := string.Join(#13#10, Lines);
+end;
+
+// The same, with one System unit covering the whole .text: the sections'
+// units are not in the detailed map, so no record can be checked against it.
+function SmallImageMapText(const Sections: array of string): string;
+begin
+  Result := SmallImageMapTextWithUnits(
+    [' 0001:00000000 00010000 C=CODE     S=.text    G=(none)   M=System   ACBP=A9'], Sections);
+end;
+
+// Three units back to back in .text, shaped like a real Win32 MAP: UnitA's
+// final `end.` record lies 4 bytes INTO UnitB (offset $1104), and UnitC's code
+// starts with a prologue that has no line -- its first record is at +$C.
+// RVA = $1000 (.text base) + offset.
+function UnitRangesMapText: string;
+begin
+  Result := SmallImageMapTextWithUnits([
+    ' 0001:00001000 00000100 C=CODE     S=.text    G=(none)   M=UnitA    ACBP=A9',
+    ' 0001:00001100 00000100 C=CODE     S=.text    G=(none)   M=UnitB    ACBP=A9',
+    ' 0001:00001200 00000100 C=CODE     S=.text    G=(none)   M=UnitC    ACBP=A9'], [
+    'Line numbers for UnitA(C:\src\UnitA.pas) segment .text',
+    '    10 0001:00001000    20 0001:000010F0    30 0001:00001104',
+    'Line numbers for UnitB(C:\src\UnitB.pas) segment .text',
+    '     5 0001:00001100     6 0001:00001108     7 0001:000011F0',
+    'Line numbers for UnitC(C:\src\UnitC.pas) segment .text',
+    '    40 0001:0000120C    41 0001:00001210']);
 end;
 
 // UnitU's own lines at .text offsets $1000 / $1100 / $1300, with a generic from
@@ -335,6 +382,69 @@ begin
     Assert.IsTrue(Map.SourceLineToRva('C:\src\Gen.pas', 900, Rva), 'Gen.pas:900 must have an address');
     CheckLine(Map, $3000, 'UnitB.pas', 20);
     CheckLine(Map, $3008, 'UnitB.pas', 20);
+  finally
+    Map.Free;
+  end;
+end;
+
+procedure TMapReaderTests.RvaToSourceLine_UnitEndRecordPastItsUnit_IsNotUsed;
+begin
+  WriteSyntheticMap(UnitRangesMapText);
+  var Map := LoadSyntheticMap;
+  try
+    // UnitB+4: the previous unit's `end.` record sits exactly here.
+    CheckLine(Map, $2104, 'UnitB.pas', 5);
+    CheckLine(Map, $2108, 'UnitB.pas', 6);
+    var Rva: UInt64;
+    Assert.IsFalse(Map.SourceLineToRva('C:\src\UnitA.pas', 30, Rva),
+      Format('UnitA.pas:30 has no code of its own, yet bound to RVA $%x', [Rva]));
+    CheckLine(Map, $20F0, 'UnitA.pas', 20);
+  finally
+    Map.Free;
+  end;
+end;
+
+procedure TMapReaderTests.RvaToSourceLine_UnitPrologueBeforeItsFirstLine_HasNoLine;
+begin
+  WriteSyntheticMap(UnitRangesMapText);
+  var Map := LoadSyntheticMap;
+  try
+    // UnitC starts at $2200; its first record is at $220C. UnitB.pas:7 at
+    // $21F0 is the nearest preceding record, within the 512-byte span.
+    var Loc: TSourceLocation;
+    Assert.IsFalse(Map.RvaToSourceLine($2204, Loc),
+      Format('UnitC''s prologue resolved to %s:%d', [ExtractFileName(Loc.SourceFile), Loc.Line]));
+    CheckLine(Map, $220C, 'UnitC.pas', 40);
+    CheckLine(Map, $21F8, 'UnitB.pas', 7);
+  finally
+    Map.Free;
+  end;
+end;
+
+procedure TMapReaderTests.SourceLineToRva_RightAfterLoad_WaitsForTheIndex;
+const
+  FIXTURE_DIR = '..\..\TestTarget\';
+  SOURCE      = 'MapOnlyBigText.dpr';
+  MARKER      = 'MAPBIG_MAIN';
+begin
+  var FixtureDir := ExpandFileName(ExtractFilePath(ParamStr(0)) + FIXTURE_DIR);
+  var MapPath := FixtureDir + 'Win32\Debug\MapOnlyBigText.map';
+  Assert.IsTrue(FileExists(MapPath), MapPath + ' not found -- run build_target.bat');
+  var MarkerLine := 0;
+  var SourceLines := TFile.ReadAllLines(FixtureDir + SOURCE);
+  for var Index := 0 to High(SourceLines) do
+    if SourceLines[Index].Contains(MARKER) then
+      MarkerLine := Index + 1;
+  Assert.IsTrue(MarkerLine > 0, MARKER + ' not found in ' + SOURCE);
+
+  var Map := TMapFile.Create;
+  try
+    // Deliberately NOT waiting for the index: this is what a breakpoint
+    // request right after launch does.
+    Map.LoadFromFile(MapPath, SYNTHETIC_PREFERRED_BASE);
+    var Rva: UInt64;
+    Assert.IsTrue(Map.SourceLineToRva(SOURCE, MarkerLine, Rva),
+      Format('%s:%d must bind even when asked before the index is ready', [SOURCE, MarkerLine]));
   finally
     Map.Free;
   end;

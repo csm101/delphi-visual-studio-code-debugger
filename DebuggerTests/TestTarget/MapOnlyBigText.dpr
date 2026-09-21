@@ -31,8 +31,11 @@ begin
     RunFiller;
 end;
 
+// The test steps INTO RunTarget from here: on Win32 the filler's `end.` record
+// lies 4 bytes inside RunTarget, and a step-into used to stop there showing the
+// filler.
 begin
   KeepFillerLinked;
   GMainReached := GetCurrentProcessId;   // {BP:MAPBIG_MAIN}
-  RunTarget(GMainReached);
+  RunTarget(GMainReached);               // {BP:MAPBIG_CALL}
 end.

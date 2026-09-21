@@ -720,50 +720,25 @@ Debugger features:
   is unchanged; JCL is a MAP-equivalent line/proc fallback for TD32/MAP-less
   modules. Remaining: DCU debug info, `.dcp`-linked (likely already covered), and
   external `.tds`. Full plan + decisions in `DEBUG_INFO_FORMATS_TODO.md`.
-- **MAP reader: drop "ghost" line records using the detailed map — OPEN
-  (found 2026-09-21 while verifying GitHub issue #12).** Some sections of a
-  unit's `.itext` belong to ANOTHER file and hold one record of generic code
-  that has no code in that unit. On the Win32 Hydra2SingleEXE MAP, 531 of the
-  538 foreign-file `.itext` sections are in units with no `.text` section for
-  that file: `Oracle.pas` ×362 (line 1321 of CVS rev 1.58, the `end;` of
-  `TOracleSession.Pkg<T>`), `System.Generics.Collections.pas` ×126,
-  `System.Generics.Defaults.pas` ×39, `GuiTools.pas` ×3, `System.Rtti.pas` ×1.
-  The record's address is meaningless: often the unit's `.itext` end (= the next
-  unit's init start), sometimes further on (`frmTABEsclusioneGiriPVU`'s lands
-  0x60 past its own end). Today `RvaToSourceLine` returns such a ghost for those
-  addresses, e.g. `Oracle.pas:1321` inside another unit's init prologue, and
-  that can surface when stepping into an `initialization`.
-  `DevTools\MapLineRvaProbe` cannot see it: it takes every record as ground
-  truth, and only the ~50 ghosts that share an address with a real record are
-  checked against the owning unit (it prints the 2 it cannot resolve as
-  `AMBIGUOUS`).
-  **A second, more common kind, Win32 only.** A unit's LAST `.text` record (its
-  `end.`) lies 4–7 bytes PAST the unit's code, inside the prologue of the next
-  unit's first routine: 1410 of 6594 units on the Win32 Hydra2 MAP, 5 of 15 on
-  the Win32 TestTarget MAP, none on Win64. Seen live through the MCP server on
-  `MapOnlyBigText` (Win32): `step_into` from `MapOnlyBigText.dpr:37` stops at
-  `RunTarget+4` and shows `MapOnlyBigTextFiller.pas:38` (the filler's `end.`,
-  record `0001:005837A4`; the filler ends at `005837A0` and `RunTarget` starts
-  there) instead of running on to `MapOnlyBigTextTarget.pas:20`, where Win64
-  correctly stops. Once the fix below lands, extend
-  `MapOnlyBigText_BreakpointsAreHitWithTheirSource` with that step-into.
-  **Plan:**
-  1. `TMapFile` reads the "Detailed map of segments" (per segment, each unit's
-     `[start, start+length)`).
-  2. It discards a record that falls outside its own section's unit range. That
-     removes the ghosts and makes the "later section wins" tie-break of
-     `StoreLineRecord` a fallback.
-  3. It bounds the nearest-preceding-record search in `RvaToSourceLine` to the
-     unit containing the address, so a unit's init prologue (its first ~12
-     bytes have no line) answers "no line" instead of the previous unit's last
-     line.
-  4. The probe applies the same rule, so it counts ghosts instead of trusting
-     them, and asserts that an address in a unit never resolves to another
-     unit's record.
-
-  Verify with the probe on both Hydra2 MAPs (twice each, sidecar path) and the
-  suite. A sidecar bump is needed only if the index layout changes. Linker
-  mechanism behind the ghosts: see `KNOWN_UNKNOWNS.md`, "MAP ghost line records".
+- **Continue from a step stop that sits on a breakpoint re-reports that
+  breakpoint — OPEN (found 2026-09-21).** Step onto a line that carries a
+  breakpoint, then continue: the session stops again at once, on the same
+  address, as a breakpoint hit, having executed nothing. Seen on both bitnesses
+  in `MapOnlyBigText` (step-into from `MapOnlyBigText.dpr` lands on
+  `MapOnlyBigTextTarget.pas:20`; with a breakpoint there, `ContinueExecution`
+  stops with `srBreakpoint` at the same IP). Not MAP-related: the reader only
+  answers line lookups. The IDE executes the line instead. Likely cause: the
+  resume path steps over the INT3 at the current PC only after a breakpoint
+  stop, not after a step stop. Needs a dedicated test; the live MAP test avoids
+  it by placing its breakpoint on the next line.
+- **The MCP server keeps a debuggee's image locked after `stop_debugging` —
+  OPEN, observation (2026-09-21).** After two sessions on `MapOnlyBigText`
+  ended with state `terminated`, rebuilding the fixture failed with `F2039`
+  until `DelphiDebuggerMcp.exe` was killed; no debuggee process was left. The
+  `hFile` handles of the process and DLL debug events are closed
+  (`WinDebuggerBase.pas`), so the holder is something else — probably the
+  symbol readers, which map the binary for the reader's lifetime by design
+  (TRAPS.md, "stale build"), outliving the session in the MCP server.
 - PE import-table reader so MAP can be dropped entirely.
 - Child process tracking.
 - **Data breakpoints / watchpoints ("stop when this address is written") — DONE,
@@ -1187,7 +1162,11 @@ Architecture / portability:
   fixture can: only a file's first `Line numbers for` section was indexed
   (`.itext`, generic instantiations), address → line answered from whatever
   happened to be loaded (wrong file, order-dependent), and a full re-sort after
-  every file load. All fixed in the same change. See
+  every file load. All fixed in the same change. A follow-up drops "ghost" line
+  records, i.e. records lying in another unit's code according to the detailed
+  map (a Win32 unit's `end.` inside the next unit's first routine: 1410 of 6594
+  units on Hydra2). It also fixes a race that left a breakpoint bound during
+  MAP indexing unverified for the whole session. See
   `DAP_DEBUGGER_ARCHITECTURE.md`, "MAP segment tables and the target's pointer
   width".
 - **Host and target pointer size are not the same thing (2026-07-25).** On x64

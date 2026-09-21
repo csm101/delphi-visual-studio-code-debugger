@@ -337,6 +337,13 @@ absurdly.
   a full re-sort after every file load made single lookups take ~2 s. After any
   `MapFileReader` change, run the probe against a large real MAP on both
   bitnesses, twice (the second run reads the sidecar).
+- **A line from another unit's FILE is not wrong by itself.** A unit's code
+  legitimately carries lines of other files: every generic it instantiates gets
+  a section `UnitX(Generic.pas)`, and include files do the same. On the Hydra2
+  MAP, `utlVenPay`'s code starts with `JOSE.Core.JWT.pas:185`, a record of
+  `utlVenPay`'s own section. What decides ownership is which unit's SECTION a
+  record is in, checked against the detailed map. The file name does not. A
+  check that judged by file name reported that correct answer as a defect.
 
 ## Cleanup that silently never happens
 

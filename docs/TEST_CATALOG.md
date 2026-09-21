@@ -648,6 +648,19 @@ fixture):
       (`RvaToSourceLine_AfterAnInterleavedSection_ResolvesToItsOwnFile`,
       `RvaToSourceLine_SharedAddressAtAUnitBoundary_GoesToTheLaterSection`).
       Large real MAPs: `DevTools\MapLineRvaProbe` (no fixture is that large)
+- [x] MAP "ghost" records, checked against the detailed map: a unit's `end.`
+      record lying inside the next unit is neither returned nor bindable, and a
+      unit prologue before its first line has no line rather than the previous
+      unit's last one (`RvaToSourceLine_UnitEndRecordPastItsUnit_IsNotUsed`,
+      `RvaToSourceLine_UnitPrologueBeforeItsFirstLine_HasNoLine`); live, the
+      Win32 step-into into `RunTarget` lands in its own unit
+      (`MapOnlyBigText_BreakpointsAreHitWithTheirSource`)
+- [x] A MAP breakpoint bound before the background index is ready still binds:
+      the lookup waits for the index instead of recording a permanent miss
+      (`SourceLineToRva_RightAfterLoad_WaitsForTheIndex`, on the MapOnlyBigText
+      MAP; the live test also passes from the sidecar path)
+- [ ] Continue from a step stop that sits on a breakpoint must not re-stop at
+      that breakpoint (open, see `PROJECT_STATE.md`)
 - [x] BPL TD32 -- BP hits (`Test_Bpl_BreakpointHits`,
       `Bpl_Breakpoint_InPackageUnit_Stops`)
 - [x] BPL TD32-only BP hits (`Test_Bpl_Td32Only_BpHits`,

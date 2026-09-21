@@ -271,7 +271,9 @@ type
     // and none was ever hit. The fixture also has the program's main block in a
     // second "Line numbers for" section of the .dpr (.itext on Win32), which
     // the reader used to ignore. Both breakpoints must bind, be HIT in order,
-    // and report the right file and line -- on both bitnesses.
+    // and report the right file and line -- on both bitnesses. A step-into on
+    // the way must land in the target unit: on Win32 the filler's `end.`
+    // record lies 4 bytes inside it and used to be shown instead.
     [Test] procedure MapOnlyBigText_BreakpointsAreHitWithTheirSource;
     // A routine name is not a variable: there is nothing at its address to read
     // as a value, only its machine code. Reading it anyway produced numbers like
@@ -6882,8 +6884,9 @@ const
   PROGRAM_SOURCE = 'MapOnlyBigText.dpr';
   TARGET_SOURCE  = 'MapOnlyBigTextTarget.pas';
   STOP_TIMEOUT_MS = 60000;
+  ANY_LINE = 0;
 var
-  MainLine, TargetLine: Integer;
+  MainLine, CallLine, TargetLine: Integer;
 
   function LineSpec(Line: Integer): TArray<TBpLineSpec>;
   begin
@@ -6898,27 +6901,65 @@ var
     Result := (Length(Bound) = 1) and Bound[0].Verified;
   end;
 
-  // '' when the session is stopped at Source:Line, otherwise what it did instead.
+  function FrameText(const Frame: TSessionFrame): string;
+  begin
+    Result := Format('%s:%d', [ExtractFileName(Frame.SourceFile), Frame.SourceLine]);
+  end;
+
+  // '' when the session is stopped at Source:Line (any line of Source for
+  // ANY_LINE), otherwise what it did instead.
   function StopProblem(Session: TDebugSession; const Source: string; Line: Integer): string;
   begin
     PumpUntilStop(Session, STOP_TIMEOUT_MS);
+    var Expected := Format('%s:%d', [Source, Line]);
     if Session.State <> dsStopped then
-      Exit(Format('never stopped at %s:%d', [Source, Line]));
+      Exit('never stopped at ' + Expected);
     var Frames := Session.GetCallStack;
     if Length(Frames) = 0 then
-      Exit(Format('stopped for %s:%d with no call stack', [Source, Line]));
-    var Actual := Format('%s:%d', [ExtractFileName(Frames[0].SourceFile), Frames[0].SourceLine]);
-    if not SameText(Actual, Format('%s:%d', [Source, Line])) then
-      Exit(Format('stopped at %s instead of %s:%d', [Actual, Source, Line]));
+      Exit('stopped for ' + Expected + ' with no call stack');
+    if not SameText(ExtractFileName(Frames[0].SourceFile), Source) then
+      Exit(Format('stopped at %s instead of %s', [FrameText(Frames[0]), Expected]));
+    if (Line <> ANY_LINE) and (Frames[0].SourceLine <> Line) then
+      Exit(Format('stopped at %s instead of %s', [FrameText(Frames[0]), Expected]));
     Result := '';
   end;
 
-  function CallerProblem(Session: TDebugSession): string;
+  function CallerProblem(Session: TDebugSession; CallLine: Integer): string;
   begin
     var Frames := Session.GetCallStack;
-    if (Length(Frames) >= 2) and SameText(ExtractFileName(Frames[1].SourceFile), PROGRAM_SOURCE) then
+    var Expected := Format('%s:%d', [PROGRAM_SOURCE, CallLine]);
+    if Length(Frames) < 2 then
+      Exit('no caller frame for RunTarget, expected ' + Expected);
+    if SameText(FrameText(Frames[1]), Expected) then
       Exit('');
-    Result := 'the caller frame of RunTarget does not resolve to ' + PROGRAM_SOURCE;
+    Result := Format('caller frame of RunTarget is %s, expected %s', [FrameText(Frames[1]), Expected]);
+  end;
+
+  // The walk, in order; '' when every stop lands where it should.
+  function WalkProblem(Session: TDebugSession): string;
+  begin
+    if not BreakpointVerified(Session, PROGRAM_SOURCE, MainLine) then
+      Exit('main-block breakpoint not verified');
+    if not BreakpointVerified(Session, TARGET_SOURCE, TargetLine) then
+      Exit('target-unit breakpoint not verified');
+    Result := StopProblem(Session, PROGRAM_SOURCE, MainLine);
+    if Result <> '' then
+      Exit;
+    Session.StepOver;
+    Result := StopProblem(Session, PROGRAM_SOURCE, CallLine);
+    if Result <> '' then
+      Exit('step over: ' + Result);
+    // On Win32 the filler's `end.` record lies 4 bytes inside RunTarget; the
+    // step used to stop there and show the filler.
+    Session.StepInto;
+    Result := StopProblem(Session, TARGET_SOURCE, ANY_LINE);
+    if Result <> '' then
+      Exit('step into RunTarget: ' + Result);
+    Session.ContinueExecution;
+    Result := StopProblem(Session, TARGET_SOURCE, TargetLine);
+    if Result <> '' then
+      Exit;
+    Result := CallerProblem(Session, CallLine);
   end;
 
   function RunScenario(const Exe, Map: string): string;
@@ -6931,18 +6972,7 @@ var
       Opts.SourceRoot := TargetDir;
       // No .rsm and no TD32 in the exe: the MAP is the only debug info.
       Assert.IsTrue(Session.Launch(Opts), 'Launch returned False');
-      if not BreakpointVerified(Session, PROGRAM_SOURCE, MainLine) then
-        Exit('main-block breakpoint not verified');
-      if not BreakpointVerified(Session, TARGET_SOURCE, TargetLine) then
-        Exit('target-unit breakpoint not verified');
-      Result := StopProblem(Session, PROGRAM_SOURCE, MainLine);
-      if Result <> '' then
-        Exit;
-      Session.ContinueExecution;
-      Result := StopProblem(Session, TARGET_SOURCE, TargetLine);
-      if Result <> '' then
-        Exit;
-      Result := CallerProblem(Session);
+      Result := WalkProblem(Session);
     finally
       if Session.State = dsStopped then
         Session.Terminate;
@@ -6952,8 +6982,9 @@ var
 
 begin
   MainLine   := MarkerLineInFile(TargetDir + PROGRAM_SOURCE, 'MAPBIG_MAIN');
+  CallLine   := MarkerLineInFile(TargetDir + PROGRAM_SOURCE, 'MAPBIG_CALL');
   TargetLine := MarkerLineInFile(TargetDir + TARGET_SOURCE, 'MAPBIG_TARGET');
-  Assert.IsTrue((MainLine > 0) and (TargetLine > 0), 'MAPBIG markers not found');
+  Assert.IsTrue((MainLine > 0) and (CallLine > 0) and (TargetLine > 0), 'MAPBIG markers not found');
 
   var Failures := '';
   for var PlatformDir in ['Win32', 'Win64'] do begin

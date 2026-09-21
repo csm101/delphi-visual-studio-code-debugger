@@ -22,7 +22,16 @@ type
     // records in ascending address order, so the two bound it.
     MinRva:     UInt64;
     MaxRva:     UInt64;
+    UnitName:   string;  // the unit the section belongs to: "Line numbers for UNIT(file)"
     FullPath:   string;  // full source path from MAP "Line numbers for" header
+  end;
+
+  // One unit's piece of a code segment, from the MAP's "Detailed map of
+  // segments", as RVAs: [StartRva, EndRva).
+  TUnitCodeRange = record
+    StartRva: UInt64;
+    EndRva:   UInt64;
+    UnitName: string;
   end;
 
   // A loaded line record. The section it came from settles which of two
@@ -61,6 +70,12 @@ type
     // the generic's source file. Keeping only the first made the rest unbindable.
     FUnitSections:   TObjectDictionary<string, TList<TUnitSectionInfo>>; // key = UPPER filename
     FSectionsByRva:  TArray<TRvaSectionEntry>;  // sorted by MinRva; built at index complete (PublishSectionIndex)
+    // Every unit's code ranges, sorted by StartRva, and the (upper-cased, sorted)
+    // names of the units that have any. Published by ReadUnitCodeRanges before
+    // FIndexReady, under FLock; immutable afterwards. Empty for a MAP without a
+    // detailed map, which turns the ownership checks off.
+    FUnitCodeRanges: TArray<TUnitCodeRange>;
+    FUnitsWithCode:  TArray<string>;
     FPublicsDataOff: Int64;   // offset of Publics data first line; 0 = not found
     FIndexReady:     Boolean;
     FPubsReady:      Boolean;
@@ -145,7 +160,10 @@ type
     // state it touches is freed.
     procedure StopIndexThread;
     function  IndexingCancelled: Boolean;
-    procedure ParseUnitSectionAt(const UnitKey, FullPath: string; DataOffset: Int64);
+    procedure ParseUnitSectionAt(const UnitKey: string; const Section: TUnitSectionInfo);
+    procedure ReadUnitCodeRanges;
+    function  TryParseCodeRangeRow(const Row: string; out Range: TUnitCodeRange): Boolean;
+    function  NearestRecordIsInSameUnit(RecordRva, Rva: UInt64): Boolean;
     procedure ParsePublicsAt(DataOffset: Int64);
     procedure EnsureUnitByKey(const UnitKey: string);
     procedure EnsureUnitForRva(Rva: UInt64);
@@ -177,6 +195,8 @@ type
     // Block until background indexing finished (public so the adapter's background
     // symbol loader can fully index a module off the dispatch thread before use).
     procedure   WaitForIndex;
+    // Blocks until the index is ready or BudgetMs elapse, whichever comes first.
+    procedure   WaitForIndexUpTo(BudgetMs: Cardinal);
     procedure   LoadFromFile(const MapPath: string; PreferredBase: UInt64 = 0;
                   OutputRvaShift: UInt64 = 0);
     // Real SizeOfImage of the module this MAP describes. Set by the module loader
@@ -523,6 +543,8 @@ begin
   FSortedRvas    := nil;
   FSortedPubRvas := nil;
   FSectionsByRva := nil;
+  FUnitCodeRanges := nil;
+  FUnitsWithCode  := nil;
   CloseMappedFile;
 
   if not FileExists(MapPath) then Exit;
@@ -649,16 +671,15 @@ end;
 { --------------------------------------------------------------------------- }
 
 const
-  // 'MIX6' -- bumped for changes that all invalidate earlier sidecars. The
-  // file now holds one record per "Line numbers for" SECTION, so a file key may
-  // repeat; an older sidecar kept only each file's first section. Each record
-  // gained the section's MaxRva. And on a MAP whose .text exceeds 4 MB, an
-  // older build read a corrupted segment-1 base (see ParseSegmentTableEager)
-  // and baked it into every MinRva it wrote.
-  // ('MIX5' was an unreleased intermediate layout without MaxRva, 'MIX4' the
-  // bump for TLS symbols losing their static RVA, 'MIX3' the one for the PE32
-  // 8-hex-digit Start column.)
-  MAP_SIDECAR_MAGIC: UInt32 = $4D495836;
+  // 'MIX7' -- each section record gained its UnitName, which the ownership
+  // check in ParseUnitSectionAt needs.
+  // ('MIX6': one record per "Line numbers for" SECTION, so a file key may
+  // repeat, plus MaxRva; it also retired sidecars that an older build wrote for
+  // a MAP whose .text exceeds 4 MB, with a corrupted segment-1 base baked into
+  // every MinRva -- see ParseSegmentTableEager. 'MIX5' was an unreleased
+  // intermediate layout, 'MIX4' the bump for TLS symbols losing their static
+  // RVA, 'MIX3' the one for the PE32 8-hex-digit Start column.)
+  MAP_SIDECAR_MAGIC: UInt32 = $4D495837;
 
 function MapSidecarIsFresh(const MapPath, SidecarPath: string): Boolean;
 begin
@@ -678,16 +699,31 @@ end;
 
 function TMapFile.LoadUnitIndexFromSidecar(const SidecarPath: string): Boolean;
 var
-  F: TFileStream;
+  F: TStream;
   Magic: UInt32;
   Count, I: UInt32;
   KeyLen: UInt16;
   KeyBuf: TBytes;
   Info: TUnitSectionInfo;
+
+  function ReadUtf8: string;
+  begin
+    var Len: UInt16;
+    F.ReadBuffer(Len, 2);
+    var Bytes: TBytes;
+    SetLength(Bytes, Len);
+    if Len > 0 then
+      F.ReadBuffer(Bytes[0], Len);
+    Result := TEncoding.UTF8.GetString(Bytes);
+  end;
+
 begin
   Result := False;
   try
-    F := TFileStream.Create(SidecarPath, fmOpenRead or fmShareDenyNone);
+    // Buffered: a record is ~8 small reads and there is one per section --
+    // 87k sections on a large MAP -- and an unbuffered TFileStream makes each
+    // read a ReadFile call.
+    F := TBufferedFileStream.Create(SidecarPath, fmOpenRead or fmShareDenyNone, 256 * 1024);
     try
       if F.Size < 8 then Exit;
       F.ReadBuffer(Magic, 4);
@@ -702,12 +738,8 @@ begin
         F.ReadBuffer(Info.DataOffset, 8);
         F.ReadBuffer(Info.MinRva, 8);
         F.ReadBuffer(Info.MaxRva, 8);
-        var PathLen: UInt16;
-        F.ReadBuffer(PathLen, 2);
-        var PathBuf: TBytes;
-        SetLength(PathBuf, PathLen);
-        if PathLen > 0 then F.ReadBuffer(PathBuf[0], PathLen);
-        Info.FullPath := TEncoding.UTF8.GetString(PathBuf);
+        Info.UnitName := ReadUtf8;
+        Info.FullPath := ReadUtf8;
         AddUnitSection(Key, Info);
       end;
       F.ReadBuffer(FPublicsDataOff, 8);
@@ -726,6 +758,15 @@ var
   F: TStream;
   Magic: UInt32;
 
+  procedure WriteUtf8(const Text: string);
+  begin
+    var Bytes := TEncoding.UTF8.GetBytes(Text);
+    var Len: UInt16 := Length(Bytes);
+    F.WriteBuffer(Len, 2);
+    if Len > 0 then
+      F.WriteBuffer(Bytes[0], Len);
+  end;
+
   // One record per section; the file key repeats for a file with several.
   procedure WriteSectionRecord(const UnitKey: string; const Section: TUnitSectionInfo);
   begin
@@ -736,10 +777,8 @@ var
     F.WriteBuffer(Section.DataOffset, 8);
     F.WriteBuffer(Section.MinRva, 8);
     F.WriteBuffer(Section.MaxRva, 8);
-    var PathBytes := TEncoding.UTF8.GetBytes(Section.FullPath);
-    var PathLen: UInt16 := Length(PathBytes);
-    F.WriteBuffer(PathLen, 2);
-    if PathLen > 0 then F.WriteBuffer(PathBytes[0], PathLen);
+    WriteUtf8(Section.UnitName);
+    WriteUtf8(Section.FullPath);
   end;
 
 begin
@@ -829,12 +868,15 @@ end;
 procedure TMapFile.IndexLineNumberSection(const Header: string; var P: PByte; PEnd, PBase: PByte);
 // Records one "Line numbers for UnitX(path\File.pas) segment .text" section
 // and leaves P after its data lines.
+const
+  HEADER_PREFIX = 'Line numbers for ';
 begin
   var OpenPos  := Header.IndexOf('(');
   var ClosePos := Header.LastIndexOf(')');
-  if (OpenPos < 0) or (ClosePos <= OpenPos) then
+  if (OpenPos < HEADER_PREFIX.Length) or (ClosePos <= OpenPos) then
     Exit;
   var Info: TUnitSectionInfo;
+  Info.UnitName := Header.Substring(HEADER_PREFIX.Length, OpenPos - HEADER_PREFIX.Length);
   Info.FullPath := Header.Substring(OpenPos + 1, ClosePos - OpenPos - 1);
 
   // Skip optional blank line between header and first data line.
@@ -899,6 +941,128 @@ begin
   end;
 end;
 
+// The range containing Rva; False when Rva lies in no unit's code.
+function TryUnitCodeRangeAt(const Ranges: TArray<TUnitCodeRange>; Rva: UInt64;
+  out Range: TUnitCodeRange): Boolean;
+begin
+  var Lo   := 0;
+  var Hi   := High(Ranges);
+  var Best := -1;
+  while Lo <= Hi do begin
+    var Mid := (Lo + Hi) div 2;
+    if Ranges[Mid].StartRva <= Rva then begin
+      Best := Mid;
+      Lo   := Mid + 1;
+    end else
+      Hi := Mid - 1;
+  end;
+  if (Best < 0) or (Rva >= Ranges[Best].EndRva) then
+    Exit(False);
+  Range  := Ranges[Best];
+  Result := True;
+end;
+
+function IsCodeSegmentClass(const SegmentClass: string): Boolean;
+begin
+  Result := SameText(SegmentClass, 'CODE') or SameText(SegmentClass, 'ICODE');
+end;
+
+function TMapFile.TryParseCodeRangeRow(const Row: string; out Range: TUnitCodeRange): Boolean;
+// ` 0001:063EF864 000587E8 C=CODE     S=.text    G=(none)   M=SomeUnit ACBP=A9`
+// -- the unit's code from segment offset $063EF864, $587E8 bytes long.
+begin
+  Result := False;
+  var Tokens := Row.Split([' ', #9], TStringSplitOptions.ExcludeEmpty);
+  if Length(Tokens) < 4 then
+    Exit;
+  var SegmentClass := '';
+  Range.UnitName := '';
+  for var Token in Tokens do begin
+    if Token.StartsWith('C=') then
+      SegmentClass := Token.Substring(2);
+    if Token.StartsWith('M=') then
+      Range.UnitName := Token.Substring(2);
+  end;
+  if Range.UnitName.IsEmpty or not IsCodeSegmentClass(SegmentClass) then
+    Exit;
+  var ColonPos := Tokens[0].IndexOf(':');
+  if ColonPos < 1 then
+    Exit;
+  var SegNum := StrToIntDef('$' + Tokens[0].Substring(0, ColonPos), 0);
+  var SegmentBase: UInt64;
+  if not FSegmentBaseRvas.TryGetValue(SegNum, SegmentBase) then
+    Exit;
+  // Offset 0 is a real start here (the first unit of a segment), unlike in a
+  // line record, where SegmentRvaFromToken treats it as "no address".
+  var Offset: Int64;
+  var Size: Int64;
+  if not TryStrToInt64('$' + Tokens[0].Substring(ColonPos + 1), Offset) or
+     not TryStrToInt64('$' + Tokens[1], Size) then
+    Exit;
+  Range.StartRva := SegmentBase + UInt64(Offset);
+  Range.EndRva   := Range.StartRva + UInt64(Size);
+  Result := Range.EndRva > Range.StartRva;
+end;
+
+procedure TMapFile.ReadUnitCodeRanges;
+// Reads the "Detailed map of segments": which part of each code segment every
+// unit's code occupies. The line records need it. A MAP holds records that lie
+// outside their own unit's code:
+// - a Win32 unit's final `end.` sits 4-7 bytes past the unit, inside the next
+//   unit's first routine (1410 of 6594 units on a real 139 MB MAP);
+// - a unit that instantiates a generic whose code it does not keep has a
+//   one-record `.itext` section of the generic's file at an unrelated address
+//   (531 on the same MAP).
+// Taken at face value, both put another unit's line on an address, e.g. a
+// step-into showing the previous unit's `end.`.
+begin
+  var Ranges := TList<TUnitCodeRange>.Create;
+  var UnitNames := TList<string>.Create;
+  try
+    var P    := FMapData;
+    var PEnd := FMapData + FMapSize;
+    var InDetailedMap := False;
+    var Line: string;
+    while ScanLine(P, PEnd, Line) and not IndexingCancelled do begin
+      var Trimmed := Line.Trim;
+      // Everything after the detailed map (publics, line numbers) ends it; a
+      // MAP built without one reaches them first and gets no ranges.
+      if Trimmed.Contains('Publics by') or Trimmed.StartsWith('Line numbers for ') then
+        Break;
+      if not InDetailedMap then begin
+        InDetailedMap := Trimmed.StartsWith('Detailed map of segments');
+        Continue;
+      end;
+      var Range: TUnitCodeRange;
+      if not TryParseCodeRangeRow(Trimmed, Range) then
+        Continue;
+      Ranges.Add(Range);
+      UnitNames.Add(UpperCase(Range.UnitName));
+    end;
+    Ranges.Sort(TComparer<TUnitCodeRange>.Construct(
+      function(const A, B: TUnitCodeRange): Integer
+      begin
+        if A.StartRva < B.StartRva then
+          Exit(-1);
+        if A.StartRva > B.StartRva then
+          Exit(1);
+        Result := 0;
+      end));
+    UnitNames.Sort;
+    DapLog(Format('[MAP] Detailed map: %d unit code ranges', [Ranges.Count]));
+    FLock.Acquire;
+    try
+      FUnitCodeRanges := Ranges.ToArray;
+      FUnitsWithCode  := UnitNames.ToArray;
+    finally
+      FLock.Release;
+    end;
+  finally
+    UnitNames.Free;
+    Ranges.Free;
+  end;
+end;
+
 procedure TMapFile.BuildIndexBackground;
 // Sequential scan of the entire mmap. Builds FUnitSections and records
 // FPublicsDataOff. Collects MinRva/MaxRva for each unit section. Then parses
@@ -913,6 +1077,11 @@ begin
   DapLog(Format('[MAP] BuildIndex start: %s sidecar=%s segBases=%d',
     [ExtractFileName(FMapPath), ExtractFileName(SidecarPath),
      FSegmentBaseRvas.Count]));
+
+  // Both paths need it, and it must be in place before FIndexReady lets the
+  // first section be parsed. Not cached in the sidecar: it sits at the head of
+  // the MAP and reads in milliseconds.
+  ReadUnitCodeRanges;
 
   // Fast path: load from sidecar when fresh.
   // Skip sidecar entirely for relocated DLL/BPL loads -- MinRva values would
@@ -1006,7 +1175,9 @@ procedure TMapFile.StoreLineRecord(Rva: UInt64; const LineRecord: TMapLineRecord
 // address -- which is where the next unit's code, and that unit's first
 // record, begins. Keeping whichever was loaded first made the answer depend on
 // lookup order. The section later in the MAP wins: sections are listed in link
-// order, so it is the unit whose code starts there.
+// order, so it is the unit whose code starts there. With a detailed map such a
+// record is dropped before it gets here (ParseUnitSectionAt); this rule is what
+// decides for a MAP without one.
 begin
   var Existing: TMapLineRecord;
   if not FRvaToLoc.TryGetValue(Rva, Existing) then begin
@@ -1016,18 +1187,43 @@ begin
     FRvaToLoc[Rva] := LineRecord;
 end;
 
-procedure TMapFile.ParseUnitSectionAt(const UnitKey, FullPath: string; DataOffset: Int64);
-// Reads line-number pairs from the mmap starting at DataOffset until a blank
-// line or a new section header is found. Inserts into FRvaToLoc / FLineToRva.
+procedure TMapFile.ParseUnitSectionAt(const UnitKey: string; const Section: TUnitSectionInfo);
+// Reads line-number pairs from the mmap starting at the section's DataOffset
+// until a blank line or a new section header is found. Inserts into FRvaToLoc /
+// FLineToRva every record except those outside the code of the section's own
+// unit (see ReadUnitCodeRanges).
 var
   P, PEnd: PByte;
   Line: string;
   SourceFile: string;
+  Ranges: TArray<TUnitCodeRange>;
+  CheckOwnership: Boolean;
+
+  // A unit the detailed map does not list -- or a MAP without one -- cannot be
+  // checked, so its records are kept.
+  function RecordIsInOwnUnitCode(Rva: UInt64): Boolean;
+  begin
+    if not CheckOwnership then
+      Exit(True);
+    var Range: TUnitCodeRange;
+    if not TryUnitCodeRangeAt(Ranges, Rva, Range) then
+      Exit(False);
+    Result := SameText(Range.UnitName, Section.UnitName);
+  end;
+
 begin
+  FLock.Acquire;
+  try
+    Ranges := FUnitCodeRanges;
+    var UnitIndex: Integer;
+    CheckOwnership := TArray.BinarySearch<string>(FUnitsWithCode, UpperCase(Section.UnitName), UnitIndex);
+  finally
+    FLock.Release;
+  end;
   // Prefer the full path (from MAP header) so VS Code can open the file directly.
   // Fall back to the uppercase basename key if no path was stored.
-  SourceFile := IfThen(FullPath <> '', FullPath, UnitKey);
-  P    := FMapData + DataOffset;
+  SourceFile := IfThen(Section.FullPath <> '', Section.FullPath, UnitKey);
+  P    := FMapData + Section.DataOffset;
   PEnd := FMapData + FMapSize;
 
   while ScanLine(P, PEnd, Line) do begin
@@ -1045,11 +1241,13 @@ begin
 
       var Rva: UInt64;
       if not SegmentRvaFromToken(RvaStr, Rva) then Continue;
+      if not RecordIsInOwnUnitCode(Rva) then
+        Continue;
 
       var LineRecord: TMapLineRecord;
       LineRecord.Loc.SourceFile := SourceFile;
       LineRecord.Loc.Line       := LineNum;
-      LineRecord.SectionOffset  := DataOffset;
+      LineRecord.SectionOffset  := Section.DataOffset;
       StoreLineRecord(Rva, LineRecord);
 
       var Key := LineKey(SourceFile, LineNum);
@@ -1214,8 +1412,13 @@ procedure TMapFile.WaitForIndex;
 begin
   // Never block the DAP loop for long while the background indexer scans a
   // very large MAP. If the index isn't ready yet, callers retry naturally
-  // (reposted breakpoints, later lookups) once the worker completes.
-  var Deadline := GetTickCount64 + 50; // short responsiveness budget
+  // (a stack walk is redone while indexing is pending) once the worker completes.
+  WaitForIndexUpTo(50); // short responsiveness budget
+end;
+
+procedure TMapFile.WaitForIndexUpTo(BudgetMs: Cardinal);
+begin
+  var Deadline := GetTickCount64 + BudgetMs;
   while True do begin
     FLock.Acquire;
     try
@@ -1223,6 +1426,11 @@ begin
     finally
       FLock.Release;
     end;
+    // No worker (nothing was loaded), or one that ended without publishing
+    // (cancelled, or failed): the index will never be ready, so waiting cannot
+    // help and would cost the whole budget on every call.
+    if (FIndexThread = nil) or FIndexThread.Finished then
+      Exit;
     if GetTickCount64 > Deadline then Exit;
     Sleep(1);
   end;
@@ -1326,11 +1534,18 @@ end;
 procedure TMapFile.EnsureUnitByKey(const UnitKey: string);
 begin
   if FLoadedUnits.ContainsKey(UnitKey) then Exit;
-  FLoadedUnits.Add(UnitKey, True);
 
   var Sections: TArray<TUnitSectionInfo>;
   FLock.Acquire;
   try
+    // Until the index is published the background thread is still filling
+    // FUnitSections, so reading it would race. Worse, a miss recorded now used
+    // to stick: the key counted as loaded and was never looked at again, and a
+    // breakpoint set while the MAP was still indexing stayed unverified for the
+    // whole session. Nothing is recorded until the index can answer.
+    if not FIndexReady then
+      Exit;
+    FLoadedUnits.Add(UnitKey, True);
     var SectionList: TList<TUnitSectionInfo>;
     if not FUnitSections.TryGetValue(UnitKey, SectionList) then begin
       DapLog(Format('[MAP] EnsureUnit MISS key="%s" totalUnits=%d',
@@ -1347,7 +1562,7 @@ begin
   // sections were indexed at all.
   var LinesBefore := FLineToRva.Count;
   for var Section in Sections do
-    ParseUnitSectionAt(UnitKey, Section.FullPath, Section.DataOffset);
+    ParseUnitSectionAt(UnitKey, Section);
   DapLog(Format('[MAP] EnsureUnit OK key="%s" sections=%d off=$%x lines+=%d',
     [UnitKey, Length(Sections), Sections[0].DataOffset, FLineToRva.Count - LinesBefore]));
 end;
@@ -1413,8 +1628,17 @@ begin
 end;
 
 procedure TMapFile.EnsureUnitForFile(const FileName: string);
+const
+  // The sections index of a 359 MB MAP is ready in under 3 s (measured with
+  // DevTools\MapLineRvaProbe); the bound only keeps a pathological file from
+  // hanging the caller.
+  BINDING_WAIT_MS = 15000;
 begin
-  WaitForIndex;
+  // Waits properly, unlike an address lookup. This answers whether a line has
+  // code -- i.e. whether a breakpoint binds -- and nothing re-asks when the
+  // index completes: a breakpoint set while the MAP was still indexing stayed
+  // unverified and never hit. The wait is paid once, on the first question.
+  WaitForIndexUpTo(BINDING_WAIT_MS);
   EnsureUnitByKey(UpperCase(ExtractFileName(FileName)));
 end;
 
@@ -1501,6 +1725,28 @@ end;
 {  Public API                                                                  }
 { --------------------------------------------------------------------------- }
 
+function TMapFile.NearestRecordIsInSameUnit(RecordRva, Rva: UInt64): Boolean;
+// The nearest preceding record counts only if it lies in the same unit's code
+// as Rva. A unit's code can start with bytes that have no line of their own --
+// a Win32 unit initialization typically opens with a ~12-byte prologue before
+// its first record -- and the nearest record before them is the previous
+// unit's last line. "No line" is the honest answer there. Where the detailed
+// map does not cover Rva there is nothing to check against, and the record
+// stands.
+begin
+  var Ranges: TArray<TUnitCodeRange>;
+  FLock.Acquire;
+  try
+    Ranges := FUnitCodeRanges;
+  finally
+    FLock.Release;
+  end;
+  var Range: TUnitCodeRange;
+  if not TryUnitCodeRangeAt(Ranges, Rva, Range) then
+    Exit(True);
+  Result := RecordRva >= Range.StartRva;
+end;
+
 function TMapFile.RvaToSourceLine(Rva: UInt64; out Loc: TSourceLocation): Boolean;
 
   function BinarySearchNearest: Boolean;
@@ -1522,6 +1768,7 @@ function TMapFile.RvaToSourceLine(Rva: UInt64; out Loc: TSourceLocation): Boolea
     end;
     if Best < 0 then Exit;
     if Rva - FSortedRvas[Best] > MAX_LINE_SPAN then Exit;
+    if not NearestRecordIsInSameUnit(FSortedRvas[Best], Rva) then Exit;
     var LineRecord: TMapLineRecord;
     Result := FRvaToLoc.TryGetValue(FSortedRvas[Best], LineRecord);
     if Result then

@@ -8,20 +8,23 @@ program MapLineRvaProbe;
 // segment SSSS, plus the offset -- derived here WITHOUT TMapFile, from the
 // MAP's segment table (names only) and the PE section headers.
 //
-// Most addresses carry exactly one record, and TMapFile must return it. Some
-// carry several, from different sections: at a unit boundary, one unit's
-// section ends with a record at its end address, which is the next unit's
-// first record. There the expected answer is a record of the unit that OWNS
-// the address according to the MAP's "Detailed map of segments" -- again
-// derived independently of TMapFile, which never reads the detailed map.
+// Not every record is truth. The MAP's "Detailed map of segments" says which
+// unit's code each address belongs to, and a record lying in ANOTHER unit's
+// code is a ghost: a Win32 unit's final `end.` a few bytes into the next unit,
+// or the leftover record of a generic instantiation whose code the unit does
+// not keep. TMapFile drops them, and so does this probe's expectation.
 //
-// Checked addresses: the first record of sections spread over the whole MAP
-// (always including the farthest section of each segment), plus EVERY address
-// that carries more than one record. For each, TMapFile is asked
+// Checked: the first record of sections spread over the whole MAP (always
+// including the farthest section of each segment), EVERY address carrying
+// more than one record, EVERY ghost, and the first byte of EVERY unit's code.
 //
-//   RvaToSourceLine(address)       -> must be an acceptable record;
-//   SourceLineToRva(file, line)    -> (unshared records only) an RVA that maps
-//                                     back to that line.
+//   address with real records  RvaToSourceLine must return one of them, and
+//                              (single record) SourceLineToRva(file, line) an
+//                              RVA that maps back to that line;
+//   ghost-only address         RvaToSourceLine must return none of the ghosts;
+//   unit start                 RvaToSourceLine must return a real record AT that
+//                              address, or -- with none there -- nothing: the
+//                              nearest record before it is the previous unit's.
 //
 // Written for GitHub issue #12: once .text passes 4 MB the detailed map's
 // segment-relative offsets exceed the preferred base, and TMapFile's segment
@@ -71,6 +74,7 @@ type
     Start:    UInt64;
     Size:     UInt64;
     UnitName: string;
+    IsCode:   Boolean;  // class CODE or ICODE
   end;
 
   TRecordVisitor = reference to procedure(const MapRecord: TMapRecord);
@@ -80,8 +84,10 @@ type
   private
     FSegmentNames:      TDictionary<Integer, string>;
     FUnitRanges:        TObjectDictionary<Integer, TList<TUnitRange>>;
+    FUnitsWithCode:     TDictionary<string, Boolean>;  // upper-cased; CODE / ICODE rows only
     FFirstRecords:      TList<TMapRecord>;
     FRecordsPerAddress: TDictionary<UInt64, Integer>;
+    FGhostAddresses:    TList<UInt64>;
     FUnorderedSections: Integer;
     procedure ReadSegmentRow(const Line: string);
     procedure ReadDetailedMapRow(const Line: string);
@@ -91,8 +97,14 @@ type
     procedure Read(const MapPath: string);
     function  OwnerUnit(Segment: Integer; Offset: UInt64): string;
     function  SharedAddresses: TArray<UInt64>;
+    // The first byte of every unit's code, as a record with no line.
+    function  UnitStarts: TArray<TMapRecord>;
+    // A record in the code of a unit other than its own. Only a unit the
+    // detailed map lists with code can be judged -- the same rule as TMapFile.
+    function  IsGhost(const MapRecord: TMapRecord): Boolean;
     property  SegmentNames: TDictionary<Integer, string> read FSegmentNames;
     property  FirstRecords: TList<TMapRecord> read FFirstRecords;
+    property  GhostAddresses: TList<UInt64> read FGhostAddresses;
     property  UnorderedSections: Integer read FUnorderedSections;
   end;
 
@@ -259,14 +271,18 @@ begin
   inherited;
   FSegmentNames      := TDictionary<Integer, string>.Create;
   FUnitRanges        := TObjectDictionary<Integer, TList<TUnitRange>>.Create([doOwnsValues]);
+  FUnitsWithCode     := TDictionary<string, Boolean>.Create;
   FFirstRecords      := TList<TMapRecord>.Create;
   FRecordsPerAddress := TDictionary<UInt64, Integer>.Create;
+  FGhostAddresses    := TList<UInt64>.Create;
 end;
 
 destructor TMapLayout.Destroy;
 begin
+  FGhostAddresses.Free;
   FRecordsPerAddress.Free;
   FFirstRecords.Free;
+  FUnitsWithCode.Free;
   FUnitRanges.Free;
   FSegmentNames.Free;
   inherited;
@@ -297,11 +313,18 @@ begin
     Exit;
   Range.Size := StrToInt64Def('$' + Tokens[1], 0);
   Range.UnitName := '';
-  for var Token in Tokens do
+  var SegmentClass := '';
+  for var Token in Tokens do begin
     if Token.StartsWith('M=') then
       Range.UnitName := Token.Substring(2);
+    if Token.StartsWith('C=') then
+      SegmentClass := Token.Substring(2);
+  end;
   if Range.UnitName.IsEmpty then
     Exit;
+  Range.IsCode := SameText(SegmentClass, 'CODE') or SameText(SegmentClass, 'ICODE');
+  if Range.IsCode then
+    FUnitsWithCode.AddOrSetValue(UpperCase(Range.UnitName), True);
   var Ranges: TList<TUnitRange>;
   if not FUnitRanges.TryGetValue(Segment, Ranges) then begin
     Ranges := TList<TUnitRange>.Create;
@@ -355,6 +378,8 @@ begin
       var Count := 0;
       FRecordsPerAddress.TryGetValue(MapRecord.Address, Count);
       FRecordsPerAddress.AddOrSetValue(MapRecord.Address, Count + 1);
+      if IsGhost(MapRecord) then
+        FGhostAddresses.Add(MapRecord.Address);
     end,
     procedure
     begin
@@ -384,6 +409,33 @@ begin
   end;
   if (Best >= 0) and (Offset < Ranges[Best].Start + Ranges[Best].Size) then
     Result := Ranges[Best].UnitName;
+end;
+
+function TMapLayout.IsGhost(const MapRecord: TMapRecord): Boolean;
+begin
+  if not FUnitsWithCode.ContainsKey(UpperCase(MapRecord.UnitName)) then
+    Exit(False);
+  Result := not SameText(OwnerUnit(MapRecord.Segment, MapRecord.Offset), MapRecord.UnitName);
+end;
+
+function TMapLayout.UnitStarts: TArray<TMapRecord>;
+begin
+  var Starts := TList<TMapRecord>.Create;
+  try
+    for var Pair in FUnitRanges do
+      for var Range in Pair.Value do begin
+        if not Range.IsCode or (Range.Size = 0) then
+          Continue;
+        var Start := Default(TMapRecord);
+        Start.UnitName := Range.UnitName;
+        Start.Segment  := Pair.Key;
+        Start.Offset   := Range.Start;
+        Starts.Add(Start);
+      end;
+    Result := Starts.ToArray;
+  finally
+    Starts.Free;
+  end;
 end;
 
 function TMapLayout.SharedAddresses: TArray<UInt64>;
@@ -421,7 +473,7 @@ begin
 end;
 
 // Addresses to check: section starts spread over the MAP, the farthest section
-// of each segment, and every shared address.
+// of each segment, every shared address and every ghost.
 function SelectAddresses(Layout: TMapLayout; SpreadSamples: Integer): TArray<UInt64>;
 begin
   var Chosen := TDictionary<UInt64, Boolean>.Create;
@@ -437,6 +489,8 @@ begin
       Chosen.AddOrSetValue(Records[Farthest].Address, True);
     for var Shared in Layout.SharedAddresses do
       Chosen.AddOrSetValue(Shared, True);
+    for var Ghost in Layout.GhostAddresses do
+      Chosen.AddOrSetValue(Ghost, True);
     Result := Chosen.Keys.ToArray;
     TArray.Sort<UInt64>(Result);
   finally
@@ -450,7 +504,8 @@ begin
   var Found := TObjectDictionary<UInt64, TList<TMapRecord>>.Create([doOwnsValues]);
   try
     for var Address in Addresses do
-      Found.Add(Address, TList<TMapRecord>.Create);
+      if not Found.ContainsKey(Address) then
+        Found.Add(Address, TList<TMapRecord>.Create);
     ForEachLineRecord(MapPath,
       procedure(const MapRecord: TMapRecord)
       begin
@@ -465,15 +520,13 @@ begin
   Result := Found;
 end;
 
-// One record: that one. Several: those of the unit owning the address.
+// The records at an address that are not ghosts. Empty when every record
+// there lies in another unit's code.
 function AcceptableRecords(Layout: TMapLayout; Records: TList<TMapRecord>): TArray<TMapRecord>;
 begin
-  if Records.Count = 1 then
-    Exit(Records.ToArray);
   Result := [];
-  var Owner := Layout.OwnerUnit(Records[0].Segment, Records[0].Offset);
   for var MapRecord in Records do
-    if SameText(MapRecord.UnitName, Owner) then
+    if not Layout.IsGhost(MapRecord) then
       Result := Result + [MapRecord];
 end;
 
@@ -516,7 +569,7 @@ begin
     Exit(Fail(Failure, Format('%s: RvaToSourceLine gave %s:%d', [Where, ExtractFileName(Loc.SourceFile), Loc.Line])));
   if Records.Count > 1 then
     Exit(True);
-  // Line -> address, for an address with a single record.
+  // Line -> address, for an address with a single (non-ghost) record.
   var Only := Records[0];
   var BoundRva: UInt64;
   if not Map.SourceLineToRva(Only.SourcePath, Only.Line, BoundRva) then
@@ -525,6 +578,44 @@ begin
   if not Map.RvaToSourceLine(BoundRva, BoundLoc) or (BoundLoc.Line <> Only.Line) then
     Exit(Fail(Failure, Format('%s: SourceLineToRva gave $%x, which is not that line', [Where, BoundRva])));
   Result := True;
+end;
+
+// Every record here is a ghost: TMapFile must return none of them. (What it
+// should return instead -- the nearest real record of the owning unit, or
+// nothing -- needs the whole line table; the unit-start check covers the case
+// that matters, the start of a unit.)
+function GhostAddressAgrees(Map: TMapFile; Records: TList<TMapRecord>; Rva: UInt64;
+  out Failure: string): Boolean;
+begin
+  var Loc: TSourceLocation;
+  if not Map.RvaToSourceLine(Rva, Loc) then
+    Exit(True);
+  if not IsAcceptable(Loc, Records.ToArray) then
+    Exit(True);
+  Result := Fail(Failure, Format('ghost RVA $%x [%s]: RvaToSourceLine returned the ghost %s:%d',
+    [Rva, DescribeAll(Records), ExtractFileName(Loc.SourceFile), Loc.Line]));
+end;
+
+// At the first byte of a unit's code the answer is a (real) record at that very
+// address -- which may carry another file's line: a generic instantiated in
+// the unit -- or, with none there, no line at all: the nearest record before it
+// is the previous unit's.
+function UnitStartAgrees(Map: TMapFile; const Start: TMapRecord; const Acceptable: TArray<TMapRecord>;
+  Rva: UInt64; out Failure: string): Boolean;
+begin
+  var Loc: TSourceLocation;
+  var HasLine := Map.RvaToSourceLine(Rva, Loc);
+  var Where := Format('start of %s (RVA $%x)', [Start.UnitName, Rva]);
+  var Found := Format('%s:%d', [ExtractFileName(Loc.SourceFile), Loc.Line]);
+  if Length(Acceptable) = 0 then begin
+    if not HasLine then
+      Exit(True);
+    Exit(Fail(Failure, Where + ': no record there, yet RvaToSourceLine gave ' + Found));
+  end;
+  if HasLine and IsAcceptable(Loc, Acceptable) then
+    Exit(True);
+  Result := Fail(Failure, Where + ': RvaToSourceLine gave ' + IfThen(HasLine, Found, 'nothing') +
+    ', expected ' + Acceptable[0].Describe);
 end;
 
 procedure WaitUntilIndexed(Map: TMapFile);
@@ -539,34 +630,12 @@ end;
 
 type
   TTally = record
-    Agreed, Disagreed, NoSection, NoOwnerRecord: Integer;
+    Agreed, Disagreed, NoSection, GhostAddresses, UnitStarts: Integer;
     SlowestMs: Int64;
   end;
 
-procedure CheckAddress(Map: TMapFile; Layout: TMapLayout; const Sections: TArray<TPeSection>;
-  Records: TList<TMapRecord>; var Tally: TTally);
+procedure CountResult(var Tally: TTally; Agrees: Boolean; const Failure: string);
 begin
-  if Records.Count = 0 then
-    Exit;
-  var SegmentName := '';
-  Layout.SegmentNames.TryGetValue(Records[0].Segment, SegmentName);
-  var SectionAddress: UInt64;
-  if not TrySectionAddress(Sections, SegmentName, SectionAddress) then begin
-    Inc(Tally.NoSection);
-    Exit;
-  end;
-  var Acceptable := AcceptableRecords(Layout, Records);
-  if Length(Acceptable) = 0 then begin
-    Inc(Tally.NoOwnerRecord);
-    var Owner := Layout.OwnerUnit(Records[0].Segment, Records[0].Offset);
-    Writeln(Format('  AMBIGUOUS seg %d + $%x [%s]: owner per detailed map = %s',
-      [Records[0].Segment, Records[0].Offset, DescribeAll(Records), IfThen(Owner.IsEmpty, '(none)', Owner)]));
-    Exit;
-  end;
-  var Failure: string;
-  var Watch := TStopwatch.StartNew;
-  var Agrees := AddressAgrees(Map, Records, Acceptable, SectionAddress + Records[0].Offset, Failure);
-  Tally.SlowestMs := Max(Tally.SlowestMs, Watch.ElapsedMilliseconds);
   if Agrees then begin
     Inc(Tally.Agreed);
     Exit;
@@ -574,6 +643,53 @@ begin
   Inc(Tally.Disagreed);
   if Tally.Disagreed <= MAX_FAILURES_SHOWN then
     Writeln('  FAIL ', Failure);
+end;
+
+function TrySegmentAddress(Layout: TMapLayout; const Sections: TArray<TPeSection>; Segment: Integer;
+  out SectionAddress: UInt64): Boolean;
+begin
+  var SegmentName := '';
+  Layout.SegmentNames.TryGetValue(Segment, SegmentName);
+  Result := TrySectionAddress(Sections, SegmentName, SectionAddress);
+end;
+
+procedure CheckAddress(Map: TMapFile; Layout: TMapLayout; const Sections: TArray<TPeSection>;
+  Records: TList<TMapRecord>; var Tally: TTally);
+begin
+  if Records.Count = 0 then
+    Exit;
+  var SectionAddress: UInt64;
+  if not TrySegmentAddress(Layout, Sections, Records[0].Segment, SectionAddress) then begin
+    Inc(Tally.NoSection);
+    Exit;
+  end;
+  var Rva := SectionAddress + Records[0].Offset;
+  var Acceptable := AcceptableRecords(Layout, Records);
+  var Failure: string;
+  var Watch := TStopwatch.StartNew;
+  var Agrees: Boolean;
+  if Length(Acceptable) = 0 then begin
+    Inc(Tally.GhostAddresses);
+    Agrees := GhostAddressAgrees(Map, Records, Rva, Failure);
+  end else
+    Agrees := AddressAgrees(Map, Records, Acceptable, Rva, Failure);
+  Tally.SlowestMs := Max(Tally.SlowestMs, Watch.ElapsedMilliseconds);
+  CountResult(Tally, Agrees, Failure);
+end;
+
+procedure CheckUnitStart(Map: TMapFile; Layout: TMapLayout; const Sections: TArray<TPeSection>;
+  const Start: TMapRecord; Found: TObjectDictionary<UInt64, TList<TMapRecord>>; var Tally: TTally);
+begin
+  var SectionAddress: UInt64;
+  if not TrySegmentAddress(Layout, Sections, Start.Segment, SectionAddress) then
+    Exit;
+  Inc(Tally.UnitStarts);
+  var Acceptable: TArray<TMapRecord> := [];
+  var Records: TList<TMapRecord>;
+  if Found.TryGetValue(Start.Address, Records) then
+    Acceptable := AcceptableRecords(Layout, Records);
+  var Failure: string;
+  CountResult(Tally, UnitStartAgrees(Map, Start, Acceptable, SectionAddress + Start.Offset, Failure), Failure);
 end;
 
 function CheckAddresses(const MapPath: string; PreferredBase: UInt64; const Sections: TArray<TPeSection>;
@@ -598,9 +714,11 @@ begin
     TArray.Sort<UInt64>(Addresses);
     for var Address in Addresses do
       CheckAddress(Map, Layout, Sections, Found[Address], Tally);
-    Writeln(Format('Addresses: %d agreed, %d disagreed; skipped %d (no PE section), %d (shared, no record of ' +
-      'the owning unit); %.1f s total, slowest %d ms', [Tally.Agreed, Tally.Disagreed, Tally.NoSection,
-      Tally.NoOwnerRecord, ChecksWatch.Elapsed.TotalSeconds, Tally.SlowestMs]));
+    for var Start in Layout.UnitStarts do
+      CheckUnitStart(Map, Layout, Sections, Start, Found, Tally);
+    Writeln(Format('Checks: %d agreed, %d disagreed -- of them %d ghost-only addresses and %d unit starts; ' +
+      'skipped %d (no PE section); %.1f s total, slowest %d ms', [Tally.Agreed, Tally.Disagreed,
+      Tally.GhostAddresses, Tally.UnitStarts, Tally.NoSection, ChecksWatch.Elapsed.TotalSeconds, Tally.SlowestMs]));
     Result := IfThen(Tally.Disagreed = 0, 0, 1);
   finally
     Map.Free;
@@ -636,10 +754,21 @@ begin
     Layout.Read(MapPath);
     PrintSegments(Layout, Sections, PreferredBase);
     var Shared := Layout.SharedAddresses;
-    Writeln(Format('Line sections: %d (%d not in ascending address order); addresses with several records: %d',
-      [Layout.FirstRecords.Count, Layout.UnorderedSections, Length(Shared)]));
-    var Addresses := SelectAddresses(Layout, SpreadSamples);
-    Writeln(Format('Addresses to check: %d', [Length(Addresses)]));
+    Writeln(Format('Line sections: %d (%d not in ascending address order); addresses with several records: %d; ' +
+      'ghost records (outside their unit''s code): %d',
+      [Layout.FirstRecords.Count, Layout.UnorderedSections, Length(Shared), Layout.GhostAddresses.Count]));
+    var Addresses: TArray<UInt64>;
+    var CheckList := TList<UInt64>.Create;
+    try
+      CheckList.AddRange(SelectAddresses(Layout, SpreadSamples));
+      Writeln(Format('Addresses to check: %d', [CheckList.Count]));
+      // The records at every unit start are needed too, for CheckUnitStart.
+      for var Start in Layout.UnitStarts do
+        CheckList.Add(Start.Address);
+      Addresses := CheckList.ToArray;
+    finally
+      CheckList.Free;
+    end;
     var Found := RecordsAt(MapPath, Addresses);
     try
       Result := CheckAddresses(MapPath, PreferredBase, Sections, Layout, Found);

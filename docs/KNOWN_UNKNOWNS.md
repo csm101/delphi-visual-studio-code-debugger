@@ -1708,8 +1708,10 @@ unit that instantiates a generic (e.g. `dbConn.Pkg<TPkgGiri>` in
 `frmTABEsclusioneGiriPVU`) often has NO `.text` section for the generic's file.
 It has only a one-record `.itext` section of that file (`Oracle.pas` line 1321,
 the generic's `end;`), at an address outside the unit's own range: 531 of 538
-foreign-file `.itext` sections. The fix that does not depend on the answer is
-planned in `PROJECT_STATE.md`, "MAP reader: drop ghost line records".
+foreign-file `.itext` sections. The reader no longer depends on the answer:
+it drops any record outside its own unit's code according to the detailed map
+(`DAP_DEBUGGER_ARCHITECTURE.md`, "Not every line record is where it claims to
+be"). What stays open is only WHY the linker leaves them.
 
 **Hypothesis (unverified):** the linker keeps one copy of each duplicate generic
 instantiation and discards the others. A discarded copy leaves behind its last
