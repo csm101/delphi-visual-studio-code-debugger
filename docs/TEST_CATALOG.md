@@ -765,6 +765,24 @@ fixture):
       EXE, stop in EXE, inspect a field of the BPL-class instance
 - [ ] **fully-qualified method name longer than 200 chars**
 - [ ] **Self.A.B.C dot chain of length > 4** in watch
+- [x] **MCP `launch_from_config` / `attach_from_config` on the workspace an IDE
+      plugin generates**: the configurations under `launch` in a
+      `.code-workspace` (BOM included), `${workspaceFolder}` = the workspace's
+      first folder relative to the file (`LaunchConfig_ReadsACodeWorkspace`),
+      and the `delphi` debug type as well as its `delphi-win64` alias
+      (`LaunchConfig_AcceptsTheDelphiType`). Found live on Hydra2; both fail on
+      the previous reader with the error the tool gave there
+- [x] **MCP `set_breakpoint` keeps the file's other breakpoints** and replaces
+      only the line it names, conditions included
+      (`SetBreakpoint_KeepsTheFileOtherLines`). Found live on Hydra2, where a
+      second breakpoint in `CambioZonaSuAnagU.pas` silently removed the first;
+      fails on the previous whole-file replace
+- [x] **A program path with forward slashes** (`${workspaceFolder}/Win64/...`,
+      as every generated configuration writes it) still names the main module
+      by its file alone (`Launch_ProgramPathWithForwardSlashes_NamesTheModuleByItsFile`).
+      Found live on Hydra2 launched from its `.code-workspace`, where the frames
+      said `hydra_2/win64/debug/hydra2.exe`; fails without the session's
+      path normalization with `debug/testtarget.exe`
 
 ---
 

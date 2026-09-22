@@ -932,7 +932,7 @@ debug target (`ddk.exe debug-target … --json`), so an agent starts a session
 from a project name alone, with the real executable or host application,
 symbols, sources and packages; DDK's warnings come back in the reply. When DDK
 is not installed, `launch_from_config` and `attach_from_config` read the
-`launch.json` the IDE plugin generated instead. Either way the session starts
+`launch.json` or `.code-workspace` the IDE plugin generated instead. Either way the session starts
 with the project's real symbol and source paths rather than a hand-built
 approximation.
 `get_compact_debug_snapshot` returns location, stack and locals in one call,

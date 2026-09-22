@@ -127,13 +127,13 @@ begin
      Prop('stopAtEntry', 'boolean', 'Stop at the program entry point instead of running to the first breakpoint.')]));
 
   Result.Add(MakeTool('launch_from_config',
-    'Launch using an existing VS Code launch.json (the same file the DAP debugger ' +
-    'uses) so you need not re-specify program / map / rsm / source paths. Reads a ' +
-    'delphi-win64 configuration (JSONC + ${workspaceFolder}/${env:} supported). Stops ' +
-    'at entry; then set breakpoints and continue_and_wait.',
-    [Prop('configFile', 'string', 'Path to launch.json. Defaults to .vscode\launch.json under the current directory.'),
-     Prop('configName', 'string', 'Which configuration ("name") to use. Defaults to the first with type "delphi-win64".'),
-     Prop('workspaceFolder', 'string', 'Base for ${workspaceFolder}. Defaults to the launch.json''s parent directory.')]));
+    'Launch using an existing VS Code launch.json or .code-workspace (the same file the ' +
+    'DAP debugger uses) so you need not re-specify program / map / rsm / source paths. ' +
+    'Reads a "delphi" (or "delphi-win64") configuration (JSONC + ${workspaceFolder}/${env:} ' +
+    'supported). Stops at entry; then set breakpoints and continue_and_wait.',
+    [Prop('configFile', 'string', 'Path to launch.json or to a .code-workspace. Defaults to .vscode\launch.json under the current directory.'),
+     Prop('configName', 'string', 'Which configuration ("name") to use. Defaults to the first of type "delphi" / "delphi-win64".'),
+     Prop('workspaceFolder', 'string', 'Base for ${workspaceFolder}. Defaults to the folder holding .vscode for a launch.json, or to the first folder of a .code-workspace.')]));
 
   Result.Add(MakeTool('attach_to_process',
     'Attach the debugger to an already-running process, selected by processId or by ' +
@@ -186,13 +186,13 @@ begin
      Prop('killOnDetach', 'boolean', 'If true, terminate the target when the debug session ends; default false (leave it running).')]));
 
   Result.Add(MakeTool('attach_from_config',
-    'Attach using an existing VS Code launch.json "attach" configuration (same file ' +
-    'the DAP debugger uses): it supplies the process selector (processId/processName), ' +
+    'Attach using an existing VS Code launch.json or .code-workspace "attach" configuration ' +
+    '(same file the DAP debugger uses): it supplies the process selector (processId/processName), ' +
     'program/map/rsm and the source paths, so you need not restate them. JSONC and ' +
     '${workspaceFolder}/${env:} are handled.',
-    [Prop('configFile', 'string', 'Path to launch.json. Defaults to .vscode\launch.json under the current directory.'),
-     Prop('configName', 'string', 'Which configuration ("name"). Defaults to the first delphi-win64 request:"attach" entry.'),
-     Prop('workspaceFolder', 'string', 'Base for ${workspaceFolder}. Defaults to the launch.json''s parent directory.'),
+    [Prop('configFile', 'string', 'Path to launch.json or to a .code-workspace. Defaults to .vscode\launch.json under the current directory.'),
+     Prop('configName', 'string', 'Which configuration ("name"). Defaults to the first "delphi" / "delphi-win64" request:"attach" entry.'),
+     Prop('workspaceFolder', 'string', 'Base for ${workspaceFolder}. Defaults to the folder holding .vscode for a launch.json, or to the first folder of a .code-workspace.'),
      Prop('killOnDetach', 'boolean', 'Terminate the target on session end; default false.')]));
 
   Result.Add(MakeTool('set_step_isolation_release',
@@ -223,8 +223,10 @@ begin
 
   // ---- Breakpoints ----
   Result.Add(MakeTool('set_breakpoint',
-    'Set (or replace) a source-line breakpoint. Returns whether the line resolved to code ' +
-    '(verified). Optional condition / hit-count / logpoint refine when it fires.',
+    'Add a source-line breakpoint, or replace the one already on that line. The file''s ' +
+    'other breakpoints are kept (use set_breakpoints to replace a file''s whole set). ' +
+    'Returns whether the line resolved to code (verified). Optional condition / ' +
+    'hit-count / logpoint refine when it fires.',
     [Prop('sourceFile', 'string', 'Source file basename or path (e.g. "Unit1.pas").', True),
      Prop('line', 'integer', 'Source line number (1-based).', True),
      Prop('condition', 'string', 'Pascal expression; the breakpoint only stops when it is true / non-zero (e.g. "i = 3", "Count > 10").'),

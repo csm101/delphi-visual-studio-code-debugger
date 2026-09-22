@@ -719,6 +719,12 @@ absurdly.
 - **Running `DevTools\PrebuildIdx` next to a live debug session is the way to hit
   the sidecar write-contention path.** Use it to exercise that code deliberately,
   not as a background convenience.
+- **A path from a launch configuration may contain `/`.** The generated ones write
+  `${workspaceFolder}/Win64/Debug/App.exe`, so after substitution the path is half
+  `\`, half `/`. Windows opens it, but `ExtractFileName` does not split on `/`: the
+  main module of Hydra2 showed as `hydra_2/win64/debug/hydra2.exe`. `TDebugSession`
+  normalizes the program, `.map` and `.rsm` paths at `Launch` / `Attach`; code that
+  derives a name from a RAW configuration path has to do the same.
 
 ## Already evaluated and rejected — do not re-walk
 

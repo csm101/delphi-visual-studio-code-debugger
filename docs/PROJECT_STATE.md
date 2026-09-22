@@ -1130,6 +1130,19 @@ Architecture / portability:
   Win32 / Windows-ARM (or attach-mode, remote, …) implementations
   plug in without touching the DAP layer or evaluator.
 
+Small defects seen in the live Hydra2 multi-BPL session of 2026-09-22 (the
+session itself found nothing broken; `set_breakpoint` and the config reader were
+fixed in the same pass):
+- `get_loaded_modules` lists `vcl290.bpl` five times, including the 32-bit copy
+  from `bin\`, at bases later reused by other packages. Likely resource-only
+  loads, or unloads that never leave the list; cause not verified.
+- `launch_from_config` / `attach_from_config` ignore `modules` (per-package
+  `.map` / `.rsm` / `.dcp` overrides), which the DAP launch reads. That one is
+  project knowledge and belongs in the reader; `exceptionFilters` and
+  `stepIsolation` deliberately do not (see `MCP_SERVER.md`).
+- A frame whose parameter the compiler never stored (an unused `Sender`)
+  shows `"arguments": "TObject"`, the type without a name.
+
 ## Important technical discoveries
 
 - **An ended session must not hold the debuggee's build outputs (2026-09-21).**

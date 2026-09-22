@@ -435,6 +435,12 @@ type
     // Breakpoints.
     function  SetBreakpoints(const SourceFile: string;
                 const Specs: TArray<TBpLineSpec>): TArray<TSessionBreakpoint>;
+    // Adds ONE line's breakpoint, or replaces the one already on that line, and
+    // keeps the file's other lines. SetBreakpoints replaces the whole file's set
+    // (the DAP contract); a caller that adds breakpoints one at a time needs this.
+    // Like any set for the file, it restarts the hit counts of its other lines.
+    function  SetBreakpoint(const SourceFile: string;
+                const Spec: TBpLineSpec): TSessionBreakpoint;
     function  ListBreakpoints: TArray<TSessionBreakpoint>;
     procedure RemoveAllBreakpoints;
     // Re-post every stored spec to the engine and fire OnBreakpointChanged for any
@@ -968,6 +974,17 @@ begin
   FPendingBps.Clear;
 end;
 
+// A configuration joins ${workspaceFolder} to "/Win64/Debug/App.exe". Windows
+// opens such a path, but ExtractFileName does not split on '/', so every name
+// derived from it -- the main module's first -- would carry the directories.
+// GetFullPathName, under ExpandFileName, turns every '/' into '\'.
+function NativeFullPath(const Path: string): string;
+begin
+  if Path = '' then
+    Exit('');
+  Result := ExpandFileName(Path);
+end;
+
 function TDebugSession.Launch(const Opts: TLaunchOptions): Boolean;
 begin
   Result := False;
@@ -978,10 +995,10 @@ begin
 
   SetState(dsLaunching);
   FStartedByAttach := False;
-  FExePath := Opts.ExePath;
-  if Opts.MapPath <> '' then FMapPath := Opts.MapPath
+  FExePath := NativeFullPath(Opts.ExePath);
+  if Opts.MapPath <> '' then FMapPath := NativeFullPath(Opts.MapPath)
   else                       FMapPath := ChangeFileExt(FExePath, '.map');
-  if Opts.RsmPath <> '' then FRsmPath := Opts.RsmPath
+  if Opts.RsmPath <> '' then FRsmPath := NativeFullPath(Opts.RsmPath)
   else                       FRsmPath := ChangeFileExt(FExePath, '.rsm');
   FResolver.Configure(Opts.SourceRoot, FExePath, Opts.ExtraSourcePaths);
   // The safelist containment rule anchors on source directories; these are the
@@ -1025,10 +1042,10 @@ begin
 
   SetState(dsAttaching);
   FStartedByAttach := True;
-  FExePath := Opts.ProgramPath;
-  if Opts.MapPath <> '' then FMapPath := Opts.MapPath
+  FExePath := NativeFullPath(Opts.ProgramPath);
+  if Opts.MapPath <> '' then FMapPath := NativeFullPath(Opts.MapPath)
   else                       FMapPath := ChangeFileExt(FExePath, '.map');
-  if Opts.RsmPath <> '' then FRsmPath := Opts.RsmPath
+  if Opts.RsmPath <> '' then FRsmPath := NativeFullPath(Opts.RsmPath)
   else                       FRsmPath := ChangeFileExt(FExePath, '.rsm');
   FResolver.Configure(Opts.SourceRoot, FExePath, Opts.ExtraSourcePaths);
   // The safelist containment rule anchors on source directories; these are the
@@ -1303,7 +1320,7 @@ begin
     Spec.LogMessages[I]   := Specs[I].LogMessage;
 
     var Rva: UInt64;
-    var Bp: TSessionBreakpoint;
+    var Bp := Default(TSessionBreakpoint);   // Kind = bkSource
     Bp.Id           := LowerCase(ExtractFileName(SourceFile)) + '|' + IntToStr(Specs[I].Line);
     Bp.SourceFile   := SourceFile;
     Bp.Line         := Specs[I].Line;
@@ -1340,6 +1357,36 @@ begin
   end
   else
     FPendingBps.Add(Spec);
+end;
+
+function TDebugSession.SetBreakpoint(const SourceFile: string;
+  const Spec: TBpLineSpec): TSessionBreakpoint;
+
+  function IsAnotherLineOfTheFile(const Bp: TSessionBreakpoint): Boolean;
+  begin
+    if Bp.Kind <> bkSource then
+      Exit(False);
+    // The same key SetBreakpoints drops a file's set by.
+    if not SameText(Bp.SourceFile, SourceFile) then
+      Exit(False);
+    Result := Bp.Line <> Spec.Line;
+  end;
+
+begin
+  var Specs: TArray<TBpLineSpec> := nil;
+  for var Bp in FBreakpoints do begin
+    if not IsAnotherLineOfTheFile(Bp) then
+      Continue;
+    var Kept := Default(TBpLineSpec);
+    Kept.Line         := Bp.Line;
+    Kept.Condition    := Bp.Condition;
+    Kept.HitCondition := Bp.HitCondition;
+    Kept.LogMessage   := Bp.LogMessage;
+    Specs := Specs + [Kept];
+  end;
+  // SetBreakpoints answers in the order of Specs, so the new line is the last.
+  var Bps := SetBreakpoints(SourceFile, Specs + [Spec]);
+  Result := Bps[High(Bps)];
 end;
 
 function TDebugSession.BuildDataBreakpointDescription: string;

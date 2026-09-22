@@ -1,10 +1,15 @@
 unit LaunchConfig;
 
-// Reads a VS Code launch.json (the same file the DAP debugger is driven from) and
-// turns a `delphi-win64` configuration into TLaunchOptions, so an agent working in
+// Reads a VS Code launch.json or .code-workspace (the same file the DAP debugger is
+// driven from) and turns a `delphi` (or `delphi-win64`) configuration into
+// TLaunchOptions, so an agent working in
 // a repo that already has a launch config need not re-specify program / map / rsm
 // / source paths. Handles JSONC (// and /* */ comments, trailing commas) and the
 // common ${workspaceFolder} / ${workspaceFolderBasename} / ${env:VAR} variables.
+//
+// Only project knowledge is read (program, symbols, source paths, arguments). The
+// human's run-control preferences -- exceptionFilters, stepIsolation -- are left
+// out on purpose: what to stop on is the agent's decision, not the IDE user's.
 //
 // Also exposes the source-search-path expansion used by the launch/attach tools so
 // a multi-root `sourceSearchPaths` array is honoured everywhere.
@@ -25,8 +30,9 @@ function ExpandSearchPaths(const Items: TArray<string>;
   const WorkspaceFolder: string): TArray<string>;
 
 // Load a LAUNCH config (request "launch"). ConfigName selects by "name"; empty
-// picks the first "delphi-win64" launch entry. WorkspaceFolder defaults to the
-// parent of the launch.json's directory. Returns False + ErrMsg on failure.
+// picks the first "delphi" / "delphi-win64" launch entry. WorkspaceFolder defaults
+// to the parent of the launch.json's directory, or to a .code-workspace's first
+// folder. Returns False + ErrMsg on failure.
 function LoadLaunchConfig(const ConfigFile, ConfigName, WorkspaceFolder: string;
   out Opts: TLaunchOptions; out ErrMsg: string): Boolean;
 
@@ -162,7 +168,49 @@ type
     ProcessName: string;
   end;
 
-// Shared reader: finds a delphi-win64 configuration (by name, or the first whose
+// A launch.json keeps its configurations at the root; a .code-workspace (what the
+// IDE plugins generate) keeps them under "launch".
+function FindConfigurations(Root: TJSONObject): TJSONArray;
+begin
+  var Configs := Root.GetValue('configurations');
+  if Configs is TJSONArray then
+    Exit(TJSONArray(Configs));
+  var Launch := Root.GetValue('launch');
+  if not (Launch is TJSONObject) then
+    Exit(nil);
+  Configs := TJSONObject(Launch).GetValue('configurations');
+  if Configs is TJSONArray then
+    Exit(TJSONArray(Configs));
+  Result := nil;
+end;
+
+// "delphi" is the extension's debug type; "delphi-win64" its older alias.
+function IsDelphiConfigType(const TypeName: string): Boolean;
+begin
+  Result := MatchText(TypeName, ['delphi', 'delphi-win64']);
+end;
+
+// What ${workspaceFolder} means when the caller does not say: for a launch.json,
+// the folder holding .vscode; for a .code-workspace, its first folder, which the
+// file names relative to itself (VS Code resolves it the same way).
+function DefaultWorkspaceFolder(const ConfigFile: string; Root: TJSONObject): string;
+begin
+  var CfgDir := ExtractFileDir(ExpandFileName(ConfigFile));
+  if Root.GetValue('configurations') is TJSONArray then
+    Exit(ExtractFileDir(CfgDir));
+  Result := CfgDir;
+  var Folders := Root.GetValue('folders');
+  if not (Folders is TJSONArray) or (TJSONArray(Folders).Count = 0) then
+    Exit;
+  var First := TJSONArray(Folders).Items[0];
+  if not (First is TJSONObject) then
+    Exit;
+  var FolderPath := TJSONObject(First).GetValue<string>('path', '');
+  if FolderPath <> '' then
+    Result := ExcludeTrailingPathDelimiter(ExpandFileName(TPath.Combine(CfgDir, FolderPath)));
+end;
+
+// Shared reader: finds a Delphi configuration (by name, or the first whose
 // request matches WantRequest -- '' = any) and extracts all fields with variables
 // resolved. No live TJSON escapes.
 function ReadConfig(const ConfigFile, ConfigName, WorkspaceFolder, WantRequest: string;
@@ -182,9 +230,9 @@ begin
     Exit;
   end;
   try
-    var Configs := TJSONObject(Root).GetValue('configurations') as TJSONArray;
+    var Configs := FindConfigurations(TJSONObject(Root));
     if Configs = nil then begin
-      ErrMsg := 'launch config has no "configurations" array';
+      ErrMsg := 'launch config has no "configurations" array (nor "launch.configurations")';
       Exit;
     end;
     var Cfg: TJSONObject := nil;
@@ -192,7 +240,7 @@ begin
       if not (Item is TJSONObject) then
         Continue;
       var O := TJSONObject(Item);
-      if not SameText(O.GetValue<string>('type', ''), 'delphi-win64') then
+      if not IsDelphiConfigType(O.GetValue<string>('type', '')) then
         Continue;
       if ConfigName <> '' then begin
         if SameText(O.GetValue<string>('name', ''), ConfigName) then begin
@@ -208,14 +256,14 @@ begin
       if ConfigName <> '' then
         ErrMsg := Format('no configuration named "%s" in %s', [ConfigName, ConfigFile])
       else
-        ErrMsg := Format('no "delphi-win64" %s configuration in %s (pass configName to pick one)',
+        ErrMsg := Format('no "delphi" %s configuration in %s (pass configName to pick one)',
           [WantRequest, ConfigFile]);
       Exit;
     end;
 
     var WS := WorkspaceFolder;
     if WS = '' then
-      WS := ExtractFileDir(ExtractFileDir(ExpandFileName(ConfigFile)));  // .vscode's parent
+      WS := DefaultWorkspaceFolder(ConfigFile, TJSONObject(Root));
 
     F.Request    := Cfg.GetValue<string>('request', 'launch');
     F.Prog       := ResolveVars(Cfg.GetValue<string>('program', ''), WS);

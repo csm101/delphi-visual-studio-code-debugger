@@ -511,6 +511,21 @@ type
     [Test] procedure GetVariable_LocalAndExpression;
     [Test] procedure Attach_ToRunningTarget_Stops;
     [Test] procedure AttachConfig_ParsesSelectorAndPaths;
+    // The IDE plugins write the launch configurations into a .code-workspace,
+    // under "launch", and name the debug type "delphi". launch_from_config
+    // accepted neither: it answered 'launch config has no "configurations"
+    // array' for the workspace Hydra2 is debugged from.
+    [Test] procedure LaunchConfig_ReadsACodeWorkspace;
+    [Test] procedure LaunchConfig_AcceptsTheDelphiType;
+    // The MCP set_breakpoint tool replaced the file's WHOLE set, so a second
+    // breakpoint in the same file silently removed the first -- met live on
+    // Hydra2, where an agent adds breakpoints one at a time.
+    [Test] procedure SetBreakpoint_KeepsTheFileOtherLines;
+    // A configuration joins ${workspaceFolder} to "/Win64/Debug/App.exe".
+    // Windows opens such a path, but ExtractFileName does not split on '/', so
+    // the main module was named "hydra_2/win64/debug/hydra2.exe" when Hydra2 was
+    // launched from its .code-workspace.
+    [Test] procedure Launch_ProgramPathWithForwardSlashes_NamesTheModuleByItsFile;
     // Step-0 superset additions (frontend-neutral core superset of the DAP needs).
     [Test] procedure Threads_StoppedThreadIsCurrent;
     [Test] procedure PerThreadStep_StepsOnlySelectedThread;
@@ -3112,6 +3127,139 @@ begin
   Assert.AreEqual('C:\Proj\Root', Opts.SourceRoot, '${workspaceFolder} not resolved for sourceRoot');
   Assert.IsTrue(Length(Opts.ExtraSourcePaths) >= 1, 'sourceSearchPaths not parsed');
   Assert.AreEqual('C:\Proj\Root\lib', Opts.ExtraSourcePaths[0], '${workspaceFolder} not resolved in a search path');
+end;
+
+procedure TDebugSessionTests.LaunchConfig_ReadsACodeWorkspace;
+begin
+  // Shaped like the workspace the IDE plugin generates: settings first, the
+  // configurations under "launch", the one folder named relative to the file.
+  var Content :=
+    '{' + sLineBreak +
+    '  "settings": { "files.exclude": { "**/CVS": true } },' + sLineBreak +
+    '  "launch": {' + sLineBreak +
+    '    "version": "0.2.0",' + sLineBreak +
+    '    "configurations": [' + sLineBreak +
+    '      {' + sLineBreak +
+    '        "type": "delphi-win64",' + sLineBreak +
+    '        "request": "launch",' + sLineBreak +
+    '        "name": "Debug MyApp",' + sLineBreak +
+    '        "program": "${workspaceFolder}/Win64/Debug/MyApp.exe",' + sLineBreak +
+    '        "sourceRoot": "${workspaceFolder}",' + sLineBreak +
+    '      },' + sLineBreak +
+    '    ],' + sLineBreak +
+    '  },' + sLineBreak +
+    '  "folders": [ { "path": "Proj" } ]' + sLineBreak +
+    '}';
+  // Pid-scoped for the same reason as the attach config above.
+  var Dir := TPath.Combine(TPath.GetTempPath, Format('mcp_test_ws_%d', [GetCurrentProcessId]));
+  TDirectory.CreateDirectory(Dir);
+  var CfgPath := TPath.Combine(Dir, 'MyApp.code-workspace');
+  // With a BOM, as the plugin writes it.
+  TFile.WriteAllText(CfgPath, Content, TEncoding.UTF8);
+  try
+    var Opts: TLaunchOptions;
+    var Err: string;
+    Assert.IsTrue(LaunchConfig.LoadLaunchConfig(CfgPath, 'Debug MyApp', '', Opts, Err),
+      'LoadLaunchConfig failed on a .code-workspace: ' + Err);
+    var Folder := TPath.Combine(Dir, 'Proj');
+    Assert.AreEqual(Folder, Opts.SourceRoot,
+      '${workspaceFolder} must be the workspace''s first folder, relative to the file');
+    Assert.AreEqual(Folder + '/Win64/Debug/MyApp.exe', Opts.ExePath, 'program not resolved');
+  finally
+    TDirectory.Delete(Dir, True);
+  end;
+end;
+
+procedure TDebugSessionTests.LaunchConfig_AcceptsTheDelphiType;
+begin
+  // "delphi" is the extension's debug type and "delphi-win64" only its alias, so
+  // a configuration written today carries the former.
+  var Content :=
+    '{ "configurations": [' + sLineBreak +
+    '  { "type": "node", "request": "launch", "name": "Not ours", "program": "x.js" },' + sLineBreak +
+    '  { "type": "delphi", "request": "launch", "name": "Debug MyApp", "program": "C:\\Proj\\MyApp.exe" }' + sLineBreak +
+    '] }';
+  var CfgPath := TPath.Combine(TPath.GetTempPath,
+    Format('mcp_test_delphi_type_%d.json', [GetCurrentProcessId]));
+  TFile.WriteAllText(CfgPath, Content);
+  try
+    var Opts: TLaunchOptions;
+    var Err: string;
+    Assert.IsTrue(LaunchConfig.LoadLaunchConfig(CfgPath, '', 'C:\Proj', Opts, Err),
+      'a "delphi" configuration was not found: ' + Err);
+    Assert.AreEqual('C:\Proj\MyApp.exe', Opts.ExePath, 'wrong configuration picked');
+  finally
+    TFile.Delete(CfgPath);
+  end;
+end;
+
+procedure TDebugSessionTests.SetBreakpoint_KeepsTheFileOtherLines;
+
+  function Spec(Line: Integer; const Condition: string = ''): TBpLineSpec;
+  begin
+    Result           := Default(TBpLineSpec);
+    Result.Line      := Line;
+    Result.Condition := Condition;
+  end;
+
+  function FindBreakpointOnLine(Session: TDebugSession; Line: Integer;
+    out Bp: TSessionBreakpoint): Boolean;
+  begin
+    for var Candidate in Session.ListBreakpoints do
+      if Candidate.Line = Line then begin
+        Bp := Candidate;
+        Exit(True);
+      end;
+    Result := False;
+  end;
+
+begin
+  // No launch needed: before one, the session only records the breakpoints, and
+  // that record is what the tool answers from.
+  var Session := TDebugSession.Create;
+  try
+    Session.SetBreakpoint('Other.pas', Spec(5));
+    Session.SetBreakpoint('Unit1.pas', Spec(10, 'i = 3'));
+    Session.SetBreakpoint('Unit1.pas', Spec(20, 'j > 1'));
+    Assert.AreEqual(3, Integer(Length(Session.ListBreakpoints)),
+      'a second breakpoint in Unit1.pas removed the first');
+    var Bp: TSessionBreakpoint;
+    Assert.IsTrue(FindBreakpointOnLine(Session, 10, Bp), 'line 10 lost');
+    Assert.AreEqual('i = 3', Bp.Condition, 'the kept line lost its condition');
+
+    // The same line again REPLACES that line's breakpoint rather than adding one.
+    var Replaced := Session.SetBreakpoint('Unit1.pas', Spec(10));
+    Assert.AreEqual(10, Replaced.Line, 'the answer is not the line just set');
+    Assert.AreEqual(3, Integer(Length(Session.ListBreakpoints)), 'setting line 10 again duplicated it');
+    Assert.IsTrue(FindBreakpointOnLine(Session, 10, Bp), 'line 10 lost on replace');
+    Assert.AreEqual('', Bp.Condition, 'line 10 was not replaced');
+    Assert.IsTrue(FindBreakpointOnLine(Session, 20, Bp), 'line 20 lost when line 10 was replaced');
+    Assert.AreEqual('j > 1', Bp.Condition, 'line 20 lost its condition');
+  finally
+    Session.Free;
+  end;
+end;
+
+procedure TDebugSessionTests.Launch_ProgramPathWithForwardSlashes_NamesTheModuleByItsFile;
+begin
+  var Session := TDebugSession.Create;
+  try
+    var Opts         := Default(TLaunchOptions);
+    // The shape variable substitution produces: a backslashed folder, a slashed tail.
+    Opts.ExePath     := ExtractFileDir(TargetExe) + '/' + ExtractFileName(TargetExe);
+    Opts.SourceRoot  := TargetDir;
+    Opts.StopAtEntry := True;
+    Assert.IsTrue(Session.Launch(Opts), 'Launch returned False');
+    PumpUntilStop(Session, 30000);
+    Assert.AreEqual(Ord(dsStopped), Ord(Session.State), 'did not stop at entry');
+    var Frames := Session.GetCallStack;
+    Assert.IsTrue(Length(Frames) > 0, 'no frames at entry');
+    Assert.AreEqual(LowerCase(ExtractFileName(TargetExe)), LowerCase(Frames[0].ModuleName),
+      'the main module is not named by its file alone');
+  finally
+    Session.Terminate;
+    Session.Free;
+  end;
 end;
 
 procedure TDebugSessionTests.Threads_StoppedThreadIsCurrent;

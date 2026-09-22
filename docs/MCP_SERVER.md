@@ -132,12 +132,22 @@ To attach to processes owned by another user or elevated targets, run the client
   unowned object; `0` never releases, `"none"` never freezes; each release is
   reported by `get_debugger_output`). The same two arguments exist on
   `launch_project`, `attach_to_process` and `attach_to_project`.
-- `launch_from_config` — launch from an existing VS Code `launch.json` (the same
-  file the DAP debugger uses), so you need not restate program / map / rsm / source
-  paths. Reads a `delphi-win64` configuration; JSONC (comments, trailing commas)
-  and `${workspaceFolder}` / `${env:VAR}` are handled. Args: `configFile`
-  (defaults to `.vscode\launch.json` under the current directory), `configName`
-  (defaults to the first `delphi-win64` entry), `workspaceFolder`.
+- `launch_from_config` — launch from an existing VS Code `launch.json` or
+  `.code-workspace` (the same file the DAP debugger uses; a workspace keeps its
+  configurations under `launch`), so you need not restate program / map / rsm /
+  source paths. Reads a `delphi` (or `delphi-win64`) configuration; JSONC
+  (comments, trailing commas) and `${workspaceFolder}` / `${env:VAR}` are handled.
+  Args: `configFile` (defaults to `.vscode\launch.json` under the current
+  directory), `configName` (defaults to the first Delphi entry),
+  `workspaceFolder` (defaults to the folder holding `.vscode`, or to a
+  workspace's first folder). `attach_from_config` reads the same files.
+  Only **project knowledge** is taken from the configuration: program, symbol
+  files, source paths, arguments. The human's **run-control preferences** —
+  `exceptionFilters`, `stepIsolation` — are deliberately not read: a
+  configuration that silences every exception must not blind the agent, and
+  which exceptions to stop on is the agent's call while it debugs
+  (`set_exception_filters`, `set_step_isolation_release`, or the arguments of
+  `launch_debuggee`).
 - `attach_to_process` — by `processId` or `processName`. An ambiguous name returns
   the candidate list instead of guessing; a different-architecture target is
   rejected. `killOnDetach` (default false).
@@ -159,8 +169,9 @@ To attach to processes owned by another user or elevated targets, run the client
 - `set_breakpoint` — `sourceFile`, `line`, plus optional `condition` (stop only
   when a Pascal expression is true, e.g. `"i = 3"`), `hitCondition`
   (`"5"`/`">5"`/`">=5"`/`"%5"`), and `logMessage` (a logpoint: does not stop,
-  emits the message with `{expr}` substituted to the debugger output). Returns
-  `verified`.
+  emits the message with `{expr}` substituted to the debugger output). Adds the
+  breakpoint, or replaces the one already on that line; the file's other
+  breakpoints stay. Returns `verified`.
 - `set_breakpoints` — set several at once (`breakpoints` array of the same
   fields); each listed file's set is replaced, unlisted files untouched.
 - `list_breakpoints`, `remove_all_breakpoints` — return/clear BOTH source and

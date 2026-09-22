@@ -787,8 +787,9 @@ begin
       Spec.Condition    := ArgStr('condition');
       Spec.HitCondition := ArgStr('hitCondition');
       Spec.LogMessage   := ArgStr('logMessage');
-      var Bps := FSession.SetBreakpoints(ArgStr('sourceFile'), [Spec]);
-      SendToolJson(IdJson, McpJson.BreakpointListToJson(Bps));
+      // One line added (or replaced); the file's other breakpoints stay.
+      var Bp := FSession.SetBreakpoint(ArgStr('sourceFile'), Spec);
+      SendToolJson(IdJson, McpJson.BreakpointListToJson([Bp]));
       Exit;
     end;
     if Name = 'set_breakpoints' then begin
