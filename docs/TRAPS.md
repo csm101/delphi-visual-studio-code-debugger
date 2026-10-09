@@ -665,6 +665,20 @@ absurdly.
   reproduce emission-order values.
 - **When driving the MCP server, set breakpoints while parked at entry, before
   `continue_and_wait`** — the Run loop pumps continuously.
+- **Never emit a DAP `Source` carrying only a `name`.** A Source with neither a
+  `path` nor a `sourceReference` does not read as "no source" to VS Code: it
+  requests the content anyway, with the reference defaulted to 0, and renders the
+  resulting ERROR RESPONSE as the file's text. The user selects a frame in their
+  own code and gets an editor reading `Could not load source 'Foo.pas': Unknown
+  sourceReference 0`. Every branch that builds a Source must end with a path or a
+  reference — `AttachUnresolvedSource` and `AttachPlaceholderSource` are the two
+  ways to get a reference.
+- **A placeholder document does not license a wrong `line`.** The frame's own
+  line stays on the frame even when the file behind it could not be found: the
+  Call Stack shows it, the MCP frontend reads it, and the BPL tests assert it.
+  The cost is that an editor honouring the line scrolls past the end of a short
+  document, which is why `UnresolvedSourceText` repeats the essentials in its
+  last paragraph.
 
 ## Diagnosing a report
 

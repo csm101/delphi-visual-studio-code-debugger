@@ -658,8 +658,21 @@ type
     function  FormatPlaceholderInstruction(const Ins: TDisasmInstruction;
                 CurrentVA: UInt64): string;
     function  SyntheticSourceRef(const ALabel: string; const F: TSessionFrame): Integer;
+    // Mints and registers a reference for an already-built document. Shared by
+    // both kinds of synthetic source so the numbering and the two dictionaries
+    // stay in one place. Callers do their own cache lookup first, so the text is
+    // built only on a miss.
+    function  NewSyntheticSourceRef(const ALabel, AText: string): Integer;
     procedure AttachPlaceholderSource(FO: TJSONObject; const F: TSessionFrame;
                 const ALabel: string);
+    // The OTHER sourceless case: the line table DOES name a unit and a line, but
+    // the file is nowhere under the configured roots. Nothing about the module's
+    // symbols is wrong, so every reason SyntheticSourceText offers would be
+    // false; this document names the file that was looked for and the roots that
+    // were searched instead.
+    function  UnresolvedSourceText(const F: TSessionFrame): string;
+    function  UnresolvedSourceRef(const F: TSessionFrame): Integer;
+    procedure AttachUnresolvedSource(FO: TJSONObject; const F: TSessionFrame);
     procedure HandleScopes(Seq: Integer; Args: TJSONObject);
     procedure HandleVariables(Seq: Integer; Args: TJSONObject);
     procedure HandleEvaluate(Seq: Integer; Args: TJSONObject);
@@ -3645,10 +3658,120 @@ function TDapServer.SyntheticSourceRef(const ALabel: string; const F: TSessionFr
 begin
   if FSynthSourceRefs.TryGetValue(ALabel, Result) then
     Exit;
+  Result := NewSyntheticSourceRef(ALabel, SyntheticSourceText(F));
+end;
+
+function TDapServer.NewSyntheticSourceRef(const ALabel, AText: string): Integer;
+begin
   Result := FNextSynthSourceRef;
   Inc(FNextSynthSourceRef);
   FSynthSourceRefs.Add(ALabel, Result);
-  FSynthSourceTexts.Add(Result, SyntheticSourceText(F));
+  FSynthSourceTexts.Add(Result, AText);
+end;
+
+// Text of the document opened for a frame whose unit and line ARE known but
+// whose file was not found on disk. Kept apart from SyntheticSourceText because
+// the two describe opposite situations: there the symbols fall short, here they
+// are complete and only the search roots are wrong. Saying "rebuild the module"
+// to someone whose file sits one directory outside sourceRoot sends them after
+// the wrong thing entirely.
+function TDapServer.UnresolvedSourceText(const F: TSessionFrame): string;
+const
+  // Same reason as in SyntheticSourceText: this opens in a plain text editor
+  // with no word wrap, so prose is hard-wrapped.
+  PLACEHOLDER_WRAP_COL = 78;
+
+  function Para(const S: string): string;
+  begin
+    Result := TrimRight(WrapText(S, PLACEHOLDER_WRAP_COL)) +
+      sLineBreak + sLineBreak;
+  end;
+
+begin
+  Result :=
+    'Source file not found on disk.' + sLineBreak + sLineBreak +
+    Format('    File    : %s', [ExtractFileName(F.SourceFile)]) + sLineBreak +
+    Format('    Line    : %d', [F.SourceLine]) + sLineBreak;
+  if F.ModuleName <> '' then
+    Result := Result + Format('    Module  : %s', [F.ModuleName]) + sLineBreak;
+  if F.FunctionName <> '' then
+    Result := Result + Format('    Function: %s', [F.FunctionName]) + sLineBreak;
+  Result := Result + sLineBreak +
+    Para('The debugger IS stopped here, and the debug information is complete:' +
+      ' it names the unit and the line above. Only the file itself could not be' +
+      ' located, so there is nothing to open.') +
+    Para('Point the debugger at the source tree in launch.json -- `sourceRoot`' +
+      ' for the project root (searched recursively), or an entry in' +
+      ' `sourceSearchPaths` for a tree somewhere else (searched two levels' +
+      ' deep) -- then restart the session.');
+
+  var Roots := FSourceResolver.SearchedRoots;
+  if Length(Roots) = 0 then
+    Result := Result +
+      Para('No source roots are configured at all: neither `sourceRoot` nor' +
+        ' `sourceSearchPaths` is set, and the debuggee''s own directory is not' +
+        ' known to this session.')
+  else begin
+    Result := Result + 'Searched, in this order:' + sLineBreak + sLineBreak;
+    for var R in Roots do
+      Result := Result + '    ' + R + sLineBreak;
+    Result := Result + sLineBreak;
+  end;
+
+  Result := Result +
+    Para('Everything else about this frame works: locals, watches and stepping' +
+      ' do not depend on the file being present. Stepping without source is' +
+      ' blind, which is the only thing that is actually lost here.') +
+    // The frame keeps its REAL line (see AttachUnresolvedSource), so an editor
+    // that honours it opens this document scrolled to its end and the LAST
+    // paragraph is what the user sees first. It therefore repeats the essentials
+    // rather than trailing off.
+    Para(Format('Source file not found: %s (line %d). Set `sourceRoot` or' +
+      ' `sourceSearchPaths` in launch.json, then restart the session.',
+      [ExtractFileName(F.SourceFile), F.SourceLine]));
+end;
+
+function TDapServer.UnresolvedSourceRef(const F: TSessionFrame): Integer;
+begin
+  // Keyed by file AND line: two frames in the same missing unit stop at
+  // different lines, and the line is on the first screen of the document.
+  var Label_ := Format('%s:%d', [ExtractFileName(F.SourceFile), F.SourceLine]);
+  if FSynthSourceRefs.TryGetValue(Label_, Result) then
+    Exit;
+  Result := NewSyntheticSourceRef(Label_, UnresolvedSourceText(F));
+end;
+
+// A frame whose file could not be resolved gets a `source` backed by a
+// sourceReference, never one carrying only a `name`.
+//
+// THE BUG THIS FIXES: a Source with neither `path` nor `sourceReference` does
+// not make VS Code leave the frame alone -- it issues a `source` request with
+// the reference defaulted to 0, HandleSource has no document under 0, and the
+// error response is rendered AS THE FILE CONTENT. The user selects a frame in
+// their own code and the editor opens showing
+// `Could not load source 'Foo.pas': Unknown sourceReference 0`.
+procedure TDapServer.AttachUnresolvedSource(FO: TJSONObject;
+  const F: TSessionFrame);
+begin
+  // Opted out via launch.json: emit no `source` at all, exactly as
+  // AttachPlaceholderSource does. A pathless `name`-only Source is never the
+  // answer -- that is the shape that produced the bug above.
+  if not FNoSourcePlaceholder then
+    Exit;
+
+  var Src := TJSONObject.Create;
+  Src.AddPair('name', ExtractFileName(F.SourceFile));
+  Src.AddPair('sourceReference', TJSONNumber.Create(UnresolvedSourceRef(F)));
+  if F.ModuleName <> '' then
+    Src.AddPair('origin', F.ModuleName);
+  FO.AddPair('source', Src);
+  // The frame's REAL line, not 1. This frame has one, the Call Stack shows it,
+  // and the MCP frontend and the BPL tests read it; a placeholder document is no
+  // reason to start reporting the wrong position. It does mean an editor that
+  // honours the line scrolls past the end of the document -- UnresolvedSourceText
+  // closes with the essentials for exactly that reason.
+  FO.AddPair('line',   TJSONNumber.Create(F.SourceLine));
+  FO.AddPair('column', TJSONNumber.Create(1));
 end;
 
 procedure TDapServer.HandleSource(Seq: Integer; Args: TJSONObject);
@@ -3664,7 +3787,19 @@ begin
   end;
   var Text: string;
   if not FSynthSourceTexts.TryGetValue(Ref, Text) then begin
-    FIO.SendErrorResponse(Seq, 'source', Format('Unknown sourceReference %d', [Ref]));
+    // Whatever goes out here is what the user READS: VS Code puts the error
+    // message in the editor, in place of the file. Reference 0 means the client
+    // asked without one -- a Source this adapter emitted carried neither a path
+    // nor a reference -- so name that rather than echo the 0 back.
+    if Ref = 0 then
+      FIO.SendErrorResponse(Seq, 'source',
+        'No source reference was given, so there is no document to return.' +
+        ' This is an adapter defect: a stack frame offered a source with' +
+        ' neither a path nor a sourceReference. Please report it.')
+    else
+      FIO.SendErrorResponse(Seq, 'source',
+        Format('Unknown sourceReference %d. The document it referred to belongs' +
+          ' to an earlier debug session.', [Ref]));
     Exit;
   end;
   var Body := TJSONObject.Create;
@@ -3751,14 +3886,21 @@ begin
       if F.ModuleName <> '' then
         FO.AddPair('moduleId', F.ModuleName);
       if F.SourceFile <> '' then begin
-        var Src := TJSONObject.Create;
-        Src.AddPair('name', ExtractFileName(F.SourceFile));
+        // A Source must carry a `path` or a `sourceReference`. One with only a
+        // `name` is not "no source" to VS Code: it requests the content anyway,
+        // with the reference defaulted to 0, and renders the resulting error as
+        // the file's text. So a file that did not resolve goes to
+        // AttachUnresolvedSource, which explains itself.
         var FullPath := ResolveSourcePath(F.SourceFile);
-        if FullPath <> '' then
+        if FullPath <> '' then begin
+          var Src := TJSONObject.Create;
+          Src.AddPair('name', ExtractFileName(F.SourceFile));
           Src.AddPair('path', FullPath);
-        FO.AddPair('source', Src);
-        FO.AddPair('line',   TJSONNumber.Create(F.SourceLine));
-        FO.AddPair('column', TJSONNumber.Create(1));
+          FO.AddPair('source', Src);
+          FO.AddPair('line',   TJSONNumber.Create(F.SourceLine));
+          FO.AddPair('column', TJSONNumber.Create(1));
+        end else
+          AttachUnresolvedSource(FO, F);
         if F.FunctionName <> '' then
           FO.AddPair('name', RawStackLabel(F, F.FunctionName))
         else

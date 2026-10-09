@@ -40,6 +40,12 @@ type
     // trying the bare name then the common Delphi namespace prefixes.
     function ResolveUnitToSource(const UnitName: string): string;
 
+    // The configured roots, in the order ResolveUncached probes them. Exists so
+    // a failed lookup can name what WAS searched: that turns "no source" into
+    // "add this directory to sourceSearchPaths". Mirrors ResolveUncached --
+    // change both together.
+    function SearchedRoots: TArray<string>;
+
     // Trims the leading RTL exception-raise plumbing so a `raise` lands on the
     // raise site instead of inside the RTL. GATED ON THE EXCEPTION KIND: it
     // trims for a Delphi `raise` and returns the frames untouched for a
@@ -279,6 +285,22 @@ begin
   end;
 
   Result := '';
+end;
+
+function TSourceResolver.SearchedRoots: TArray<string>;
+begin
+  Result := [];
+  if FSourceRoot <> '' then
+    Result := Result + [FSourceRoot + '   (sourceRoot, recursive)'];
+  if FExePath <> '' then begin
+    var ExeDir := ExtractFileDir(FExePath);
+    Result := Result + [ExeDir + '   (the debuggee directory)'];
+    Result := Result + [ExtractFileDir(ExeDir) + '   (its parent)'];
+    Result := Result + [ExtractFileDir(ExtractFileDir(ExeDir)) + '   (its grandparent)'];
+  end;
+  for var P in FExtraSourcePaths do
+    if P <> '' then
+      Result := Result + [P + '   (sourceSearchPaths, two levels deep)'];
 end;
 
 // KEPT, though TrimRaisePlumbing no longer calls it: the names are measured and

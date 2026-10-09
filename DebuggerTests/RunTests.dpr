@@ -60,6 +60,7 @@ uses
   TestTempDirs    in 'TestTempDirs.pas',
   RegisterWriteDapTests in 'RegisterWriteDapTests.pas',
   PlaceholderDisassemblyTests in 'PlaceholderDisassemblyTests.pas',
+  UnresolvedSourceDapTests in 'UnresolvedSourceDapTests.pas',
   WinDebuggerX86  in '..\DebuggerCore\WinDebuggerX86.pas',
   ExceptionStepTests in 'ExceptionStepTests.pas',
   DataBpExpressionTests in 'DataBpExpressionTests.pas';

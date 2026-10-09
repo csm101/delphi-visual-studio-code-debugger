@@ -1726,6 +1726,54 @@ The probe that established all three, before any of them were fixed, was a
 throwaway test that evaluated nine spellings and failed with the results — worth
 repeating rather than guessing at a parser from the outside.
 
+## X. A frame whose source file is not on disk
+
+`DebuggerTests\UnresolvedSourceDapTests.pas` — new file. The complement of
+section T: there the symbols fall short, here they are complete — the line table
+names the unit and the line — and only the FILE is missing. The everyday case is
+debugging a binary whose source tree sits outside `sourceRoot`, or one built on
+another machine.
+
+The defect it pins: that branch emitted a `Source` carrying a `name` and nothing
+else — no `path`, because none resolved, and no `sourceReference`, because only
+the sourceless branch minted one. VS Code does not read that as "no source". It
+requests the content with the reference defaulted to 0, `HandleSource` has no
+document under 0, and the editor opens showing the ERROR RESPONSE as the file's
+text: `Could not load source 'Foo.pas': Unknown sourceReference 0`. Reported from
+a real session on a Delphi 12 Win32 project, where the unit sat two directories
+outside the debuggee's grandparent.
+
+Fixture: `InstructionStepSample`'s exe/map/rsm copied into a scratch directory
+WITHOUT its `.dpr`, launched from there with `sourceRoot` pointing at that same
+directory. Every root the resolver probes — `sourceRoot`, the debuggee
+directory, its parent and grandparent — is then real and searched, and none holds
+the file. Copying rather than mis-pointing `sourceRoot` at the real tree is the
+point: the exe's own directory is a root too, so a target left where it was built
+resolves no matter what `sourceRoot` says. The breakpoint is still set through
+the REAL path, as a user with the file open in the editor would.
+
+- [x] **The frame offers an openable source**
+      (`Win64_SourceFileMissing_FrameOffersAPlaceholderReference`) — `path` empty
+      (else the fixture, not the adapter, is wrong) and `sourceReference` > 0,
+      returning a document. RED before the fix: reference 0, and the `source`
+      request failed.
+- [x] **The document describes THIS failure**
+      (`Win64_SourceFileMissing_DocumentNamesTheFileAndTheFix`) — names the file
+      and both settings that fix it, and must NOT carry the stale-symbol wording
+      (`does not cover this address`), which would send the user to rebuild a
+      module that is in perfect order.
+- [x] **It lists what was searched**
+      (`Win64_SourceFileMissing_DocumentListsTheSearchedRoots`) — via
+      `TSourceResolver.SearchedRoots`, so the fix is a directory read off the
+      page rather than a guess.
+
+The frame's own `line` stays the real one throughout. The BPL tests
+(`Test_Bpl_BreakpointHits`, `Test_Bpl_Td32Only_BpHits`) assert exactly that and
+caught the first attempt at this fix, which reported line 1 for the placeholder
+document. Those two run against a BPL whose `.pas` sits in a sibling directory of
+the debuggee's tree, so they were already crossing this path — with the broken
+Source shape — before this fixture existed.
+
 ## What the suite does NOT prove (2026-08-08)
 
 Coverage-honesty notes. Each records a place where a green run is weaker evidence

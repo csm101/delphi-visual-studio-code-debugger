@@ -903,6 +903,18 @@ Debugger features:
   forever. Surfaced, not fixed, while building increment 5: an exception
   stop's reported frame 0 does not reliably resolve to the true faulting
   address in code with no debug info (`KNOWN_UNKNOWNS.md`).
+- A frame whose unit and line ARE known but whose `.pas` is nowhere under the
+  configured roots now gets a placeholder document of its own — **DONE**. It
+  names the file, the line and the roots that were searched
+  (`TSourceResolver.SearchedRoots`) and points at `sourceRoot` /
+  `sourceSearchPaths`, instead of repeating the sourceless-frame reasons, which
+  are all false when the symbols are complete and only the file is absent. This
+  replaced a defect, not a gap: that branch used to emit a `Source` with a
+  `name` and nothing else, and VS Code answers such a Source by requesting
+  reference 0 and rendering the error response as the file's content
+  (`Could not load source 'Foo.pas': Unknown sourceReference 0`). The frame
+  keeps its real line throughout. Rule in `TRAPS.md` "Diagnosing a report";
+  tests in `UnresolvedSourceDapTests.pas`.
 - Win32 (32-bit) targets — **DONE**. Run control, locals, object expansion,
   evaluation and the multi-BPL case all work on a WOW64 target from the same
   64-bit adapter binary. See "Target architecture" under Implemented features
