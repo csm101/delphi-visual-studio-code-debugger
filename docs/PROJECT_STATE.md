@@ -106,7 +106,7 @@ VS Code  ── DAP (JSON over stdio) ──>  VisualStudioCodeDelphiDebugger.ex
 - `DebuggerTests\`: DUnitX integration test suite. Launches the adapter,
   exercises BPs / locals / step / globals / evaluate.
   Run with `cmd /c "C:\Athens\GitHub\Win64Debugger\DebuggerTests\build_and_run.bat"`.
-  Current status (v0.7.1): **1381 found / 1377 pass / 0 fail / 4 ignored**,
+  Current status (v0.7.3): **1381 found / 1377 pass / 0 fail / 4 ignored**,
   in ~80 s (~12 s build + ~68 s of tests across 8 concurrent worker processes).
   Set `RUNTESTS_JOBS=1` for the sequential path — same results, ~440 s. See
   "Parallel execution" in `CLAUDE.md`.
