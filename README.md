@@ -36,7 +36,7 @@ The repository contains **three programs** that share one debugger engine:
 | | What it is | Where it lives |
 |---|---|---|
 | **Debug adapter** | A **Debug Adapter Protocol (DAP)** server. This is the debugger itself: breakpoints, stepping, call stacks, variables, expression evaluation. Any DAP client can drive it. | `VisualStudioCodeDelphiDebugger\` |
-| **VS Code extension** | The client that makes it usable in the editor: the `delphi-win64` debug type, the process picker for attaching, status-bar progress, and an editor for the exception rules. | `install\local.delphi-win64-debug\` |
+| **VS Code extension** | The client that makes it usable in the editor: the `delphi` debug type (alias `delphi-win64`), the process picker for attaching, status-bar progress, and an editor for the exception rules. | `install\mca-software.delphi-debugger\` |
 | **MCP server** | The same engine exposed to an **AI agent** over the Model Context Protocol — 46 tools (`set_breakpoint`, `step_into`, `get_locals`, `evaluate_expression`, `get_call_stack`, `read_memory`, …). It lets an agent run a program, stop it, and read its actual state instead of guessing from the source. | `MCPDebugger\` |
 
 The rest of the tree:
@@ -898,7 +898,8 @@ One server, three ways to get it:
   path, `%LOCALAPPDATA%\DelphiWin64Debugger\DelphiDebuggerMcp.exe`, refreshed
   silently whenever the bundled exe is newer. The command **Delphi: Register
   MCP Server with Claude Code** registers that copy with the `claude` CLI
-  (user scope); it says so and does nothing when the CLI is not on PATH.
+  (user scope); when the CLI is not on PATH it registers nothing and shows the
+  command to run by hand instead.
 - **From the setup zip** (`Setup.exe`): the same stable folder, registered
   with Claude Code and with VS Code's user `mcp.json` by `register-mcp.ps1`.
   The route for a machine without VS Code, for Claude Desktop, and for offline
@@ -966,7 +967,7 @@ symbol resolution reaches both.
 | `DebuggerCore\` | The debugger proper: Windows debug loop, symbol readers (`.rsm`, TD32, `.map`, `.dcp`, JCL), expression evaluator, exception rules |
 | `VisualStudioCodeDelphiDebugger\` | DAP server: reads DAP from stdin, drives the engine |
 | `MCPDebugger\` | MCP server: the same engine as 46 tools an agent can call |
-| `install\local.delphi-win64-debug\` | VS Code extension: registers the `delphi-win64` debug type, the attach picker and the exception-rules editor, and bundles the adapter |
+| `install\mca-software.delphi-debugger\` | VS Code extension: registers the `delphi` debug type (alias `delphi-win64`), the attach picker and the exception-rules editor, and bundles the adapter and the MCP server |
 | `Debugme.dpr` | A small program used as a debug target while developing the debugger |
 
 ### Key source files
