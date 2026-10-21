@@ -38,12 +38,18 @@ starts. A hand-written entry is one line — see
 > version warns when the old copy is still installed and offers to remove it;
 > accept, then reload the window.
 
-**The same engine also talks to AI agents.** The download ships an **MCP
-server** alongside this extension: 46 tools that let an agent set breakpoints,
-step, read locals and evaluate expressions in a live Delphi process — the
-debugger's own capabilities, driven by something other than a human. It is
-registered by the installer and needs nothing from this extension; the two are
-independent clients of one debugger.
+**The same engine also talks to AI agents.** This extension bundles an **MCP
+server** whose tools let an agent set breakpoints, step, read locals and
+evaluate expressions in a live Delphi process — the debugger's own
+capabilities, driven by something other than a human. Agents hosted by VS Code
+(1.101 or later) see it as `delphi-debugger` with nothing to configure. For
+Claude Code, run **Delphi: Register MCP Server with Claude Code** once from the
+Command Palette: it registers, at user scope, a copy the extension keeps at
+`%LOCALAPPDATA%\DelphiWin64Debugger\` and refreshes on every update, so the
+registration survives updates. Claude Desktop, and machines without VS Code,
+take the setup zip from the
+[GitHub releases](https://github.com/csm101/delphi-visual-studio-code-debugger/releases).
+The extension and the agent are independent clients of one debugger.
 
 ---
 
