@@ -209,6 +209,19 @@ the GitHub release. The script opens both the page and the folder at the end so
 this is not forgotten. Verification takes a few minutes; the version then shows
 on <https://marketplace.visualstudio.com/items?itemName=mca-software.delphi-debugger>.
 
+**The first time there is no extension to update.** Until a version has been
+published, the publisher page lists nothing and **Update** does not exist:
+choose **+ New extension** → **Visual Studio Code** and upload the same file.
+The extension id comes from the VSIX (`publisher` + `name` in the manifest), so
+it must match the publisher you are logged in as. Check first with
+`npx @vscode/vsce show mca-software.delphi-debugger`: "not found" means this is
+the first publication.
+
+The listing page shows the README packaged INSIDE the VSIX
+(`install\mca-software.delphi-debugger\README.md`), not the repository's. A
+README fix reaches the Marketplace only with a new version, since a version
+cannot be uploaded twice.
+
 Do this after the GitHub release is published, not before: the extension's own
 update check points users at the GitHub release, and a Marketplace version with
 no matching release page is a dead link.

@@ -230,18 +230,25 @@ itself — lets the debugger resolve lines and procedure names with no `.map` to
 distribute. It is generated *from* a `.map` at build time, so you still produce
 one; you just do not have to deliver it.
 
-**2. Install the [Delphi IDE plugin](https://github.com/csm101/EditInVsCodeDelphiPlugin).**
+**2. Let something that knows your project describe it — one of three ways.**
 
-This is the piece that makes the debugger usable in practice. It adds an
-*Open in VS Code* command to the Delphi IDE which, for the current project or
-project group, generates the workspace and the launch configuration — output
-paths, source root, the unit search paths, and the package list for a BPL
-project. A real Delphi project can carry a couple of hundred search paths; that
-configuration is not something anyone wants to write by hand.
+The debugger needs the executable (or the host application of a package), its
+symbol files, the source search paths and the project's packages. A real Delphi
+project can carry a couple of hundred search paths; that configuration is not
+something anyone wants to write by hand. Any **one** of these supplies it:
 
-The debugger works without it if you write `launch.json` yourself — see
-[Getting started](#getting-started) — but with it, debugging a project is one
-command from the IDE you already have open.
+- **[delphi-devkit (DDK)](https://marketplace.visualstudio.com/items?itemName=Snowcaloid.delphi-devkit)**,
+  a VS Code extension. With DDK installed there is no `launch.json` to write:
+  right-click a project in DDK's tree and choose **Debug** or **Attach
+  Debugger**, and the configuration is completed from DDK when the session
+  starts. See [Debugging a DDK project](#debugging-a-ddk-project).
+- **The [Delphi IDE plugin](https://github.com/csm101/EditInVsCodeDelphiPlugin)**,
+  for working from RAD Studio. Its **Tools → Edit in Visual Studio Code**
+  command generates the workspace and the launch configuration for the current
+  project or project group: output paths, source root, the unit search paths,
+  and the package list for a BPL project.
+- **A `launch.json` you write yourself**, with nothing else to install. Fine
+  for a small project — see [Without DDK](#without-ddk).
 
 **3. Install [DelphiLSP](https://marketplace.visualstudio.com/items?itemName=embarcaderotechnologies.delphilsp)**
 (`embarcaderotechnologies.delphilsp`) for Delphi language support — syntax
