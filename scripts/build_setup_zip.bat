@@ -85,6 +85,14 @@ if exist "%REPO%\ThirdParty\Zydis\bin\x64\Zydis.dll" (
 )
 
 echo.
+echo === [2b/3] Smoke-test Setup.exe from the staged layout ===
+call "%~dp0smoke_test_setup.bat" "%STAGE%"
+if errorlevel 1 (
+  echo ERROR: Setup.exe failed its smoke test on the staged zip layout; no zip was built.
+  exit /b 1
+)
+
+echo.
 echo === [3/3] Compress to zip ===
 set ZIP=%DIST%\delphi-win64-debugger-setup-v%VER%.zip
 if exist "%ZIP%" del /q "%ZIP%"

@@ -385,6 +385,14 @@ absurdly.
   `dist\` (verify its SHA-256 against the published notes) is what makes a
   byte-identical restore possible: `gh release create <tag> --verify-tag
   --latest=false --notes-file <notes> <zip>`, then `--latest` if it was latest.
+- **`Setup.exe` looks for each file twice: next to itself (the zip) and in the
+  repository. Moving a file in the repository moves only the second.** When
+  `register-mcp.ps1` went into `scripts\`, a rename changed both lookups in
+  `install\Install.dpr`; the zip still had the script at its root, and 0.7.0 to
+  0.7.2 shipped an installer that skipped the MCP registration with one printed
+  line. `scripts\smoke_test_setup.bat` now runs the staged installer in a
+  sandbox on every zip build and fails it; keep its checks in step with what
+  `Setup.exe` is supposed to do.
 
 ## Session notes and the resume cursor
 

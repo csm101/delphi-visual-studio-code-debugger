@@ -130,7 +130,11 @@ What happens, in order:
    rather than blocking anything else), and packages
    `dist\mca-software.delphi-debugger-<version>.vsix` with `vsce`
    (`scripts/build_vsix.bat`); the VSIX is also bundled inside the zip, where
-   `Setup.exe` installs it in preference to packaging the folder itself;
+   `Setup.exe` installs it in preference to packaging the folder itself.
+   Before zipping it runs `Setup.exe` from a copy of the staged layout in a
+   sandbox (`scripts/smoke_test_setup.bat`: per-user folders under `%TEMP%`,
+   no editor and no `claude` on PATH) and builds no zip unless the installer
+   ran in portable mode and installed and registered the MCP server;
 6. computes the zip's SHA-256;
 7. renders the template, substituting the version, the hash, the MCP tool count
    (read from `MCPDebugger\McpToolSchemas.pas`) and your "What's new";

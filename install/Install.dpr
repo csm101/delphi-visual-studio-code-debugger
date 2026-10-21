@@ -226,7 +226,7 @@ end;
 // ------------------------------- MCP server ---------------------------------
 // The MCP server is a standalone stdio exe registered with Claude Code / VS Code
 // by ABSOLUTE path, so it is copied to a stable per-user location (surviving
-// deletion of the installer/zip) and scripts/register-mcp.ps1 does the registration.
+// deletion of the installer/zip) and register-mcp.ps1 does the registration.
 
 // Portable (zip): bundled next to the installer. Repository: the build output.
 function McpSourceExe: string;
@@ -242,9 +242,13 @@ begin
   Result := TPath.Combine(GetEnvironmentVariable('LOCALAPPDATA'), 'DelphiWin64Debugger');
 end;
 
+// Portable (zip): next to the installer, where scripts\build_setup_zip.bat puts
+// it. Repository: scripts\. The two differ on purpose; when the repository
+// script moved into scripts\, the portable path was moved with it, and every
+// installer from 0.7.0 to 0.7.2 skipped the registration it was run for.
 function RegisterScriptPath: string;
 begin
-  Result := TPath.Combine(ExeDir, 'scripts/register-mcp.ps1');   // bundled (portable)
+  Result := TPath.Combine(ExeDir, 'register-mcp.ps1');            // bundled (portable)
   if TFile.Exists(Result) then
     Exit;
   Result := TPath.Combine(RepoRoot, 'scripts\register-mcp.ps1'); // repository
@@ -296,7 +300,7 @@ begin
 
   var Script := RegisterScriptPath;
   if not TFile.Exists(Script) then begin
-    Writeln('scripts/register-mcp.ps1 not found; skipping automatic registration.');
+    Writeln('register-mcp.ps1 not found (' + Script + '); skipping automatic registration.');
     Writeln('Register manually:  claude mcp add ' + MCP_SERVER_NAME + ' -s user -- "' + Dest + '"');
     Exit;
   end;
