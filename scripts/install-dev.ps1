@@ -36,6 +36,20 @@ if (-not (Test-Path $adapterExe)) {
 
 $extRoot = Join-Path $env:USERPROFILE '.vscode\extensions'
 $targets = @(Get-ChildItem -Path $extRoot -Directory -Filter 'mca-software.delphi-debugger*' -ErrorAction SilentlyContinue)
+
+# Only the folder VS Code has registered. Installing a new .vsix leaves the old
+# version's folder on disk, listed in `.obsolete`, until the next full restart;
+# patching it too printed a "kept registered version" note about a version that
+# was no longer registered at all. extensions.json is the registry; when it
+# cannot be read, every matching folder is patched as before.
+try {
+    $registered = @((Get-Content (Join-Path $extRoot 'extensions.json') -Raw | ConvertFrom-Json) |
+        Where-Object { $_.identifier.id -eq 'mca-software.delphi-debugger' } |
+        ForEach-Object { $_.relativeLocation })
+    if ($registered.Count -gt 0) {
+        $targets = @($targets | Where-Object { $registered -contains $_.Name })
+    }
+} catch { }
 if ($targets.Count -eq 0) {
     Write-Error "No installed 'mca-software.delphi-debugger*' extension found under $extRoot.`nRun install\Install.exe (or the distributed Setup.exe) once first, then re-run install-dev."
     exit 1
