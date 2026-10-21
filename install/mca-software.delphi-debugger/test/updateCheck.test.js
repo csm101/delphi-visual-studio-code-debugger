@@ -52,6 +52,44 @@ ok(updates.shouldCheck(now - (DAY / 2), now) === false, 'half a day later -> do 
 // A clock that moved backwards must not park the next check in the future.
 ok(updates.shouldCheck(now + DAY, now) === true, 'a future timestamp -> check anyway');
 
+// --- installSourceFrom / readInstallSource -----------------------------------
+// The entry shape is the one VS Code 1.142 wrote in an isolated extensions
+// folder after a Marketplace install and after `--install-extension x.vsix`.
+const ID = 'mca-software.delphi-debugger';
+const extensionsJson = (entries) => JSON.stringify(entries);
+const entry = (folder, version, source, extra) => Object.assign({
+  identifier: { id: ID }, version: version, relativeLocation: folder,
+  metadata: source === undefined ? {} : { source: source }
+}, extra || {});
+const src = updates.installSourceFrom;
+ok(src(extensionsJson([entry(ID + '-0.7.1', '0.7.1', 'gallery')]), ID + '-0.7.1', ID, '0.7.1') === 'gallery',
+   'a Marketplace install reads as gallery');
+ok(src(extensionsJson([entry(ID + '-0.7.1', '0.7.1', 'vsix', { metadata: { source: 'vsix', pinned: true } })]),
+       ID + '-0.7.1', ID, '0.7.1') === 'vsix',
+   'a .vsix install reads as vsix');
+ok(src(extensionsJson([
+       { identifier: { id: 'someone.else' }, version: '0.7.1', relativeLocation: 'someone.else-0.7.1', metadata: { source: 'gallery' } },
+       entry(ID + '-0.7.1', '0.7.1', 'vsix')]), ID + '-0.7.1', ID, '0.7.1') === 'vsix',
+   'another extension\'s entry is not taken for ours');
+ok(src(extensionsJson([entry(undefined, '0.7.1', 'gallery')]), 'not-the-folder', 'MCA-Software.Delphi-Debugger', '0.7.1') === 'gallery',
+   'without relativeLocation the entry is found by id (case-insensitive) and version');
+ok(src(extensionsJson([entry(undefined, '0.7.0', 'gallery')]), 'not-the-folder', ID, '0.7.1') === undefined,
+   'an entry for another version of ours is not this copy');
+ok(src(extensionsJson([entry(ID + '-0.7.1', '0.7.1', undefined)]), ID + '-0.7.1', ID, '0.7.1') === undefined,
+   'an entry without a source is unknown');
+ok(src('{ not json', ID + '-0.7.1', ID, '0.7.1') === undefined, 'a corrupt file is unknown, not an exception');
+ok(src('{}', ID + '-0.7.1', ID, '0.7.1') === undefined, 'a file that is not an array is unknown');
+
+let readPath = '';
+const fakeRead = (text) => (file) => { readPath = file; return text; };
+ok(updates.readInstallSource('C:\\Users\\u\\.vscode\\extensions\\' + ID + '-0.7.1', ID, '0.7.1',
+     fakeRead(extensionsJson([entry(ID + '-0.7.1', '0.7.1', 'gallery')]))) === 'gallery' &&
+   readPath === path.join('C:\\Users\\u\\.vscode\\extensions', 'extensions.json'),
+   'the extensions.json beside the extension folder is the one read');
+ok(updates.readInstallSource('C:\\x\\' + ID + '-0.7.1', ID, '0.7.1', () => { throw new Error('ENOENT'); }) === undefined,
+   'a missing extensions.json is unknown, not an exception');
+ok(updates.readInstallSource(undefined, ID, '0.7.1', fakeRead('[]')) === undefined, 'no extension path is unknown');
+
 // --- the notification flow ---------------------------------------------------
 function makeContext(version, state) {
   const store = state || {};
@@ -142,6 +180,33 @@ function makeVscode(settings, shown) {
   });
   ok(ctx._store['delphiWin64.updateCheck.lastCheck'] === 12345,
      'the check timestamp is stamped even on failure');
+
+  // A Marketplace install is updated by the editor: GitHub is not even asked,
+  // and nothing is stamped, so a later move to a .vsix install checks at once.
+  shown = [];
+  asked = false;
+  ctx = makeContext('0.2.3');
+  await ext.checkForUpdate(ctx, {
+    vscode: makeVscode({}, shown),
+    installSource: 'gallery',
+    updateCheck: Object.assign({}, updates, {
+      fetchLatestRelease: () => { asked = true; return Promise.resolve({ version: '9.9.9', url: '' }); }
+    })
+  });
+  ok(shown.length === 0 && !asked && !('delphiWin64.updateCheck.lastCheck' in ctx._store),
+     'a Marketplace install is never told about a GitHub release');
+
+  // A .vsix install (Setup.exe) is pinned by the editor: it is told.
+  shown = [];
+  await ext.checkForUpdate(makeContext('0.2.3'), {
+    vscode: makeVscode({}, shown),
+    installSource: 'vsix',
+    updateCheck: Object.assign({}, updates, {
+      fetchLatestRelease: () => Promise.resolve({ version: '0.3.0', url: 'https://example/rel' })
+    })
+  });
+  ok(shown.length === 1 && shown[0].indexOf('Delphi Debugger 0.3.0') === 0,
+     'a .vsix install is told, under the extension\'s current name');
 
   console.log(failures === 0 ? '\nall cases pass' : '\n' + failures + ' case(s) FAILED');
   process.exit(failures === 0 ? 0 : 1);

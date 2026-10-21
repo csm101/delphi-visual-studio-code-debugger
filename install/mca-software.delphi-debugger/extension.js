@@ -590,9 +590,13 @@ const DIAGNOSTIC_CHANNEL_NAME = 'Delphi Debugger';
 const UPDATE_LAST_CHECK_KEY = 'delphiWin64.updateCheck.lastCheck';
 const UPDATE_SKIPPED_KEY    = 'delphiWin64.updateCheck.skippedVersion';
 
-// Asks GitHub, at most once a day, whether a newer release exists -- because
-// this extension is installed by an installer rather than from a marketplace,
-// so nothing else would ever tell the user.
+// Asks GitHub, at most once a day, whether a newer release exists -- for a
+// copy installed from the setup zip (or any .vsix), which the editor pins and
+// never updates, so nothing else would ever tell the user. A Marketplace copy
+// is updated by the editor and is left alone: announcing a GitHub download
+// there offered the setup zip to someone who needed nothing, and installing
+// that zip's .vsix over the Marketplace copy would pin it and stop the
+// editor's own updates.
 //
 // Everything here is written to stay out of the way: it never blocks
 // activation, it says nothing at all when the check fails, and "Skip this
@@ -607,14 +611,20 @@ async function checkForUpdate(context, deps) {
   const config = vs.workspace.getConfiguration('delphi-win64');
   if (!config.get('checkForUpdates', true)) return;
 
+  const ext = context.extension;
+  const pkg = ext && ext.packageJSON;
+  if (!pkg || !pkg.version) return;
+  const source = 'installSource' in d
+    ? d.installSource
+    : updates.readInstallSource(ext.extensionPath, ext.id, pkg.version);
+  if (source === 'gallery') return;
+
   const state = context.globalState;
   if (!updates.shouldCheck(state.get(UPDATE_LAST_CHECK_KEY), now)) return;
   // Stamp BEFORE the request, not after: a GitHub that is slow or unreachable
   // must not turn every activation into another attempt.
   await state.update(UPDATE_LAST_CHECK_KEY, now);
 
-  const pkg = context.extension && context.extension.packageJSON;
-  if (!pkg || !pkg.version) return;
   const repoUrl = pkg.repository && pkg.repository.url;
 
   const latest = await updates.fetchLatestRelease(repoUrl, d.httpGet);
@@ -625,7 +635,7 @@ async function checkForUpdate(context, deps) {
   const download = 'Download';
   const skip = 'Skip this version';
   const choice = await vs.window.showInformationMessage(
-    'Delphi Win64 Debugger ' + latest.version + ' is available (you have ' +
+    'Delphi Debugger ' + latest.version + ' is available (you have ' +
       pkg.version + ').',
     download, skip);
   if (choice === download && latest.url)

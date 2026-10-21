@@ -139,9 +139,10 @@ Console** (REPL) and breakpoint conditions:
 
 **Housekeeping**
 
-- Tells you when a newer release exists on GitHub, once a day at most, with a
-  link — because an installer-delivered extension has nothing else to announce
-  it (see [Staying up to date](#staying-up-to-date); switch it off with
+- Installed from the setup zip, it tells you when a newer release exists on
+  GitHub, once a day at most, with a link — VS Code never updates a copy
+  installed that way. A Marketplace install is updated by VS Code and is never
+  told (see [Staying up to date](#staying-up-to-date); switch it off with
   `delphi-win64.checkForUpdates`)
 - The debugger's own diagnostics go to a **Delphi Debugger** channel in the
   Output panel, leaving the Debug Console for your program's output (see
@@ -860,13 +861,20 @@ configuration; that writes every DAP request, response and debug event to
 
 ## Staying up to date
 
-This extension is installed by an installer, not from a marketplace, so nothing
-in VS Code would otherwise tell you a new version exists — and in practice that
-means people run an old one for months without knowing.
+**Installed from the Marketplace**, the extension is updated by VS Code like any
+other, and nothing below applies: it never asks GitHub.
 
-So it checks. Once a day at most, the extension asks GitHub for the latest
-release of this project and, if it is newer than what you have, shows one
-notification with a link to the download page.
+**Installed from the setup zip** (`Setup.exe`, or a `.vsix` installed by hand),
+it is pinned: VS Code installed that exact file and never updates it, so nothing
+in VS Code would tell you a new version exists — and in practice that means
+people run an old one for months without knowing. To move such a copy to
+Marketplace updates, uninstall it and install it again from the Marketplace.
+
+So a pinned copy checks. Once a day at most, the extension asks GitHub for the
+latest release of this project and, if it is newer than what you have, shows
+one notification with a link to the download page. Which kind of install it is
+comes from the `extensions.json` VS Code keeps beside its extensions; when that
+cannot be read, the copy is treated as pinned.
 
 What it does **not** do, deliberately:
 
