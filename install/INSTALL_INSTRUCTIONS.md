@@ -34,7 +34,9 @@ If you received the `delphi-win64-debugger-setup-*.zip`:
 2. Run `Setup.exe`. It packages the extension into a `.vsix` and installs it
    through the VS Code CLI (`code --install-extension`), which registers it
    properly and updates any previous version in place. It then offers to install
-   and register the **MCP debug server** (see below).
+   and register the **MCP debug server** (see below). An editor that already has
+   the extension from the Marketplace is left alone (see
+   [Setup.exe and the Marketplace](#setupexe-and-the-marketplace)).
 3. Reload VS Code (Ctrl+Shift+P -> "Developer: Reload Window").
 
 ### Memory inspection needs nothing else
@@ -59,19 +61,30 @@ code --install-extension ms-vscode.hexeditor
 No repository, Delphi toolchain, or build step is required — the adapter is
 already compiled and bundled inside the zip.
 
-### MCP debug server (Claude Code + VS Code)
+### MCP debug server (Claude Code)
 
 The zip also bundles `DelphiDebuggerMcp.exe` (a Model Context Protocol stdio
-server that lets an AI agent drive the debugger) and `scripts/register-mcp.ps1`. When you
-answer "yes" to the MCP prompt, `Setup.exe` copies the server to
-`%LOCALAPPDATA%\DelphiWin64Debugger\` and registers it with **Claude Code**
-(`claude mcp add … -s user`) and **VS Code / VS Code Insiders** (user `mcp.json`).
-Restart Claude Code / reload VS Code to pick it up. To (un)register later:
+server that lets an AI agent drive the debugger) and `register-mcp.ps1`, both
+next to `Setup.exe`. When you answer "yes" to the MCP prompt, `Setup.exe` copies
+the server to `%LOCALAPPDATA%\DelphiWin64Debugger\` and registers it with
+**Claude Code** (`claude mcp add … -s user`). VS Code needs nothing more: the
+extension registers the server with VS Code itself, so `register-mcp.ps1` no
+longer writes VS Code's user `mcp.json` (it removes the entries an earlier
+`Setup.exe` wrote there). Restart Claude Code to pick it up. To (un)register
+later, from the folder you extracted the zip into:
 
 ```
-powershell -ExecutionPolicy Bypass -File scripts/register-mcp.ps1 "%LOCALAPPDATA%\DelphiWin64Debugger\DelphiDebuggerMcp.exe"
-powershell -ExecutionPolicy Bypass -File scripts/register-mcp.ps1 -Unregister
+powershell -ExecutionPolicy Bypass -File register-mcp.ps1 "%LOCALAPPDATA%\DelphiWin64Debugger\DelphiDebuggerMcp.exe"
+powershell -ExecutionPolicy Bypass -File register-mcp.ps1 -Unregister "%LOCALAPPDATA%\DelphiWin64Debugger\DelphiDebuggerMcp.exe"
 ```
+
+`-Unregister` with the path removes only the registrations that point at that
+exe; without the path it removes the names whatever they point at.
+
+Once the extension is installed it also keeps the server in step by itself: the
+stable copy is refreshed at the next VS Code start after an update, and Claude
+Code is given the registration without being asked, once per install, when the
+`claude` CLI is on PATH.
 
 The tool surface is documented at
 <https://github.com/csm101/delphi-visual-studio-code-debugger/blob/main/docs/MCP_SERVER.md>
@@ -83,6 +96,39 @@ The tool surface is documented at
 > default. If `code` is not found, `Setup.exe` falls back to a folder copy and
 > prints the manual command to finish the install:
 > `code --install-extension "<path-to>.vsix" --force`.
+
+### Setup.exe and the Marketplace
+
+Use one source per editor. If the editor already has the extension from the
+Marketplace, `Setup.exe` leaves that editor alone and says so: installing the
+`.vsix` over it would pin it, because VS Code records a `.vsix` install as
+pinned and never updates it again. To use the zip's copy instead, uninstall the
+extension in the Extensions view first and run `Setup.exe` again; to go the
+other way, uninstall the zip's copy first and install from the Marketplace. A
+copy that is newer than the installer's is not downgraded either.
+
+When an editor keeps its own copy, `Setup.exe` also skips the MCP step: that
+copy refreshes the stable folder and the Claude Code registration itself.
+
+### Uninstalling
+
+```
+Setup.exe --uninstall
+```
+
+It uninstalls the extension from each detected editor through the editor's CLI
+(`<cli> --uninstall-extension`). A Marketplace copy, or an editor whose CLI is
+not on PATH, is reported and kept: remove it in the Extensions view. Only if no
+editor still has the extension does it then remove the MCP server's Claude Code
+registration and delete the files in `%LOCALAPPDATA%\DelphiWin64Debugger\`.
+
+Uninstalling the extension from the Extensions view does the same cleanup
+through the extension's own uninstall hook, but VS Code runs that hook only
+when it deletes the extension from disk, at a later restart and not at the
+uninstall (after a command-line uninstall, `code --uninstall-extension`, that is
+the second start). If another editor still has the extension, nothing is
+removed. A Claude Code registration that points at
+another executable (a development build) is never touched.
 
 ## Installation from source
 

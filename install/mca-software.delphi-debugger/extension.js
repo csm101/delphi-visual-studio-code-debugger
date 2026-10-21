@@ -981,6 +981,59 @@ function activate(context) {
   return { exceptionStops: exceptionStops };
 }
 
+const CLAUDE_SYNC_KEY = 'delphiWin64.mcp.claudeSyncedFor';
+
+/**
+ * Registers the stable copy of the MCP server with Claude Code, without asking,
+ * once per install of this copy: the key is the version plus the install
+ * timestamp the editor records, which changes at every install, update and
+ * reinstall. So VS Code's startup does not spawn the claude CLI every time, a
+ * reinstall registers again what the uninstall hook removed, and a
+ * registration the user deleted by hand stays deleted until the next install.
+ * The key is stored only once the question is settled: without the claude CLI
+ * (or with a CLI that refused) it is asked again at the next start.
+ *
+ * deps (tests): installEntry, serverPath, serverExists(path), claude
+ * (hasClaude/run), vscode.
+ */
+async function syncClaudeOncePerInstall(context, appendDiagnostic, deps) {
+  const d = deps || {};
+  const vs = d.vscode || vscode;
+  const ext = context.extension;
+  const pkg = ext && ext.packageJSON;
+  if (!pkg || !pkg.version) return;
+
+  const entry = 'installEntry' in d
+    ? d.installEntry
+    : require('./updateCheck').readInstallEntry(context.extensionPath, ext.id, pkg.version);
+  const installedAt = (entry && entry.metadata && entry.metadata.installedTimestamp) || '';
+  const key = pkg.version + '|' + installedAt;
+  if (context.globalState.get(CLAUDE_SYNC_KEY) === key) return;
+
+  const serverPath = 'serverPath' in d ? d.serverPath : mcpServer.stableServerPath(process.env);
+  const serverExists = d.serverExists || ((file) => require('fs').existsSync(file));
+  if (!serverPath || !serverExists(serverPath)) return;   // the refresh failed: next start
+
+  const result = await mcpServer.syncClaudeRegistration(serverPath, d.claude || mcpServer.claudeCliDeps());
+  switch (result.outcome) {
+    case 'added':
+      appendDiagnostic('MCP server: registered with Claude Code as "' + mcpServer.SERVER_NAME + '" (' + serverPath + ').');
+      vs.window.showInformationMessage('Delphi Debugger: the MCP server is now registered with Claude Code as "' +
+        mcpServer.SERVER_NAME + '". Restart Claude Code to use it.');
+      break;
+    case 'foreign':
+      appendDiagnostic('MCP server: Claude Code\'s "' + mcpServer.SERVER_NAME + '" points at ' + result.detail +
+        ', not at this installation; left as it is.');
+      break;
+    case 'failed':
+      appendDiagnostic('MCP server: registering with Claude Code failed: ' + result.detail);
+      return;
+    case 'no-claude':
+      return;
+  }
+  await context.globalState.update(CLAUDE_SYNC_KEY, key);
+}
+
 /**
  * The MCP server as shipped inside the extension: registered with VS Code's
  * own MCP registry (bundled exe, updates with the extension), mirrored to the
@@ -1013,6 +1066,9 @@ function setUpMcpServerDistribution(context, appendDiagnostic) {
     } catch (error) {
       appendDiagnostic('MCP server: VS Code registration failed: ' + describe(error));
     }
+
+    syncClaudeOncePerInstall(context, appendDiagnostic)
+      .catch((error) => appendDiagnostic('MCP server: Claude Code registration not checked: ' + describe(error)));
   }
 
   context.subscriptions.push(
@@ -1055,5 +1111,7 @@ module.exports = {
   StepIsolationTracker: StepIsolationTracker,
   STEP_ISOLATION_EVENT: STEP_ISOLATION_EVENT,
   STEP_ISOLATION_CONTEXT_KEY: STEP_ISOLATION_CONTEXT_KEY,
-  checkForUpdate: checkForUpdate
+  checkForUpdate: checkForUpdate,
+  syncClaudeOncePerInstall: syncClaudeOncePerInstall,
+  CLAUDE_SYNC_KEY: CLAUDE_SYNC_KEY
 };

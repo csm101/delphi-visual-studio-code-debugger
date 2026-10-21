@@ -38,25 +38,39 @@ finds it).
   it updates with the extension. For agents outside VS Code the path must be
   stable, so the extension also keeps a copy at
   `%LOCALAPPDATA%\DelphiWin64Debugger\DelphiDebuggerMcp.exe` — the folder
-  `Setup.exe` uses — and refreshes it when the bundled exe is newer. Windows
+  `Setup.exe` uses — and refreshes it when the bundled exe is newer. The
+  extension activates on `onStartupFinished`, so after an update the copy is
+  refreshed at the next editor start (it used to wait for the first Delphi
+  debug session or the Modules view). Windows
   refuses to overwrite or delete a running exe but allows renaming it, so the
   running file is renamed to the first free `.oldN` name, the new one copied
   under the original name, and every `*.old*` deleted where possible (a locked
   one goes at a later activation). All of it silent: at most a line in the
   "Delphi Debugger" output channel. The command **Delphi: Register MCP Server
   with Claude Code** runs `claude mcp add delphi-debugger -s user -- "<stable
-  path>"` and skips with a message when the `claude` CLI is not on PATH.
+  path>"` (replacing whatever the name pointed at) and skips with a message when
+  the `claude` CLI is not on PATH. Claude Code is also registered WITHOUT being
+  asked, once per install of the extension, and unregistered when the extension
+  is uninstalled; the rules are in `DAP_DEBUGGER_ARCHITECTURE.md` "The MCP
+  server's three channels".
 - **The setup zip** (`Setup.exe`, `scripts/build_setup_zip.bat`): run it and
   accept "Also install and register the MCP debug server?". It copies
   `DelphiDebuggerMcp.exe` to the same stable folder and `register-mcp.ps1`
-  registers it with **Claude Code** (`claude mcp add … -s user`) and with **VS
-  Code / Insiders** (user `mcp.json`). The route for machines without VS Code,
-  Claude Desktop, and offline installs.
+  registers it with **Claude Code** (`claude mcp add … -s user`). It does not
+  write VS Code's user `mcp.json`: the extension registers itself with VS Code
+  (since 0.7.0), and an entry there listed the server twice. The route for
+  machines without VS Code, Claude Desktop, and offline installs. `Setup.exe
+  --uninstall` is the way back, and an editor holding the Marketplace copy is
+  left alone (same section of the architecture document).
 - **From source:** `scripts/install-dev.bat` builds the MCP server and registers
   the build-output exe (so a `scripts/build_mcp.bat` rebuild is picked up on
   restart), or directly `powershell -ExecutionPolicy Bypass -File
-  scripts/register-mcp.ps1 <path-to-DelphiDebuggerMcp.exe>` — idempotent;
-  `-Unregister` removes it.
+  scripts/register-mcp.ps1 <path-to-DelphiDebuggerMcp.exe> [-VsCode]` —
+  idempotent. VS Code's user `mcp.json` is written only with `-VsCode`
+  (`install-dev.bat` passes it); without it the script removes the `mcp.json`
+  entries pointing at that exe. `-Unregister <exe>` removes only the
+  registrations pointing at that exe; `-Unregister` alone removes the names
+  whatever they point at.
 
 Restart Claude Code / reload VS Code to pick a registration up. WinGet (a stable,
 on-PATH install of adapter + server) is the planned follow-up once the first

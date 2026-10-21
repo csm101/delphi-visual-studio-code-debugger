@@ -229,6 +229,33 @@ Project knowledge from delphi-devkit (DDK):
   Project-scoped exception rules are not applied on the MCP side (the rule-file
   loader lives in the DAP adapter; the MCP server has never read rule files).
 
+Installation lifecycle (the MCP server and Claude Code):
+- **Claude Code follows the extension, without being asked (2026-10-21, not yet
+  released).** The extension activates on `onStartupFinished`, so after an
+  update the stable copy `%LOCALAPPDATA%\DelphiWin64Debugger\DelphiDebuggerMcp.exe`
+  is refreshed at the next editor start. Once per install of a copy, when the
+  `claude` CLI is on PATH and `delphi-debugger` is not registered, it runs
+  `claude mcp add delphi-debugger -s user` on that copy (a registration on
+  another executable is left alone). A `vscode:uninstall` hook (`uninstall.js`)
+  removes the registration, the matching `mcp.json` entries and the stable
+  folder when VS Code deletes the uninstalled extension from disk, at a later
+  restart (after a CLI uninstall, the second start; measured with VS Code
+  1.142, UI path not measured: `TRAPS.md` "Releases").
+- **`Setup.exe` respects Marketplace installs.** An editor holding the
+  Marketplace copy is left alone (a `.vsix` over it would pin it), a newer copy
+  is not downgraded, and the MCP step is skipped when any editor kept its own
+  copy. New `Setup.exe --uninstall`. `scripts\register-mcp.ps1` writes VS Code's
+  `mcp.json` only with `-VsCode`; `-Unregister <exe>` removes only what points
+  at that exe.
+- Tests: `install/extension-tests/test-claude-lifecycle.js` (registration rules,
+  once-per-install key, uninstall hook against a real temporary profile),
+  `test-manifest.js` (activation event, hook declared and shipped), and
+  `scripts\smoke_test_setup.bat` (install, `--uninstall`, Marketplace copy, with
+  stand-in `claude`/`code` CLIs in `scripts\setup-smoke\`; fails on the released
+  0.7.2 `Setup.exe`). Mechanism and rules in `DAP_DEBUGGER_ARCHITECTURE.md` "The
+  MCP server's three channels"; what these tests do not prove, in
+  `TEST_CATALOG.md` "What the suite does NOT prove".
+
 Target architecture:
 - **Win32 (32-bit / WOW64) targets — SHIPPED.** One 64-bit adapter binary
   debugs both bitnesses; a 64-bit process can debug a 32-bit one, and the
@@ -654,8 +681,9 @@ Integration with delphi-devkit (DDK), in this order:
   user wrote); the MCP server has `launch_project` / `attach_to_project` on
   the same target (`DdkTarget.pas`, `--ddk-exe`); the MCP server ships in the
   VSIX, is registered with VS Code's MCP registry, mirrored to
-  `%LOCALAPPDATA%\DelphiWin64Debugger` and registered with Claude Code on
-  command, under the name `delphi-debugger`. Remaining: **WinGet** — a
+  `%LOCALAPPDATA%\DelphiWin64Debugger` and registered with Claude Code (since
+  2026-10-21 automatically, once per install; see "Installation lifecycle"),
+  under the name `delphi-debugger`. Remaining: **WinGet** — a
   stable, on-PATH install of adapter + MCP server for machines without the
   Marketplace — once the first Marketplace release is out. The original plan,
   for the record: proposal posted on issue #1
@@ -1649,5 +1677,23 @@ by `DAP_LOG=1` in the environment. One previous generation is kept beside it as
   contributors of one debug type make VS Code ask at every session start).
   The extension warns and offers the removal; `Install.exe` uninstalls it.
 - **The MCP server's registered name is `delphi-debugger`** in every channel
-  (extension command, `register-mcp.ps1`, VS Code's MCP registry); the old
-  `delphi-win64-debugger` registration is removed by each of them.
+  (the extension's command and automatic Claude Code sync, `register-mcp.ps1`,
+  VS Code's MCP registry); the old `delphi-win64-debugger` registration is
+  removed by each of them (the automatic sync only when it points at the stable
+  copy).
+- **Registrations that point at another executable are never touched** by the
+  extension's sync, its uninstall hook, `Setup.exe --uninstall` or
+  `register-mcp.ps1 -Unregister <exe>`: a development build registered under the
+  same name is someone's decision. Only the command **Delphi: Register MCP Server
+  with Claude Code** and a plain `register-mcp.ps1 <exe>` replace it, because
+  the user asked for exactly that.
+- **One source per editor: Marketplace or `Setup.exe`, not both.** A `.vsix`
+  installed over a Marketplace copy is recorded as pinned and never updates.
+  `Setup.exe` leaves such an editor alone.
+- **Two distribution channels since 0.7.1 (2026-10-21).** The VS Code
+  Marketplace (`mca-software.delphi-debugger`, uploaded by hand) is the route for
+  VS Code and Insiders, and the editor updates it. The setup zip on GitHub stays
+  for Cursor, Windsurf, VSCodium and Trae (the Microsoft Marketplace does not
+  serve them, and the extension is not on Open VSX), for offline machines, and
+  for machines that only want the MCP server. This supersedes the 2026-08-03
+  decision to distribute by installer only.

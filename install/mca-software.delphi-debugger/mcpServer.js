@@ -23,9 +23,15 @@
  *      later activation. Silent by design: at most a line in the output
  *      channel.
  *
+ * Claude Code follows the installation without being asked: the stable copy
+ * is registered with it when the extension is installed or reinstalled
+ * (syncClaudeRegistration, once per install of a copy), keeps serving the same
+ * registration after an update because only the file behind the path changes,
+ * and is unregistered and deleted by the uninstall hook (uninstall.js).
+ *
  * Plus the command "Delphi: Register MCP Server with Claude Code", which runs
  * the same `claude mcp add` the setup zip's register-mcp.ps1 performs, against
- * the stable copy.
+ * the stable copy - replacing whatever the name pointed at.
  */
 
 const path = require('path');
@@ -207,6 +213,93 @@ async function registerWithClaudeCode(serverPath, deps) {
   return true;
 }
 
+/**
+ * The executable a `claude mcp get <name>` reports, or undefined when the
+ * output names none. The CLI prints the registration as indented `Key: value`
+ * lines ("  Command: C:\...\DelphiDebuggerMcp.exe", Claude Code 2.x).
+ */
+function registeredCommandFrom(output) {
+  const match = /^\s*Command:\s*(.*?)\s*$/m.exec(String(output || ''));
+  if (!match || match[1] === '') return undefined;
+  return match[1].replace(/^"(.*)"$/, '$1');
+}
+
+/** The same file as Windows sees it: case-insensitive, either slash, quotes ignored. */
+function samePath(a, b) {
+  if (typeof a !== 'string' || typeof b !== 'string' || a === '' || b === '') return false;
+  const norm = (p) => path.win32.normalize(p.replace(/^"(.*)"$/, '$1')).toLowerCase();
+  return norm(a) === norm(b);
+}
+
+/**
+ * Keeps Claude Code's user-scope registration in step with this installation,
+ * WITHOUT asking -- the maintainer's decision: an installed debugger is a
+ * registered one. Resolves with { outcome, detail }:
+ *   'no-claude'  - the CLI is not on PATH: nothing to do, ask again next time;
+ *   'registered' - already registered on `serverPath`;
+ *   'added'      - it was not registered at all; now it is;
+ *   'foreign'    - registered on ANOTHER executable (a development build, a
+ *                  hand-made entry): that is someone's decision and is kept;
+ *   'failed'     - the CLI refused, `detail` says why.
+ * The legacy name is dropped when it points at this same copy.
+ * `deps.hasClaude()` resolves true/false; `deps.run(commandLine)` resolves with
+ * { error, stdout, stderr } and never rejects.
+ */
+async function syncClaudeRegistration(serverPath, deps) {
+  if (!serverPath) return { outcome: 'failed', detail: 'no stable install location (LOCALAPPDATA is not set)' };
+  if (!(await deps.hasClaude())) return { outcome: 'no-claude' };
+
+  const legacy = await deps.run('claude mcp get ' + LEGACY_SERVER_NAME);
+  if (!legacy.error && samePath(registeredCommandFrom(legacy.stdout), serverPath))
+    await deps.run('claude mcp remove ' + LEGACY_SERVER_NAME + ' -s user');
+
+  const current = await deps.run('claude mcp get ' + SERVER_NAME);
+  if (!current.error) {
+    const command = registeredCommandFrom(current.stdout);
+    return { outcome: samePath(command, serverPath) ? 'registered' : 'foreign', detail: command };
+  }
+  const added = await deps.run(claudeCommandLines(serverPath)[2]);
+  if (added.error)
+    return { outcome: 'failed', detail: (added.stderr || added.stdout || added.error.message || '').trim() };
+  return { outcome: 'added' };
+}
+
+/**
+ * Removes the Claude Code registrations (current and legacy name) that point
+ * at `serverPath`, and only those: a registration on any other executable is
+ * someone's decision. Resolves with the names removed. Used by the uninstall
+ * hook, where nothing may be asked and nothing may throw.
+ */
+async function removeClaudeRegistrations(serverPath, deps) {
+  const removed = [];
+  if (!serverPath || !(await deps.hasClaude())) return removed;
+  for (const name of [SERVER_NAME, LEGACY_SERVER_NAME]) {
+    const current = await deps.run('claude mcp get ' + name);
+    if (current.error || !samePath(registeredCommandFrom(current.stdout), serverPath)) continue;
+    const result = await deps.run('claude mcp remove ' + name + ' -s user');
+    if (!result.error) removed.push(name);
+  }
+  return removed;
+}
+
+/**
+ * The real CLI, for syncClaudeRegistration / removeClaudeRegistrations. Run
+ * from the home folder: `claude mcp get` also sees project-scoped servers of
+ * the directory it runs in, and the extension host's directory is arbitrary.
+ */
+function claudeCliDeps() {
+  const childProcess = require('child_process');
+  const os = require('os');
+  const options = { windowsHide: true, cwd: os.homedir() };
+  return {
+    hasClaude: () => new Promise((resolve) =>
+      childProcess.exec('where claude', { windowsHide: true }, (error) => resolve(!error))),
+    run: (commandLine) => new Promise((resolve) =>
+      childProcess.exec(commandLine, options, (error, stdout, stderr) =>
+        resolve({ error: error, stdout: String(stdout || ''), stderr: String(stderr || '') })))
+  };
+}
+
 function runCollecting(exec, commandLine) {
   return new Promise((resolve) => {
     exec(commandLine, (error, stdout, stderr) =>
@@ -232,5 +325,10 @@ module.exports = {
   describeOutcome: describeOutcome,
   registerDefinitionProvider: registerDefinitionProvider,
   claudeCommandLines: claudeCommandLines,
-  registerWithClaudeCode: registerWithClaudeCode
+  registerWithClaudeCode: registerWithClaudeCode,
+  registeredCommandFrom: registeredCommandFrom,
+  samePath: samePath,
+  syncClaudeRegistration: syncClaudeRegistration,
+  removeClaudeRegistrations: removeClaudeRegistrations,
+  claudeCliDeps: claudeCliDeps
 };

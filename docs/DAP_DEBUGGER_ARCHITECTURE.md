@@ -3674,8 +3674,86 @@ under the id `delphi-debugger`, and mirrored to
 that tolerates a running server — `mcpServer.js`), in the setup zip
 (`Setup.exe` + `register-mcp.ps1`, same folder, same name), and from source.
 The tests: `install/extension-tests/test-ddk-target.js`, `test-ddk-provider.js`,
-`test-mcp-distribution.js`; `DebuggerTests\DdkTargetTests.pas`;
-`McpE2ETests.LaunchProject_*` (a stand-in `ddk.cmd` through `--ddk-exe`).
+`test-mcp-distribution.js`, `test-claude-lifecycle.js`;
+`DebuggerTests\DdkTargetTests.pas`; `McpE2ETests.LaunchProject_*` (a stand-in
+`ddk.cmd` through `--ddk-exe`); `scripts\smoke_test_setup.bat` for `Setup.exe`.
+
+**Claude Code follows the extension's lifecycle.** Decided by the maintainer: an
+installed debugger is a registered one, so nothing is asked.
+
+- *Refresh at editor start.* The extension activates on `onStartupFinished` as
+  well as on the debug and view events, so after an update the stable copy is
+  refreshed at the next editor start. Before, only the first Delphi debug
+  session or the opening of the Modules view activated it.
+- *Register, once per install of a copy.* `syncClaudeOncePerInstall`
+  (`extension.js`) keys the work on `<version>|<installedTimestamp>`, read from
+  this copy's entry in the editor's `extensions.json`
+  (`updateCheck.readInstallEntry`) and kept in the globalState key
+  `delphiWin64.mcp.claudeSyncedFor`. The timestamp is new at every install,
+  update and reinstall. So a reinstall registers again (the uninstall hook had
+  removed it); an update finds the name already registered on the same path and
+  changes nothing; a registration the user deleted by hand stays deleted until
+  the next install; and a start does not spawn the `claude` CLI every time. The
+  key is NOT stored when the CLI is absent or the add failed, so those are asked
+  again at the next start, and nothing is tried while the stable copy does not
+  exist yet.
+- *What it does to the registration.* `mcpServer.syncClaudeRegistration` reads
+  the registered executable from the `Command:` line of `claude mcp get`
+  (run from the home folder, because the command also sees project-scoped
+  servers of the directory it runs in) and answers `no-claude`, `registered`,
+  `added` (one information toast), `foreign` or `failed`. `foreign` means the
+  name points at another executable, such as a development build: it is left
+  as it is and logged to the output channel. The legacy name
+  `delphi-win64-debugger` is dropped only when it points at the stable copy.
+- *Unregister at uninstall.* `package.json` declares
+  `"scripts": { "vscode:uninstall": "node ./uninstall.js" }`. VS Code runs it
+  with plain Node, no `vscode` API, at a restart after a COMPLETE uninstall
+  when VS Code deletes the extension from disk, and never for an update. The
+  shared-process cleanup (`ExtensionsScanner.cleanUp`,
+  `deleteExtensionsMarkedForRemoval`) runs the hook, BEFORE it deletes the
+  folder (so `require('./mcpServer')` still works), and deletes the folder, only
+  for extensions listed in `<extensions dir>\.obsolete`. After a CLI uninstall
+  (`code --uninstall-extension`) the entry leaves `extensions.json` at once but
+  the folder is not yet marked: the first start marks it ("Marked extension as
+  removed" in `sharedprocess.log`) and the SECOND start runs the hook ("Running
+  post uninstall script"). Measured with VS Code 1.142 in an isolated
+  `--extensions-dir` / `--user-data-dir` instance; the UI uninstall path was not
+  measured. The hook acts only when no VS Code-family
+  editor (the copy's own extensions folder plus `%USERPROFILE%\.vscode`,
+  `.vscode-insiders`, `.cursor`, `.windsurf`, `.vscode-oss`, `.trae`) still
+  lists the extension in its `extensions.json`: the entry, not the folder, says
+  "installed", because the folder outlives the entry (the editor drops the
+  entry at uninstall time; the folder stays on disk until the cleanup above).
+  In that live run the hook logged `Still installed in
+  %USERPROFILE%\.vscode\extensions` (spelled out in the log) and touched
+  nothing, correctly: the machine's regular VS Code still had the extension.
+  Otherwise it removes the Claude Code registrations (both names) that
+  point at the stable copy; removes the same entries from VS Code's and
+  Insiders' user `mcp.json` (plain-JSON files only; one with comments is left);
+  and deletes the stable folder's server, `Zydis.dll`, `Zydis-LICENSE.txt` and
+  `*.oldN` files, then the folder if it is empty (a file someone else put
+  there survives). A file locked by a running server is reported, not retried.
+  It logs to `%TEMP%\delphi-debugger-uninstall.log`.
+- *`register-mcp.ps1`.* Registers with Claude Code. VS Code's user `mcp.json` is
+  written only with `-VsCode` (`install-dev.bat` passes it): the extension
+  registers itself with VS Code through the provider API since 0.7.0, so an
+  entry there listed the server twice. Without `-VsCode` the script only
+  REMOVES entries pointing at the given exe, the duplicates earlier `Setup.exe`
+  versions wrote. `-Unregister <exe>` removes only the registrations (Claude
+  Code and `mcp.json`) pointing at that exe; `-Unregister` alone keeps the old
+  unconditional behaviour.
+- *`Setup.exe` (`install\Install.dpr`).* Per editor it reads `extensions.json`
+  (`InstalledCopyIn`, `MayInstallOver`). A Marketplace copy (`metadata.source`
+  = `gallery`) is left alone with a message to uninstall it first: installing
+  the `.vsix` over it would pin it, since VS Code records a `.vsix` install as
+  pinned and never auto-updates it. A copy newer than the installer's is not
+  downgraded (`--force` used to). When any editor kept its own copy the MCP
+  step is skipped, because that copy owns the stable folder and the
+  registration. `Setup.exe --uninstall` runs `<cli> --uninstall-extension` in
+  each detected editor (a Marketplace copy, or a missing CLI, is reported and
+  kept), then, only if no editor still has the extension, runs
+  `register-mcp.ps1 -Unregister <stable exe>` and deletes the stable folder's
+  files.
 
 ## DAP capabilities advertised
 

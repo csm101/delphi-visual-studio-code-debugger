@@ -64,11 +64,23 @@ test('package.json parses and keeps its Marketplace identity', () => {
   // types, or the alias would never activate it. The view event is what lets
   // the modules tree populate when it is opened with no session running --
   // without it the view renders and stays permanently empty, because nothing
-  // has activated the extension that provides its data.
+  // has activated the extension that provides its data. onStartupFinished is
+  // what keeps the MCP server Claude Code runs in step with an update the
+  // editor installed: without it the stable copy was refreshed only at the
+  // first Delphi debug session after the update.
   assert.deepStrictEqual(manifest.activationEvents,
     ['onDebugResolve:delphi', 'onDebugDynamicConfigurations:delphi',
      'onDebugResolve:delphi-win64', 'onDebugDynamicConfigurations:delphi-win64',
-     'onView:delphiModules']);
+     'onView:delphiModules', 'onStartupFinished']);
+});
+
+test('the uninstall hook is declared, is Node, and ships', () => {
+  // VS Code runs `vscode:uninstall` at the first restart after a complete
+  // uninstall; it is what takes the MCP server out of Claude Code.
+  assert.strictEqual(manifest.scripts['vscode:uninstall'], 'node ./uninstall.js');
+  assert.ok(fs.existsSync(path.join(extensionDir, 'uninstall.js')));
+  const ignore = fs.readFileSync(path.join(extensionDir, '.vscodeignore'), 'utf8');
+  assert.ok(!/^uninstall\.js$/m.test(ignore), 'uninstall.js must ship');
 });
 
 test('the .vscodeignore keeps the tests out of the package and the runtime files in', () => {

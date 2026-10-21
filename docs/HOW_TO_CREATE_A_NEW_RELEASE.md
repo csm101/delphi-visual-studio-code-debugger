@@ -133,8 +133,13 @@ What happens, in order:
    `Setup.exe` installs it in preference to packaging the folder itself.
    Before zipping it runs `Setup.exe` from a copy of the staged layout in a
    sandbox (`scripts/smoke_test_setup.bat`: per-user folders under `%TEMP%`,
-   no editor and no `claude` on PATH) and builds no zip unless the installer
-   ran in portable mode and installed and registered the MCP server;
+   stand-in `claude` and `code` CLIs from `scripts\setup-smoke\` that log their
+   calls and keep a registry in the sandbox) and builds no zip unless all three
+   runs pass: the install runs in portable mode and registers the stable copy of
+   the MCP server with Claude Code; `Setup.exe --uninstall` removes that
+   registration and the stable folder; and an editor holding the Marketplace
+   copy is left alone, with no `.vsix` installed over it and the MCP step
+   skipped;
 6. computes the zip's SHA-256;
 7. renders the template, substituting the version, the hash, the MCP tool count
    (read from `MCPDebugger\McpToolSchemas.pas`) and your "What's new";

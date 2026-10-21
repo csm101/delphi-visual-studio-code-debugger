@@ -26,6 +26,8 @@ uses
   System.SysUtils,
   System.IOUtils,
   System.Classes,
+  System.Math,
+  System.RegularExpressions,
   System.Zip,
   System.Generics.Collections,
   System.JSON,
@@ -50,6 +52,16 @@ type
     Cli: string;
     ExtSubdir: string;
     DownloadUrl: string;
+  end;
+
+  // What an editor's own extensions.json records about this extension.
+  // Source 'gallery' is a Marketplace install, which the editor keeps updated;
+  // 'vsix' is this installer's copy or a hand-installed .vsix, which the
+  // editor pins and never updates.
+  TInstalledCopy = record
+    Found: Boolean;
+    Version: string;
+    Source: string;
   end;
 
 const
@@ -468,6 +480,86 @@ begin
   Result := TPath.Combine(EditorParentDir(Target), 'extensions');
 end;
 
+// The editor's record of this extension: extensions.json beside the extension
+// folders. The editor drops an entry there at uninstall time, while the folder
+// stays until it restarts, so the entry is what says "installed". A file that
+// cannot be read or parsed counts as "not found".
+function InstalledCopyIn(const AExtensionsDir: string): TInstalledCopy;
+begin
+  Result := Default(TInstalledCopy);
+  var ListPath := TPath.Combine(AExtensionsDir, 'extensions.json');
+  if not TFile.Exists(ListPath) then
+    Exit;
+  var Text: string;
+  try
+    Text := TFile.ReadAllText(ListPath, TEncoding.UTF8);
+  except
+    Exit;   // being rewritten by the editor this very moment
+  end;
+  var Json := TJSONObject.ParseJSONValue(Text);   // nil when not JSON
+  try
+    if not (Json is TJSONArray) then
+      Exit;
+    for var Item in TJSONArray(Json) do begin
+      var Id := '';
+      if not Item.TryGetValue<string>('identifier.id', Id) or not SameText(Id, EXTENSION_ID) then
+        Continue;
+      Result.Found := True;
+      Item.TryGetValue<string>('version', Result.Version);
+      Item.TryGetValue<string>('metadata.source', Result.Source);
+      Exit;
+    end;
+  finally
+    Json.Free;
+  end;
+end;
+
+// >0 when A is newer, <0 when B is, 0 when equal. Dotted numbers; a part that
+// is not a number counts as 0 (the rule of the extension's updateCheck.js).
+function CompareVersions(const A, B: string): Integer;
+
+  function PartOf(const Parts: TArray<string>; Index: Integer): Integer;
+  begin
+    if Index >= Length(Parts) then
+      Exit(0);
+    Result := StrToIntDef(Parts[Index].Trim, 0);
+  end;
+
+begin
+  var Left := A.Split(['.']);
+  var Right := B.Split(['.']);
+  for var I := 0 to Max(Length(Left), Length(Right)) - 1 do begin
+    Result := CompareValue(PartOf(Left, I), PartOf(Right, I));
+    if Result <> 0 then
+      Exit;
+  end;
+  Result := 0;
+end;
+
+// Whether this installer may put its copy into an editor that already has the
+// extension. A Marketplace copy is the editor's to update, and installing this
+// .vsix over it would pin it there for good: the rule is to uninstall one
+// before installing the other. A newer copy is never downgraded.
+function MayInstallOver(const Target: TEditorTarget; const Existing: TInstalledCopy;
+  const BundledVersion: string): Boolean;
+begin
+  if not Existing.Found then
+    Exit(True);
+  if SameText(Existing.Source, 'gallery') then begin
+    Writeln(Format('%s has Delphi Debugger %s from the Marketplace, which keeps it updated: left as it is.',
+      [Target.DisplayName, Existing.Version]));
+    Writeln('  To use this installer''s copy instead, uninstall it in the Extensions view, then run Setup again.');
+    Exit(False);
+  end;
+  if CompareVersions(Existing.Version, BundledVersion) > 0 then begin
+    Writeln(Format('%s has Delphi Debugger %s, newer than this installer''s %s: not downgraded.',
+      [Target.DisplayName, Existing.Version, BundledVersion]));
+    Writeln('  To go back to this version, uninstall it in the Extensions view first.');
+    Exit(False);
+  end;
+  Result := True;
+end;
+
 // An editor counts as present if its CLI is on PATH or its profile directory
 // exists (the CLI is not always added to PATH by the editor's own installer).
 function EditorDetected(const Target: TEditorTarget): Boolean;
@@ -596,10 +688,14 @@ end;
 
 // Installs the extension into one detected editor. Prefers the editor's CLI
 // (works on current builds); falls back to a folder copy only when the CLI is
-// not on PATH.
-procedure InstallForEditor(const Target: TEditorTarget; const AVsixPath: string);
+// not on PATH. Returns False when the editor keeps a copy this installer must
+// not replace (see MayInstallOver).
+function InstallForEditor(const Target: TEditorTarget; const AVsixPath, ABundledVersion: string): Boolean;
 begin
   Writeln('--- ' + Target.DisplayName + ' ---');
+  Result := MayInstallOver(Target, InstalledCopyIn(EditorExtensionsDir(Target)), ABundledVersion);
+  if not Result then
+    Exit;
   if CommandOnPath(Target.Cli) then begin
     UninstallOldSideloadedCopy(Target.Cli);
     RemoveLeftoverFolders(EditorExtensionsDir(Target));
@@ -617,59 +713,177 @@ begin
   InstallInto(EditorExtensionsDir(Target));
 end;
 
+procedure InstallMcpServer;
+begin
+  Writeln('');
+  Writeln('--- MCP debug server (Claude Code) ---');
+  // Its own failure domain: the extension is installed by this point, and
+  // reporting the whole install as failed - skipping the "reload the editor"
+  // instruction with it - is worse than reporting the part that did fail.
+  if not AskYesNo('Also install and register the MCP debug server?', True) then
+    Exit;
+  try
+    RegisterMcp;
+  except
+    on E: Exception do begin
+      Writeln('MCP server NOT installed: ' + E.Message);
+      Writeln('The VS Code extension is installed and usable; re-run the installer for the MCP server.');
+    end;
+  end;
+end;
+
+procedure InstallEverything;
+begin
+  if IsPortable then begin
+    Writeln('Mode: portable (bundled adapter)');
+  end
+  else begin
+    Writeln('Mode: repository (' + RepoRoot + ')');
+    EnsureAdapterBuilt;
+    StageFiles;
+  end;
+  // Idempotent either way: portable mode's StageDir already carries
+  // Zydis.dll from the zip (scripts/build_setup_zip.bat stages it into
+  // the extension folder before zipping); repository mode needs it copied
+  // here since StageFiles above only staged the adapter exe.
+  CopyZydisIfAvailable(StageDir);
+  Writeln('');
+
+  var Info := ReadVsixInfo;
+  var VsixPath := BundledVsixPath;
+  if VsixPath <> '' then
+    Writeln('Using the packaged VSIX: ' + VsixPath)
+  else begin
+    VsixPath := BuildVsix(Info);
+    Writeln('Built VSIX: ' + VsixPath);
+  end;
+  Writeln('');
+
+  // An editor that keeps its own copy (from the Marketplace, or newer than
+  // this one) also keeps the MCP server: that copy refreshes the stable folder
+  // and the Claude Code registration itself, and this installer's older server
+  // would only be swapped back at the editor's next start.
+  var KeptBy := '';
+  var Detected := DetectedEditors;
+  if Length(Detected) = 0 then
+    PrintNoEditorInstructions(VsixPath)
+  else
+    for var Target in ChooseEditors(Detected) do
+      if not InstallForEditor(Target, VsixPath, Info.Version) then
+        KeptBy := Target.DisplayName;
+
+  if KeptBy = '' then
+    InstallMcpServer
+  else begin
+    Writeln('');
+    Writeln('MCP debug server: left to the extension already installed in ' + KeptBy +
+      ', which keeps it and its Claude Code registration up to date.');
+  end;
+
+  Writeln('');
+  Writeln('Done. Reload the editor (Ctrl+Shift+P -> Developer: Reload Window).');
+end;
+
+// The files this installer and the extension put in the stable MCP folder:
+// the server, its companions, and copies a refresh parked as *.oldN.
+function IsMcpInstallFile(const FileName: string): Boolean;
+begin
+  for var Name in ['DelphiDebuggerMcp.exe', 'Zydis.dll', 'Zydis-LICENSE.txt'] do
+    if SameText(FileName, Name) then
+      Exit(True);
+  Result := TRegEx.IsMatch(FileName, '\.old\d+$', [roIgnoreCase]);
+end;
+
+procedure RemoveMcpInstallDir;
+begin
+  var Dir := McpInstallDir;
+  if not TDirectory.Exists(Dir) then
+    Exit;
+  for var FilePath in TDirectory.GetFiles(Dir) do begin
+    if not IsMcpInstallFile(TPath.GetFileName(FilePath)) then
+      Continue;
+    if DeleteFile(PChar(FilePath)) then
+      Writeln('Deleted ' + FilePath)
+    else
+      Writeln('Could not delete ' + FilePath + ' (in use: close Claude Code, then delete it by hand).');
+  end;
+  if RemoveDirectory(PChar(Dir)) then
+    Writeln('Removed ' + Dir);
+end;
+
+// Uninstalls the extension from one editor, if this installer may. Returns
+// False when the editor keeps a copy: one from the Marketplace (the editor's
+// own), or one that cannot be removed without the editor's CLI.
+function UninstallFromEditor(const Target: TEditorTarget): Boolean;
+begin
+  var Existing := InstalledCopyIn(EditorExtensionsDir(Target));
+  if not Existing.Found then
+    Exit(True);
+  if SameText(Existing.Source, 'gallery') then begin
+    Writeln(Format('%s: Delphi Debugger %s comes from the Marketplace - uninstall it in the Extensions view.',
+      [Target.DisplayName, Existing.Version]));
+    Exit(False);
+  end;
+  if not CommandOnPath(Target.Cli) then begin
+    Writeln(Format('%s: %s CLI not on PATH - uninstall Delphi Debugger in the Extensions view.',
+      [Target.DisplayName, Target.Cli]));
+    Exit(False);
+  end;
+  Result := RunAndWait(Format('cmd.exe /c %s --uninstall-extension %s', [Target.Cli, EXTENSION_ID])) = 0;
+  if Result then
+    Writeln(Format('%s: Delphi Debugger %s uninstalled.', [Target.DisplayName, Existing.Version]))
+  else
+    Writeln(Format('%s: %s --uninstall-extension failed.', [Target.DisplayName, Target.Cli]));
+end;
+
+// Setup.exe --uninstall: the way back for what this installer put on the
+// machine. The extension leaves every editor where this installer's copy is;
+// then the MCP server leaves Claude Code and its stable folder - unless an
+// editor still has the extension, since that copy uses them. Uninstalling the
+// extension in an editor does the same through its own uninstall hook, at the
+// editor's next restart; this is also for a machine where no editor is
+// involved and the server was installed only for Claude Code.
+procedure UninstallEverything;
+begin
+  Writeln('Mode: uninstall');
+  var KeptBy := '';
+  for var Target in DetectedEditors do
+    if not UninstallFromEditor(Target) then
+      KeptBy := Target.DisplayName;
+  Writeln('');
+  Writeln('--- MCP debug server (Claude Code) ---');
+  if KeptBy <> '' then begin
+    Writeln('Kept: Delphi Debugger is still installed in ' + KeptBy + ', which uses it.');
+    Exit;
+  end;
+  var Script := RegisterScriptPath;
+  var StableExe := TPath.Combine(McpInstallDir, 'DelphiDebuggerMcp.exe');
+  if TFile.Exists(Script) then
+    RunAndWait(Format('cmd.exe /c powershell -NoProfile -ExecutionPolicy Bypass -File "%s" -Unregister "%s"',
+      [Script, StableExe]))
+  else
+    Writeln('register-mcp.ps1 not found (' + Script + '); run by hand:  claude mcp remove ' + MCP_SERVER_NAME + ' -s user');
+  RemoveMcpInstallDir;
+  Writeln('');
+  Writeln('Done.');
+end;
+
+function UninstallRequested: Boolean;
+begin
+  for var I := 1 to ParamCount do
+    for var Switch in ['--uninstall', '-uninstall', '/uninstall'] do
+      if SameText(ParamStr(I), Switch) then
+        Exit(True);
+  Result := False;
+end;
+
 begin
   try
     Writeln('Delphi Debugger (Win32/Win64) - installer');
-    if IsPortable then begin
-      Writeln('Mode: portable (bundled adapter)');
-    end
-    else begin
-      Writeln('Mode: repository (' + RepoRoot + ')');
-      EnsureAdapterBuilt;
-      StageFiles;
-    end;
-    // Idempotent either way: portable mode's StageDir already carries
-    // Zydis.dll from the zip (scripts/build_setup_zip.bat stages it into
-    // the extension folder before zipping); repository mode needs it copied
-    // here since StageFiles above only staged the adapter exe.
-    CopyZydisIfAvailable(StageDir);
-    Writeln('');
-
-    var VsixPath := BundledVsixPath;
-    if VsixPath <> '' then
-      Writeln('Using the packaged VSIX: ' + VsixPath)
-    else begin
-      var Info := ReadVsixInfo;
-      VsixPath := BuildVsix(Info);
-      Writeln('Built VSIX: ' + VsixPath);
-    end;
-    Writeln('');
-
-    var Detected := DetectedEditors;
-    if Length(Detected) = 0 then
-      PrintNoEditorInstructions(VsixPath)
+    if UninstallRequested then
+      UninstallEverything
     else
-      for var Target in ChooseEditors(Detected) do
-        InstallForEditor(Target, VsixPath);
-
-    Writeln('');
-    Writeln('--- MCP debug server (Claude Code + VS Code) ---');
-    // Its own failure domain: the extension is installed by this point, and
-    // reporting the whole install as failed - skipping the "reload the editor"
-    // instruction with it - is worse than reporting the part that did fail.
-    if AskYesNo('Also install and register the MCP debug server?', True) then begin
-      try
-        RegisterMcp;
-      except
-        on E: Exception do begin
-          Writeln('MCP server NOT installed: ' + E.Message);
-          Writeln('The VS Code extension is installed and usable; re-run the installer for the MCP server.');
-        end;
-      end;
-    end;
-
-    Writeln('');
-    Writeln('Done. Reload the editor (Ctrl+Shift+P -> Developer: Reload Window).');
+      InstallEverything;
   except
     on E: Exception do begin
       Writeln('ERROR: ' + E.Message);

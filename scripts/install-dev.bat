@@ -24,5 +24,5 @@ if errorlevel 1 (
 )
 
 echo === Registering MCP server with Claude Code + VS Code (build output) ===
-powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0register-mcp.ps1" "%REPO_ROOT%\MCPDebugger\Win64\Debug\DelphiDebuggerMcp.exe"
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0register-mcp.ps1" "%REPO_ROOT%\MCPDebugger\Win64\Debug\DelphiDebuggerMcp.exe" -VsCode
 exit /b %ERRORLEVEL%

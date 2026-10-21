@@ -46,6 +46,9 @@ echo.
 echo === MCP server distribution: stable copy, VS Code registry, Claude Code ===
 node test-mcp-distribution.js || set FAILED=1
 echo.
+echo === Claude Code follows install, update, reinstall and uninstall ===
+node test-claude-lifecycle.js || set FAILED=1
+echo.
 
 REM These live next to the extension rather than here, because they exercise
 REM functions exported from extension.js and updateCheck.js directly. They were

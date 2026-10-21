@@ -1731,20 +1731,16 @@ records land. Also open: whether Win64 has the same ghosts in `.text` (it has no
 
 ## Process / repo
 
-- **VS Code extension publishing — DECIDED 2026-08-03: stays as it is.**
-  `install\Install.exe` packages a `.vsix` and installs it into every detected
-  editor of the VS Code family (VS Code, Insiders, Cursor, Windsurf, VSCodium,
-  Trae) through that editor's own CLI, falling back to a folder copy when the
-  editor is present but its CLI is not on PATH.
-
-  The Microsoft marketplace would REDUCE reach here, not extend it: Cursor,
-  Windsurf and VSCodium do not pull from it (Open VSX is their registry), and
-  multi-editor support is a requirement rather than a nicety. So this was
-  previously mis-filed as an open production blocker; it is a deliberate choice.
-
-  What it does not provide, and nobody has asked for: automatic updates (users
-  re-run the installer) and hosted distribution of the installer itself
-  (`scripts/build_setup_zip.bat` / `scripts/make_release.bat` package it).
+- **When does `vscode:uninstall` run after an uninstall from the Extensions
+  view, and in the other editors of the family?** Measured only for
+  `code --uninstall-extension` in VS Code 1.142 (isolated profile): the hook ran
+  at the SECOND start (`TRAPS.md` "Releases"). The UI path, Insiders, Cursor,
+  Windsurf, VSCodium and Trae are unmeasured, so the README's description of the
+  cleanup ("at a later restart") is a lower bound, not a promise. To settle it:
+  uninstall from the UI of an isolated `--extensions-dir` / `--user-data-dir`
+  instance and read `sharedprocess.log` ("Marked extension as removed",
+  "Running post uninstall script") across restarts. Until then
+  `Setup.exe --uninstall` is the cleanup that does not depend on the hook.
 
 ## Open items recovered from the task journal (2026-08-08)
 

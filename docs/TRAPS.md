@@ -393,6 +393,28 @@ absurdly.
   line. `scripts\smoke_test_setup.bat` now runs the staged installer in a
   sandbox on every zip build and fails it; keep its checks in step with what
   `Setup.exe` is supposed to do.
+- **The `vscode:uninstall` hook does not run at the uninstall, nor at "the next
+  restart" in every case, and "installed" is read from `extensions.json`
+  entries, never from extension folders.** VS Code runs `uninstall.js` (plain
+  Node, no `vscode` API) from its shared-process cleanup
+  (`ExtensionsScanner.cleanUp` -> `deleteExtensionsMarkedForRemoval`), only for
+  extensions listed in `<extensions dir>\.obsolete`, and BEFORE it deletes the
+  folder (so `require('./mcpServer')` in the hook works). After
+  `code --uninstall-extension` the entry leaves `extensions.json` at once but
+  the folder is not yet marked: the first start marks it (`sharedprocess.log`:
+  "Marked extension as removed"), the SECOND start runs the hook ("Running post
+  uninstall script") and deletes the folder. Measured with VS Code 1.142 in an
+  isolated `--extensions-dir` / `--user-data-dir` instance; the UI uninstall
+  path was not measured. Never for an update. Until the cleanup the folder is
+  still on disk while its entry is gone: a folder check reports a copy that no
+  longer exists, and a check of the hook's own editor alone misses a Cursor or
+  Insiders that still has the extension. So the hook and `Setup.exe`
+  (`stillInstalledIn`, `InstalledCopyIn`) read the entries of every editor in
+  the family. When testing, restart the editor twice after a CLI uninstall
+  before looking for the cleanup (`%TEMP%\delphi-debugger-uninstall.log`; it
+  records "Still installed in ..." when another editor keeps the extension),
+  and expect nothing if the extension was installed again before then. Use an
+  isolated `--extensions-dir` / `--user-data-dir`, never the regular profile.
 
 ## Session notes and the resume cursor
 

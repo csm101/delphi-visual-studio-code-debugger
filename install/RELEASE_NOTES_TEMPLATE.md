@@ -36,8 +36,14 @@ source search paths, the packages. Two things can supply that:
 1. Download `delphi-win64-debugger-setup-v{{VERSION}}.zip` below and extract it anywhere.
 2. Run `Setup.exe`. It installs the bundled `.vsix` through the VS Code CLI
    (`code --install-extension`), updating any previous version in place, then
-   offers to register the MCP debug server with Claude Code and VS Code.
+   offers to install and register the MCP debug server with Claude Code (VS Code
+   gets the server from the extension itself).
 3. Reload VS Code.
+
+An editor that already has the extension from the Marketplace is left alone by
+`Setup.exe`: installing the `.vsix` over it would stop it updating itself.
+Uninstall one copy before installing the other. `Setup.exe --uninstall` removes
+what `Setup.exe` installed.
 
 **The extension is now `mca-software.delphi-debugger`.** Earlier releases
 installed it under the id `local.delphi-win64-debug`; the two must not coexist,

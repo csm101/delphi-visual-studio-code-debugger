@@ -1815,6 +1815,20 @@ never gave. Recovered from `TASK_RESUME.md` when that file was cut back.
   `boundary` divergences that vanish at a 33% sample of the SAME binary) --
   a reminder that the oracle itself can have limits worth measuring, not
   just the thing being checked against it.
+- **The extension and installer tests (2026-10-21) run against stand-ins, not
+  against a real VS Code or a real Claude Code.** They are outside
+  `RunTests.exe`: `install\extension-tests\run.bat` (Node) and
+  `scripts\smoke_test_setup.bat` (run by `build_setup_zip.bat`). In
+  `test-claude-lifecycle.js` the `claude` CLI is a fake whose `mcp get` prints
+  the format of Claude Code 2.x, so a change in that output would pass here and
+  break `registeredCommandFrom` for real; the uninstall hook runs against a real
+  temporary profile but is called directly, so no test proves that VS Code
+  invokes `vscode:uninstall`: that was observed once by hand (VS Code 1.142, a
+  CLI uninstall in an isolated profile, hook run at the second start; the UI
+  uninstall path was not measured, see `TRAPS.md` "Releases"). The smoke test
+  uses stand-in `claude.cmd` / `code.cmd` (`scripts\setup-smoke\`) with a
+  sandboxed `USERPROFILE` / `LOCALAPPDATA` / `APPDATA`: it proves what
+  `Setup.exe` asks of the CLIs, not what the real CLIs do with it.
 
 ### Fixture-design rules that follow from the above
 

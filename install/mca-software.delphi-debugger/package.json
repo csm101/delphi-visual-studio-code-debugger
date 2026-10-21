@@ -31,12 +31,16 @@
     "dap"
   ],
   "main": "./extension.js",
+  "scripts": {
+    "vscode:uninstall": "node ./uninstall.js"
+  },
   "activationEvents": [
     "onDebugResolve:delphi",
     "onDebugDynamicConfigurations:delphi",
     "onDebugResolve:delphi-win64",
     "onDebugDynamicConfigurations:delphi-win64",
-    "onView:delphiModules"
+    "onView:delphiModules",
+    "onStartupFinished"
   ],
   "contributes": {
     "commands": [

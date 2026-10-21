@@ -42,12 +42,17 @@ starts. A hand-written entry is one line — see
 server** whose tools let an agent set breakpoints, step, read locals and
 evaluate expressions in a live Delphi process — the debugger's own
 capabilities, driven by something other than a human. Agents hosted by VS Code
-(1.101 or later) see it as `delphi-debugger` with nothing to configure. For
-Claude Code, run **Delphi: Register MCP Server with Claude Code** once from the
-Command Palette: it registers, at user scope, a copy the extension keeps at
-`%LOCALAPPDATA%\DelphiWin64Debugger\` and refreshes on every update, so the
-registration survives updates. Claude Desktop, and machines without VS Code,
-take the setup zip from the
+(1.101 or later) see it as `delphi-debugger` with nothing to configure.
+**Claude Code** gets it too, without being asked: when the `claude` CLI is
+installed, the extension registers (user scope) a copy it keeps at
+`%LOCALAPPDATA%\DelphiWin64Debugger\`, the first time it starts after being
+installed. An update refreshes that copy, so the registration keeps working;
+uninstalling the extension removes both when VS Code deletes the extension
+from disk, at a restart after the uninstall — unless another editor of yours
+still has the extension. A registration you made on
+another executable — a development build — is never touched, and
+**Delphi: Register MCP Server with Claude Code** registers the copy again by
+hand. Claude Desktop, and machines without VS Code, take the setup zip from the
 [GitHub releases](https://github.com/csm101/delphi-visual-studio-code-debugger/releases).
 The extension and the agent are independent clients of one debugger.
 
