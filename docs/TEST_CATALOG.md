@@ -1806,10 +1806,10 @@ before a `PAGE_NOACCESS` page.
 - [x] **`read_memory` refusals** (`ReadMemory_InvalidArguments_Refused`): `count`
       0 and 1 048 577, unknown `format`, `codePage` with `utf8`, out-of-range and
       uninstalled code pages, `stopAtNull` with `hex`.
-- [x] **Schemas** (`ToolSchemas_LargeResultTools_DeclareMetaAndMaxStringLength`):
-      `_meta["anthropic/maxResultSizeChars"] = 500000` on `get_variable`,
-      `evaluate_expression`, `read_memory` only; `maxStringLength` on the two
-      single-value tools only.
+- [x] **Schemas** (`ToolSchemas_NoResultSizeMeta_MaxStringLengthOnSingleValueTools`):
+      no tool declares `_meta["anthropic/maxResultSizeChars"]`, so Claude Code
+      saves a large result to a file rather than putting it whole into the
+      model's context; `maxStringLength` on the two single-value tools only.
 
 ## Y. Release of synthetic-call results
 

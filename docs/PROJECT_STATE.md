@@ -216,8 +216,11 @@ Long strings and memory blocks over MCP (2026-10-31):
   surrogate pair, a UTF-8 sequence or a DBCS pair.
 - **`read_memory`**: `count` up to 1 048 576, partial reads (`partial`,
   `failedAt`), `format` `utf16`/`utf8`/`ansi` (+ `codePage`, `stopAtNull`);
-  `hex` output unchanged. The three tools declare
-  `_meta["anthropic/maxResultSizeChars"] = 500000` (Claude Code's maximum).
+  `hex` output unchanged. No tool declares
+  `_meta["anthropic/maxResultSizeChars"]` (0.8.0 did, on these three):
+  Claude Code then saves a large result to a file the model reads in pieces,
+  instead of putting up to 500 000 characters straight into its context
+  (`MCP_SERVER.md`, "Result size").
 - Defects fixed on the way: an AnsiString-family string over 4096 bytes
   rendered as `''`; a PAnsiChar/PWideChar longer than one 256-element chunk
   kept only its last chunk, carried no marker at the limit, and failed when the
@@ -225,7 +228,7 @@ Long strings and memory blocks over MCP (2026-10-31):
   marker compiled as `â€¦` (the unit has no BOM; now `#$2026`); the by-name
   `WideString` fallback read a BSTR with the UnicodeString rule.
 - Tests: `TStringReaderLimitTests` (fake memory), `McpE2ETests.LongStrings_*`,
-  `ReadMemory_*`, `ToolSchemas_LargeResultTools_*` on the new fixture
+  `ReadMemory_*`, `ToolSchemas_NoResultSizeMeta_*` on the new fixture
   `DebuggerTests\TestTarget\LongStringSample.dpr`. Contract in `MCP_SERVER.md`
   "Long strings and memory blocks".
 

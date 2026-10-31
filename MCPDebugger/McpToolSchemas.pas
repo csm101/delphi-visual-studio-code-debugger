@@ -99,15 +99,13 @@ begin
 end;
 
 const
-  // Claude Code saves a text tool result longer than 50,000 characters to a file
-  // and hands the model a path instead, unless the tool's tools/list entry
-  // declares a larger ceiling under this key; 500,000 is the most it accepts
+  // No tool declares _meta["anthropic/maxResultSizeChars"], deliberately. Claude
+  // Code uses that value IN PLACE OF its MAX_MCP_OUTPUT_TOKENS limit, so up to
+  // 500,000 characters would land whole in the model's context (well over
+  // 100,000 tokens, far more for read_memory's hex). Without it, a result over
+  // 50,000 characters or 25,000 tokens is saved to a file the model reads in
+  // pieces, which is what a long string or a large memory block should get
   // (https://code.claude.com/docs/en/mcp, "MCP output limits and warnings").
-  // A longer result is still saved to a file. Clients that do not know the key
-  // ignore it.
-  MAX_RESULT_SIZE_META_KEY = 'anthropic/maxResultSizeChars';
-  LARGE_RESULT_SIZE_CHARS  = 500000;
-
   MAX_STRING_LENGTH_DESC =
     'Longest string to return, in Delphi Length units: UTF-16 code units for string/' +
     'UnicodeString/WideString/PWideChar, bytes for AnsiString/UTF8String/RawByteString/' +
@@ -116,24 +114,13 @@ const
     'function returns. A string cut short ends in a marker such as "' + #$2026 + '(10000 chars total)". ' +
     'Above 4096 the length in the string header is believed only when the header is ' +
     'plausible and the memory is readable; otherwise the default applies and the marker ' +
-    'says "length not trusted". Results over 500000 characters are saved to a file by ' +
-    'Claude Code.';
+    'says "length not trusted".';
 
   // For the tools that return many values at once.
   LIST_STRING_LIMIT_NOTE =
     ' Strings in this result are cut at 4096 characters (marker "' + #$2026 + '(N chars total)"); ' +
     'read a longer one in full with get_variable or evaluate_expression on that field ' +
     'and maxStringLength.';
-
-// Declares that this tool may return up to LARGE_RESULT_SIZE_CHARS characters
-// before a client that honours the key spills the result to a file.
-function WithLargeResults(Tool: TJSONObject): TJSONObject;
-begin
-  var Meta := TJSONObject.Create;
-  Meta.AddPair(MAX_RESULT_SIZE_META_KEY, TJSONNumber.Create(LARGE_RESULT_SIZE_CHARS));
-  Tool.AddPair('_meta', Meta);
-  Result := Tool;
-end;
 
 function BuildToolsArray: TJSONArray;
 begin
@@ -529,7 +516,7 @@ begin
     LIST_STRING_LIMIT_NOTE,
     [Prop('handle', 'string', 'The opaque expansion handle of the variable to expand.', True)]));
 
-  Result.Add(WithLargeResults(MakeTool('get_variable',
+  Result.Add(MakeTool('get_variable',
     'Return a single named variable. Prefers a frame local (so a class/record/array ' +
     'result carries an expansion handle); otherwise evaluates the name (fields, globals, ' +
     'dotted paths). Pass maxStringLength to read a string longer than 4096 characters in full.',
@@ -538,9 +525,9 @@ begin
        'Stack frame to read in, as returned by get_call_stack (0 = innermost). Omit for the top frame.', False),
      Prop('threadId', 'integer',
        'OS thread id owning the frame (from get_threads). Omit for the stopped thread.', False),
-     Prop('maxStringLength', 'integer', MAX_STRING_LENGTH_DESC, False)])));
+     Prop('maxStringLength', 'integer', MAX_STRING_LENGTH_DESC, False)]));
 
-  Result.Add(WithLargeResults(MakeTool('evaluate_expression',
+  Result.Add(MakeTool('evaluate_expression',
     'Evaluate a Pascal expression in the context of a stack frame (locals, fields, ' +
     'globals, arithmetic, casts, method calls). Defaults to the top frame of the stopped ' +
     'thread; after a pause that is usually inside a system DLL where nothing resolves, so ' +
@@ -551,7 +538,7 @@ begin
        'Stack frame to evaluate in, as returned by get_call_stack (0 = innermost). Omit for the top frame.', False),
      Prop('threadId', 'integer',
        'OS thread id owning the frame (from get_threads). Omit for the stopped thread.', False),
-     Prop('maxStringLength', 'integer', MAX_STRING_LENGTH_DESC, False)])));
+     Prop('maxStringLength', 'integer', MAX_STRING_LENGTH_DESC, False)]));
 
   Result.Add(MakeTool('get_exception_details',
     'When stopped on an exception, return its class, message, description and stack.', []));
@@ -570,20 +557,19 @@ begin
     'Return debugger-generated output since the previous call — notably logpoint messages ' +
     '(incremental).', []));
 
-  Result.Add(WithLargeResults(MakeTool('read_memory',
+  Result.Add(MakeTool('read_memory',
     'Read a block of the debuggee''s memory. By default returns the bytes as hex plus ' +
     'little-endian integer interpretations, for inspecting raw structures (VMT slots, ' +
     'record fields) the evaluator does not surface. With format "utf16", "utf8" or "ansi" ' +
     'the block is returned as text instead (half the size of hex), e.g. a buffer whose ' +
     'address and length you know; the result then states bytesRead, bytesDecoded, chars ' +
     'and format. If the block runs into unreadable memory, the bytes read before it are ' +
-    'returned with partial:true and failedAt. Results over 500000 characters (hex of more ' +
-    'than ~250000 bytes) are saved to a file by Claude Code. The session must be stopped.',
+    'returned with partial:true and failedAt. The session must be stopped.',
     [Prop('address', 'string', 'Start address, decimal or 0x-hex (e.g. "0x239B7765CC0").', True),
      Prop('count', 'integer', 'Number of bytes to read (1..1048576).', True),
      Prop('format', 'string', '"hex" (default), "utf16", "utf8" or "ansi".'),
      Prop('codePage', 'integer', 'Code page for format "ansi" (e.g. 1252, 932). Default: the system ANSI code page, stated in the result.'),
-     Prop('stopAtNull', 'boolean', 'Text formats only: stop decoding at the first null character (a 2-byte zero for utf16). Default false.')])));
+     Prop('stopAtNull', 'boolean', 'Text formats only: stop decoding at the first null character (a 2-byte zero for utf16). Default false.')]));
 
   Result.Add(MakeTool('write_memory',
     'Write bytes into the debuggee''s memory at an address. Use with care — it mutates the ' +

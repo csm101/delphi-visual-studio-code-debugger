@@ -435,13 +435,15 @@ own header; `RawByteString` is raw bytes and is not trimmed).
   first null character and reports `stoppedAtNull`. `codePage` with a non-ansi
   format, `stopAtNull` with hex, or an uninstalled code page is a tool error.
 - **Result size.** Claude Code saves a text tool result over 50 000 characters
-  to a file and hands the model its path, unless the tool's `tools/list` entry
-  declares `_meta["anthropic/maxResultSizeChars"]`
-  (<https://code.claude.com/docs/en/mcp>, "MCP output limits and warnings").
-  `get_variable`, `evaluate_expression` and `read_memory` declare 500 000, the
-  most it accepts. A longer result — a string over ~500 000 characters, or hex
-  of more than ~250 000 bytes — is still saved to a file; that is expected, and
-  a text format halves what `read_memory` produces. Other clients ignore the key.
+  or 25 000 tokens to a file and hands the model its path, which the model then
+  reads in pieces (<https://code.claude.com/docs/en/mcp>, "MCP output limits and
+  warnings"). That is the intended behaviour for a long string or a large
+  memory block, so **no tool declares `_meta["anthropic/maxResultSizeChars"]`**:
+  a tool that does has that value used IN PLACE OF `MAX_MCP_OUTPUT_TOKENS`, and
+  up to 500 000 characters — well over 100 000 tokens, far more for hex — would
+  land whole in the model's context. (0.8.0 declared it on
+  `get_variable`, `evaluate_expression` and `read_memory`.) A text format still
+  halves what `read_memory` produces.
 
 No raw DAP identifiers cross the boundary: frames carry a semantic `index`,
 breakpoints a `file|line` id, variables a formatted value.

@@ -159,9 +159,9 @@ type
     // runs into a PAGE_NOACCESS page, and "hex" output unchanged for small reads.
     [Test] procedure ReadMemory_LargeCount_TextFormats_PartialRead;
     [Test] procedure ReadMemory_InvalidArguments_Refused;
-    // The single-value tools declare _meta["anthropic/maxResultSizeChars"]; the
-    // list tools neither declare it nor accept maxStringLength.
-    [Test] procedure ToolSchemas_LargeResultTools_DeclareMetaAndMaxStringLength;
+    // No tool declares _meta["anthropic/maxResultSizeChars"]; only the single-value
+    // tools accept maxStringLength.
+    [Test] procedure ToolSchemas_NoResultSizeMeta_MaxStringLengthOnSingleValueTools;
     // What a synthetic call returns is released when the debuggee next runs
     // (CallResultSample.dpr): the reference counts of a returned string, the
     // string inside a returned Variant and a returned interface rise while the
@@ -3783,7 +3783,7 @@ begin
   end;
 end;
 
-procedure TMcpE2ETests.ToolSchemas_LargeResultTools_DeclareMetaAndMaxStringLength;
+procedure TMcpE2ETests.ToolSchemas_NoResultSizeMeta_MaxStringLengthOnSingleValueTools;
 
   function FindTool(Tools: TJSONArray; const Name: string): TJSONObject;
   begin
@@ -3807,17 +3807,18 @@ begin
     var Resp := C.Call('tools/list', nil);
     try
       var Tools := (Resp.GetValue('result') as TJSONObject).GetValue('tools') as TJSONArray;
-      for var Name in ['get_variable', 'evaluate_expression', 'read_memory'] do begin
-        var Meta := FindTool(Tools, Name).GetValue('_meta') as TJSONObject;
-        Assert.IsNotNull(Meta, Name + ' declares no _meta');
-        Assert.AreEqual(500000, Meta.GetValue<Integer>('anthropic/maxResultSizeChars', 0), Name);
+      // Declaring a result size would make Claude Code put up to 500 000
+      // characters straight into the model's context instead of saving a large
+      // result to a file. No tool may do it.
+      for var T in Tools do begin
+        var Meta := (T as TJSONObject).GetValue('_meta') as TJSONObject;
+        Assert.IsTrue((Meta = nil) or (Meta.GetValue('anthropic/maxResultSizeChars') = nil),
+          (T as TJSONObject).GetValue<string>('name', '') + ' declares a result size: ' + T.ToJSON);
       end;
       for var Name in ['get_variable', 'evaluate_expression'] do
         Assert.IsTrue(HasProperty(FindTool(Tools, Name), 'maxStringLength'), Name + ' lacks maxStringLength');
-      for var Name in ['get_locals', 'expand_variable', 'get_compact_debug_snapshot'] do begin
-        Assert.IsNull(FindTool(Tools, Name).GetValue('_meta'), Name + ' should keep the default result size');
+      for var Name in ['get_locals', 'expand_variable', 'get_compact_debug_snapshot'] do
         Assert.IsFalse(HasProperty(FindTool(Tools, Name), 'maxStringLength'), Name + ' must not take maxStringLength');
-      end;
       for var Prop in ['format', 'codePage', 'stopAtNull'] do
         Assert.IsTrue(HasProperty(FindTool(Tools, 'read_memory'), Prop), 'read_memory lacks ' + Prop);
     finally
