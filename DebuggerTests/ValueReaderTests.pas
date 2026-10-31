@@ -214,6 +214,7 @@ type
                 out Slot: Integer; out RefusalReason: string): Boolean;
     function  AllocateRemoteString(const Text, TypeHint: string; out NewPtr: UInt64): Boolean;
     function  SetStringVariable(TargetAddr: UInt64; const Text, TypeHint: string): Boolean;
+    procedure RetainCallResult(CalleeVA: UInt64; Kind: TCallResultKind; SlotVA: UInt64);
     function  TryResolveSymbolVA(const Name: string; out VA: UInt64): Boolean;
     function  AddressIsExecutable(VA: UInt64): Boolean;
     function  RemoteCallInFlight: Boolean;
@@ -409,6 +410,8 @@ function  TFakeMemTarget.HardwareWatchpointHitCount: Integer; begin Result := 0;
 function  TFakeMemTarget.LastHardwareWatchpointHit: TWatchpointHit; begin Result := Default(TWatchpointHit); Result.Slot := -1; end;
 function  TFakeMemTarget.AllocateRemoteString(const Text, TypeHint: string; out NewPtr: UInt64): Boolean; begin NewPtr := 0; Result := False; end;
 function  TFakeMemTarget.SetStringVariable(TargetAddr: UInt64; const Text, TypeHint: string): Boolean; begin Result := False; end;
+// No process, no synthetic calls, nothing to release.
+procedure TFakeMemTarget.RetainCallResult(CalleeVA: UInt64; Kind: TCallResultKind; SlotVA: UInt64); begin end;
 function  TFakeMemTarget.TryResolveSymbolVA(const Name: string; out VA: UInt64): Boolean; begin VA := 0; Result := False; end;
 function  TFakeMemTarget.AddressIsExecutable(VA: UInt64): Boolean; begin Result := False; end;
 function  TFakeMemTarget.RemoteCallInFlight: Boolean; begin Result := False; end;

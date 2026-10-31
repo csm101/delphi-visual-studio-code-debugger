@@ -507,6 +507,18 @@ absurdly.
   that names a routine.
 - The same hazard applies to every other by-name RTL lookup in the engine
   (`@UStrAsg` and friends in `SetStringVariable`). Not yet re-measured there.
+- **For a finalizer the wrong copy is not a wrong answer, it is heap
+  corruption.** Releasing a synthetic call's result (`@UStrClr`, `@IntfClear`,
+  ...) through an RTL whose memory manager did not allocate it frees the block
+  into a foreign heap. `TryResolveFinalizer` therefore resolves in the CALLEE's
+  module first. Its last resort -- any other module's export -- is right for a
+  module built with runtime packages and wrong for a DLL that links its own RTL
+  but whose debug information lacks the System symbols; that case has not been
+  met, and would show as a crash inside `FreeMem` after a resume.
+- **Never release a synthetic call's result whose type is a guess.** `ExprEval`
+  falls back to "returns a string" when the first argument is one; the same
+  slot then holds whatever the callee really returned, and `_UStrClr` on an
+  interface or a dynamic array decrements a word that is not a reference count.
 
 ## Per-thread stepping
 

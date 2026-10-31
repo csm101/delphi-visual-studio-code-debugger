@@ -162,6 +162,14 @@ type
     // The single-value tools declare _meta["anthropic/maxResultSizeChars"]; the
     // list tools neither declare it nor accept maxStringLength.
     [Test] procedure ToolSchemas_LargeResultTools_DeclareMetaAndMaxStringLength;
+    // What a synthetic call returns is released when the debuggee next runs
+    // (CallResultSample.dpr): the reference counts of a returned string, the
+    // string inside a returned Variant and a returned interface rise while the
+    // stop lasts and are back at their baseline after a continue; a string the
+    // debugger built for an expression is unmapped by then. RED before: the
+    // counts only ever rose.
+    [Test] procedure CallResults_ReleasedWhenTheDebuggeeResumes;
+    [Test] procedure CallResults_Win32_ReleasedWhenTheDebuggeeResumes;
   end;
 
 implementation
@@ -3377,34 +3385,49 @@ begin
   Result := StringOfChar(WideChar('x'), 4095) + StringOfChar(WideChar($E8), ExtraChars);
 end;
 
-procedure OpenLongStringSample(C: TMcpTestClient; const TargetDir: string);
+// Launches TargetDir\<Bitness>\Debug\<SourceName as .exe>, sets a breakpoint on
+// every marker and runs to the first one.
+procedure OpenSampleAt(C: TMcpTestClient; const TargetDir, Bitness, SourceName: string;
+  const Markers: array of string);
+
+  function MarkerLine(Lines: TStringList; const Marker: string): Integer;
+  begin
+    for var I := 0 to Lines.Count - 1 do
+      if Lines[I].Contains('{BP:' + Marker + '}') then
+        Exit(I + 1);
+    Assert.Fail('marker ' + Marker + ' not found in ' + SourceName);
+    Result := 0;
+  end;
+
 begin
   var Lines := TStringList.Create;
   try
-    Lines.LoadFromFile(TargetDir + LONGSTR_SOURCE);
-    var Line := 0;
-    for var I := 0 to Lines.Count - 1 do
-      if Lines[I].Contains('{BP:' + LONGSTR_MARKER + '}') then
-        Line := I + 1;
-    Assert.IsTrue(Line > 0, 'marker ' + LONGSTR_MARKER + ' not found in ' + LONGSTR_SOURCE);
+    Lines.LoadFromFile(TargetDir + SourceName);
     var LaunchArgs := TJSONObject.Create;
-    LaunchArgs.AddPair('program', TargetDir + 'Win64\Debug\LongStringSample.exe');
+    LaunchArgs.AddPair('program', TargetDir + Bitness + '\Debug\' + ChangeFileExt(SourceName, '.exe'));
     LaunchArgs.AddPair('sourceRoot', TargetDir);
     C.CallTool('launch_debuggee', LaunchArgs).Free;
-    var BpArgs := TJSONObject.Create;
-    BpArgs.AddPair('sourceFile', LONGSTR_SOURCE);
-    BpArgs.AddPair('line', TJSONNumber.Create(Line));
-    C.CallTool('set_breakpoint', BpArgs).Free;
+    for var Marker in Markers do begin
+      var BpArgs := TJSONObject.Create;
+      BpArgs.AddPair('sourceFile', SourceName);
+      BpArgs.AddPair('line', TJSONNumber.Create(MarkerLine(Lines, Marker)));
+      C.CallTool('set_breakpoint', BpArgs).Free;
+    end;
     var Snap := C.CallTool('continue_and_wait', nil);
     try
       Assert.AreEqual('stopped', TJSONObject(Snap).GetValue<string>('state', ''),
-        'LongStringSample did not stop at ' + LONGSTR_MARKER + ': ' + Snap.ToJSON);
+        Format('%s (%s) did not stop at %s: %s', [SourceName, Bitness, Markers[0], Snap.ToJSON]));
     finally
       Snap.Free;
     end;
   finally
     Lines.Free;
   end;
+end;
+
+procedure OpenLongStringSample(C: TMcpTestClient; const TargetDir: string);
+begin
+  OpenSampleAt(C, TargetDir, 'Win64', LONGSTR_SOURCE, [LONGSTR_MARKER]);
 end;
 
 // get_variable (Subject = a name) or evaluate_expression (Subject = an
@@ -3803,6 +3826,92 @@ begin
   finally
     C.Free;
   end;
+end;
+
+{ Release of synthetic-call results: CallResultSample.dpr }
+
+const
+  CALLRES_SOURCE = 'CallResultSample.dpr';
+
+// The Integer an expression evaluates to.
+function EvaluatedInteger(C: TMcpTestClient; const Expression: string): Int64;
+begin
+  var Typed := SingleValue(C, 'evaluate_expression', Expression);
+  // '1  (0x1)': the decimal rendering comes first.
+  var Text := Typed.Substring(Typed.IndexOf('>') + 1).Trim.Split([' '])[0];
+  Assert.IsTrue(TryStrToInt64(Text, Result),
+    Format('%s did not evaluate to an integer: %s', [Expression, Typed]));
+end;
+
+procedure RunCallResultsReleasedWhenTheDebuggeeResumes(const McpExePath, TargetDir, Bitness: string);
+begin
+  var C := TMcpTestClient.Start(McpExePath);
+  try
+    C.Call('initialize', nil).Free;
+    OpenSampleAt(C, TargetDir, Bitness, CALLRES_SOURCE, ['CALLRES_FIRST', 'CALLRES_SECOND']);
+    var Context := Bitness + ': ';
+
+    Assert.AreEqual<Int64>(1, EvaluatedInteger(C, 'TextRefCount()'), Context + 'string baseline');
+    Assert.AreEqual<Int64>(2, EvaluatedInteger(C, 'VariantTextRefCount()'), Context + 'Variant string baseline');
+    Assert.AreEqual<Int64>(1, EvaluatedInteger(C, 'IntfRefCount()'), Context + 'interface baseline');
+
+    for var Round := 1 to 3 do
+      Assert.IsTrue(SingleValue(C, 'evaluate_expression', 'SharedText()').Contains('tttt'),
+        Context + 'SharedText() did not return the shared string');
+    var IntfShown := '';
+    for var Round := 1 to 2 do begin
+      SingleValue(C, 'evaluate_expression', 'SharedVariant()');
+      IntfShown := SingleValue(C, 'evaluate_expression', 'SharedIntf()');
+    end;
+    var LiteralAddress := '';
+    var Literal := SingleValueObject(C, 'evaluate_expression', '''built-by-the-debugger''');
+    try
+      LiteralAddress := Literal.GetValue<string>('address', '');
+    finally
+      Literal.Free;
+    end;
+    Assert.IsTrue(LiteralAddress <> '', Context + 'a string literal carries no address');
+
+    // Held while the stop lasts: the values are still displayed and expandable.
+    // This is also what proves the counters see the calls at all.
+    Assert.IsTrue(EvaluatedInteger(C, 'TextRefCount()') > 1, Context + 'the returned string holds no reference');
+    Assert.IsTrue(EvaluatedInteger(C, 'VariantTextRefCount()') > 2, Context + 'the returned Variant holds no reference');
+    Assert.IsTrue(EvaluatedInteger(C, 'IntfRefCount()') > 1, Context + 'the returned interface holds no reference');
+
+    var Snap := C.CallTool('continue_and_wait', nil);
+    try
+      Assert.AreEqual('stopped', TJSONObject(Snap).GetValue<string>('state', ''),
+        Context + 'did not stop at CALLRES_SECOND: ' + Snap.ToJSON);
+    finally
+      Snap.Free;
+    end;
+
+    Assert.AreEqual<Int64>(1, EvaluatedInteger(C, 'TextRefCount()'), Context + 'returned strings were not released');
+    Assert.AreEqual<Int64>(2, EvaluatedInteger(C, 'VariantTextRefCount()'), Context + 'returned Variants were not released');
+    Assert.AreEqual<Int64>(1, EvaluatedInteger(C, 'IntfRefCount()'),
+      Context + 'returned interfaces were not released; SharedIntf() showed ' + IntfShown);
+    var Freed := McpReadMemory(C, LiteralAddress, 4, []);
+    try
+      Assert.IsTrue(Freed is TJSONString,
+        Context + 'the string the debugger built is still mapped after the resume: ' + Freed.ToJSON);
+    finally
+      Freed.Free;
+    end;
+
+    C.CallTool('terminate_debuggee', nil).Free;
+  finally
+    C.Free;
+  end;
+end;
+
+procedure TMcpE2ETests.CallResults_ReleasedWhenTheDebuggeeResumes;
+begin
+  RunCallResultsReleasedWhenTheDebuggeeResumes(McpExe, TargetDir, 'Win64');
+end;
+
+procedure TMcpE2ETests.CallResults_Win32_ReleasedWhenTheDebuggeeResumes;
+begin
+  RunCallResultsReleasedWhenTheDebuggeeResumes(McpExe, TargetDir, 'Win32');
 end;
 
 initialization

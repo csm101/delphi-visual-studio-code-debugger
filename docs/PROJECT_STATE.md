@@ -187,6 +187,21 @@ module you are standing in carries debug information at all.
 
 ## Implemented features
 
+Synthetic-call results are released (2026-10-31):
+- **What an evaluation's function call returns is released when the debuggee
+  next runs**: strings, BSTRs, interfaces and Variants, through the debuggee's
+  own RTL finalizer in the callee's module (`RetainCallResult`,
+  `ReleaseSyntheticCallLeftovers`). Before, every evaluation leaked its result
+  for the life of the process, and an interface result kept its object alive.
+  Also released before a breakpoint auto-continues (false condition, logpoint)
+  and before a clean detach. Strings the debugger builds (literal arguments,
+  concatenations) share 64 KB regions freed at the same moment, instead of one
+  64 KB reservation each, never freed. Dynamic arrays and managed records are
+  still not released (`KNOWN_UNKNOWNS.md`). Test:
+  `McpE2ETests.CallResults_*ReleasedWhenTheDebuggeeResumes` (x64 + Win32) on
+  `DebuggerTests\TestTarget\CallResultSample.dpr`; mechanism in
+  `DAP_DEBUGGER_ARCHITECTURE.md` "What a synthetic call leaves behind".
+
 Long strings and memory blocks over MCP (2026-10-31):
 - **`maxStringLength` on `get_variable` / `evaluate_expression`** (default 4096,
   ceiling 1 048 576, out of range = tool error) raises the single truncation

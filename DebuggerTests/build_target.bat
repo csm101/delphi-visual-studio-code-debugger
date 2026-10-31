@@ -69,6 +69,13 @@ dcc64 -$O- -V -VN -VR -GD -E.\Win64\Debug -NU.\Win64\Debug LongStringSample.dpr 
 set LONGSTR64_ERR=%errorlevel%
 dcc32 -$O- -V -VN -VR -GD -E.\Win32\Debug -NU.\Win32\Debug LongStringSample.dpr 2>&1
 set LONGSTR32_ERR=%errorlevel%
+rem Call-result fixture: functions returning a string, a Variant and an
+rem interface that share a reference with a global, to prove the debugger
+rem releases what its synthetic calls return. Separate target, same reason.
+dcc64 -$O- -V -VN -VR -GD -E.\Win64\Debug -NU.\Win64\Debug CallResultSample.dpr 2>&1
+set CALLRES64_ERR=%errorlevel%
+dcc32 -$O- -V -VN -VR -GD -E.\Win32\Debug -NU.\Win32\Debug CallResultSample.dpr 2>&1
+set CALLRES32_ERR=%errorlevel%
 rem External-TDS target (-VT): debug info in a standalone .tds, no embedded .debug.
 dcc64 -$O- -VT -VN -E.\Win64\Debug -NU.\Win64\Debug TdsSample.dpr 2>&1
 set TDS_ERR=%errorlevel%
@@ -104,4 +111,6 @@ if not "%INSTR64_ERR%"=="0" exit /b %INSTR64_ERR%
 if not "%INSTR32_ERR%"=="0" exit /b %INSTR32_ERR%
 if not "%LONGSTR64_ERR%"=="0" exit /b %LONGSTR64_ERR%
 if not "%LONGSTR32_ERR%"=="0" exit /b %LONGSTR32_ERR%
+if not "%CALLRES64_ERR%"=="0" exit /b %CALLRES64_ERR%
+if not "%CALLRES32_ERR%"=="0" exit /b %CALLRES32_ERR%
 exit /b %TT32_ERR%

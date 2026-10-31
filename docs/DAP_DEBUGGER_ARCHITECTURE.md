@@ -3122,6 +3122,51 @@ This path is used today for `@UStrAsg`/`@LStrAsg`. Any future feature
 that wants to run debuggee code (remote `Format`, custom getters, etc.)
 should reuse it.
 
+### What a synthetic call leaves behind, and when it is released
+
+A function returning a managed type writes its result through a hidden pointer
+to a slot the debugger provides (`GetRemoteScratchSlot`). What lands there is a
+reference the debuggee's RTL now owes a release for: a string with its count
+raised, a new BSTR, an interface after `_AddRef`, a Variant holding any of
+these. Real code drops it when the caller's temporary goes out of scope. The
+debugger used to read it and then zero the slot for the next call, so every
+evaluation leaked the value into the debuggee for the life of the process -- and
+an interface result kept its object alive, which changes what the program does.
+
+- `IDebugTarget.RetainCallResult(CalleeVA, Kind, SlotVA)` records the value
+  (a pointer, or a whole `TVarData`, copied out at once because the slot is
+  reused). Called by `ExprEval` from `ApplyMethodCall` and `InvokeGetter`, and
+  only for a type known for certain: a bound return type, or a property's RTTI
+  kind. The unbound fallback that GUESSES a string from the first argument is
+  never released, because finalizing a value with the wrong routine corrupts the
+  debuggee's heap. TD32 names a returned interface `^IFoo`; that one is
+  recognised by the value instead -- the pointer written into the slot decodes
+  through an IMT adjustor thunk (`TDelphiRtti.ObjectFromInterfaceThunk`).
+- `ReleaseSyntheticCallLeftovers` runs just before the debuggee runs again: at
+  the head of every resuming command in `ProcessCommandQueue`, before the
+  auto-continue of a breakpoint whose condition or log message was false/only
+  logged, and before a clean detach. Not earlier: until the stop ends the values
+  are displayed and expanded. Each value is copied into the scratch slot and
+  handed to the RTL finalizer for its kind (`@UStrClr`, `@LStrClr`, `@WStrClr`,
+  `@IntfClear`, `System.Variants.@VarClr`) through `RunMethodCall`. At a
+  first-chance exception stop no call can be made, so the release waits for the
+  next resume that allows one.
+- **Which RTL copy** (`TryResolveFinalizer`): the one that allocated the value,
+  i.e. the callee's module -- a symbol there, else that module's export
+  directory, else any other module's exports (the packaged case: `rtl<ver>.bpl`
+  carries no debug information and exports the routines under the names in
+  `EXPORTS_X64` / `EXPORTS_X86`, read from the package with `tdump -ee -m`).
+  Cached per module and kind.
+- The strings the debugger builds itself (`AllocateRemoteString`: literal
+  arguments, concatenations) are carved out of 64 KB regions and freed at the
+  same moment. One `VirtualAllocEx` per string used to reserve 64 KB of address
+  space each, for ever. Freeing them at resume matches what Delphi promises a
+  callee about a string argument: with refCnt -1, every assignment that keeps one
+  (`_UStrAsg`, `_LStrAsg`, `_WStrAsg`; `setVariable` goes through them) copies it.
+- Not released: dynamic arrays and records with managed fields. Their finalizers
+  (`_DynArrayClear`, `_FinalizeRecord`) need the type's `TypeInfo`, which the
+  call site does not have (`KNOWN_UNKNOWNS.md`).
+
 ### Cancellation + watchdog (a hung call must never freeze the adapter)
 
 The injected call runs on the debuggee's stopped THREAD, driven by the single

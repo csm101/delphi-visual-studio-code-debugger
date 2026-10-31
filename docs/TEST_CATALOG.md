@@ -1811,6 +1811,26 @@ before a `PAGE_NOACCESS` page.
       `evaluate_expression`, `read_memory` only; `maxStringLength` on the two
       single-value tools only.
 
+## Y. Release of synthetic-call results
+
+Fixture `DebuggerTests\TestTarget\CallResultSample.dpr` (Win64 and Win32): each
+`Shared*` function returns a value that shares a reference with a global, and
+`TextRefCount` / `VariantTextRefCount` / `IntfRefCount` (plain Integers, which
+leave nothing behind) let the program itself report the counts. Mechanism in
+`DAP_DEBUGGER_ARCHITECTURE.md`, "What a synthetic call leaves behind".
+
+- [x] **Released when the debuggee resumes, held until then**
+      (`McpE2ETests.CallResults_ReleasedWhenTheDebuggeeResumes`,
+      `CallResults_Win32_ReleasedWhenTheDebuggeeResumes`): after three
+      `SharedText()`, two `SharedVariant()` and two `SharedIntf()` evaluations
+      the counts are above their baseline while stopped (the values are still
+      shown and expandable) and back at 1 / 2 / 1 after `continue_and_wait`; the
+      region holding a string literal the debugger built for an expression is
+      unmapped by then. RED with the release disabled: the string count stayed
+      at 4.
+- [ ] Dynamic arrays and records with managed fields are not released
+      (`KNOWN_UNKNOWNS.md`).
+
 ## What the suite does NOT prove (2026-08-08)
 
 Coverage-honesty notes. Each records a place where a green run is weaker evidence

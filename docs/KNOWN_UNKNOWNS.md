@@ -5,6 +5,25 @@ or condition the work. Move resolved items out of this file into
 whichever document now holds the answer (`RSM_*`, `DAP_DEBUGGER_*`,
 `PROJECT_STATE.md`) — do not leave them here as historical record.
 
+## Where does a call site find the TypeInfo of a returned dynamic array or managed record?
+
+A synthetic call that returns a dynamic array, or a record with managed fields,
+still leaks its result into the debuggee: strings, Variants and interfaces are
+released when the debuggee resumes (`DAP_DEBUGGER_ARCHITECTURE.md`, "What a
+synthetic call leaves behind"), these two are not. Their RTL finalizers,
+`_DynArrayClear(var A; TypeInfo)` and `_FinalizeRecord(P; TypeInfo)`, need the
+`PTypeInfo` of the exact type, and the evaluator has a type NAME (often
+`^Element` for an array) and a TD32 type id, not a typeinfo address. A
+property getter carries one (`TRttiPropInfo.PropTypeInfoAddr`); a plain method
+or function call does not.
+
+**What would settle it:** whether TD32 or the RSM records the address of a
+type's compiler-generated typeinfo (a `TypeInfo(T)` symbol per type), or whether
+it can be found through the RTTI of the declaring class. With it, both kinds
+join `TCallResultKind`. Without it, a dynamic array of UNMANAGED elements could
+still be released by hand (refcount at `-2 * PointerSize`, `FreeMem` of the
+block when it reaches zero); elements that are themselves managed cannot.
+
 ## Is TD32 tag `$0036` really `RawByteString`, or the whole AnsiString family?
 
 `TD32FileReader.pas` names tag `$0036` `RawByteString`. Its own comment says the

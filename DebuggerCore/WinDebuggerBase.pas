@@ -79,6 +79,15 @@ type
     OldValue:    UInt64;
   end;
 
+  // One managed value a synthetic call returned, awaiting its release (see
+  // IDebugTarget.RetainCallResult). Bytes is the slot's content at the time of
+  // the call: a pointer, or a whole TVarData.
+  TRetainedCallResult = record
+    Kind:     TCallResultKind;
+    CalleeVA: UInt64;
+    Bytes:    TBytes;
+  end;
+
   TWinDebugger = class(TInterfacedObject, IDebugTarget)
   private
     FProcess:      THandle;
@@ -265,6 +274,20 @@ type
     // Allocated lazily; zeroed on each use. One page (4 KB) is enough for
     // every supported return type.
     FRemoteScratch:   UInt64;
+    // Managed values synthetic calls returned, released just before the
+    // debuggee next runs (ReleaseSyntheticCallLeftovers).
+    FCallResults:     TList<TRetainedCallResult>;
+    // The strings the debugger itself builds in the debuggee
+    // (AllocateRemoteString: literal arguments, concatenations) are carved out
+    // of these regions and freed at the same moment. One VirtualAllocEx per
+    // string used to cost 64 KB of address space each, for the life of the
+    // process.
+    FStringArenas:    TList<UInt64>;
+    FArenaCursor:     UInt64;
+    FArenaEnd:        UInt64;
+    // Finalizer VA per module base + routine, so a burst of releases resolves
+    // each routine once.
+    FFinalizerCache:  TDictionary<string, UInt64>;
     // Hardware watchpoints. FWatchSlots is the allocator's own state: which
     // slot holds which address, for whom -- thread-independent, because DR0..
     // DR3 must be replicated onto every thread to mean anything (see
@@ -631,6 +654,18 @@ type
     function  RaiseSiteLocation(out UnitName: string; out Line: Integer): Boolean;
     function  FormatCallStackText: string;
     procedure ProcessCommandQueue;
+    // Synthetic-call leftovers: the managed results RetainCallResult recorded
+    // and the strings AllocateRemoteString built, all released together just
+    // before the debuggee runs again (ReleaseSyntheticCallLeftovers), or simply
+    // forgotten when the process is gone (DiscardSyntheticCallLeftovers).
+    function  ModuleBaseContaining(VA: UInt64): UInt64;
+    function  TryResolveFinalizer(Kind: TCallResultKind; CalleeVA: UInt64;
+                out FnVA: UInt64): Boolean;
+    procedure FinalizeCallResult(const Item: TRetainedCallResult);
+    function  AllocateFromStringArena(Size: NativeUInt): UInt64;
+    procedure FreeStringArenas;
+    procedure ReleaseSyntheticCallLeftovers;
+    procedure DiscardSyntheticCallLeftovers;
     procedure DrainBreakpointCommands;
     procedure DoSetBreakpoints(const Spec: TBpSpec);
     // Address-breakpoint counterparts of ClearBreakpointsByFile/DoSetBreakpoints.
@@ -802,6 +837,7 @@ type
     // marshalling string literals as arguments to a method call.
     function  AllocateRemoteString(const Text, TypeHint: string;
                 out Ptr: UInt64): Boolean;
+    procedure RetainCallResult(CalleeVA: UInt64; Kind: TCallResultKind; SlotVA: UInt64);
     // Generic method-call invoker. Callers supply POSITIONAL arguments; this
     // x64 implementation dispatches them to RCX/RDX/R8/R9 (or XMM0..3 for
     // floats, by position) and to the stack for args 5+, then captures RAX and
@@ -1150,6 +1186,9 @@ begin
   FDllSizes      := TDictionary<string, UInt64>.Create;
   FGlobalMissCache := TDictionary<string, UInt64>.Create;
   FExportIndexes := TDictionary<UInt64, TExportSymbolIndex>.Create;
+  FCallResults   := TList<TRetainedCallResult>.Create;
+  FStringArenas  := TList<UInt64>.Create;
+  FFinalizerCache := TDictionary<string, UInt64>.Create;
   InitializeCriticalSection(FQueueLock);
   FFirstBreak             := False;
   FRunning                := False;
@@ -1182,6 +1221,9 @@ begin
   FDllSizes.Free;
   FGlobalMissCache.Free;
   FExportIndexes.Free;
+  FCallResults.Free;
+  FStringArenas.Free;
+  FFinalizerCache.Free;
   DeleteCriticalSection(FQueueLock);
   inherited;
 end;
@@ -4508,6 +4550,10 @@ begin
 end;
 
 procedure TWinDebugger.ProcessCommandQueue;
+const
+  // The commands that end a stop: the debuggee runs again after each.
+  RESUMING_COMMANDS = [ckContinue, ckStepInto, ckStepOver, ckStepOut,
+    ckStepInstruction, ckStepToHandler];
 var
   Cmd: TCommand;
 begin
@@ -4520,6 +4566,11 @@ begin
     finally
       LeaveCriticalSection(FQueueLock);
     end;
+
+    // Released while the stop still holds, so the release calls can be made;
+    // the values were displayed and expanded until now.
+    if (Cmd.Kind in RESUMING_COMMANDS) and FIsStopped then
+      ReleaseSyntheticCallLeftovers;
 
     case Cmd.Kind of
       ckSetBreakpoints:
@@ -4965,6 +5016,7 @@ begin
   FStepFrozenTids.Clear;
   FStepFreezeActive := False;
   FStepTid          := 0;
+  DiscardSyntheticCallLeftovers;
   ContinueDebugEvent(Ev.dwProcessId, Ev.dwThreadId, DBG_CONTINUE);
   if Assigned(FOnExited) then
     FOnExited(Ev.ExitProcess.dwExitCode);
@@ -5452,6 +5504,10 @@ begin
            not StepTargetLanded then
           ShouldStop := FOnBpHit(BP);
         if not ShouldStop then begin
+          // A condition or log message that called a function left its result
+          // behind exactly like an evaluation at a real stop, and this hit
+          // resumes without passing through the command queue.
+          ReleaseSyntheticCallLeftovers;
           ContinueDebugEvent(Ev.dwProcessId, Ev.dwThreadId, DBG_CONTINUE);
           Exit;
         end;
@@ -6727,18 +6783,17 @@ begin
   if TypeHint = 'WideString' then begin
     var WideBytes := Length(Text) * 2;
     var BstrSize: NativeUInt := 4 + NativeUInt(WideBytes) + 2;  // len + data + #0#0
-    var BstrBase := VirtualAllocEx(FProcess, nil, BstrSize,
-                      MEM_COMMIT or MEM_RESERVE, PAGE_READWRITE);
-    if BstrBase = nil then
+    var BstrBase := AllocateFromStringArena(BstrSize);
+    if BstrBase = 0 then
       Exit;
     var BstrBlock: TBytes;
     SetLength(BstrBlock, BstrSize);
     PInteger(@BstrBlock[0])^ := WideBytes;
     if WideBytes > 0 then
       Move(PChar(Text)^, BstrBlock[4], WideBytes);
-    if not WriteMemoryAt(UInt64(BstrBase), @BstrBlock[0], BstrSize) then
+    if not WriteMemoryAt(BstrBase, @BstrBlock[0], BstrSize) then
       Exit;
-    Ptr := UInt64(BstrBase) + 4;
+    Ptr := BstrBase + 4;
     Exit(True);
   end;
 
@@ -6763,9 +6818,8 @@ begin
   end;
 
   var AllocSize: NativeUInt := HEADER_SIZE + UInt64(CharCount + 1) * ElemSize;
-  var Base := VirtualAllocEx(FProcess, nil, AllocSize, MEM_COMMIT or MEM_RESERVE,
-    PAGE_READWRITE);
-  if Base = nil then
+  var Base := AllocateFromStringArena(AllocSize);
+  if Base = 0 then
     Exit;
 
   var Block: TBytes;
@@ -6777,10 +6831,218 @@ begin
   if CharCount > 0 then
     Move(Bytes[0], Block[HEADER_SIZE], Length(Bytes));
 
-  if not WriteMemoryAt(UInt64(Base), @Block[0], AllocSize) then
+  if not WriteMemoryAt(Base, @Block[0], AllocSize) then
     Exit;
-  Ptr    := UInt64(Base) + HEADER_SIZE;
+  Ptr    := Base + HEADER_SIZE;
   Result := True;
+end;
+
+// The strings AllocateRemoteString builds live until the debuggee next runs,
+// not for the life of the process: their region is freed by
+// ReleaseSyntheticCallLeftovers. That is what Delphi itself promises a callee
+// about a string argument -- RefCnt -1 makes every assignment that keeps one
+// (_UStrAsg, _LStrAsg, _WStrAsg) take a copy, and setVariable goes through
+// exactly those helpers.
+function TWinDebugger.AllocateFromStringArena(Size: NativeUInt): UInt64;
+const
+  // What one VirtualAllocEx reserves anyway: the allocation granularity.
+  REGION_SIZE = 64 * 1024;
+  ALIGNMENT   = 16;
+begin
+  Result := 0;
+  if FProcess = 0 then
+    Exit;
+  var Aligned := (UInt64(Size) + ALIGNMENT - 1) and not UInt64(ALIGNMENT - 1);
+  if (FArenaCursor = 0) or (FArenaCursor + Aligned > FArenaEnd) then begin
+    var RegionSize := (Aligned + REGION_SIZE - 1) div REGION_SIZE * REGION_SIZE;
+    var Region := VirtualAllocEx(FProcess, nil, RegionSize, MEM_COMMIT or MEM_RESERVE,
+      PAGE_READWRITE);
+    if Region = nil then
+      Exit;
+    FStringArenas.Add(UInt64(Region));
+    FArenaCursor := UInt64(Region);
+    FArenaEnd    := FArenaCursor + RegionSize;
+  end;
+  Result := FArenaCursor;
+  Inc(FArenaCursor, Aligned);
+end;
+
+procedure TWinDebugger.FreeStringArenas;
+begin
+  for var Region in FStringArenas do
+    VirtualFreeEx(FProcess, Pointer(Region), 0, MEM_RELEASE);
+  FStringArenas.Clear;
+  FArenaCursor := 0;
+  FArenaEnd    := 0;
+end;
+
+procedure TWinDebugger.RetainCallResult(CalleeVA: UInt64; Kind: TCallResultKind;
+  SlotVA: UInt64);
+
+  // A nil string/interface, or an unassigned (varEmpty) Variant: nothing is
+  // owed.
+  function HoldsNothing(const Bytes: TBytes): Boolean;
+  begin
+    var Significant := Length(Bytes);
+    if Kind = crkVariant then
+      Significant := SizeOf(Word);   // VType
+    for var I := 0 to Significant - 1 do
+      if Bytes[I] <> 0 then
+        Exit(False);
+    Result := True;
+  end;
+
+begin
+  var Item := Default(TRetainedCallResult);
+  Item.Kind     := Kind;
+  Item.CalleeVA := CalleeVA;
+  // SizeOf(TVarData) in the TARGET: VType + 3 reserved words, then two
+  // pointer-sized words (the VRecord/RecInfo pair is the widest member).
+  var Size := TargetLayout.PointerSize;
+  if Kind = crkVariant then
+    Size := 8 + 2 * TargetLayout.PointerSize;
+  SetLength(Item.Bytes, Size);
+  if not ReadProcessMemoryAt(SlotVA, @Item.Bytes[0], Size) then
+    Exit;
+  if HoldsNothing(Item.Bytes) then
+    Exit;
+  FCallResults.Add(Item);
+end;
+
+// Base of the loaded module that contains VA, from the module list built out of
+// the debug events (see AddressInLoadedModule for why not dbghelp first).
+function TWinDebugger.ModuleBaseContaining(VA: UInt64): UInt64;
+begin
+  if (FImageBase <> 0) and (VA >= FImageBase) and (VA < FImageBase + FImageSize) then
+    Exit(FImageBase);
+  for var KV in FDllBases do begin
+    var Size: UInt64 := 0;
+    if FDllSizes.TryGetValue(KV.Key, Size) and (VA >= KV.Value) and (VA < KV.Value + Size) then
+      Exit(KV.Value);
+  end;
+  EnsureSymInitialized;
+  Result := SymGetModuleBase64(FProcess, VA);
+end;
+
+// The RTL routine that finalizes a value of Kind, in the copy of the RTL that
+// ALLOCATED it: the one in the callee's module. A process can hold more than one
+// RTL (a statically linked exe and rtl<ver>.bpl, or a DLL with its own), each
+// with its own memory manager, and releasing through the wrong one frees a block
+// into a heap that never owned it. Same search as System.ExceptObject in
+// TryGetHandlerException: a symbol in the callee's module, else the export
+// directory -- the callee's module first, then the others, which in a packaged
+// application is where rtl<ver>.bpl (no debug information) exports it.
+function TWinDebugger.TryResolveFinalizer(Kind: TCallResultKind; CalleeVA: UInt64;
+  out FnVA: UInt64): Boolean;
+const
+  SYMBOLS: array[TCallResultKind] of string = (
+    'System.@UStrClr', 'System.@LStrClr', 'System.@WStrClr', 'System.@IntfClear',
+    'System.Variants.@VarClr');
+  // Read from rtl290.bpl (tdump -ee -m), both bitnesses.
+  EXPORTS_X64: array[TCallResultKind] of AnsiString = (
+    '_ZN6System8_UStrClrEPv', '_ZN6System8_LStrClrEPv', '_ZN6System8_WStrClrEPv',
+    '_ZN6System10_IntfClearERNS_15DelphiInterfaceINS_10IInterfaceEEE',
+    '_ZN6System8Variants7_VarClrER8TVarData');
+  EXPORTS_X86: array[TCallResultKind] of AnsiString = (
+    '@System@@UStrClr$qqrpv', '@System@@LStrClr$qqrpv', '@System@@WStrClr$qqrpv',
+    '@System@@IntfClear$qqrr44System@%DelphiInterface$17System@IInterface%',
+    '@System@Variants@@VarClr$qqrr8TVarData');
+
+  function TryCalleeModuleSymbol(ModBase: UInt64; out VA: UInt64): Boolean;
+  begin
+    VA := 0;
+    if FDebugInfo = nil then
+      Exit(False);
+    for var Rva in FDebugInfo.NameToRvaCandidates(SYMBOLS[Kind]) do begin
+      var Candidate := RvaToVA(Rva);
+      if (ModBase <> 0) and (ModuleBaseContaining(Candidate) <> ModBase) then
+        Continue;
+      VA := Candidate;
+      Exit(True);
+    end;
+    Result := False;
+  end;
+
+  function TryExport(ModBase: UInt64; out VA: UInt64): Boolean;
+  begin
+    var ExportName := EXPORTS_X86[Kind];
+    if TargetLayout.PointerSize = 8 then
+      ExportName := EXPORTS_X64[Kind];
+    Result := TryResolveExportedRoutine(ModBase, ExportName, VA);
+  end;
+
+  function TryAnyOtherModuleExport(ModBase: UInt64; out VA: UInt64): Boolean;
+  begin
+    for var KV in FDllBases do
+      if (KV.Value <> ModBase) and TryExport(KV.Value, VA) then
+        Exit(True);
+    Result := (FImageBase <> ModBase) and TryExport(FImageBase, VA);
+  end;
+
+begin
+  var ModBase := ModuleBaseContaining(CalleeVA);
+  var CacheKey := Format('%x:%d', [ModBase, Ord(Kind)]);
+  if FFinalizerCache.TryGetValue(CacheKey, FnVA) then
+    Exit(True);
+  Result := TryCalleeModuleSymbol(ModBase, FnVA) or TryExport(ModBase, FnVA) or
+            TryAnyOtherModuleExport(ModBase, FnVA);
+  if Result then
+    FFinalizerCache.AddOrSetValue(CacheKey, FnVA);
+end;
+
+// Hands the RTL a COPY of the value in the scratch slot -- the slot the call
+// returned it in has been reused since -- and lets the finalizer clear it: a
+// string's reference count drops (freeing it at zero), a BSTR is freed, an
+// interface is released, a Variant is cleared.
+procedure TWinDebugger.FinalizeCallResult(const Item: TRetainedCallResult);
+const
+  KIND_NAMES: array[TCallResultKind] of string = (
+    'UnicodeString', 'AnsiString', 'WideString', 'interface', 'Variant');
+begin
+  var FnVA: UInt64;
+  if not TryResolveFinalizer(Item.Kind, Item.CalleeVA, FnVA) then begin
+    DapLog(Format('Call result not released: no RTL finalizer for a %s found for the ' +
+      'module of 0x%x', [KIND_NAMES[Item.Kind], Item.CalleeVA]));
+    Exit;
+  end;
+  var Cell := GetRemoteScratchSlot(Length(Item.Bytes));
+  if (Cell = 0) or not WriteMemoryAt(Cell, @Item.Bytes[0], Length(Item.Bytes)) then
+    Exit;
+  var IntResult, FloatResult: UInt64;
+  if not RunMethodCall(FnVA, [Cell], [sakOrdinal], IntResult, FloatResult) then
+    DapLog(Format('Call result not released: finalizing a %s failed (%s)',
+      [KIND_NAMES[Item.Kind], FLastSyntheticCallError]));
+end;
+
+// Runs just before the debuggee runs again. Deferred while stopped on a
+// first-chance exception -- no synthetic call can be made there (see
+// RunMethodCall) -- to the next resume that allows one; the string regions wait
+// with the results, which may point into them.
+procedure TWinDebugger.ReleaseSyntheticCallLeftovers;
+begin
+  if (FCallResults.Count = 0) and (FStringArenas.Count = 0) then
+    Exit;
+  if (FProcess = 0) or FHasExited then begin
+    DiscardSyntheticCallLeftovers;
+    Exit;
+  end;
+  if FPendingContinueStatus <> DBG_CONTINUE then
+    Exit;
+  var Pending := FCallResults.ToArray;
+  FCallResults.Clear;
+  for var Item in Pending do
+    FinalizeCallResult(Item);
+  FreeStringArenas;
+end;
+
+// The process is gone, and its memory with it.
+procedure TWinDebugger.DiscardSyntheticCallLeftovers;
+begin
+  FCallResults.Clear;
+  FStringArenas.Clear;
+  FArenaCursor := 0;
+  FArenaEnd    := 0;
+  FFinalizerCache.Clear;
 end;
 
 { ---------------------------------------------------------------------------
@@ -7425,6 +7687,10 @@ begin
     //      those threads would stay parked forever in a process that carries on
     //      running. Only this branch needs it -- the kill branch above ends the
     //      process, which makes its suspend counts moot.
+    // And before any of that, while the stop still holds: release what the
+    // evaluations of this stop left in the process, which carries on running.
+    if FIsStopped then
+      ReleaseSyntheticCallLeftovers;
     ThawStepFrozenThreads;
     if FWatchArmedSlots <> 0 then
       for var Slot := 0 to 3 do

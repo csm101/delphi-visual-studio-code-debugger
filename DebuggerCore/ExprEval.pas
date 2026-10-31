@@ -318,6 +318,25 @@ uses
   DelphiValueReaders;   // WideFloatByteSize / ReadValueSlotRaw for the float
                         // types that do not fit the 8-byte value slot
 
+// The RTL finalizer family of a value a call returned through its hidden result
+// slot (IDebugTarget.RetainCallResult), or False when the engine does not
+// release that kind: a dynamic array or a record with managed fields needs its
+// TypeInfo to be finalized, and the call site does not have it.
+function TryCallResultKind(TypeKind: Byte; out ResultKind: TCallResultKind): Boolean;
+begin
+  Result := True;
+  case TypeKind of
+    TK_USTRING:   ResultKind := crkUnicodeString;
+    TK_LSTRING:   ResultKind := crkAnsiString;
+    TK_WSTRING:   ResultKind := crkWideString;
+    TK_INTERFACE: ResultKind := crkInterface;
+    TK_VARIANT:   ResultKind := crkVariant;
+  else
+    ResultKind := crkUnicodeString;
+    Result     := False;
+  end;
+end;
+
 { TExprEvaluator }
 
 constructor TExprEvaluator.Create(const Debugger: IDebugTarget; Rtti: TDelphiRtti;
@@ -1608,6 +1627,21 @@ function TExprEvaluator.ApplyMethodCall(const Base: TExprValue;
                     TK_DYNARRAY, TK_INTERFACE, TK_VARIANT];
   end;
 
+  // TD32 names a returned interface `^IFoo`, and the kind behind that name
+  // resolves like a class, so the name alone cannot say "interface". The value
+  // can: a callee wrote a pointer through the hidden slot, and that pointer
+  // decodes through an IMT adjustor thunk to an object only if it IS an
+  // interface reference.
+  function SlotHoldsInterfaceReference(SlotVA: UInt64): Boolean;
+  begin
+    if FRtti = nil then
+      Exit(False);
+    var Ref: UInt64 := 0;
+    if not FDebugger.ReadProcessMemoryAt(SlotVA, @Ref, FDebugger.TargetLayout.PointerSize) then
+      Exit(False);
+    Result := (Ref <> 0) and (FRtti.ObjectFromInterfaceThunk(Ref) <> 0);
+  end;
+
 var
   ClassName, FullName: string;
   FuncVA: UInt64;
@@ -2024,6 +2058,18 @@ begin
     Exit(InvalidValue('<method invocation failed>'));
   end;
 
+  // The call handed the debuggee's RTL a reference it now owes a release for.
+  // Only for a return type known for certain (HaveBoundReturn): the unbound
+  // fallback above GUESSES a string from the first argument, and finalizing a
+  // value with the wrong routine corrupts the debuggee's heap.
+  var ResultKind: TCallResultKind;
+  if HaveBoundReturn and (WantsStringReturn or WantsVariantReturn) and
+     TryCallResultKind(RetKind, ResultKind) then
+    FDebugger.RetainCallResult(FuncVA, ResultKind, Slot)
+  else if HaveBoundReturn and WantsStringReturn and RetTypeName.StartsWith('^') and
+          (RetPointeeKind <> TK_DYNARRAY) and SlotHoldsInterfaceReference(Slot) then
+    FDebugger.RetainCallResult(FuncVA, crkInterface, Slot);
+
   // Build the return TExprValue. When we have a bound-property return type,
   // use it verbatim; otherwise fall back to the legacy heuristic shape.
   if WantsFloatReturn then begin
@@ -2248,7 +2294,9 @@ function TExprEvaluator.ApplyDot(const Base: TExprValue; const Field: string): T
       // the common cases without parsing the TypeInfo size yet); 8 bytes
       // for managed pointer-sized handles (strings, dyn-arrays).
       case P.PropTypeKind of
-        TK_VARIANT:               SlotSize := 16;
+        // SizeOf(TVarData) in the target: 16 on x86, 24 on x64. A fixed 16
+        // left the last 8 bytes of a Win64 result unzeroed.
+        TK_VARIANT:               SlotSize := 8 + 2 * FDebugger.TargetLayout.PointerSize;
         TK_RECORD, TK_MRECORD:    SlotSize := 256;
         TK_SET: begin
           SlotSize := 0;
@@ -2269,6 +2317,11 @@ function TExprEvaluator.ApplyDot(const Base: TExprValue; const Field: string): T
       // this call deliberately does not know about.
       if not FDebugger.RunRemoteCallEx(FuncVA, ObjAddr, Slot, 0, 0, Rax, Xmm0) then
         Exit(InvalidValue('<getter invocation failed>'));
+      // Owed a release once the stop ends -- see the sibling in ApplyMethodCall.
+      // The kind comes from the property's RTTI, so it is never a guess.
+      var ResultKind: TCallResultKind;
+      if TryCallResultKind(P.PropTypeKind, ResultKind) then
+        FDebugger.RetainCallResult(FuncVA, ResultKind, Slot);
       Result.TypeHint     := P.PropTypeName;
       Result.TypeInfoAddr := P.PropTypeInfoAddr;
       Result.Address      := Slot;

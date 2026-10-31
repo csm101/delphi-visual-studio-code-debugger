@@ -333,6 +333,13 @@ type
     ModuleName:   string;           // bkAddress only: '' = main exe, else lowercase file name
   end;
 
+  // The managed result kinds a synthetic call can leave behind, one per RTL
+  // finalizer (see IDebugTarget.RetainCallResult). Dynamic arrays and records
+  // with managed fields are absent on purpose: their finalizers need the
+  // type's TypeInfo address, which the call site does not have.
+  TCallResultKind = (crkUnicodeString, crkAnsiString, crkWideString,
+    crkInterface, crkVariant);
+
   TCommandKind = (ckContinue, ckStepInto, ckStepOver, ckStepOut, ckPause,
     ckSetBreakpoints, ckSetDataBreakpoints, ckSetAddressBreakpoints,
     ckStepInstruction, ckStepToHandler);
@@ -654,6 +661,19 @@ type
                 out NewPtr: UInt64): Boolean;
     function  SetStringVariable(TargetAddr: UInt64;
                 const Text, TypeHint: string): Boolean;
+
+    // A managed value a synthetic call returned through its hidden result slot
+    // is a reference the debuggee now owes a release for: a string with its
+    // reference count raised, a newly allocated BSTR, an interface after
+    // _AddRef, a Variant holding any of these. Real code drops that reference
+    // when the caller's temporary goes out of scope; the debugger must do the
+    // same or every evaluation leaks it into the debuggee. RetainCallResult
+    // records the value now in SlotVA (read immediately: the slot is reused by
+    // the next call); the engine finalizes it through the debuggee's own RTL
+    // routine for that type just before the debuggee next runs -- not at once,
+    // because the value is displayed and expanded until the stop ends.
+    // CalleeVA picks WHICH RTL copy releases it: the one in the callee's module.
+    procedure RetainCallResult(CalleeVA: UInt64; Kind: TCallResultKind; SlotVA: UInt64);
 
     // Synthetic remote-call infrastructure (used by ExprEval).
     function  TryResolveSymbolVA(const Name: string; out VA: UInt64): Boolean;
