@@ -452,6 +452,12 @@ type
     // Returns whatever WriteProcessMemory itself reports (0..Size); never
     // guesses at a partial count.
     function  WriteMemoryPartial(VA: UInt64; Buf: Pointer; Size: NativeUInt): NativeUInt;
+    // True when every byte of [VA, VA + Size) lies in committed memory that is
+    // neither PAGE_NOACCESS nor a guard page (VirtualQueryEx), WITHOUT reading
+    // it. Lets a caller decide whether a length it found in target memory can be
+    // believed before it allocates and reads that many bytes: a garbage string
+    // header claiming hundreds of megabytes is answered by a few region queries.
+    function  IsRangeReadable(VA, Size: UInt64): Boolean;
     // Like ReadProcessMemoryAt, but for reading CODE a caller intends to
     // disassemble or otherwise inspect as instructions rather than data.
     // Two differences (docs/DISASSEMBLY_PLAN.md, "Traps"):
@@ -795,7 +801,24 @@ function FrameOriginName(Origin: TFrameOrigin): string;
 // a refusal rather than an accidental alias of some other register.
 function SameRegisterName(const A, B: string): Boolean;
 
+const
+  // Granularity of every chunked read of target memory. Windows commits and
+  // protects memory per page, and the page is 4 KB on both x86 and x64.
+  TARGET_PAGE_SIZE = 4096;
+
+// Reads up to Count bytes at VA into Buf (resized to Count by the caller or not:
+// it is resized here) and returns how many leading bytes were actually read.
+// Reads in 64 KB chunks; a chunk that fails is retried page by page, so a block
+// that runs into unreadable memory yields everything readable before it instead
+// of nothing. FailedAt is the first address that could not be read, or 0 when the
+// whole block was read.
+function ReadMemoryPrefix(const Target: IDebugTarget; VA: UInt64; Count: Integer;
+  var Buf: TBytes; out FailedAt: UInt64): Integer;
+
 implementation
+
+uses
+  System.Math;
 
 function SameRegisterName(const A, B: string): Boolean;
 
@@ -837,6 +860,47 @@ end;
 function TRegisterSnapshot.FramePtr: UInt64;
 begin
   Result := Rbp;
+end;
+
+function ReadMemoryPrefix(const Target: IDebugTarget; VA: UInt64; Count: Integer;
+  var Buf: TBytes; out FailedAt: UInt64): Integer;
+const
+  CHUNK_SIZE = 64 * 1024;
+
+  // Reads Size bytes at At into Buf[Offset..] one page at a time and returns how
+  // many leading bytes made it.
+  function ReadPageByPage(At: UInt64; Offset, Size: Integer): Integer;
+  begin
+    Result := 0;
+    while Result < Size do begin
+      var Cursor := At + UInt64(Result);
+      var BytesToPageEnd := TARGET_PAGE_SIZE - Integer(Cursor mod TARGET_PAGE_SIZE);
+      var Piece := Min(Size - Result, BytesToPageEnd);
+      if not Target.ReadProcessMemoryAt(Cursor, @Buf[Offset + Result], Piece) then
+        Exit;
+      Inc(Result, Piece);
+    end;
+  end;
+
+begin
+  FailedAt := 0;
+  Result := 0;
+  SetLength(Buf, Max(Count, 0));
+  while Result < Count do begin
+    var Piece := Min(CHUNK_SIZE, Count - Result);
+    var At := VA + UInt64(Result);
+    if Target.ReadProcessMemoryAt(At, @Buf[Result], Piece) then begin
+      Inc(Result, Piece);
+      Continue;
+    end;
+    var Salvaged := ReadPageByPage(At, Result, Piece);
+    Inc(Result, Salvaged);
+    if Salvaged < Piece then begin
+      FailedAt := VA + UInt64(Result);
+      Break;
+    end;
+  end;
+  SetLength(Buf, Result);
 end;
 
 end.

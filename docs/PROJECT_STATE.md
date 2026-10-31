@@ -187,6 +187,33 @@ module you are standing in carries debug information at all.
 
 ## Implemented features
 
+Long strings and memory blocks over MCP (2026-10-31):
+- **`maxStringLength` on `get_variable` / `evaluate_expression`** (default 4096,
+  ceiling 1 048 576, out of range = tool error) raises the single truncation
+  limit of every string reader (`TDelphiValueReader.MaxStringLength`, owned by
+  `TDebugSession.MaxStringLength`) for that request only, restored in a
+  `finally`; DAP, hover and the list tools keep 4096. Above 4096 a header
+  length is believed only when the header is plausible and
+  `IDebugTarget.IsRangeReadable` (`VirtualQueryEx`) confirms the memory;
+  otherwise the default applies and the marker says `length not trusted`.
+  Reads are chunked (`DebugTarget.ReadMemoryPrefix`, 64 KB, page-by-page
+  fallback) so a partial read keeps what it got; a cut never splits a
+  surrogate pair, a UTF-8 sequence or a DBCS pair.
+- **`read_memory`**: `count` up to 1 048 576, partial reads (`partial`,
+  `failedAt`), `format` `utf16`/`utf8`/`ansi` (+ `codePage`, `stopAtNull`);
+  `hex` output unchanged. The three tools declare
+  `_meta["anthropic/maxResultSizeChars"] = 500000` (Claude Code's maximum).
+- Defects fixed on the way: an AnsiString-family string over 4096 bytes
+  rendered as `''`; a PAnsiChar/PWideChar longer than one 256-element chunk
+  kept only its last chunk, carried no marker at the limit, and failed when the
+  fixed chunk crossed into an unreadable page; the `…` of every truncation
+  marker compiled as `â€¦` (the unit has no BOM; now `#$2026`); the by-name
+  `WideString` fallback read a BSTR with the UnicodeString rule.
+- Tests: `TStringReaderLimitTests` (fake memory), `McpE2ETests.LongStrings_*`,
+  `ReadMemory_*`, `ToolSchemas_LargeResultTools_*` on the new fixture
+  `DebuggerTests\TestTarget\LongStringSample.dpr`. Contract in `MCP_SERVER.md`
+  "Long strings and memory blocks".
+
 Step isolation (2026-09-06, found during the DDK live verification, not a
 regression):
 - **A step keeps every other thread frozen for the whole step, stepped-over

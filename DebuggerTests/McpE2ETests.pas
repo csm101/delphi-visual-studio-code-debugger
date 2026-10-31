@@ -145,6 +145,23 @@ type
     // makes the disassembler-unavailable refusal reachable from OUTSIDE the
     // process too, not just at the engine level.
     [Test] procedure StepInto_Instruction_RefusedWhenDisassemblerUnavailable;
+
+    // Long strings (LongStringSample.dpr). By default every string kind is cut
+    // at 4096 with a marker -- never shown as '' (the AnsiString family used
+    // to be) -- and a 300-character PAnsiChar/PWideChar comes back whole (it
+    // used to keep only its last 44 characters). Lists keep the default even
+    // right after a single-value request raised it.
+    [Test] procedure LongStrings_Default_TruncatedWithMarker_ListsUnchanged;
+    // maxStringLength on get_variable / evaluate_expression, including the
+    // string a called function returns; out-of-range values are refused.
+    [Test] procedure LongStrings_MaxStringLength_ReturnsWholeValue_AndRefusesOutOfRange;
+    // read_memory beyond 4096 bytes: text formats, stopAtNull, a block that
+    // runs into a PAGE_NOACCESS page, and "hex" output unchanged for small reads.
+    [Test] procedure ReadMemory_LargeCount_TextFormats_PartialRead;
+    [Test] procedure ReadMemory_InvalidArguments_Refused;
+    // The single-value tools declare _meta["anthropic/maxResultSizeChars"]; the
+    // list tools neither declare it nor accept maxStringLength.
+    [Test] procedure ToolSchemas_LargeResultTools_DeclareMetaAndMaxStringLength;
   end;
 
 implementation
@@ -3333,6 +3350,458 @@ begin
     end;
   finally
     DeleteTempDirWithRetry(ScratchDir);
+  end;
+end;
+
+{ Long strings: LongStringSample.dpr }
+
+const
+  LONGSTR_SOURCE = 'LongStringSample.dpr';
+  LONGSTR_MARKER = 'LONGSTR_BODY';
+  // The documented ceiling of maxStringLength and of read_memory's count.
+  MAX_STRING_LENGTH_CEILING_FOR_TESTS = 1048576;
+  // U+2026, the first character of a truncation marker. A code point because
+  // this file has no BOM: dcc would read a literal as ANSI.
+  ELLIPSIS = #$2026;
+
+// The fixture's PatternText: 'a'..'z' repeated.
+function LongStrPattern(Count: Integer): string;
+begin
+  SetLength(Result, Count);
+  for var I := 1 to Count do
+    Result[I] := Char(Ord('a') + (I - 1) mod 26);
+end;
+
+function LongStrUtf8Text(ExtraChars: Integer): string;
+begin
+  Result := StringOfChar(WideChar('x'), 4095) + StringOfChar(WideChar($E8), ExtraChars);
+end;
+
+procedure OpenLongStringSample(C: TMcpTestClient; const TargetDir: string);
+begin
+  var Lines := TStringList.Create;
+  try
+    Lines.LoadFromFile(TargetDir + LONGSTR_SOURCE);
+    var Line := 0;
+    for var I := 0 to Lines.Count - 1 do
+      if Lines[I].Contains('{BP:' + LONGSTR_MARKER + '}') then
+        Line := I + 1;
+    Assert.IsTrue(Line > 0, 'marker ' + LONGSTR_MARKER + ' not found in ' + LONGSTR_SOURCE);
+    var LaunchArgs := TJSONObject.Create;
+    LaunchArgs.AddPair('program', TargetDir + 'Win64\Debug\LongStringSample.exe');
+    LaunchArgs.AddPair('sourceRoot', TargetDir);
+    C.CallTool('launch_debuggee', LaunchArgs).Free;
+    var BpArgs := TJSONObject.Create;
+    BpArgs.AddPair('sourceFile', LONGSTR_SOURCE);
+    BpArgs.AddPair('line', TJSONNumber.Create(Line));
+    C.CallTool('set_breakpoint', BpArgs).Free;
+    var Snap := C.CallTool('continue_and_wait', nil);
+    try
+      Assert.AreEqual('stopped', TJSONObject(Snap).GetValue<string>('state', ''),
+        'LongStringSample did not stop at ' + LONGSTR_MARKER + ': ' + Snap.ToJSON);
+    finally
+      Snap.Free;
+    end;
+  finally
+    Lines.Free;
+  end;
+end;
+
+// get_variable (Subject = a name) or evaluate_expression (Subject = an
+// expression). MaxStringLengthJson is the raw JSON of the argument, '' to omit.
+function CallSingleValue(C: TMcpTestClient; const Tool, Subject, MaxStringLengthJson: string): TJSONValue;
+begin
+  var Args := TJSONObject.Create;
+  if Tool = 'get_variable' then
+    Args.AddPair('name', Subject)
+  else
+    Args.AddPair('expression', Subject);
+  if MaxStringLengthJson <> '' then
+    Args.AddPair('maxStringLength', TJSONObject.ParseJSONValue(MaxStringLengthJson));
+  Result := C.CallTool(Tool, Args);
+end;
+
+function SingleValueObject(C: TMcpTestClient; const Tool, Subject: string;
+  MaxStringLength: Integer = 0): TJSONObject;
+begin
+  var Json := '';
+  if MaxStringLength <> 0 then
+    Json := IntToStr(MaxStringLength);
+  var R := CallSingleValue(C, Tool, Subject, Json);
+  if not (R is TJSONObject) then begin
+    var Text := R.ToJSON;
+    R.Free;
+    Assert.Fail(Format('%s(%s) failed: %s', [Tool, Subject, Text]));
+  end;
+  Result := TJSONObject(R);
+end;
+
+// The value, prefixed with its type in angle brackets: '<type>value'. The type
+// is part of what a failure needs to say -- the same text renders differently
+// as an AnsiString and as a RawByteString.
+function SingleValue(C: TMcpTestClient; const Tool, Subject: string;
+  MaxStringLength: Integer = 0): string;
+begin
+  var Obj := SingleValueObject(C, Tool, Subject, MaxStringLength);
+  try
+    Result := '<' + Obj.GetValue<string>('type', '') + '>' + Obj.GetValue<string>('value', '');
+  finally
+    Obj.Free;
+  end;
+end;
+
+// What an AnsiString-family local shows for Text (encoded as UTF-8). TD32 tag
+// $0036 names the whole family RawByteString (docs/KNOWN_UNKNOWNS.md, first
+// entry), and a RawByteString renders its bytes in the printable-ASCII view,
+// with '.' for every other byte. Either rendering is accepted until that open
+// question is settled; both prove how many bytes were read.
+function ExpectedAnsiFamilyText(const TypedValue, Text: string): string;
+begin
+  if not TypedValue.StartsWith('<RawByteString>') then
+    Exit(Text);
+  var Ascii := TStringBuilder.Create;
+  try
+    for var B in TEncoding.UTF8.GetBytes(Text) do
+      if (B >= 32) and (B < 127) then
+        Ascii.Append(Char(B))
+      else
+        Ascii.Append('.');
+    Result := Ascii.ToString;
+  finally
+    Ascii.Free;
+  end;
+end;
+
+procedure AssertShowsText(const Value, ExpectedText, Context: string);
+begin
+  Assert.IsTrue(Value.Contains('''' + ExpectedText + ''''),
+    Format('%s: expected the whole text (%d chars) between quotes; got %d chars: %s...',
+      [Context, Length(ExpectedText), Length(Value), Copy(Value, 1, 200)]));
+end;
+
+function McpReadMemory(C: TMcpTestClient; const Address: string; Count: Integer;
+  const Extra: array of string): TJSONValue;
+begin
+  var Args := TJSONObject.Create;
+  Args.AddPair('address', Address);
+  Args.AddPair('count', TJSONNumber.Create(Count));
+  // Extra = key/raw-JSON pairs.
+  var I := 0;
+  while I < High(Extra) do begin
+    Args.AddPair(Extra[I], TJSONObject.ParseJSONValue(Extra[I + 1]));
+    Inc(I, 2);
+  end;
+  Result := C.CallTool('read_memory', Args);
+end;
+
+function PayloadAddress(C: TMcpTestClient; const Name: string): string;
+begin
+  var Obj := SingleValueObject(C, 'get_variable', Name);
+  try
+    Result := Obj.GetValue<string>('address', '');
+    Assert.IsTrue(Result <> '', Name + ' carries no address: ' + Obj.ToJSON);
+  finally
+    Obj.Free;
+  end;
+end;
+
+procedure TMcpE2ETests.LongStrings_Default_TruncatedWithMarker_ListsUnchanged;
+begin
+  var C := TMcpTestClient.Start(McpExe);
+  try
+    C.Call('initialize', nil).Free;
+    OpenLongStringSample(C, TargetDir);
+
+    var Cut4096 := LongStrPattern(4096);
+    AssertShowsText(SingleValue(C, 'get_variable', 'LongUnicode'), Cut4096 + ELLIPSIS + '(10000 chars total)', 'UnicodeString');
+    AssertShowsText(SingleValue(C, 'get_variable', 'LongWide'), Cut4096 + ELLIPSIS + '(5000 chars total)', 'WideString');
+    AssertShowsText(SingleValue(C, 'get_variable', 'LongAnsi'), Cut4096 + ELLIPSIS + '(5000 chars total)', 'AnsiString');
+    AssertShowsText(SingleValue(C, 'get_variable', 'LongRaw'), Cut4096 + ELLIPSIS + '(5000 chars total)', 'RawByteString');
+    // The cut falls inside a two-byte UTF-8 sequence: it moves back to 4095.
+    AssertShowsText(SingleValue(C, 'get_variable', 'LongUtf8'), LongStrUtf8Text(0) + ELLIPSIS + '(6095 chars total)', 'UTF8String');
+    AssertShowsText(SingleValue(C, 'get_variable', 'PAnsi5000'), Cut4096 + ELLIPSIS + '(more than 4096 chars)', 'PAnsiChar 5000');
+    AssertShowsText(SingleValue(C, 'get_variable', 'PWide5000'), Cut4096 + ELLIPSIS + '(more than 4096 chars)', 'PWideChar 5000');
+    AssertShowsText(SingleValue(C, 'get_variable', 'PAnsi300'), LongStrPattern(300), 'PAnsiChar 300');
+    AssertShowsText(SingleValue(C, 'get_variable', 'PWide300'), LongStrPattern(300), 'PWideChar 300');
+    // Terminators in the last bytes before a PAGE_NOACCESS page.
+    AssertShowsText(SingleValue(C, 'get_variable', 'EdgeAnsi'), 'edge', 'PAnsiChar at a page edge');
+    AssertShowsText(SingleValue(C, 'get_variable', 'EdgeWide'), 'edge', 'PWideChar at a page edge');
+
+    // A raised limit applies to that one request only.
+    AssertShowsText(SingleValue(C, 'get_variable', 'LongUnicode', 20000), LongStrPattern(10000), 'raised limit');
+    var Locals := C.CallTool('get_locals', nil);
+    try
+      var Row: TJSONObject;
+      Assert.IsTrue(McpFindRow(Locals as TJSONArray, 'LongUnicode', Row), 'LongUnicode not in get_locals');
+      AssertShowsText(Row.GetValue<string>('value', ''), Cut4096 + ELLIPSIS + '(10000 chars total)', 'get_locals after a raised get_variable');
+    finally
+      Locals.Free;
+    end;
+    var Snap := C.CallTool('get_compact_debug_snapshot', nil);
+    try
+      var Row: TJSONObject;
+      Assert.IsTrue(McpFindRow((Snap as TJSONObject).GetValue('locals') as TJSONArray, 'LongAnsi', Row),
+        'LongAnsi not in the snapshot locals');
+      AssertShowsText(Row.GetValue<string>('value', ''), Cut4096 + ELLIPSIS + '(5000 chars total)', 'snapshot locals');
+    finally
+      Snap.Free;
+    end;
+
+    C.CallTool('terminate_debuggee', nil).Free;
+  finally
+    C.Free;
+  end;
+end;
+
+procedure TMcpE2ETests.LongStrings_MaxStringLength_ReturnsWholeValue_AndRefusesOutOfRange;
+begin
+  var C := TMcpTestClient.Start(McpExe);
+  try
+    C.Call('initialize', nil).Free;
+    OpenLongStringSample(C, TargetDir);
+
+    var Whole := SingleValue(C, 'get_variable', 'LongUnicode', 20000);
+    AssertShowsText(Whole, LongStrPattern(10000), 'UnicodeString, limit 20000');
+    Assert.IsFalse(Whole.Contains(ELLIPSIS + '('), 'a whole string carries no marker');
+    AssertShowsText(SingleValue(C, 'get_variable', 'LongUnicode', 5000),
+      LongStrPattern(5000) + ELLIPSIS + '(10000 chars total)', 'UnicodeString, limit 5000');
+    AssertShowsText(SingleValue(C, 'get_variable', 'LongUnicode', MAX_STRING_LENGTH_CEILING_FOR_TESTS),
+      LongStrPattern(10000), 'UnicodeString, limit at the ceiling');
+    AssertShowsText(SingleValue(C, 'get_variable', 'LongWide', 10000), LongStrPattern(5000), 'WideString');
+    AssertShowsText(SingleValue(C, 'get_variable', 'LongAnsi', 10000), LongStrPattern(5000), 'AnsiString');
+    AssertShowsText(SingleValue(C, 'get_variable', 'LongRaw', 10000), LongStrPattern(5000), 'RawByteString');
+    var Utf8Whole := SingleValue(C, 'get_variable', 'LongUtf8', 10000);
+    AssertShowsText(Utf8Whole, ExpectedAnsiFamilyText(Utf8Whole, LongStrUtf8Text(1000)), 'UTF8String');
+    AssertShowsText(SingleValue(C, 'get_variable', 'PAnsi5000', 10000), LongStrPattern(5000), 'PAnsiChar');
+    AssertShowsText(SingleValue(C, 'get_variable', 'PWide5000', 10000), LongStrPattern(5000), 'PWideChar');
+
+    // The string a called function returns goes through the same readers.
+    AssertShowsText(SingleValue(C, 'evaluate_expression', 'LongTextOf(10000)'),
+      LongStrPattern(4096) + ELLIPSIS + '(10000 chars total)', 'function result, default limit');
+    AssertShowsText(SingleValue(C, 'evaluate_expression', 'LongTextOf(10000)', 10000),
+      LongStrPattern(10000), 'function result, limit 10000');
+
+    for var Tool in ['get_variable', 'evaluate_expression'] do
+      for var Bad in ['0', '-5', '1048577', '1.5', '"100"', 'true'] do begin
+        var R := CallSingleValue(C, Tool, 'LongUnicode', Bad);
+        try
+          Assert.IsTrue(R is TJSONString, Format('%s with maxStringLength=%s was not refused: %s',
+            [Tool, Bad, Copy(R.ToJSON, 1, 200)]));
+          Assert.IsTrue((R as TJSONString).Value.Contains('maxStringLength'),
+            'the refusal does not name the argument: ' + (R as TJSONString).Value);
+        finally
+          R.Free;
+        end;
+      end;
+
+    C.CallTool('terminate_debuggee', nil).Free;
+  finally
+    C.Free;
+  end;
+end;
+
+procedure TMcpE2ETests.ReadMemory_LargeCount_TextFormats_PartialRead;
+
+  function NumberValue(C: TMcpTestClient; const Name: string): UInt64;
+  begin
+    var Typed := SingleValue(C, 'get_variable', Name);
+    var Text := Typed.Substring(Typed.IndexOf('>') + 1).Trim;
+    var Digits := '';
+    for var Ch in Text do begin
+      if not CharInSet(Ch, ['0'..'9']) then
+        Break;
+      Digits := Digits + Ch;
+    end;
+    Assert.IsTrue(TryStrToUInt64(Digits, Result), Name + ' is not a number: ' + Text);
+  end;
+
+begin
+  var C := TMcpTestClient.Start(McpExe);
+  try
+    C.Call('initialize', nil).Free;
+    OpenLongStringSample(C, TargetDir);
+
+    // "hex" of a small block: exactly the fields it always had.
+    var UnicodeAddr := PayloadAddress(C, 'LongUnicode');
+    var Small := McpReadMemory(C, UnicodeAddr, 4, []) as TJSONObject;
+    try
+      Assert.AreEqual('61006200', Small.GetValue<string>('hex', ''), 'hex of "ab": ' + Small.ToJSON);
+      for var Key in ['bytesRead', 'format', 'partial', 'text'] do
+        Assert.IsNull(Small.GetValue(Key), Format('hex output gained "%s": %s', [Key, Small.ToJSON]));
+    finally
+      Small.Free;
+    end;
+
+    var Utf16 := McpReadMemory(C, UnicodeAddr, 20000, ['format', '"utf16"']) as TJSONObject;
+    try
+      Assert.AreEqual(LongStrPattern(10000), Utf16.GetValue<string>('text', ''), 'utf16 text of 20000 bytes');
+      Assert.AreEqual(20000, Utf16.GetValue<Integer>('bytesRead', 0));
+      Assert.AreEqual(10000, Utf16.GetValue<Integer>('chars', 0));
+      Assert.AreEqual('utf16', Utf16.GetValue<string>('format', ''));
+    finally
+      Utf16.Free;
+    end;
+    var BigHex := McpReadMemory(C, UnicodeAddr, 20000, []) as TJSONObject;
+    try
+      Assert.AreEqual(40000, Length(BigHex.GetValue<string>('hex', '')), 'hex of 20000 bytes');
+    finally
+      BigHex.Free;
+    end;
+
+    var Utf8Addr := PayloadAddress(C, 'LongUtf8');
+    var Utf8Cut := McpReadMemory(C, Utf8Addr, 4096, ['format', '"utf8"']) as TJSONObject;
+    try
+      Assert.AreEqual(LongStrUtf8Text(0), Utf8Cut.GetValue<string>('text', ''),
+        'a block ending inside a UTF-8 sequence decodes up to the last whole character');
+      Assert.AreEqual(4095, Utf8Cut.GetValue<Integer>('bytesDecoded', 0));
+    finally
+      Utf8Cut.Free;
+    end;
+
+    var AnsiAddr := PayloadAddress(C, 'LongAnsi');
+    var Ansi := McpReadMemory(C, AnsiAddr, 5000, ['format', '"ansi"', 'codePage', '1252']) as TJSONObject;
+    try
+      Assert.AreEqual(LongStrPattern(5000), Ansi.GetValue<string>('text', ''));
+      Assert.AreEqual(1252, Ansi.GetValue<Integer>('codePage', 0));
+    finally
+      Ansi.Free;
+    end;
+    var AnsiDefault := McpReadMemory(C, AnsiAddr, 10, ['format', '"ansi"']) as TJSONObject;
+    try
+      Assert.AreEqual(Integer(GetACP), AnsiDefault.GetValue<Integer>('codePage', 0),
+        'the default code page is the system ANSI one, and says so');
+    finally
+      AnsiDefault.Free;
+    end;
+
+    var Stop8 := McpReadMemory(C, PayloadAddress(C, 'Ansi300'), 400,
+      ['format', '"ansi"', 'stopAtNull', 'true']) as TJSONObject;
+    try
+      Assert.AreEqual(LongStrPattern(300), Stop8.GetValue<string>('text', ''));
+      Assert.IsTrue(Stop8.GetValue<Boolean>('stoppedAtNull', False), Stop8.ToJSON);
+    finally
+      Stop8.Free;
+    end;
+    var Stop16 := McpReadMemory(C, PayloadAddress(C, 'Wide300'), 1000,
+      ['format', '"utf16"', 'stopAtNull', 'true']) as TJSONObject;
+    try
+      Assert.AreEqual(LongStrPattern(300), Stop16.GetValue<string>('text', ''));
+    finally
+      Stop16.Free;
+    end;
+
+    // A block that runs into the PAGE_NOACCESS page: the readable 16 bytes come
+    // back, with where the read stopped.
+    var EdgeEnd := NumberValue(C, 'EdgeEnd');
+    var Partial := McpReadMemory(C, Format('0x%x', [EdgeEnd - 16]), 64, []) as TJSONObject;
+    try
+      Assert.AreEqual(16, Partial.GetValue<Integer>('bytesRead', 0), Partial.ToJSON);
+      Assert.AreEqual(32, Length(Partial.GetValue<string>('hex', '')));
+      Assert.IsTrue(Partial.GetValue<Boolean>('partial', False));
+      var FailedAt := Partial.GetValue<string>('failedAt', '');
+      Assert.IsTrue(StrToUInt64('$' + FailedAt.Substring(2)) = EdgeEnd,
+        Format('failedAt %s is not the first unreadable byte 0x%x', [FailedAt, EdgeEnd]));
+    finally
+      Partial.Free;
+    end;
+    var Unreadable := McpReadMemory(C, Format('0x%x', [EdgeEnd]), 16, []);
+    try
+      Assert.IsTrue(Unreadable is TJSONString, 'nothing readable is still an error: ' + Unreadable.ToJSON);
+    finally
+      Unreadable.Free;
+    end;
+
+    // The ceiling is accepted; whatever lies beyond the heap block comes back partial.
+    var AtCeiling := McpReadMemory(C, UnicodeAddr, MAX_STRING_LENGTH_CEILING_FOR_TESTS, ['format', '"utf16"']);
+    try
+      Assert.IsTrue(AtCeiling is TJSONObject, 'count at the ceiling was refused: ' + Copy(AtCeiling.ToJSON, 1, 200));
+    finally
+      AtCeiling.Free;
+    end;
+
+    C.CallTool('terminate_debuggee', nil).Free;
+  finally
+    C.Free;
+  end;
+end;
+
+procedure TMcpE2ETests.ReadMemory_InvalidArguments_Refused;
+
+  procedure AssertRefused(C: TMcpTestClient; const Address: string; Count: Integer;
+    const Extra: array of string; const Expected: string);
+  begin
+    var R := McpReadMemory(C, Address, Count, Extra);
+    try
+      Assert.IsTrue(R is TJSONString, Format('read_memory count=%d %s was not refused: %s',
+        [Count, string.Join(' ', Extra), Copy(R.ToJSON, 1, 200)]));
+      Assert.IsTrue((R as TJSONString).Value.Contains(Expected),
+        Format('refusal "%s" does not mention "%s"', [(R as TJSONString).Value, Expected]));
+    finally
+      R.Free;
+    end;
+  end;
+
+begin
+  var C := TMcpTestClient.Start(McpExe);
+  try
+    C.Call('initialize', nil).Free;
+    OpenLongStringSample(C, TargetDir);
+    var Addr := PayloadAddress(C, 'LongUnicode');
+    AssertRefused(C, Addr, 0, [], 'count');
+    AssertRefused(C, Addr, MAX_STRING_LENGTH_CEILING_FOR_TESTS + 1, [], 'count');
+    AssertRefused(C, Addr, 16, ['format', '"base64"'], 'format');
+    AssertRefused(C, Addr, 16, ['format', '"utf8"', 'codePage', '1252'], 'codePage');
+    AssertRefused(C, Addr, 16, ['format', '"ansi"', 'codePage', '70000'], 'codePage');
+    AssertRefused(C, Addr, 16, ['format', '"ansi"', 'codePage', '1'], 'code page 1');
+    AssertRefused(C, Addr, 16, ['stopAtNull', 'true'], 'stopAtNull');
+    C.CallTool('terminate_debuggee', nil).Free;
+  finally
+    C.Free;
+  end;
+end;
+
+procedure TMcpE2ETests.ToolSchemas_LargeResultTools_DeclareMetaAndMaxStringLength;
+
+  function FindTool(Tools: TJSONArray; const Name: string): TJSONObject;
+  begin
+    for var T in Tools do
+      if (T as TJSONObject).GetValue<string>('name', '') = Name then
+        Exit(TJSONObject(T));
+    Assert.Fail('tool not listed: ' + Name);
+    Result := nil;
+  end;
+
+  function HasProperty(Tool: TJSONObject; const Prop: string): Boolean;
+  begin
+    var Props := (Tool.GetValue('inputSchema') as TJSONObject).GetValue('properties') as TJSONObject;
+    Result := Props.GetValue(Prop) <> nil;
+  end;
+
+begin
+  var C := TMcpTestClient.Start(McpExe);
+  try
+    C.Call('initialize', nil).Free;
+    var Resp := C.Call('tools/list', nil);
+    try
+      var Tools := (Resp.GetValue('result') as TJSONObject).GetValue('tools') as TJSONArray;
+      for var Name in ['get_variable', 'evaluate_expression', 'read_memory'] do begin
+        var Meta := FindTool(Tools, Name).GetValue('_meta') as TJSONObject;
+        Assert.IsNotNull(Meta, Name + ' declares no _meta');
+        Assert.AreEqual(500000, Meta.GetValue<Integer>('anthropic/maxResultSizeChars', 0), Name);
+      end;
+      for var Name in ['get_variable', 'evaluate_expression'] do
+        Assert.IsTrue(HasProperty(FindTool(Tools, Name), 'maxStringLength'), Name + ' lacks maxStringLength');
+      for var Name in ['get_locals', 'expand_variable', 'get_compact_debug_snapshot'] do begin
+        Assert.IsNull(FindTool(Tools, Name).GetValue('_meta'), Name + ' should keep the default result size');
+        Assert.IsFalse(HasProperty(FindTool(Tools, Name), 'maxStringLength'), Name + ' must not take maxStringLength');
+      end;
+      for var Prop in ['format', 'codePage', 'stopAtNull'] do
+        Assert.IsTrue(HasProperty(FindTool(Tools, 'read_memory'), Prop), 'read_memory lacks ' + Prop);
+    finally
+      Resp.Free;
+    end;
+  finally
+    C.Free;
   end;
 end;
 

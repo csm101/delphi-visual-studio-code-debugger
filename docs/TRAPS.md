@@ -558,6 +558,21 @@ absurdly.
 
 ## Engine and language gotchas
 
+- **A non-ASCII literal in a `.pas` without a BOM compiles as mojibake.** dcc
+  reads a BOM-less source as ANSI, so `'…'` written as UTF-8 becomes the three
+  characters `'â€¦'` — and nothing fails: the truncation marker of every string
+  reader shipped that way until a test compared it with a literal from a file
+  that HAS a BOM. Most sources here have none. Write a non-ASCII character in a
+  string literal as a code point (`#$2026`, `TRUNCATION_MARK`), never as the
+  character itself; comments are harmless. `McpToolSchemas.pas` still carries
+  literal em-dashes in tool descriptions, which reach clients as `â€”`.
+- **A fake memory window must end on a page boundary when the reader under test
+  relies on page-granular readability.** Windows grants or denies access a
+  whole page at a time, and the null-terminated readers retry a failed read up
+  to the end of the current page. `TFakeMemTarget` serves exactly its byte
+  array, so a window ending mid-page fails a read no process could fail; pad it
+  (`PagePadded` in `ValueReaderTests.pas`).
+
 - **When a reported stop disagrees with the exception event's own address, suspect
   the REPORTING layer before the stack walker.** An exception stop in code with no
   debug info was reported at the CALLING Delphi frame — real source, real line,

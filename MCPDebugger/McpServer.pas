@@ -93,7 +93,10 @@ type
     procedure HandleLaunchProject(const IdJson: string; Args: TJSONObject);
     procedure HandleAttachToProject(const IdJson: string; Args: TJSONObject);
     procedure CheckWaitTimeout;
-    procedure HandleReadMemory(const IdJson, AddrStr: string; Count: Integer);
+    // FormatName: "hex" (default) or a text format ("utf16", "utf8", "ansi").
+    // CodePage 0 = not given (ansi then uses the system ANSI code page).
+    procedure HandleReadMemory(const IdJson, AddrStr: string; Count: Integer;
+      const FormatName: string; CodePage: Integer; StopAtNull: Boolean);
     procedure HandleWriteMemory(const IdJson, AddrStr, HexBytes: string);
     // docs/DISASSEMBLY_PLAN.md increment 4. AddrStr = '' means "resolve from
     // FrameIndex/ThreadId instead" (same frame-selection convention
@@ -137,7 +140,7 @@ implementation
 
 uses
   System.IOUtils, McpToolSchemas, McpJson, LaunchConfig, DdkTarget,
-  Disassembler, ZydisDisassembler;
+  Disassembler, ZydisDisassembler, DelphiValueReaders;
 
 var
   GLogPath: string;
@@ -600,6 +603,35 @@ var
   begin
     Result := FSession.State = dsStopped;
   end;
+  // An optional integer argument: Default when absent (or null), otherwise an
+  // integer within MinValue..MaxValue. Anything else is refused with a tool
+  // error naming the range -- never clamped silently.
+  function TryBoundedIntArg(const Key: string; MinValue, MaxValue, Default: Integer;
+    out Value: Integer): Boolean;
+  begin
+    Value := Default;
+    var V: TJSONValue := nil;
+    if Args <> nil then
+      V := Args.FindValue(Key);
+    if (V = nil) or (V is TJSONNull) then
+      Exit(True);
+    var N: Int64;
+    if not (V is TJSONNumber) or not TryStrToInt64(V.Value, N) or
+       (N < MinValue) or (N > MaxValue) then begin
+      SendToolError(IdJson, Format('%s must be an integer in %d..%d (got %s).',
+        [Key, MinValue, MaxValue, V.ToJSON]));
+      Exit(False);
+    end;
+    Value := Integer(N);
+    Result := True;
+  end;
+  // `maxStringLength` of the single-value tools, applied to the session for the
+  // duration of the request only.
+  function TryMaxStringLengthArg(out Limit: Integer): Boolean;
+  begin
+    Result := TryBoundedIntArg('maxStringLength', 1, MAX_STRING_LENGTH_CEILING,
+      DEFAULT_MAX_STRING_LENGTH, Limit);
+  end;
   // `stepIsolationReleaseMs` / `stepIsolation` on every launch / attach tool, with
   // the same meaning as the launch.json attributes.
   function StepIsolationArg(out Setting: Integer): Boolean;
@@ -1057,11 +1089,17 @@ begin
         SendToolError(IdJson, 'Cannot read a variable while the debuggee is running. Pause or wait for a stop first.');
         Exit;
       end;
+      var StringLimit: Integer;
+      if not TryMaxStringLengthArg(StringLimit) then
+        Exit;
+      var SavedStringLimit := FSession.MaxStringLength;
+      FSession.MaxStringLength := StringLimit;
       BeginSelectedFrame;
       try
         SendToolJson(IdJson, McpJson.VarToJson(FSession.GetVariable(ArgStr('name'))));
       finally
         EndSelectedFrame;
+        FSession.MaxStringLength := SavedStringLimit;
       end;
       Exit;
     end;
@@ -1094,9 +1132,18 @@ begin
       var EvalFrame := DEFAULT_FRAME_INDEX;
       if FrameArgGiven then
         EvalFrame := ArgInt('frameIndex', 0);
-      SendToolJson(IdJson, McpJson.EvalResultToJson(
-        FSession.EvaluateForFrame(ArgStr('expression'),
-          EvalFrame, Cardinal(ArgInt('threadId', 0)))));
+      var StringLimit: Integer;
+      if not TryMaxStringLengthArg(StringLimit) then
+        Exit;
+      var SavedStringLimit := FSession.MaxStringLength;
+      FSession.MaxStringLength := StringLimit;
+      try
+        SendToolJson(IdJson, McpJson.EvalResultToJson(
+          FSession.EvaluateForFrame(ArgStr('expression'),
+            EvalFrame, Cardinal(ArgInt('threadId', 0)))));
+      finally
+        FSession.MaxStringLength := SavedStringLimit;
+      end;
       Exit;
     end;
     if Name = 'get_exception_details' then begin
@@ -1153,7 +1200,17 @@ begin
       Exit;
     end;
     if Name = 'read_memory' then begin
-      HandleReadMemory(IdJson, ArgStr('address'), ArgInt('count'));
+      var Count, CodePage: Integer;
+      if not TryBoundedIntArg('count', 1, MAX_STRING_LENGTH_CEILING, 0, Count) then
+        Exit;
+      if Count = 0 then begin
+        SendToolError(IdJson, Format('count is required: an integer in 1..%d.', [MAX_STRING_LENGTH_CEILING]));
+        Exit;
+      end;
+      if not TryBoundedIntArg('codePage', 1, 65535, 0, CodePage) then
+        Exit;
+      HandleReadMemory(IdJson, ArgStr('address'), Count, ArgStr('format', 'hex'),
+        CodePage, ArgBool('stopAtNull'));
       Exit;
     end;
     if Name = 'write_memory' then begin
@@ -1183,36 +1240,153 @@ begin
   Result := TryStrToUInt64(T, Addr);
 end;
 
-procedure TMcpServer.HandleReadMemory(const IdJson, AddrStr: string; Count: Integer);
+// The block is read in chunks (ReadMemoryPrefix): a block that runs into
+// unreadable memory returns what was readable before it, with `partial` and the
+// first failing address, instead of failing as a whole. The "hex" output of a
+// fully read block is exactly what this tool always returned.
+procedure TMcpServer.HandleReadMemory(const IdJson, AddrStr: string; Count: Integer;
+  const FormatName: string; CodePage: Integer; StopAtNull: Boolean);
+type
+  TMemoryFormat = (mfHex, mfUtf16, mfUtf8, mfAnsi);
+const
+  FORMAT_NAMES: array[TMemoryFormat] of string = ('hex', 'utf16', 'utf8', 'ansi');
 var
   Addr: UInt64;
+  Buf: TBytes;
+  Obj: TJSONObject;
+
+  function TryParseFormat(out Fmt: TMemoryFormat): Boolean;
+  begin
+    for var F := Low(TMemoryFormat) to High(TMemoryFormat) do
+      if SameText(FormatName, FORMAT_NAMES[F]) then begin
+        Fmt := F;
+        Exit(True);
+      end;
+    Result := False;
+  end;
+
+  // Why the format-dependent options do not fit together, or ''.
+  function OptionConflict(Fmt: TMemoryFormat): string;
+  begin
+    if (CodePage <> 0) and (Fmt <> mfAnsi) then
+      Exit('codePage applies only to format "ansi".');
+    if (CodePage <> 0) and not IsValidCodePage(CodePage) then
+      Exit(Format('code page %d is not installed on this machine.', [CodePage]));
+    if StopAtNull and (Fmt = mfHex) then
+      Exit('stopAtNull applies only to the text formats ("utf16", "utf8", "ansi").');
+    Result := '';
+  end;
+
+  procedure AddHexView;
+  begin
+    var Hex := TStringBuilder.Create(Length(Buf) * 2);
+    try
+      for var B in Buf do
+        Hex.Append(IntToHex(B, 2));
+      Obj.AddPair('hex', Hex.ToString);
+    finally
+      Hex.Free;
+    end;
+    // Little-endian integer views for the common widths, for reading VMT slots
+    // and record fields without hand-assembling the bytes.
+    if Length(Buf) >= 8 then Obj.AddPair('u64le', TJSONNumber.Create(PUInt64(@Buf[0])^));
+    if Length(Buf) >= 4 then Obj.AddPair('u32le', TJSONNumber.Create(Int64(PCardinal(@Buf[0])^)));
+    if Length(Buf) >= 2 then Obj.AddPair('u16le', TJSONNumber.Create(PWord(@Buf[0])^));
+  end;
+
+  // Number of leading bytes before the first null element, or -1 when none.
+  function NullTerminatorOffset(ElemSize: Integer): Integer;
+  begin
+    var Index := 0;
+    while (Index + 1) * ElemSize <= Length(Buf) do begin
+      var IsNull := True;
+      for var B := Index * ElemSize to (Index + 1) * ElemSize - 1 do
+        IsNull := IsNull and (Buf[B] = 0);
+      if IsNull then
+        Exit(Index * ElemSize);
+      Inc(Index);
+    end;
+    Result := -1;
+  end;
+
+  // Decodes the block as text. Without a terminator the block's end is wherever
+  // `count` happened to fall, so it is moved back to a whole character.
+  procedure AddTextView(Fmt: TMemoryFormat);
+  begin
+    var EffectiveCodePage: Cardinal := CP_UTF8;
+    if Fmt = mfAnsi then
+      EffectiveCodePage := GetACP;
+    if CodePage <> 0 then
+      EffectiveCodePage := Cardinal(CodePage);
+    var ElemSize := 1;
+    if Fmt = mfUtf16 then
+      ElemSize := SizeOf(WideChar);
+    var Decoded := NullTerminatorOffset(ElemSize);
+    var FoundNull := StopAtNull and (Decoded >= 0);
+    if not FoundNull and (Fmt = mfUtf16) then
+      Decoded := WholeUtf16Prefix(Buf, Length(Buf))
+    else if not FoundNull then
+      Decoded := WholeCharacterPrefix(Buf, Length(Buf), EffectiveCodePage);
+    var Enc: TEncoding;
+    case Fmt of
+      mfUtf16: Enc := TEncoding.Unicode;
+      mfUtf8:  Enc := TEncoding.UTF8;
+    else
+      Enc := TEncoding.GetEncoding(Integer(EffectiveCodePage));
+    end;
+    try
+      var Text := Enc.GetString(Buf, 0, Decoded);
+      Obj.AddPair('format', FORMAT_NAMES[Fmt]);
+      if Fmt = mfAnsi then
+        Obj.AddPair('codePage', TJSONNumber.Create(EffectiveCodePage));
+      Obj.AddPair('bytesDecoded', TJSONNumber.Create(Decoded));
+      Obj.AddPair('chars', TJSONNumber.Create(Length(Text)));
+      if StopAtNull then
+        Obj.AddPair('stoppedAtNull', TJSONBool.Create(FoundNull));
+      Obj.AddPair('text', Text);
+    finally
+      if not TEncoding.IsStandardEncoding(Enc) then
+        Enc.Free;
+    end;
+  end;
+
 begin
-  if (Count < 1) or (Count > 4096) then begin
-    SendToolError(IdJson, 'count must be 1..4096');
+  var Fmt: TMemoryFormat;
+  if not TryParseFormat(Fmt) then begin
+    SendToolError(IdJson, Format('format must be one of "hex", "utf16", "utf8", "ansi" (got "%s").', [FormatName]));
+    Exit;
+  end;
+  var Conflict := OptionConflict(Fmt);
+  if Conflict <> '' then begin
+    SendToolError(IdJson, Conflict);
     Exit;
   end;
   if not ParseAddress(AddrStr, Addr) then begin
     SendToolError(IdJson, 'invalid address: ' + AddrStr);
     Exit;
   end;
-  var Buf: TBytes;
-  SetLength(Buf, Count);
-  if not FSession.Debugger.ReadProcessMemoryAt(Addr, @Buf[0], Count) then begin
+  if FSession.Debugger = nil then begin
+    SendToolError(IdJson, 'No debuggee: launch or attach first.');
+    Exit;
+  end;
+  var FailedAt: UInt64;
+  if ReadMemoryPrefix(FSession.Debugger, Addr, Count, Buf, FailedAt) = 0 then begin
     SendToolError(IdJson, Format('read failed at 0x%x (%d bytes)', [Addr, Count]));
     Exit;
   end;
-  var Hex := '';
-  for var B in Buf do
-    Hex := Hex + IntToHex(B, 2);
-  var Obj := TJSONObject.Create;
+  Obj := TJSONObject.Create;
   Obj.AddPair('address', Format('0x%x', [Addr]));
   Obj.AddPair('count', TJSONNumber.Create(Count));
-  Obj.AddPair('hex', Hex);
-  // Little-endian integer views for the common widths, for reading VMT slots
-  // and record fields without hand-assembling the bytes.
-  if Count >= 8 then Obj.AddPair('u64le', TJSONNumber.Create(PUInt64(@Buf[0])^));
-  if Count >= 4 then Obj.AddPair('u32le', TJSONNumber.Create(Int64(PCardinal(@Buf[0])^)));
-  if Count >= 2 then Obj.AddPair('u16le', TJSONNumber.Create(PWord(@Buf[0])^));
+  if (Fmt <> mfHex) or (FailedAt <> 0) then
+    Obj.AddPair('bytesRead', TJSONNumber.Create(Length(Buf)));
+  if FailedAt <> 0 then begin
+    Obj.AddPair('partial', TJSONBool.Create(True));
+    Obj.AddPair('failedAt', Format('0x%x', [FailedAt]));
+  end;
+  if Fmt = mfHex then
+    AddHexView
+  else
+    AddTextView(Fmt);
   SendToolJson(IdJson, Obj);
 end;
 

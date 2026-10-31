@@ -117,13 +117,51 @@ function FormatDelphiDateTime(V: Double): string;
 // Render a byte buffer as "XX(c) XX(c) ..." (RawByteString display).
 function FormatHexAscii(const Bytes: TBytes): string;
 
+const
+  // How much of a string the readers return before they truncate it, in the
+  // string's own Length units: UTF-16 code units for UnicodeString, WideString
+  // and PWideChar, bytes for the AnsiString family and PAnsiChar. Every display
+  // path (DAP variables, hover, watches, MCP lists) reads with the default; an
+  // MCP request for a single value may raise it up to the ceiling
+  // (TDebugSession.MaxStringLength).
+  DEFAULT_MAX_STRING_LENGTH = 4096;
+  MAX_STRING_LENGTH_CEILING = 1048576;
+  // U+2026, the first character of every truncation marker ('…(N chars total)').
+  // A code point rather than a literal: this file has no BOM, so dcc reads it
+  // as ANSI, and a literal '…' compiled into the three characters 'â€¦'.
+  TRUNCATION_MARK = #$2026;
+
+// Length of the longest prefix of Bytes[0..Len) that does not end inside a
+// multi-byte character of the given code page: a UTF-8 sequence (65001) or a
+// DBCS lead byte (any code page whose characters are at most two bytes). 0
+// means the process's ANSI code page; $FFFF (RawByteString) is raw bytes and is
+// never trimmed. Used wherever a reader cuts a string short.
+function WholeCharacterPrefix(const Bytes: TBytes; Len: Integer; CodePage: Cardinal): Integer;
+
+// Same for UTF-16: drops a high surrogate left without its low half.
+function WholeUtf16Prefix(const Bytes: TBytes; Len: Integer): Integer;
+
 type
   TDelphiValueReader = class
+  private
+    function StringLimit: Integer;
+    function NeedsLengthVerification(ClaimedLength: Integer): Boolean;
+    function WhyStrRecLengthIsNotTrusted(Ptr: UInt64; ElemSize: Word;
+      ClaimedLength: Integer): string;
+    function WhyBstrLengthIsNotTrusted(Ptr: UInt64; ByteLength: Integer): string;
+    function ReadLengthPrefixedPayload(Ptr: UInt64; ElemSize, ClaimedLength: Integer;
+      const DistrustReason: string; out Bytes: TBytes; out Marker: string): Boolean;
+    function ReadNullTerminated(Ptr: UInt64; ElemSize: Integer; out Bytes: TBytes;
+      out Marker: string): Boolean;
   public
     // Set by the owner as they become available. Rtti may stay nil early.
     Debugger:  IDebugTarget;
     Rtti:      TDelphiRtti;
     DebugInfo: TDebugInfoSet;   // type kind / enum / size lookups (formatting)
+    // The single truncation limit of every string reader below, in the string's
+    // Length units. DEFAULT_MAX_STRING_LENGTH unless an owner raises it for one
+    // request and restores it afterwards.
+    MaxStringLength: Integer;
 
     constructor Create(ADebugInfo: TDebugInfoSet; ADebugger: IDebugTarget;
       ARtti: TDelphiRtti);
@@ -141,7 +179,11 @@ type
     function ReadUtf16Prefixed(Ptr: UInt64; LengthIsBytes: Boolean;
                out S: string): Boolean;
     function ReadDelphiAnsiString(Ptr: UInt64; out S: string): Boolean;
-    function ReadDelphiAnsiBytes(Ptr: UInt64; out Bytes: TBytes): Boolean;
+    // Marker is '' when Bytes is the whole string, otherwise the text a caller
+    // appends to say what is missing ('<TRUNCATION_MARK>(N chars total)' and its
+    // siblings).
+    function ReadDelphiAnsiBytes(Ptr: UInt64; out Bytes: TBytes;
+      out Marker: string): Boolean;
     // Encoding recorded in the string's own header (TStrRec.codePage, a Word at
     // Ptr-12) -- NOT the machine's system ANSI code page. Caller must Free the
     // result when it is not a standard singleton (TEncoding.IsStandardEncoding).
@@ -422,6 +464,97 @@ begin
   end;
 end;
 
+function Utf8SequenceLength(Lead: Byte): Integer;
+begin
+  if Lead < $C0 then
+    Exit(1);
+  if Lead < $E0 then
+    Exit(2);
+  if Lead < $F0 then
+    Exit(3);
+  if Lead < $F8 then
+    Exit(4);
+  Result := 1;
+end;
+
+function WholeUtf8Prefix(const Bytes: TBytes; Len: Integer): Integer;
+const
+  MAX_CONTINUATION_BYTES = 3;
+begin
+  var LeadIndex := Len - 1;
+  var Continuations := 0;
+  while (LeadIndex >= 0) and (Continuations <= MAX_CONTINUATION_BYTES) and
+        ((Bytes[LeadIndex] and $C0) = $80) do begin
+    Dec(LeadIndex);
+    Inc(Continuations);
+  end;
+  // Nothing but continuation bytes, or more of them than any sequence has:
+  // this is not UTF-8, and there is no character boundary to respect.
+  if (LeadIndex < 0) or (Continuations > MAX_CONTINUATION_BYTES) then
+    Exit(Len);
+  if Len - LeadIndex < Utf8SequenceLength(Bytes[LeadIndex]) then
+    Exit(LeadIndex);
+  Result := Len;
+end;
+
+// A trail byte of a DBCS can have the value of a lead byte, so the boundary is
+// found by walking from the start, never by looking backwards.
+function WholeDbcsPrefix(const Bytes: TBytes; Len: Integer; CodePage: Cardinal): Integer;
+begin
+  var CharStart := 0;
+  while CharStart < Len do begin
+    var CharLen := 1;
+    if IsDBCSLeadByteEx(CodePage, Bytes[CharStart]) then
+      CharLen := 2;
+    if CharStart + CharLen > Len then
+      Exit(CharStart);
+    Inc(CharStart, CharLen);
+  end;
+  Result := Len;
+end;
+
+function WholeCharacterPrefix(const Bytes: TBytes; Len: Integer; CodePage: Cardinal): Integer;
+const
+  CP_RAWBYTESTRING = $FFFF;
+begin
+  if Len <= 0 then
+    Exit(0);
+  if CodePage = CP_RAWBYTESTRING then
+    Exit(Len);
+  if CodePage = CP_ACP then
+    CodePage := GetACP;
+  if CodePage = CP_UTF8 then
+    Exit(WholeUtf8Prefix(Bytes, Len));
+  var Info: TCPInfo;
+  if GetCPInfo(CodePage, Info) and (Info.MaxCharSize = 2) then
+    Exit(WholeDbcsPrefix(Bytes, Len, CodePage));
+  Result := Len;
+end;
+
+function WholeUtf16Prefix(const Bytes: TBytes; Len: Integer): Integer;
+begin
+  Result := Len - Len mod SizeOf(WideChar);
+  if Result < SizeOf(WideChar) then
+    Exit;
+  var LastUnit := PWord(@Bytes[Result - SizeOf(WideChar)])^;
+  if (LastUnit >= $D800) and (LastUnit <= $DBFF) then
+    Dec(Result, SizeOf(WideChar));
+end;
+
+type
+  // Delphi's long-string header, the 12 bytes below the character data. Same
+  // offsets on both bitnesses (Win64 adds 4 bytes of padding BELOW it), see
+  // TWinDebugger.AllocateRemoteString and TVariableExpander.ValueByteSize.
+  TStrRecHeader = packed record
+    CodePage: Word;
+    ElemSize: Word;
+    RefCnt:   Integer;
+    Length:   Integer;
+  end;
+
+const
+  CP_UTF16LE = 1200;
+
 { TDelphiValueReader }
 
 constructor TDelphiValueReader.Create(ADebugInfo: TDebugInfoSet;
@@ -431,6 +564,163 @@ begin
   DebugInfo := ADebugInfo;
   Debugger  := ADebugger;
   Rtti      := ARtti;
+  MaxStringLength := DEFAULT_MAX_STRING_LENGTH;
+end;
+
+function TDelphiValueReader.StringLimit: Integer;
+begin
+  Result := EnsureRange(MaxStringLength, 1, MAX_STRING_LENGTH_CEILING);
+end;
+
+// Up to the default limit a length is used the way it always was. Beyond it the
+// reader is about to read, allocate and display far more than usual, and the
+// length came out of target memory: on an uninitialised or freed variable it is
+// garbage. So it is checked first.
+function TDelphiValueReader.NeedsLengthVerification(ClaimedLength: Integer): Boolean;
+begin
+  Result := (ClaimedLength > DEFAULT_MAX_STRING_LENGTH) and
+            (StringLimit > DEFAULT_MAX_STRING_LENGTH);
+end;
+
+// '' when the header of a UnicodeString (ElemSize 2) or an AnsiString-family
+// string (ElemSize 1) supports the length it claims; otherwise why not.
+function TDelphiValueReader.WhyStrRecLengthIsNotTrusted(Ptr: UInt64; ElemSize: Word;
+  ClaimedLength: Integer): string;
+begin
+  var Header: TStrRecHeader;
+  if not Debugger.ReadProcessMemoryAt(Ptr - SizeOf(Header), @Header, SizeOf(Header)) then
+    Exit('the string header is not readable');
+  if Header.ElemSize <> ElemSize then
+    Exit(Format('element size %d in the header, expected %d', [Header.ElemSize, ElemSize]));
+  if (ElemSize = SizeOf(WideChar)) and (Header.CodePage <> CP_UTF16LE) then
+    Exit(Format('code page %d in the header, expected %d', [Header.CodePage, CP_UTF16LE]));
+  if (Header.RefCnt <> -1) and (Header.RefCnt < 1) then
+    Exit(Format('reference count %d in the header', [Header.RefCnt]));
+  var ByteLength := UInt64(ClaimedLength) * ElemSize;
+  if not Debugger.IsRangeReadable(Ptr, ByteLength) then
+    Exit(Format('[0x%x, 0x%x) is not readable memory', [Ptr, Ptr + ByteLength]));
+  Result := '';
+end;
+
+// A WideString (BSTR) has no header beyond its byte length, so what can be
+// checked is the length itself and the terminator SysAllocStringLen puts after
+// the last character.
+function TDelphiValueReader.WhyBstrLengthIsNotTrusted(Ptr: UInt64; ByteLength: Integer): string;
+begin
+  if Odd(ByteLength) then
+    Exit(Format('odd byte length %d', [ByteLength]));
+  if not Debugger.IsRangeReadable(Ptr, UInt64(ByteLength) + SizeOf(WideChar)) then
+    Exit(Format('[0x%x, 0x%x) is not readable memory', [Ptr, Ptr + UInt64(ByteLength)]));
+  var Terminator: Word := $FFFF;
+  if not Debugger.ReadProcessMemoryAt(Ptr + UInt64(ByteLength), @Terminator, SizeOf(Terminator)) or
+     (Terminator <> 0) then
+    Exit('no null terminator after the last character');
+  Result := '';
+end;
+
+// Reads the character data of a length-prefixed string, at most StringLimit
+// elements -- or the default limit when the length was not trusted -- in
+// chunks, keeping what was readable when a chunk fails. A cut that is not the
+// string's real end is moved back to a whole character by the caller, which
+// knows the encoding. False only when not a single element could be read.
+function TDelphiValueReader.ReadLengthPrefixedPayload(Ptr: UInt64;
+  ElemSize, ClaimedLength: Integer; const DistrustReason: string;
+  out Bytes: TBytes; out Marker: string): Boolean;
+begin
+  Marker := '';
+  var Limit := StringLimit;
+  if DistrustReason <> '' then
+    Limit := Min(Limit, DEFAULT_MAX_STRING_LENGTH);
+  var Elements := Min(ClaimedLength, Limit);
+  var FailedAt: UInt64;
+  var Got := ReadMemoryPrefix(Debugger, Ptr, Elements * ElemSize, Bytes, FailedAt);
+  SetLength(Bytes, Got - Got mod ElemSize);
+  if Length(Bytes) = 0 then
+    Exit(False);
+  if FailedAt <> 0 then
+    Marker := Format(TRUNCATION_MARK + '(%d of %d chars readable; read failed at 0x%x)',
+      [Length(Bytes) div ElemSize, ClaimedLength, FailedAt])
+  else if DistrustReason <> '' then
+    Marker := Format(TRUNCATION_MARK + '(header claims %d chars; length not trusted: %s)',
+      [ClaimedLength, DistrustReason])
+  else if Elements < ClaimedLength then
+    Marker := Format(TRUNCATION_MARK + '(%d chars total)', [ClaimedLength]);
+  Result := True;
+end;
+
+// Reads a null-terminated string of ElemSize-byte elements, at most StringLimit
+// of them. Each read ends on a page boundary and, when a multi-page read fails,
+// is retried up to the end of the current page only: a terminator near the end
+// of the last readable page is then found without touching the page after it.
+function TDelphiValueReader.ReadNullTerminated(Ptr: UInt64; ElemSize: Integer;
+  out Bytes: TBytes; out Marker: string): Boolean;
+const
+  CHUNK_SIZE = 64 * 1024;
+var
+  Acc: TBytes;
+  Used: Integer;
+
+  function ElementIsTerminator(Index: Integer): Boolean;
+  begin
+    for var B := Index * ElemSize to (Index + 1) * ElemSize - 1 do
+      if Acc[B] <> 0 then
+        Exit(False);
+    Result := True;
+  end;
+
+  // Appends the next readable piece of the string to Acc; False when nothing at
+  // the cursor is readable.
+  function ReadNextPiece(MaxBytes: Integer): Boolean;
+  begin
+    var Cursor := Ptr + UInt64(Used);
+    var ToPageEnd := TARGET_PAGE_SIZE - Integer(Cursor mod TARGET_PAGE_SIZE);
+    var WholePages := (CHUNK_SIZE - ToPageEnd) div TARGET_PAGE_SIZE * TARGET_PAGE_SIZE;
+    var Want := Min(MaxBytes - Used, ToPageEnd + WholePages);
+    if Length(Acc) < Used + Want then
+      SetLength(Acc, Max(Used + Want, 2 * Length(Acc)));
+    if not Debugger.ReadProcessMemoryAt(Cursor, @Acc[Used], Want) then begin
+      if Want <= ToPageEnd then
+        Exit(False);
+      Want := ToPageEnd;
+      if not Debugger.ReadProcessMemoryAt(Cursor, @Acc[Used], Want) then
+        Exit(False);
+    end;
+    Inc(Used, Want);
+    Result := True;
+  end;
+
+begin
+  Marker := '';
+  SetLength(Bytes, 0);
+  if Ptr = 0 then
+    Exit(False);
+  var Limit := StringLimit;
+  // One element past the limit: a terminator exactly there is a string of
+  // exactly Limit characters, not a truncated one.
+  var MaxBytes := (Limit + 1) * ElemSize;
+  Used := 0;
+  var Scanned := 0;
+  while Used < MaxBytes do begin
+    if not ReadNextPiece(MaxBytes) then
+      Break;
+    while (Scanned + 1) * ElemSize <= Used do begin
+      if ElementIsTerminator(Scanned) then begin
+        Bytes := Copy(Acc, 0, Scanned * ElemSize);
+        Exit(True);
+      end;
+      Inc(Scanned);
+    end;
+  end;
+  if Scanned = 0 then
+    Exit(False);
+  var Elements := Min(Scanned, Limit);
+  Bytes := Copy(Acc, 0, Elements * ElemSize);
+  if Used >= MaxBytes then
+    Marker := Format(TRUNCATION_MARK + '(more than %d chars)', [Limit])
+  else
+    Marker := Format(TRUNCATION_MARK + '(%d chars read, no terminator before unreadable memory at 0x%x)',
+      [Elements, Ptr + UInt64(Used)]);
+  Result := True;
 end;
 
 function TDelphiValueReader.ReadDelphiUnicodeString(Ptr: UInt64; out S: string): Boolean;
@@ -448,49 +738,38 @@ begin
   Result := ReadUtf16Prefixed(Ptr, True, S);
 end;
 
+// Reads at most StringLimit characters and surfaces a longer string as its
+// truncated content plus a marker, never as an empty string.
 function TDelphiValueReader.ReadUtf16Prefixed(Ptr: UInt64; LengthIsBytes: Boolean;
   out S: string): Boolean;
-const
-  MAX_LEN = 4096;
 var
-  StrLen: Integer;
-  Buf: TBytes;
+  RawLength: Integer;
 begin
-  Result := False;
   S := '';
-  if Ptr = 0 then begin
-    S := '';
-    Result := True;
-    Exit;
-  end;
-  if not Debugger.ReadProcessMemoryAt(Ptr - 4, @StrLen, 4) then
-    Exit;
+  if Ptr = 0 then
+    Exit(True);
+  if not Debugger.ReadProcessMemoryAt(Ptr - 4, @RawLength, 4) then
+    Exit(False);
+  var CharCount := RawLength;
   if LengthIsBytes then
-    StrLen := StrLen div SizeOf(WideChar);
-  if StrLen < 0 then begin
-    S := '';
-    Result := True;
-    Exit;
+    CharCount := RawLength div SizeOf(WideChar);
+  if CharCount <= 0 then
+    Exit(True);
+  var DistrustReason := '';
+  if NeedsLengthVerification(CharCount) then begin
+    if LengthIsBytes then
+      DistrustReason := WhyBstrLengthIsNotTrusted(Ptr, RawLength)
+    else
+      DistrustReason := WhyStrRecLengthIsNotTrusted(Ptr, SizeOf(WideChar), CharCount);
   end;
-  if StrLen = 0 then begin
-    S := '';
-    Result := True;
-    Exit;
-  end;
-  // Cap the READ at MAX_LEN chars but surface the truncated content + a
-  // marker, instead of dropping a long string to empty.
-  var ReadChars := StrLen;
-  var Truncated := False;
-  if ReadChars > MAX_LEN then begin
-    ReadChars := MAX_LEN;
-    Truncated := True;
-  end;
-  SetLength(Buf, ReadChars * 2);
-  if not Debugger.ReadProcessMemoryAt(Ptr, @Buf[0], ReadChars * 2) then
-    Exit;
-  S := TEncoding.Unicode.GetString(Buf);
-  if Truncated then
-    S := S + Format('…(%d chars total)', [StrLen]);
+  var Buf: TBytes;
+  var Marker: string;
+  if not ReadLengthPrefixedPayload(Ptr, SizeOf(WideChar), CharCount, DistrustReason, Buf, Marker) then
+    Exit(False);
+  var Kept := Length(Buf);
+  if Marker <> '' then
+    Kept := WholeUtf16Prefix(Buf, Kept);
+  S := TEncoding.Unicode.GetString(Buf, 0, Kept) + Marker;
   Result := True;
 end;
 
@@ -522,106 +801,79 @@ end;
 function TDelphiValueReader.ReadDelphiAnsiString(Ptr: UInt64; out S: string): Boolean;
 var
   Bytes: TBytes;
+  Marker: string;
 begin
   S := '';
-  Result := ReadDelphiAnsiBytes(Ptr, Bytes);
-  if not Result or (Length(Bytes) = 0) then Exit;
+  Result := ReadDelphiAnsiBytes(Ptr, Bytes, Marker);
+  if not Result or (Length(Bytes) = 0) then
+    Exit;
   var Enc := AnsiEncodingFor(Ptr);
   try
-    S := Enc.GetString(Bytes);
+    S := Enc.GetString(Bytes) + Marker;
   finally
     if not TEncoding.IsStandardEncoding(Enc) then
       Enc.Free;
   end;
 end;
 
-function TDelphiValueReader.ReadDelphiAnsiBytes(Ptr: UInt64; out Bytes: TBytes): Boolean;
-const
-  MAX_LEN = 4096;
+// A string longer than the limit used to come back as zero bytes with success,
+// so a long AnsiString or UTF8String displayed as '' with nothing to say so. It
+// now comes back truncated -- at a whole character of its own code page -- with
+// the same marker the UTF-16 readers use.
+function TDelphiValueReader.ReadDelphiAnsiBytes(Ptr: UInt64; out Bytes: TBytes;
+  out Marker: string): Boolean;
 var
   StrLen: Integer;
 begin
-  Result := False;
   SetLength(Bytes, 0);
-  if Ptr = 0 then begin
-    Result := True;
-    Exit;
-  end;
+  Marker := '';
+  if Ptr = 0 then
+    Exit(True);
   if not Debugger.ReadProcessMemoryAt(Ptr - 4, @StrLen, 4) then
-    Exit;
-  if (StrLen <= 0) or (StrLen > MAX_LEN) then begin
-    Result := True;
-    Exit;
+    Exit(False);
+  if StrLen <= 0 then
+    Exit(True);
+  var DistrustReason := '';
+  if NeedsLengthVerification(StrLen) then
+    DistrustReason := WhyStrRecLengthIsNotTrusted(Ptr, SizeOf(AnsiChar), StrLen);
+  if not ReadLengthPrefixedPayload(Ptr, SizeOf(AnsiChar), StrLen, DistrustReason, Bytes, Marker) then
+    Exit(False);
+  if Marker <> '' then begin
+    var CodePage: Word := CP_ACP;
+    Debugger.ReadProcessMemoryAt(Ptr - SizeOf(TStrRecHeader), @CodePage, SizeOf(CodePage));
+    SetLength(Bytes, WholeCharacterPrefix(Bytes, Length(Bytes), CodePage));
   end;
-  SetLength(Bytes, StrLen);
-  if not Debugger.ReadProcessMemoryAt(Ptr, @Bytes[0], StrLen) then
-    Exit;
   Result := True;
 end;
 
 function TDelphiValueReader.ReadNullTerminatedAnsi(Ptr: UInt64; out S: string): Boolean;
-const
-  MAX_LEN = 4096;
-  CHUNK   = 256;
 var
-  Buf: TBytes;
-  Len, Read: Integer;
+  Bytes: TBytes;
+  Marker: string;
 begin
-  Result := False;
   S := '';
-  if Ptr = 0 then
-    Exit;
-  SetLength(Buf, CHUNK);
-  Len := 0;
-  while Len < MAX_LEN do begin
-    Read := CHUNK;
-    if Len + Read > MAX_LEN then
-      Read := MAX_LEN - Len;
-    if not Debugger.ReadProcessMemoryAt(Ptr + UInt64(Len), @Buf[0], Read) then
-      Exit;
-    for var I := 0 to Read - 1 do begin
-      if Buf[I] = 0 then begin
-        S := TEncoding.ANSI.GetString(Buf, 0, I);
-        Exit(True);
-      end;
-    end;
-    Inc(Len, Read);
-    S := S + TEncoding.ANSI.GetString(Buf, 0, Read);
-  end;
-  Result := True; // returned truncated at MAX_LEN
+  if not ReadNullTerminated(Ptr, SizeOf(AnsiChar), Bytes, Marker) then
+    Exit(False);
+  var Kept := Length(Bytes);
+  if Marker <> '' then
+    Kept := WholeCharacterPrefix(Bytes, Kept, CP_ACP);
+  S := TEncoding.ANSI.GetString(Bytes, 0, Kept) + Marker;
+  Result := True;
 end;
 
 function TDelphiValueReader.ReadNullTerminatedUtf16(Ptr: UInt64; out S: string): Boolean;
-const
-  MAX_CHARS = 4096;
-  CHUNK     = 256;
 var
-  Buf: TBytes;
-  Chars, Read: Integer;
+  Bytes: TBytes;
+  Marker: string;
 begin
-  Result := False;
   S := '';
-  if Ptr = 0 then
-    Exit;
-  SetLength(Buf, CHUNK * 2);
-  Chars := 0;
-  while Chars < MAX_CHARS do begin
-    Read := CHUNK;
-    if Chars + Read > MAX_CHARS then
-      Read := MAX_CHARS - Chars;
-    if not Debugger.ReadProcessMemoryAt(Ptr + UInt64(Chars * 2), @Buf[0],
-        Read * 2) then
-      Exit;
-    for var I := 0 to Read - 1 do begin
-      if PWord(@Buf[I * 2])^ = 0 then begin
-        S := TEncoding.Unicode.GetString(Buf, 0, I * 2);
-        Exit(True);
-      end;
-    end;
-    Inc(Chars, Read);
-    S := S + TEncoding.Unicode.GetString(Buf, 0, Read * 2);
-  end;
-  Result := True; // truncated
+  if not ReadNullTerminated(Ptr, SizeOf(WideChar), Bytes, Marker) then
+    Exit(False);
+  var Kept := Length(Bytes);
+  if Marker <> '' then
+    Kept := WholeUtf16Prefix(Bytes, Kept);
+  S := TEncoding.Unicode.GetString(Bytes, 0, Kept) + Marker;
+  Result := True;
 end;
 
 // Formatting routines below intentionally bit-reinterpret raw memory across
@@ -1273,10 +1525,33 @@ function TDelphiValueReader.FormatLocalValue(const V: TLocalValue): string;
   // types whose TTypeInfo wasn't parsed. Handles UnicodeString / AnsiString /
   // WideString / RawByteString / UTF8String / user-declared aliases of any
   // of the above.
+  // RawByteString: the printable-ASCII view, then the bytes in hex. A truncation
+  // marker goes after the ASCII view, inside the quotes, as on every string.
+  function FormatRawByteString(Ptr: UInt64): string;
+  var
+    Bytes:  TBytes;
+    Marker: string;
+  begin
+    if not ReadDelphiAnsiBytes(Ptr, Bytes, Marker) then
+      Exit(Format('@0x%x (raw read failed)', [Ptr]));
+    var AsciiText := TStringBuilder.Create(Length(Bytes) + Length(Marker));
+    try
+      for var B in Bytes do
+        if (B >= 32) and (B < 127) then
+          AsciiText.Append(Char(B))
+        else
+          AsciiText.Append('.');
+      AsciiText.Append(Marker);
+      Result := Format('''%s''  [%s]  (@0x%x)',
+        [AsciiText.ToString, FormatHexAscii(Bytes), Ptr]);
+    finally
+      AsciiText.Free;
+    end;
+  end;
+
   function FormatStringByPointer(Ptr: UInt64; const TypeName: string): string;
   var
     Decoded: string;
-    Bytes:   TBytes;
     Kind:    Byte;
   begin
     Result := '';
@@ -1299,19 +1574,8 @@ function TDelphiValueReader.FormatLocalValue(const V: TLocalValue): string;
       TK_LSTRING: begin
         // AnsiString family. RawByteString needs the hex/ascii view; other
         // AnsiString aliases get the decoded-with-codepage rendering.
-        if SameText(TypeName, 'RawByteString') then begin
-          if ReadDelphiAnsiBytes(Ptr, Bytes) then begin
-            var AsciiText := '';
-            for var B in Bytes do
-              if (B >= 32) and (B < 127) then
-                AsciiText := AsciiText + Char(B)
-              else
-                AsciiText := AsciiText + '.';
-            Exit(Format('''%s''  [%s]  (@0x%x)',
-              [AsciiText, FormatHexAscii(Bytes), Ptr]));
-          end;
-          Exit(Format('@0x%x (raw read failed)', [Ptr]));
-        end;
+        if SameText(TypeName, 'RawByteString') then
+          Exit(FormatRawByteString(Ptr));
         if ReadDelphiAnsiString(Ptr, Decoded) then
           Exit(Format('''%s''  (@0x%x)', [Decoded, Ptr]));
         Exit(Format('@0x%x (string read failed)', [Ptr]));
@@ -1336,25 +1600,19 @@ function TDelphiValueReader.FormatLocalValue(const V: TLocalValue): string;
 
     // Kind = 0 / unrecognised: fall back to the by-name table for types
     // whose TTypeInfo wasn't parsed.
-    if (TypeName = 'UnicodeString') or (TypeName = 'string') or
-       (TypeName = 'WideString') then begin
+    if (TypeName = 'UnicodeString') or (TypeName = 'string') then begin
       if ReadDelphiUnicodeString(Ptr, Decoded) then
         Exit(Format('''%s''  (@0x%x)', [Decoded, Ptr]));
       Exit(Format('@0x%x (string read failed)', [Ptr]));
     end;
-    if TypeName = 'RawByteString' then begin
-      if ReadDelphiAnsiBytes(Ptr, Bytes) then begin
-        var AsciiText := '';
-        for var B in Bytes do
-          if (B >= 32) and (B < 127) then
-            AsciiText := AsciiText + Char(B)
-          else
-            AsciiText := AsciiText + '.';
-        Exit(Format('''%s''  [%s]  (@0x%x)',
-          [AsciiText, FormatHexAscii(Bytes), Ptr]));
-      end;
-      Exit(Format('@0x%x (raw read failed)', [Ptr]));
+    // BSTR: the prefix is a byte count, as in the TK_WSTRING branch above.
+    if TypeName = 'WideString' then begin
+      if ReadDelphiWideString(Ptr, Decoded) then
+        Exit(Format('''%s''  (@0x%x)', [Decoded, Ptr]));
+      Exit(Format('@0x%x (string read failed)', [Ptr]));
     end;
+    if TypeName = 'RawByteString' then
+      Exit(FormatRawByteString(Ptr));
     if (TypeName = 'AnsiString') or (TypeName = 'UTF8String') then begin
       if ReadDelphiAnsiString(Ptr, Decoded) then
         Exit(Format('''%s''  (@0x%x)', [Decoded, Ptr]));
@@ -1442,7 +1700,7 @@ function TDelphiValueReader.FormatLocalValue(const V: TLocalValue): string;
     end;
     Result := '[' + string.Join(', ', Parts);
     if Len > Shown then
-      Result := Result + Format(', …(%d total)', [Len]);
+      Result := Result + Format(', ' + TRUNCATION_MARK + '(%d total)', [Len]);
     Result := Result + ']';
   end;
 

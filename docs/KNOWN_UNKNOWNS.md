@@ -1581,9 +1581,11 @@ investigation belong here instead.
   reading an unassigned slot and disagreeing about garbage.
 
   Checked while there, because that uninitialised read declared a string of
-  15 144 541 characters: `TDelphiValueReader` caps the read at `MAX_LEN = 4096`
-  and appends `…(N chars total)`. A bogus length is not trusted. Correct as
-  designed, recorded because a garbage length is precisely where an unbounded
+  15 144 541 characters: `TDelphiValueReader` caps the read at its
+  `MaxStringLength` (4096 unless an MCP request raises it) and appends
+  `…(N chars total)`; above 4096 a length is believed only after the header and
+  the memory range check out (`DAP_DEBUGGER_ARCHITECTURE.md`, "String length
+  limit"). Recorded because a garbage length is precisely where an unbounded
   read would bite.
 
 Still open there, unchanged and all low: F5 (opaque pointer fields show an empty

@@ -59,6 +59,42 @@ type
     [Test] procedure DynArrayHeader_Win32ImageReadAsWin64_IsWrong;
   end;
 
+  // The string readers' single truncation limit (TDelphiValueReader.
+  // MaxStringLength, the MCP `maxStringLength`) against a fake memory window:
+  // when a length from target memory is believed, what a partial read keeps,
+  // that a cut never splits a character, and the PAnsiChar/PWideChar readers'
+  // accumulation and page-edge behaviour.
+  [TestFixture]
+  TStringReaderLimitTests = class
+  public
+    // Above the default limit a header length is believed only when the header
+    // is plausible and the memory is readable; otherwise the default applies.
+    [Test] procedure UnicodeString_HugeGarbageLength_NotTrusted;
+    [Test] procedure UnicodeString_WrongCodePage_NotTrusted;
+    [Test] procedure AnsiString_ZeroRefCount_NotTrusted;
+    [Test] procedure WideString_MissingTerminator_NotTrusted;
+    [Test] procedure UnicodeString_PlausibleHeader_ReadWhole;
+    // At the default limit nothing is verified: today's behaviour, unchanged.
+    [Test] procedure UnicodeString_DefaultLimit_TruncatesWithMarker;
+    // Defect: a long AnsiString came back as '' with success.
+    [Test] procedure AnsiString_OverDefault_TruncatedWithMarker;
+    [Test] procedure PartialRead_KeepsTheReadablePrefix;
+    [Test] procedure Truncation_DoesNotSplitASurrogatePair;
+    [Test] procedure Truncation_DoesNotSplitAUtf8Sequence;
+    [Test] procedure WholeCharacterPrefix_Dbcs_WalksFromTheStart;
+    // Defect: a pointer string longer than one 256-element chunk kept only its
+    // last chunk.
+    [Test] procedure PWideChar_300Chars_ReadWhole;
+    [Test] procedure PAnsiChar_300Chars_ReadWhole;
+    [Test] procedure PAnsiChar_OverLimit_MarkedAsTruncated;
+    [Test] procedure PWideChar_ExactlyAtLimit_NoMarker;
+    // Defect: a fixed 256-element chunk ran past a terminator near the end of a
+    // readable region and failed the whole read.
+    [Test] procedure PAnsiChar_TerminatorAtPageEdge_Found;
+    [Test] procedure PWideChar_TerminatorAtPageEdge_Found;
+    [Test] procedure PAnsiChar_NoTerminatorBeforeUnreadable_MarkedPartial;
+  end;
+
   // The debug-info provider interfaces are looked up by GUID with `Supports`,
   // which does not care whether two of them share one. Duplicating a GUID hands
   // out the WRONG vtable, so a call lands on whichever method occupies that slot
@@ -88,7 +124,7 @@ type
 implementation
 
 uses
-  System.SysUtils, System.TypInfo, Winapi.Windows,
+  System.SysUtils, System.TypInfo, System.Math, Winapi.Windows,
   DebugInfoTypes, DebugTarget, DebugInfoSet, DelphiValueReaders, ExceptionRules,
   ValueEncoders, TargetLayout, Disassembler, WinDebuggerBase;
 
@@ -118,6 +154,7 @@ type
     procedure SetLayout(const ALayout: TTargetLayout);
     function  TargetLayout: TTargetLayout;
     function  ReadProcessMemoryAt(VA: UInt64; Buf: Pointer; Size: NativeUInt): Boolean;
+    function  IsRangeReadable(VA, Size: UInt64): Boolean;
     function  ReadCodeMemoryAt(VA: UInt64; Buf: Pointer; Size: NativeUInt): NativeUInt;
     function  NearestInstructionBoundaryBefore(VA: UInt64; out BoundaryVA: UInt64): Boolean;
     function  NearestExportedEntryBefore(VA: UInt64; out BoundaryVA: UInt64): Boolean;
@@ -243,6 +280,16 @@ begin
   if (VA < FBase) or (VA + Size > FBase + UInt64(Length(FMem))) then Exit;
   Move(FMem[VA - FBase], Buf^, Size);
   Result := True;
+end;
+
+// The fake's whole byte window is "committed"; everything outside it is not.
+function TFakeMemTarget.IsRangeReadable(VA, Size: UInt64): Boolean;
+begin
+  if Size = 0 then
+    Exit(True);
+  if VA < FBase then
+    Exit(False);
+  Result := VA + Size <= FBase + UInt64(Length(FMem));
 end;
 
 // No breakpoints exist on this fake (there is no live process), so this is
@@ -656,6 +703,250 @@ begin
     'a default-code-page AnsiString must still decode as before');
 end;
 
+{ TStringReaderLimitTests }
+
+const
+  STRREC_HEADER_SIZE = 12;
+  CEILING_LIMIT      = 1048576;
+  FAKE_PAGE_SIZE     = 4096;
+
+type
+  TStringKind = (skUnicode, skWide, skAnsi, skPAnsi, skPWide);
+
+function PatternOf(Count: Integer): string;
+begin
+  SetLength(Result, Count);
+  for var I := 1 to Count do
+    Result[I] := Char(Ord('a') + (I - 1) mod 26);
+end;
+
+function Utf16Bytes(const S: string): TBytes;
+begin
+  Result := TEncoding.Unicode.GetBytes(S);
+end;
+
+function AsciiBytes(const S: string): TBytes;
+begin
+  Result := TEncoding.ASCII.GetBytes(S);
+end;
+
+// A TStrRec image: the 12-byte header, then Payload, then a two-byte zero
+// terminator. The string pointer is FAKE_BASE + 12. WindowSize > 0 cuts the
+// image (the fake's readable memory) to that many bytes.
+function StrRecImage(CodePage, ElemSize: Word; RefCnt, Len: Integer; const Payload: TBytes;
+  WindowSize: Integer = 0): TBytes;
+begin
+  var Size := STRREC_HEADER_SIZE + Length(Payload) + 2;
+  if WindowSize > 0 then
+    Size := WindowSize;
+  SetLength(Result, Size);
+  FillChar(Result[0], Size, 0);
+  PWord(@Result[0])^    := CodePage;
+  PWord(@Result[2])^    := ElemSize;
+  PInteger(@Result[4])^ := RefCnt;
+  PInteger(@Result[8])^ := Len;
+  Move(Payload[0], Result[STRREC_HEADER_SIZE], Min(Length(Payload), Size - STRREC_HEADER_SIZE));
+end;
+
+function ReadStringAt(const Mem: TBytes; Ptr: UInt64; Kind: TStringKind;
+  Limit: Integer = DEFAULT_MAX_STRING_LENGTH): string;
+begin
+  var Fake: IDebugTarget := TFakeMemTarget.Create(FAKE_BASE, Mem);
+  var DI := TDebugInfoSet.Create;
+  var Reader := TDelphiValueReader.Create(DI, Fake, nil);
+  try
+    Reader.MaxStringLength := Limit;
+    var Ok := False;
+    case Kind of
+      skUnicode: Ok := Reader.ReadDelphiUnicodeString(Ptr, Result);
+      skWide:    Ok := Reader.ReadDelphiWideString(Ptr, Result);
+      skAnsi:    Ok := Reader.ReadDelphiAnsiString(Ptr, Result);
+      skPAnsi:   Ok := Reader.ReadNullTerminatedAnsi(Ptr, Result);
+      skPWide:   Ok := Reader.ReadNullTerminatedUtf16(Ptr, Result);
+    end;
+    if not Ok then
+      Result := '<read failed>';
+  finally
+    Reader.Free;
+    DI.Free;
+  end;
+end;
+
+// Real memory is readable or not a whole page at a time, and the pointer-string
+// reader relies on that; a fake window that ends mid-page would make it fail
+// where a process never could. Zero padding: a terminator for free.
+function PagePadded(const Bytes: TBytes): TBytes;
+begin
+  Result := Copy(Bytes);
+  var Pages := (Length(Bytes) + FAKE_PAGE_SIZE - 1) div FAKE_PAGE_SIZE;
+  SetLength(Result, Pages * FAKE_PAGE_SIZE);
+  if Length(Result) > Length(Bytes) then
+    FillChar(Result[Length(Bytes)], Length(Result) - Length(Bytes), 0);
+end;
+
+function ReadStrRecAt(const Mem: TBytes; Kind: TStringKind; Limit: Integer = DEFAULT_MAX_STRING_LENGTH): string;
+begin
+  Result := ReadStringAt(Mem, FAKE_BASE + STRREC_HEADER_SIZE, Kind, Limit);
+end;
+
+procedure TStringReaderLimitTests.UnicodeString_HugeGarbageLength_NotTrusted;
+begin
+  var Mem := StrRecImage(1200, 2, 1, 50000000, Utf16Bytes(PatternOf(10000)));
+  var S := ReadStrRecAt(Mem, skUnicode, CEILING_LIMIT);
+  Assert.IsTrue(S.StartsWith(PatternOf(4096) + '…(header claims 50000000 chars; length not trusted: '),
+    'a length the memory cannot hold must fall back to the default: ' + Copy(S, 4090, 200));
+  Assert.IsTrue(S.EndsWith('is not readable memory)'), Copy(S, 4090, 200));
+end;
+
+procedure TStringReaderLimitTests.UnicodeString_WrongCodePage_NotTrusted;
+begin
+  var Mem := StrRecImage(0, 2, 1, 8000, Utf16Bytes(PatternOf(8000)));
+  Assert.AreEqual(PatternOf(4096) + '…(header claims 8000 chars; length not trusted: ' +
+    'code page 0 in the header, expected 1200)', ReadStrRecAt(Mem, skUnicode, CEILING_LIMIT));
+end;
+
+procedure TStringReaderLimitTests.AnsiString_ZeroRefCount_NotTrusted;
+begin
+  var Mem := StrRecImage(0, 1, 0, 6000, AsciiBytes(PatternOf(6000)));
+  Assert.AreEqual(PatternOf(4096) + '…(header claims 6000 chars; length not trusted: ' +
+    'reference count 0 in the header)', ReadStrRecAt(Mem, skAnsi, CEILING_LIMIT));
+end;
+
+procedure TStringReaderLimitTests.WideString_MissingTerminator_NotTrusted;
+begin
+  // BSTR: a 4-byte BYTE length, the characters, and here no terminator.
+  var Data := Utf16Bytes(PatternOf(6000) + 'AA');
+  var Mem: TBytes;
+  SetLength(Mem, 4 + Length(Data));
+  PInteger(@Mem[0])^ := 12000;
+  Move(Data[0], Mem[4], Length(Data));
+  Assert.AreEqual(PatternOf(4096) + '…(header claims 6000 chars; length not trusted: ' +
+    'no null terminator after the last character)',
+    ReadStringAt(Mem, FAKE_BASE + 4, skWide, CEILING_LIMIT));
+end;
+
+procedure TStringReaderLimitTests.UnicodeString_PlausibleHeader_ReadWhole;
+begin
+  var Mem := StrRecImage(1200, 2, -1, 8000, Utf16Bytes(PatternOf(8000)));
+  Assert.AreEqual(PatternOf(8000), ReadStrRecAt(Mem, skUnicode, CEILING_LIMIT));
+end;
+
+procedure TStringReaderLimitTests.UnicodeString_DefaultLimit_TruncatesWithMarker;
+begin
+  var Plausible := StrRecImage(1200, 2, 1, 8000, Utf16Bytes(PatternOf(8000)));
+  Assert.AreEqual(PatternOf(4096) + '…(8000 chars total)', ReadStrRecAt(Plausible, skUnicode));
+  // Nothing is verified at the default limit, exactly as before.
+  var Implausible := StrRecImage(0, 0, 0, 8000, Utf16Bytes(PatternOf(8000)));
+  Assert.AreEqual(PatternOf(4096) + '…(8000 chars total)', ReadStrRecAt(Implausible, skUnicode));
+end;
+
+procedure TStringReaderLimitTests.AnsiString_OverDefault_TruncatedWithMarker;
+begin
+  var Mem := StrRecImage(0, 1, 1, 5000, AsciiBytes(PatternOf(5000)));
+  Assert.AreEqual(PatternOf(4096) + '…(5000 chars total)', ReadStrRecAt(Mem, skAnsi));
+  Assert.AreEqual(PatternOf(5000), ReadStrRecAt(Mem, skAnsi, 10000));
+end;
+
+procedure TStringReaderLimitTests.PartialRead_KeepsTheReadablePrefix;
+begin
+  // Two readable pages; the string claims 6000 characters, the default limit
+  // asks for 4096 of them (8192 bytes from FAKE_BASE + 12), and the last 12
+  // bytes of those lie past the window.
+  var Mem := StrRecImage(1200, 2, 1, 6000, Utf16Bytes(PatternOf(6000)), 2 * FAKE_PAGE_SIZE);
+  Assert.AreEqual(PatternOf(4090) + Format('…(4090 of 6000 chars readable; read failed at 0x%x)',
+    [FAKE_BASE + 2 * FAKE_PAGE_SIZE]), ReadStrRecAt(Mem, skUnicode));
+end;
+
+procedure TStringReaderLimitTests.Truncation_DoesNotSplitASurrogatePair;
+begin
+  // U+1F600 occupies units 4096 and 4097: the cut at 4096 drops its high half.
+  var Text := StringOfChar(WideChar('a'), 4095) + #$D83D#$DE00 + StringOfChar(WideChar('b'), 10);
+  var Mem := StrRecImage(1200, 2, 1, Length(Text), Utf16Bytes(Text));
+  Assert.AreEqual(StringOfChar(WideChar('a'), 4095) + Format('…(%d chars total)', [Length(Text)]),
+    ReadStrRecAt(Mem, skUnicode));
+end;
+
+procedure TStringReaderLimitTests.Truncation_DoesNotSplitAUtf8Sequence;
+begin
+  // 4095 'x' then U+20AC (E2 82 AC) ten times: byte 4096 is the first of three.
+  var Payload := AsciiBytes(StringOfChar(WideChar('x'), 4095));
+  for var I := 1 to 10 do
+    Payload := Payload + [$E2, $82, $AC];
+  var Mem := StrRecImage(65001, 1, 1, Length(Payload), Payload);
+  Assert.AreEqual(StringOfChar(WideChar('x'), 4095) + Format('…(%d chars total)', [Length(Payload)]),
+    ReadStrRecAt(Mem, skAnsi));
+end;
+
+procedure TStringReaderLimitTests.WholeCharacterPrefix_Dbcs_WalksFromTheStart;
+begin
+  var Utf8: TBytes := [$78, $E2, $82];
+  Assert.AreEqual(1, WholeCharacterPrefix(Utf8, 3, CP_UTF8), 'incomplete UTF-8 sequence');
+  Assert.AreEqual(3, WholeCharacterPrefix(Utf8, 3, $FFFF), 'RawByteString is never trimmed');
+  if not IsValidCodePage(932) then begin
+    Assert.Pass('code page 932 is not installed on this machine');
+    Exit;
+  end;
+  // Shift-JIS: $82 is a lead byte, and is also a valid TRAIL byte. 'A', then
+  // the two-byte character $82 $82, then a lone lead byte.
+  var Sjis: TBytes := [$41, $82, $82, $82];
+  Assert.AreEqual(3, WholeCharacterPrefix(Sjis, 4, 932), 'a trailing lead byte is dropped');
+  Assert.AreEqual(3, WholeCharacterPrefix(Sjis, 3, 932), 'a lead+trail pair is kept');
+  Assert.AreEqual(1, WholeCharacterPrefix(Sjis, 2, 932), 'half a pair is dropped');
+end;
+
+procedure TStringReaderLimitTests.PWideChar_300Chars_ReadWhole;
+begin
+  Assert.AreEqual(PatternOf(300), ReadStringAt(PagePadded(Utf16Bytes(PatternOf(300))), FAKE_BASE, skPWide));
+end;
+
+procedure TStringReaderLimitTests.PAnsiChar_300Chars_ReadWhole;
+begin
+  Assert.AreEqual(PatternOf(300), ReadStringAt(PagePadded(AsciiBytes(PatternOf(300))), FAKE_BASE, skPAnsi));
+end;
+
+procedure TStringReaderLimitTests.PAnsiChar_OverLimit_MarkedAsTruncated;
+begin
+  var Mem := PagePadded(AsciiBytes(PatternOf(5000)));
+  Assert.AreEqual(PatternOf(4096) + '…(more than 4096 chars)', ReadStringAt(Mem, FAKE_BASE, skPAnsi));
+  Assert.AreEqual(PatternOf(5000), ReadStringAt(Mem, FAKE_BASE, skPAnsi, 10000));
+end;
+
+procedure TStringReaderLimitTests.PWideChar_ExactlyAtLimit_NoMarker;
+begin
+  // 8192 bytes of text: the terminator is the first element of the third page.
+  Assert.AreEqual(PatternOf(4096), ReadStringAt(PagePadded(Utf16Bytes(PatternOf(4096) + #0)), FAKE_BASE, skPWide));
+end;
+
+procedure TStringReaderLimitTests.PAnsiChar_TerminatorAtPageEdge_Found;
+begin
+  var Mem: TBytes;
+  SetLength(Mem, FAKE_PAGE_SIZE);
+  FillChar(Mem[0], FAKE_PAGE_SIZE, 0);
+  var Text := AsciiBytes('edge');
+  Move(Text[0], Mem[FAKE_PAGE_SIZE - 5], Length(Text));
+  Assert.AreEqual('edge', ReadStringAt(Mem, FAKE_BASE + FAKE_PAGE_SIZE - 5, skPAnsi));
+end;
+
+procedure TStringReaderLimitTests.PWideChar_TerminatorAtPageEdge_Found;
+begin
+  var Mem: TBytes;
+  SetLength(Mem, FAKE_PAGE_SIZE);
+  FillChar(Mem[0], FAKE_PAGE_SIZE, 0);
+  var Text := Utf16Bytes('edge');
+  Move(Text[0], Mem[FAKE_PAGE_SIZE - 10], Length(Text));
+  Assert.AreEqual('edge', ReadStringAt(Mem, FAKE_BASE + FAKE_PAGE_SIZE - 10, skPWide));
+end;
+
+procedure TStringReaderLimitTests.PAnsiChar_NoTerminatorBeforeUnreadable_MarkedPartial;
+begin
+  var Mem: TBytes;
+  SetLength(Mem, FAKE_PAGE_SIZE);
+  FillChar(Mem[0], FAKE_PAGE_SIZE, Ord('z'));
+  Assert.AreEqual(StringOfChar(WideChar('z'), 96) +
+    Format('…(96 chars read, no terminator before unreadable memory at 0x%x)', [FAKE_BASE + FAKE_PAGE_SIZE]),
+    ReadStringAt(Mem, FAKE_BASE + FAKE_PAGE_SIZE - 96, skPAnsi));
+end;
+
 // --- setVariable encoder tests ------------------------------------------------
 
 type
@@ -955,6 +1246,7 @@ end;
 
 initialization
   TDUnitX.RegisterTestFixture(TValueReaderTests);
+  TDUnitX.RegisterTestFixture(TStringReaderLimitTests);
   TDUnitX.RegisterTestFixture(TProviderInterfaceTests);
   TDUnitX.RegisterTestFixture(TValueEncoderTests);
 

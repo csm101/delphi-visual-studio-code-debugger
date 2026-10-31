@@ -728,6 +728,7 @@ type
     function  EvaluateLocalName(const Name: string; out Value: TLocalValue): Boolean;
     function  EvaluateGlobalName(const Name: string; out Value: TLocalValue): Boolean;
     function  ReadProcessMemoryAt(VA: UInt64; Buf: Pointer; Size: NativeUInt): Boolean;
+    function  IsRangeReadable(VA, Size: UInt64): Boolean;
     function  ReadCodeMemoryAt(VA: UInt64; Buf: Pointer; Size: NativeUInt): NativeUInt;
     function  WriteMemoryAt(VA: UInt64; Buf: Pointer; Size: NativeUInt): Boolean;
     function  WriteMemoryPartial(VA: UInt64; Buf: Pointer; Size: NativeUInt): NativeUInt;
@@ -6580,6 +6581,42 @@ begin
   Result := (FProcess <> 0) and
     Winapi.Windows.ReadProcessMemory(FProcess, Pointer(VA), Buf, Size, R) and
     (R = Size);
+end;
+
+// Walks the regions VirtualQueryEx reports across [VA, VA + Size). Bounded: a
+// range that spans more regions than MAX_REGIONS is not one allocation, which is
+// all a caller of this ever asks about.
+function TWinDebugger.IsRangeReadable(VA, Size: UInt64): Boolean;
+const
+  MAX_REGIONS = 256;
+
+  function RegionIsReadable(const Mbi: MEMORY_BASIC_INFORMATION): Boolean;
+  begin
+    if Mbi.State <> MEM_COMMIT then
+      Exit(False);
+    if Mbi.Protect and (PAGE_NOACCESS or PAGE_GUARD) <> 0 then
+      Exit(False);
+    Result := True;
+  end;
+
+begin
+  if Size = 0 then
+    Exit(True);
+  if (FProcess = 0) or (Size > High(UInt64) - VA) then
+    Exit(False);
+  var RangeEnd := VA + Size;
+  var Cursor := VA;
+  for var Region := 1 to MAX_REGIONS do begin
+    var Mbi := Default(MEMORY_BASIC_INFORMATION);
+    if VirtualQueryEx(FProcess, Pointer(Cursor), Mbi, SizeOf(Mbi)) <> SizeOf(Mbi) then
+      Exit(False);
+    if not RegionIsReadable(Mbi) then
+      Exit(False);
+    Cursor := UInt64(Mbi.BaseAddress) + Mbi.RegionSize;
+    if Cursor >= RangeEnd then
+      Exit(True);
+  end;
+  Result := False;
 end;
 
 // See DebugTarget.IDebugTarget.ReadCodeMemoryAt: restores the debugger's own

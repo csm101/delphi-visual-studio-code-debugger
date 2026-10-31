@@ -1744,6 +1744,73 @@ The probe that established all three, before any of them were fixed, was a
 throwaway test that evaluated nine spellings and failed with the results — worth
 repeating rather than guessing at a parser from the outside.
 
+## X. Long strings and large memory blocks (MCP `maxStringLength`, `read_memory`)
+
+Contract in `MCP_SERVER.md` "Long strings and memory blocks", mechanism in
+`DAP_DEBUGGER_ARCHITECTURE.md` "String length limit".
+
+Reader level — `ValueReaderTests.TStringReaderLimitTests`, against
+`TFakeMemTarget` (no debuggee; windows padded to whole pages, see `TRAPS.md`):
+
+- [x] **A header length is believed above 4096 only when it is plausible**:
+      unreadable payload (`UnicodeString_HugeGarbageLength_NotTrusted`, a
+      50 000 000-char claim), wrong code page (`UnicodeString_WrongCodePage_NotTrusted`),
+      refCnt 0 (`AnsiString_ZeroRefCount_NotTrusted`), BSTR without terminator
+      (`WideString_MissingTerminator_NotTrusted`); each falls back to 4096 with
+      the reason in the marker. A plausible one is read whole
+      (`UnicodeString_PlausibleHeader_ReadWhole`); at the default limit nothing is
+      verified (`UnicodeString_DefaultLimit_TruncatesWithMarker`).
+- [x] **A long AnsiString is truncated with a marker, never `''`**
+      (`AnsiString_OverDefault_TruncatedWithMarker`). RED before: zero bytes
+      with success.
+- [x] **A partial read keeps the readable prefix** (`PartialRead_KeepsTheReadablePrefix`).
+- [x] **A cut never splits a character**: surrogate pair
+      (`Truncation_DoesNotSplitASurrogatePair`), UTF-8 sequence
+      (`Truncation_DoesNotSplitAUtf8Sequence`), DBCS pair walked from the start
+      (`WholeCharacterPrefix_Dbcs_WalksFromTheStart`; passes trivially where code
+      page 932 is not installed).
+- [x] **PAnsiChar / PWideChar**: 300 characters read whole
+      (`PWideChar_300Chars_ReadWhole`, `PAnsiChar_300Chars_ReadWhole` — RED before:
+      the last 44 characters); a marker at the limit
+      (`PAnsiChar_OverLimit_MarkedAsTruncated`) but none at exactly the limit
+      (`PWideChar_ExactlyAtLimit_NoMarker`); a terminator in the last bytes of a
+      readable region is found (`PAnsiChar_TerminatorAtPageEdge_Found`,
+      `PWideChar_TerminatorAtPageEdge_Found` — RED before: the fixed 256-element
+      chunk failed the read); no terminator before unreadable memory is reported
+      as such (`PAnsiChar_NoTerminatorBeforeUnreadable_MarkedPartial`).
+
+End to end — `McpE2ETests`, fixture `DebuggerTests\TestTarget\LongStringSample.dpr`
+(Win64; also built for Win32). Every text is the pattern `a..z` repeated, so a
+test recomputes it; `MakePageEdgeStrings` puts two strings in the last bytes
+before a `PAGE_NOACCESS` page.
+
+- [x] **Default: every kind truncated with a marker, lists unchanged**
+      (`LongStrings_Default_TruncatedWithMarker_ListsUnchanged`): UnicodeString,
+      WideString, AnsiString, RawByteString, UTF8String (cut moved back off a
+      2-byte sequence), PAnsiChar/PWideChar of 5000; 300-char and page-edge
+      pointer strings whole; then `get_locals` and the snapshot still at 4096
+      right after a `get_variable` with `maxStringLength: 20000`.
+- [x] **`maxStringLength`** (`LongStrings_MaxStringLength_ReturnsWholeValue_AndRefusesOutOfRange`):
+      whole values for every kind, the limit honoured (5000 of 10 000), the
+      ceiling accepted, a called function's result (`LongTextOf(10000)`) default
+      and raised, and `0`, `-5`, `1048577`, `1.5`, `"100"`, `true` refused on both
+      tools. The UTF8String row accepts the `RawByteString` rendering as well —
+      TD32 `$0036` names the whole AnsiString family (`KNOWN_UNKNOWNS.md`).
+- [x] **`read_memory`** (`ReadMemory_LargeCount_TextFormats_PartialRead`): `hex`
+      of 4 bytes has exactly the old fields; 20 000 bytes as `utf16` and as `hex`;
+      `utf8` cut moved back to a whole character; `ansi` with `codePage` 1252 and
+      with the system default echoed; `stopAtNull` in `ansi` and `utf16`; a block
+      running into the `PAGE_NOACCESS` page returns its 16 readable bytes with
+      `partial`/`failedAt`, and a block starting there is an error; `count` at the
+      ceiling accepted.
+- [x] **`read_memory` refusals** (`ReadMemory_InvalidArguments_Refused`): `count`
+      0 and 1 048 577, unknown `format`, `codePage` with `utf8`, out-of-range and
+      uninstalled code pages, `stopAtNull` with `hex`.
+- [x] **Schemas** (`ToolSchemas_LargeResultTools_DeclareMetaAndMaxStringLength`):
+      `_meta["anthropic/maxResultSizeChars"] = 500000` on `get_variable`,
+      `evaluate_expression`, `read_memory` only; `maxStringLength` on the two
+      single-value tools only.
+
 ## What the suite does NOT prove (2026-08-08)
 
 Coverage-honesty notes. Each records a place where a green run is weaker evidence

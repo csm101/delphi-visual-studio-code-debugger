@@ -576,6 +576,47 @@ the BSTR rule rather than to the UTF-16 decode.
 rendering — a `Contains('w_hello')` check passed happily while the garbage was
 still there.
 
+#### String length limit
+
+Every string reader in `TDelphiValueReader` honours ONE limit,
+`MaxStringLength`, in the string's own Length units (UTF-16 units for
+`UnicodeString`/`WideString`/`PWideChar`, bytes for the AnsiString family and
+`PAnsiChar`). It is 4096 (`DEFAULT_MAX_STRING_LENGTH`) for every display path.
+The owner is `TDebugSession.MaxStringLength`, re-applied by `Readers` on every
+call so it survives the reader being freed and recreated at teardown; the MCP
+frontend raises it for one `get_variable` / `evaluate_expression` request
+(`maxStringLength`) and restores it in a `finally`. A function or method result
+goes through the same readers (`FormatExprValue` → `FormatLocalValue` →
+`FormatStringByPointer`), so it is covered too. The evaluator's own operand
+readers (`ConcatStrings`, `TryReadTextOperand`, cap 65 536) are not display
+paths and keep refusing rather than truncating.
+
+- **Length-prefixed** (`ReadUtf16Prefixed`, `ReadDelphiAnsiBytes`): the header
+  length is used as-is up to 4096. Beyond it, only when the limit was raised,
+  `WhyStrRecLengthIsNotTrusted` / `WhyBstrLengthIsNotTrusted` check the header
+  (`TStrRec` at `Ptr-12`: codePage, elemSize, refCnt, length — the same offsets
+  on both bitnesses; a BSTR has only its byte length, checked for evenness and a
+  null terminator) and `IDebugTarget.IsRangeReadable` the payload. A failed check
+  reads the default amount and says why in the marker.
+- **Null-terminated** (`ReadNullTerminated`): accumulates every chunk (the old
+  loop overwrote the result with the last 256-element chunk), reads up to one
+  element past the limit so a string of exactly the limit is not "truncated", and
+  ends each read on a page boundary, retrying a failed multi-page read up to the
+  end of the current page — a terminator in the last bytes of a region is found
+  without touching the next page.
+- **Chunked reads** (`DebugTarget.ReadMemoryPrefix`, 64 KB, page-by-page retry
+  of a failed chunk) return the readable prefix; a reader reports it with
+  `…(K of N chars readable; read failed at 0x…)`. Only a read that yields
+  nothing fails.
+- A cut that is not the string's real end is moved back to a whole character:
+  `WholeUtf16Prefix` (unpaired high surrogate), `WholeCharacterPrefix` (UTF-8
+  sequence; DBCS pair walked from the start, since a trail byte can look like a
+  lead byte; `RawByteString` untouched), using the code page in the string's
+  header.
+- Markers start with `TRUNCATION_MARK` (`#$2026`). It is a code point, not a
+  literal: `DelphiValueReaders.pas` has no BOM, dcc reads it as ANSI, and the
+  literal `'…'` compiled into `'â€¦'` for as long as it existed.
+
 #### Float types wider than the value slot
 
 Every value is decoded from an 8-byte `RawValue`. Three float types do not fit

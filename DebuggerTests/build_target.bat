@@ -61,6 +61,14 @@ dcc64 -$O- -V -VN -VR -GD -E.\Win64\Debug -NU.\Win64\Debug InstructionStepSample
 set INSTR64_ERR=%errorlevel%
 dcc32 -$O- -V -VN -VR -GD -E.\Win32\Debug -NU.\Win32\Debug InstructionStepSample.dpr 2>&1
 set INSTR32_ERR=%errorlevel%
+rem Long-string fixture: every string kind the value readers decode, longer than
+rem their default limit (MCP maxStringLength, read_memory beyond 4096 bytes).
+rem Separate target for the usual reason -- adding scenarios to TestTarget
+rem shifts RSM import indices and marker ordering.
+dcc64 -$O- -V -VN -VR -GD -E.\Win64\Debug -NU.\Win64\Debug LongStringSample.dpr 2>&1
+set LONGSTR64_ERR=%errorlevel%
+dcc32 -$O- -V -VN -VR -GD -E.\Win32\Debug -NU.\Win32\Debug LongStringSample.dpr 2>&1
+set LONGSTR32_ERR=%errorlevel%
 rem External-TDS target (-VT): debug info in a standalone .tds, no embedded .debug.
 dcc64 -$O- -VT -VN -E.\Win64\Debug -NU.\Win64\Debug TdsSample.dpr 2>&1
 set TDS_ERR=%errorlevel%
@@ -94,4 +102,6 @@ if not "%NOSRC64_ERR%"=="0" exit /b %NOSRC64_ERR%
 if not "%NOSRC32_ERR%"=="0" exit /b %NOSRC32_ERR%
 if not "%INSTR64_ERR%"=="0" exit /b %INSTR64_ERR%
 if not "%INSTR32_ERR%"=="0" exit /b %INSTR32_ERR%
+if not "%LONGSTR64_ERR%"=="0" exit /b %LONGSTR64_ERR%
+if not "%LONGSTR32_ERR%"=="0" exit /b %LONGSTR32_ERR%
 exit /b %TT32_ERR%

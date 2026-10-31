@@ -385,6 +385,64 @@ the session to be stopped.
   to be stopped. Full design and the "no heuristics" reasoning behind
   `before` are in `DISASSEMBLY_PLAN.md`.
 
+### Long strings and memory blocks
+
+Every string the value readers decode is cut at **4096** of its Length units —
+UTF-16 code units for `string`/`UnicodeString`/`WideString`/`PWideChar`, bytes
+for `AnsiString`/`UTF8String`/`RawByteString`/`PAnsiChar` — and a cut string ends
+in a marker inside the quotes:
+
+| Marker | Meaning |
+|---|---|
+| `…(N chars total)` | cut at the limit; the header says N |
+| `…(more than N chars)` | a null-terminated string with no terminator within the limit |
+| `…(K of N chars readable; read failed at 0x…)` | the characters run into unreadable memory |
+| `…(K chars read, no terminator before unreadable memory at 0x…)` | same, for a null-terminated string |
+| `…(header claims N chars; length not trusted: <reason>)` | see below |
+
+A cut never splits a character: no unpaired UTF-16 surrogate, no incomplete
+UTF-8 sequence, no lone DBCS lead byte (decided by the code page in the string's
+own header; `RawByteString` is raw bytes and is not trimmed).
+
+- `maxStringLength` (integer, optional) on **`get_variable` and
+  `evaluate_expression` only** raises the limit for that one request: default
+  4096, ceiling 1 048 576; a value outside `1..1048576` (or not an integer) is a
+  tool error, never clamped. It applies to every string the request decodes,
+  including the string a called function returns (`LongTextOf(10000)`), and is
+  restored afterwards, so DAP, hover and every list keep the default.
+  `get_locals`, `expand_variable` and `get_compact_debug_snapshot` do not take it
+  — they would multiply the output by the number of variables; read a long field
+  in full with `get_variable`/`evaluate_expression` on that field.
+- **Above 4096 a header length is not believed blindly.** On an uninitialised or
+  freed variable it is garbage, so before reading past the default the reader
+  checks: `UnicodeString` elemSize 2 and codePage 1200; AnsiString family elemSize
+  1; refCnt -1 or ≥ 1; `WideString` (BSTR, length in bytes) an even length and a
+  null terminator in place; and in every case that `[Ptr, Ptr + length)` is
+  readable (`VirtualQueryEx`, through `IDebugTarget.IsRangeReadable`). A failed
+  check falls back to the default limit and says so in the marker.
+  Null-terminated strings have no header: the limit itself and page-bounded reads
+  protect them.
+- `read_memory` (`address`, `count`, `format`, `codePage`, `stopAtNull`):
+  `count` is `1..1048576` (was `1..4096`). The block is read in 64 KB chunks; one
+  that runs into unreadable memory returns the bytes before it with
+  `bytesRead`, `partial:true` and `failedAt` (the first unreadable address)
+  instead of failing — nothing readable at all is still an error. `format`
+  `"hex"` (default) returns exactly what it always did for a fully read block.
+  `"utf16"`, `"utf8"` and `"ansi"` (with `codePage`, default the system ANSI code
+  page, echoed as `codePage`) return the block as `text` — half the size of hex —
+  with `bytesRead`, `bytesDecoded`, `chars` and `format`; the end of the block is
+  moved back to a whole character. `stopAtNull` (text formats only) stops at the
+  first null character and reports `stoppedAtNull`. `codePage` with a non-ansi
+  format, `stopAtNull` with hex, or an uninstalled code page is a tool error.
+- **Result size.** Claude Code saves a text tool result over 50 000 characters
+  to a file and hands the model its path, unless the tool's `tools/list` entry
+  declares `_meta["anthropic/maxResultSizeChars"]`
+  (<https://code.claude.com/docs/en/mcp>, "MCP output limits and warnings").
+  `get_variable`, `evaluate_expression` and `read_memory` declare 500 000, the
+  most it accepts. A longer result — a string over ~500 000 characters, or hex
+  of more than ~250 000 bytes — is still saved to a file; that is expected, and
+  a text format halves what `read_memory` produces. Other clients ignore the key.
+
 No raw DAP identifiers cross the boundary: frames carry a semantic `index`,
 breakpoints a `file|line` id, variables a formatted value.
 

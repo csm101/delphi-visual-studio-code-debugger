@@ -66,6 +66,10 @@ type
     FRtti:       TDelphiRtti;
     FReaders:    TDelphiValueReader;
     FResolver:   TSourceResolver;
+    // Kept here rather than only on FReaders: the reader is freed and recreated
+    // on teardown, and a value a frontend set for one request must neither be
+    // lost by nor survive that.
+    FMaxStringLength: Integer;
 
     // Session config / state.
     FState:              TDebugSessionState;
@@ -153,6 +157,7 @@ type
     FOnSymbolsArrived:          TNotifyEvent;
 
     function  Readers: TDelphiValueReader;
+    procedure SetMaxStringLength(Value: Integer);
     procedure SetState(NewState: TDebugSessionState);
     // Shared body of StepOver / StepInto / StepOut: posts the command, or
     // routes to the run-to-handler path at an exception stop.
@@ -675,6 +680,12 @@ type
     // The shared leaf value reader (Variant / string decode / interface recovery),
     // refreshed to the current Debugger/Rtti on each call.
     function GetReaders: TDelphiValueReader;
+    // Truncation limit of every string the value reader decodes, in the string's
+    // Length units (DelphiValueReaders.DEFAULT_MAX_STRING_LENGTH). A frontend
+    // raises it for ONE request that returns a single value and restores it in a
+    // finally: lists of values keep the default, or a request would multiply its
+    // output by the number of variables.
+    property MaxStringLength: Integer read FMaxStringLength write SetMaxStringLength;
 
     property OnSessionStopped: TSessionStoppedEvent read FOnStopped write FOnStopped;
     property OnSessionExited:  TSessionExitedEvent  read FOnExited  write FOnExited;
@@ -780,6 +791,7 @@ begin
   inherited Create;
   FDebugInfo  := TDebugInfoSet.Create;
   FResolver   := TSourceResolver.Create;
+  FMaxStringLength := DEFAULT_MAX_STRING_LENGTH;
   FBreakpoints := TList<TSessionBreakpoint>.Create;
   FPendingBps  := TList<TBpSpec>.Create;
   FBpSpecs     := TDictionary<string, TBpSpec>.Create;
@@ -898,7 +910,15 @@ begin
     FReaders.Debugger := FDebugger;
     FReaders.Rtti     := FRtti;
   end;
+  FReaders.MaxStringLength := FMaxStringLength;
   Result := FReaders;
+end;
+
+procedure TDebugSession.SetMaxStringLength(Value: Integer);
+begin
+  FMaxStringLength := Value;
+  if FReaders <> nil then
+    FReaders.MaxStringLength := Value;
 end;
 
 function TDebugSession.EnsureRtti: TDelphiRtti;
