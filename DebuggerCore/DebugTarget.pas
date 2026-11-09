@@ -771,7 +771,12 @@ type
     procedure SetExceptionRules(const Rules: TArray<TExceptionRule>);
 
     // Lifecycle / control.
-    procedure Launch(const ExePath: string; StopAtEntry: Boolean);
+    // CommandLine: the quoted program path followed by its arguments.
+    // CaptureStdio: give the process standard handles of its own -- stdin reads
+    // the NUL device, stdout and stderr go into a pipe forwarded through OnOutput
+    // -- instead of the ones a console child receives from this process, which
+    // are the DAP / MCP protocol channel.
+    procedure Launch(const CommandLine: string; StopAtEntry, CaptureStdio: Boolean);
     // Attach to an already-running process. After return, debug events
     // flow as if we had launched it; the kernel injects an initial
     // breakpoint to mark "attach completed". Detach behaviour on

@@ -1278,8 +1278,53 @@ Covered by `Test_EmptyCommandMessage_Ignored_AdapterStaysResponsive`.
 ```
 ProcessCommandQueue                                       // DAP → debugger
 WaitForDebugEvent(10)                                     // OS → debugger
+DrainDebuggeeStdio                                        // console debuggee → output
 dispatch by event code
 ```
+
+## Debuggee standard handles
+
+A launched console program shares the adapter's console, and when it gets no
+standard handles of its own Windows hands it duplicates of the adapter's, even
+with `bInheritHandles = False`. Those are the protocol channel, for the DAP
+adapter and the MCP server alike: the debuggee's writes landed between protocol
+messages and its reads consumed the client's requests (`docs/TRAPS.md`). So
+`TDebugSession.Launch` reads the image's PE `Subsystem`
+(`PeSymbolSupport.ReadPESubsystem`) and, for `IMAGE_SUBSYSTEM_WINDOWS_CUI`,
+launches with `CaptureStdio`. `TWinDebugger.LaunchWithCapturedStdio` then gives
+the debuggee handles of its own:
+
+- **stdin** is the NUL device, so a read returns end-of-file at once. Nothing can
+  be typed into a debuggee; an interactive console program sees empty input.
+- **stdout and stderr** share one anonymous 64 KB pipe. `DrainDebuggeeStdio`
+  reads it without blocking (`PeekNamedPipe`) and forwards the text through
+  `OnOutput`, the path `OutputDebugString` text takes: a DAP `output` event with
+  category `stdout`, and MCP `get_debuggee_output`. Stderr is not told apart from
+  stdout.
+- **Inheritance** is limited to exactly those two handles by
+  `PROC_THREAD_ATTRIBUTE_HANDLE_LIST`. A bare `bInheritHandles = True` would also
+  pass every inheritable handle of the adapter, the protocol pipes included.
+- **Order.** `ProcessOneEvent` drains before it dispatches each debug event,
+  while the whole debuggee is suspended, so text written before a stop reaches
+  the client ahead of the stop. It also drains on every idle tick, because a
+  running debuggee blocks in `WriteFile` once the pipe is full.
+  `HandleExitProcess` drains and flushes before it reports the exit.
+- **Decoding.** UTF-8 when the bytes are valid UTF-8, the ANSI code page
+  otherwise: a Delphi program's `Write` into a pipe produces
+  `DefaultSystemCodePage`, because `System.TextOpen` uses the console code page
+  only for a character device. A UTF-8 sequence cut in two by a read is held back
+  until the next read.
+- **GUI programs are left alone.** They get none of the adapter's standard
+  handles anyway, and valid ones would change what they observe compared with a
+  run outside the debugger.
+- **No window or console flag** is involved, on either path: an `SW_HIDE` meant
+  for a console once hid VCL main forms instead.
+
+Limits: a synthetic call pumps debug events itself and does not drain, so a
+console debuggee that writes more than 64 KB during an evaluated call blocks
+until the call times out. `terminate` releases the pipe without a last drain, so
+what the debuggee wrote in its final milliseconds can be lost. An attached
+process keeps the handles it already had, and nothing of it is captured.
 
 ## DLL / BPL candidate detection
 
@@ -3885,6 +3930,8 @@ Anything else is currently absent (function breakpoints, `setExpression`).
 
 ## Known assumptions and limits
 
+- A launched console program's output reaches the client, its input does not:
+  stdin is the NUL device (see "Debuggee standard handles").
 - Multi-thread aware. Every live thread is reported (`threads`), any thread's
   stack + locals/watches are inspectable read-only at a stop, and step
   over/into/out act on the selected thread while the others are frozen (see

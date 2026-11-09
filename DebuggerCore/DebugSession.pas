@@ -1037,8 +1037,13 @@ begin
   var CmdLine := '"' + FExePath + '"';
   if Opts.Args <> '' then
     CmdLine := CmdLine + ' ' + Opts.Args;
+  // A console program would otherwise share this process's console AND its
+  // standard handles, which are the DAP / MCP protocol channel (see
+  // TWinDebugger.LaunchWithCapturedStdio). A GUI program receives no standard
+  // handles from us either way, so it keeps exactly what it has without a debugger.
+  var CaptureStdio := ReadPESubsystem(FExePath) = IMAGE_SUBSYSTEM_WINDOWS_CUI;
   try
-    FDebugger.Launch(CmdLine, Opts.StopAtEntry);
+    FDebugger.Launch(CmdLine, Opts.StopAtEntry, CaptureStdio);
   except
     on E: Exception do begin
       FDebugger := nil;

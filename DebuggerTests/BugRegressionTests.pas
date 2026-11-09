@@ -133,6 +133,14 @@ type
     // ...with one deliberate exception: `cancel` really is a harmless no-op.
     [Test]
     procedure CancelCommand_IsToleratedAsANoOp;
+
+    // A console debuggee gets standard handles of its own, not the adapter's
+    // (StdioConsoleSample.dpr). RED before: Windows handed it the adapter's
+    // stdin / stdout, which ARE the DAP channel, so its writes landed between DAP
+    // messages and its stdin read waited on the client's bytes. Now its stdout
+    // and stderr arrive as `output` events and its stdin reads as empty.
+    [Test]
+    procedure ConsoleDebuggee_StdioArrivesAsOutputEvents_ProtocolStaysClean;
   end;
 
   // Bug 11: TDebugInfoSet.SortedRvas concatenated each provider's sorted
@@ -831,6 +839,28 @@ begin
   finally
     Resp.Free;
   end;
+end;
+
+procedure TBugRegressionTests.ConsoleDebuggee_StdioArrivesAsOutputEvents_ProtocolStaysClean;
+begin
+  var Exe := TargetDir + 'Win64\Debug\StdioConsoleSample.exe';
+  FClient := TDapClient.Create;
+  FClient.Start(AdapterExe);
+  FClient.Initialize.Free;
+  Assert.IsTrue(FClient.WaitForInitialized);
+  // No exception breakpoints: the marker exception is handled, so the run does not stop.
+  FClient.SetExceptionBreakpoints([]).Free;
+  FClient.Launch(Exe, ChangeFileExt(Exe, '.map'), ChangeFileExt(Exe, '.rsm'), TargetDir, False).Free;
+  FClient.ConfigDone.Free;
+
+  // The program's text may arrive split over any number of `output` events.
+  var Output := '';
+  while not Output.Contains('STDIO_SAMPLE_DONE') do
+    Output := Output + FClient.WaitForOutputContaining('', 15000);
+  // STDIN_BYTES=0: stdin is the NUL device, not the adapter's own input.
+  for var Expected in ['STDIO_SAMPLE_STDERR', 'STDIO_SAMPLE_PARTIAL', 'STDIN_BYTES=0'] do
+    Assert.IsTrue(Output.Contains(Expected), Format('"%s" is missing from the program output: %s', [Expected, Output]));
+  Assert.IsTrue(FClient.WaitForTerminated(30000), 'target did not terminate');
 end;
 
 initialization

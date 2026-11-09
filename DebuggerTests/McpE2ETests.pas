@@ -170,6 +170,18 @@ type
     // counts only ever rose.
     [Test] procedure CallResults_ReleasedWhenTheDebuggeeResumes;
     [Test] procedure CallResults_Win32_ReleasedWhenTheDebuggeeResumes;
+    // A console debuggee gets standard handles of its own, not the server's
+    // (StdioConsoleSample.dpr). It writes a stdout fragment with no line break
+    // right before a first-chance exception, then reads stdin. RED before:
+    // Windows handed it the server's stdin / stdout, so the reply to
+    // continue_and_wait reached the client glued behind that fragment and was
+    // dropped (the call never returned), and the stdin read took the client's
+    // next request. Its stdout and stderr now arrive through get_debuggee_output
+    // and its stdin reads as empty.
+    [Test] procedure ConsoleDebuggee_StdioIsCaptured_ProtocolStaysClean;
+    // A GUI debuggee keeps what it has without a debugger: no standard handles,
+    // so nothing it writes through them shows up anywhere (StdioGuiSample.dpr).
+    [Test] procedure GuiDebuggee_KeepsNoStandardHandles;
   end;
 
 implementation
@@ -3913,6 +3925,116 @@ end;
 procedure TMcpE2ETests.CallResults_Win32_ReleasedWhenTheDebuggeeResumes;
 begin
   RunCallResultsReleasedWhenTheDebuggeeResumes(McpExe, TargetDir, 'Win32');
+end;
+
+{ Standard handles of a launched debuggee: StdioConsoleSample.dpr, StdioGuiSample.dpr }
+
+// launch_debuggee with these exception filters; returns at the entry stop.
+procedure LaunchStdioSample(C: TMcpTestClient; const Exe: string; const Filters: array of string);
+begin
+  var Args := TJSONObject.Create;
+  Args.AddPair('program', Exe);
+  var FilterArray := TJSONArray.Create;
+  for var Filter in Filters do
+    FilterArray.Add(Filter);
+  Args.AddPair('exceptionFilters', FilterArray);
+  var Entry := C.CallTool('launch_debuggee', Args);
+  try
+    Assert.IsTrue(Entry is TJSONObject, 'launch_debuggee failed: ' + Entry.ToJSON);
+    Assert.AreEqual('stopped', TJSONObject(Entry).GetValue<string>('state', ''),
+      'no entry stop: ' + Entry.ToJSON);
+  finally
+    Entry.Free;
+  end;
+end;
+
+// continue_and_wait; the snapshot it returns (caller frees).
+function ContinueToNextStop(C: TMcpTestClient): TJSONObject;
+begin
+  var Args := TJSONObject.Create;
+  Args.AddPair('timeoutMs', TJSONNumber.Create(30000));
+  var Reply := C.CallTool('continue_and_wait', Args);
+  if Reply is TJSONObject then
+    Exit(TJSONObject(Reply));
+  var Text := Reply.ToJSON;
+  Reply.Free;
+  Assert.Fail('continue_and_wait returned no snapshot: ' + Text);
+  Result := nil;
+end;
+
+// Everything get_debuggee_output returns, joined.
+function DebuggeeOutputText(C: TMcpTestClient): string;
+begin
+  Result := '';
+  var Output := C.CallTool('get_debuggee_output', nil);
+  try
+    Assert.IsTrue(Output is TJSONArray, 'get_debuggee_output returned no list: ' + Output.ToJSON);
+    for var Item in TJSONArray(Output) do
+      Result := Result + Item.Value;
+  finally
+    Output.Free;
+  end;
+end;
+
+procedure TMcpE2ETests.ConsoleDebuggee_StdioIsCaptured_ProtocolStaysClean;
+begin
+  var C := TMcpTestClient.Start(McpExe);
+  try
+    C.Call('initialize', nil).Free;
+    LaunchStdioSample(C, TargetDir + 'Win64\Debug\StdioConsoleSample.exe', ['delphi']);
+
+    // The last thing the program writes before the marker exception is a stdout
+    // fragment with no line break. A reply that followed it on a shared channel
+    // was one line the client could not parse, and this call never came back.
+    var Stop := ContinueToNextStop(C);
+    try
+      Assert.AreEqual('exception', Stop.GetValue<string>('stopReason', ''), 'no stop at the marker: ' + Stop.ToJSON);
+      Assert.AreEqual('EStdioSampleMarker', Stop.GetValue<string>('exception.class', ''),
+        'stopped on something else: ' + Stop.ToJSON);
+    finally
+      Stop.Free;
+    end;
+    var UpToTheStop := DebuggeeOutputText(C);
+    Assert.IsTrue(UpToTheStop.Contains('STDIO_SAMPLE_STDERR'), 'stderr was not captured: ' + UpToTheStop);
+    Assert.IsTrue(UpToTheStop.Contains('STDIO_SAMPLE_PARTIAL'),
+      'what the program wrote before the stop was not reported by then: ' + UpToTheStop);
+
+    var Exited := ContinueToNextStop(C);
+    try
+      Assert.AreEqual('exited', Exited.GetValue<string>('state', ''), 'did not run to the end: ' + Exited.ToJSON);
+    finally
+      Exited.Free;
+    end;
+    var AfterTheStop := DebuggeeOutputText(C);
+    // 0: stdin is the NUL device. The server's own stdin would have blocked the
+    // read or handed it the client's next request.
+    Assert.IsTrue(AfterTheStop.Contains('STDIN_BYTES=0'), 'stdin was not empty: ' + AfterTheStop);
+    Assert.IsTrue(AfterTheStop.Contains('STDIO_SAMPLE_DONE'), 'the last line was lost: ' + AfterTheStop);
+  finally
+    C.Free;
+  end;
+end;
+
+procedure TMcpE2ETests.GuiDebuggee_KeepsNoStandardHandles;
+begin
+  var C := TMcpTestClient.Start(McpExe);
+  try
+    C.Call('initialize', nil).Free;
+    // "unhandled" alone: the marker exception is handled, so the run does not stop.
+    LaunchStdioSample(C, TargetDir + 'Win64\Debug\StdioGuiSample.exe', ['unhandled']);
+    var Exited := ContinueToNextStop(C);
+    try
+      Assert.AreEqual('exited', Exited.GetValue<string>('state', ''), 'did not run to the end: ' + Exited.ToJSON);
+    finally
+      Exited.Free;
+    end;
+    // The console twin's scenario, none of it visible: a GUI program has no
+    // standard handles with or without a debugger, and the debugger gives it none.
+    var Output := DebuggeeOutputText(C);
+    Assert.IsFalse(Output.Contains('STDIO_SAMPLE'), 'a GUI debuggee was given standard handles: ' + Output);
+  finally
+    C.Free;
+  end;
 end;
 
 initialization

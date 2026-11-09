@@ -964,6 +964,23 @@ repeated small values, or pairs of in-image addresses.
 
 ### Live process and adapter
 
+#### McpStdioProbe
+
+```bat
+DevTools\Win64\Debug\McpStdioProbe.exe <serverExe> <program> [args|-] [filters|-] [timeoutMs]
+```
+
+Drives `DelphiDebuggerMcp.exe` over stdio the way an MCP client does: initialize,
+`launch_debuggee`, `continue_and_wait`, then `terminate_debuggee`. For every line
+the server writes it prints when the line arrived, how long it is, and whether
+it parses as JSON-RPC, so it settles a "the tool call never returned" report: no
+answer at all, a late answer, or an answer something else wrote over. When
+`continue_and_wait` gets no reply it asks `get_debug_session_status`, which is
+how such a report usually describes the session. `-` stands for no arguments
+(an empty `""` may be dropped by PowerShell, which shifts every later argument).
+The filters are a comma-separated `exceptionFilters` list, `delphi,av,unhandled`
+by default; `-` sends an empty list. Exit code 2 when a call went unanswered.
+
 #### SessionEndLockProbe
 
 ```bat

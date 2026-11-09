@@ -570,6 +570,22 @@ absurdly.
 
 ## Engine and language gotchas
 
+- **A console debuggee receives the debugger's standard handles even with
+  `bInheritHandles = False`.** A console-subsystem child that shares its parent's
+  console and gets no standard handles of its own (`STARTF_USESTDHANDLES`) is
+  handed duplicates of the parent's, and the parent here is the DAP / MCP
+  server, whose stdin and stdout ARE the protocol channel. Measured with
+  `DevTools\McpStdioProbe` on a DUnitX console runner: the reply to
+  `continue_and_wait` arrived glued behind the runner's unterminated
+  `DUnitX - [...` line, the client could not parse it and dropped it, and the
+  call never returned. A `ReadFile` on the debuggee's stdin took the first 64
+  bytes of the client's next request, which then got no reply either. A GUI
+  debuggee gets none of the parent's handles and is not affected.
+  `TWinDebugger.LaunchWithCapturedStdio` gives a console debuggee handles of its
+  own; never launch one another way, and never with a bare
+  `bInheritHandles = True`, which would also pass it the protocol pipes. The old
+  rule "test targets are GUI subsystem and never write to stdio" only worked
+  around this trap.
 - **A non-ASCII literal in a `.pas` without a BOM compiles as mojibake.** dcc
   reads a BOM-less source as ANSI, so `'…'` written as UTF-8 becomes the three
   characters `'â€¦'` — and nothing fails: the truncation marker of every string
@@ -727,6 +743,13 @@ absurdly.
 
 - **Read `%TEMP%\dap_adapter.log` FIRST.** It is append-only and survives the
   session; three defects were diagnosed from it without re-running anything.
+- **PowerShell may drop an empty `""` argument to a native program**, and every
+  later argument then shifts one place left without a word.
+  `McpStdioProbe <server> <program> "" delphi 5000` ran with `delphi` as the
+  debuggee's arguments, `5000` as the exception filters (none recognised) and
+  the default timeout: a debugger that "ignored" a Delphi exception it had never
+  been told to stop on. Give a tool a placeholder it understands (`-` for
+  McpStdioProbe) instead of an empty string.
 - **"It stopped at the same place again" is not a diagnosis until the RETURN
   ADDRESS says so.** Two stops can share thread, RIP and RSP: one routine
   called from two sites of the same frame. Compare frame 1's IP against the

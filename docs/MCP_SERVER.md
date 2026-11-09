@@ -312,8 +312,12 @@ the session to be stopped.
   parentheses here exactly as in source. String comparison compares characters,
   not heap pointers),
   `get_exception_details`,
-  `get_debuggee_output` (program stdout), `get_debugger_output` (logpoint
-  messages and debugger notices).
+  `get_debuggee_output` (the program's output: its `OutputDebugString` text and,
+  for a console program, what it wrote to stdout and stderr; a console program's
+  stdin reads as empty), `get_debugger_output` (logpoint messages and debugger
+  notices). A console program never writes into this server's own stdout: it is
+  launched with standard handles of its own (`DAP_DEBUGGER_ARCHITECTURE.md`,
+  "Debuggee standard handles").
 - `get_threads` — every thread at the stop, and per thread its `lastError` (the
   TEB `LastErrorValue`, i.e. what `GetLastError` would return in THAT thread) and
   `lastStatus` (the NTSTATUS underneath it, usually the half that says why).

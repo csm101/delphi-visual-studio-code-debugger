@@ -1052,6 +1052,7 @@ At runtime the adapter compares the debuggee's actual `ImageBase` (from `CREATE_
 - [x] All threads enumerated (with names); the whole process stops together (`allThreadsStopped`)
 - [x] Update notice: a copy installed from the setup zip checks GitHub once a day for a newer release and shows a link, since VS Code never updates a `.vsix` install; a Marketplace install is updated by VS Code and never asks (`delphi-win64.checkForUpdates` turns it off; it downloads nothing and sends nothing)
 - [x] The debugger's own diagnostics go to a **Delphi Debugger** channel in the Output panel, leaving the Debug Console to the debuggee
+- [x] A **console program**'s stdout and stderr appear in the Debug Console (over MCP, in `get_debuggee_output`). Its stdin reads as empty: there is no way to type into it
 - [x] Per-thread inspection: selecting any thread shows that thread's own call stack, and its frames' locals/watches are inspectable (read-only)
 - [x] RVA/address resolution from Delphi `.map` files (segment-relative offsets handled correctly)
 - [x] ASLR: actual ImageBase vs. preferred base handled at runtime

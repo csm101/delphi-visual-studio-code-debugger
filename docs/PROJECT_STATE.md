@@ -187,6 +187,24 @@ module you are standing in carries debug information at all.
 
 ## Implemented features
 
+A console debuggee has standard handles of its own (2026-11-08, reported from a
+session building an MCP server for driving Delphi apps):
+- **A launched console program no longer shares the DAP / MCP protocol
+  channel.** Windows gave it the debugger's own stdin and stdout, so its writes
+  landed between protocol messages and its reads consumed client requests. The
+  report was `continue_and_wait` never returning, not even at its timeout, when
+  `GlassboxTests.exe` (a DUnitX console runner) stopped on a first-chance
+  exception: the reply arrived glued behind the runner's unterminated output and
+  the client dropped it. The same corrupted the DAP channel of any console
+  program debugged from VS Code. Now a console image (PE `Subsystem` = CUI) gets
+  stdin from the NUL device and stdout + stderr into a pipe the engine drains
+  into the program output: DAP `output` events (category `stdout`) and MCP
+  `get_debuggee_output`. GUI programs are unchanged. Mechanism in
+  `DAP_DEBUGGER_ARCHITECTURE.md` "Debuggee standard handles"; tests in
+  `TEST_CATALOG.md` section Z, on the new fixtures
+  `DebuggerTests\TestTarget\StdioConsoleSample.dpr` / `StdioGuiSample.dpr`;
+  diagnostic probe `DevTools\McpStdioProbe`.
+
 Synthetic-call results are released (2026-10-31):
 - **What an evaluation's function call returns is released when the debuggee
   next runs**: strings, BSTRs, interfaces and Variants, through the debuggee's
@@ -1220,6 +1238,16 @@ fixed in the same pass):
 
 ## Important technical discoveries
 
+- **A console child receives its parent's standard handles even with
+  `bInheritHandles = False` (2026-11-08).** When a console-subsystem process is
+  created sharing its parent's console and without `STARTF_USESTDHANDLES`,
+  Windows hands it duplicates of the parent's standard handles, pipes included.
+  Measured with `DevTools\McpStdioProbe`: the debuggee's output reached the MCP
+  client's pipe, and its `ReadFile` on stdin took 64 bytes of the client's next
+  request. A GUI-subsystem child receives none of them. Only an explicit
+  `STARTF_USESTDHANDLES` launch, with inheritance limited by
+  `PROC_THREAD_ATTRIBUTE_HANDLE_LIST`, keeps the protocol channel to the
+  debugger alone (`docs/TRAPS.md`).
 - **An ended session must not hold the debuggee's build outputs (2026-09-21).**
   The MCP server keeps an ended `TDebugSession` until the next launch, so
   anything it holds stays locked, and rebuilding the target failed with

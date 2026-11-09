@@ -76,6 +76,15 @@ dcc64 -$O- -V -VN -VR -GD -E.\Win64\Debug -NU.\Win64\Debug CallResultSample.dpr 
 set CALLRES64_ERR=%errorlevel%
 dcc32 -$O- -V -VN -VR -GD -E.\Win32\Debug -NU.\Win32\Debug CallResultSample.dpr 2>&1
 set CALLRES32_ERR=%errorlevel%
+rem Stdio fixtures: a CONSOLE-subsystem debuggee and its GUI twin, both writing
+rem through their standard handles (StdioSampleCore.pas). The console one is the
+rem only console fixture, on purpose: a console child receives its parent's
+rem standard handles, and the parent here is the DAP / MCP server, whose stdio is
+rem the protocol channel (docs/TRAPS.md). Options in each fixture's own .cfg.
+dcc64 StdioConsoleSample.dpr 2>&1
+set STDIOCON_ERR=%errorlevel%
+dcc64 StdioGuiSample.dpr 2>&1
+set STDIOGUI_ERR=%errorlevel%
 rem External-TDS target (-VT): debug info in a standalone .tds, no embedded .debug.
 dcc64 -$O- -VT -VN -E.\Win64\Debug -NU.\Win64\Debug TdsSample.dpr 2>&1
 set TDS_ERR=%errorlevel%
@@ -113,4 +122,6 @@ if not "%LONGSTR64_ERR%"=="0" exit /b %LONGSTR64_ERR%
 if not "%LONGSTR32_ERR%"=="0" exit /b %LONGSTR32_ERR%
 if not "%CALLRES64_ERR%"=="0" exit /b %CALLRES64_ERR%
 if not "%CALLRES32_ERR%"=="0" exit /b %CALLRES32_ERR%
+if not "%STDIOCON_ERR%"=="0" exit /b %STDIOCON_ERR%
+if not "%STDIOGUI_ERR%"=="0" exit /b %STDIOGUI_ERR%
 exit /b %TT32_ERR%

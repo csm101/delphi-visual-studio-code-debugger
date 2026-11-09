@@ -551,7 +551,8 @@ begin
     LIST_STRING_LIMIT_NOTE, []));
 
   Result.Add(MakeTool('get_debuggee_output',
-    'Return debuggee (program stdout) output produced since the previous call (incremental).', []));
+    'Return the program''s output produced since the previous call (incremental): its OutputDebugString text ' +
+    'and, for a console program, what it wrote to stdout and stderr. A console program''s stdin reads as empty.', []));
 
   Result.Add(MakeTool('get_debugger_output',
     'Return debugger-generated output since the previous call — notably logpoint messages ' +

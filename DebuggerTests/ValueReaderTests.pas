@@ -236,7 +236,7 @@ type
     function  GetStepIsolationState: TStepIsolationState;
     procedure SetDelphiClassFilter(const ClassNames: string);
     procedure SetExceptionRules(const Rules: TArray<TExceptionRule>);
-    procedure Launch(const ExePath: string; StopAtEntry: Boolean);
+    procedure Launch(const CommandLine: string; StopAtEntry, CaptureStdio: Boolean);
     procedure Attach(ProcessId: Cardinal; KillOnDetach: Boolean);
     procedure Terminate;
     procedure PostCommand(const Cmd: TCommand);
@@ -443,7 +443,7 @@ procedure TFakeMemTarget.SetStepIsolationAutoRelease(Enabled: Boolean; ReleaseMs
 function  TFakeMemTarget.GetStepIsolationState: TStepIsolationState; begin Result := Default(TStepIsolationState); end;
 procedure TFakeMemTarget.SetDelphiClassFilter(const ClassNames: string); begin end;
 procedure TFakeMemTarget.SetExceptionRules(const Rules: TArray<TExceptionRule>); begin end;
-procedure TFakeMemTarget.Launch(const ExePath: string; StopAtEntry: Boolean); begin end;
+procedure TFakeMemTarget.Launch(const CommandLine: string; StopAtEntry, CaptureStdio: Boolean); begin end;
 procedure TFakeMemTarget.Attach(ProcessId: Cardinal; KillOnDetach: Boolean); begin end;
 procedure TFakeMemTarget.Terminate; begin end;
 procedure TFakeMemTarget.PostCommand(const Cmd: TCommand); begin end;

@@ -10,6 +10,11 @@ interface
 // module's provider can be scoped to the RVA range [0, ImageSize). 0 on failure.
 function ReadPEImageSize(const ExePath: string): UInt64;
 
+// Reads the PE OptionalHeader Subsystem (IMAGE_SUBSYSTEM_*, offset $44 for both
+// HDR32/HDR64) before the process exists: a console program has to be launched
+// with standard handles of its own. 0 on failure.
+function ReadPESubsystem(const ExePath: string): Word;
+
 // True when a symbol sidecar (.rsm / .map / .dcp) is older than its binary, so the
 // loader should ignore it and fall back to fresher sources. A 2-second grace
 // avoids a same-build write-order race; missing files / errors are treated as
@@ -21,20 +26,29 @@ implementation
 uses
   System.SysUtils, System.Classes, System.IOUtils, System.DateUtils, Winapi.Windows;
 
-function ReadPEImageSize(const ExePath: string): UInt64;
+function IsKnownOptionalHeaderMagic(Magic: Word): Boolean;
+begin
+  if Magic = IMAGE_NT_OPTIONAL_HDR32_MAGIC then
+    Exit(True);
+  Result := Magic = IMAGE_NT_OPTIONAL_HDR64_MAGIC;
+end;
+
+// The Size-byte field (at most 4) at Offset from the start of an on-disk image's
+// OptionalHeader, or 0. Only for fields at the same offset in HDR32 and HDR64,
+// which is every field from SectionAlignment ($20) to DllCharacteristics ($46):
+// HDR64 widens ImageBase by exactly the 4 bytes it drops with BaseOfData.
+function ReadOptionalHeaderField(const ExePath: string; Offset, Size: Integer): Cardinal;
 var
   FS: TFileStream;
   Dos: TImageDosHeader;
   NtSig: Cardinal;
   FileHdr: TImageFileHeader;
   OptMagic: Word;
-  SizeOfImage32: Cardinal;
-  SizeOfImage64: Cardinal;
 begin
   Result := 0;
   if not FileExists(ExePath) then
     Exit;
-  FS := TFileStream.Create(ExePath, fmOpenRead or fmShareDenyWrite);
+  FS := TFileStream.Create(ExePath, fmOpenRead or fmShareDenyNone);
   try
     if FS.Size < SizeOf(TImageDosHeader) then
       Exit;
@@ -49,21 +63,23 @@ begin
       Exit;
     FS.ReadBuffer(FileHdr, SizeOf(FileHdr));
     FS.ReadBuffer(OptMagic, SizeOf(OptMagic));
-    case OptMagic of
-      IMAGE_NT_OPTIONAL_HDR32_MAGIC: begin
-        FS.Position := Dos._lfanew + 4 + SizeOf(FileHdr) + $38;
-        FS.ReadBuffer(SizeOfImage32, 4);
-        Result := SizeOfImage32;
-      end;
-      IMAGE_NT_OPTIONAL_HDR64_MAGIC: begin
-        FS.Position := Dos._lfanew + 4 + SizeOf(FileHdr) + $38;
-        FS.ReadBuffer(SizeOfImage64, 4);
-        Result := SizeOfImage64;
-      end;
-    end;
+    if not IsKnownOptionalHeaderMagic(OptMagic) then
+      Exit;
+    FS.Position := Dos._lfanew + 4 + SizeOf(FileHdr) + Offset;
+    FS.ReadBuffer(Result, Size);
   finally
     FS.Free;
   end;
+end;
+
+function ReadPEImageSize(const ExePath: string): UInt64;
+begin
+  Result := ReadOptionalHeaderField(ExePath, $38, SizeOf(Cardinal));
+end;
+
+function ReadPESubsystem(const ExePath: string): Word;
+begin
+  Result := Word(ReadOptionalHeaderField(ExePath, $44, SizeOf(Word)));
 end;
 
 function SymbolFileIsStale(const SymPath, BinPath: string): Boolean;

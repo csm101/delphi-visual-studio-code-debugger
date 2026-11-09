@@ -1831,6 +1831,32 @@ leave nothing behind) let the program itself report the counts. Mechanism in
 - [ ] Dynamic arrays and records with managed fields are not released
       (`KNOWN_UNKNOWNS.md`).
 
+## Z. Standard handles of a launched debuggee
+
+Fixtures `DebuggerTests\TestTarget\StdioConsoleSample.dpr` (console subsystem, the
+only console fixture) and `StdioGuiSample.dpr` (its GUI twin), both running
+`StdioSampleCore.RunStdioScenario`: a line on stderr, a stdout fragment with no
+line break, a first-chance `EStdioSampleMarker`, then a stdin read whose byte
+count is printed. Mechanism in `DAP_DEBUGGER_ARCHITECTURE.md`, "Debuggee standard
+handles".
+
+- [x] **MCP: the protocol survives a console debuggee, its output is captured**
+      (`McpE2ETests.ConsoleDebuggee_StdioIsCaptured_ProtocolStaysClean`):
+      `continue_and_wait` returns the stop on the marker, the stderr line and the
+      fragment are in `get_debuggee_output` by then, and the rest, with
+      `STDIN_BYTES=0`, by the exit. RED before the fix: `MCP read timeout`, the
+      reply arrived glued behind the fragment.
+- [x] **DAP: the same over the adapter**
+      (`BugRegressionTests.ConsoleDebuggee_StdioArrivesAsOutputEvents_ProtocolStaysClean`):
+      the whole scenario's text arrives in `output` events. RED before the fix:
+      no output event ever arrived.
+- [x] **A GUI debuggee is left alone**
+      (`McpE2ETests.GuiDebuggee_KeepsNoStandardHandles`): it runs to its exit and
+      nothing it writes through standard handles appears. Green before the fix
+      too: a GUI program never received the server's handles.
+- [ ] A console debuggee that writes more than 64 KB during a synthetic call
+      blocks until the call times out (the call's own event pump does not drain).
+
 ## What the suite does NOT prove (2026-08-08)
 
 Coverage-honesty notes. Each records a place where a green run is weaker evidence

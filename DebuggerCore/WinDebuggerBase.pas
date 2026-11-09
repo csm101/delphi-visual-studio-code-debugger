@@ -315,6 +315,12 @@ type
     FOnNotice:           TOnOutput;
     FOnDllLoaded:        TOnDllLoaded;
     FOnDllUnloaded:      TOnDllUnloaded;
+    // Read end of the pipe a launched console debuggee writes its stdout and
+    // stderr into; 0 when the debuggee was attached to or is not a console
+    // program. See LaunchWithCapturedStdio.
+    FStdioRead:    THandle;
+    // The bytes of a UTF-8 sequence the last read cut off, prepended to the next.
+    FStdioPending: TBytes;
     FOnBpHit:            TOnBpHit;
     FLastExceptionDesc:    string;  // "Class: Message" (or class / AV summary) for the stop UI
     FLastExceptionClass:   string;  // raised class name alone (DAP exceptionInfo.exceptionId)
@@ -679,6 +685,11 @@ type
     procedure HandleExitProcess(const Ev: TDebugEvent);
     procedure DrainUntilExit(TimeoutMs: Cardinal);
     procedure CloseTargetHandles;
+    procedure LaunchWithCapturedStdio(const CommandLine: string);
+    procedure DrainDebuggeeStdio;
+    procedure EmitDebuggeeStdio(const Bytes: TBytes; Final: Boolean);
+    procedure FinishDebuggeeStdio;
+    procedure ReleaseDebuggeeStdio;
     procedure HandleOutputDbgString(const Ev: TDebugEvent);
     procedure HandleException(const Ev: TDebugEvent; out ContinueStatus: DWORD);
     procedure HandleLoadDll(const Ev: TDebugEvent);
@@ -695,7 +706,7 @@ type
     constructor Create(ADebugInfo: TDebugInfoSet; PreferredBase: UInt64);
     destructor  Destroy; override;
     // Called from debug thread
-    procedure Launch(const ExePath: string; StopAtEntry: Boolean);
+    procedure Launch(const CommandLine: string; StopAtEntry, CaptureStdio: Boolean);
     procedure Attach(ProcessId: Cardinal; KillOnDetach: Boolean);
     procedure SetExceptionFilters(Filters: TExceptionFilters);
     procedure SetStepIsolation(ReleaseMs: Integer);
@@ -1169,6 +1180,118 @@ const
   SYMOPT_FAIL_CRITICAL_ERRORS = DWORD($00000200);
 
 // Defined further down (locals section); used earlier by EvaluateGlobalName.
+
+// ---- Standard handles of a launched console debuggee ------------------------
+// See TWinDebugger.LaunchWithCapturedStdio for why they exist.
+const
+  PROC_THREAD_ATTRIBUTE_HANDLE_LIST = $00020002;
+  DEBUGGEE_STDIO_PIPE_SIZE          = 64 * 1024;
+
+type
+  // STARTUPINFOEXW: Winapi.Windows declares the attribute-list functions but not
+  // the record they go in.
+  TStartupInfoExW = record
+    StartupInfo:     TStartupInfo;
+    lpAttributeList: PProcThreadAttributeList;
+  end;
+
+// CreateProcess for a debuggee: DEBUG_ONLY_THIS_PROCESS plus ExtraFlags. The
+// process and thread handles arrive again with CREATE_PROCESS_DEBUG_EVENT, so the
+// ones returned here are closed.
+procedure CreateDebuggeeProcess(const CommandLine: string; InheritHandles: Boolean;
+  ExtraFlags: DWORD; const [Ref] Startup: TStartupInfo);
+begin
+  // CreateProcessW may write into the command-line buffer.
+  var Writable := CommandLine;
+  UniqueString(Writable);
+  var ProcessInfo: TProcessInformation;
+  if not CreateProcess(nil, PChar(Writable), nil, nil, InheritHandles,
+       DEBUG_ONLY_THIS_PROCESS or ExtraFlags, nil, nil, Startup, ProcessInfo) then
+    RaiseLastOSError;
+  CloseHandle(ProcessInfo.hThread);
+  CloseHandle(ProcessInfo.hProcess);
+end;
+
+// CreateProcess with STARTF_USESTDHANDLES (stderr shares StdOutput) and an
+// attribute list that limits inheritance to exactly StdInput and StdOutput.
+procedure CreateDebuggeeWithStdHandles(const CommandLine: string; StdInput, StdOutput: THandle);
+begin
+  var ListSize: NativeUInt := 0;
+  // Sizing call: fails by design and reports the size the list needs.
+  InitializeProcThreadAttributeList(nil, 1, 0, ListSize);
+  var ListBuffer: TBytes;
+  SetLength(ListBuffer, ListSize);
+  var List := PProcThreadAttributeList(@ListBuffer[0]);
+  if not InitializeProcThreadAttributeList(List, 1, 0, ListSize) then
+    RaiseLastOSError;
+  try
+    var InheritedHandles: array[0..1] of THandle;
+    InheritedHandles[0] := StdInput;
+    InheritedHandles[1] := StdOutput;
+    // lpReturnSize is reserved and must be NULL; the RTL declares it as a var parameter.
+    if not UpdateProcThreadAttribute(List, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+         @InheritedHandles[0], SizeOf(InheritedHandles), nil, PNativeUInt(nil)^) then
+      RaiseLastOSError;
+    var StartupEx := Default(TStartupInfoExW);
+    StartupEx.StartupInfo.cb         := SizeOf(StartupEx);
+    StartupEx.StartupInfo.dwFlags    := STARTF_USESTDHANDLES;
+    StartupEx.StartupInfo.hStdInput  := StdInput;
+    StartupEx.StartupInfo.hStdOutput := StdOutput;
+    StartupEx.StartupInfo.hStdError  := StdOutput;
+    StartupEx.lpAttributeList        := List;
+    CreateDebuggeeProcess(CommandLine, True, EXTENDED_STARTUPINFO_PRESENT, StartupEx.StartupInfo);
+  finally
+    DeleteProcThreadAttributeList(List);
+  end;
+end;
+
+// Number of bytes in a UTF-8 sequence that starts with LeadByte; 0 for a
+// continuation byte or a byte no sequence starts with.
+function Utf8SequenceLength(LeadByte: Byte): Integer;
+begin
+  if LeadByte < $80 then
+    Exit(1);
+  if (LeadByte and $E0) = $C0 then
+    Exit(2);
+  if (LeadByte and $F0) = $E0 then
+    Exit(3);
+  if (LeadByte and $F8) = $F0 then
+    Exit(4);
+  Result := 0;
+end;
+
+// How many bytes at the end of Bytes belong to a UTF-8 sequence that is not
+// finished yet; 0 when the last character is complete.
+function IncompleteUtf8TailLength(const Bytes: TBytes): Integer;
+begin
+  var Lookback := Length(Bytes);
+  if Lookback > 3 then
+    Lookback := 3;
+  for var Back := 1 to Lookback do begin
+    var SequenceLength := Utf8SequenceLength(Bytes[Length(Bytes) - Back]);
+    // A continuation byte: its lead byte is further back.
+    if SequenceLength = 0 then
+      Continue;
+    if SequenceLength > Back then
+      Exit(Back);
+    Exit(0);
+  end;
+  Result := 0;
+end;
+
+// A debuggee's bytes as text: UTF-8 when they are valid UTF-8, otherwise the ANSI
+// code page, which is what a Delphi program's Write produces when its output is
+// not a console (System.TextOpen picks DefaultSystemCodePage for a pipe).
+function DecodeDebuggeeText(const Bytes: TBytes): string;
+begin
+  var CharCount := MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
+    PAnsiChar(@Bytes[0]), Length(Bytes), nil, 0);
+  if CharCount = 0 then
+    Exit(TEncoding.ANSI.GetString(Bytes));
+  SetLength(Result, CharCount);
+  MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
+    PAnsiChar(@Bytes[0]), Length(Bytes), PChar(Result), CharCount);
+end;
 
 { TWinDebugger }
 
@@ -5018,6 +5141,9 @@ begin
   FStepTid          := 0;
   DiscardSyntheticCallLeftovers;
   ContinueDebugEvent(Ev.dwProcessId, Ev.dwThreadId, DBG_CONTINUE);
+  // The program's last output goes out before the exit is reported.
+  DrainDebuggeeStdio;
+  FinishDebuggeeStdio;
   if Assigned(FOnExited) then
     FOnExited(Ev.ExitProcess.dwExitCode);
 end;
@@ -5956,28 +6082,142 @@ begin
   end;
 end;
 
-procedure TWinDebugger.Launch(const ExePath: string; StopAtEntry: Boolean);
-var
-  SI: TStartupInfo;
-  PI: TProcessInformation;
+procedure TWinDebugger.Launch(const CommandLine: string; StopAtEntry, CaptureStdio: Boolean);
 begin
   FStopAtEntry  := StopAtEntry;
   FFirstBreak   := False;
   FKillOnDetach := True;  // launch mode: we own the process; kill on disconnect.
-  SI := Default(TStartupInfo);
-  SI.cb := SizeOf(SI);
-  // No window / console flags here: the adapter must not interfere with the
-  // debuggee's UI in any way. GUI debuggees show their forms as usual; their
-  // own subsystem decides whether a console is allocated. Test targets are
-  // built as GUI-subsystem programs and never write to stdio, so the DAP
-  // channel on the adapter's stdin/stdout stays clean.
-  if not CreateProcess(nil, PChar(ExePath), nil, nil, False,
-      DEBUG_ONLY_THIS_PROCESS,
-      nil, nil, SI, PI) then
+  // No window / console flags on either path: the adapter must not interfere
+  // with the debuggee's UI in any way (an SW_HIDE once meant for a console hid
+  // VCL main forms instead). GUI debuggees show their forms as usual; their own
+  // subsystem decides whether a console is allocated.
+  if CaptureStdio then begin
+    LaunchWithCapturedStdio(CommandLine);
+    Exit;
+  end;
+  var Startup := Default(TStartupInfo);
+  Startup.cb := SizeOf(Startup);
+  CreateDebuggeeProcess(CommandLine, False, 0, Startup);
+end;
+
+// A console debuggee shares this process's console, and when it is given no
+// standard handles of its own Windows hands it DUPLICATES of this process's --
+// even with bInheritHandles = False. Here those are the DAP / MCP protocol
+// channel. Measured with DevTools\McpStdioProbe: a reply written after the
+// debuggee's unterminated "DUnitX - [..." line reached the client glued to it, as
+// one line it could not parse, so continue_and_wait never returned; and the
+// debuggee's ReadFile on stdin took the first 64 bytes of the client's next
+// request, which then never got a reply either. A GUI debuggee receives none of
+// this process's standard handles, which is why the session asks for a capture
+// only for console images.
+//
+// So the debuggee gets handles of its own. Stdin reads the NUL device: a read
+// returns end-of-file at once instead of waiting for input nobody can type.
+// Stdout and stderr share one pipe, whose read end DrainDebuggeeStdio forwards as
+// program output. Only those two handles are inherited
+// (PROC_THREAD_ATTRIBUTE_HANDLE_LIST): a plain bInheritHandles = True would also
+// pass every other inheritable handle of this process, the protocol pipes
+// included, and a debuggee holding a copy of our stdout would keep the client
+// from ever seeing it close.
+procedure TWinDebugger.LaunchWithCapturedStdio(const CommandLine: string);
+begin
+  var Inheritable := Default(TSecurityAttributes);
+  Inheritable.nLength        := SizeOf(Inheritable);
+  Inheritable.bInheritHandle := True;
+  var NulInput := CreateFile('NUL', GENERIC_READ, FILE_SHARE_READ or FILE_SHARE_WRITE,
+    @Inheritable, OPEN_EXISTING, 0, 0);
+  if NulInput = INVALID_HANDLE_VALUE then
     RaiseLastOSError;
-  // Handles stored when CREATE_PROCESS_DEBUG_EVENT arrives
-  CloseHandle(PI.hThread);  // we get the thread handle in the event
-  CloseHandle(PI.hProcess);
+  try
+    var PipeRead, PipeWrite: THandle;
+    if not CreatePipe(PipeRead, PipeWrite, @Inheritable, DEBUGGEE_STDIO_PIPE_SIZE) then
+      RaiseLastOSError;
+    try
+      SetHandleInformation(PipeRead, HANDLE_FLAG_INHERIT, 0);
+      CreateDebuggeeWithStdHandles(CommandLine, NulInput, PipeWrite);
+    except
+      CloseHandle(PipeRead);
+      CloseHandle(PipeWrite);
+      raise;
+    end;
+    // The debuggee has its own copy of the write end. Ours has to go, or the pipe
+    // could never report that every writer is gone.
+    CloseHandle(PipeWrite);
+    FStdioRead := PipeRead;
+  finally
+    CloseHandle(NulInput);
+  end;
+end;
+
+// Forwards what a captured debuggee wrote to stdout / stderr since the last call
+// as program output, through OnOutput like OutputDebugString text. Never blocks:
+// PeekNamedPipe says how much is waiting. ProcessOneEvent calls it before it
+// dispatches each debug event, while the whole debuggee is suspended, so text
+// written before a stop is reported ahead of the stop, in the order a console
+// shows it.
+procedure TWinDebugger.DrainDebuggeeStdio;
+const
+  // Bounds one call while the debuggee runs and keeps writing.
+  MAX_BYTES_PER_DRAIN = 1024 * 1024;
+begin
+  var Drained: Int64 := 0;
+  while (FStdioRead <> 0) and (Drained < MAX_BYTES_PER_DRAIN) do begin
+    var Waiting: DWORD := 0;
+    if not PeekNamedPipe(FStdioRead, nil, 0, nil, @Waiting, nil) then begin
+      // Every writer is gone: the debuggee and any child that inherited its handles.
+      FinishDebuggeeStdio;
+      Exit;
+    end;
+    if Waiting = 0 then
+      Exit;
+    var Chunk: TBytes;
+    SetLength(Chunk, Waiting);
+    var BytesRead: DWORD := 0;
+    if not ReadFile(FStdioRead, Chunk[0], Waiting, BytesRead, nil) then
+      Exit;
+    if BytesRead = 0 then
+      Exit;
+    SetLength(Chunk, BytesRead);
+    Inc(Drained, BytesRead);
+    EmitDebuggeeStdio(FStdioPending + Chunk, False);
+  end;
+end;
+
+// Reports captured bytes as text. Unless Final, the bytes of a UTF-8 sequence the
+// read cut off are held back and prepended to the next read.
+procedure TWinDebugger.EmitDebuggeeStdio(const Bytes: TBytes; Final: Boolean);
+begin
+  var Complete := Length(Bytes);
+  if not Final then
+    Dec(Complete, IncompleteUtf8TailLength(Bytes));
+  FStdioPending := Copy(Bytes, Complete, Length(Bytes) - Complete);
+  if Complete = 0 then
+    Exit;
+  if Assigned(FOnOutput) then
+    FOnOutput(DecodeDebuggeeText(Copy(Bytes, 0, Complete)));
+end;
+
+// The capture is over (every writer is gone, or the debuggee exited): reports the
+// bytes still held back for an unfinished UTF-8 sequence, then releases the pipe.
+procedure TWinDebugger.FinishDebuggeeStdio;
+begin
+  if FStdioRead = 0 then
+    Exit;
+  var Held := FStdioPending;
+  ReleaseDebuggeeStdio;
+  if Length(Held) > 0 then
+    EmitDebuggeeStdio(Held, True);
+end;
+
+// Closes the pipe and drops held-back bytes WITHOUT reporting anything: this runs
+// during teardown too, when the session behind OnOutput may already be gone.
+procedure TWinDebugger.ReleaseDebuggeeStdio;
+begin
+  FStdioPending := nil;
+  if FStdioRead = 0 then
+    Exit;
+  CloseHandle(FStdioRead);
+  FStdioRead := 0;
 end;
 
 // Enable SeDebugPrivilege in the current process token so DebugActiveProcess
@@ -6040,9 +6280,13 @@ begin
   ProcessCommandQueue;
 
   if not WaitForDebugEvent(Ev, 10) then begin
+    // A running console debuggee blocks in WriteFile once its pipe is full.
+    DrainDebuggeeStdio;
     CheckStepIsolation;
     Exit;
   end;
+  // What the debuggee wrote before this event is reported ahead of it.
+  DrainDebuggeeStdio;
 
   ContStatus := DBG_CONTINUE;
   case Ev.dwDebugEventCode of
@@ -7629,6 +7873,7 @@ end;
 // alive. Idempotent: safe to call again from Destroy.
 procedure TWinDebugger.CloseTargetHandles;
 begin
+  ReleaseDebuggeeStdio;
   if FSymInitialized then begin
     SymCleanup(FProcess);
     FSymInitialized := False;
