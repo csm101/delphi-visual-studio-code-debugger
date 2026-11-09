@@ -322,6 +322,7 @@ type
     // The bytes of a UTF-8 sequence the last read cut off, prepended to the next.
     FStdioPending: TBytes;
     FOnBpHit:            TOnBpHit;
+    FOnExceptionLogged:  TOnExceptionLogged;
     FLastExceptionDesc:    string;  // "Class: Message" (or class / AV summary) for the stop UI
     FLastExceptionClass:   string;  // raised class name alone (DAP exceptionInfo.exceptionId)
     FLastExceptionMessage: string;  // Exception.Message text alone
@@ -659,6 +660,9 @@ type
     procedure CaptureAnnouncedThreadName(const Ev: TDebugEvent);
     function  RaiseSiteLocation(out UnitName: string; out Line: Integer): Boolean;
     function  FormatCallStackText: string;
+    procedure ReportLoggedException(const Ev: TDebugEvent; Action: TExceptionAction;
+      const ExcClass, ExcMessage: string; HasRaiseSite: Boolean;
+      const RaiseUnit: string; RaiseLine: Integer);
     procedure ProcessCommandQueue;
     // Synthetic-call leftovers: the managed results RetainCallResult recorded
     // and the strings AllocateRemoteString built, all released together just
@@ -890,6 +894,7 @@ type
     function  GetOnDllLoaded:   TOnDllLoaded;   procedure SetOnDllLoaded(const V: TOnDllLoaded);
     function  GetOnDllUnloaded: TOnDllUnloaded; procedure SetOnDllUnloaded(const V: TOnDllUnloaded);
     function  GetOnBpHit:       TOnBpHit;       procedure SetOnBpHit(const V: TOnBpHit);
+    function  GetOnExceptionLogged: TOnExceptionLogged; procedure SetOnExceptionLogged(const V: TOnExceptionLogged);
     // Method-style accessors for the read-only properties -- needed for
     // IDebugTarget. Declared as functions; the field-backed property
     // declarations below let the rest of TWinDebugger keep using
@@ -924,6 +929,7 @@ type
     property  OnDllLoaded:    TOnDllLoaded   read GetOnDllLoaded   write SetOnDllLoaded;
     property  OnDllUnloaded:  TOnDllUnloaded read GetOnDllUnloaded write SetOnDllUnloaded;
     property  OnBpHit:        TOnBpHit       read GetOnBpHit       write SetOnBpHit;
+    property  OnExceptionLogged: TOnExceptionLogged read GetOnExceptionLogged write SetOnExceptionLogged;
   end;
 
 // Removes locals that share a frame address with another local, because two
@@ -5990,10 +5996,10 @@ begin
       // Rule engine: a matching rule's action overrides the filter decision.
       var EffAction: TExceptionAction;
       if FilterStop then EffAction := eaBreak else EffAction := eaIgnore;
+      var RaiseUnit := '';
+      var RaiseLine := 0;
+      var HasRaiseSite := False;
       if Length(FExceptionRules) > 0 then begin
-        var RaiseUnit := '';
-        var RaiseLine := 0;
-        var HasRaiseSite := False;
         if RulesNeedRaiseSite(FExceptionRules) then
           HasRaiseSite := RaiseSiteLocation(RaiseUnit, RaiseLine);
         // Runtime class + ancestors for `classIs`; a non-Delphi exception has no
@@ -6058,11 +6064,8 @@ begin
         ContinueStatus         := DBG_EXCEPTION_NOT_HANDLED;
       end else begin
         // ignore / log / logStack: do not pause; resume after optional logging.
-        if (EffAction in [eaLog, eaLogStack]) and Assigned(FOnOutput) then begin
-          FOnOutput(Format('[Exception] %s at $%x', [ExcDesc, ExcAddr]));
-          if EffAction = eaLogStack then
-            FOnOutput(FormatCallStackText);
-        end;
+        if EffAction in [eaLog, eaLogStack] then
+          ReportLoggedException(Ev, EffAction, ExcClass, ExcMessage, HasRaiseSite, RaiseUnit, RaiseLine);
         // If a step-over is running over a call (resume BP planted) and this is
         // a real unwinding exception, the raise will not return to the call's
         // return address -- it lands in this function's except/finally handler.
@@ -7844,6 +7847,50 @@ begin
   end;
 end;
 
+// A `log` / `logStack` rule matched: report the exception without stopping. The
+// structured report goes to OnExceptionLogged; a host that does not listen gets
+// the same report as text through OnOutput. The raise site is the one the rule
+// match already walked for, or -- for logStack -- the first frame with source.
+procedure TWinDebugger.ReportLoggedException(const Ev: TDebugEvent; Action: TExceptionAction;
+  const ExcClass, ExcMessage: string; HasRaiseSite: Boolean; const RaiseUnit: string; RaiseLine: Integer);
+begin
+  var Entry := Default(TLoggedException);
+  Entry.ThreadId       := Ev.dwThreadId;
+  Entry.Code           := Ev.Exception.ExceptionRecord.ExceptionCode;
+  Entry.Address        := UInt64(Ev.Exception.ExceptionRecord.ExceptionAddress);
+  Entry.FirstChance    := Ev.Exception.dwFirstChance <> 0;
+  Entry.ExceptionClass := ExcClass;
+  Entry.Message        := ExcMessage;
+  Entry.Action         := Action;
+  if HasRaiseSite then begin
+    Entry.RaiseFile := RaiseUnit;
+    Entry.RaiseLine := RaiseLine;
+  end;
+  if Action = eaLogStack then begin
+    Entry.Frames := GetStackFrames;
+    if Entry.RaiseFile = '' then
+      for var Frame in Entry.Frames do
+        if Frame.SourceFile <> '' then begin
+          Entry.RaiseFile := Frame.SourceFile;
+          Entry.RaiseLine := Frame.SourceLine;
+          Break;
+        end;
+  end;
+
+  if Assigned(FOnExceptionLogged) then begin
+    FOnExceptionLogged(Entry);
+    Exit;
+  end;
+  if not Assigned(FOnOutput) then
+    Exit;
+  var Desc := ExcClass;
+  if ExcMessage <> '' then
+    Desc := ExcClass + ': ' + ExcMessage;
+  FOnOutput(Format('[Exception] %s at $%x', [Desc, Entry.Address]));
+  if Action = eaLogStack then
+    FOnOutput(FormatCallStackText);
+end;
+
 // Pump the debug port until the target's EXIT_PROCESS event (or a timeout),
 // releasing each intermediate event with DBG_CONTINUE. After a TerminateProcess
 // the killed target still holds outstanding debug events; until we consume the
@@ -7983,6 +8030,8 @@ function  TWinDebugger.GetOnDllUnloaded: TOnDllUnloaded; begin Result := FOnDllU
 procedure TWinDebugger.SetOnDllUnloaded(const V: TOnDllUnloaded); begin FOnDllUnloaded := V; end;
 function  TWinDebugger.GetOnBpHit:       TOnBpHit;       begin Result := FOnBpHit;       end;
 procedure TWinDebugger.SetOnBpHit(const V: TOnBpHit);    begin FOnBpHit := V;            end;
+function  TWinDebugger.GetOnExceptionLogged: TOnExceptionLogged; begin Result := FOnExceptionLogged; end;
+procedure TWinDebugger.SetOnExceptionLogged(const V: TOnExceptionLogged); begin FOnExceptionLogged := V; end;
 
 function TWinDebugger.ProcessHandle:     THandle; begin Result := FProcess;            end;
 function TWinDebugger.ImageBase:         UInt64;  begin Result := FImageBase;          end;

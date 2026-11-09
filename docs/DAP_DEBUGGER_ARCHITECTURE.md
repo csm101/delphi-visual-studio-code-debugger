@@ -3511,20 +3511,30 @@ matcher takes the raw `ExceptionCode` alongside the decoded fields; the overload
 without it pass `NO_EXCEPTION_CODE` (0), which never satisfies a `code` rule.
 `ParseExceptionCode` accepts `0x…`, `$…`, decimal and signed decimal.
 
-`DapServer.ParseExceptionRulesArray` builds the table from an `exceptionRules`
-array (`class`/`classIs` string|array, `code` string|number|array, `message`,
-`messageRegex`, `unit` with the `*unknown*` token, `line`/`lineFrom`/`lineTo`,
-mandatory `action`), and the combined result reaches the debugger via
+`ExceptionRuleFiles.ParseExceptionRulesArray` (DebuggerCore, shared by both
+frontends) builds the table from a JSON rule array (`class`/`classIs`
+string|array, `code` string|number|array, `message`, `messageRegex`, `unit` with
+the `*unknown*` token, `line`/`lineFrom`/`lineTo`, mandatory `action`; keys
+starting with `_` are comments). Its `Problems` out-parameter names every finding
+as `rule #N: ...`: an entry that must be skipped (no valid action, an unparsable
+`code`, a `messageRegex` that does not compile, not an object) and an unknown key,
+which leaves the rule in place. `ParseExceptionRulesDocument` accepts the two
+shapes a rules file has (a bare array, or an object with an `exceptionRules`
+array) and reports any other. A VS Code rule FILE is read leniently -- problems go
+to the diagnostic log -- while the MCP server refuses an agent's rules on any
+problem (see "MCP frontend" below). The table reaches the debugger via
 `IDebugTarget.SetExceptionRules` in both the launch and attach paths.
 
-#### The precedence chain
+#### The precedence chain (VS Code / DAP only)
 
-Rules come from up to three places, and **every one of them is a FILE**.
-`ApplyExceptionRules` (called once per launch/attach) builds them into
-`FRuleTiers: TArray<TExceptionRuleTier>`, ordered narrowest scope first, and the
-table handed to the engine is simply their rules concatenated -- so
-first-match-wins across the whole chain is the same rule it always was, over a
-longer list:
+`ExceptionRuleFiles.TExceptionRuleChain` holds the rule-file tiers of a DAP
+session, ordered narrowest scope first, and the table handed to the engine
+(`Combined`) is simply their rules concatenated -- so first-match-wins across the
+whole chain is the same rule it always was, over a longer list.
+`LoadFiles(ProjectFile, GlobalPath)` replaces the tiers, `ReloadChangedFiles` is
+the hot-reload below. Only the DAP frontend has one (`TDapServer.FRuleChain`,
+filled by `ApplyExceptionRules` once per launch/attach): the MCP server never
+reads these files (see "MCP frontend").
 
 | # | Tier | Source | Scope |
 |---|---|---|---|
@@ -3562,8 +3572,8 @@ It was one until this landed, and the consequence was that "Debug X" and "Attach
 to X" -- one project, started two ways -- were free to disagree about which
 exceptions matter. Which rules apply and how the session started are orthogonal,
 so the scope was removed rather than kept beside the ones that mean something.
-Nothing parses the key from a launch request any more; `ParseExceptionRulesArray`
-survives because the FILES use it. Pinned by
+Nothing in the DAP frontend parses the key from a launch request any more.
+Pinned by
 `RulesInTheLaunchRequest_AreNotRead`, which sends the array the old way and
 requires that it change nothing.
 
@@ -3581,8 +3591,8 @@ tier whose mtime moved is reloaded in place, the combined table is pushed via
 can edit any rules file while stopped and have it take effect on resume without
 restarting the session -- and because an absent file has an mtime of its own (0),
 CREATING a sidecar mid-session counts as a change too
-(`SidecarCreatedMidSession_IsPickedUpOnResume`). Now that every tier is a file,
-this covers the whole chain.
+(`SidecarCreatedMidSession_IsPickedUpOnResume`). Every tier is a file, so this
+covers the whole chain.
 
 Covered by `Test_GlobalExceptionRules_HotReloadOnResume` for the machine-wide
 file and by `TProjectExceptionRulesTests` / `TPackageExceptionRulesTests`
@@ -3604,7 +3614,7 @@ first stack frame with known source — for a Delphi `raise` the exception addre
 is in the RTL, so frame 0 is sourceless and the walk finds the user frame; for an
 AV frame 0 is the faulting line. `eaBreak` keeps the existing stop path
 (`ReportStopped` + pending `DBG_EXCEPTION_NOT_HANDLED`); `eaLog`/`eaLogStack`
-emit to the console (stack via `FormatCallStackText`) then pass through;
+report the exception through `ReportLoggedException` then pass through;
 `eaIgnore` passes through silently. The step-over raise-arming
 (`PlantInFuncStepBps`) still runs on the pass-through path. Covered by
 `Test_ExceptionRule_Ignore_Resumes`,
@@ -3614,6 +3624,65 @@ emit to the console (stack via `FormatCallStackText`) then pass through;
 `--run-native-exception-test`: a native `0xE0424242` raise followed by a Delphi
 raise — the code rule must break on the first and leave the second to the
 filters) and `Test_ExceptionRule_Code_Decimal_BreaksOnNative`.
+
+#### Logged exceptions
+
+`ReportLoggedException` builds a `TLoggedException` (`DebugTarget.pas`: thread,
+code, address, first-chance flag, class, message, action, the raise site, and for
+`eaLogStack` the raising thread's `GetStackFrames`) and hands it to
+`IDebugTarget.OnExceptionLogged`. The raise site is the one the rule match already
+walked for, or for `eaLogStack` the first frame with source; an `eaLog` whose
+rules needed no raise site does not walk the stack just to fill it. An engine
+with no listener writes the old text through `OnOutput`.
+
+`TDebugSession.HandleExceptionLogged` numbers the entry, keeps it in a bounded
+list (`EXCEPTION_LOG_CAPACITY` = 1000 between two drains; older entries are
+dropped and counted) for `DrainExceptionLog`, and emits the text form --
+`[Exception] Class: Message at $addr` plus one indented line per frame -- as
+`okLogPoint` into the debugger output. Before, that text went through the
+program-output path: DAP showed it as the program's `stdout` and MCP mixed it
+into `get_debuggee_output` with whatever the program wrote. It is output the
+user's own rule asked for, which is what `okLogPoint` already meant for a
+logpoint, so in VS Code it is now a `console` line in the Debug Console.
+
+#### MCP frontend
+
+**The MCP server never reads the VS Code rule files** -- neither the project's
+`<Project>.ExceptionSettings*.json` nor the machine-wide `exceptionRules.json`,
+whoever names the project (DDK, a launch.json's `delphiProjectFile`). Those files
+are the preferences of the human debugging by hand in VS Code; what an agent asks
+of the debugger is not the same thing, and several agent sessions may debug in
+parallel, each with rules of its own. So an MCP session's rules live in the
+session (`TMcpServer.FSessionRules`) and come only from the agent:
+
+- `exceptionRules` (inline array) or `exceptionRulesFile` (the path of a JSON
+  rules document the agent wrote or chose -- a bare array or an object with an
+  `exceptionRules` array) on every launch / attach tool, through
+  `TMcpServer.ApplyExceptionArgs`. At most one of the two. A file is read once,
+  by the call that names it, and never watched: there is no hot-reload in MCP.
+- `set_exception_rules` with `rules` or `rulesFile` (exactly one), which replaces
+  them on the live session (`TDebugSession.SetExceptionRules`, which unlike the
+  launch path also applies an empty table).
+
+Both are parsed strictly (`TryAgentRulesArgs`): any finding
+`ParseExceptionRulesArray` reports fails the call and changes nothing. A VS Code
+file can be lenient because its author reads the log; an agent that mistypes
+`clas` would otherwise get a rule with no class criterion, which matches every
+exception.
+
+`ApplyExceptionArgs` also takes `exceptionFilters` / `delphiExceptionClasses`,
+now on the attach tools too. The presence of the array is what sets them, so `[]`
+means "no first-chance stops" as the tool schema always said; it used to be read
+as "not given". It first makes sure the session can start
+(`EnsureFreshSessionForStart`, then `dsNone`), so a launch the session would
+reject does not leave `get_exception_rules` describing rules no debuggee runs
+under.
+
+`get_exception_rules` returns the session's rules, and `get_exception_log`
+drains `DrainExceptionLog` as data -- each entry with its frames' unit, file,
+line, address and module, so an agent driving the application (GlassBox) reads
+class, message and stack of every handled exception without the debuggee ever
+stopping.
 
 ### `$lasterror` / `$laststatus` pseudo-variables
 

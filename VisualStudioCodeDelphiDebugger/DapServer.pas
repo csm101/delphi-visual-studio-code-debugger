@@ -11,7 +11,7 @@ uses
   System.SyncObjs, System.StrUtils, System.IOUtils, System.Math, System.DateUtils,
   System.NetEncoding,
   Winapi.Windows, Winapi.TlHelp32,
-  DapProtocol, DebugInfoTypes, DebugInfoSet, DebugTarget, ExceptionRules,
+  DapProtocol, DebugInfoTypes, DebugInfoSet, DebugTarget, ExceptionRules, ExceptionRuleFiles,
   MapFileReader, TD32FileReader, RsmFileReader, WinDebuggerBase, DelphiRtti, DebugSourceIndex,
   DelphiValueReaders, SourceResolver, DebugSessionTypes, DebugSession, VariableExpander,
   BreakpointEval, PeSymbolSupport, ModuleSymbolLoader,
@@ -35,151 +35,6 @@ const
 // TDapServer.BuildPlaceholderDisassembly (docs/ASSEMBLY_LEVEL_DEBUGGING.md
 // increment 5). Forward-declared so call order is irrelevant.
 function ResolveZydisDllPath: string; forward;
-
-// Defined further down; used earlier by OnDllLoaded. Forward-declared so
-// call order is irrelevant.
-
-// Parse the launch.json `exceptionRules` array into the rule-engine table.
-// Each entry: { class?: string|string[], classIs?: string|string[],
-// code?: string|number|array, message?, messageRegex?, unit?, line?: int,
-// lineFrom?: int, lineTo?: int, action: "ignore"|"log"|"logStack"|"break" }.
-// Unknown / malformed entries are skipped.
-function ParseExceptionRulesArray(Arr: TJSONArray): TArray<TExceptionRule>;
-
-  function ReadNames(Entry: TJSONObject; const Key: string): TArray<string>;
-  begin
-    Result := nil;
-    var V := Entry.FindValue(Key);
-    if V is TJSONArray then begin
-      for var I := 0 to TJSONArray(V).Count - 1 do
-        Result := Result + [TJSONArray(V).Items[I].Value]
-    end
-    else if (V <> nil) and (V.Value <> '') then
-      Result := [V.Value];
-  end;
-
-  // `code` accepts a hex ("0xC0000005" / "$C0000005") or decimal spelling, as a
-  // JSON string or a JSON number, singly or as an any-of array. Entries that do
-  // not parse are dropped rather than turned into a match-everything rule.
-  function ReadCodes(Entry: TJSONObject; const Key: string): TArray<Cardinal>;
-
-    procedure AddCode(V: TJSONValue; var Codes: TArray<Cardinal>);
-    begin
-      if V = nil then
-        Exit;
-      var Code: Cardinal;
-      if ParseExceptionCode(V.Value, Code) then
-        Codes := Codes + [Code];
-    end;
-
-  begin
-    Result := nil;
-    var V := Entry.FindValue(Key);
-    if V is TJSONArray then begin
-      for var I := 0 to TJSONArray(V).Count - 1 do
-        AddCode(TJSONArray(V).Items[I], Result)
-    end
-    else
-      AddCode(V, Result);
-  end;
-
-var
-  Rules: TList<TExceptionRule>;
-begin
-  Result := nil;
-  if Arr = nil then Exit;
-  Rules := TList<TExceptionRule>.Create;
-  try
-    for var I := 0 to Arr.Count - 1 do begin
-      if not (Arr.Items[I] is TJSONObject) then Continue;
-      var Entry := TJSONObject(Arr.Items[I]);
-      var Action: TExceptionAction;
-      if not ParseExceptionAction(Entry.GetValue<string>('action', ''), Action) then
-        Continue;  // an action is mandatory and must be valid
-
-      var Rule := Default(TExceptionRule);
-      Rule.Action       := Action;
-      Rule.ClassNames   := ReadNames(Entry, 'class');
-      Rule.ClassIsNames := ReadNames(Entry, 'classIs');
-      Rule.Codes        := ReadCodes(Entry, 'code');
-      // A `code` that parsed to nothing would silently degrade into a wildcard
-      // and make the rule match every exception; drop the rule instead.
-      if (Entry.FindValue('code') <> nil) and (Length(Rule.Codes) = 0) then begin
-        DapLog('exceptionRules: rule skipped, `code` is not a valid Win32 exception code');
-        Continue;
-      end;
-      Rule.MessageSub   := Entry.GetValue<string>('message', '');
-      Rule.MessageRegex := Entry.GetValue<string>('messageRegex', '');
-      var UnitStr := Entry.GetValue<string>('unit', '');
-      if SameText(UnitStr, UNKNOWN_UNIT_TOKEN) then
-        Rule.MatchUnknownUnit := True
-      else
-        Rule.UnitName := UnitStr;
-      Rule.LineFrom := -1;
-      Rule.LineTo   := -1;
-      var SingleLine := Entry.GetValue<Integer>('line', -1);
-      if SingleLine >= 0 then begin
-        Rule.LineFrom := SingleLine;
-        Rule.LineTo   := SingleLine;
-      end;
-      Rule.LineFrom := Entry.GetValue<Integer>('lineFrom', Rule.LineFrom);
-      Rule.LineTo   := Entry.GetValue<Integer>('lineTo',   Rule.LineTo);
-      Rules.Add(Rule);
-    end;
-    Result := Rules.ToArray;
-  finally
-    Rules.Free;
-  end;
-end;
-
-// Load exception rules from a JSON file -- the machine-wide shared file or
-// either project sidecar; all three have the same shape. Accepts a bare array or
-// an object with an `exceptionRules` key. Strict JSON, no JSONC: this is not
-// launch.json. A missing or malformed file yields no rules and never raises --
-// rules the user cannot see are a nuisance, a debugger that will not start is not.
-function LoadExceptionRulesFile(const Path: string): TArray<TExceptionRule>;
-begin
-  Result := nil;
-  if (Path = '') or not FileExists(Path) then Exit;
-  try
-    var Root := TJSONObject.ParseJSONValue(TFile.ReadAllText(Path, TEncoding.UTF8));
-    if Root = nil then Exit;
-    try
-      if Root is TJSONArray then
-        Result := ParseExceptionRulesArray(TJSONArray(Root))
-      else if Root is TJSONObject then
-        Result := ParseExceptionRulesArray(
-          TJSONObject(Root).FindValue('exceptionRules') as TJSONArray);
-    finally
-      Root.Free;
-    end;
-  except
-    on E: Exception do
-      DapLog('LoadExceptionRulesFile failed: ' + E.Message);
-  end;
-end;
-
-// Default shared-rules path: %USERPROFILE%\.DelphiWinDebugger\exceptionRules.json
-function DefaultGlobalExceptionRulesPath: string;
-begin
-  var Home := GetEnvironmentVariable('USERPROFILE');
-  if Home = '' then Exit('');
-  Result := TPath.Combine(TPath.Combine(Home, '.DelphiWinDebugger'), 'exceptionRules.json');
-end;
-
-// Last-write time of a rules file, 0 when absent -- used to detect edits. An
-// absent file legitimately has an mtime: creating it later IS a change.
-function ExceptionRulesFileMTime(const Path: string): TDateTime;
-begin
-  Result := 0;
-  if (Path <> '') and FileExists(Path) then
-    try
-      Result := TFile.GetLastWriteTime(Path);
-    except
-      Result := 0;
-    end;
-end;
-
 
 // Whether to advertise `supportsReadMemoryRequest` / `supportsWriteMemoryRequest`.
 // A command-line switch rather than a launch-config field, because `initialize`
@@ -291,19 +146,6 @@ type
     Size:     UInt64;   // 0 = the adapter could not establish it (never guessed)
     Name:     string;
     TypeName: string;
-  end;
-
-  // One tier of the exception-rule precedence chain. The session holds them in
-  // order, most specific first, and the table handed to the engine is simply
-  // their rules concatenated -- first match wins across the whole chain.
-  //
-  // Every tier is a FILE, and carries the mtime last seen there so the resume
-  // path can notice an edit and reload just that tier.
-  TExceptionRuleTier = record
-    Path:        string;
-    Description: string;   // how the console log names this tier
-    MTime:       TDateTime;
-    Rules:       TArray<TExceptionRule>;
   end;
 
   // Background symbol-loader work item. A VALUE copy of the fields the parse
@@ -478,10 +320,9 @@ type
     FDelphiClassFilter:   string;  // condition for the `delphi` filter (comma-separated class names)
     // Exception-rule state, captured at launch so the file-backed tiers can be
     // hot-reloaded on resume without re-reading launch.json.
-    FRuleTiers:         TArray<TExceptionRuleTier>; // ordered, most specific first
-    FDelphiProjectFile: string;   // `delphiProjectFile`, absolute; '' = no project scope
-    FUseGlobalRules:    Boolean;
-    FGlobalRulesPath:   string;
+    // A DAP session never fills the chain's session tier: a launch
+    // configuration is not a place rules can live (see ApplyExceptionRules).
+    FRuleChain:         TExceptionRuleChain;
 
     // `progressLocation` from the launch/attach config -> FProgressAsCustomEvent.
     procedure ParseProgressLocation(Args: TJSONObject);
@@ -743,8 +584,6 @@ type
     // options.
     function  ApplyExceptionRules(Args: TJSONObject): TArray<TExceptionRule>;
     function  ResolveDelphiProjectFile(Args: TJSONObject): string;
-    procedure AddFileRuleTier(const Path, Description: string);
-    function  CombinedExceptionRules: TArray<TExceptionRule>;
     procedure ReloadExceptionRuleFilesIfChanged;
     // Value formatting (FormatLocalValue / FormatLocalType / Variant + string
     // decode / SlotSizeAt) moved to DelphiValueReaders (TDelphiValueReader).
@@ -786,6 +625,7 @@ begin
   // ON.
   FDiagnosticsToOutputChannel := True;
   FIO         := TDapIO.Create;
+  FRuleChain  := TExceptionRuleChain.Create;
   // The session owns the engine + all symbol/expansion machinery. Configure its
   // loader with the DAP-side enriched module class + PACKAGEINFO hooks + log sinks
   // BEFORE any launch, and subscribe to the session's async + module events.
@@ -925,6 +765,7 @@ begin
   // The session's destructor tears down the engine and frees Loader-before-DebugInfo
   // in the correct order; the DAP layer owns and frees NONE of those directly.
   FSession.Free;
+  FRuleChain.Free;
   FRefToHandle.Free;
   FHandleToRef.Free;
   FMemoryExtents.Free;
@@ -1807,38 +1648,13 @@ begin
   Result := ExpandFileName(Result);
 end;
 
-// Append a file-backed tier. The file need not exist: an absent one contributes
-// no rules but keeps its place in the chain, so creating it mid-session is picked
-// up by the hot-reload on the next resume (mtime 0 -> a real timestamp).
-procedure TDapServer.AddFileRuleTier(const Path, Description: string);
-begin
-  if Path = '' then
-    Exit;
-  var Tier := Default(TExceptionRuleTier);
-  Tier.Path        := Path;
-  Tier.Description := Description;
-  Tier.MTime       := ExceptionRulesFileMTime(Path);
-  Tier.Rules       := LoadExceptionRulesFile(Path);
-  FRuleTiers := FRuleTiers + [Tier];
-  if Length(Tier.Rules) > 0 then
-    DapLog(Format('exceptionRules: %d %s rule(s) from %s',
-      [Length(Tier.Rules), Description, Path]));
-end;
-
-function TDapServer.CombinedExceptionRules: TArray<TExceptionRule>;
-begin
-  Result := nil;
-  for var Tier in FRuleTiers do
-    Result := Result + Tier.Rules;
-end;
-
 // Capture the session's exception-rule config at launch/attach and return the
 // combined table, so the caller can hand it to the session's launch/attach
 // options -- the session pushes it to the engine it builds (the engine does not
 // exist yet at this point).
 //
-// The chain runs from the narrowest scope to the widest, and first match wins
-// across all of it:
+// The chain (ExceptionRuleFiles.TExceptionRuleChain) runs from the narrowest
+// scope to the widest, and first match wins across all of it:
 //
 //   1. <Project>.ExceptionSettings.local.json  this developer, this machine
 //   2. <Project>.ExceptionSettings.json        the project's own, shared by the team
@@ -1855,22 +1671,17 @@ end;
 // alongside the ones that mean something.
 function TDapServer.ApplyExceptionRules(Args: TJSONObject): TArray<TExceptionRule>;
 begin
-  SetLength(FRuleTiers, 0);
-  FDelphiProjectFile := ResolveDelphiProjectFile(Args);
-  FUseGlobalRules    := Args.GetValue<Boolean>('useGlobalExceptionRules', True);
-  FGlobalRulesPath   := Args.GetValue<string>('globalExceptionRulesPath', '');
-  if FUseGlobalRules and (FGlobalRulesPath = '') then
-    FGlobalRulesPath := DefaultGlobalExceptionRulesPath;
-
-  if FDelphiProjectFile <> '' then begin
-    DapLog('delphiProjectFile: ' + FDelphiProjectFile);
-    AddFileRuleTier(LocalProjectExceptionRulesPath(FDelphiProjectFile), 'project (local)');
-    AddFileRuleTier(ProjectExceptionRulesPath(FDelphiProjectFile),      'project (shared)');
+  var ProjectFile := ResolveDelphiProjectFile(Args);
+  if ProjectFile <> '' then
+    DapLog('delphiProjectFile: ' + ProjectFile);
+  var GlobalPath := '';
+  if Args.GetValue<Boolean>('useGlobalExceptionRules', True) then begin
+    GlobalPath := Args.GetValue<string>('globalExceptionRulesPath', '');
+    if GlobalPath = '' then
+      GlobalPath := DefaultGlobalExceptionRulesPath;
   end;
-  if FUseGlobalRules then
-    AddFileRuleTier(FGlobalRulesPath, 'machine-wide');
-
-  Result := CombinedExceptionRules;
+  FRuleChain.LoadFiles(ProjectFile, GlobalPath);
+  Result := FRuleChain.Combined;
 end;
 
 // Hot-reload: re-read every tier that changed on disk, so the user can edit
@@ -1880,19 +1691,12 @@ procedure TDapServer.ReloadExceptionRuleFilesIfChanged;
 begin
   if FDebugger = nil then
     Exit;
-  var Changed := False;
-  for var I := 0 to High(FRuleTiers) do begin
-    var MTime := ExceptionRulesFileMTime(FRuleTiers[I].Path);
-    if MTime = FRuleTiers[I].MTime then
-      Continue;
-    FRuleTiers[I].MTime := MTime;
-    FRuleTiers[I].Rules := LoadExceptionRulesFile(FRuleTiers[I].Path);
-    Changed := True;
-    SendConsoleLog(Format('[exceptionRules] reloaded %s (%d rules): %s',
-      [FRuleTiers[I].Description, Length(FRuleTiers[I].Rules), FRuleTiers[I].Path]));
-  end;
-  if Changed then
-    FDebugger.SetExceptionRules(CombinedExceptionRules);
+  var Messages: TArray<string>;
+  if not FRuleChain.ReloadChangedFiles(Messages) then
+    Exit;
+  for var Msg in Messages do
+    SendConsoleLog(Msg);
+  FDebugger.SetExceptionRules(FRuleChain.Combined);
 end;
 
 // TDebugSession.OnSessionStopped subscriber. The neutral half (ClearActiveFrame,

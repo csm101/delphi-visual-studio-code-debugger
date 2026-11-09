@@ -52,7 +52,29 @@ type
     [Test] procedure SidecarPaths_EmptyProjectYieldsNoPath;
   end;
 
+  // The JSON rule schema and the precedence chain (ExceptionRuleFiles.pas),
+  // shared by the DAP and MCP frontends.
+  [TestFixture]
+  TExceptionRuleFilesTests = class
+  private
+    function Parse(const Json: string; out Problems: TArray<string>): TArray<TExceptionRule>;
+  public
+    [Test] procedure WellFormedRules_NoProblems;
+    // A mistyped key would silently turn a criterion into a wildcard.
+    [Test] procedure UnknownKey_ReportedButRuleKept;
+    [Test] procedure UnderscoreKeys_AreComments;
+    [Test] procedure InvalidEntries_SkippedAndReported;
+    // A rules document is a bare array or an object with an exceptionRules
+    // array; anything else is named, not silently empty.
+    [Test] procedure Document_BothShapesAccepted_OtherShapesReported;
+    [Test] procedure Chain_FileTiersInPrecedenceOrder;
+    [Test] procedure Chain_ReloadsAFileThatAppeared;
+  end;
+
 implementation
+
+uses
+  System.JSON, System.IOUtils, Winapi.Windows, ExceptionRuleFiles;
 
 function TExceptionRulesTests.Rule(const Action: TExceptionAction): TExceptionRule;
 begin
@@ -367,8 +389,150 @@ begin
   Assert.AreEqual('', LocalProjectExceptionRulesPath('   '));
 end;
 
+{ TExceptionRuleFilesTests }
+
+function TExceptionRuleFilesTests.Parse(const Json: string; out Problems: TArray<string>): TArray<TExceptionRule>;
+begin
+  var Arr := TJSONObject.ParseJSONValue(Json) as TJSONArray;
+  try
+    Result := ParseExceptionRulesArray(Arr, Problems);
+  finally
+    Arr.Free;
+  end;
+end;
+
+procedure TExceptionRuleFilesTests.WellFormedRules_NoProblems;
+begin
+  var Problems: TArray<string>;
+  var Rules := Parse('[{"class": ["EAbort", "EFOpenError"], "message": "x", "action": "log"},' +
+    ' {"code": "0xC0000005", "line": 12, "action": "break"}]', Problems);
+  Assert.AreEqual<Integer>(0, Length(Problems), string.Join('; ', Problems));
+  Assert.AreEqual<Integer>(2, Length(Rules));
+  Assert.AreEqual<Integer>(2, Length(Rules[0].ClassNames));
+  Assert.IsTrue(Rules[0].Action = eaLog);
+  Assert.AreEqual(Cardinal($C0000005), Rules[1].Codes[0]);
+  Assert.AreEqual(12, Rules[1].LineFrom);
+  Assert.AreEqual(12, Rules[1].LineTo);
+end;
+
+procedure TExceptionRuleFilesTests.UnknownKey_ReportedButRuleKept;
+begin
+  var Problems: TArray<string>;
+  var Rules := Parse('[{"clas": "EAbort", "action": "break"}]', Problems);
+  Assert.AreEqual<Integer>(1, Length(Problems));
+  Assert.Contains(Problems[0], 'rule #1');
+  Assert.Contains(Problems[0], 'unknown key "clas"');
+  // Kept for a rule FILE (lenient, as before); the MCP server refuses the call.
+  Assert.AreEqual<Integer>(1, Length(Rules));
+end;
+
+procedure TExceptionRuleFilesTests.UnderscoreKeys_AreComments;
+begin
+  var Problems: TArray<string>;
+  var Rules := Parse('[{"_comment": "why", "class": "EAbort", "action": "ignore"}]', Problems);
+  Assert.AreEqual<Integer>(0, Length(Problems), string.Join('; ', Problems));
+  Assert.AreEqual<Integer>(1, Length(Rules));
+end;
+
+procedure TExceptionRuleFilesTests.InvalidEntries_SkippedAndReported;
+begin
+  var Problems: TArray<string>;
+  var Rules := Parse('[42, {"class": "E"}, {"code": "nope", "action": "log"},' +
+    ' {"messageRegex": "(", "action": "log"}, {"class": "EOk", "action": "logStack"}]', Problems);
+  Assert.AreEqual<Integer>(4, Length(Problems), string.Join('; ', Problems));
+  Assert.Contains(Problems[0], 'rule #1');
+  Assert.Contains(Problems[1], '"action"');
+  Assert.Contains(Problems[2], '"code"');
+  Assert.Contains(Problems[3], '"messageRegex"');
+  Assert.AreEqual<Integer>(1, Length(Rules), 'only the valid rule survives');
+  Assert.AreEqual('EOk', Rules[0].ClassNames[0]);
+end;
+
+procedure TExceptionRuleFilesTests.Document_BothShapesAccepted_OtherShapesReported;
+begin
+  for var Json in ['[{"class": "EA", "action": "log"}]',
+                   '{"exceptionRules": [{"class": "EA", "action": "log"}]}'] do begin
+    var Root := TJSONObject.ParseJSONValue(Json);
+    try
+      var Problems: TArray<string>;
+      var Rules := ParseExceptionRulesDocument(Root, Problems);
+      Assert.AreEqual<Integer>(0, Length(Problems), Json);
+      Assert.AreEqual<Integer>(1, Length(Rules), Json);
+    finally
+      Root.Free;
+    end;
+  end;
+  for var Json in ['{"rules": []}', '"text"'] do begin
+    var Root := TJSONObject.ParseJSONValue(Json);
+    try
+      var Problems: TArray<string>;
+      var Rules := ParseExceptionRulesDocument(Root, Problems);
+      Assert.AreEqual<Integer>(1, Length(Problems), Json);
+      Assert.AreEqual<Integer>(0, Length(Rules), Json);
+    finally
+      Root.Free;
+    end;
+  end;
+end;
+
+procedure TExceptionRuleFilesTests.Chain_FileTiersInPrecedenceOrder;
+begin
+  var Dir := TPath.Combine(TPath.GetTempPath, Format('ExcRuleChain_%d_%d', [GetCurrentProcessId, GetTickCount]));
+  TDirectory.CreateDirectory(Dir);
+  var Chain := TExceptionRuleChain.Create;
+  try
+    var Project := TPath.Combine(Dir, 'P.dpr');
+    TFile.WriteAllText(ProjectExceptionRulesPath(Project), '[{"class": "EShared", "action": "ignore"}]');
+    TFile.WriteAllText(LocalProjectExceptionRulesPath(Project), '[{"class": "ELocal", "action": "ignore"}]');
+    var Global := TPath.Combine(Dir, 'global.json');
+    TFile.WriteAllText(Global, '{"exceptionRules": [{"class": "EGlobal", "action": "ignore"}]}');
+
+    Chain.LoadFiles(Project, Global);
+
+    var Combined := Chain.Combined;
+    Assert.AreEqual<Integer>(3, Length(Combined));
+    Assert.AreEqual('ELocal',   Combined[0].ClassNames[0]);
+    Assert.AreEqual('EShared',  Combined[1].ClassNames[0]);
+    Assert.AreEqual('EGlobal',  Combined[2].ClassNames[0]);
+    var Tiers := Chain.Tiers;
+    Assert.AreEqual<Integer>(3, Length(Tiers));
+    Assert.IsTrue(Tiers[0].Kind = rtkProjectLocal);
+    Assert.IsTrue(Tiers[2].Kind = rtkMachineWide);
+
+    // Without a project or a machine-wide file there is no chain at all.
+    Chain.LoadFiles('', '');
+    Assert.AreEqual<Integer>(0, Length(Chain.Combined));
+  finally
+    Chain.Free;
+    TDirectory.Delete(Dir, True);
+  end;
+end;
+
+procedure TExceptionRuleFilesTests.Chain_ReloadsAFileThatAppeared;
+begin
+  var Dir := TPath.Combine(TPath.GetTempPath, Format('ExcRuleReload_%d_%d', [GetCurrentProcessId, GetTickCount]));
+  TDirectory.CreateDirectory(Dir);
+  var Chain := TExceptionRuleChain.Create;
+  try
+    var Project := TPath.Combine(Dir, 'P.dpr');
+    Chain.LoadFiles(Project, '');
+    Assert.AreEqual<Integer>(0, Length(Chain.Combined));
+    var Messages: TArray<string>;
+    Assert.IsFalse(Chain.ReloadChangedFiles(Messages), 'nothing changed yet');
+
+    TFile.WriteAllText(ProjectExceptionRulesPath(Project), '[{"class": "ENew", "action": "log"}]');
+    Assert.IsTrue(Chain.ReloadChangedFiles(Messages), 'a new file is a change');
+    Assert.AreEqual<Integer>(1, Length(Messages));
+    Assert.AreEqual<Integer>(1, Length(Chain.Combined));
+  finally
+    Chain.Free;
+    TDirectory.Delete(Dir, True);
+  end;
+end;
+
 
 initialization
   TDUnitX.RegisterTestFixture(TExceptionRulesTests);
+  TDUnitX.RegisterTestFixture(TExceptionRuleFilesTests);
 
 end.

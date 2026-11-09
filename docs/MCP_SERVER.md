@@ -161,10 +161,41 @@ To attach to processes owned by another user or elevated targets, run the client
   configuration that silences every exception must not blind the agent, and
   which exceptions to stop on is the agent's call while it debugs
   (`set_exception_filters`, `set_step_isolation_release`, or the arguments of
-  `launch_debuggee`).
+  the tool). Nor is `delphiProjectFile` used to find rule files: see
+  "Exception rules" below.
 - `attach_to_process` — by `processId` or `processName`. An ambiguous name returns
   the candidate list instead of guessing; a different-architecture target is
   rejected. `killOnDetach` (default false).
+- **Exception rules**, on every launch / attach tool above: `exceptionRules`
+  (an inline array, same schema as the VS Code rule files) or
+  `exceptionRulesFile` (the path of a JSON rules document — a bare array or an
+  object with an `exceptionRules` array — read once by that call, never
+  watched); at most one. A malformed rule fails the call. **These are the only
+  rules an MCP session runs under.** The VS Code rule files —
+  `<Project>.ExceptionSettings*.json` and the machine-wide
+  `%USERPROFILE%\.DelphiWinDebugger\exceptionRules.json` — are the preferences
+  of the human debugging by hand and are never read by this server, whoever
+  names the project: what an agent asks of the debugger is not what the user
+  wants in VS Code, and parallel agent sessions may need different rules for
+  the same program. The attach tools also take `exceptionFilters` /
+  `delphiExceptionClasses`. An explicit `exceptionFilters: []` disables every
+  exception stop, `unhandled` included, so a crash ends the process without a
+  stop; `["unhandled"]` silences first-chance stops and keeps crashes. Mechanism: `DAP_DEBUGGER_ARCHITECTURE.md`,
+  "Per-exception rule engine", "MCP frontend".
+- `set_exception_rules` — `rules` (`[]` removes them) or `rulesFile`, exactly
+  one: replace the session's rules on the live session. Returns them, as
+  `get_exception_rules`. Typical use, an agent driving the application:
+  `[{"classIs": "Exception", "action": "logStack"}]` — every Delphi raise is
+  recorded and the debuggee never stops, so the application keeps answering.
+- `get_exception_rules` — the session's rules in evaluation order: `rules`,
+  `ruleCount`.
+- `get_exception_log` — what `log` / `logStack` rules recorded since the last
+  call, oldest first: `entries` (`sequence`, `threadId`, `code`, `address`,
+  `module`, `firstChance`, `exceptionClass`, `message`, `action`, `raiseSite`
+  {`file`, `unit`, `line`} or null, and for `logStack` `frames` [{`function`,
+  `unit`, `file`, `line`, `address`, `module`}], top first) and `dropped` (older
+  entries discarded beyond 1000 between two calls). The same records appear as
+  text in `get_debugger_output`, never in `get_debuggee_output`.
 - `detach_debugger` — leave the process running.
 - `terminate_debuggee` — kill it.
 - `stop_debugging` — detach an attached session, terminate a launched one.
@@ -314,8 +345,8 @@ the session to be stopped.
   `get_exception_details`,
   `get_debuggee_output` (the program's output: its `OutputDebugString` text and,
   for a console program, what it wrote to stdout and stderr; a console program's
-  stdin reads as empty), `get_debugger_output` (logpoint messages and debugger
-  notices). A console program never writes into this server's own stdout: it is
+  stdin reads as empty), `get_debugger_output` (logpoint messages, exceptions
+  recorded by `log` / `logStack` rules, and debugger notices). A console program never writes into this server's own stdout: it is
   launched with standard handles of its own (`DAP_DEBUGGER_ARCHITECTURE.md`,
   "Debuggee standard handles").
 - `get_threads` — every thread at the stop, and per thread its `lastError` (the

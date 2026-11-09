@@ -956,6 +956,7 @@ The 46 tools cover the debugging cycle:
 |---|---|
 | Session | `launch_project`, `attach_to_project` (a delphi-devkit project: everything else comes from DDK), `launch_debuggee`, `launch_from_config`, `attach_to_process`, `attach_from_config`, `list_debuggable_processes`, `detach_debugger`, `terminate_debuggee`, `stop_debugging`, `get_debug_session_status` |
 | Breakpoints | `set_breakpoint`, `set_breakpoints`, `list_breakpoints`, `remove_all_breakpoints`, `set_exception_filters` |
+| Exceptions | `set_exception_rules`, `get_exception_rules`, `get_exception_log` (exceptions recorded by `log` / `logStack` rules, without stopping the debuggee); every launch / attach tool also takes `exceptionRules` / `exceptionRulesFile`. An MCP session runs only under the rules the agent passes: the VS Code rule files are never read |
 | Execution | `continue_and_wait`, `step_over`, `step_into`, `step_out`, `pause_execution`, `wait_until_stopped` |
 | State | `get_call_stack`, `get_threads`, `get_locals`, `get_variable`, `expand_variable`, `evaluate_expression`, `get_current_source_location`, `get_exception_details`, `get_compact_debug_snapshot` |
 | Memory | `read_memory`, `write_memory` |

@@ -806,6 +806,23 @@ absurdly.
   normalizes the program, `.map` and `.rsm` paths at `Launch` / `Attach`; code that
   derives a name from a RAW configuration path has to do the same.
 
+## The MCP server and the user's VS Code settings
+
+- **The MCP server never reads the user's VS Code run-control settings — no
+  exception rule files, no exception filters, no step isolation from a
+  launch.json.** `<Project>.ExceptionSettings*.json` and the machine-wide
+  `exceptionRules.json` are what the human wants while debugging by hand; what an
+  agent asks of the debugger is a different thing, and several agent sessions may
+  debug in parallel with different needs. An MCP session's settings live in the
+  session and arrive through tools: inline JSON, or a file the agent names
+  (read once by that call). This is an explicit project decision, not a gap to
+  fill: on 2026-11-09 a request to "load the project and machine-wide rule files
+  as DAP does" was implemented that way and had to be reverted. Pinned by
+  `ProjectRuleFiles_OfTheDdkProject_AreNotRead`,
+  `ProjectRuleFiles_OfTheLaunchConfig_AreNotRead` and
+  `MachineWideRuleFile_IsNotRead` (`McpE2ETests.pas`). Project KNOWLEDGE from a
+  launch.json or DDK (program, symbols, sources, modules, arguments) is fine.
+
 ## Already evaluated and rejected — do not re-walk
 
 - Container-aware `ParseUserTypeTable`; pointer-cursor sidecar decoder;

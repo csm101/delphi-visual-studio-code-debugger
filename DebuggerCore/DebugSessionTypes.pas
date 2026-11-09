@@ -45,8 +45,9 @@ type
 
   // Who produced a line of output, because the three belong in different
   // places. okDebuggee is the program's own stdout and okLogPoint is a message
-  // the USER authored on a breakpoint -- both are program-facing and belong in
-  // the Debug Console. okDebugger is the debugger talking about itself (symbol
+  // the USER asked for -- a logpoint on a breakpoint, or an exception a `log` /
+  // `logStack` rule reported -- both are program-facing and belong in the Debug
+  // Console. okDebugger is the debugger talking about itself (symbol
   // loading, modules without debug info, warnings), which is diagnostics and
   // drowns the other two when mixed with them.
   // okNotice is the debugger reporting a fault in something the USER wrote -- a

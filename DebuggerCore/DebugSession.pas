@@ -144,7 +144,13 @@ type
 
     // Output ring buffers (MCP has no async channel -> drained on demand).
     FDebuggeeOutput: TList<string>;   // program stdout
-    FDebuggerOutput: TList<string>;   // debugger-generated (logpoints, notices)
+    FDebuggerOutput: TList<string>;   // debugger-generated (logpoints, notices, logged exceptions)
+    // Exceptions a `log` / `logStack` rule reported, as data, oldest first. Bounded:
+    // a program that raises in a loop must not grow the debugger without limit, so
+    // past EXCEPTION_LOG_CAPACITY the oldest entry goes and the drop is counted.
+    FExceptionLog:        TList<TLoggedException>;
+    FExceptionLogDropped: Integer;
+    FExceptionLogSeq:     Integer;
 
     // Events.
     FOnStopped: TSessionStoppedEvent;
@@ -321,6 +327,7 @@ type
     procedure HandleTargetExited(ExitCode: Integer);
     procedure HandleTargetOutput(const Text: string);
     procedure HandleEngineNotice(const Text: string);
+    procedure HandleExceptionLogged(const Entry: TLoggedException);
     function  HandleBpHit(const BP: TBreakpointRec): Boolean;
     procedure HandleDllLoaded(const Name, Path: string; Base, ImageSize: UInt64);
     procedure HandleDllUnloaded(const Name: string; Base: UInt64);
@@ -581,6 +588,10 @@ type
     class function ParseExceptionFilters(const Names: TArray<string>): TExceptionFilters;
     function  SetExceptionFilters(const Names: TArray<string>;
                 const DelphiClasses: string): Boolean;
+    // Replace the engine's exception-rule table on a live session (unlike the
+    // launch/attach path, an empty table is applied too: it clears the rules).
+    // Returns False if there is no active debuggee.
+    function  SetExceptionRules(const Rules: TArray<TExceptionRule>): Boolean;
 
     // Threads.
     function  GetThreads: TArray<TSessionThread>;
@@ -662,6 +673,9 @@ type
     // Output.
     function  DrainDebuggeeOutput: TArray<string>;
     function  DrainDebuggerOutput: TArray<string>;
+    // The logged-exception entries since the last drain, oldest first. Dropped =
+    // how many older entries the bound discarded since the last drain.
+    function  DrainExceptionLog(out Dropped: Integer): TArray<TLoggedException>;
 
     // Read-only access to the shared engines the session owns+frees, so a
     // frontend can drive nested expansion / symbol load / lookups directly.
@@ -799,6 +813,7 @@ begin
   FDataBreakpoints := TList<TSessionDataBreakpoint>.Create;
   FDebuggeeOutput := TList<string>.Create;
   FDebuggerOutput := TList<string>.Create;
+  FExceptionLog   := TList<TLoggedException>.Create;
   FExpander    := TVariableExpander.Create;
   FBpEval      := TBpEvaluator.Create;
   FAnnouncedBadConditions := TDictionary<string, Boolean>.Create;
@@ -846,6 +861,7 @@ begin
   FBpEval.Free;          // owns nothing; reader/rtti refs not owned
   FAnnouncedBadConditions.Free;
   FSafePolicy.Free;
+  FExceptionLog.Free;
   FDebuggerOutput.Free;
   FDebuggeeOutput.Free;
   FLoader.Free;          // removes its module providers from FDebugInfo, frees
@@ -977,6 +993,7 @@ begin
   FDebugger.OnOutput      := HandleTargetOutput;
   FDebugger.OnNotice      := HandleEngineNotice;
   FDebugger.OnBpHit       := HandleBpHit;
+  FDebugger.OnExceptionLogged := HandleExceptionLogged;
   FDebugger.OnDllLoaded   := HandleDllLoaded;
   FDebugger.OnDllUnloaded := HandleDllUnloaded;
   FLoader.Debugger := FDebugger;  // now available for DLL RVA-shift math
@@ -2324,6 +2341,49 @@ begin
     FOnOutput(okNotice, Text);
 end;
 
+const
+  // Entries kept between two drains of the exception log. Generous for an agent
+  // that drains after every action; small enough that a raise in a tight loop
+  // costs a bounded amount of memory (a logStack entry carries a whole stack).
+  EXCEPTION_LOG_CAPACITY = 1000;
+
+// "[Exception] Class: Message at $address", then for logStack one indented line
+// per frame -- the text the engine used to write itself.
+function FormatLoggedException(const Entry: TLoggedException): string;
+begin
+  var Desc := Entry.ExceptionClass;
+  if Entry.Message <> '' then
+    Desc := Desc + ': ' + Entry.Message;
+  Result := Format('[Exception] %s at $%x', [Desc, Entry.Address]);
+  for var Frame in Entry.Frames do begin
+    var Where := Frame.FunctionName;
+    if Frame.SourceFile <> '' then
+      Where := Format('%s (%s:%d)', [Frame.FunctionName, ExtractFileName(Frame.SourceFile), Frame.SourceLine]);
+    Result := Result + sLineBreak + '    ' + Where;
+  end;
+end;
+
+// A `log` / `logStack` exception rule matched. The entry is kept as data for a
+// client that drains it (MCP `get_exception_log`), and the same report goes out
+// as text with the logpoints: it is output the user's own rules asked for, about
+// the program, and not the program's own stdout it used to be mixed into.
+procedure TDebugSession.HandleExceptionLogged(const Entry: TLoggedException);
+begin
+  Inc(FExceptionLogSeq);
+  var Numbered := Entry;
+  Numbered.Sequence := FExceptionLogSeq;
+  if FExceptionLog.Count >= EXCEPTION_LOG_CAPACITY then begin
+    FExceptionLog.Delete(0);
+    Inc(FExceptionLogDropped);
+  end;
+  FExceptionLog.Add(Numbered);
+
+  var Text := FormatLoggedException(Numbered);
+  FDebuggerOutput.Add(Text);
+  if Assigned(FOnOutput) then
+    FOnOutput(okLogPoint, Text);
+end;
+
 // Called by the engine when a planted breakpoint fires. Delegates the condition /
 // hit-count / logpoint decision to the shared evaluator; on a logpoint it emits the
 // rendered text to the debugger-output buffer and resumes. Returns True to stop,
@@ -2745,6 +2805,13 @@ begin
     Exit;
   FDebugger.SetExceptionFilters(ParseExceptionFilters(Names));
   FDebugger.SetDelphiClassFilter(DelphiClasses);
+end;
+
+function TDebugSession.SetExceptionRules(const Rules: TArray<TExceptionRule>): Boolean;
+begin
+  Result := FDebugger <> nil;
+  if Result then
+    FDebugger.SetExceptionRules(Rules);
 end;
 
 procedure TDebugSession.HandleDllUnloaded(const Name: string; Base: UInt64);
@@ -4153,6 +4220,14 @@ function TDebugSession.DrainDebuggeeOutput: TArray<string>;
 begin
   Result := FDebuggeeOutput.ToArray;
   FDebuggeeOutput.Clear;
+end;
+
+function TDebugSession.DrainExceptionLog(out Dropped: Integer): TArray<TLoggedException>;
+begin
+  Result  := FExceptionLog.ToArray;
+  Dropped := FExceptionLogDropped;
+  FExceptionLog.Clear;
+  FExceptionLogDropped := 0;
 end;
 
 function TDebugSession.DrainDebuggerOutput: TArray<string>;

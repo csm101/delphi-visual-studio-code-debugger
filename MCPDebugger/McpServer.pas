@@ -18,7 +18,7 @@ interface
 uses
   System.SysUtils, System.Classes, System.JSON, System.Generics.Collections,
   Winapi.Windows, System.SyncObjs,
-  DebugSession, DebugSessionTypes, DebugTarget, ProcessEnum;
+  DebugSession, DebugSessionTypes, DebugTarget, ProcessEnum, ExceptionRules, ExceptionRuleFiles;
 
 type
   TMcpIO = class
@@ -71,6 +71,21 @@ type
     FDataBpSpecs:     TArray<TDataBpSpec>;
     FDataBpOwnIds:    TArray<string>;
     FNextDataBpOwnId: Integer;
+
+    // The exception rules of the current session, exactly as the agent passed
+    // them (exceptionRules / exceptionRulesFile of a launch / attach tool, then
+    // set_exception_rules). The ONLY rules an MCP session runs under: the rule
+    // files of VS Code (<Project>.ExceptionSettings*.json, the machine-wide
+    // exceptionRules.json) are the preferences of the human debugging by hand,
+    // and several agents may debug in parallel with different needs.
+    FSessionRules: TArray<TExceptionRule>;
+
+    // The exception-rule and exception-filter arguments of a launch / attach
+    // tool, resolved into the options. False + Err on a malformed rule or an
+    // unreadable rules file: nothing is changed then.
+    function  ApplyExceptionArgs(Args: TJSONObject;
+                out Rules: TArray<TExceptionRule>; out Filters: TExceptionFilters;
+                out FiltersSet: Boolean; out ClassFilter: string; out Err: string): Boolean;
 
     procedure ProcessRpc(Msg: TJSONObject);
     procedure DispatchInitialize(const IdJson: string);
@@ -385,6 +400,140 @@ begin
   Result := ResolveStepIsolation(Args.GetValue<string>('stepIsolation', ''), HasRelease, ReleaseMs, Setting);
 end;
 
+// The agent's exception rules: the only ones an MCP session runs under. They
+// come inline (an array in the call) or from a file the agent names, read once
+// at the call -- never watched, and never a location the server looks in by
+// itself. The VS Code rule files (<Project>.ExceptionSettings*.json, the
+// machine-wide exceptionRules.json) are deliberately not read: they are the
+// preferences of the human debugging by hand, and parallel agent sessions may
+// need different rules for the same program.
+//
+// Strict, unlike a VS Code rule file: a rule the parser has to skip, or a key it
+// does not know, fails the call. An agent that mistypes "clas" would otherwise
+// get a rule with no class criterion, which matches every exception.
+
+function RefuseRuleProblems(const Source: string; const Problems: TArray<string>;
+  var Rules: TArray<TExceptionRule>; out Err: string): Boolean;
+begin
+  Err := '';
+  if Length(Problems) = 0 then
+    Exit(True);
+  Rules := nil;
+  Err := Format('%s was refused, nothing was changed: %s', [Source, string.Join('; ', Problems)]);
+  Result := False;
+end;
+
+function TryParseInlineRules(V: TJSONValue; const ArgName: string;
+  out Rules: TArray<TExceptionRule>; out Err: string): Boolean;
+begin
+  Rules := nil;
+  if not (V is TJSONArray) then begin
+    Err := Format('The %s argument must be an array of rule objects.', [ArgName]);
+    Exit(False);
+  end;
+  var Problems: TArray<string>;
+  Rules  := ParseExceptionRulesArray(TJSONArray(V), Problems);
+  Result := RefuseRuleProblems(Format('The %s argument', [ArgName]), Problems, Rules, Err);
+end;
+
+// Strict JSON, the same two shapes as a rule file: a bare array, or an object
+// with an `exceptionRules` array.
+function TryReadRulesFile(const Path: string; out Rules: TArray<TExceptionRule>;
+  out Err: string): Boolean;
+begin
+  Rules := nil;
+  Err   := '';
+  if not FileExists(Path) then begin
+    Err := Format('Rules file not found: %s', [Path]);
+    Exit(False);
+  end;
+  var Root: TJSONValue := nil;
+  try
+    Root := TJSONObject.ParseJSONValue(TFile.ReadAllText(Path, TEncoding.UTF8));
+  except
+    on E: Exception do begin
+      Err := Format('Rules file %s could not be read: %s', [Path, E.Message]);
+      Exit(False);
+    end;
+  end;
+  if Root = nil then begin
+    Err := Format('Rules file %s is not valid JSON (strict JSON: no comments, no trailing commas).', [Path]);
+    Exit(False);
+  end;
+  try
+    var Problems: TArray<string>;
+    Rules  := ParseExceptionRulesDocument(Root, Problems);
+    Result := RefuseRuleProblems('Rules file ' + Path, Problems, Rules, Err);
+  finally
+    Root.Free;
+  end;
+end;
+
+// InlineKey (an array) or FileKey (a path), at most one. Given = False when the
+// call carries neither: the caller decides what that means.
+function TryAgentRulesArgs(Args: TJSONObject; const InlineKey, FileKey: string;
+  out Given: Boolean; out Rules: TArray<TExceptionRule>; out Err: string): Boolean;
+begin
+  Given := False;
+  Rules := nil;
+  Err   := '';
+  if Args = nil then
+    Exit(True);
+  var InlineValue := Args.FindValue(InlineKey);
+  if InlineValue is TJSONNull then
+    InlineValue := nil;
+  var Path := Trim(Args.GetValue<string>(FileKey, ''));
+  if (InlineValue <> nil) and (Path <> '') then begin
+    Err := Format('Pass either %s or %s, not both.', [InlineKey, FileKey]);
+    Exit(False);
+  end;
+  Given := (InlineValue <> nil) or (Path <> '');
+  if InlineValue <> nil then
+    Exit(TryParseInlineRules(InlineValue, InlineKey, Rules, Err));
+  if Path <> '' then
+    Exit(TryReadRulesFile(ExpandFileName(Path), Rules, Err));
+  Result := True;
+end;
+
+function TMcpServer.ApplyExceptionArgs(Args: TJSONObject;
+  out Rules: TArray<TExceptionRule>; out Filters: TExceptionFilters;
+  out FiltersSet: Boolean; out ClassFilter: string; out Err: string): Boolean;
+begin
+  Rules       := nil;
+  Filters     := [];
+  FiltersSet  := False;
+  ClassFilter := '';
+  // Refuse before touching FSessionRules: a start the session will reject anyway
+  // must not leave get_exception_rules describing rules no debuggee runs under.
+  EnsureFreshSessionForStart;
+  if FSession.State <> dsNone then begin
+    Err := 'A debug session is already active. Stop it first.';
+    Exit(False);
+  end;
+  var Given: Boolean;
+  if not TryAgentRulesArgs(Args, 'exceptionRules', 'exceptionRulesFile', Given, Rules, Err) then
+    Exit(False);
+
+  // `exceptionFilters: []` is a request too (no exception stops at all, unhandled
+  // included, as with set_exception_filters), so the presence of the array is what
+  // counts, not its length.
+  var FilterArg: TJSONValue := nil;
+  if Args <> nil then
+    FilterArg := Args.FindValue('exceptionFilters');
+  if FilterArg is TJSONArray then begin
+    var Names: TArray<string> := nil;
+    for var Item in TJSONArray(FilterArg) do
+      Names := Names + [Item.Value];
+    Filters     := TDebugSession.ParseExceptionFilters(Names);
+    FiltersSet  := True;
+    ClassFilter := Args.GetValue<string>('delphiExceptionClasses', '');
+  end;
+
+  FSessionRules := Rules;
+  McpLog(Format('exception rules for the session: %d', [Length(Rules)]));
+  Result := True;
+end;
+
 function WarningsPayload(const Target: TDdkDebugTarget): TJSONObject;
 begin
   Result := TJSONObject.Create;
@@ -421,20 +570,12 @@ begin
   // `args` in a launch.json entry override what the RAD Studio plugin wrote.
   if (Args <> nil) and (Args.FindValue('args') <> nil) then
     Opts.Args := Args.GetValue<string>('args', '');
-  var ExcFilters: TArray<string> := nil;
-  if Args <> nil then begin
-    var V := Args.FindValue('exceptionFilters');
-    if V is TJSONArray then
-      for var Item in TJSONArray(V) do
-        ExcFilters := ExcFilters + [Item.Value];
-  end;
-  if Length(ExcFilters) > 0 then begin
-    Opts.ExceptionFilters    := TDebugSession.ParseExceptionFilters(ExcFilters);
-    Opts.ExceptionFiltersSet := True;
-    Opts.DelphiClassFilter   := Args.GetValue<string>('delphiExceptionClasses', '');
+  if not ApplyExceptionArgs(Args, Opts.ExceptionRules, Opts.ExceptionFilters,
+       Opts.ExceptionFiltersSet, Opts.DelphiClassFilter, Err) then begin
+    SendToolError(IdJson, Err);
+    Exit;
   end;
   Opts.StepIsolationSet := StepIsolationFromJson(Args, Opts.StepIsolationReleaseMs);
-  EnsureFreshSessionForStart;
   // Same rule as launch_debuggee: always park at entry, so breakpoints can be
   // set before any user code runs (stopAtEntry is accepted, never honoured as false).
   Opts.StopAtEntry := True;
@@ -467,6 +608,11 @@ begin
   var Opts: TAttachOptions;
   var PName: string;
   if not DdkTarget.AttachOptionsFromTarget(Target, Opts, PName, Err) then begin
+    SendToolError(IdJson, Err);
+    Exit;
+  end;
+  if not ApplyExceptionArgs(Args, Opts.ExceptionRules, Opts.ExceptionFilters,
+       Opts.ExceptionFiltersSet, Opts.DelphiClassFilter, Err) then begin
     SendToolError(IdJson, Err);
     Exit;
   end;
@@ -700,11 +846,11 @@ begin
       Opts.RsmPath     := ArgStr('rsmFile');
       Opts.SourceRoot  := ArgStr('sourceRoot');
       Opts.ExtraSourcePaths := LaunchConfig.ExpandSearchPaths(ArgStrArray('sourceSearchPaths'), ArgStr('workspaceFolder'));
-      var ExcFilters := ArgStrArray('exceptionFilters');
-      if Length(ExcFilters) > 0 then begin
-        Opts.ExceptionFilters    := TDebugSession.ParseExceptionFilters(ExcFilters);
-        Opts.ExceptionFiltersSet := True;
-        Opts.DelphiClassFilter   := ArgStr('delphiExceptionClasses');
+      var Err: string;
+      if not ApplyExceptionArgs(Args, Opts.ExceptionRules, Opts.ExceptionFilters,
+           Opts.ExceptionFiltersSet, Opts.DelphiClassFilter, Err) then begin
+        SendToolError(IdJson, Err);
+        Exit;
       end;
       Opts.StepIsolationSet := StepIsolationArg(Opts.StepIsolationReleaseMs);
       // Always stop at entry so breakpoints can be set BEFORE any user code runs.
@@ -728,6 +874,11 @@ begin
       var Err: string;
       if not LaunchConfig.LoadLaunchConfig(CfgFile, ArgStr('configName'),
            ArgStr('workspaceFolder'), Opts, Err) then begin
+        SendToolError(IdJson, Err);
+        Exit;
+      end;
+      if not ApplyExceptionArgs(Args, Opts.ExceptionRules, Opts.ExceptionFilters,
+           Opts.ExceptionFiltersSet, Opts.DelphiClassFilter, Err) then begin
         SendToolError(IdJson, Err);
         Exit;
       end;
@@ -757,6 +908,12 @@ begin
       Opts.SourceRoot       := ArgStr('sourceRoot');
       Opts.ExtraSourcePaths := LaunchConfig.ExpandSearchPaths(ArgStrArray('sourceSearchPaths'), ArgStr('workspaceFolder'));
       Opts.StepIsolationSet := StepIsolationArg(Opts.StepIsolationReleaseMs);
+      var Err: string;
+      if not ApplyExceptionArgs(Args, Opts.ExceptionRules, Opts.ExceptionFilters,
+           Opts.ExceptionFiltersSet, Opts.DelphiClassFilter, Err) then begin
+        SendToolError(IdJson, Err);
+        Exit;
+      end;
       PerformAttach(IdJson, Cardinal(ArgInt('processId', 0)), ArgStr('processName'),
         ArgBool('killOnDetach'), Opts);
       Exit;
@@ -772,6 +929,11 @@ begin
       var PName, Err: string;
       if not LaunchConfig.LoadAttachConfig(CfgFile, ArgStr('configName'),
            ArgStr('workspaceFolder'), Opts, Pid, PName, Err) then begin
+        SendToolError(IdJson, Err);
+        Exit;
+      end;
+      if not ApplyExceptionArgs(Args, Opts.ExceptionRules, Opts.ExceptionFilters,
+           Opts.ExceptionFiltersSet, Opts.DelphiClassFilter, Err) then begin
         SendToolError(IdJson, Err);
         Exit;
       end;
@@ -1069,6 +1231,36 @@ begin
         SendToolError(IdJson, 'No active debuggee. Launch or attach first.')
       else
         SendToolJson(IdJson, McpJson.StatusToJson(FSession));
+      Exit;
+    end;
+    if Name = 'set_exception_rules' then begin
+      var Given: Boolean;
+      var Rules: TArray<TExceptionRule>;
+      var Err: string;
+      if not TryAgentRulesArgs(Args, 'rules', 'rulesFile', Given, Rules, Err) then begin
+        SendToolError(IdJson, Err);
+        Exit;
+      end;
+      if not Given then begin
+        SendToolError(IdJson, 'Pass rules (an array of rule objects; [] removes them) or rulesFile (the path of a JSON rules file).');
+        Exit;
+      end;
+      if not FSession.SetExceptionRules(Rules) then begin
+        SendToolError(IdJson, 'No active debuggee. Launch or attach first, or pass exceptionRules to the launch / attach tool.');
+        Exit;
+      end;
+      FSessionRules := Rules;
+      SendToolJson(IdJson, McpJson.ExceptionRulesToJson(FSessionRules));
+      Exit;
+    end;
+    if Name = 'get_exception_rules' then begin
+      SendToolJson(IdJson, McpJson.ExceptionRulesToJson(FSessionRules));
+      Exit;
+    end;
+    if Name = 'get_exception_log' then begin
+      var Dropped: Integer;
+      var Entries := FSession.DrainExceptionLog(Dropped);
+      SendToolJson(IdJson, McpJson.ExceptionLogToJson(Entries, Dropped, FSession.GetModules));
       Exit;
     end;
     if Name = 'get_locals' then begin

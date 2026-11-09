@@ -187,6 +187,32 @@ module you are standing in carries debug information at all.
 
 ## Implemented features
 
+Exception rules through MCP (2026-11-09, requested by the session building the
+GlassBox app-automation component):
+- **The MCP server applies exception rules -- the agent's, and only those.**
+  Before, no MCP tool filled the rule table at all: the only way for an agent to
+  see a handled exception was a break filter, which stopped the main thread of
+  the application it was driving. Every launch / attach tool now takes
+  `exceptionRules` (inline) or `exceptionRulesFile` (a file the agent names, read
+  once by the call), strictly validated; `set_exception_rules` replaces them on
+  the live session. The VS Code rule files (`<Project>.ExceptionSettings*.json`,
+  the machine-wide `exceptionRules.json`) are deliberately NEVER read by the MCP
+  server: they are the human's preferences for debugging by hand, and parallel
+  agent sessions may need different rules. New tools: `set_exception_rules`,
+  `get_exception_rules`, `get_exception_log` (class, message, code, raise site and
+  frames of every `log` / `logStack` match, as data). The attach tools accept
+  `exceptionFilters` too, and `exceptionFilters: []` is no longer read as "not
+  given": like `set_exception_filters` with `[]` it disables every exception stop,
+  `unhandled` included. `["unhandled"]` is the setting that keeps crash stops.
+- **A logged exception is debugger output, not program output.** The engine
+  reports it structured (`IDebugTarget.OnExceptionLogged`); its text goes to
+  `get_debugger_output` and, in VS Code, to the Debug Console as `console`
+  instead of the program's `stdout`.
+- Rule parsing and the VS Code rule-file chain moved out of `DapServer` into
+  `DebuggerCore\ExceptionRuleFiles.pas`; the MCP server uses only the parser. Mechanism in
+  `DAP_DEBUGGER_ARCHITECTURE.md` "Per-exception rule engine"; tests in
+  `TEST_CATALOG.md` F.2 / F.3.
+
 A console debuggee has standard handles of its own (2026-11-08, reported from a
 session building an MCP server for driving Delphi apps):
 - **A launched console program no longer shares the DAP / MCP protocol

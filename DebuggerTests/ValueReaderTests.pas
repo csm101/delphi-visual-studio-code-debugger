@@ -255,6 +255,8 @@ type
     procedure SetOnDllUnloaded(const Value: TOnDllUnloaded);
     function  GetOnBpHit: TOnBpHit;
     procedure SetOnBpHit(const Value: TOnBpHit);
+    function  GetOnExceptionLogged: TOnExceptionLogged;
+    procedure SetOnExceptionLogged(const Value: TOnExceptionLogged);
   end;
 
 constructor TFakeMemTarget.Create(BaseVA: UInt64; const Bytes: TBytes);
@@ -462,6 +464,8 @@ function  TFakeMemTarget.GetOnDllUnloaded: TOnDllUnloaded; begin Result := FOnDl
 procedure TFakeMemTarget.SetOnDllUnloaded(const Value: TOnDllUnloaded); begin FOnDllUnloaded := Value; end;
 function  TFakeMemTarget.GetOnBpHit: TOnBpHit; begin Result := FOnBpHit; end;
 procedure TFakeMemTarget.SetOnBpHit(const Value: TOnBpHit); begin FOnBpHit := Value; end;
+function  TFakeMemTarget.GetOnExceptionLogged: TOnExceptionLogged; begin Result := nil; end;
+procedure TFakeMemTarget.SetOnExceptionLogged(const Value: TOnExceptionLogged); begin end;
 
 procedure TValueReaderTests.CollidingLocals_AreDropped_UniqueAndRegisterOnesKept;
 

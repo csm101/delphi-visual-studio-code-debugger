@@ -122,6 +122,46 @@ const
     'read a longer one in full with get_variable or evaluate_expression on that field ' +
     'and maxStringLength.';
 
+const
+  EXCEPTION_RULE_SCHEMA_DESC =
+    'Each rule is an object: "action" (required): "ignore" | "log" | "logStack" | "break"; ' +
+    'criteria, AND-ed, an omitted one matches anything: "class" (name or array of names, exact ' +
+    'runtime class), "classIs" (name or array, the class or any ancestor), "code" (Win32 exception ' +
+    'code such as "0xC0000005", or an array; the only criterion that matches a native, non-Delphi ' +
+    'exception), "message" (case-insensitive substring), "messageRegex" (regular expression, ' +
+    'case-insensitive), "unit" (unit of the first frame with source, or "*unknown*"), "line" / ' +
+    '"lineFrom" / "lineTo". Keys starting with "_" are comments. The first matching rule decides; ' +
+    'with none matching, the exception filters decide. "log" records the exception and resumes, ' +
+    '"logStack" records it with the raising thread''s call stack and resumes - the debuggee never ' +
+    'stops for either; read the records with get_exception_log. "ignore" resumes silently; "break" ' +
+    'stops at the exception.';
+
+  EXCEPTION_RULES_SCOPE_NOTE =
+    'These are the ONLY exception rules of this debug session: the rule files of the VS Code ' +
+    'debugger (<Project>.ExceptionSettings*.json, the machine-wide exceptionRules.json) are never ' +
+    'read by this server.';
+
+  EXCEPTION_RULES_ARG_DESC =
+    'Exception rules for this debug session, inline. ' + EXCEPTION_RULES_SCOPE_NOTE +
+    ' A malformed rule fails the call. Replace them later with set_exception_rules. ' +
+    EXCEPTION_RULE_SCHEMA_DESC;
+
+  EXCEPTION_RULES_FILE_ARG_DESC =
+    'Instead of exceptionRules: the path of a JSON file holding the rules (a bare array, or an ' +
+    'object with an "exceptionRules" array; strict JSON). Read once, by this call; later edits ' +
+    'to the file change nothing.';
+
+// The exception arguments every launch / attach tool takes.
+function WithExceptionRuleProps(const Props: array of TPropSpec): TArray<TPropSpec>;
+begin
+  Result := nil;
+  for var P in Props do
+    Result := Result + [P];
+  Result := Result + [
+    ArrayProp('exceptionRules', EXCEPTION_RULES_ARG_DESC, ItemsOfType('object')),
+    Prop('exceptionRulesFile', 'string', EXCEPTION_RULES_FILE_ARG_DESC)];
+end;
+
 function BuildToolsArray: TJSONArray;
 begin
   Result := TJSONArray.Create;
@@ -137,7 +177,7 @@ begin
     'Start a new process under the debugger. Returns once the process is running ' +
     '(or, if stopAtEntry is true, once it stops at entry). Set breakpoints before or ' +
     'after, then use continue_and_wait.',
-    [Prop('program', 'string', 'Full path to the target .exe.', True),
+    WithExceptionRuleProps([Prop('program', 'string', 'Full path to the target .exe.', True),
      Prop('args', 'string', 'Command-line arguments passed to the target.'),
      Prop('mapFile', 'string', 'Override path to the .map (defaults to the exe with .map).'),
      Prop('rsmFile', 'string', 'Override path to the .rsm (defaults to the exe with .rsm).'),
@@ -146,25 +186,27 @@ begin
      Prop('workspaceFolder', 'string', 'Base for resolving ${workspaceFolder} in the paths above.'),
      Prop('stepIsolationReleaseMs', 'integer', 'Step isolation: how long (ms) a step may keep every other thread frozen while the stepped thread waits on an object with no owner (an event, a semaphore, I/O) before the others are released; a wait on a lock a frozen thread holds is released at once. Default 3000. 0 = never release (strict); negative = never freeze.'),
      Prop('stepIsolation', 'string', '"auto" (default: freeze other threads for each step, release on a detected deadlock) or "none" (never freeze; the IDE''s behaviour).'),
-     ArrayProp('exceptionFilters', 'Which exceptions break: any of "delphi" (first-chance Delphi raises), "av" (access violations), "all" (every first-chance), "unhandled" (second-chance). Omit for the default [delphi, av, unhandled]; pass [] or e.g. ["unhandled"] to stop breaking on first-chance exceptions in a noisy app.', ItemsOfType('string')),
+     ArrayProp('exceptionFilters', 'Which exceptions break: any of "delphi" (first-chance Delphi raises), "av" (access violations), "all" (every first-chance), "unhandled" (second-chance). Omit for the default [delphi, av, unhandled]. Pass ["unhandled"] to stop breaking on first-chance exceptions in a noisy app while still stopping on a crash; [] disables EVERY exception stop, unhandled included, so a crash ends the process without stopping.', ItemsOfType('string')),
      Prop('delphiExceptionClasses', 'string', 'Comma/semicolon-separated class names to narrow the "delphi" filter (e.g. "EAccessViolation, EConvertError"). Empty = all Delphi raises.'),
-     Prop('stopAtEntry', 'boolean', 'Stop at the program entry point instead of running to the first breakpoint.')]));
+     Prop('stopAtEntry', 'boolean', 'Stop at the program entry point instead of running to the first breakpoint.')])));
 
   Result.Add(MakeTool('launch_from_config',
     'Launch using an existing VS Code launch.json or .code-workspace (the same file the ' +
     'DAP debugger uses) so you need not re-specify program / map / rsm / source paths. ' +
     'Reads a "delphi" (or "delphi-win64") configuration (JSONC + ${workspaceFolder}/${env:} ' +
     'supported). Stops at entry; then set breakpoints and continue_and_wait.',
-    [Prop('configFile', 'string', 'Path to launch.json or to a .code-workspace. Defaults to .vscode\launch.json under the current directory.'),
+    WithExceptionRuleProps([Prop('configFile', 'string', 'Path to launch.json or to a .code-workspace. Defaults to .vscode\launch.json under the current directory.'),
      Prop('configName', 'string', 'Which configuration ("name") to use. Defaults to the first of type "delphi" / "delphi-win64".'),
-     Prop('workspaceFolder', 'string', 'Base for ${workspaceFolder}. Defaults to the folder holding .vscode for a launch.json, or to the first folder of a .code-workspace.')]));
+     Prop('workspaceFolder', 'string', 'Base for ${workspaceFolder}. Defaults to the folder holding .vscode for a launch.json, or to the first folder of a .code-workspace.'),
+     ArrayProp('exceptionFilters', 'Exception filter ids to enable, as in launch_debuggee.', ItemsOfType('string')),
+     Prop('delphiExceptionClasses', 'string', 'Delphi exception class filter, as in launch_debuggee.')])));
 
   Result.Add(MakeTool('attach_to_process',
     'Attach the debugger to an already-running process, selected by processId or by ' +
     'processName. If a name matches more than one process the call fails and lists the ' +
     'candidates so you can pick a pid. A target of a different architecture is rejected. ' +
     'By default detaching leaves the process running.',
-    [Prop('processId', 'integer', 'PID of the target process.'),
+    WithExceptionRuleProps([Prop('processId', 'integer', 'PID of the target process.'),
      Prop('processName', 'string', 'Executable basename to attach to (must be unambiguous).'),
      Prop('program', 'string', 'Override the exe path used to locate .map/.rsm (defaults to the running image).'),
      Prop('mapFile', 'string', 'Override path to the .map.'),
@@ -174,7 +216,9 @@ begin
      Prop('workspaceFolder', 'string', 'Base for resolving ${workspaceFolder} in the paths above.'),
      Prop('stepIsolationReleaseMs', 'integer', 'Step isolation: how long (ms) a step may keep every other thread frozen while the stepped thread waits on an object with no owner (an event, a semaphore, I/O) before the others are released; a wait on a lock a frozen thread holds is released at once. Default 3000. 0 = never release (strict); negative = never freeze.'),
      Prop('stepIsolation', 'string', '"auto" (default: freeze other threads for each step, release on a detected deadlock) or "none" (never freeze; the IDE''s behaviour).'),
-     Prop('killOnDetach', 'boolean', 'If true, terminate the target when the debug session ends; default false (leave it running).')]));
+     ArrayProp('exceptionFilters', 'Exception filter ids to enable, as in launch_debuggee.', ItemsOfType('string')),
+     Prop('delphiExceptionClasses', 'string', 'Delphi exception class filter, as in launch_debuggee.'),
+     Prop('killOnDetach', 'boolean', 'If true, terminate the target when the debug session ends; default false (leave it running).')])));
 
   Result.Add(MakeTool('launch_project',
     'Launch a project known to delphi-devkit (DDK) under the debugger. PREFER THIS over ' +
@@ -186,14 +230,14 @@ begin
     'ddkKind and ddkWarnings (missing or stale .map/.rsm, a package not built) next to the ' +
     'snapshot. Errors from DDK (ambiguous reference with its candidate list, unknown project, ' +
     'ddk.exe not found) are returned verbatim.',
-    [Prop('project', 'string', 'DDK project reference: a project id, a project name, or a path to a .dproj/.dpr/.dpk (a path DDK does not manage is described ad hoc).', True),
+    WithExceptionRuleProps([Prop('project', 'string', 'DDK project reference: a project id, a project name, or a path to a .dproj/.dpr/.dpk (a path DDK does not manage is described ad hoc).', True),
      Prop('compiler', 'string', 'Compiler configuration for an ad-hoc project path: a key like "12.0" or a product name like "Delphi 12". Ignored for a managed project.'),
      Prop('args', 'string', 'Command-line arguments for the target, overriding the run parameters DDK reports (dproj Debugger_RunParams fused with DDK Start Parameters).'),
      Prop('stopAtEntry', 'boolean', 'Accepted for compatibility; the launch always stops at entry.'),
      Prop('stepIsolationReleaseMs', 'integer', 'Step isolation: how long (ms) a step may keep every other thread frozen while the stepped thread waits on an object with no owner (an event, a semaphore, I/O) before the others are released; a wait on a lock a frozen thread holds is released at once. Default 3000. 0 = never release (strict); negative = never freeze.'),
      Prop('stepIsolation', 'string', '"auto" (default: freeze other threads for each step, release on a detected deadlock) or "none" (never freeze; the IDE''s behaviour).'),
      ArrayProp('exceptionFilters', 'Exception filter ids to enable, as in launch_debuggee.', ItemsOfType('string')),
-     Prop('delphiExceptionClasses', 'string', 'Delphi exception class filter, as in launch_debuggee.')]));
+     Prop('delphiExceptionClasses', 'string', 'Delphi exception class filter, as in launch_debuggee.')])));
 
   Result.Add(MakeTool('attach_to_project',
     'Attach to the running executable of a project known to delphi-devkit (DDK): the program, ' +
@@ -202,22 +246,26 @@ begin
     'running instance is attached to directly; several instances fail with the candidate list ' +
     'unless processId names one. The reply carries ddkProject, ddkProjectFile, ddkKind and ' +
     'ddkWarnings next to the snapshot; DDK errors are returned verbatim.',
-    [Prop('project', 'string', 'DDK project reference: a project id, a project name, or a path to a .dproj/.dpr/.dpk.', True),
+    WithExceptionRuleProps([Prop('project', 'string', 'DDK project reference: a project id, a project name, or a path to a .dproj/.dpr/.dpk.', True),
      Prop('compiler', 'string', 'Compiler configuration for an ad-hoc project path (see launch_project).'),
      Prop('processId', 'integer', 'PID to attach to when several instances of the executable are running.'),
+     ArrayProp('exceptionFilters', 'Exception filter ids to enable, as in launch_debuggee.', ItemsOfType('string')),
+     Prop('delphiExceptionClasses', 'string', 'Delphi exception class filter, as in launch_debuggee.'),
      Prop('stepIsolationReleaseMs', 'integer', 'Step isolation: how long (ms) a step may keep every other thread frozen while the stepped thread waits on an object with no owner (an event, a semaphore, I/O) before the others are released; a wait on a lock a frozen thread holds is released at once. Default 3000. 0 = never release (strict); negative = never freeze.'),
      Prop('stepIsolation', 'string', '"auto" (default: freeze other threads for each step, release on a detected deadlock) or "none" (never freeze; the IDE''s behaviour).'),
-     Prop('killOnDetach', 'boolean', 'If true, terminate the target when the debug session ends; default false (leave it running).')]));
+     Prop('killOnDetach', 'boolean', 'If true, terminate the target when the debug session ends; default false (leave it running).')])));
 
   Result.Add(MakeTool('attach_from_config',
     'Attach using an existing VS Code launch.json or .code-workspace "attach" configuration ' +
     '(same file the DAP debugger uses): it supplies the process selector (processId/processName), ' +
     'program/map/rsm and the source paths, so you need not restate them. JSONC and ' +
     '${workspaceFolder}/${env:} are handled.',
-    [Prop('configFile', 'string', 'Path to launch.json or to a .code-workspace. Defaults to .vscode\launch.json under the current directory.'),
+    WithExceptionRuleProps([Prop('configFile', 'string', 'Path to launch.json or to a .code-workspace. Defaults to .vscode\launch.json under the current directory.'),
      Prop('configName', 'string', 'Which configuration ("name"). Defaults to the first "delphi" / "delphi-win64" request:"attach" entry.'),
      Prop('workspaceFolder', 'string', 'Base for ${workspaceFolder}. Defaults to the folder holding .vscode for a launch.json, or to the first folder of a .code-workspace.'),
-     Prop('killOnDetach', 'boolean', 'Terminate the target on session end; default false.')]));
+     ArrayProp('exceptionFilters', 'Exception filter ids to enable, as in launch_debuggee.', ItemsOfType('string')),
+     Prop('delphiExceptionClasses', 'string', 'Delphi exception class filter, as in launch_debuggee.'),
+     Prop('killOnDetach', 'boolean', 'Terminate the target on session end; default false.')])));
 
   Result.Add(MakeTool('set_step_isolation_release',
     'Switch the step-isolation deadlock detector for the rest of the session. A step keeps every ' +
@@ -493,8 +541,33 @@ begin
     'Change which exceptions break, on the LIVE session (also settable at launch via ' +
     'exceptionFilters). Useful to silence first-chance breaks in an app that raises many ' +
     '(e.g. pass ["unhandled"] so only truly-unhandled exceptions stop).',
-    [ArrayProp('filters', 'Any of "delphi", "av", "all", "unhandled". [] = never break on first-chance.', ItemsOfType('string'), True),
+    [ArrayProp('filters', 'Any of "delphi", "av", "all", "unhandled". ["unhandled"] = stop only on crashes; [] = never stop on any exception, unhandled included.', ItemsOfType('string'), True),
      Prop('delphiExceptionClasses', 'string', 'Comma/semicolon-separated class names to narrow the "delphi" filter. Empty = all.')]));
+
+  Result.Add(MakeTool('set_exception_rules',
+    'Replace the exception rules of the LIVE session (the ones a launch / attach tool took as ' +
+    'exceptionRules / exceptionRulesFile). ' + EXCEPTION_RULES_SCOPE_NOTE + ' Use it to watch ' +
+    'exceptions without stopping: e.g. [{"classIs": "Exception", "action": "logStack"}] keeps the ' +
+    'debuggee running while every Delphi raise is recorded for get_exception_log. Pass exactly ' +
+    'one of rules / rulesFile. A malformed rule fails the whole call and changes nothing. Returns ' +
+    'the rules now in force, as get_exception_rules. ' + EXCEPTION_RULE_SCHEMA_DESC,
+    [ArrayProp('rules', 'The new rules, first match wins. [] removes them.', ItemsOfType('object')),
+     Prop('rulesFile', 'string', 'Instead of rules: the path of a JSON file holding them (a bare array, ' +
+       'or an object with an "exceptionRules" array; strict JSON). Read once, by this call.')]));
+
+  Result.Add(MakeTool('get_exception_rules',
+    'Return the exception rules of this debug session, in evaluation order (first match wins): ' +
+    'what the launch / attach tool or the last set_exception_rules received. No other rules ' +
+    'apply. {rules, ruleCount}.', []));
+
+  Result.Add(MakeTool('get_exception_log',
+    'Return the exceptions that a "log" or "logStack" rule recorded since the previous call ' +
+    '(incremental), oldest first, as data: sequence, threadId, code, address, firstChance, ' +
+    'exceptionClass, message, action, raiseSite {file, unit, line} (the first frame with source, ' +
+    'null when unresolved) and, for logStack, frames [{function, unit, file, line, address, ' +
+    'module}] of the raising thread, top first. "dropped" counts older records discarded because ' +
+    'more than 1000 accumulated between two calls. The same records also appear as text in ' +
+    'get_debugger_output.', []));
 
   Result.Add(MakeTool('get_locals',
     'Return the local variables of a stack frame with their formatted values and types. ' +
@@ -556,7 +629,7 @@ begin
 
   Result.Add(MakeTool('get_debugger_output',
     'Return debugger-generated output since the previous call — notably logpoint messages ' +
-    '(incremental).', []));
+    'and the exceptions "log" / "logStack" rules recorded (incremental).', []));
 
   Result.Add(MakeTool('read_memory',
     'Read a block of the debuggee''s memory. By default returns the bytes as hex plus ' +

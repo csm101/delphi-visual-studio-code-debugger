@@ -389,6 +389,24 @@ type
   TOnDllUnloaded = procedure(const Name: string; Base: UInt64) of object;
   TOnBpHit       = function(const BP: TBreakpointRec): Boolean of object;
 
+  // An exception that a `log` / `logStack` rule reported without stopping the
+  // debuggee. Structured, so a frontend can hand it to a client as data instead
+  // of a line of text to parse.
+  TLoggedException = record
+    Sequence:       Integer;                // numbered by the session, 1-based; the engine leaves 0
+    ThreadId:       Cardinal;
+    Code:           Cardinal;               // Win32 exception code
+    Address:        UInt64;                 // ExceptionAddress
+    FirstChance:    Boolean;
+    ExceptionClass: string;                 // Delphi class, or a synthetic name for a native exception
+    Message:        string;
+    Action:         TExceptionAction;       // eaLog or eaLogStack
+    RaiseFile:      string;                 // first frame with source; '' = not resolved
+    RaiseLine:      Integer;
+    Frames:         TArray<TStackFrame>;    // the raising thread's stack; eaLogStack only
+  end;
+  TOnExceptionLogged = procedure(const Entry: TLoggedException) of object;
+
   // Abstract debug-target contract. Implementations: TWinDebugger today,
   // future TWin32Debugger / TAttachedDebugger / TRemoteDebugger.
   // The step isolation as it stands in a live session.
@@ -806,14 +824,19 @@ type
     procedure SetOnDllUnloaded(const Value: TOnDllUnloaded);
     function  GetOnBpHit: TOnBpHit;
     procedure SetOnBpHit(const Value: TOnBpHit);
+    // A `log` / `logStack` exception rule matched. Unassigned, the engine writes
+    // the same report as text through OnOutput instead.
+    function  GetOnExceptionLogged: TOnExceptionLogged;
+    procedure SetOnExceptionLogged(const Value: TOnExceptionLogged);
 
-    property OnStopped:     TOnStopped     read GetOnStopped     write SetOnStopped;
+    property OnStopped:    TOnStopped     read GetOnStopped     write SetOnStopped;
     property OnExited:      TOnExited      read GetOnExited      write SetOnExited;
     property OnOutput:      TOnOutput      read GetOnOutput      write SetOnOutput;
     property OnNotice:      TOnOutput      read GetOnNotice      write SetOnNotice;
     property OnDllLoaded:   TOnDllLoaded   read GetOnDllLoaded   write SetOnDllLoaded;
     property OnDllUnloaded: TOnDllUnloaded read GetOnDllUnloaded write SetOnDllUnloaded;
     property OnBpHit:       TOnBpHit       read GetOnBpHit       write SetOnBpHit;
+    property OnExceptionLogged: TOnExceptionLogged read GetOnExceptionLogged write SetOnExceptionLogged;
   end;
 
 function FrameOriginName(Origin: TFrameOrigin): string;

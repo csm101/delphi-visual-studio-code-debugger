@@ -10,7 +10,7 @@ interface
 uses
   System.JSON, System.Generics.Collections,
   DebugSessionTypes, DebugTarget, DebugInfoTypes, DebugSession, ProcessEnum,
-  Disassembler;
+  Disassembler, ExceptionRules;
 
 function IdJsonOf(Msg: TJSONObject): string;
 function ParseIdOrNull(const IdJson: string): TJSONValue;
@@ -53,6 +53,14 @@ function RegisterListToJson(const Regs: TArray<TRegisterValue>): TJSONArray;
 // mnemonic), and symbol/source when a provider knows one.
 function DisasmInstructionToJson(const Ins: TDisasmInstruction): TJSONObject;
 function DisasmInstructionListToJson(const Insns: TArray<TDisasmInstruction>): TJSONArray;
+
+// {rules: [...], ruleCount}: the exception rules of an MCP session, each in the
+// rule-file schema.
+function ExceptionRulesToJson(const Rules: TArray<TExceptionRule>): TJSONObject;
+// {entries: [...], dropped}: get_exception_log. Modules resolve each address to
+// the module that holds it.
+function ExceptionLogToJson(const Entries: TArray<TLoggedException>; Dropped: Integer;
+  const Modules: TArray<TSessionModule>): TJSONObject;
 
 implementation
 
@@ -544,6 +552,126 @@ begin
   Result := TJSONArray.Create;
   for var R in Regs do
     Result.Add(RegisterToJson(R));
+end;
+
+// ---- exception rules / exception log ----
+
+function NamesToJson(const Names: TArray<string>): TJSONValue;
+begin
+  if Length(Names) = 1 then
+    Exit(TJSONString.Create(Names[0]));
+  var Arr := TJSONArray.Create;
+  for var N in Names do
+    Arr.Add(N);
+  Result := Arr;
+end;
+
+function ExceptionCodeToStr(Code: Cardinal): string;
+begin
+  Result := '0x' + IntToHex(Code, 8);
+end;
+
+// A rule in the same shape the rule files and exceptionRules use, criteria
+// left out when they are wildcards.
+function ExceptionRuleToJson(const Rule: TExceptionRule): TJSONObject;
+begin
+  Result := TJSONObject.Create;
+  if Length(Rule.ClassNames) > 0 then
+    Result.AddPair('class', NamesToJson(Rule.ClassNames));
+  if Length(Rule.ClassIsNames) > 0 then
+    Result.AddPair('classIs', NamesToJson(Rule.ClassIsNames));
+  if Length(Rule.Codes) > 0 then begin
+    var Codes: TArray<string> := nil;
+    for var Code in Rule.Codes do
+      Codes := Codes + [ExceptionCodeToStr(Code)];
+    Result.AddPair('code', NamesToJson(Codes));
+  end;
+  if Rule.MessageSub <> '' then
+    Result.AddPair('message', Rule.MessageSub);
+  if Rule.MessageRegex <> '' then
+    Result.AddPair('messageRegex', Rule.MessageRegex);
+  if Rule.MatchUnknownUnit then
+    Result.AddPair('unit', UNKNOWN_UNIT_TOKEN)
+  else if Rule.UnitName <> '' then
+    Result.AddPair('unit', Rule.UnitName);
+  if Rule.LineFrom >= 0 then
+    Result.AddPair('lineFrom', TJSONNumber.Create(Rule.LineFrom));
+  if Rule.LineTo >= 0 then
+    Result.AddPair('lineTo', TJSONNumber.Create(Rule.LineTo));
+  Result.AddPair('action', ExceptionActionToStr(Rule.Action));
+end;
+
+function ExceptionRulesToJson(const Rules: TArray<TExceptionRule>): TJSONObject;
+begin
+  Result := TJSONObject.Create;
+  var RulesArr := TJSONArray.Create;
+  for var Rule in Rules do
+    RulesArr.Add(ExceptionRuleToJson(Rule));
+  Result.AddPair('rules', RulesArr);
+  Result.AddPair('ruleCount', TJSONNumber.Create(Length(Rules)));
+end;
+
+function UnitOfSourceFile(const SourceFile: string): string;
+begin
+  Result := ChangeFileExt(ExtractFileName(SourceFile), '');
+end;
+
+function ModuleOf(const Modules: TArray<TSessionModule>; VA: UInt64): string;
+begin
+  Result := '';
+  for var M in Modules do
+    if (M.Base <> 0) and (VA >= M.Base) and (VA < M.Base + M.Size) then
+      Exit(M.Name);
+end;
+
+function LoggedExceptionToJson(const Entry: TLoggedException;
+  const Modules: TArray<TSessionModule>): TJSONObject;
+begin
+  Result := TJSONObject.Create;
+  Result.AddPair('sequence', TJSONNumber.Create(Entry.Sequence));
+  Result.AddPair('threadId', TJSONNumber.Create(Entry.ThreadId));
+  Result.AddPair('code', ExceptionCodeToStr(Entry.Code));
+  Result.AddPair('address', '0x' + IntToHex(Entry.Address, 1));
+  Result.AddPair('module', ModuleOf(Modules, Entry.Address));
+  Result.AddPair('firstChance', TJSONBool.Create(Entry.FirstChance));
+  Result.AddPair('exceptionClass', Entry.ExceptionClass);
+  Result.AddPair('message', Entry.Message);
+  Result.AddPair('action', ExceptionActionToStr(Entry.Action));
+  if Entry.RaiseFile <> '' then begin
+    var Site := TJSONObject.Create;
+    Site.AddPair('file', Entry.RaiseFile);
+    Site.AddPair('unit', UnitOfSourceFile(Entry.RaiseFile));
+    Site.AddPair('line', TJSONNumber.Create(Entry.RaiseLine));
+    Result.AddPair('raiseSite', Site);
+  end else
+    Result.AddPair('raiseSite', TJSONNull.Create);
+  if Entry.Action <> eaLogStack then
+    Exit;
+  var Frames := TJSONArray.Create;
+  for var Frame in Entry.Frames do begin
+    var F := TJSONObject.Create;
+    F.AddPair('function', Frame.FunctionName);
+    if Frame.SourceFile <> '' then begin
+      F.AddPair('unit', UnitOfSourceFile(Frame.SourceFile));
+      F.AddPair('file', Frame.SourceFile);
+      F.AddPair('line', TJSONNumber.Create(Frame.SourceLine));
+    end;
+    F.AddPair('address', '0x' + IntToHex(Frame.IP, 1));
+    F.AddPair('module', ModuleOf(Modules, Frame.IP));
+    Frames.Add(F);
+  end;
+  Result.AddPair('frames', Frames);
+end;
+
+function ExceptionLogToJson(const Entries: TArray<TLoggedException>; Dropped: Integer;
+  const Modules: TArray<TSessionModule>): TJSONObject;
+begin
+  Result := TJSONObject.Create;
+  var Arr := TJSONArray.Create;
+  for var Entry in Entries do
+    Arr.Add(LoggedExceptionToJson(Entry, Modules));
+  Result.AddPair('entries', Arr);
+  Result.AddPair('dropped', TJSONNumber.Create(Dropped));
 end;
 
 end.

@@ -603,6 +603,47 @@ fixture):
       would be silently ignored, which is exactly why it is asserted
       (`TheDebugmeSampleSidecar_IsAFileTheAdapterCanActuallyRead`)
 
+### F.2 Rule parsing and the chain (`ExceptionRulesTests.pas`, `TExceptionRuleFilesTests`)
+
+- [x] Well-formed rules parse with no findings (`WellFormedRules_NoProblems`);
+      an unknown key is reported and the rule kept, since a mistyped key turns
+      a criterion into a wildcard (`UnknownKey_ReportedButRuleKept`); `_` keys
+      are comments (`UnderscoreKeys_AreComments`); a non-object, a missing
+      action, an unparsable code and an invalid regex are each skipped and
+      named (`InvalidEntries_SkippedAndReported`)
+- [x] A rules document is a bare array or an object with an `exceptionRules`
+      array; any other shape is reported
+      (`Document_BothShapesAccepted_OtherShapesReported`)
+- [x] The VS Code tiers come in the order project local, project shared,
+      machine-wide (`Chain_FileTiersInPrecedenceOrder`); a rule file that
+      appears mid-session is a change the reload sees
+      (`Chain_ReloadsAFileThatAppeared`)
+
+### F.3 Exception rules through MCP (`McpE2ETests.pas`, `TMcpExceptionRulesTests`)
+
+- [x] A `logStack` rule passed at launch does not stop the debuggee, and
+      `get_exception_log` returns class, message, code, raise site and the
+      raising frame (`TestTargetCore.pas` at `EXC_RAISE`) as data, drained by
+      the call; the text form is in `get_debugger_output` and no longer in
+      `get_debuggee_output`
+      (`LaunchRule_LogStack_RecordsStructuredEntryWithoutStopping`)
+- [x] `set_exception_rules` on the live session decides the next exception
+      (`SetExceptionRules_OnTheLiveSession_TakesEffect`); a malformed rule
+      (unknown key, invalid action) is refused and the rules in force stay
+      (`SetExceptionRules_MalformedRule_RefusedAndNothingChanged`); an invalid
+      regex in `exceptionRules` refuses the launch
+      (`LaunchRule_Malformed_RefusesTheLaunch`)
+- [x] A rules file the agent names is read by the call that names it and
+      never again (`LaunchRulesFile_ReadOnceByTheCall`,
+      `SetExceptionRules_FromARulesFile`); inline rules and a rules file
+      together, or `set_exception_rules` with neither, are refused
+      (`InlineRulesAndRulesFileTogether_Refused`)
+- [x] The VS Code rule files are NOT read by the MCP server: the project's
+      next to DDK's project file (`ProjectRuleFiles_OfTheDdkProject_AreNotRead`)
+      or a launch.json's `delphiProjectFile`
+      (`ProjectRuleFiles_OfTheLaunchConfig_AreNotRead`), and the machine-wide
+      file under the server's `USERPROFILE` (`MachineWideRuleFile_IsNotRead`)
+
 ---
 
 ## G. Threads
