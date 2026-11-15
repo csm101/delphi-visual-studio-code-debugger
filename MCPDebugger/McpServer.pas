@@ -749,6 +749,16 @@ var
   begin
     Result := FSession.State = dsStopped;
   end;
+  // pause_execution / wait_until_stopped wait for the NEXT stop. When the
+  // debuggee is already stopped (or gone) none will come, so the answer is the
+  // current snapshot, now -- not after the whole timeout.
+  function AnsweredBecauseAlreadySettled: Boolean;
+  begin
+    if not (Stopped or FSession.HasExited) then
+      Exit(False);
+    SendToolJson(IdJson, McpJson.SnapshotToJson(FSession.Snapshot));
+    Result := True;
+  end;
   // An optional integer argument: Default when absent (or null), otherwise an
   // integer within MinValue..MaxValue. Anything else is refused with a tool
   // error naming the range -- never clamped silently.
@@ -1137,10 +1147,17 @@ begin
       Exit;
     end;
     if Name = 'pause_execution' then begin
-      FSession.Pause;     ArmWait(IdJson, 30000); Exit;
+      if AnsweredBecauseAlreadySettled then
+        Exit;
+      FSession.Pause;
+      ArmWait(IdJson, 30000);
+      Exit;
     end;
     if Name = 'wait_until_stopped' then begin
-      ArmWait(IdJson, ArgInt('timeoutMs', 30000)); Exit;
+      if AnsweredBecauseAlreadySettled then
+        Exit;
+      ArmWait(IdJson, ArgInt('timeoutMs', 30000));
+      Exit;
     end;
 
     // ---- inspection (require a stop) ----

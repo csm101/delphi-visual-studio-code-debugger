@@ -308,6 +308,10 @@ the session to be stopped.
 - `continue_and_wait` (optional `timeoutMs`), `step_over`, `step_into`,
   `step_out`, `pause_execution`, `wait_until_stopped`. Each returns a compact
   snapshot of the new state.
+- `pause_execution` and `wait_until_stopped` wait for the NEXT stop. On a
+  debuggee that is already stopped (or has exited) no further stop will come, so
+  they answer at once with the current snapshot rather than when the timeout
+  expires (30 s for `pause_execution`).
 - `step_over`/`step_into`/`step_out` take an optional `granularity`:
   `"statement"` (default) is the pre-existing source-level step; `"instruction"`
   (`ASSEMBLY_LEVEL_DEBUGGING.md` increment 4) steps exactly ONE machine

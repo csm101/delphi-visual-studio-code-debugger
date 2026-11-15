@@ -230,6 +230,11 @@ session building an MCP server for driving Delphi apps):
   `TEST_CATALOG.md` section Z, on the new fixtures
   `DebuggerTests\TestTarget\StdioConsoleSample.dpr` / `StdioGuiSample.dpr`;
   diagnostic probe `DevTools\McpStdioProbe`.
+- **MCP `pause_execution` / `wait_until_stopped` on a debuggee already stopped
+  answer at once** with the current snapshot. They used to wait for a next stop
+  that never came and answer only at the timeout (30 s for `pause_execution`),
+  which in the same report looked like a second hang. Test:
+  `McpE2ETests.PauseAndWait_WhenAlreadyStopped_AnswerAtOnce`.
 
 Synthetic-call results are released (2026-10-31):
 - **What an evaluation's function call returns is released when the debuggee

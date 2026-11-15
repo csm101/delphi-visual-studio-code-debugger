@@ -182,6 +182,11 @@ type
     // A GUI debuggee keeps what it has without a debugger: no standard handles,
     // so nothing it writes through them shows up anywhere (StdioGuiSample.dpr).
     [Test] procedure GuiDebuggee_KeepsNoStandardHandles;
+    // pause_execution / wait_until_stopped on a debuggee that is ALREADY stopped
+    // answer with the current snapshot at once. RED before: both waited for a
+    // NEXT stop that never came and answered only when the timeout ran out
+    // (30 s for pause_execution), which an agent reads as one more hang.
+    [Test] procedure PauseAndWait_WhenAlreadyStopped_AnswerAtOnce;
   end;
 
   // Exception rules through the MCP server. The rules of an MCP session are the
@@ -4078,6 +4083,45 @@ begin
     // standard handles with or without a debugger, and the debugger gives it none.
     var Output := DebuggeeOutputText(C);
     Assert.IsFalse(Output.Contains('STDIO_SAMPLE'), 'a GUI debuggee was given standard handles: ' + Output);
+  finally
+    C.Free;
+  end;
+end;
+
+procedure TMcpE2ETests.PauseAndWait_WhenAlreadyStopped_AnswerAtOnce;
+const
+  PROMPT_REPLY_MS = 5000;
+begin
+  var C := TMcpTestClient.Start(McpExe);
+  try
+    C.Call('initialize', nil).Free;
+    LaunchStdioSample(C, TargetDir + 'Win64\Debug\StdioGuiSample.exe', ['unhandled']);
+
+    // Stopped at the entry. A timeout far above PROMPT_REPLY_MS, so an answer
+    // that only comes when the wait expires is told apart from a prompt one.
+    for var ToolName in ['pause_execution', 'wait_until_stopped'] do begin
+      var Args := TJSONObject.Create;
+      Args.AddPair('timeoutMs', TJSONNumber.Create(20000));
+      var Started := GetTickCount64;
+      var Reply := C.CallTool(ToolName, Args);
+      try
+        var ElapsedMs := GetTickCount64 - Started;
+        Assert.IsTrue(Reply is TJSONObject, ToolName + ' returned no snapshot: ' + Reply.ToJSON);
+        Assert.AreEqual('stopped', TJSONObject(Reply).GetValue<string>('state', ''), ToolName + ': ' + Reply.ToJSON);
+        Assert.IsTrue(ElapsedMs < PROMPT_REPLY_MS,
+          Format('%s took %d ms on a debuggee that was already stopped', [ToolName, ElapsedMs]));
+      finally
+        Reply.Free;
+      end;
+    end;
+
+    // Nothing was left pending: the run goes on to the end without a stray pause.
+    var Exited := ContinueToNextStop(C);
+    try
+      Assert.AreEqual('exited', Exited.GetValue<string>('state', ''), 'did not run to the end: ' + Exited.ToJSON);
+    finally
+      Exited.Free;
+    end;
   finally
     C.Free;
   end;

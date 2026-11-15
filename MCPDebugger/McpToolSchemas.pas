@@ -461,11 +461,12 @@ begin
      Prop('value', 'string', 'New value, decimal or 0x-hex.', True)]));
 
   Result.Add(MakeTool('pause_execution',
-    'Pause a running debuggee. Returns a snapshot once it stops.', []));
+    'Pause a running debuggee. Returns a snapshot once it stops; at once when it is already ' +
+    'stopped or has exited.', []));
 
   Result.Add(MakeTool('wait_until_stopped',
     'Wait until the debuggee stops (without issuing a command). Use after the target was ' +
-    'left running. Returns a snapshot.',
+    'left running. Returns a snapshot; at once when it is already stopped or has exited.',
     [Prop('timeoutMs', 'integer', 'Max milliseconds to wait (default 30000).')]));
 
   // ---- State inspection ----

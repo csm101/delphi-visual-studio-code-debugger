@@ -1897,6 +1897,13 @@ handles".
       too: a GUI program never received the server's handles.
 - [ ] A console debuggee that writes more than 64 KB during a synthetic call
       blocks until the call times out (the call's own event pump does not drain).
+- [x] **MCP: pause / wait on a debuggee already stopped answer at once**
+      (`McpE2ETests.PauseAndWait_WhenAlreadyStopped_AnswerAtOnce`, uses
+      `StdioGuiSample` only as a target to stop at the entry): both return the
+      `stopped` snapshot in well under 5 s, and the run then continues to its
+      exit with no stray pause. RED before: each waited for a next stop that never
+      came and answered at the timeout. Found while diagnosing the stdio report,
+      whose `pause_execution` calls took 30 s each.
 
 ## What the suite does NOT prove (2026-08-08)
 
