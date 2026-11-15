@@ -235,6 +235,14 @@ session building an MCP server for driving Delphi apps):
   that never came and answer only at the timeout (30 s for `pause_execution`),
   which in the same report looked like a second hang. Test:
   `McpE2ETests.PauseAndWait_WhenAlreadyStopped_AnswerAtOnce`.
+- **Output of a function the debugger calls is no longer lost or blocking.** A
+  synthetic call (an evaluation that invokes a function or getter) pumps debug
+  events on its own, and that pump neither read the stdio pipe nor kept
+  `OutputDebugString` text: a console callee writing more than 64 KB blocked
+  until the call's watchdog failed the evaluation, and debug strings were
+  dropped. The pump now drains the pipe, and both kinds of output are held for
+  the call's duration and reported when it ends. Test:
+  `McpE2ETests.ConsoleDebuggee_OutputOfAnEvaluatedCall_IsReported`.
 
 Synthetic-call results are released (2026-10-31):
 - **What an evaluation's function call returns is released when the debuggee

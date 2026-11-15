@@ -321,6 +321,10 @@ type
     FStdioRead:    THandle;
     // The bytes of a UTF-8 sequence the last read cut off, prepended to the next.
     FStdioPending: TBytes;
+    // > 0 while a synthetic call runs: program output is collected in
+    // FHeldProgramOutput and reported when the outermost call ends.
+    FProgramOutputHoldDepth: Integer;
+    FHeldProgramOutput:      TArray<string>;
     FOnBpHit:            TOnBpHit;
     FOnExceptionLogged:  TOnExceptionLogged;
     FLastExceptionDesc:    string;  // "Class: Message" (or class / AV summary) for the stop UI
@@ -694,6 +698,9 @@ type
     procedure EmitDebuggeeStdio(const Bytes: TBytes; Final: Boolean);
     procedure FinishDebuggeeStdio;
     procedure ReleaseDebuggeeStdio;
+    procedure ReportProgramOutput(const Text: string);
+    procedure ReleaseHeldProgramOutput;
+    function  ReadDebugStringText(const Ev: TDebugEvent): string;
     procedure HandleOutputDbgString(const Ev: TDebugEvent);
     procedure HandleException(const Ev: TDebugEvent; out ContinueStatus: DWORD);
     procedure HandleLoadDll(const Ev: TDebugEvent);
@@ -5154,18 +5161,14 @@ begin
     FOnExited(Ev.ExitProcess.dwExitCode);
 end;
 
-procedure TWinDebugger.HandleOutputDbgString(const Ev: TDebugEvent);
-var
-  Len: WORD;
-  Buf: TBytes;
-  R: SIZE_T;
-  S: string;
+// The text an OUTPUT_DEBUG_STRING_EVENT carries; '' when there is none or it
+// cannot be read.
+function TWinDebugger.ReadDebugStringText(const Ev: TDebugEvent): string;
 begin
-  Len := Ev.DebugString.nDebugStringLength;
-  if Len = 0 then begin
-    ContinueDebugEvent(Ev.dwProcessId, Ev.dwThreadId, DBG_CONTINUE);
+  Result := '';
+  var Len := Ev.DebugString.nDebugStringLength;
+  if Len = 0 then
     Exit;
-  end;
   // nDebugStringLength counts CHARACTERS (incl. terminating null): bytes are
   // Len for ANSI events, Len*2 for Unicode. Reading Len*2 unconditionally
   // decoded the ANSI tail as garbage (and could fail outright when the
@@ -5173,20 +5176,24 @@ begin
   var ByteCount: NativeUInt := Len;
   if Ev.DebugString.fUnicode <> 0 then
     ByteCount := NativeUInt(Len) * 2;
+  var Buf: TBytes;
   SetLength(Buf, ByteCount);
-  if ReadProcessMemory(FProcess, Ev.DebugString.lpDebugStringData,
-       @Buf[0], ByteCount, R) and (R > 0) then begin
-    if Ev.DebugString.fUnicode <> 0 then
-      S := TEncoding.Unicode.GetString(Buf, 0, R)
-    else
-      S := TEncoding.ANSI.GetString(Buf, 0, R);
-    // Drop the terminating null(s) so the DAP output event carries the
-    // exact text the program passed to OutputDebugString.
-    while (S <> '') and (S[Length(S)] = #0) do
-      SetLength(S, Length(S) - 1);
-    if Assigned(FOnOutput) then
-      FOnOutput(S);
-  end;
+  var R: SIZE_T := 0;
+  if not ReadProcessMemory(FProcess, Ev.DebugString.lpDebugStringData, @Buf[0], ByteCount, R) or (R = 0) then
+    Exit;
+  if Ev.DebugString.fUnicode <> 0 then
+    Result := TEncoding.Unicode.GetString(Buf, 0, R)
+  else
+    Result := TEncoding.ANSI.GetString(Buf, 0, R);
+  // Drop the terminating null(s) so the output event carries the exact text
+  // the program passed to OutputDebugString.
+  while (Result <> '') and (Result[Length(Result)] = #0) do
+    SetLength(Result, Length(Result) - 1);
+end;
+
+procedure TWinDebugger.HandleOutputDbgString(const Ev: TDebugEvent);
+begin
+  ReportProgramOutput(ReadDebugStringText(Ev));
   ContinueDebugEvent(Ev.dwProcessId, Ev.dwThreadId, DBG_CONTINUE);
 end;
 
@@ -6196,8 +6203,33 @@ begin
   FStdioPending := Copy(Bytes, Complete, Length(Bytes) - Complete);
   if Complete = 0 then
     Exit;
+  ReportProgramOutput(DecodeDebuggeeText(Copy(Bytes, 0, Complete)));
+end;
+
+// The one way out for what the program writes (OutputDebugString, captured
+// stdout / stderr). While a synthetic call runs it is held, not reported: the
+// call's pump has to keep reading it -- a console debuggee blocks in WriteFile
+// once its pipe is full -- but the evaluation that made the call is still in
+// progress, and its result must not be overtaken by the program's text.
+procedure TWinDebugger.ReportProgramOutput(const Text: string);
+begin
+  if Text = '' then
+    Exit;
+  if FProgramOutputHoldDepth > 0 then begin
+    FHeldProgramOutput := FHeldProgramOutput + [Text];
+    Exit;
+  end;
   if Assigned(FOnOutput) then
-    FOnOutput(DecodeDebuggeeText(Copy(Bytes, 0, Complete)));
+    FOnOutput(Text);
+end;
+
+// Reports what was held during a synthetic call, in the order it was produced.
+procedure TWinDebugger.ReleaseHeldProgramOutput;
+begin
+  var Held := FHeldProgramOutput;
+  FHeldProgramOutput := nil;
+  for var Text in Held do
+    ReportProgramOutput(Text);
 end;
 
 // The capture is over (every writer is gone, or the debuggee exited): reports the
@@ -7472,8 +7504,12 @@ begin
       CallDeadline := FAutoCallDeadline;
   end;
   var Aborted := False;
+  Inc(FProgramOutputHoldDepth);
   try
     while True do begin
+      // The callee may write to a captured stdout: keep the pipe from filling,
+      // or the call blocks in WriteFile until the watchdog gives up on it.
+      DrainDebuggeeStdio;
       if not WaitForDebugEvent(Ev, 100) then begin
         // No debug event this slice. Abort the call if a control command asked
         // us to, or the watchdog expired; if a forced abort already happened
@@ -7656,6 +7692,11 @@ begin
          (Ev.Exception.ExceptionRecord.ExceptionCode = MS_VC_EXCEPTION) then
         CaptureAnnouncedThreadName(Ev);
 
+      // OutputDebugString from inside the call: held like the stdio text, then
+      // the plain DBG_CONTINUE at the bottom.
+      if Ev.dwDebugEventCode = OUTPUT_DEBUG_STRING_EVENT then
+        ReportProgramOutput(ReadDebugStringText(Ev));
+
       // Track threads born/dying while the call runs so a skip on a brand-new
       // thread can still resolve its handle through ThreadHandle().
       if Ev.dwDebugEventCode = CREATE_THREAD_DEBUG_EVENT then
@@ -7692,6 +7733,11 @@ begin
     end;
     PendingSkips.Free;
     AtomicExchange(FInRemoteCall, 0);
+    // What the callee wrote last is in the pipe already, the debuggee frozen.
+    DrainDebuggeeStdio;
+    Dec(FProgramOutputHoldDepth);
+    if FProgramOutputHoldDepth = 0 then
+      ReleaseHeldProgramOutput;
   end;
 end;
 

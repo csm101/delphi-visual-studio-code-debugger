@@ -187,6 +187,14 @@ type
     // NEXT stop that never came and answered only when the timeout ran out
     // (30 s for pause_execution), which an agent reads as one more hang.
     [Test] procedure PauseAndWait_WhenAlreadyStopped_AnswerAtOnce;
+    // A function the debugger calls for an evaluation writes 100 KB to a
+    // captured stdout plus one OutputDebugString line (StdioSampleCore
+    // .WriteBulkOutput, at the STDIO_EVAL marker). The call completes and all of it
+    // reaches get_debuggee_output. RED before: the call's own event pump never
+    // read the pipe, so the callee blocked in WriteFile once 64 KB were waiting
+    // and the evaluation failed when the watchdog gave up on it; and that pump
+    // dropped OutputDebugString text outright.
+    [Test] procedure ConsoleDebuggee_OutputOfAnEvaluatedCall_IsReported;
   end;
 
   // Exception rules through the MCP server. The rules of an MCP session are the
@@ -4116,6 +4124,63 @@ begin
     end;
 
     // Nothing was left pending: the run goes on to the end without a stray pause.
+    var Exited := ContinueToNextStop(C);
+    try
+      Assert.AreEqual('exited', Exited.GetValue<string>('state', ''), 'did not run to the end: ' + Exited.ToJSON);
+    finally
+      Exited.Free;
+    end;
+  finally
+    C.Free;
+  end;
+end;
+
+procedure TMcpE2ETests.ConsoleDebuggee_OutputOfAnEvaluatedCall_IsReported;
+const
+  BULK_BYTES     = 100000;  // well past the 64 KB the stdio pipe holds
+  WATCHDOG_MS    = 8000;    // RunMethodCall's REMOTE_CALL_TIMEOUT_MS
+begin
+  var Line := MarkerLine('StdioSampleCore.pas', 'STDIO_EVAL');
+  Assert.IsTrue(Line > 0, 'marker {BP:STDIO_EVAL} not found in StdioSampleCore.pas');
+  var C := TMcpTestClient.Start(McpExe);
+  try
+    C.Call('initialize', nil).Free;
+    // "unhandled" alone: no stop at the marker exception, only at the breakpoint.
+    LaunchStdioSample(C, TargetDir + 'Win64\Debug\StdioConsoleSample.exe', ['unhandled']);
+    var BpArgs := TJSONObject.Create;
+    BpArgs.AddPair('sourceFile', 'StdioSampleCore.pas');
+    BpArgs.AddPair('line', TJSONNumber.Create(Line));
+    C.CallTool('set_breakpoint', BpArgs).Free;
+    var Stop := ContinueToNextStop(C);
+    try
+      Assert.AreEqual(Line, Stop.GetValue<Integer>('location.line', -1), 'not stopped at the marker: ' + Stop.ToJSON);
+    finally
+      Stop.Free;
+    end;
+    DebuggeeOutputText(C);  // what the program wrote before the stop
+
+    var EvalArgs := TJSONObject.Create;
+    EvalArgs.AddPair('expression', Format('WriteBulkOutput(%d)', [BULK_BYTES]));
+    var Started := GetTickCount64;
+    var Reply := C.CallTool('evaluate_expression', EvalArgs);
+    try
+      var ElapsedMs := GetTickCount64 - Started;
+      Assert.IsTrue(Reply is TJSONObject, 'evaluate_expression returned no object: ' + Reply.ToJSON);
+      Assert.IsTrue(TJSONObject(Reply).GetValue<Boolean>('success', False), 'the call failed: ' + Reply.ToJSON);
+      Assert.IsTrue(TJSONObject(Reply).GetValue<string>('value', '').Contains(IntToStr(BULK_BYTES)),
+        'unexpected result: ' + Reply.ToJSON);
+      Assert.IsTrue(ElapsedMs < WATCHDOG_MS div 2,
+        Format('the call took %d ms: it waited on a full pipe until the watchdog', [ElapsedMs]));
+    finally
+      Reply.Free;
+    end;
+
+    var Output := DebuggeeOutputText(C);
+    Assert.IsTrue(Output.Contains(StringOfChar('x', BULK_BYTES) + 'STDIO_BULK_END'),
+      Format('the call''s stdout did not arrive whole (%d characters)', [Output.Length]));
+    Assert.IsTrue(Output.Contains('STDIO_BULK_ODS'), 'the call''s OutputDebugString text was lost');
+
+    // The program itself is unaffected: it runs on to the end.
     var Exited := ContinueToNextStop(C);
     try
       Assert.AreEqual('exited', Exited.GetValue<string>('state', ''), 'did not run to the end: ' + Exited.ToJSON);

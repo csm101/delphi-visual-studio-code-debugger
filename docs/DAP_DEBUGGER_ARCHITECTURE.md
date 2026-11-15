@@ -1309,6 +1309,14 @@ the debuggee handles of its own:
   the client ahead of the stop. It also drains on every idle tick, because a
   running debuggee blocks in `WriteFile` once the pipe is full.
   `HandleExitProcess` drains and flushes before it reports the exit.
+- **During a synthetic call.** `RunMethodCall` pumps debug events itself, and
+  drains on every turn of that pump too: a callee that writes more than the
+  pipe holds would otherwise block in `WriteFile` until the call's watchdog gave
+  up on it. What the call produces, captured stdio and `OutputDebugString` text
+  alike, is held (`FProgramOutputHoldDepth`, through `ReportProgramOutput`, the
+  single exit for program output) and reported when the outermost call ends,
+  after the evaluation's own work is done. Before, that pump read no stdio and
+  dropped `OutputDebugString` events.
 - **Decoding.** UTF-8 when the bytes are valid UTF-8, the ANSI code page
   otherwise: a Delphi program's `Write` into a pipe produces
   `DefaultSystemCodePage`, because `System.TextOpen` uses the console code page
@@ -1320,9 +1328,7 @@ the debuggee handles of its own:
 - **No window or console flag** is involved, on either path: an `SW_HIDE` meant
   for a console once hid VCL main forms instead.
 
-Limits: a synthetic call pumps debug events itself and does not drain, so a
-console debuggee that writes more than 64 KB during an evaluated call blocks
-until the call times out. `terminate` releases the pipe without a last drain, so
+Limits: `terminate` releases the pipe without a last drain, so
 what the debuggee wrote in its final milliseconds can be lost. An attached
 process keeps the handles it already had, and nothing of it is captured.
 

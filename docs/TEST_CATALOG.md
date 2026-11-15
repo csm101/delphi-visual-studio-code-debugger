@@ -1895,8 +1895,16 @@ handles".
       (`McpE2ETests.GuiDebuggee_KeepsNoStandardHandles`): it runs to its exit and
       nothing it writes through standard handles appears. Green before the fix
       too: a GUI program never received the server's handles.
-- [ ] A console debuggee that writes more than 64 KB during a synthetic call
-      blocks until the call times out (the call's own event pump does not drain).
+- [x] **Output of an evaluated call: drained, held, reported**
+      (`McpE2ETests.ConsoleDebuggee_OutputOfAnEvaluatedCall_IsReported`): at the
+      `STDIO_EVAL` breakpoint, `evaluate_expression` calls
+      `StdioSampleCore.WriteBulkOutput(100000)`, which writes 100 KB to stdout
+      and one `OutputDebugString` line. The call succeeds well inside the
+      watchdog, and the whole text plus the debug string are in
+      `get_debuggee_output` afterwards. RED before the fix: `<method invocation
+      failed>` -- the call's own event pump never read the pipe, so the callee
+      blocked in `WriteFile` until the watchdog; its `OutputDebugString` events
+      were dropped.
 - [x] **MCP: pause / wait on a debuggee already stopped answer at once**
       (`McpE2ETests.PauseAndWait_WhenAlreadyStopped_AnswerAtOnce`, uses
       `StdioGuiSample` only as a target to stop at the entry): both return the

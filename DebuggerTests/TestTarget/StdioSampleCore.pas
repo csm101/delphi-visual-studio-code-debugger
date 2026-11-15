@@ -12,6 +12,9 @@ unit StdioSampleCore;
 // last thing written. After the stop the program reads its standard input and
 // reports how many bytes it got: the NUL device gives 0, while a debugger's own
 // protocol input would block the read or hand it a client request.
+//
+// Between the two, at the STDIO_EVAL marker, a test evaluates WriteBulkOutput: output
+// produced by code the debugger calls, not by the program running.
 
 interface
 
@@ -55,6 +58,20 @@ begin
   Result := BytesRead;
 end;
 
+// Called by the debugger from an evaluation, never by the program itself: writes
+// Count filler bytes to stdout -- more than a 64 KB pipe holds -- then
+// STDIO_BULK_END, and one OutputDebugString line. Returns Count.
+function WriteBulkOutput(Count: Integer): Integer;
+begin
+  WriteToStdHandle(STD_OUTPUT_HANDLE, AnsiString(StringOfChar('x', Count)) + 'STDIO_BULK_END' + #13#10);
+  OutputDebugString('STDIO_BULK_ODS');
+  Result := Count;
+end;
+
+var
+  // Referencing WriteBulkOutput keeps the linker from dropping it.
+  BulkOutputWriter: function(Count: Integer): Integer;
+
 procedure RunStdioScenario;
 begin
   WriteToStdHandle(STD_ERROR_HANDLE, 'STDIO_SAMPLE_STDERR' + #13#10);
@@ -65,6 +82,7 @@ begin
     on EStdioSampleMarker do
       WriteToStdHandle(STD_OUTPUT_HANDLE, ' CAUGHT');
   end;
+  BulkOutputWriter := WriteBulkOutput; // {BP:STDIO_EVAL}
   WriteToStdHandle(STD_OUTPUT_HANDLE, AnsiString(Format(' STDIN_BYTES=%d', [BytesReadFromStdIn])) + #13#10);
   WriteToStdHandle(STD_OUTPUT_HANDLE, 'STDIO_SAMPLE_DONE' + #13#10);
 end;
