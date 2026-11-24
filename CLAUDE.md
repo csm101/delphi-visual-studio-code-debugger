@@ -8,6 +8,12 @@ Primary goal is progress on the debugger itself.
 The sample target app exists only for testing.
 It may be extended whenever needed to validate new debugger features.
 
+The debugger stays a generic debugging engine with two front ends (DAP and the MCP server).
+Tools of a different nature (for example a bridge that inspects or drives Delphi VCL applications
+from the inside) are not hosted here: they integrate by composition on the agent side (addresses
+returned by one tool passed to the debugger's tools, functions called through `evaluate_expression`),
+not by adding code to this repository. The owner turned down such a merge on 2026-10-31.
+
 # Operating mode
 
 Use minimum tokens.
