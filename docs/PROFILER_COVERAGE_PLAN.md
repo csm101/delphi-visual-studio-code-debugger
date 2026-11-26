@@ -33,7 +33,7 @@ and 3 add front ends, not engines, so step 1 has to be built for them:
 
 | later step | what it needs from step 1 |
 |---|---|
-| 2, coverage CLI | launch-time arming, a "run until exit" driver, accumulation of several runs into one session, the store as a file, exporters (Cobertura, LCOV, JSON, HTML), a threshold check |
+| 2, coverage CLI | launch-time arming, a "run until exit" driver, accumulation of several runs into one session, the reference that fixes the total, the store as a file, exporters (Cobertura, LCOV, JSON, HTML), a threshold check |
 | 2, profiler CLI | the same driver, the report text, exporters (`.cpuprofile`, collapsed stacks, callgrind) |
 | 3, VS Code | the same engine API behind DAP custom requests, results readable while the session is alive, per-line figures keyed by source file |
 | 4, continuous testing | coverage attributed per test, which needs a "reset and read" cycle cheap enough to run between tests |
@@ -75,6 +75,15 @@ and 3 add front ends, not engines, so step 1 has to be built for them:
   subordinate roles only: as the fallback for a line that cannot take a
   counting probe, and as an intermediate stage on the way there (see
   "Coverage").
+- **Coverage is measured against a project named from outside**, not against
+  whatever the test executables happen to contain (owner, 2026-11-26). The
+  linker drops what nothing calls and never links a unit no test uses, so a
+  percentage taken over the measured executables alone is always flattering.
+  For the tests of a library the denominator is the whole library, for
+  instance every unit of its package (see "Coverage").
+- **Coverage accumulates over several test executables.** The results live in
+  a store that outlives the process that ran a test, and the next executable
+  adds to it.
 - Profiling in three forms: sampling, instrumentation of whole routines,
   instrumentation of single lines.
 - AQtime is the reference for concepts (areas, hit count, time, time with
@@ -494,6 +503,37 @@ Stage 1 is not the coverage the owner asked for. It is a step towards it that
 happens to be usable. Whether it is released on its own is the first of the
 "Decisions for the owner".
 
+**What the percentage is a percentage of.** A coverage session can be given a
+**reference**: the built binaries of the project under test, with their debug
+information — a package, an executable, several of them — named by path or as a
+DDK project. Nothing is run. Their line tables are read from the files and
+every line with code in them becomes a line of the session, covered or not.
+
+- The reference fixes the total. A unit no test links, and a routine the
+  linker dropped from every test executable, are then lines with zero hits
+  instead of lines that do not exist. They appear in `coverage_uncovered`.
+- The reference fixes the default scope: the source files of the reference are
+  what is probed in the test executables. Test code, the RTL and third-party
+  units stay out of both the probes and the total.
+- Hits are matched to reference lines by source identity (file and line, unit
+  and routine), the same key that merges two test executables. A line that
+  runs in a test executable, belongs to a reference file, and has no record in
+  the reference — a generic instantiated only by a test — is added to the
+  total as well as to the covered lines.
+- It is a store operation, so it can be applied before the first run, between
+  runs, or to a finished session.
+- A reference built from other sources than the tests would compare different
+  line tables. The store's source hashes catch it and the report says so.
+- When the tests load the project as a runtime package, that package is itself
+  a measured module and all of its lines are in the total already. The
+  reference is what gives the same answer to tests that link the units in.
+- Without a reference the total is the union of the lines found in the measured
+  modules, and every report says in its header that it is.
+
+A package is close to a complete reference, because it keeps what its units
+export. An executable is a reference of what production actually links, which
+is also a defensible total.
+
 **Pausing and clearing.** `profile_pause` leaves every patch in place. A
 one-shot that fires while paused is restored, not recorded, and planted again
 at `profile_resume`; a counter's increase over the paused interval is read at
@@ -661,7 +701,8 @@ the table and column names are the same, so one viewer can read both:
 | `sample_line` | exclusive and inclusive samples per (file, line, method) |
 | `timing_stat`, `timing_tree` | as in the reference: calls, total, self, min, max, exception exits |
 | `line_stat` | hits, self and total nanoseconds per (file, line, method) |
-| `coverage_line` | per (file, line, method): records, records that ran, hits, and whether the hits are exact or `1+` |
+| `reference` | the binaries that define the total: path, size, timestamp, symbol format, when read |
+| `coverage_line` | per (file, line, method): records, records that ran, hits, whether the hits are exact or `1+`, and whether the line comes from the reference, from a measured module or from both |
 | `coverage_method`, `coverage_file` | lines, lines covered, calls |
 
 Accumulation and merge are one store operation: `appendTo` on a collection and
@@ -678,7 +719,8 @@ Arming:
 
 | tool | arguments | notes |
 |---|---|---|
-| every launch and attach tool | optional `profile` object: `mode`, `level`, `include`, `exclude`, `exactCounts`, `intervalMs`, `name`, `appendTo`, `startPaused` | the collection exists before the first instruction. Still stops at entry |
+| every launch and attach tool | optional `profile` object: `mode`, `level`, `include`, `exclude`, `reference`, `exactCounts`, `intervalMs`, `name`, `appendTo`, `startPaused` | the collection exists before the first instruction. Still stops at entry |
+| `coverage_reference` | `sessionId`, and `binaries` (paths) or `project` (DDK) | reads the line tables of the project under test into the session; runs nothing. Needs no debug session |
 | `profile_start` | the same fields | on the live session, "from now on". At the entry stop of a launch that loses only the start-up of statically imported DLLs that are not packages |
 | `profile_run` | one of `program` / `project` / `configFile`, `args`, the `profile` fields, `waitSeconds` (default 30), `durationSeconds` (0: until the program exits), `keepRunning` | launch, arm, run. Answers within `waitSeconds`: the summary if the run has ended, otherwise the session and its state |
 | `profile_wait` | `sessionId`, `waitSeconds` | waits again, bounded the same way |
@@ -739,6 +781,8 @@ No engine change. Two DevTools.
     "Routine analysis", and the unconfirmed ones with the reason;
   - records that point at a table rather than at code;
   - source lines with more than one record, by construct;
+  - the same unit compiled into two binaries (a package and an executable that
+    links it): do the two line tables name the same lines;
   - the share of lines that could take each counting form, the share left to a
     `$CC`, and the same for routine exits;
   - every indirect jump with the code around it.
@@ -749,7 +793,7 @@ No engine change. Two DevTools.
   `Hydra2SingleEXE`. For dynamic runs, a real program that can run unattended:
   `DevTools\PrebuildIdx.exe` over a symbol directory, and the test runner
   itself with a filter.
-- Exit: assumptions 1, 2, 8, 9, 10 and 17 answered with numbers. Assumption 9
+- Exit: assumptions 1, 2, 8, 9, 10, 17 and 18 answered with numbers. Assumption 9
   matters most here: it says how much of a coverage run will be counted and
   how much will read `1+`.
 
@@ -843,9 +887,11 @@ not confirmed.
 
 - `SqliteApi.pas`, `TProfileStore` with the dictionary and coverage tables,
   the registry (root, ids, names, default session, archives), accumulation,
-  source identity.
+  source identity, the reference (a code map built from a file, with no
+  process).
 - Tests: in-memory and on-disk databases; two different files of the same name
-  kept apart; a database written by this code opened by the reference viewer,
+  kept apart; a reference whose unit no measured module contains shows as
+  lines with zero hits; a reference built from changed sources is reported; a database written by this code opened by the reference viewer,
   if the schema is to be shared (decision 4).
 
 ### Increment 7 — Coverage, stage 1, over MCP: which lines ran
@@ -870,8 +916,13 @@ not confirmed.
 - The deferred-reply slot: `ArmWait` overwrites a pending wait without
   answering it. The new wait gets its own kind and a second wait-class call
   while one is pending is refused.
-- Tests: two executables sharing units accumulated into one session; a run
-  longer than `waitSeconds` observed to its end through `profile_wait`.
+- `coverage_reference` and the `reference` field; the report header that names
+  what the total is.
+- Tests: two executables sharing units accumulated into one session, the
+  second started by a server process other than the first's; the same session
+  with and without a reference, where the percentage must drop by exactly the
+  lines of a unit neither executable links; a run longer than `waitSeconds`
+  observed to its end through `profile_wait`.
 
 ### Increment 9 — Relocation
 
@@ -983,16 +1034,19 @@ too many lines left without a count.
 | 15 | a thread's cycle counter moves while the thread runs on another core between context switches | 12 | suspend every thread whose last sample was not a wait |
 | 16 | dbghelp reads code through the read routine it is given, not from the image file | 1 | nothing to do if it reads the file: it then never sees a patch |
 | 17 | a TD32 procedure range covers the routine's funclets and clause tables | 0 | attribute them through the scope tables |
+| 18 | a unit compiled into two binaries has the same lines with code in both, so hits in one match the reference lines of the other | 0 | match by routine as well and report the lines that differ instead of counting them |
 
 ## Accepted limits
 
 - **Line coverage only.** No branch or condition coverage.
 - **A hit count is exact where a counting probe fits and `1+` elsewhere,**
   unless the collection asks for `exactCounts`.
-- **Code the linker removed does not exist.** A routine nothing references has
-  no line records, so it is neither covered nor uncovered and the percentage
-  does not see it. Step 2 can take the denominator from the production
-  executable instead of from the test executable.
+- **Without a reference, code the linker removed does not exist.** A routine
+  nothing references has no line records in the measured executables, so it is
+  neither covered nor uncovered. That is what the reference is for; a session
+  without one says so in every report. Even with one, code that the reference
+  binary itself does not contain — a private routine nothing calls, a generic
+  nobody instantiates — is not in the total.
 - **Inlined routines** are measured as lines of their caller. A routine-level
   figure for them does not exist.
 - **Before attach is unknown.** A collection on an attached process starts at
