@@ -14,6 +14,12 @@ from the inside) are not hosted here: they integrate by composition on the agent
 returned by one tool passed to the debugger's tools, functions called through `evaluate_expression`),
 not by adding code to this repository. The owner turned down such a merge on 2026-10-31.
 
+Profiling and code coverage are not tools of a different nature: they are built on the engine's
+own debug loop, breakpoints, symbols and stack walker, and the owner made them the next milestone
+on 2026-11-26 (`docs/PROJECT_STATE.md`, "Open milestones"; plan in
+`docs/PROFILER_COVERAGE_PLAN.md`). Their command-line tools and VS Code views are further front
+ends over the same engine.
+
 # Operating mode
 
 Use minimum tokens.

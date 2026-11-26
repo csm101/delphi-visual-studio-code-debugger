@@ -772,6 +772,32 @@ by RSM's name-keyed format (see `KNOWN_UNKNOWNS.md`).
 
 ## Open milestones (roadmap)
 
+**Next, in this order: profiler and code coverage (decided 2026-11-26).** Nothing
+is built yet. The plan, its increments and the assumptions it still has to
+measure are in `PROFILER_COVERAGE_PLAN.md`.
+
+1. **The MCP server gains a profiler and code coverage** — one server, one
+   engine. Coverage at line level by instrumentation, a hit count for every
+   line; a sampling profiler; an instrumenting profiler at routine level and at
+   line level. AQtime is the reference for the concepts, the maintainer's
+   .NET-for-Android profiler for the tool names and the data model. A release
+   can follow increment 8 (coverage that only tells which lines ran, if wanted
+   on its own), 11 (coverage with hit counts), 13 (sampling) and 15 (the
+   instrumenting profiler).
+2. **Command-line tools** — coverage accumulated over several test executables
+   of one codebase, console or interactive, with a report at the end and a
+   minimum-percentage check for CI; a profiler run from a shell. New front ends
+   over what step 1 builds: arming at launch, the "run until exit" driver, the
+   session database, the exporters.
+3. **VS Code** — coverage shown in the editor after an explicit run, the way
+   NCrunch marks lines, and profiler results browsable there. The same engine
+   API behind DAP custom requests; the DAP adapter does not change before this
+   step.
+4. **Much later: continuous testing** — rebuild and re-run the affected tests on
+   every change. Not planned yet.
+
+Everything below keeps its own status and is not scheduled ahead of these.
+
 Integration with delphi-devkit (DDK), in this order:
 - **DDK as the source of project knowledge — debugger half DONE (2026-09-06,
   branch `feat/ddk-integration`); the DDK half is on DDK's `feat/debug-target`

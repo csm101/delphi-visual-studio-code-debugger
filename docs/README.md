@@ -40,6 +40,7 @@ does not say for itself.
 | [EXCEPTION_HANDLER_SCOPE_PLAN.md](EXCEPTION_HANDLER_SCOPE_PLAN.md) | Stepping at an exception stop |
 | [PROJECT_SCOPED_EXCEPTION_RULES_PLAN.md](PROJECT_SCOPED_EXCEPTION_RULES_PLAN.md) | Exception rules that belong to a Delphi project rather than to a launch configuration |
 | [DEBUG_INFO_FORMATS_TODO.md](DEBUG_INFO_FORMATS_TODO.md) | Debug-information formats not yet read |
+| [PROFILER_COVERAGE_PLAN.md](PROFILER_COVERAGE_PLAN.md) | Profiler and code coverage: the plan of the next milestone. Nothing in it is built yet |
 | [TASK_RESUME.md](TASK_RESUME.md) | A cursor for work interrupted mid-step. Erased on every commit, so a stub here means nothing is in flight |
 
 The user-facing documentation — installation, a first debug session, the

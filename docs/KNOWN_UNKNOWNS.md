@@ -1868,3 +1868,50 @@ standing first explanation for any future "types missing for package X" report.
 Without it, a BPL whose RSM has zero locals for a function — while its TD32 has
 them — shows empty locals and `Self: not found`. Regression test:
 `Test_Bpl_Td32Only_LocalsVisible`.
+
+## Profiler and code coverage — what the plan still assumes
+
+Nothing of `PROFILER_COVERAGE_PLAN.md` is built (2026-11-26). Its table
+"Assumptions to measure" is the full list, each with the increment that settles
+it. Six of them can change the design rather than a number, and none has been
+measured:
+
+- **How many TD32 line records are not the first byte of an instruction, and
+  how many point at a table?** Coverage puts a probe on every record, not only
+  on the lines a user picks, so the plan probes a record only when a forward
+  decode from a proven place arrives exactly at it. A decode started AT the
+  record proves nothing: x86 decoding falls back into step. Code sections hold
+  clause tables on both bitnesses. The same survey has to say what the records
+  OUTSIDE every routine range are, because the plan drops them, and how many
+  lines can take a counting probe at all, because that is how much of a
+  coverage run gets real hit counts. Increments 0 and 4.
+- **Does the x64 system unwinder read a jump patch near a return address as an
+  epilogue?** `RtlVirtualUnwind` reads the code at each frame's return address:
+  an optional `add rsp` / `lea rsp`, any pops, then a `ret` or a `jmp` leaving
+  the function. If a patch anywhere in that run is taken for the final `jmp`,
+  every exception raised below the call mis-unwinds the frame. The plan
+  forbids a jump there and uses a `call` or a `$CC` instead (rule 6). That a
+  relative `jmp` counts is from the implementation, not from documentation.
+  Increment 1.
+- **When does the loader apply base relocations to a module mapped away from
+  its preferred address: before or after `LOAD_DLL_DEBUG_EVENT`?** A one-byte
+  patch on an instruction's first byte does not care; a five-byte patch written
+  before the relocation is damaged by it. The plan waits for the module's
+  entry point either way; the answer says whether it must. Only an x86 module
+  without a dynamic base that collides can show it. Increment 1.
+- **Does a fault sent back from a trampoline to its original address dispatch
+  exactly as in an uninstrumented run**, through `try..except` and
+  `try..finally`, on both bitnesses? The whole fault handling of the counting
+  probes rests on it. Increment 1.
+- **Which shapes do `case` jump tables take in dcc32 and dcc64 output**, and is
+  every one recognisable? A routine with an indirect jump the analysis cannot
+  resolve loses the records after it. Increments 0 and 4.
+- **Does a thread's cycle counter move while the thread runs on another core
+  between two context switches?** The sampler wants to skip threads that have
+  not run without suspending them. If the counter is only brought up to date
+  at a switch, that test skips exactly the busiest thread and the profile
+  under-counts it without any sign. Increment 12, before the sampler is
+  written.
+
+Each answer moves into `DAP_DEBUGGER_ARCHITECTURE.md` with the increment that
+produced it, and its entry leaves this file.
