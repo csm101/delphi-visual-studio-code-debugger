@@ -1869,6 +1869,42 @@ Without it, a BPL whose RSM has zero locals for a function — while its TD32 ha
 them — shows empty locals and `Self: not found`. Regression test:
 `Test_Bpl_Td32Only_LocalsVisible`.
 
+## A breakpoint on a line record that is not code is accepted — OPEN DEFECT, in 0.9.2
+
+Found 2026-11-27 while measuring for the profiler; it is a defect of the
+debugger as released, independent of the profiler.
+
+On a 32-bit target the line record of a unit's final `end.` points at a data
+byte after the unit's last routine (`TD32_FORMAT_NOTES.md`, "What a line record
+points at"). A breakpoint set on that line binds, is reported `verified`, and
+its `$CC` is written into the data. When the program reads that data it loops
+on an access violation.
+
+Reproduced with the engine as it stands (no engine change since 0.9.2):
+
+```
+DevTools\Win64\Debug\LiveSessionProbe.exe DebuggerTests\TestTarget\Win32\Debug\TestTarget.exe DebuggerTests\TestTarget TestTargetUsesA.pas:38 -seconds 8 -targetargs "-run-uses-scope"
+```
+
+Line 38 is the unit's `end.`: `verified=True`, and the target never ends (the
+same command with the breakpoint on line 30 stops there and the target exits
+0). Without `-run-uses-scope` the data is never read and the run is normal,
+which is why nobody met it.
+
+Not yet measured: whether a source breakpoint on a line of generic code binds
+to one of the x64 records that land on zero or undecodable bytes (878 of them
+in one large image). `SourceLineToRvaCandidates` returns every record of the
+line, so it may.
+
+The fix is not "reject a record outside every TD32 procedure range": the
+bodies of anonymous methods are outside every range too (TD32 has no procedure
+record for them) and breakpoints in them must keep working. What separates the
+two is whether the address is a proven instruction boundary, which is what the
+routine analysis of the profiler plan (increment 4) computes. Candidates: wait
+for that and let it gate user breakpoints as well; or ship a stopgap first
+(refuse to plant where the byte to be saved is `$00`, which no compiled
+statement starts with and which covers both observed cases). Not decided.
+
 ## Profiler and code coverage — what the plan still assumes
 
 No engine code of `PROFILER_COVERAGE_PLAN.md` is built yet. Its table
