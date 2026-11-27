@@ -717,6 +717,119 @@ compare against this table — a change that adds a real Zydis gap should show
 up as a NEW `mnemonic` divergence; a change to the normalisation table
 should be justified by a measured example the same way every entry above is.
 
+#### LineSiteSurvey
+
+```bat
+DevTools\Win64\Debug\LineSiteSurvey.exe <exe-or-bpl> [-out <dir>] [-src <dir>]... [-compare <other>] [-sample N] [-maxlist N] [-zydisdll <path>]
+
+rem examples
+DevTools\Win64\Debug\LineSiteSurvey.exe DebuggerTests\TestTarget\Win32\Debug\TestTarget.exe -out %TEMP%\lss
+DevTools\Win64\Debug\LineSiteSurvey.exe DebuggerTests\TestHost\Win64\Debug\TestSubject.bpl -compare DebuggerTests\TestTarget\Win64\Debug\TestTarget.exe
+```
+
+Static survey of the places a line probe could go: the static half of
+"Increment 0" of `docs/PROFILER_COVERAGE_PLAN.md` (assumptions 1, 8, 9, 17 and
+18). The binary is read as a file and never executed. A 64-bit tool that
+analyses both bitnesses; the Zydis machine mode comes from the PE header.
+
+The line table and the procedure ranges come from `TTD32FileReader`, so the
+numbers describe what the engine sees. Everything else is read from the PE
+file: sections, base relocations, imports (delay-load included), `.pdata` and
+the Delphi scope and clause tables behind `_DelphiExceptionHandler`.
+
+**How a record is confirmed.** Never by decoding FROM it: x86 decoding falls
+back into step within a few instructions, so a record in the middle of an
+instruction would pass. Each routine is decoded by following control flow from
+proven places, added in stages so the report can say what each source buys:
+
+| stage | proven places |
+|---|---|
+| 0 | the routine entry, direct branch targets, in-routine call targets |
+| 1 | x64: `.pdata` function starts, scope-table targets (finally funclets, bare `except` blocks), clause-table blocks |
+| 2 | entries of recognised jump tables |
+| 3 | x86: handler stubs named by a `push imm32`, the code or the clause table behind a stub, the continuation a `try..finally` pushes |
+
+A record is confirmed when such a decode arrives exactly at it. An unconfirmed
+record is listed with its reason: inside an instruction the proven decode
+reached, inside a table, or unreached after a `ret` / `jmp` / indirect jump.
+
+**Sections of the report** (the summary goes to stdout; `-out` adds one listing
+per section, capped by `-maxlist`):
+
+| # | content |
+|---|---|
+| 1 | records, distinct (file, line), routines, source files |
+| 2 | records outside every TD32 procedure range and what they are; on x64 where finally funclets, `except` blocks and clause tables sit relative to the TD32 range of their procedure |
+| 3 | records confirmed after each stage; the unconfirmed ones by reason |
+| 4 | records that point into a recognised jump table or clause table; on x86 the handler stubs by RTL handler |
+| 5 | source lines with more than one record in one routine, by the first token of the source line when the source is found (`-src`, or next to the binary) |
+| 6 | code length per record, return addresses, x64 unwinder windows, and the probe form each record and each routine exit could take |
+| 7 | every indirect jump by shape, with the instructions before it and the table after it |
+| 8 | `-compare`: per shared source file, the lines only one of the two binaries names, and whether their routine exists in the other |
+
+Section 6 follows the plan's rules literally (retargeted direct call in the
+line's first straight-line block, then a five-byte jump, then the call form,
+else a `$CC`) and prints a second column for "a span may contain later line
+starts", which is what merged spans would buy.
+
+**Simplifications**, all of them also in the source header:
+
+- only routines owning a line record are decoded, so an indirect jump in code
+  with no line record is never seen;
+- a procedure range is assumed contiguous; its end is found by bisection on
+  `RvaToFunctionStart`;
+- every call is assumed to return, except a call to `System.@Halt0`;
+- an instruction is relocatable unless it is `int3` / `int n`;
+- an indirect jump that is neither an import thunk, a recognised table nor the
+  x86 finally exit makes its routine "incomplete", as the plan says;
+- the x64 window of a return address is an optional `add rsp` / `lea rsp`, any
+  number of `pop`, and the one instruction after them;
+- rule 5 of the jump rule (breakpoints, thread positions) and flags liveness are
+  dynamic and not modelled;
+- the reader keeps ONE line per distinct RVA and identifies a source file by
+  base name, so the raw number of line pairs is not available.
+
+**Baseline (2026-11-26, Delphi 12 Athens, compiler 36.0).** Full passes, no
+sampling; the 500 MB images take about 21 s each.
+
+| module | records | routines | outside every range | unconfirmed | retargeted call | jump | call form | left to `$CC` | exits: jump / call form / `$CC` |
+|---|---|---|---|---|---|---|---|---|---|
+| `TestTarget.exe` x64 | 1 904 | 301 | 28 | 0 | 39.98 % | 50.43 % | 6.50 % | 3.09 % | 59.47 / 40.53 / 0.00 % |
+| `TestTarget.exe` x86 | 1 974 | 425 | 32 | 4 | 33.68 % | 57.31 % | — | 8.81 % | 69.10 / — / 30.90 % |
+| `TestSubject.bpl` x64 | 1 863 | 300 | 29 | 0 | 40.68 % | 49.78 % | 6.54 % | 3.00 % | 59.67 / 40.33 / 0.00 % |
+| `TestSubject.bpl` x86 | 1 953 | 440 | 28 | 4 | 34.08 % | 56.99 % | — | 8.73 % | 69.77 / — / 30.23 % |
+| `Hydra2SingleEXE.exe` x64 (620 MB) | 2 880 014 | 411 229 | 14 468 | 2 203 | 41.52 % | 48.94 % | 5.57 % | 3.89 % | 54.49 / 44.08 / 1.43 % |
+| `Hydra2SingleEXE.exe` x86 (530 MB) | 2 791 210 | 398 810 | 14 740 | 22 549 | 37.07 % | 51.99 % | — | 10.13 % | 55.41 / — / 44.59 % |
+
+The form shares are of the records inside TD32 procedure ranges.
+
+What the first runs established, and what to look for when a number moves:
+
+- **dcc32 leaves a finally block with `pop eax; jmp eax`, not `ret`.** The
+  handler stub follows it directly. It is an indirect jump in every routine
+  with a `try..finally`, explicit or implicit (123 008 in the x86 Hydra image),
+  so a routine analysis that treats every unrecognised indirect jump as a break
+  loses a fifth of the routines. The tool recognises the shape; `x86 finally
+  exit` in section 7 counts it.
+- **dcc64 emits no jump tables.** The only table found in 21.4 million decoded
+  instructions is hand-written assembly (`System._FillChar`). dcc32 emits two
+  forms, both of absolute relocated addresses: `jmp [reg*4+T]` with `T` right
+  after the jump, and the same with a byte index table between the jump and
+  `T`, loaded by `mov reg8, [reg+idx]` or `movzx reg, byte ptr [reg+idx]`.
+- **Anonymous-method bodies have no TD32 procedure record** on either bitness
+  (the MAP names them `...$ActRec.$0$Body`; `Td32ProcNesting` finds no proc
+  record). On x64 they are reachable through `.pdata`; on x86 nothing proves
+  their entry.
+- A TD32 procedure range holds more than code: about a fifth of its bytes are
+  never reached by a decode (string literals, padding, tables), and on x86 a
+  `push imm32` of such a literal looks like the push of a handler stub. Only
+  an address whose bytes are a `jmp` out of the routine is taken for a stub.
+- The unconfirmed records are real: line records of generic instantiations
+  that land inside an instruction, dead code behind a `raise` compiled as a
+  jump, `System.Character.inc`'s `bin_data` (a procedure whose body is data,
+  1 579 records), and on x86 the static functions of linked C objects, which
+  share one TD32 range with the public symbol in front of them.
+
 #### HexDump
 
 ```bat
@@ -1200,11 +1313,75 @@ carried across into `DebuggerCore`.
 Nothing in the probe is fixture specific: every path, address and count comes
 from the command line, and it works against any executable of either bitness.
 
+#### ProbeCostProbe
+
+```bat
+rem what one line probe costs when it goes through a debug event
+DevTools\Win64\Debug\ProbeCostProbe.exe -hits -n 10 DebuggerTests\TestTarget\Win64\Debug\TestTarget.exe -run-real-scenario
+DevTools\Win64\Debug\ProbeCostProbe.exe -hits -keeprwx -inroutine DebuggerTests\TestTarget\Win32\Debug\TestTarget.exe
+DevTools\Win64\Debug\ProbeCostProbe.exe -hits -bisect -timeout 5 DebuggerTests\TestTarget\Win32\Debug\TestTarget.exe
+
+rem what one raw stack capture costs at a stop, at a depth of your choosing
+DevTools\Win64\Debug\ProbeCostProbe.exe -walk DebuggerTests\TestTarget\Win64\Debug\TestTarget.exe ^
+  DebuggerTests\TestTarget\TestTargetEdge.pas:RECURSION_BASE_BODY
+DevTools\Win64\Debug\ProbeCostProbe.exe -walk DevTools\Win32\Debug\ProbeCostProbe.exe ^
+  DevTools\ProbeCostProbe.dpr:RECURSE_BOTTOM -recurse 56
+
+rem what suspending a running thread and reading its context costs
+DevTools\Win64\Debug\ProbeCostProbe.exe -suspend DevTools\Win64\Debug\ProbeCostProbe.exe -spin 0 60
+
+rem does a thread's cycle counter move while it runs on another core
+DevTools\Win64\Debug\ProbeCostProbe.exe -cycles
+```
+
+The measurements `docs\PROFILER_COVERAGE_PLAN.md` asks for before the profiler
+and the coverage are built (increment 0, assumptions 2, 10 and 15). Four modes,
+one per question; every target, source line and count comes from the command
+line. Options of the tool come first, the first word that is not one of them is
+the target, and everything after it is passed to the target.
+
+| Mode | What it does | What it reports |
+|---|---|---|
+| `-hits <exe> [args]` | Raw Windows debug loop, no engine. Reads the main module's line records with `TTD32FileReader`, plants a `$CC` on every one at the first breakpoint event (one read and one write per page), and on each hit restores the byte, rewinds the program counter and continues. Each repetition also runs the target unprobed under the same loop. | Records planted, pages touched, time to plant, hits, stale hits (a second thread that ran into a `$CC` already taken out), both wall times, `(probed - baseline) / hits`, the time between consecutive hits, and how much of a hit is spent restoring the byte, reading the context and writing it back. |
+| `-walk <exe> <source:line\|source:MARKER> [args]` | Drives a real `TDebugSession` to a breakpoint (`MARKER` is the text inside a `{BP:...}` tag) and walks the stopped thread N times per variant. | Microseconds per walk for the engine's `WalkRawFrames` (reached through a descendant class, so the per-stop frame cache and the 30-frame cap of `GetStackFrames` are out of the way), for `StackWalk64` called directly, with the stack read once, and with every other page cached; for a 32-bit target also a bare EBP chain. Plus how many reads one dbghelp walk makes. |
+| `-suspend <exe> [args]` | Runs the target under the raw debug loop and, between events, suspends its busiest thread and one that does not run, reads the context and resumes. | Each of the three calls separately, and how far the thread's cycle counter moved since the previous sample. |
+| `-cycles` | Starts a child copy of itself that spins on one core, and reads that thread's cycle counter and `GetThreadTimes` from another core: on a 1 ms high-resolution timer, on `Sleep(1)` at the default timer resolution, and on a busy wait of 1 ms and of `-finetick` microseconds. A thread blocked in `Sleep(INFINITE)` is the control. | Readings that did not change, the longest run of them, and the distribution of the deltas. |
+
+`-hits` checks what it measures: the probed run must end with the baseline's
+exit code, its output must match (`-maskdigits` masks numbers, for a target
+that prints timings), and at the exit event every patched page must read as it
+did before planting, except for a `$CC` on each record that never fired. Exit
+code 3 when any of that fails.
+
+A `$CC` on **every** line record is not safe on a 32-bit target: dcc32 emits a
+record for a unit's final `end.` that belongs to no routine and can point at
+data inside `.text`. `-bisect` finds such records one at a time (it measures
+nothing), `-skip <rva,...>` leaves the listed ones out, and `-inroutine` leaves
+out every record the TD32 reader attributes to no routine. A run that faults
+for ever is ended after `-floodlimit` exceptions (20000) instead of at the
+timeout.
+
+The tool is also its own fixture, so that a deep stack and a busy thread exist
+on both bitnesses without a change to the test targets: `-recurse <depth>` stops
+making calls at a line tagged `RECURSE_BOTTOM`, and `-spin <maskhex> <seconds>`
+keeps one thread in user mode and one blocked. `ProbeCostProbe.cfg` adds `-V`, so
+the executable carries the TD32 line records a breakpoint needs. Built with
+`build_one32.bat ProbeCostProbe.dpr` only those two modes exist: the 32-bit
+build is a debuggee.
+
+Measuring a real program needs one that carries TD32 line records. The tools
+here are built without them; build a private copy with the fixtures' flags
+(`-$O- -V -VN -VR -GD`) into a directory of its own. For `PrebuildIdx`, copy a
+few `.rsm` files to a scratch directory and pass `-verify -j 1`: it rebuilds
+every sidecar and compares hashes, so its exit code says whether the probed run
+produced the same bytes (`-force` on a fresh sidecar only reloads it).
+
 ## Source layout
 
 | File | Purpose |
 |------|---------|
-| `<Tool>.dpr` | One self-contained entry point per tool; there are 48 of them and no shared units other than `RsmReader.pas` |
+| `<Tool>.dpr` | One self-contained entry point per tool; there are 55 of them and no shared units other than `RsmReader.pas` |
+| `ProbeCostProbe.cfg` | Adds `-V` to that one tool, which is also its own debuggee and needs TD32 line records in its executable |
 | `Fixtures\*.dpr` | Debuggees, not tools. In a subfolder so `build_all.bat`'s `*.dpr` discovery does not pick them up, and built with their own script because they need full debug info |
 | `RsmReader.pas` | Standalone binary RSM analyzer, used only by `RsmAnalyzer` (separate from `DebuggerCore\RsmFileReader.pas`, which is the parser the adapter actually ships) |
 | `build_all.bat` | Builds every `*.dpr` in this folder |
