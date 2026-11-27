@@ -63,7 +63,7 @@ program BreakpointSample;
 {$O-}
 
 uses
-  System.SysUtils, Winapi.Windows;
+  FixtureQuiet, System.SysUtils, Winapi.Windows;
 
 const
   // The tests count on these numbers.

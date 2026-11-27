@@ -19,7 +19,7 @@ program NestedEnumSample;
 {$APPTYPE CONSOLE}
 
 uses
-  System.SysUtils;
+  FixtureQuiet, System.SysUtils;
 
 type
   // Unit-level: its members ARE reachable by a bare name from any unit that

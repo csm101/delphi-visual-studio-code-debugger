@@ -12,7 +12,7 @@ program LongStringSample;
 // GUI subsystem, like every fixture: no console window.
 
 uses
-  Winapi.Windows, System.SysUtils;
+  FixtureQuiet, Winapi.Windows, System.SysUtils;
 
 const
   PAGE = 4096;

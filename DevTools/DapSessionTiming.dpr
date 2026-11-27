@@ -153,6 +153,9 @@ end;
 var
   Total: Double;
 begin
+  // Inherited by every target this probe starts: no Windows error box and no
+  // Error Reporting dialog from a fixture (docs/TRAPS.md).
+  SetErrorMode(GetErrorMode or SEM_FAILCRITICALERRORS or SEM_NOGPFAULTERRORBOX or SEM_NOOPENFILEERRORBOX);
   try
     QueryPerformanceFrequency(Freq);
 

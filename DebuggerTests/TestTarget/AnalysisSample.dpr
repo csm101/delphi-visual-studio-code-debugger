@@ -41,7 +41,7 @@ program AnalysisSample;
 {$O-}
 
 uses
-  System.SysUtils;
+  FixtureQuiet, System.SysUtils;
 
 var
   GSink: Integer = 0;

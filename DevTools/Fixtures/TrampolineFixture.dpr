@@ -69,7 +69,7 @@ program TrampolineFixture;
 {$OVERFLOWCHECKS OFF}
 
 uses
-  Winapi.Windows,
+  FixtureQuiet in '..\..\DebuggerTests\TestTarget\FixtureQuiet.pas', Winapi.Windows,
   System.SysUtils;
 
 type

@@ -16,7 +16,7 @@ program MapOnlyBigText;
 // a console window, the same rule the other test targets follow.
 
 uses
-  Winapi.Windows,
+  FixtureQuietNoSysUtils, Winapi.Windows,
   MapOnlyBigTextFiller in 'MapOnlyBigTextFiller.pas',
   MapOnlyBigTextTarget in 'MapOnlyBigTextTarget.pas';
 

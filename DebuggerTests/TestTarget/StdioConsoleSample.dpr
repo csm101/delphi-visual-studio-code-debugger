@@ -12,7 +12,7 @@ program StdioConsoleSample;
 {$APPTYPE CONSOLE}
 
 uses
-  StdioSampleCore;
+  FixtureQuiet, StdioSampleCore;
 
 begin
   RunStdioScenario;

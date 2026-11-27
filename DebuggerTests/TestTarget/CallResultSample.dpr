@@ -11,7 +11,7 @@ program CallResultSample;
 // RSM import indices and marker ordering. GUI subsystem, like every fixture.
 
 uses
-  System.SysUtils, System.Variants;
+  FixtureQuiet, System.SysUtils, System.Variants;
 
 type
   TCounted = class(TInterfacedObject)

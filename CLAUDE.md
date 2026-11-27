@@ -310,6 +310,25 @@ cmd /c "C:\Athens\GitHub\Win64Debugger\DebuggerTests\run_tests.bat" 2>&1
 These patterns are pre-approved in `.claude/settings.json` (committed).
 Run the full suite after every change to the adapter or RSM parser.
 
+## A test never opens a dialog and never takes the focus
+
+The suite runs on the machine somebody is working on. A fixture that crashes on
+purpose, a negative control, a probe: none of them may show a message box, an
+error-reporting dialog, a console window or any other window. What would have
+been in the box is written instead: to standard error and through
+`OutputDebugString`, or, for a run-time error, by the RTL to standard output.
+
+- Every fixture program (`DebuggerTests\TestTarget\`, `DebuggerTests\TestHost\`,
+  `DevTools\Fixtures\`) uses the quiet unit, `FixtureQuiet` (or
+  `FixtureQuietNoSysUtils` when it does not link `System.SysUtils`);
+  `docs\TRAPS.md` says how it is wired and why the unit order matters. A new
+  fixture without it fails `FixtureQuietTests`.
+- A program that launches targets for a test or a measurement (`RunTests.exe`,
+  `RunTestsParallel.exe`, the DevTools probes) sets the no-dialog error mode
+  first thing, so its children inherit it.
+- Never in the engine, the adapter or the MCP server: the debugger does not
+  change the error mode of a user's program.
+
 ## Parallel execution
 
 `build_and_run.bat` runs the suite as several concurrent `RunTests.exe` worker

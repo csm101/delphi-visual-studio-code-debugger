@@ -422,6 +422,9 @@ var
   StartTick: UInt64;
   Failed:    Integer;
 begin
+  // Inherited by every worker, and through them by every adapter and target: no
+  // Windows error box and no Error Reporting dialog from a test (docs/TRAPS.md).
+  SetErrorMode(GetErrorMode or SEM_FAILCRITICALERRORS or SEM_NOGPFAULTERRORBOX or SEM_NOOPENFILEERRORBOX);
   LoadSensitive := 0;
   try
     OutDir    := ExtractFilePath(ParamStr(0));               // ...\Win64\Debug\

@@ -303,6 +303,60 @@ absurdly.
   `Refused_WhenNotLaunched_ReachesClientAsFailedRequest`
   (ASSEMBLY_LEVEL_DEBUGGING.md increment 2) before the assertion was fixed to
   drill into `body.error.format`.
+- **A fixture, a negative control or a probe never opens a dialog** (rule in
+  `CLAUDE.md`). Every fixture program uses `FixtureQuiet` (it links
+  `System.SysUtils`) or `FixtureQuietNoSysUtils` (it deliberately does not);
+  `FixtureQuietTests` fails, naming the file, for a program without the right
+  one. Libraries and packages cannot carry it -- `ExceptProc`, `NoErrMsg` and
+  `IsConsole` belong to the RTL of the module that holds them -- their host
+  program does. The unit sets the error mode (`SEM_FAILCRITICALERRORS`,
+  `SEM_NOGPFAULTERRORBOX`, `SEM_NOOPENFILEERRORBOX`), an unhandled-exception
+  filter that writes the fault and returns `EXCEPTION_EXECUTE_HANDLER` (so
+  Windows Error Reporting is never consulted), `NoErrMsg`, `IsConsole := True`
+  and an `ExceptProc` that writes class, message and address to stderr and
+  through `OutputDebugString`, then ends with exit code 1 (the
+  `System.SysUtils`-free variant writes and returns, and the RTL ends with run-
+  time error 217, as before). Exit codes are the RTL's own.
+  - **The unit-order trap.** `System.SysUtils` installs its `ExceptProc` (the
+    "Application Error" box) in its own initialization (`InitExceptions`, called
+    from the class constructor of `Exception`). A quiet unit listed FIRST in a
+    `uses` clause initializes BEFORE it and is overwritten. The old
+    `TestTargetQuiet` did exactly that: measured on both bitnesses, `ExceptProc`
+    was `System.SysUtils.ExceptHandler` at run time (MAP) and the box came up.
+    `FixtureQuiet` uses `System.SysUtils`, so it initializes after it in any
+    position.
+  - **`NoErrMsg` and the run-time error line.** Without `NoErrMsg` a GUI program
+    that ends on a run-time error shows "Runtime error N at ..." in a box.
+    `_Halt0` writes that message BEFORE the `ExitProc` chain and the
+    finalizations and clears `ErrorAddr` right after, so no exit procedure can
+    report the address. `IsConsole := True` makes the RTL write the line itself,
+    to STANDARD OUTPUT; the RTL reads `IsConsole` in exactly four places, each a
+    choice between a standard handle and a message box.
+  - **Win32 consults the filter for every exception.** Without a debugger the
+    RTL's outermost frame calls `UnhandledExceptionFilter` before it reports an
+    exception itself: without the quiet filter, WER files an APPCRASH report for
+    every unhandled Delphi exception of a 32-bit fixture (silent on the machine
+    where it was measured, a dialog wherever WER is set to show one). With it, a main-thread fault on Win32
+    is written twice -- by the filter, then by `ExceptProc` or as a run-time
+    error.
+  - **Launchers.** `RunTests`, `RunTestsParallel` and every DevTools probe that
+    starts a target call `SetErrorMode` with the same flags first thing; every
+    child inherits it, since neither they nor the engine pass
+    `CREATE_DEFAULT_ERROR_MODE`. Never in `DebuggerCore`, the adapter or the MCP
+    server: the debugger does not change the error mode of a user's program.
+  - **The quiet unit has no debug information** (`FixtureQuietSwitches.inc`:
+    `$D- $L- $Y-`, like the RTL). With line records of its own it became part
+    of what tests read as the fixture's own code: the first line-table entry of
+    `TestTarget.exe` was `FixtureQuiet.inc` (`LineTable_ForwardKnownRva`; the old
+    unit passed only because its name began with `TestTarget`), and the routine
+    oracle on `AnalysisSample` required its never-run routines to be executed.
+    Any unit added to a fixture for infrastructure needs the same treatment.
+  - **A visible window takes the focus unless told not to.** A test window
+    created with `WS_VISIBLE` -- even off-screen -- became the foreground window
+    in every suite run (`ProcessListJsonTests`); it is now created hidden with
+    `WS_EX_NOACTIVATE` and shown with `SW_SHOWNOACTIVATE`.
+  - `DevTools\WindowWatch.exe` lists every window shown and every foreground
+    change while it runs: the way to check a suite run against this rule.
 
 ## What the suite cannot prove
 

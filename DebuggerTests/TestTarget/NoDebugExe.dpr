@@ -9,7 +9,7 @@ program NoDebugExe;
 {$APPTYPE CONSOLE}
 
 uses
-  Winapi.Windows;
+  FixtureQuietNoSysUtils, Winapi.Windows;
 
 begin
   Sleep(60000);

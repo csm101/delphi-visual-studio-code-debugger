@@ -23,7 +23,7 @@ program NoSourceStop;
 {$APPTYPE CONSOLE}
 
 uses
-  Winapi.Windows,
+  FixtureQuiet, Winapi.Windows,
   System.SysUtils;
 
 // Faults INSIDE the RTL: System.Move dereferences the source pointer. The

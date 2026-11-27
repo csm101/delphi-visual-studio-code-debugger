@@ -30,7 +30,7 @@ program InstructionStepSample;
 {$O-}
 
 uses
-  System.SysUtils;
+  FixtureQuiet, System.SysUtils;
 
 const
   REP_BLOCK_SIZE = 65536;   // large enough that stepping it per-iteration is

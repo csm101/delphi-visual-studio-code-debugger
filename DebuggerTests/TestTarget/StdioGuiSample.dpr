@@ -5,7 +5,7 @@ program StdioGuiSample;
 // the debugger. Options in StdioGuiSample.cfg.
 
 uses
-  StdioSampleCore;
+  FixtureQuiet, StdioSampleCore;
 
 begin
   RunStdioScenario;

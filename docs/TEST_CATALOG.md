@@ -2520,6 +2520,46 @@ that unloads, while a re-arm is pending; the x64 `.pdata` condition of the
 final-`end.` rule (one record on the large image, no fixture). The race test
 shows nothing on a single core.
 
+## AE. Fixtures fail in writing, never in a dialog
+
+`DebuggerTests\FixtureQuietTests.pas`, fixture `TFixtureQuietTests`. The rule is
+in `CLAUDE.md` ("A test never opens a dialog and never takes the focus"), the
+mechanism in `TRAPS.md` ("Fixture design").
+
+- [x] **Every fixture program uses the right quiet unit**
+      (`EveryFixtureProgram_UsesTheRightQuietUnit`): every `program` under
+      `DebuggerTests\TestTarget\`, `DebuggerTests\TestHost\` and
+      `DevTools\Fixtures\` uses `FixtureQuiet` when it links `System.SysUtils`
+      (followed through the fixture's own units), `FixtureQuietNoSysUtils` when
+      it does not, and never `FixtureQuiet` there. Libraries are exempt (their
+      host carries it); packages are `.dpk` and not scanned. Negative control:
+      with the unit removed from `MapOnlyGlobals.dpr` and `ExcNestFixture.dpr`,
+      and `FixtureQuiet` put into `TdsSample.dpr`, the test named all three.
+- [x] **An unhandled exception, a run-time error and a fault with no handler end
+      by themselves, in writing** -- GUI and console, with and without
+      `System.SysUtils`, Win32 and Win64
+      (`GuiFixture_FailsInWriting_NeverInADialog`,
+      `ConsoleFixture_FailsInWriting_NeverInADialog`,
+      `GuiFixtureWithoutSysUtils_FailsInWriting_NeverInADialog`,
+      `ConsoleFixtureWithoutSysUtils_FailsInWriting_NeverInADialog`; fixtures
+      `QuietFail*.dpr`, scenario `QuietFailCore.pas`). Each run is started
+      without a debugger, with `CREATE_DEFAULT_ERROR_MODE` and on a private
+      desktop, and must end within 5 s with the RTL's own exit code (1 / 217
+      without `System.SysUtils` for `-raise`, 204 for `-runerror`, `$C0000005`
+      for `-fault`) and the failure text: on stderr for an exception or a fault,
+      the RTL's `Runtime error N at ...` on stdout for a run-time error. A process
+      still alive at the timeout is killed and reported with the windows found
+      on its desktop. Negative control: `QuietFailGui` without `FixtureQuiet`
+      failed on both bitnesses with the "Application Error" and the "Runtime
+      error 204" box read from the private desktop, and the fault without its
+      text.
+
+Not proved here: that a fixture started BY THE ENGINE stays quiet (the error
+mode it inherits from the runner is exactly what the dynamic test removes);
+`OutputDebugString` delivery of the failure text (no debugger in these runs);
+that a launcher sets the error mode (`RunTests.dpr`, `RunTestsParallel.dpr`, the
+DevTools probes: reviewed, not tested).
+
 ## What the suite does NOT prove (2026-08-08)
 
 Coverage-honesty notes. Each records a place where a green run is weaker evidence

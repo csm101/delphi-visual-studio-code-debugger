@@ -4,6 +4,7 @@ program RunTests;
 
 uses
   System.SysUtils,
+  Winapi.Windows,
   DUnitX.TestFramework,
   DUnitX.Filters,
   DUnitX.Extensibility,
@@ -74,7 +75,8 @@ uses
   RoutineAnalysis in '..\DebuggerCore\RoutineAnalysis.pas',
   RoutineAnalysisTests in 'RoutineAnalysisTests.pas',
   LiveCodeAnalysis in '..\DebuggerCore\LiveCodeAnalysis.pas',
-  BreakpointPlacementTests in 'BreakpointPlacementTests.pas';
+  BreakpointPlacementTests in 'BreakpointPlacementTests.pas',
+  FixtureQuietTests in 'FixtureQuietTests.pas';
 
 const
   // Tests that cannot run while another RunTests worker is executing, because
@@ -234,6 +236,9 @@ var
   SerialMode: string;
   Selection:  ITestFilter;
 begin
+  // Inherited by every adapter and target this runner or the engine starts: no
+  // Windows error box and no Error Reporting dialog from a test (docs/TRAPS.md).
+  SetErrorMode(GetErrorMode or SEM_FAILCRITICALERRORS or SEM_NOGPFAULTERRORBOX or SEM_NOOPENFILEERRORBOX);
   try
     TDUnitX.CheckCommandLine;
     Runner  := TDUnitX.CreateRunner;

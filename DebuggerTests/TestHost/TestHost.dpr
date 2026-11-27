@@ -11,11 +11,11 @@ program TestHost;
 // matching TestTarget.exe.
 
 uses
-  // FIRST: silences the RTL and Windows error dialogs before the package is
-  // loaded, so a deliberate fault inside TestSubject.bpl cannot block an
-  // unattended run. The exception is still raised and still reaches the
-  // debugger; only the modal box is gone.
-  TestTargetQuiet in '..\TestTarget\TestTargetQuiet.pas',
+  // A failure is written, never shown in a dialog (FixtureQuiet.pas), also for
+  // a deliberate fault inside TestSubject.bpl: a package cannot carry it, its
+  // host does. The exception is still raised and still reaches the debugger;
+  // only the modal box is gone.
+  FixtureQuiet in '..\TestTarget\FixtureQuiet.pas',
   System.SysUtils,
   Winapi.Windows;
 

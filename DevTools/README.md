@@ -57,6 +57,21 @@ set JCL_ROOT=D:\src\jcl\jcl\source
 set DUNITX_ROOT=D:\src\DUnitX\Source
 ```
 
+### Tools that start a target
+
+No target a probe starts may show a dialog (`CLAUDE.md`, "A test never opens a
+dialog and never takes the focus"). Every tool that starts one -- directly, or
+through the engine, the adapter or the MCP server (`DapSessionTiming`,
+`DataBpProbe`, `Disasm`, `ExcHandlerProbe`, `ExceptionStopProbe`,
+`LiveSessionProbe`, `LoaderTimingProbe`, `McpStdioProbe`,
+`PatchFeasibilityProbe`, `ProbeCostProbe`, `SessionEndLockProbe`, `StepPerf`,
+`Win32SessionProbe`, `Wow64RegWriteProbe`, `Wow64StackProbe`) -- calls
+`SetErrorMode(GetErrorMode or SEM_FAILCRITICALERRORS or SEM_NOGPFAULTERRORBOX or
+SEM_NOOPENFILEERRORBOX)` as the first statement of its main block, and every
+process below it inherits that mode. A new tool that starts a target does the
+same. The fixtures in `Fixtures\` use `FixtureQuiet` like every test fixture
+(`docs\TRAPS.md`, "Fixture design").
+
 ## Tools
 
 Grouped by what you are investigating.
@@ -1285,6 +1300,25 @@ how such a report usually describes the session. `-` stands for no arguments
 (an empty `""` may be dropped by PowerShell, which shifts every later argument).
 The filters are a comma-separated `exceptionFilters` list, `delphi,av,unhandled`
 by default; `-` sends an empty list. Exit code 2 when a call went unanswered.
+
+#### WindowWatch
+
+```bat
+DevTools\Win64\Debug\WindowWatch.exe [-seconds <n>] [-pid <process id>] [-root <dir>]
+```
+
+Lists every top-level window that is shown, and every change of the foreground
+window, on the desktop it runs on, while it runs: start it, run the suite or a
+probe beside it, then read which processes showed a window or took the focus.
+It hooks the events (`SetWinEventHook`, out of context) instead of polling, so a
+console window or a box that lives for a few milliseconds is listed too. One
+line per event: seconds since start, `SHOW` or `FOREGROUND`, process id,
+executable, window class, title; `-root` marks with `*` the processes whose
+executable lies under that directory. It stops after `-seconds` (600 by default)
+or as soon as the `-pid` process has ended. A console window is reported under
+the console program's own process id (class `ConsoleWindowClass`); Windows Error
+Reporting dialogs come from `WerFault.exe`. Windows on other desktops are out of
+its view -- as they are out of the user's.
 
 #### SessionEndLockProbe
 

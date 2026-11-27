@@ -7,7 +7,7 @@ program TdsSample;
 {$APPTYPE CONSOLE}
 
 uses
-  Winapi.Windows;
+  FixtureQuietNoSysUtils, Winapi.Windows;
 
 function TdsSampleAdd(A, B: Integer): Integer;
 begin

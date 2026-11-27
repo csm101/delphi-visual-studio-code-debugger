@@ -503,6 +503,9 @@ begin
 end;
 
 begin
+  // Inherited by every target this probe starts: no Windows error box and no
+  // Error Reporting dialog from a fixture (docs/TRAPS.md).
+  SetErrorMode(GetErrorMode or SEM_FAILCRITICALERRORS or SEM_NOGPFAULTERRORBOX or SEM_NOOPENFILEERRORBOX);
   // The engine's own log carries what the printed frames cannot: WHY a stack
   // stopped where it did. A probe exists to be diagnosed from, so this is on
   // unconditionally rather than behind a switch nobody remembers to pass.

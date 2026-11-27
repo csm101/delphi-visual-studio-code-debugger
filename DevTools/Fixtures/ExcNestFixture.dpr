@@ -39,7 +39,7 @@ program ExcNestFixture;
 }
 
 uses
-  System.SysUtils;
+  FixtureQuiet in '..\..\DebuggerTests\TestTarget\FixtureQuiet.pas', System.SysUtils;
 
 var
   GSink: Integer = 0;

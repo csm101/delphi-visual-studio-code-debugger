@@ -116,6 +116,27 @@ dcc64 StdioConsoleSample.dpr 2>&1
 set STDIOCON_ERR=%errorlevel%
 dcc64 StdioGuiSample.dpr 2>&1
 set STDIOGUI_ERR=%errorlevel%
+rem Quiet-failure fixtures (FixtureQuietTests): programs that fail on purpose --
+rem an unhandled exception, a run-time error, a fault with no handler -- and are
+rem run WITHOUT a debugger, to prove each failure is written and never shown in
+rem a dialog. GUI and console, with and without System.SysUtils (FixtureQuiet and
+rem FixtureQuietNoSysUtils), both bitnesses. No debug info: nothing debugs them.
+dcc64 -$O- -E.\Win64\Debug -NU.\Win64\Debug QuietFailGui.dpr 2>&1
+set QUIETGUI64_ERR=%errorlevel%
+dcc32 -$O- -E.\Win32\Debug -NU.\Win32\Debug QuietFailGui.dpr 2>&1
+set QUIETGUI32_ERR=%errorlevel%
+dcc64 -$O- -E.\Win64\Debug -NU.\Win64\Debug QuietFailConsole.dpr 2>&1
+set QUIETCON64_ERR=%errorlevel%
+dcc32 -$O- -E.\Win32\Debug -NU.\Win32\Debug QuietFailConsole.dpr 2>&1
+set QUIETCON32_ERR=%errorlevel%
+dcc64 -$O- -E.\Win64\Debug -NU.\Win64\Debug QuietFailNoSysUtilsGui.dpr 2>&1
+set QUIETNSGUI64_ERR=%errorlevel%
+dcc32 -$O- -E.\Win32\Debug -NU.\Win32\Debug QuietFailNoSysUtilsGui.dpr 2>&1
+set QUIETNSGUI32_ERR=%errorlevel%
+dcc64 -$O- -E.\Win64\Debug -NU.\Win64\Debug QuietFailNoSysUtilsConsole.dpr 2>&1
+set QUIETNSCON64_ERR=%errorlevel%
+dcc32 -$O- -E.\Win32\Debug -NU.\Win32\Debug QuietFailNoSysUtilsConsole.dpr 2>&1
+set QUIETNSCON32_ERR=%errorlevel%
 rem External-TDS target (-VT): debug info in a standalone .tds, no embedded .debug.
 dcc64 -$O- -VT -VN -E.\Win64\Debug -NU.\Win64\Debug TdsSample.dpr 2>&1
 set TDS_ERR=%errorlevel%
@@ -161,4 +182,12 @@ if not "%BPLIB64_ERR%"=="0" exit /b %BPLIB64_ERR%
 if not "%BPLIB32_ERR%"=="0" exit /b %BPLIB32_ERR%
 if not "%STDIOCON_ERR%"=="0" exit /b %STDIOCON_ERR%
 if not "%STDIOGUI_ERR%"=="0" exit /b %STDIOGUI_ERR%
+if not "%QUIETGUI64_ERR%"=="0" exit /b %QUIETGUI64_ERR%
+if not "%QUIETGUI32_ERR%"=="0" exit /b %QUIETGUI32_ERR%
+if not "%QUIETCON64_ERR%"=="0" exit /b %QUIETCON64_ERR%
+if not "%QUIETCON32_ERR%"=="0" exit /b %QUIETCON32_ERR%
+if not "%QUIETNSGUI64_ERR%"=="0" exit /b %QUIETNSGUI64_ERR%
+if not "%QUIETNSGUI32_ERR%"=="0" exit /b %QUIETNSGUI32_ERR%
+if not "%QUIETNSCON64_ERR%"=="0" exit /b %QUIETNSCON64_ERR%
+if not "%QUIETNSCON32_ERR%"=="0" exit /b %QUIETNSCON32_ERR%
 exit /b %TT32_ERR%

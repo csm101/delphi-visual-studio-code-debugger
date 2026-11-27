@@ -236,9 +236,14 @@ const
 begin
   // Positioned off-screen so the suite does not flash a window at the user; it
   // still has to be genuinely visible, since that is what the enumeration filters on.
-  var Wnd := CreateWindowEx(0, 'STATIC', Caption, WS_OVERLAPPEDWINDOW or WS_VISIBLE,
+  // Shown WITHOUT activation: created with WS_VISIBLE it took the foreground --
+  // the keyboard focus of whoever works at the machine -- in every suite run
+  // (seen with DevTools\WindowWatch). WS_EX_NOACTIVATE also keeps it off the
+  // taskbar; it is not a tool window, which the enumeration would skip.
+  var Wnd := CreateWindowEx(WS_EX_NOACTIVATE, 'STATIC', Caption, WS_OVERLAPPEDWINDOW,
     -32000, -32000, 120, 40, 0, 0, HInstance, nil);
   Assert.IsTrue(Wnd <> 0, 'could not create the probe window');
+  ShowWindow(Wnd, SW_SHOWNOACTIVATE);
   try
     var Own: TProcessInfo;
     Assert.IsTrue(GetProcessInfo(GetCurrentProcessId, Own), 'own process info');

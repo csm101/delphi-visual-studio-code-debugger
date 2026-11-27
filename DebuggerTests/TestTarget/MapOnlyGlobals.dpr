@@ -20,7 +20,7 @@ program MapOnlyGlobals;
 // nothing anyway.
 
 uses
-  Winapi.Windows;
+  FixtureQuietNoSysUtils, Winapi.Windows;
 
 var
   GSmallA: Byte  = 5;

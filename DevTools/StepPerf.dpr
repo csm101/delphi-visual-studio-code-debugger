@@ -25,7 +25,7 @@ program StepPerf;
 {$APPTYPE CONSOLE}
 
 uses
-  System.SysUtils,
+  Winapi.Windows, System.SysUtils,
   System.StrUtils,
   System.JSON,
   System.Diagnostics,
@@ -293,6 +293,9 @@ begin
 end;
 
 begin
+  // Inherited by every target this probe starts: no Windows error box and no
+  // Error Reporting dialog from a fixture (docs/TRAPS.md).
+  SetErrorMode(GetErrorMode or SEM_FAILCRITICALERRORS or SEM_NOGPFAULTERRORBOX or SEM_NOOPENFILEERRORBOX);
   try
     if not ParseCommandLine then begin
       PrintUsage;

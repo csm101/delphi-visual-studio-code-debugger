@@ -31,7 +31,7 @@ program LtHost;
 {$APPTYPE CONSOLE}
 
 uses
-  Winapi.Windows,
+  FixtureQuiet in '..\..\..\DebuggerTests\TestTarget\FixtureQuiet.pas', Winapi.Windows,
   System.SysUtils,
   LtHostUnit in 'LtHostUnit.pas',
   LtPkgStaticUnit;
