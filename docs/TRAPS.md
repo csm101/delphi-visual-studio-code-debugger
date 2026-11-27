@@ -658,8 +658,9 @@ absurdly.
   re-traps on the same instruction forever — an unbounded `BP hit / PlantInt3 OK`
   loop in `%TEMP%\dap_adapter.log`, with the target apparently running and no
   stop ever arriving. `RearmStepBpAfterForeignHit` is the one place that does it
-  correctly (leave unplanted, trap-step off, re-plant), and `FSteppingOffStepBp`
-  marks that trap as deciding nothing so no step mode reads it as progress.
+  correctly (leave unplanted, trap-step off, re-plant), and the `StepOffOnly`
+  flag of the thread's pending re-arm marks that trap as deciding nothing so no
+  step mode reads it as progress.
 - **`FPendingContinueStatus` is CONSUMED, never overwritten.** At a first-chance
   exception stop it holds `DBG_EXCEPTION_NOT_HANDLED` so the program's own
   handler runs. `ckContinue` read it correctly; `ckStepInto`, `ckStepOver` and
@@ -745,6 +746,59 @@ absurdly.
   exceptions in 5 s before it was understood). `ProbeCostProbe -hits -bisect`
   finds the offending record. See `TD32_FORMAT_NOTES.md`, "What a line record
   points at".
+- **A MAP public in the code segment is not necessarily a routine.** The class
+  data of a unit is listed there too (`Unit..TClass`), and `TMapFile` reports
+  every public outside DATA/BSS/TLS as a routine range. Decoding from such a
+  start "proves" whatever the bytes happen to decode to. On x86 the record of
+  the previous unit's final `end.` lands a few bytes into exactly that data:
+  given a "routine", it was confirmed by a decode of garbage on a live image
+  and the breakpoint 0.9.3 refused was planted again -- intermittently, since
+  it depended on whether the MAP's background index was ready. A MAP range is
+  taken for a routine only when a line record of its own unit starts on its
+  first byte (`TModuleCodeMap.AddRoutinesOfSecondProvider`).
+- **"The process is gone" does not mean the program ran to its end.** With the
+  exception filters off, a program that dies on a `$CC` written into its data
+  exits like any other, with `$C0000005` as its exit code. A test that only
+  waits for `HasExited` passes on the crash it exists to catch. Check the exit
+  code (`BreakpointPlacementTests.RunToTheEnd`).
+- **The mapped header of an image does not say whether it is relocated.** A
+  fixed-base image that could not have its preferred base is relocated by the
+  loader after its load event -- and its header's `ImageBase` keeps the
+  preferred base for as long as the module stays (measured at the entry point
+  and at later stops, x86 and x64). "`ImageBase` = load address" recognises a
+  dynamic-base image and an unmoved one; for a moved one the only sign of the
+  relocation is that its entry point was reached
+  (`TWinDebugger.WatchModuleRelocation`). A check of the header alone left such
+  a module unanalysed for the whole session.
+- **A stop in a module mapped BELOW the main image has no line.**
+  `TWinDebugger.VAToRva` answers 0 for an address under the main image's base,
+  so `ReportStopped` finds no file and no line there, while the breakpoint
+  itself binds and fires (the forward direction wraps correctly). A relocated
+  fixed-base DLL lands low on x64, above the executable on x86: a test that
+  counts stops in such a module by LINE passes on one bitness and fails on the
+  other, or from one run to the next. Tell the stops apart by address
+  (`ModuleRelocatedAfterItsLoadEvent_IsJudgedAgainAtItsEntryPoint`). Not fixed
+  with the breakpoint work that found it: `VAToRva` has 35 call sites, and what
+  a wrapped RVA does to each has not been looked at.
+- **A breakpoint event can be queued behind the stop being reported.** Several
+  threads that execute one `$CC` within the same microseconds each get an
+  event, and the debugger sees them one at a time: by the time the second is
+  read the byte is suspended and the thread stands one byte into the
+  instruction. Any code that classifies a breakpoint event by "is a record
+  planted there NOW" takes it for foreign. The main loop reports it as a hit of
+  its own; the synthetic-call pump has to recognise it too.
+- **Do not read the depth of a recursion off a parameter in a test.** On x64 a
+  small routine with a parameter and no locals has no frame pointer
+  (`sub rsp, N` only), and `Evaluate` of its parameter at its first line gave a
+  constant wrong value in `BreakpointSample` (`Recurse`, `Depth`). Count the
+  frames of the routine in the call stack instead.
+- **An instruction resumed from its second byte can run without a trace.**
+  `mov eax, [rip+d32]` (`8B 05 ..`) decodes from its second byte as
+  `add eax, imm32`, the same length: the program carries on with a wrong
+  value, ends normally, and every stop count is right. A test of the
+  breakpoint hit path needs the program to COMPUTE something the instruction
+  under the breakpoint contributes to, and to compare it with an undisturbed
+  run (`GSink` in `BreakpointSample`).
 - **A decode that starts AT an address does not prove the address is an
   instruction boundary.** x86 decoding falls back into step within a few
   instructions, so "the decode reaches the next known boundary" passes for an

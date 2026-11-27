@@ -331,6 +331,15 @@ type
     HitCount:     Integer;
     Kind:         TBreakpointKind;  // bkSource (default) or bkAddress
     ModuleName:   string;           // bkAddress only: '' = main exe, else lowercase file name
+    // Set by PlantInt3 when it declined to plant a user's source breakpoint
+    // here: the address is not the start of an instruction. A refused record
+    // owns no byte and takes no hit; it stays in the list so that the line is
+    // still known to carry a breakpoint.
+    Refused:      Boolean;
+    // The record is a COPY of a source breakpoint: the same line emitted a
+    // second time in another piece of the same routine (x64: the funclet of a
+    // `finally` block). The records of one source line share one hit count.
+    IsCopy:       Boolean;
   end;
 
   // The managed result kinds a synthetic call can leave behind, one per RTL
@@ -389,6 +398,42 @@ type
   TOnDllUnloaded = procedure(const Name: string; Base: UInt64) of object;
   TOnBpHit       = function(const BP: TBreakpointRec): Boolean of object;
 
+  /// <summary>What the owner of a session's code analysis says about planting
+  /// a user's source breakpoint at an address.</summary>
+  TPlantVerdict = (
+    /// <summary>Nothing is known about the address: no decoder, no code map
+    /// for its module, or the module is not analysable yet. The engine falls
+    /// back to its own test (the byte there must not be zero).</summary>
+    pvNoAnalysis,
+    /// <summary>Plant: the address is a proven instruction start, or nothing
+    /// shows that it is not one.</summary>
+    pvPlant,
+    /// <summary>Do not plant: the address is shown to be something else than
+    /// the start of an instruction.</summary>
+    pvRefuse
+  );
+
+  /// <summary>Asked by the engine before it writes a user's source breakpoint.</summary>
+  /// <param name="VA">Address the breakpoint would be written at.</param>
+  /// <param name="Reason">For <c>pvRefuse</c>: what the address is, in words
+  /// a user can read.</param>
+  /// <returns>The verdict.</returns>
+  TOnJudgePlant  = function(VA: UInt64; out Reason: string): TPlantVerdict of object;
+
+  /// <summary>Asked by the engine for the other places a source line's code
+  /// was emitted a second time within the same routine.</summary>
+  /// <param name="VA">An address the line's breakpoint is planted at.</param>
+  /// <returns>The addresses of the copies; empty when there are none or
+  /// nothing is known.</returns>
+  TOnPlantCopies = function(VA: UInt64): TArray<UInt64> of object;
+
+  /// <summary>Told by the engine that a module which was mapped but NOT yet
+  /// relocated at its load event has reached its entry point: it is relocated
+  /// now and none of its code has run. Whatever was decided about its
+  /// breakpoints at the load event can be decided again.</summary>
+  /// <param name="Base">The module's load address.</param>
+  TOnModuleRelocated = procedure(Base: UInt64) of object;
+
   // An exception that a `log` / `logStack` rule reported without stopping the
   // debuggee. Structured, so a frontend can hand it to a client as data instead
   // of a line of text to parse.
@@ -414,6 +459,36 @@ type
     FrozenPerStep: Boolean;   // False under stepIsolation "none": nothing is ever frozen
     AutoRelease:   Boolean;   // the deadlock detector may release the frozen threads
     ReleaseMs:     Integer;   // the wait-state threshold that applies while AutoRelease
+  end;
+
+  /// <summary>Where a source breakpoint goes, and who is asked. A small
+  /// interface of its own because <c>IDebugTarget</c> has a second implementer
+  /// in the tests: the session obtains this one with <c>Supports</c>, and an
+  /// engine that does not implement it simply plants as it always did.</summary>
+  IBreakpointPlacement = interface
+    ['{C9F2A1B0-4D3E-44F8-8A22-9F5D8E0C7312}']
+    /// <summary>Installs the two questions the engine asks about a user's
+    /// source breakpoint. Both run on the engine's thread, inside its event
+    /// loop; an exception raised by either is logged and read as "nothing
+    /// known".</summary>
+    /// <param name="Judge">May the breakpoint be written at this address; nil
+    /// leaves the engine with its own zero-byte test.</param>
+    /// <param name="Copies">Where else the line's code was emitted within the
+    /// same routine; nil plants no copies.</param>
+    /// <param name="Relocated">Called at the entry point of a module that was
+    /// not relocated at its load event; what it re-posts is planted before the
+    /// module's first instruction runs. Nil: nothing is told.</param>
+    procedure SetSourcePlantAdvice(const Judge: TOnJudgePlant; const Copies: TOnPlantCopies;
+      const Relocated: TOnModuleRelocated);
+    /// <summary>The addresses a source breakpoint on a line is planted at, as
+    /// the engine would compute them now: one per line-table provider that
+    /// knows the line, moved off a routine's entry onto its first statement,
+    /// plus the copies <c>TOnPlantCopies</c> names.</summary>
+    /// <param name="SourceFile">Source file name; a path is reduced to it.</param>
+    /// <param name="Line">1-based line.</param>
+    /// <returns>Virtual addresses, without repeats. Empty when the line
+    /// resolves nowhere, and before the image base is known.</returns>
+    function SourceBreakpointAddresses(const SourceFile: string; Line: Integer): TArray<UInt64>;
   end;
 
   IDebugTarget = interface

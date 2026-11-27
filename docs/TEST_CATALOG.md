@@ -388,9 +388,11 @@ real implementation. Run summary shows the live count
       unverified, and the program runs to its end
       (`Win32_BreakpointOnAUnitsFinalEnd_SetAtAStop_IsRefusedAndTheProgramRuns`,
       `Win32_BreakpointOnAUnitsFinalEnd_SetBeforeTheProcess_IsRefusedAndTheProgramRuns`).
-      Negative control run: with the refusal disabled both fail with "the
-      program did not run to its end". Only the zero-byte case is covered; a
-      bad record on any other byte is not detected (`KNOWN_UNKNOWNS.md`).
+      Both now also assert WHO refused it: the notice must carry the reason of
+      the routine analysis. With the decoder made unavailable the zero-byte
+      test of 0.9.3 refuses instead, and says so
+      (`Win32_BreakpointOnAUnitsFinalEnd_WithoutTheDecoder_FallsBackToTheZeroByteTest`).
+      Everything else about where a source breakpoint goes is in section AD.
 - [x] Step over (`Test_Step_Over_StaysInProc`,
       `Test_Step_Over_FromFunctionEntry_LandsNextLine`,
       `Test_Step_Over_NotTakenBranch_LandsNextLine`)
@@ -1986,8 +1988,28 @@ point lookups, not from hand-written values. Mechanism in
       the JCL lookup cannot name.
 - [x] **The two new provider interfaces have GUIDs of their own**
       (`ValueReaderTests.ProviderInterfaceGuids_AreUnique`, extended).
-- [ ] The code map of a module of a LIVE session. Nothing builds one yet; the
-      shifted-reader test above covers the arithmetic, not the wiring.
+- [x] **A second routine provider, on hand-built tables**
+      (`CodeMapTests.SecondRoutineProvider_Synthetic_AddsOnlyWhatTheFirstLeavesOut`):
+      a range wholly in a gap is taken; one reaching into the next routine is
+      cut there; one that starts inside a routine, one whose first byte carries
+      a record of ANOTHER unit and one with no record on its first byte are
+      refused; one holding no record is never looked at; and for every record
+      the first provider covers the routine (start, end, name, flags, record
+      count) and the code length are what they were without it.
+- [x] **The MAP as second routine provider, on the fixtures**
+      (`CodeMapTests.SecondRoutineProvider_OnTheFixtures_NamesAnonymousMethodBodies`,
+      `BreakpointSample` and `AnalysisSample`, both bitnesses, the MAP read
+      from a private copy): the body of the anonymous method is outside every
+      TD32 range and gets a routine named `...$ActRec...`, flagged; every
+      routine taken lies in a gap and holds a record; nothing changes for a
+      record TD32 covers. On `TestTarget`, both bitnesses: no class data
+      (`Unit..TClass`) is taken for a routine and the `end.` records of three
+      units stay outside every routine.
+- [x] **Picking the second provider**
+      (`CodeMapTests.PickSecondRoutineProvider_IsTheNextOneThatHasRanges`).
+- [x] The code map of a module of a LIVE session: built by
+      `TLiveCodeAnalysis` for the breakpoint path, on the main executable and
+      on a package loaded at run time. Covered through its users, section AD.
 - [ ] MAP and JDBG on a large real binary. Only TD32 was run on one
       (`DevTools\CodeMapDump`).
 - [ ] A MAP enumerated while its index is still building (`Complete = False`).
@@ -2274,6 +2296,229 @@ Not proved: the x64 window definition against the operating system's unwinder
 `System.@Halt0` or `_DelphiExceptionHandler` through an import thunk in a LIVE
 process whose import lookup table is gone (the file case is covered by
 `TestSubject.bpl`).
+
+## AD. Where a source breakpoint is planted (PROFILER_COVERAGE_PLAN.md increment 4, second half)
+
+`DebuggerTests\BreakpointPlacementTests.pas`, fixture
+`TBreakpointPlacementTests`. Protocol-free: `TDebugSession` is driven directly.
+Debuggee `DebuggerTests\TestTarget\BreakpointSample.dpr` (both bitnesses, built
+by `build_target.bat`), plus `AnalysisSample` for a line record inside a jump
+table, plus `TestTarget` and the `TestHost` / `TestSubject.bpl` pair wherever
+the same thing has to hold in a package. Mechanism in
+`DAP_DEBUGGER_ARCHITECTURE.md`, "Breakpoints" and "Persistent breakpoint
+re-arming".
+
+`BreakpointSample` runs ONE other scenario instead of its default run when
+given a switch (`-loop`, `-recurse`, `-two`, `-race`, `-spin`, `-fault`, `-lib`,
+with `-wait-debugger` in front for an attach), and checks its own arithmetic:
+exit code 3 when a sum is wrong. `-lib` loads `BreakpointSampleLib.dll`, a
+second fixture (`BreakpointSampleLib.dpr`, fixed image base, no dynamic base)
+whose preferred base the program reserves first.
+
+Two things every run of `BreakpointSample` is checked for, beyond its stops:
+the program must EXIT WITH CODE 0 (with the exception filters off a crash on a
+planted byte is otherwise just "the process is gone"), and it must have
+computed the same `GSink` as a run no breakpoint disturbed (an instruction
+resumed one byte in can run without any other trace).
+
+The analysis decides:
+
+- [x] **A line record inside a jump table is refused, with that reason**
+      (`LineInsideAJumpTable_IsRefusedWithThatReason_AndTheProgramRuns`, both
+      bitnesses): the `DD` / `DQ` line of `AsmTable`. Unverified at the stop,
+      no stop, exit code 0, the notice names the jump table. The bytes there
+      are a non-zero address: 0.9.3 planted it.
+- [x] **Inside an instruction: the decision function**
+      (`DecisionFunction_RefusesInsideAnInstruction_AndPlantsOnABoundary`, both
+      bitnesses, `TLiveCodeAnalysis` over the fixture as a file). No fixture
+      has a line record in the middle of an instruction, so the function the
+      engine asks is called directly: every byte of a statement's first block
+      that is not the first byte of an instruction is refused with that reason,
+      every boundary is plantable, an address in no module has no verdict.
+      Also there: `ForgetModule` drops the module's map and verdicts, and the
+      next question builds them again.
+- [x] **In a package** (`Bpl_EndOfThePackageSource_IsRefusedThroughTheAnalysis`,
+      x64): the `end.` of `TestSubject.dpk`, a module loaded at run time. The
+      notice must carry the analysis's reason, not the fallback's.
+- [x] **An unconfirmed record is planted**
+      (`AnonymousMethodBody_BindsAndFires_WithAndWithoutAMap`): the body of an
+      anonymous method binds and stops twice on x86 without a MAP (verdict
+      unconfirmed), on x86 with a MAP (confirmed: the MAP is the second
+      routine provider) and on x64 (confirmed through `.pdata`).
+- [x] The zero-byte fallback without the decoder: section E.
+
+One byte, several records:
+
+- [x] **Removing one of two records leaves the other firing**
+      (`SharedAddress_AddressBreakpointRemoved_TheSourceBreakpointStillFires`,
+      `SharedAddress_SourceBreakpointRemoved_TheAddressBreakpointStillFires`,
+      both bitnesses): six stops in six passes for the survivor.
+- [x] **A re-post of the address set does not silence a source breakpoint**
+      (`SharedAddress_AddressSetReposted_DoesNotSilenceTheSourceBreakpoint`):
+      a second address breakpoint in the module re-posts the set; one stop per
+      pass although two records sit on the address.
+- [x] **Two source lines on one address** (`begin`, moved to the first
+      statement, and that statement)
+      (`SharedAddress_TwoSourceLines_StopOncePerPassOnEveryPass`): six stops,
+      one address. 0.9.3 stopped twice.
+- [x] **Two LOGPOINTS on one address** (`SharedAddress_TwoLogpoints_BothLogEveryPass`,
+      both bitnesses): six log lines each in six passes. Without a stop only
+      the hit path and its single step touch the byte; a stop would repair a
+      hit path that suspends one record of the two (see the negative controls).
+- [x] **A breakpoint added on the address the thread is stopped at**
+      (`SharedAddress_AddedWhileStoppedOnTheAddress_BothKeepFiring`): five more
+      stops and the same `GSink`.
+- [x] **In the executable and in a package**
+      (`SharedAddress_InAPackageAndInTheExecutable_TheSurvivorFires`,
+      `TestTarget` and `TestHost` + `TestSubject.bpl`, both bitnesses, both
+      removal orders): the pair is formed at a stop, after a step off the
+      address; the survivor stops the next pass at the same address, in the
+      same module.
+
+Copies:
+
+- [x] **x64: a `finally` block stops on both paths**
+      (`Win64_FinallyBlock_StopsOnThePlainPathAndOnTheExceptionPath`): two
+      stops at two different addresses of the line.
+      `Win64_FinallyBlock_SetBeforeTheProcess_StopsOnBothPaths`: the same for
+      a breakpoint registered before the startup break.
+- [x] **x86: one address, two stops**
+      (`Win32_FinallyBlock_StopsOnBothPathsAtOneAddress`): the block is not
+      duplicated there.
+- [x] **Nested blocks, a block inside a `finally`, a block left by `Exit`**
+      (`FinallyBlocks_NestedAndLeftByExit_StopOncePerPass`, both bitnesses):
+      two stops for two passes, each.
+- [x] **A `for` line stops once per entry into the loop**
+      (`ForLine_StopsOncePerEntryIntoTheLoop`, both bitnesses): two entries,
+      two stops; and the same for a loop inside a `finally` block, one entry in
+      each copy of the block.
+- [x] **A `finally` block only an exception runs**
+      (`FinallyBlockRunOnlyByAnException_Stops_InTheExecutableAndInAPackage`,
+      `RunExcHandlerFlow` of `TestTargetFlow.pas`, executable and package, both
+      bitnesses): one stop. On x64 0.9.3 reported it verified and never
+      stopped.
+
+- [x] **A hit condition counts passes through the LINE**
+      (`HitCondition_OnALineWithACopy_CountsPassesThroughTheLine`, both
+      bitnesses): `>= 2` on the `finally` block that is passed twice stops
+      exactly once. On x64 the two passes are two records.
+- [x] **A second provider that names the copy gives the line no second record**
+      (`SecondProviderNamingTheCopy_DoesNotGiveTheLineASecondRecord`, x64): a
+      line-table provider answering with the funclet's address is put in front
+      of the engine; a logpoint on the line logs twice for two passes.
+
+The byte under a running thread (`DAP_DEBUGGER_ARCHITECTURE.md`, "Persistent
+breakpoint re-arming"). All both bitnesses; every program checks its own sums:
+
+- [x] **Two logpoints on two threads both log every pass**
+      (`Rearm_TwoLogpointsOnTwoThreads_BothLogEveryPass`, `-two`): 150 and 150.
+- [x] **A breakpoint set on the line a thread is resumed from stops the next
+      pass** (`Rearm_BreakpointOnTheLineAThreadResumesFrom_StopsTheNextPass`,
+      `-loop`): the thread is STEPPED onto the line, the breakpoints replaced
+      by one on that line; four more stops in the four remaining passes.
+- [x] **A step-out whose target is the address the thread is at**
+      (`Rearm_StepOutToTheAddressTheThreadIsAt_LandsInTheCaller`, `-recurse`):
+      lands at the same address one frame up, with a breakpoint on it.
+- [x] **A breakpoint re-created under a parked thread, then another thread
+      stepped** (`Rearm_BreakpointRecreatedUnderAParkedThread_ThenAnotherThreadStepped`,
+      `-spin`): the parked thread runs onto the new `$CC` with its re-arm still
+      pending and must execute its instruction exactly once.
+- [x] **A hit queued behind a stop survives a function call at that stop**
+      (`Rearm_HitQueuedBehindAStop_SurvivesAFunctionCallAtThatStop`, `-race`):
+      four threads through one line, `RaceProbe()` evaluated at every stop. A
+      RACE by nature; see the negative controls for how reliably it shows.
+- [x] **A clean detach clears the trap flag of every thread that owes a
+      re-arm** (`Rearm_CleanDetach_ClearsTheTrapFlagOfEveryThreadThatOwesOne`,
+      `-spin -wait-debugger`, attach with `killOnDetach` off): the detached
+      program must end with exit code 0.
+- [x] **The instruction under the breakpoint faults**
+      (`Rearm_InstructionUnderTheBreakpointFaults_TheBreakpointStopsTheNextPass`,
+      `-fault`, exception filters off): four stops in four passes.
+- [x] **An exception stop on a planted address does not lose the breakpoint**
+      (`Rearm_ExceptionStopOnAPlantedAddress_DoesNotLoseTheBreakpoint`,
+      `-fault`, access violations reported): four breakpoint stops and four
+      exception stops.
+
+When the analysis has to wait:
+
+- [x] **A provider that is still indexing is not waited for and nothing is
+      kept** (`Analysis_ProviderStillIndexing_IsNotWaitedForAndNotKept`, the
+      store over a file with a provider the test controls): no verdict, the
+      tables never asked for, nothing kept, the module remembered as waiting,
+      reported ready exactly once when the index is; and a provider that is
+      not indexing but calls its tables incomplete gets no verdict, no map
+      kept, and is not read again for the same module.
+- [x] **Providers the prefetcher publishes are used**
+      (`Analysis_ProvidersPublishedByThePrefetcher_AreUsedAtTheNextQuestion`,
+      `TestHost` + `TestSubject.bpl`, both bitnesses): the package's MAP is
+      read in the load hook and the analysis asked (one provider); once the
+      prefetcher has published the TD32 the analysis rests on both.
+- [x] **A module relocated after its load event is judged again at its entry
+      point** (`ModuleRelocatedAfterItsLoadEvent_IsJudgedAgainAtItsEntryPoint`,
+      `-lib`, both bitnesses, breakpoints set before the process): the
+      `finally` block of the DLL stops twice (two addresses on x64), the line
+      of its address table is refused as "inside a jump table", exit code 0,
+      and the DLL is not at its preferred base. Stops told apart by address.
+
+A unit's final `end.`:
+
+- [x] **On bytes that decode it is refused as what it is**
+      (`FinalEndOfAUnit_OnBytesThatDecode_IsRefused`, `TestTarget` x86): the
+      byte of the `end.` record of `TestTargetUsesA.pas` is changed from `$00`
+      to `$4F` -- in the reader for the decision function, in the live process
+      for the session; refused, unverified, the notice says `final "end."`.
+- [x] **Only the last line of the unit's own file outside every routine**
+      (`FinalEndOfAUnit_Synthetic_OnlyTheLastLineOfTheUnitsOwnFileOutsideEveryRoutine`,
+      hand-built tables): an earlier line outside every routine, the last
+      "line" of ANOTHER unit's file, and a last line that also has a record
+      inside a routine all stay unconfirmed; a zero byte is still reported as
+      a zero byte.
+
+Negative controls, run 2026-11-27 (each reverted in the engine, the runner
+rebuilt, the tests of this section and of E run):
+
+| reverted | fails |
+|---|---|
+| the engine ignores the analysis's verdict | the jump-table test (x64: exit code `$C0000005`; both: no refusal announced); the package test and the two `end.` tests ("not decided the expected way") |
+| deleting a record restores the byte | the three removal / re-post tests (0 stops of 6) and the executable-and-package test, all eight combinations |
+| the hit suspends one record only | the two logpoints on one address (1 and 1 log lines of 6). The tests that STOP no longer notice: resuming from a stop suspends the address again and re-arms it, which sets the flags right |
+| resuming looks at one record, AND the trap of the owning thread on a re-planted address is continued in place | added-while-stopped, x64 (`GSink` 416 against 461); not detected on x86. Either one alone is no longer detected: each repairs what the other misses |
+| no copies | both x64 `finally` tests, the nested / `Exit` test and the loop-in-finally (x64), the exception-only block in the executable and in the package (x64, 0 stops) |
+| every record of the line is a copy | the `for` test (7 and 8 stops for 2 entries) |
+| the second routine provider is ignored | the two second-provider tests; the anonymous method with a MAP is no longer confirmed |
+| a MAP range needs no record on its first byte | the synthetic test (4 ranges taken for 2), the class-data check on `TestTarget` x86 (three `end.` records given `..TDup` / `..TSink` for a routine), and — when the MAP's index is ready in time — the `end.` test set at a stop |
+| an unconfirmed record is refused | the anonymous method on x86 without a MAP never stops in its body |
+| no zero-byte fallback | the decoder-unavailable test |
+| the hit count is per record | the hit-condition test on x64 (0 stops). Not on x86, where the line has one address |
+| a candidate is compared with the other candidates only | the second-provider-names-the-copy test (3 log lines for 2 passes) |
+| one pending re-arm for the process (a new one drops the others) | two logpoints on two threads (1 and 150 of 150) |
+| resuming from a planted address suspends without arming the re-arm | the loop test (0 stops of 4) and the step-out test (never lands, the program ends) |
+| the owning thread's trap on a re-planted address is continued in place | the parked-thread test (exit code 3 on both bitnesses) |
+| a hit at a suspended address is "not ours" inside a synthetic call | the race test: exit code 3 on both bitnesses after 100 stops, in 4 runs of 4 on a 16-core machine |
+| a detach clears the trap flag of the stopped thread only | the detach test (the detached program does not end) |
+| an exception on a thread that owes a re-arm leaves it pending | the fault test and the exception-stop test (1 stop of 4 each) |
+| resuming from an exception stop suspends a planted address | the exception-stop test (1 breakpoint stop of 4); the fault test still passes |
+| the tables of a provider that is indexing are asked for | the still-indexing test ("asked for" 2 times) |
+| an incomplete code map is used | the still-indexing test (a verdict from incomplete tables) |
+| nothing is forgotten when the prefetcher publishes | the prefetcher test (1 provider for 2), both bitnesses |
+| the entry point of a moved fixed-base module is not watched | the relocation test: x86 exit code 3 and no refusal; x64 one stop for two passes, the program hung on the table, no refusal |
+| no final-`end.` rule | both `end.` tests |
+| the rule without "the unit's own file" | the synthetic test (the record under another unit's file is refused) |
+
+Not proved here: the zero-byte floor in a routine known only from a MAP (no
+fixture has such a record); a one-shot and a persistent record on one address
+(a user breakpoint set on a step's target mid-step), which is reasoned from the
+existing "user breakpoint was there first" path and not reproduced; that the
+SESSION drops a module's analysis when the module unloads (the store's
+`ForgetModule` is tested, the one-line call from `HandleDllUnloaded` is not
+observed); the session's re-post at a stop once a deferred module became ready
+(`RejudgeBreakpointsOfModulesThatBecameReady`: the store's half,
+`TakeModulesThatBecameReady`, is tested, the 250 ms check in `Pump` is not
+observed); a moved fixed-base module that was already loaded when the session
+attached, and one without an entry point; a thread that exits, or a module
+that unloads, while a re-arm is pending; the x64 `.pdata` condition of the
+final-`end.` rule (one record on the large image, no fixture). The race test
+shows nothing on a single core.
 
 ## What the suite does NOT prove (2026-08-08)
 

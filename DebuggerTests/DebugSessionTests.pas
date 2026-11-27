@@ -46,6 +46,9 @@ type
     // set before the process exists.
     [Test] procedure Win32_BreakpointOnAUnitsFinalEnd_SetAtAStop_IsRefusedAndTheProgramRuns;
     [Test] procedure Win32_BreakpointOnAUnitsFinalEnd_SetBeforeTheProcess_IsRefusedAndTheProgramRuns;
+    // The same refusal with the decoder made unavailable: the routine analysis
+    // has nothing to say, and the zero-byte test of 0.9.3 must still refuse.
+    [Test] procedure Win32_BreakpointOnAUnitsFinalEnd_WithoutTheDecoder_FallsBackToTheZeroByteTest;
     // Handler-scoped `$exception` is x64-only, and the 32-bit answer has to be
     // a stated limitation rather than an empty Locals row. A row that simply
     // never appears is indistinguishable from a bug from the outside, so the
@@ -737,7 +740,7 @@ implementation
 uses
   Winapi.Windows, System.SysUtils, System.Classes, System.IOUtils,
   DebugSession, DebugSessionTypes, DebugInfoTypes, DebugTarget, LaunchConfig,
-  ModuleSymbolLoader, TestTempDirs;
+  ModuleSymbolLoader, TestTempDirs, ZydisApi;
 
 const
   EVAL_MARKER = 'EVAL_BODY';
@@ -4927,10 +4930,17 @@ begin
   end;
 end;
 
+const
+  // What the refusal says when the routine analysis decided it, and when the
+  // analysis had nothing to say and the engine's own zero-byte test did.
+  REFUSED_BY_THE_ANALYSIS = 'no instruction leads there and the byte is $00';
+  REFUSED_BY_THE_FALLBACK = 'no routine analysis was available';
+
 // A breakpoint on the final `end.` of TestTargetUsesA.pas, in the scenario that
 // reads the data that record points at. Before the fix the target never ended.
+// DecidedBy is the text that tells which of the two tests refused it.
 procedure RunBreakpointOnAUnitsFinalEnd(const ExePath, MapPath, RsmPath,
-  SourceDir: string; SetAtEntryStop: Boolean);
+  SourceDir: string; SetAtEntryStop: Boolean; const DecidedBy: string);
 const
   UNIT_FILE = 'TestTargetUsesA.pas';
   ARGS      = '-run-uses-scope';
@@ -4988,12 +4998,19 @@ begin
     // or the compiler stops producing that record, this fails rather than passing
     // on a breakpoint that simply never resolved.
     var Announced := False;
+    var Notice := '';
     for var Line in Session.DrainDebuggerOutput do
-      if Line.Contains(REFUSAL) then
+      if Line.Contains(REFUSAL) then begin
         Announced := True;
+        Notice := Line;
+      end;
     Assert.IsTrue(Announced,
       'the engine never announced a refused breakpoint: the "end." record of ' + UNIT_FILE +
       ' no longer points at data, so this test proves nothing');
+    // WHO refused it. Without this the test would pass on either path, and a
+    // session that silently lost its analysis would go unnoticed.
+    Assert.IsTrue(Notice.Contains(DecidedBy),
+      Format('the refusal was not decided the expected way: wanted "%s" in "%s"', [DecidedBy, Notice]));
 
     for var Bp in Session.ListBreakpoints do
       if Bp.Line = EndLine then
@@ -5007,12 +5024,33 @@ end;
 
 procedure TWin32RunControlTests.Win32_BreakpointOnAUnitsFinalEnd_SetAtAStop_IsRefusedAndTheProgramRuns;
 begin
-  RunBreakpointOnAUnitsFinalEnd(Win32Exe, Win32Map, Win32Rsm, TargetDir, True);
+  RunBreakpointOnAUnitsFinalEnd(Win32Exe, Win32Map, Win32Rsm, TargetDir, True,
+    REFUSED_BY_THE_ANALYSIS);
 end;
 
 procedure TWin32RunControlTests.Win32_BreakpointOnAUnitsFinalEnd_SetBeforeTheProcess_IsRefusedAndTheProgramRuns;
 begin
-  RunBreakpointOnAUnitsFinalEnd(Win32Exe, Win32Map, Win32Rsm, TargetDir, False);
+  RunBreakpointOnAUnitsFinalEnd(Win32Exe, Win32Map, Win32Rsm, TargetDir, False,
+    REFUSED_BY_THE_ANALYSIS);
+end;
+
+procedure TWin32RunControlTests.Win32_BreakpointOnAUnitsFinalEnd_WithoutTheDecoder_FallsBackToTheZeroByteTest;
+begin
+  // ZydisTryLoad is a one-shot latch for the whole process (docs/TRAPS.md):
+  // pointing it at a DLL that does not exist makes the decoder unavailable to
+  // everything that asks afterwards, the session's routine analysis included.
+  ZydisResetForTests;
+  Assert.IsFalse(ZydisTryLoad('X:\does-not-exist\DebugSessionTests\NotReallyZydis.dll'),
+    'a missing DLL must not load');
+  try
+    RunBreakpointOnAUnitsFinalEnd(Win32Exe, Win32Map, Win32Rsm, TargetDir, True,
+      REFUSED_BY_THE_FALLBACK);
+    RunBreakpointOnAUnitsFinalEnd(Win32Exe, Win32Map, Win32Rsm, TargetDir, False,
+      REFUSED_BY_THE_FALLBACK);
+  finally
+    // Leave the latch clean for whatever runs next in this process.
+    ZydisResetForTests;
+  end;
 end;
 
 procedure TWin32RunControlTests.Win32_Breakpoint_BindsAndFires;

@@ -169,6 +169,11 @@ type
     /// <summary>Not code: not reached, and the bytes there are not an
     /// instruction.</summary>
     lvrUndecodable,
+    /// <summary>Not code: the record is on the last line of its unit's own
+    /// source file and outside every routine -- the unit's final <c>end.</c>
+    /// (or an empty <c>finalization</c>), which has no code. Its bytes can
+    /// decode: they are whatever follows the unit's last routine.</summary>
+    lvrFinalEndOfUnit,
     /// <summary>Unconfirmed: follows an indirect jump.</summary>
     lvrAfterIndirectJump,
     /// <summary>Unconfirmed: follows a <c>ret</c> or an unconditional
@@ -601,7 +606,7 @@ type
     function  RootFunction(Index: Integer): Integer;
     procedure BuildUnmapped;
     function  FindUnmapped(Rva: Cardinal): Integer;
-    function  StrayLine(LineIndex: Integer): TRoutineLine;
+    function  StrayLine(LineIndex: Integer; Rva: Cardinal): TRoutineLine;
     // --- one routine ---
     function  AnalyzeRange(RoutineIndex: Integer; StartRva, EndRva: Cardinal;
       FirstLine, LineCount: Integer; OutsideOnly: Boolean): TRoutineAnalysis;
@@ -664,6 +669,31 @@ type
     /// <param name="LineIndex">Index into <c>TModuleCodeMap.Lines</c>.</param>
     /// <returns>The record with its verdict.</returns>
     function AnalyzeLine(LineIndex: Integer): TRoutineLine;
+    /// <summary>The verdict for an arbitrary address of the module: the one of
+    /// its line record when a record starts there, otherwise what the analysis
+    /// of the routine holding the address shows about that byte.</summary>
+    /// <remarks>This is what decides whether a breakpoint may be planted at an
+    /// address that a line table names: a provider other than the code map's
+    /// can name an address the code map has no record for. Analyses the whole
+    /// routine, like <c>AnalyzeLine</c>.</remarks>
+    /// <param name="Rva">Module-relative address.</param>
+    /// <returns>The verdict and its reason; <c>LineIndex</c> is -1 when no
+    /// line record of the code map starts at the address, and the block fields
+    /// are filled for a line record only.</returns>
+    function AnalyzeAddress(Rva: Cardinal): TRoutineLine;
+    /// <summary>x64: the piece of code an address lies in, as <c>.pdata</c>
+    /// divides a routine: its body, or one of its funclets (a <c>finally</c>
+    /// block emitted a second time for the exception dispatch to call, the
+    /// handler of a <c>safecall</c> routine).</summary>
+    /// <param name="Rva">Module-relative address.</param>
+    /// <param name="RegionStart">First byte of the <c>.pdata</c> function
+    /// holding the address.</param>
+    /// <param name="RootStart">First byte of the function that region belongs
+    /// to, through nested funclets. Equal to <c>RegionStart</c> when the
+    /// address is in the body itself; different when it is in a funclet.</param>
+    /// <returns>False on x86, without a decoder, and for an address no
+    /// <c>.pdata</c> function holds.</returns>
+    function CodeRegionOf(Rva: Cardinal; out RegionStart, RootStart: Cardinal): Boolean;
     /// <summary>Whether Zydis is loaded. False makes every analysis report
     /// "decoder unavailable".</summary>
     property Available: Boolean read FAvailable;
@@ -680,6 +710,21 @@ type
     /// import or its name cannot be read (a live module without a lookup
     /// table).</returns>
     function ImportNameOfSlot(SlotRva: Int64): string;
+    /// <summary>Whether a line record is a unit's final <c>end.</c> that has
+    /// no code.</summary>
+    /// <remarks>Decided without reading a source and without looking at a
+    /// byte: the record lies outside every routine of the code map (and, on
+    /// x64, outside every function <c>.pdata</c> knows); it is on the highest
+    /// line of its source file that has a line record; no record on that line
+    /// lies inside a routine; and the file is its unit's OWN source. The body
+    /// of an anonymous method, which is outside every TD32 range as well,
+    /// never qualifies: the <c>end;</c> of the routine around it comes later.
+    /// The last condition keeps out code the compiler synthesises for another
+    /// unit's generic or inline routine under a line number past the end of
+    /// that file.</remarks>
+    /// <param name="LineIndex">Index into <c>TModuleCodeMap.Lines</c>.</param>
+    /// <returns>True for such a record.</returns>
+    function IsFinalEndOfUnit(LineIndex: Integer): Boolean;
   end;
 
 /// <summary>Display text of a verdict reason.</summary>
@@ -735,6 +780,7 @@ const
     'inside an exception clause table',
     'not reached, and the byte there is zero',
     'not reached, and the bytes there are not an instruction',
+    'the last line of its file, outside every routine: the unit''s final end., which has no code',
     'not reached: follows an indirect jump',
     'not reached: follows a ret / unconditional jmp, no known branch to it',
     'not reached: follows int3 / int n / hlt / ud2 / far jump',
@@ -769,7 +815,8 @@ begin
   case Reason of
     lvrBoundary:
       Result := lvConfirmed;
-    lvrInsideInstruction, lvrInJumpTable, lvrInClauseTable, lvrZeroByte, lvrUndecodable:
+    lvrInsideInstruction, lvrInJumpTable, lvrInClauseTable, lvrZeroByte, lvrUndecodable,
+    lvrFinalEndOfUnit:
       Result := lvNotCode;
   else
     Result := lvUnconfirmed;
@@ -1442,18 +1489,17 @@ begin
   Result := AnalyzeRange(-1, Item.StartRva, Item.EndRva, Lo, Count, True);
 end;
 
-function TRoutineAnalyzer.StrayLine(LineIndex: Integer): TRoutineLine;
-// A record no routine and no .pdata function contains. Nothing proves an entry
-// before it, so it cannot be confirmed; but bytes that are zero or are not an
-// instruction show it is data.
+function TRoutineAnalyzer.StrayLine(LineIndex: Integer; Rva: Cardinal): TRoutineLine;
+// An address no routine and no .pdata function contains (LineIndex is its line
+// record, or -1). Nothing proves an entry before it, so it cannot be confirmed;
+// but bytes that are zero or are not an instruction show it is data.
 var
   Code: array[0..MAX_INSN_LENGTH - 1] of Byte;
   Detail: TZydisInstructionDetail;
 begin
-  var Line := FMap.Lines[LineIndex];
   Result := Default(TRoutineLine);
   Result.LineIndex := LineIndex;
-  Result.Rva       := Line.Rva;
+  Result.Rva       := Rva;
   Result.Verdict   := lvUnconfirmed;
   Result.Reason    := lvrOutsideEveryRoutine;
   if not FAvailable then begin
@@ -1461,16 +1507,44 @@ begin
     Exit;
   end;
   FillChar(Code, SizeOf(Code), 0);
-  var Got := FInput.Reader(VaOf(Line.Rva), @Code[0], SizeOf(Code));
+  var Got := FInput.Reader(VaOf(Rva), @Code[0], SizeOf(Code));
   if Got <= 0 then begin
     Result.Reason := lvrUnreadable;
     Exit;
   end;
   if Code[0] = 0 then
     Result.Reason := lvrZeroByte
-  else if not ZydisDecodeDetail(FMode, VaOf(Line.Rva), Code, Got, Detail) then
-    Result.Reason := lvrUndecodable;
+  else if not ZydisDecodeDetail(FMode, VaOf(Rva), Code, Got, Detail) then
+    Result.Reason := lvrUndecodable
+  // Bytes that happen to decode say nothing: a third of the final `end.`
+  // records of a large 32-bit image land on such bytes, right after the unit's
+  // last routine. What the record IS decides.
+  else if (LineIndex >= 0) and IsFinalEndOfUnit(LineIndex) then
+    Result.Reason := lvrFinalEndOfUnit;
   Result.Verdict := VerdictOfReason(Result.Reason);
+end;
+
+function TRoutineAnalyzer.IsFinalEndOfUnit(LineIndex: Integer): Boolean;
+begin
+  Result := False;
+  var Line := FMap.Lines[LineIndex];
+  if Line.RoutineIndex >= 0 then
+    Exit;
+  if FMap.LastLineOutsideRoutines(Line.FileIndex) <> Line.Line then
+    Exit;
+  // The unit's OWN file. A line of another file recorded in this unit is an
+  // instantiation of a generic or an inlined routine, and the compiler gives
+  // some synthesised code of that kind a line number beyond the end of the
+  // file it names: the highest "line" of that file, and real code.
+  var OwnUnit := FMap.UnitName(Line.UnitIndex);
+  if (OwnUnit = '') or not SameText(ChangeFileExt(FMap.Files[Line.FileIndex].Name, ''), OwnUnit) then
+    Exit;
+  // x64: a record inside a function .pdata lists is code with a proven entry.
+  if FIs64 then
+    for var Sibling in FMap.LinesAt(Line.FileIndex, Line.Line) do
+      if FindPdataContaining(FMap.Lines[Sibling].Rva) >= 0 then
+        Exit;
+  Result := True;
 end;
 
 function TRoutineAnalyzer.AnalyzeLine(LineIndex: Integer): TRoutineLine;
@@ -1484,13 +1558,78 @@ begin
     if FIs64 and FAvailable then
       Unmapped := FindUnmapped(Line.Rva);
     if Unmapped < 0 then
-      Exit(StrayLine(LineIndex));
+      Exit(StrayLine(LineIndex, Line.Rva));
     Analysis := AnalyzeUnmapped(Unmapped);
   end;
   var Index := Analysis.FindLine(Line.Rva);
   if Index < 0 then
-    Exit(StrayLine(LineIndex));
+    Exit(StrayLine(LineIndex, Line.Rva));
   Result := Analysis.Lines[Index];
+end;
+
+function TRoutineAnalyzer.AnalyzeAddress(Rva: Cardinal): TRoutineLine;
+begin
+  var LineIndex := FMap.FindLine(Rva);
+  if LineIndex >= 0 then
+    Exit(AnalyzeLine(LineIndex));
+
+  // No record of the code map starts here: the routine's flags answer.
+  var Analysis: TRoutineAnalysis;
+  var Routine := FMap.FindRoutine(Rva);
+  if Routine >= 0 then
+    Analysis := Analyze(Routine)
+  else begin
+    var Unmapped := -1;
+    if FIs64 and FAvailable then
+      Unmapped := FindUnmapped(Rva);
+    if Unmapped < 0 then
+      Exit(StrayLine(-1, Rva));
+    Analysis := AnalyzeUnmapped(Unmapped);
+  end;
+
+  Result := Default(TRoutineLine);
+  Result.LineIndex := -1;
+  Result.Rva       := Rva;
+  Result.Verdict   := lvUnconfirmed;
+  Result.Reason    := lvrDecoderUnavailable;
+  if not FAvailable then
+    Exit;
+  Result.Reason := lvrUnreadable;
+  // Not analysed (unreadable, too large), or the address is past where the
+  // routine stops owning addresses.
+  if (Length(Analysis.Flags) = 0) or (Rva < Analysis.StartRva) or
+     (Int64(Rva) - Analysis.StartRva >= Length(Analysis.Flags)) then
+    Exit;
+  var Flag := Analysis.Flags[Rva - Analysis.StartRva];
+  if Flag and rbfBoundary <> 0 then
+    Result.Reason := lvrBoundary
+  else if Flag and rbfJumpTable <> 0 then
+    Result.Reason := lvrInJumpTable
+  else if Flag and rbfClauseTable <> 0 then
+    Result.Reason := lvrInClauseTable
+  else if Flag and rbfInterior <> 0 then
+    Result.Reason := lvrInsideInstruction
+  else begin
+    // The scratch buffers still hold the routine just analysed.
+    FUnreachedOfs := -1;
+    Result.Reason := UnreachedReason(Integer(Rva - FS), Result.Verdict);
+  end;
+  Result.Verdict := VerdictOfReason(Result.Reason);
+end;
+
+function TRoutineAnalyzer.CodeRegionOf(Rva: Cardinal;
+  out RegionStart, RootStart: Cardinal): Boolean;
+begin
+  RegionStart := 0;
+  RootStart   := 0;
+  if (not FIs64) or (Length(FPdBegin) = 0) then
+    Exit(False);
+  var Holder := FindPdataContaining(Rva);
+  if Holder < 0 then
+    Exit(False);
+  RegionStart := FPdBegin[Holder];
+  RootStart   := FPdBegin[RootFunction(Holder)];
+  Result := True;
 end;
 
 { TRoutineAnalyzer: one routine }

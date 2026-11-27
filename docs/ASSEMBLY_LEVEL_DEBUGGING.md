@@ -103,8 +103,9 @@ already restored, so writing the INT3 straight back re-traps on the same
 instruction the instant the thread resumes. Measured as an unbounded
 trap/re-plant loop in the debug log before the fix. `RearmStepBpAfterForeignHit`
 now does the same dance a persistent breakpoint hit does — leave it unplanted,
-single-step off it, re-plant on that trap — and `FSteppingOffStepBp` marks that
-trap as deciding nothing, so neither step mode mistakes it for progress.
+single-step off it, re-plant on that trap — and the `StepOffOnly` flag of the
+thread's pending re-arm marks that trap as deciding nothing, so neither step
+mode mistakes it for progress.
 
 The classification (`call`, `rep`-family) is read from the DECODER'S OWN
 mnemonic text, the same discipline `ZydisDisassembler`'s direct-branch whitelist

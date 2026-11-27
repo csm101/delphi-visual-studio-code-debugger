@@ -513,10 +513,14 @@ Increment 1 measured the loader's side of this on both bitnesses. An image
 with a dynamic base, the executable included, is already relocated at its load
 event; a fixed-base image that had to move is relocated after the event and
 before its entry point, and a jump written at the event came back with the
-loader's delta added to its fifth byte. The mapped header tells the two apart
-in one read: its `ImageBase` field equals the real base exactly when the image
-is already relocated. No line of a module ran before that module's entry
-point, in any of six modules. On attach the target's threads do not run
+loader's delta added to its fifth byte. The mapped header tells the two kinds
+apart in one read, and nothing more (corrected in increment 4): its
+`ImageBase` field equals the real base for an image relocated when it was
+mapped, and keeps the preferred base for ever in a fixed-base image that had to
+move, before the loader relocates it and after. So the header says that a
+module is of the late kind, never that its relocation is done; the first sign
+of that is the module's entry point. No line of a module ran before that
+module's entry point, in any of six modules. On attach the target's threads do not run
 between the synthesised events.
 
 **Payloads.**
@@ -1447,6 +1451,89 @@ inline copy only, so it does not fire when an exception runs the block.
 One thing the code map has to change for x86: with TD32 present it takes both
 tables from TD32, so the MAP's range for an anonymous method never reaches the
 analysis even when a MAP is there.
+
+## Verified in increment 4, second half: ordinary breakpoints
+
+2026-11-27. The analysis has its first user: the engine's own breakpoints.
+`LiveCodeAnalysis.pas` (the code map and analyzer of each module of a live
+session, built at the first question and dropped at unload),
+`IBreakpointPlacement` in `DebugTarget.pas` (how the session hands the engine
+its advice without the engine learning about sessions), DevTool
+`BreakpointPlanProbe`, fixtures `BreakpointSample.dpr` and
+`BreakpointSampleLib.dpr`. Mechanism in `DAP_DEBUGGER_ARCHITECTURE.md`,
+"Breakpoints"; tests in `TEST_CATALOG.md`, "AD". Suite: 1539 found / 1535 pass
+/ 0 fail / 4 ignored (36 new). Every fix has a negative control: reverted, its
+test fails with the intended message.
+
+**What refuses a source breakpoint.** Only a verdict of "not code". An
+unconfirmed record is planted as before, which keeps the body of an x86
+anonymous method without a MAP working (pinned by a test). Without the decoder
+the zero-byte test of 0.9.3 is the fallback (pinned too).
+
+**A unit's final `end.` needed a rule of its own.** On the large x86 image 577
+of the records on a unit's final `end.` sit on non-zero bytes that happen to
+decode, so neither the zero byte nor the decoder catches them. The rule: a
+record outside every routine of both providers, on the highest line that has a
+record in its file, in a file that is the unit's own source, and (x64) with no
+record of that line inside a `.pdata` function. It takes 1 421 records on that
+image (827 on a zero byte, 17 undecodable, 577 decodable), none on the x64 one.
+Of the 1 421, 1 201 read `end.` in today's sources, 2 an empty `finalization`,
+102 have no source at hand, and 116 read something else; the six of those that
+were checked are sources edited after the binary was built. The own-file
+condition is needed: generic code is given line numbers past the end of another
+unit's file, and that is real code.
+
+**Which records of a line get a breakpoint.** One per line-table provider, as
+before. On x64, in addition, the lowest record of the line in each other piece
+(`.pdata`: body or funclet) of the same routine. That is what makes a
+breakpoint inside a `finally` stop when an exception runs the block; records in
+the same piece are never copies of one another, so a `for` line still stops
+once per entry into the loop. On x86 nothing is added: the block exists once.
+The copies of a line share one hit count.
+
+**The code map takes a second routine provider** for records the first one
+leaves outside every range (the MAP's range for an anonymous method when TD32
+is the first). A second-provider range is accepted only when a line record of
+its own unit starts on its first byte: a MAP lists class data among the
+publics of the code segment, and decoding that as a routine confirmed an `end.`
+record by accident.
+
+**Cost.** The first source breakpoint in a module builds that module's code
+map, on the pump thread: 485 ms and about 100 MB on the large x64 image, 438 ms
+on the x86 one (648 ms with the MAP as second provider), 1-4 ms on the
+fixtures. Later breakpoints cost one routine's analysis. Building the map for
+the asked routine only is the obvious reduction; not done.
+
+**Relocation, corrected.** The header of a fixed-base image that had to move
+keeps its preferred base for ever, so it cannot say when relocation is done
+(the design text above is corrected). Such a module is judged at a one-shot on
+its entry point and its breakpoints reposted there. A module of that kind
+without an entry point is never analysed and keeps the fallback.
+
+**Defects of the released engine fixed on the way.** An independent review of
+the change traced ten scenarios through the rewritten code; the change itself
+held, and the review found these in the lines around it, all present in 0.9.3:
+
+- deleting a breakpoint restored the byte under another breakpoint on the same
+  address, which then never fired;
+- breakpoints on `begin` and on the first statement of one routine fired twice
+  and then never again;
+- an address breakpoint added on the address a thread is stopped at made the
+  thread resume one byte into the instruction;
+- so did a hit queued behind a stop and consumed by the pump of an injected
+  call, and a record re-created under a parked thread while another thread was
+  stepped;
+- one pending re-arm for the whole process: with two threads on two
+  breakpoints one of the two stopped firing. Now per thread;
+- a breakpoint on the address a thread resumes from was dead until the next
+  stop (a breakpoint on the current line in a loop; a step-out in recursion);
+- a clean detach left the trap flag set on a thread in the middle of a re-arm.
+
+**Still planted where it should not be, or not where it should:** the
+unconfirmed records that are in fact bad (2 108 on the x64 image and 34 682 on
+the x86 one are unconfirmed, nearly all good code); the `end;` of an x64
+routine with an implicit finally, whose funclet has no line record. Both, and
+three unrelated defects met on the way, are in `KNOWN_UNKNOWNS.md`.
 
 ## Assumptions to measure
 

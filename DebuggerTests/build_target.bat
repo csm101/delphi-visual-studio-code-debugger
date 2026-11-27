@@ -88,6 +88,25 @@ dcc64 -$O- -V -VN -VR -GD -E.\Win64\Debug -NU.\Win64\Debug AnalysisSample.dpr 2>
 set ANALYSIS64_ERR=%errorlevel%
 dcc32 -$O- -V -VN -VR -GD -E.\Win32\Debug -NU.\Win32\Debug AnalysisSample.dpr 2>&1
 set ANALYSIS32_ERR=%errorlevel%
+rem Breakpoint-placement fixture: the shapes where "one address per line" is the
+rem wrong answer or where two breakpoint records share an address (a `finally`
+rem block run plainly and by an exception, an implicit finally, a `for` line, a
+rem loop inside a finally, `Exit` through a finally, nested finallys, an
+rem anonymous method, `begin` plus the first statement). Both bitnesses: dcc64
+rem emits a finally block twice and dcc32 once. Separate target, same reason as
+rem above.
+dcc64 -$O- -V -VN -VR -GD -E.\Win64\Debug -NU.\Win64\Debug BreakpointSample.dpr 2>&1
+set BPSAMPLE64_ERR=%errorlevel%
+dcc32 -$O- -V -VN -VR -GD -E.\Win32\Debug -NU.\Win32\Debug BreakpointSample.dpr 2>&1
+set BPSAMPLE32_ERR=%errorlevel%
+rem The DLL BreakpointSample loads with -lib: a FIXED image base and no dynamic
+rem base (set in its source), so that reserving that address makes the loader
+rem relocate it after its load event. Beside BreakpointSample.exe, which loads
+rem it by name.
+dcc64 -$O- -V -VN -VR -GD -E.\Win64\Debug -NU.\Win64\Debug BreakpointSampleLib.dpr 2>&1
+set BPLIB64_ERR=%errorlevel%
+dcc32 -$O- -V -VN -VR -GD -E.\Win32\Debug -NU.\Win32\Debug BreakpointSampleLib.dpr 2>&1
+set BPLIB32_ERR=%errorlevel%
 rem Stdio fixtures: a CONSOLE-subsystem debuggee and its GUI twin, both writing
 rem through their standard handles (StdioSampleCore.pas). The console one is the
 rem only console fixture, on purpose: a console child receives its parent's
@@ -136,6 +155,10 @@ if not "%CALLRES64_ERR%"=="0" exit /b %CALLRES64_ERR%
 if not "%CALLRES32_ERR%"=="0" exit /b %CALLRES32_ERR%
 if not "%ANALYSIS64_ERR%"=="0" exit /b %ANALYSIS64_ERR%
 if not "%ANALYSIS32_ERR%"=="0" exit /b %ANALYSIS32_ERR%
+if not "%BPSAMPLE64_ERR%"=="0" exit /b %BPSAMPLE64_ERR%
+if not "%BPSAMPLE32_ERR%"=="0" exit /b %BPSAMPLE32_ERR%
+if not "%BPLIB64_ERR%"=="0" exit /b %BPLIB64_ERR%
+if not "%BPLIB32_ERR%"=="0" exit /b %BPLIB32_ERR%
 if not "%STDIOCON_ERR%"=="0" exit /b %STDIOCON_ERR%
 if not "%STDIOGUI_ERR%"=="0" exit /b %STDIOGUI_ERR%
 exit /b %TT32_ERR%

@@ -270,6 +270,7 @@ type
 
     // Frontend hooks.
     FOnSymbolsLoaded:   TModuleSymbolsEvent;
+    FOnProvidersPublished: TModuleSymbolsEvent;
     FShouldRetryModule: TModuleRetryPredicate;
     FRequiresFor:       TModuleRequiresSupplier;
     FOnLog:             TModuleLoaderLog;   // diagnostic sink (DAP: DapLog)
@@ -314,6 +315,12 @@ type
     property ModuleClass:   TModuleSymbolsClass read FModuleClass write FModuleClass;
 
     property OnSymbolsLoaded:   TModuleSymbolsEvent     read FOnSymbolsLoaded   write FOnSymbolsLoaded;
+    /// <summary>Fired once per module when the background prefetcher's readers
+    /// are registered for it (<c>DrainPrefetch</c>), before the caller's single
+    /// repost for the whole drain. For whatever keeps something derived from a
+    /// module's provider SET and has to drop it when the set changes; it must
+    /// be cheap and must not repost breakpoints.</summary>
+    property OnProvidersPublished: TModuleSymbolsEvent  read FOnProvidersPublished write FOnProvidersPublished;
     property ShouldRetryModule: TModuleRetryPredicate   read FShouldRetryModule write FShouldRetryModule;
     property RequiresFor:       TModuleRequiresSupplier read FRequiresFor       write FRequiresFor;
     property OnLog:             TModuleLoaderLog        read FOnLog     write FOnLog;
@@ -377,6 +384,12 @@ type
     // rendering a stack.
     function  DescribeAddress(PC: UInt64; out ModuleName: string): TSymbolAvailability;
     function  ModuleRvaRange(Module: TModuleSymbols; out Lo, Hi: UInt64): Boolean;
+    /// <summary>The LOADED providers a code map of a module can be built from
+    /// (CodeMap.TModuleCodeMap), most trusted first: TD32 or the external
+    /// .tds, then MAP, then JDBG. Nothing is parsed by asking.</summary>
+    /// <param name="Module">A runtime module, or nil for the main executable.</param>
+    /// <returns>The providers; empty when none of those formats is loaded.</returns>
+    function  CodeMapProviders(Module: TModuleSymbols): TArray<IInterface>;
     procedure AddModuleProvider(Module: TModuleSymbols; const Provider: IInterface);
 
     // --- Per-module symbol load (synchronous) ---
@@ -1333,6 +1346,31 @@ begin
   Hi := Lo + Module.ImageSize;
 end;
 
+function TModuleSymbolLoader.CodeMapProviders(Module: TModuleSymbols): TArray<IInterface>;
+
+  procedure Add(const Provider: IInterface);
+  begin
+    if Provider <> nil then
+      Result := Result + [Provider];
+  end;
+
+begin
+  Result := nil;
+  if Module <> nil then begin
+    Add(Module.Td32Iface);
+    Add(Module.TdsIface);
+    Add(Module.MapIface);
+    Add(Module.JclIface);
+    Exit;
+  end;
+  var MainCodeView := GetMainTD32;
+  if (MainCodeView <> nil) and MainCodeView.Loaded then
+    Add(MainCodeView as IInterface);
+  if FMainMapRegistered then
+    Add(FMainMap as IInterface);
+  Add(FMainJcl);
+end;
+
 procedure TModuleSymbolLoader.AddModuleProvider(Module: TModuleSymbols;
   const Provider: IInterface);
 begin
@@ -1788,6 +1826,9 @@ begin
     // RepostBreakpoints, and a drain can publish a dozen modules in one turn;
     // reposting every breakpoint spec a dozen times over is pure churn. The
     // caller reposts ONCE for the whole drain instead (DrainPrefetch's result).
+    // What IS said per module is that its provider set changed.
+    if SymbolsArrived and Assigned(FOnProvidersPublished) then
+      FOnProvidersPublished(Module);
     Result := SymbolsArrived;
   finally
     // Whatever we did not take a reference to (module gone, or a provider that

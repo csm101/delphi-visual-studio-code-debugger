@@ -82,6 +82,12 @@ type
     [Test] procedure PickProviders_WithoutBothTables_ReportsNotMeasurable;
     [Test] procedure Build_WithoutAProvider_Raises;
 
+    // --- a second routine provider (TD32 has no procedure record for the body
+    //     of an anonymous method; a MAP names it) ---
+    [Test] procedure SecondRoutineProvider_Synthetic_AddsOnlyWhatTheFirstLeavesOut;
+    [Test] procedure SecondRoutineProvider_OnTheFixtures_NamesAnonymousMethodBodies;
+    [Test] procedure PickSecondRoutineProvider_IsTheNextOneThatHasRanges;
+
     // --- the other formats ---
     // ONE test for the MAP on purpose: a MAP loaded unshifted writes an index
     // sidecar beside itself, and two tests doing that in two worker processes
@@ -94,7 +100,7 @@ implementation
 
 uses
   System.Classes, System.IOUtils,
-  MapFileReader, JclDebugReader, PeSymbolSupport;
+  MapFileReader, JclDebugReader, PeSymbolSupport, TestTempDirs;
 
 const
   MARKER_SOURCE = 'TestTargetCore.pas';
@@ -929,6 +935,320 @@ begin
     begin
       TModuleCodeMap.Build('fake', nil, nil, 0, 0).Free;
     end, EArgumentNilException);
+end;
+
+{ A second routine provider }
+
+procedure TCodeMapTests.SecondRoutineProvider_Synthetic_AddsOnlyWhatTheFirstLeavesOut;
+const
+  IMAGE_SIZE = $2000;
+  UNIT_A = 0;
+  UNIT_B = 1;
+
+  function Routine(StartRva, EndRva: UInt64; const Name, UnitName: string; Approximate: Boolean): TRoutineRange;
+  begin
+    Result := Default(TRoutineRange);
+    Result.StartRva := StartRva;
+    Result.EndRva   := EndRva;
+    Result.Name     := Name;
+    Result.UnitName := UnitName;
+    Result.EndIsApproximate := Approximate;
+  end;
+
+  function Line(Rva: UInt64; LineNumber, UnitIndex: Integer): TLineRecord;
+  begin
+    Result.Rva       := Rva;
+    Result.FileIndex := 0;
+    Result.Line      := LineNumber;
+    Result.UnitIndex := UnitIndex;
+  end;
+
+  function OwnerName(Map: TModuleCodeMap; Rva: Cardinal): string;
+  begin
+    var Index := Map.FindLine(Rva);
+    if (Index < 0) or (Map.Lines[Index].RoutineIndex < 0) then
+      Exit('');
+    Result := Map.Routines[Map.Lines[Index].RoutineIndex].Name;
+  end;
+
+begin
+  var First := TFakeTables.Create;
+  var FirstRef: IInterface := First;
+  First.LinesComplete    := True;
+  First.RoutinesComplete := True;
+  First.Ranges := [
+    Routine(100, 200, 'A', 'UnitA', False),
+    Routine(300, 400, 'B', 'UnitA', False)];
+  First.Table.Files := [Default(TLineRecordFile)];
+  First.Table.Files[0].Name := 'Only.pas';
+  First.Table.Units := ['UnitA', 'UnitB'];
+  First.Table.Records := [
+    Line(100, 1, UNIT_A), Line(150, 2, UNIT_A),     // in A
+    Line(210, 3, UNIT_B), Line(220, 4, UNIT_B), Line(240, 5, UNIT_B),  // the gap between A and B
+    Line(255, 6, UNIT_B), Line(260, 7, UNIT_B),
+    Line(300, 8, UNIT_A),                           // in B
+    Line(450, 9, UNIT_B), Line(470, 10, UNIT_B),    // after B
+    Line(600, 11, UNIT_A),                          // a record of UnitA where UnitB's data is
+    Line(700, 12, UNIT_B), Line(710, 13, UNIT_B),   // inside a range with no record on its start
+    Line(1000, 14, UNIT_B)];                        // far from everything
+
+  var Second := TFakeTables.Create;
+  var SecondRef: IInterface := Second;
+  Second.RoutinesComplete := True;
+  Second.Ranges := [
+    // Repeats a range of the first provider: no record of it is left out.
+    Routine(100, 200, 'A-again', 'UnitB', True),
+    // Wholly in the gap, a record of its unit on its first byte: taken as it is.
+    Routine(210, 250, 'Anon1', 'UnitB', False),
+    // Starts in the gap, reaches into B: taken, cut where B starts.
+    Routine(255, 350, 'Anon2', 'UnitB', True),
+    // Holds the two records after B, but STARTS inside B: it would take over
+    // B's records behind its start. Refused.
+    Routine(380, 480, 'Straddle', 'UnitB', True),
+    // A record sits on its first byte, of ANOTHER unit: the shape of a unit's
+    // final `end.` landing on the next unit's class data. Refused.
+    Routine(600, 650, 'OtherUnitsData', 'UnitB', True),
+    // Holds records, none on its first byte: nothing says it is a routine.
+    Routine(695, 720, 'NoEntryRecord', 'UnitB', True),
+    // Holds no record: never looked at.
+    Routine(900, 950, 'Empty', 'UnitB', True)];
+
+  var Plain := TModuleCodeMap.Build('fake', First, First, 0, IMAGE_SIZE);
+  var Map := TModuleCodeMap.Build('fake', First, First, 0, IMAGE_SIZE, nil, Second);
+  try
+    Assert.AreEqual(0, Plain.SecondProviderRoutineCount, 'no second provider, nothing taken from one');
+    Assert.AreEqual(11, Plain.OutsideRoutineCount, 'the first provider alone leaves eleven records out');
+    Assert.AreEqual(2, Map.SecondProviderRoutineCount, 'two ranges of the second provider are taken');
+    Assert.AreEqual(3, Map.SecondProviderRefusedCount, 'three are refused');
+    Assert.AreEqual(4, Integer(Length(Map.Routines)));
+    Assert.AreEqual(6, Map.OutsideRoutineCount, 'six records stay outside every routine');
+
+    Assert.AreEqual('Anon1', OwnerName(Map, 210));
+    Assert.AreEqual('Anon1', OwnerName(Map, 220));
+    Assert.AreEqual('Anon1', OwnerName(Map, 240));
+    Assert.AreEqual('Anon2', OwnerName(Map, 255));
+    Assert.AreEqual('Anon2', OwnerName(Map, 260));
+    Assert.AreEqual('', OwnerName(Map, 450), 'a record held by a range that starts inside a routine stays outside');
+    Assert.AreEqual('', OwnerName(Map, 470));
+    Assert.AreEqual('', OwnerName(Map, 600), 'a record of another unit on the start of a range does not make it a routine');
+    Assert.AreEqual('', OwnerName(Map, 700), 'a range with no record on its start is not a routine');
+    Assert.AreEqual('', OwnerName(Map, 710));
+    Assert.AreEqual('', OwnerName(Map, 1000));
+
+    for var I := 0 to High(Map.Routines) do begin
+      var Taken := Map.Routines[I];
+      if not Taken.FromSecondProvider then
+        Continue;
+      Assert.IsTrue(Taken.EndIsApproximate, Taken.Name + ': an end taken from a second provider is approximate');
+      Assert.IsTrue(Taken.LineCount > 0, Taken.Name + ': taken without a record in it');
+      Assert.AreEqual('UnitB', Map.UnitName(Taken.UnitIndex), Taken.Name + ': the second provider''s unit');
+    end;
+    var Anon2 := Map.Routines[Map.Lines[Map.FindLine(260)].RoutineIndex];
+    Assert.AreEqual<Cardinal>(255, Anon2.StartRva);
+    Assert.AreEqual<Cardinal>(300, Anon2.EndRva, 'cut at the next routine of the first provider');
+
+    // Nothing changed for a record the first provider covers.
+    Assert.AreEqual(Integer(Length(Plain.Lines)), Integer(Length(Map.Lines)));
+    for var I := 0 to High(Plain.Lines) do begin
+      var Before := Plain.Lines[I];
+      var After := Map.Lines[I];
+      Assert.AreEqual(Before.Rva, After.Rva);
+      if Before.RoutineIndex < 0 then
+        Continue;
+      var Was := Plain.Routines[Before.RoutineIndex];
+      var Still := Map.Routines[After.RoutineIndex];
+      Assert.AreEqual(Was.Name, Still.Name, Format('record $%x changed routine', [Before.Rva]));
+      Assert.AreEqual(Was.StartRva, Still.StartRva);
+      Assert.AreEqual(Was.EndRva, Still.EndRva);
+      Assert.AreEqual(Was.EndIsApproximate, Still.EndIsApproximate);
+      Assert.IsFalse(Still.FromSecondProvider);
+      Assert.AreEqual(Was.LineCount, Still.LineCount);
+      Assert.AreEqual(Before.CodeLength, After.CodeLength, Format('record $%x changed length', [Before.Rva]));
+    end;
+  finally
+    Map.Free;
+    Plain.Free;
+  end;
+end;
+
+procedure TCodeMapTests.SecondRoutineProvider_OnTheFixtures_NamesAnonymousMethodBodies;
+// On real binaries, both bitnesses: with the MAP as the second routine
+// provider the body of an anonymous method -- outside every TD32 range -- gets
+// a routine, and every record TD32 covers keeps exactly what it had.
+type
+  TSample = record
+    Name, Source, Marker: string;
+  end;
+const
+  SAMPLES: array[0..1] of TSample = (
+    (Name: 'BreakpointSample'; Source: 'BreakpointSample.dpr'; Marker: '{BP:BS_ANON_BODY}'),
+    (Name: 'AnalysisSample';   Source: 'AnalysisSample.dpr';   Marker: '{BP:AN_ANON_BODY}'));
+
+  function MarkerLineOf(const Sample: TSample): Integer;
+  begin
+    Result := 0;
+    var Source := TStringList.Create;
+    try
+      Source.LoadFromFile(FixtureRoot + 'TestTarget\' + Sample.Source);
+      for var I := 0 to Source.Count - 1 do
+        if Source[I].Contains(Sample.Marker) then
+          Exit(I + 1);
+    finally
+      Source.Free;
+    end;
+  end;
+
+begin
+  // The MAP is read from a private copy: a MAP loaded as a file writes an
+  // index sidecar beside itself, and the fixture directory is shared with the
+  // other worker processes.
+  PurgeLeftoverTempDirs('cmap2nd_');
+  var Scratch := MakeTestScratchDir('cmap2nd_');
+  try
+    for var Sample in SAMPLES do
+      for var Bitness in ['Win32', 'Win64'] do begin
+        var Binary := LoadOne(Sample.Name + ' ' + Bitness,
+          'TestTarget\' + Bitness + '\Debug\' + Sample.Name + '.exe');
+        var MapCopy := TPath.Combine(Scratch, Sample.Name + '_' + Bitness + '.map');
+        TFile.Copy(Binary.MapPath, MapCopy, True);
+        var MapFile := TMapFile.Create;
+        var KeepMap: IInterface := MapFile;
+        MapFile.LoadFromFile(MapCopy, ReadPEPreferredBase(Binary.Path));
+        MapFile.ImageSize := Binary.ImageSize;
+
+        var Second := TModuleCodeMap.PickSecondRoutineProvider([Binary.Keep, KeepMap], Binary.Reader);
+        Check(Second <> nil, Binary.Caption + ': the MAP was not picked as the second routine provider');
+        var Plain := BuildMap(Binary);
+        var Map := TModuleCodeMap.Build(ExtractFileName(Binary.Path), Binary.Reader, Binary.Reader, 0,
+          Binary.ImageSize, nil, Second);
+        try
+          Check(Map.SecondProviderRoutineCount > 0, Binary.Caption + ': nothing was taken from the MAP');
+          Check(Length(Map.Routines) = Length(Plain.Routines) + Map.SecondProviderRoutineCount,
+            Binary.Caption + ': the routine count does not add up');
+
+          // The body of the anonymous method.
+          var Line := MarkerLineOf(Sample);
+          var Files := Map.FindFiles(Sample.Source);
+          Check((Line > 0) and (Length(Files) = 1), Binary.Caption + ': marker or file not found');
+          if (Line > 0) and (Length(Files) = 1) then begin
+            var Records := Map.LinesAt(Files[0], Line);
+            Check(Length(Records) > 0, Binary.Caption + ': the body has no line record');
+            for var Index in Records do begin
+              Check(Plain.Lines[Index].RoutineIndex < 0,
+                Binary.Caption + ': TD32 has a procedure record for the body after all');
+              var Owner := Map.Lines[Index].RoutineIndex;
+              Check(Owner >= 0, Binary.Caption + ': the body is still outside every routine');
+              if Owner < 0 then
+                Continue;
+              var Routine := Map.Routines[Owner];
+              Check(Routine.FromSecondProvider and Routine.EndIsApproximate,
+                Binary.Caption + ': the body''s routine is not flagged as the MAP''s, approximate');
+              Check(Routine.Name.Contains('$ActRec'),
+                Binary.Caption + ': the body''s routine is named ' + Routine.Name);
+            end;
+          end;
+
+          // Every routine taken lies in a gap of TD32's ranges and holds a record.
+          for var I := 0 to High(Map.Routines) do begin
+            var Routine := Map.Routines[I];
+            if not Routine.FromSecondProvider then
+              Continue;
+            Check(Routine.LineCount > 0, Format('%s: %s was taken without a record', [Binary.Caption, Routine.Name]));
+            Check(Plain.FindRoutine(Routine.StartRva) < 0,
+              Format('%s: %s starts inside a TD32 routine', [Binary.Caption, Routine.Name]));
+            if Routine.EndRva > Routine.StartRva then
+              Check(Plain.FindRoutine(Routine.EndRva - 1) < 0,
+                Format('%s: %s reaches into a TD32 routine', [Binary.Caption, Routine.Name]));
+          end;
+
+          // Nothing changed for a record TD32 covers.
+          Check(Length(Map.Lines) = Length(Plain.Lines), Binary.Caption + ': the line records differ in number');
+          if Length(Map.Lines) = Length(Plain.Lines) then
+            for var I := 0 to High(Plain.Lines) do begin
+              var Before := Plain.Lines[I];
+              var After := Map.Lines[I];
+              Check((Before.Rva = After.Rva) and (Before.Line = After.Line) and
+                    (Before.FileIndex = After.FileIndex), Format('%s: record %d differs', [Binary.Caption, I]));
+              if Before.RoutineIndex < 0 then
+                Continue;
+              var Was := Plain.Routines[Before.RoutineIndex];
+              var Still := Map.Routines[After.RoutineIndex];
+              Check((Was.StartRva = Still.StartRva) and (Was.EndRva = Still.EndRva) and (Was.Name = Still.Name) and
+                    (Was.EndIsApproximate = Still.EndIsApproximate) and (not Still.FromSecondProvider) and
+                    (Was.LineCount = Still.LineCount) and (Before.CodeLength = After.CodeLength),
+                Format('%s: record $%x of %s changed', [Binary.Caption, Before.Rva, Was.Name]));
+            end;
+        finally
+          Map.Free;
+          Plain.Free;
+          KeepMap := nil;
+        end;
+      end;
+    // What must NOT be taken. A MAP lists the class data of a unit among the
+    // publics of the code segment (`Unit..TClass`), and on x86 the record of
+    // the previous unit's final `end.` lands a few bytes into it. Taken as a
+    // routine, that data would be decoded as instructions.
+    for var Bitness in ['Win32', 'Win64'] do begin
+      var Binary := LoadOne('TestTarget ' + Bitness, 'TestTarget\' + Bitness + '\Debug\TestTarget.exe');
+      var MapCopy := TPath.Combine(Scratch, 'TestTarget_' + Bitness + '.map');
+      TFile.Copy(Binary.MapPath, MapCopy, True);
+      var MapFile := TMapFile.Create;
+      var KeepMap: IInterface := MapFile;
+      MapFile.LoadFromFile(MapCopy, ReadPEPreferredBase(Binary.Path));
+      MapFile.ImageSize := Binary.ImageSize;
+      var Plain := BuildMap(Binary);
+      var Map := TModuleCodeMap.Build(ExtractFileName(Binary.Path), Binary.Reader, Binary.Reader, 0,
+        Binary.ImageSize, nil, TModuleCodeMap.PickSecondRoutineProvider([Binary.Keep, KeepMap], Binary.Reader));
+      try
+        Check(Map.SecondProviderRoutineCount > 0, Binary.Caption + ': nothing was taken from the MAP');
+        for var I := 0 to High(Map.Routines) do
+          if Map.Routines[I].FromSecondProvider then
+            Check(not Map.Routines[I].Name.Contains('..'),
+              Format('%s: class data %s was taken for a routine', [Binary.Caption, Map.Routines[I].Name]));
+        // The last record of each of these units is its final `end.`.
+        for var UnitFile in ['TestTargetUsesA.pas', 'TestTargetUsesB.pas', 'TestTargetUsesHost.pas'] do begin
+          var Files := Map.FindFiles(UnitFile);
+          if Length(Files) <> 1 then
+            Continue;
+          var Records := Map.LinesOfFile(Files[0]);
+          if Length(Records) = 0 then
+            Continue;
+          var Last := Records[High(Records)];
+          if Plain.Lines[Last].RoutineIndex >= 0 then
+            Continue;   // this build has it inside a routine: not the shape tested
+          var Given := '';
+          if Map.Lines[Last].RoutineIndex >= 0 then
+            Given := Map.Routines[Map.Lines[Last].RoutineIndex].Name;
+          Check(Given = '', Format('%s: the "end." record of %s ($%x) was given the routine %s by the MAP',
+            [Binary.Caption, UnitFile, Map.Lines[Last].Rva, Given]));
+        end;
+      finally
+        Map.Free;
+        Plain.Free;
+        KeepMap := nil;
+      end;
+    end;
+  finally
+    DeleteTempDirWithRetry(Scratch);
+  end;
+  AssertNoProblems;
+end;
+
+procedure TCodeMapTests.PickSecondRoutineProvider_IsTheNextOneThatHasRanges;
+begin
+  var LinesOnly: IInterface := TFakeLinesOnly.Create;
+  var Both: IInterface := TFakeTables.Create;
+  var RoutinesOnly: IInterface := TFakeRoutinesOnly.Create;
+  var Lines: ILineRecordProvider;
+  var First: IRoutineRangeProvider;
+  Assert.IsTrue(TModuleCodeMap.PickProviders([nil, Both, LinesOnly, RoutinesOnly], Lines, First));
+
+  var Second := TModuleCodeMap.PickSecondRoutineProvider([nil, Both, LinesOnly, RoutinesOnly], First);
+  Assert.IsTrue((Second <> nil) and ((Second as TObject) = (RoutinesOnly as TObject)),
+    'the next provider of ranges after the first one');
+  Assert.IsTrue(TModuleCodeMap.PickSecondRoutineProvider([Both, LinesOnly], First) = nil,
+    'no other provider of ranges: none');
+  Assert.IsTrue(TModuleCodeMap.PickSecondRoutineProvider([], First) = nil);
 end;
 
 { The other formats }

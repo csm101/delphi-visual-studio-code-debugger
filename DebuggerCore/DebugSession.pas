@@ -29,7 +29,8 @@ uses
   MapFileReader, RsmFileReader, TD32FileReader, ModuleSymbolLoader,
   DelphiRtti, DelphiValueReaders, ExprEval, WinDebuggerBase, WinDebuggerX86,
   SourceResolver, SafeCallPolicy,
-  VariableExpander, BreakpointEval, ExceptionRules, ValueEncoders, DapProtocol;
+  VariableExpander, BreakpointEval, ExceptionRules, ValueEncoders, DapProtocol,
+  LiveCodeAnalysis, ZydisDisassembler;
 
 const
   // Frame index meaning "the caller has no opinion -- use the session's default
@@ -105,6 +106,13 @@ type
     FPendingBps:  TList<TBpSpec>;
     FBpSpecs:     TDictionary<string, TBpSpec>;   // lcase file -> last spec, for repost on module load
     FBpVerified:  TDictionary<string, Boolean>;   // 'lcasefile|line' -> last-known verified state, for flip detection
+    // Code maps and routine analyses of the loaded modules, built on demand:
+    // what decides whether a source breakpoint may be planted at an address
+    // and where its copies go (LiveCodeAnalysis.pas). Owned here, asked by the
+    // engine through IBreakpointPlacement; emptied whenever the process or
+    // its symbol providers go away.
+    FCodeAnalysis: TLiveCodeAnalysis;
+    FLastDeferredCheck: UInt64;   // GetTickCount64 of the last RejudgeBreakpoints... check
 
     // Data breakpoints (watchpoints; increment 4 of docs/DATA_BREAKPOINTS_PLAN.md).
     // Unlike source breakpoints there is no per-file grouping -- SetDataBreakpoints
@@ -351,12 +359,33 @@ type
     // for each line that flipped to verified.
     procedure NotifyBreakpointFlips;
     procedure StoreVerifiedState(const BpId: string; Verified: Boolean);
-    // True when the line resolves and every address it resolves to holds a zero
-    // byte in the live process: the engine will refuse to plant there. False
-    // when that cannot be established yet (no process, module not mapped).
+    // True when the line resolves and the engine will refuse to plant at EVERY
+    // address it would use for it. False when that cannot be established yet
+    // (no process, module not mapped).
     function  SourceLineLandsOnlyOnData(const SourceFile: string; Line: Integer): Boolean;
+    // The engine's own decision for one address (TWinDebugger.
+    // SourcePlantIsRefused), asked from this side: the analysis when it has a
+    // verdict, the zero-byte test when it has none.
+    function  SourcePlantWouldBeRefused(VA: UInt64): Boolean;
     // The verified state of a source line: it resolves, and not only to data.
     function  SourceLineIsBindable(const SourceFile: string; Line: Integer): Boolean;
+    // What the code analysis reads the target through, and how it finds the
+    // module an address is in.
+    function  ReadCodeForAnalysis(VA: UInt64; Buf: Pointer; Size: Integer): Integer;
+    function  LookupModuleForAnalysis(VA: UInt64; out Info: TLiveModuleInfo): Boolean;
+    // The two questions the engine asks about a source breakpoint.
+    function  HandleJudgePlant(VA: UInt64; out Reason: string): TPlantVerdict;
+    function  HandlePlantCopies(VA: UInt64): TArray<UInt64>;
+    // A module that was not relocated at its load event reached its entry
+    // point: its breakpoints are judged again, with the analysis this time.
+    procedure HandleModuleRelocated(Base: UInt64);
+    // The prefetcher's readers were registered for a module: what the analysis
+    // concluded from its previous provider set is dropped.
+    procedure HandleProvidersPublished(Module: TModuleSymbols);
+    // While stopped: a module the analysis had to decline (image not relocated,
+    // a provider still indexing) can be analysed now -> judge the breakpoints
+    // again. Paced, because the pump calls it on every turn.
+    procedure RejudgeBreakpointsOfModulesThatBecameReady;
     // Address breakpoints (docs/DISASSEMBLY_PLAN.md increment 5). Identity is
     // (ModuleName, Rva), resolved from the caller's absolute address at SET
     // time against GetModules -- never a bare VA, which is meaningless across
@@ -695,6 +724,9 @@ type
     // source resolver: read-only so a frontend can keep its introspection handlers
     // driving the single owned engine directly during the ownership-transfer phase.
     property Debugger:       IDebugTarget     read FDebugger;
+    /// <summary>Code maps and routine analyses of the loaded modules, built on
+    /// demand. Exposed for diagnostics and tests; the session owns it.</summary>
+    property CodeAnalysis:   TLiveCodeAnalysis read FCodeAnalysis;
     property Rtti:           TDelphiRtti      read FRtti;
     property SourceResolver: TSourceResolver  read FResolver;
     // Lazily create (if the process handle is available) and return the RTTI
@@ -819,6 +851,15 @@ begin
   FPendingBps  := TList<TBpSpec>.Create;
   FBpSpecs     := TDictionary<string, TBpSpec>.Create;
   FBpVerified  := TDictionary<string, Boolean>.Create;
+  FCodeAnalysis := TLiveCodeAnalysis.Create(ReadCodeForAnalysis, LookupModuleForAnalysis);
+  // The decoder is found the way the engine's own disassembler finds it: next
+  // to this executable, else the repository's copy.
+  FCodeAnalysis.ZydisDllPath := ResolveZydisDllPathForThisExe;
+  FCodeAnalysis.OnLog :=
+    procedure(const Text: string)
+    begin
+      DapLog(Text);
+    end;
   FDataBreakpoints := TList<TSessionDataBreakpoint>.Create;
   FDebuggeeOutput := TList<string>.Create;
   FDebuggerOutput := TList<string>.Create;
@@ -836,6 +877,7 @@ begin
   FLoader.DebugInfo       := FDebugInfo;
   FLoader.IsRsmDisabled   := FRsmDisabled;
   FLoader.OnSymbolsLoaded  := HandleModuleSymbolsLoaded;
+  FLoader.OnProvidersPublished := HandleProvidersPublished;
   FLoader.OnConsole        := HandleLoaderConsole;
   // ShouldRetryModule / RequiresFor stay nil (no launch-config retry, no
   // PACKAGEINFO requires) -- the neutral core is single-module oriented.
@@ -864,6 +906,7 @@ begin
                ': ' + E.Message);
     end;
   FDebugger := nil;  // release the IDebugTarget refcount (engine teardown)
+  FreeAndNil(FCodeAnalysis);
   FReaders.Free;
   FRtti.Free;
   FExpander.Free;        // frees only its handle table; reader refs not owned
@@ -894,6 +937,7 @@ begin
   // valid (destructor + a later relaunch both work; every read is gated on
   // dsStopped, so nothing touches these between now and the next launch). F17.
   FExpander.Reset;             // drop cached expansion handles into the old readers
+  FCodeAnalysis.Clear;         // maps and verdicts of a process that is gone
   FreeAndNil(FReaders);        // holds a now-stale FDebugInfo ref
   FreeAndNil(FRtti);           // the process handle is dead after teardown
   // Preserve the loader's frontend-configured hooks across the recreate. The DAP
@@ -918,6 +962,7 @@ begin
   FLoader.DebugInfo       := FDebugInfo;
   FLoader.IsRsmDisabled   := FRsmDisabled;
   FLoader.OnSymbolsLoaded := HandleModuleSymbolsLoaded;
+  FLoader.OnProvidersPublished := HandleProvidersPublished;
   FLoader.OnConsole       := HandleLoaderConsole;
   // Reapply the frontend hooks captured above (nil for the neutral core / MCP).
   if SavedModuleClass <> nil then FLoader.ModuleClass := SavedModuleClass;
@@ -1005,6 +1050,13 @@ begin
   FDebugger.OnExceptionLogged := HandleExceptionLogged;
   FDebugger.OnDllLoaded   := HandleDllLoaded;
   FDebugger.OnDllUnloaded := HandleDllUnloaded;
+  // Where a source breakpoint may be written, and where its copies go, is
+  // decided by the analysis this session owns. An engine without the
+  // interface plants as it always did.
+  FCodeAnalysis.Clear;
+  var Placement: IBreakpointPlacement;
+  if Supports(FDebugger, IBreakpointPlacement, Placement) then
+    Placement.SetSourcePlantAdvice(HandleJudgePlant, HandlePlantCopies, HandleModuleRelocated);
   FLoader.Debugger := FDebugger;  // now available for DLL RVA-shift math
   Result := True;
 end;
@@ -1176,6 +1228,50 @@ begin
   PublishPrefetchedSymbols;
   FDebugger.ProcessOneEvent;
   PublishPrefetchedSymbols;
+  RejudgeBreakpointsOfModulesThatBecameReady;
+end;
+
+procedure TDebugSession.RejudgeBreakpointsOfModulesThatBecameReady;
+const
+  CHECK_EVERY_MS = 250;
+begin
+  // Only while STOPPED, for the reason PublishPrefetchedSymbols gives: a
+  // repost rewrites planted INT3s, and the debuggee must not be running
+  // through them meanwhile.
+  if (FState <> dsStopped) or (FDebugger = nil) then
+    Exit;
+  if FCodeAnalysis.DeferredCount = 0 then
+    Exit;
+  var Now64 := GetTickCount64;
+  if Now64 - FLastDeferredCheck < CHECK_EVERY_MS then
+    Exit;
+  FLastDeferredCheck := Now64;
+  var Ready := False;
+  try
+    Ready := FCodeAnalysis.TakeModulesThatBecameReady;
+  except
+    on E: Exception do
+      DapLog('code analysis: the check for modules that became analysable raised ' +
+        E.ClassName + ': ' + E.Message);
+  end;
+  if Ready and HaveBreakpoints then
+    RepostBreakpoints;
+end;
+
+procedure TDebugSession.HandleModuleRelocated(Base: UInt64);
+begin
+  // Runs inside the engine's event loop, at the module's entry point; the
+  // engine plants what is posted here before the module's code runs.
+  FCodeAnalysis.MarkRelocated(Base);
+  FCodeAnalysis.ForgetModule(Base);
+  if HaveBreakpoints then
+    RepostBreakpoints;
+end;
+
+procedure TDebugSession.HandleProvidersPublished(Module: TModuleSymbols);
+begin
+  if (Module <> nil) and (FCodeAnalysis <> nil) then
+    FCodeAnalysis.ForgetModule(Module.Base);
 end;
 
 procedure TDebugSession.PublishPrefetchedSymbols;
@@ -2322,6 +2418,9 @@ begin
   Inc(FStopGeneration);
   if Assigned(FOnExited) then
     FOnExited(ExitCode);
+  // Nothing of the process is left to analyse, and the maps below share their
+  // routine names with the readers that are about to go.
+  FCodeAnalysis.Clear;
   // The main exe AND every runtime BPL keep their own binary memory-mapped for
   // the loader's whole life (embedded TD32). On an attach the session outlives
   // the target, so those mappings lock each file on disk and block a rebuild
@@ -2463,6 +2562,10 @@ end;
 // every stored spec so a breakpoint set before the module was present binds.
 procedure TDebugSession.HandleModuleSymbolsLoaded(Module: TModuleSymbols);
 begin
+  // The module has providers it did not have a moment ago: whatever was
+  // concluded about it without them is worked out again on the next question.
+  if Module <> nil then
+    FCodeAnalysis.ForgetModule(Module.Base);
   RepostBreakpoints;
   if Assigned(FOnModuleSymbolsLoadedHook) then
     FOnModuleSymbolsLoadedHook(Module);
@@ -2670,12 +2773,19 @@ begin
 end;
 
 // The session-side half of the engine's refusal in TWinDebugger.PlantInt3 (see
-// SourceBreakpointLandsOnData there for what is refused and why it is a
-// stopgap). The engine keeps the program safe on its own; this only keeps the
-// reported state honest, and only when the bytes can already be read -- which
-// is the case for a breakpoint set at a stop, the way the MCP front end sets
-// them. A breakpoint set before the process exists is reported from the symbols
-// alone, as before, and the engine's notice says what happened to it.
+// SourcePlantIsRefused there for what is refused and why). The engine keeps the
+// program safe on its own; this only keeps the reported state honest, and only
+// when the bytes can already be read -- which is the case for a breakpoint set
+// at a stop, the way the MCP front end sets them. A breakpoint set before the
+// process exists is reported from the symbols alone, as before, re-evaluated
+// at the first module event (HandleDllLoaded), and the engine's notice says
+// what happened to it.
+//
+// The addresses are the ENGINE's (IBreakpointPlacement.
+// SourceBreakpointAddresses), not the line table's: the engine moves a
+// breakpoint off a routine's entry and adds the copies of a line, and the
+// verdict has to be about where the byte would really go. The line is refused
+// only when every one of them is.
 function TDebugSession.SourceLineLandsOnlyOnData(const SourceFile: string;
   Line: Integer): Boolean;
 begin
@@ -2685,20 +2795,113 @@ begin
   var Base := FDebugger.ImageBase;
   if Base = 0 then
     Exit;
-  var Candidates := FDebugInfo.SourceLineToRvaCandidates(SourceFile, Line);
-  if Length(Candidates) = 0 then
+  var Addresses: TArray<UInt64> := nil;
+  var Placement: IBreakpointPlacement;
+  if Supports(FDebugger, IBreakpointPlacement, Placement) then
+    Addresses := Placement.SourceBreakpointAddresses(SourceFile, Line)
+  else
+    for var Rva in FDebugInfo.SourceLineToRvaCandidates(SourceFile, Line) do begin
+      {$Q-}
+      Addresses := Addresses + [Base + Rva];
+      {$Q+}
+    end;
+  if Length(Addresses) = 0 then
     Exit;
-  for var Rva in Candidates do begin
-    var FirstByte: Byte := 0;
-    {$Q-}
-    var VA := Base + Rva;
-    {$Q+}
-    if FDebugger.ReadCodeMemoryAt(VA, @FirstByte, 1) <> 1 then
-      Exit(False);   // not mapped (yet): nothing is known about this address
-    if FirstByte <> 0 then
+  for var VA in Addresses do
+    if not SourcePlantWouldBeRefused(VA) then
       Exit(False);
-  end;
   Result := True;
+end;
+
+function TDebugSession.SourcePlantWouldBeRefused(VA: UInt64): Boolean;
+begin
+  var Reason: string;
+  case HandleJudgePlant(VA, Reason) of
+    pvPlant:
+      Exit(False);
+    pvRefuse:
+      Exit(True);
+  end;
+  var FirstByte: Byte := 0;
+  if FDebugger.ReadCodeMemoryAt(VA, @FirstByte, 1) <> 1 then
+    Exit(False);   // not mapped (yet): nothing is known about this address
+  Result := FirstByte = 0;
+end;
+
+function TDebugSession.ReadCodeForAnalysis(VA: UInt64; Buf: Pointer; Size: Integer): Integer;
+begin
+  if (FDebugger = nil) or (Size <= 0) then
+    Exit(0);
+  // Through the engine's code reader: the program's own bytes where a
+  // breakpoint is planted, and a short read instead of a failure at the end
+  // of a region.
+  Result := Integer(FDebugger.ReadCodeMemoryAt(VA, Buf, NativeUInt(Size)));
+end;
+
+function TDebugSession.LookupModuleForAnalysis(VA: UInt64;
+  out Info: TLiveModuleInfo): Boolean;
+begin
+  Info := Default(TLiveModuleInfo);
+  if (FDebugger = nil) or (FLoader = nil) then
+    Exit(False);
+  var MainBase := FDebugger.ImageBase;
+  if (MainBase <> 0) and (VA >= MainBase) and (VA - MainBase < FLoader.MainImageSize) then begin
+    Info.Name      := LowerCase(ExtractFileName(FExePath));
+    Info.Base      := MainBase;
+    Info.Size      := FLoader.MainImageSize;
+    Info.RvaShift  := 0;
+    Info.Providers := FLoader.CodeMapProviders(nil);
+    Exit(True);
+  end;
+  var Module := FLoader.ModuleForPC(VA);
+  if Module = nil then
+    Exit(False);
+  var Lo, Hi: UInt64;
+  if not FLoader.ModuleRvaRange(Module, Lo, Hi) then
+    Exit(False);
+  Info.Name      := Module.Name;
+  Info.Base      := Module.Base;
+  Info.Size      := Module.ImageSize;
+  Info.RvaShift  := Lo;
+  Info.Providers := FLoader.CodeMapProviders(Module);
+  Result := True;
+end;
+
+// Runs on the engine's thread, inside its event loop (PlantInt3), and from
+// SetBreakpoints. A defect in the analysis must cost the analysis and nothing
+// else, so nothing it raises leaves this method.
+function TDebugSession.HandleJudgePlant(VA: UInt64; out Reason: string): TPlantVerdict;
+begin
+  Reason := '';
+  Result := pvNoAnalysis;
+  if FCodeAnalysis = nil then
+    Exit;
+  try
+    Result := FCodeAnalysis.JudgeAddress(VA, Reason);
+  except
+    on E: Exception do begin
+      DapLog(Format('code analysis: the verdict for $%x raised %s: %s',
+        [VA, E.ClassName, E.Message]));
+      Reason := '';
+      Result := pvNoAnalysis;
+    end;
+  end;
+end;
+
+function TDebugSession.HandlePlantCopies(VA: UInt64): TArray<UInt64>;
+begin
+  Result := nil;
+  if FCodeAnalysis = nil then
+    Exit;
+  try
+    Result := FCodeAnalysis.CopiesOf(VA);
+  except
+    on E: Exception do begin
+      DapLog(Format('code analysis: the copies of $%x raised %s: %s',
+        [VA, E.ClassName, E.Message]));
+      Result := nil;
+    end;
+  end;
 end;
 
 function TDebugSession.SourceLineIsBindable(const SourceFile: string;
@@ -2875,6 +3078,9 @@ end;
 
 procedure TDebugSession.HandleDllUnloaded(const Name: string; Base: UInt64);
 begin
+  // Keyed by address, so it must not survive the unload: the loader maps a
+  // module, unmaps it and maps it (or another) again at the same address.
+  FCodeAnalysis.ModuleUnloaded(Base);
   FLoader.RemoveModuleRecord(Name, Base);
   // The engine has already unplanted any breakpoint (of either kind) whose VA
   // fell in this module's range (TWinDebugger.HandleUnloadDll, VA-range based,

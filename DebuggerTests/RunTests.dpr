@@ -72,7 +72,9 @@ uses
   ZydisDetailTests in 'ZydisDetailTests.pas',
   PeImageFile     in '..\DebuggerCore\PeImageFile.pas',
   RoutineAnalysis in '..\DebuggerCore\RoutineAnalysis.pas',
-  RoutineAnalysisTests in 'RoutineAnalysisTests.pas';
+  RoutineAnalysisTests in 'RoutineAnalysisTests.pas',
+  LiveCodeAnalysis in '..\DebuggerCore\LiveCodeAnalysis.pas',
+  BreakpointPlacementTests in 'BreakpointPlacementTests.pas';
 
 const
   // Tests that cannot run while another RunTests worker is executing, because

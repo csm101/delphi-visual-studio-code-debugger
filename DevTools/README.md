@@ -941,6 +941,63 @@ handler funclets of `safecall` routines, which a scope entry names with
 `Handler` = 1 (`docs/EH_FORMAT_NOTES.md`); the funclet rule now covers them and
 the exits agree.
 
+#### BreakpointPlanProbe
+
+```bat
+DevTools\Win64\Debug\BreakpointPlanProbe.exe <exe-or-bpl> [-map <file.map>] [-zydis <Zydis.dll>] [-line <source file>:<line>]... [-notcode] [-lastlines [-listlast] [-src <dir>]...]
+
+rem examples
+DevTools\Win64\Debug\BreakpointPlanProbe.exe DebuggerTests\TestTarget\Win64\Debug\BreakpointSample.exe -line BreakpointSample.dpr:56
+DevTools\Win64\Debug\BreakpointPlanProbe.exe DebuggerTests\TestTarget\Win32\Debug\TestTarget.exe -map DebuggerTests\TestTarget\Win32\Debug\TestTarget.map -notcode
+DevTools\Win64\Debug\BreakpointPlanProbe.exe DebuggerTests\TestTarget\Win32\Debug\TestTarget.exe -map DebuggerTests\TestTarget\Win32\Debug\TestTarget.map -lastlines -src DebuggerTests\TestTarget
+```
+
+Answers, for one binary read as a FILE (nothing is launched), the two
+questions the engine asks before it plants a source breakpoint
+(`docs/DAP_DEBUGGER_ARCHITECTURE.md`, "Breakpoints") — through
+`DebuggerCore\LiveCodeAnalysis.pas`, the class a session uses for a live
+process, so the answers and the timings are the session's.
+
+- **What the first breakpoint in the module costs.** The first question builds
+  the code map and the analyzer; the tool prints that time, its two parts, the
+  growth of the process's private bytes, and what the same address costs when
+  asked again. The time to load the debug information is printed apart: a
+  session pays it at start, breakpoint or not. With `-map` the MAP is loaded
+  as the session loads one that lies beside the binary, and on a 32-bit image
+  it becomes the second routine provider of the code map. The tool waits for
+  the MAP's background index before asking; a session never does.
+- **`-line <file>:<n>`**: every line record of the line, the routine and (x64)
+  the piece of it each is in — `body` or `FUNCLET` — the verdict of the
+  routine analysis, and which of them get a breakpoint: `BP` for the address a
+  line-table provider answers with, `COPY` for a record in another piece of
+  the same routine.
+- **`-notcode`**: the source lines that have a record the analysis shows NOT to
+  be the start of an instruction, with the reason. A breakpoint on such a
+  record is refused. Analyses every routine: seconds on a large image.
+- **`-lastlines`**: the evidence for the rule that calls a record "the unit's
+  final `end.`" (`TRoutineAnalyzer.IsFinalEndOfUnit`). Of the records outside
+  every routine it counts those on the last line of their file (and, on x64,
+  those of them inside a `.pdata` function), then those the rule takes -- the
+  ones in the own file of their unit -- each split by what the bytes are: a
+  zero byte, no instruction, bytes that decode. A record on the last line of
+  its file that the rule does NOT take is printed with the unit it belongs to.
+  With `-src <dir>` (repeatable, searched recursively by file name) the source
+  line of every record taken is read and compared with `end.`; the ones that
+  say something else are printed. A source newer than the binary gives a false
+  "something else": the line number is the old file's last line. `-listlast`
+  adds, per record taken, the distance to the routine below it and whose unit
+  that routine is.
+- `-map` must name a file that exists: a `TMapFile` over a missing file reports
+  its index as pending for ever, and the tool would only wait.
+
+`-zydis` defaults to the DLL beside the tool, else the repository's
+`ThirdParty\Zydis\bin\x64` copy.
+
+Measured 2026-11-27 on a 620 MB x64 and a 530 MB x86 image: first verdict 485
+and 438 ms (code map 425 and 413, analyzer 60 and 24), 103 and 88 MB; with the
+x86 image's 145 MB MAP 648 ms, 2 694 routines taken from it. `-notcode`: 1 182
+and 2 607 records, the same 2 607 with and without the MAP.
+
 #### CodeMapDump
 
 Builds the code map of one binary from its TD32 (`DebuggerCore\CodeMap.pas`,

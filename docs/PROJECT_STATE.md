@@ -784,12 +784,18 @@ is the first engine code: it enumerates every routine and line record of a
 module and nothing uses it yet. Increment 3, the scope (`ProfileScope.pas`:
 which lines of a code map an `include` / `exclude` request selects; the
 PACKAGEINFO reader now in the core as `PackageInfoReader.pas`), is done too.
-So is the first half of increment 4: `RoutineAnalysis.pas` decodes a routine
-by following control flow and says of each line record whether it is a proven
-instruction boundary, proven not to be code, or neither. Nothing in the engine
-uses it yet. Next: the second half, where it replaces the 0.9.3 stopgap for
-breakpoints and two breakpoint defects it exposed are fixed
-(`KNOWN_UNKNOWNS.md`).
+So is increment 4: `RoutineAnalysis.pas` decodes a routine by following
+control flow and says of each line record whether it is a proven instruction
+boundary, proven not to be code, or neither; and the engine's own breakpoints
+are its first user (`LiveCodeAnalysis.pas`). A source breakpoint is refused
+only where the analysis shows there is no instruction, which replaces the
+0.9.3 stopgap; on x64 a breakpoint inside a `finally` also stops when an
+exception runs the block; and seven defects of the released engine in how a
+breakpoint is suspended, re-armed and deleted are fixed (list in the plan,
+"Verified in increment 4, second half"). These fixes are on
+`feat/profiler-coverage` only; none is in a release yet. Suite on the branch:
+1539 found / 1535 pass / 0 fail / 4 ignored. Next: increment 5, the patch map
+and the one-shot form.
 
 1. **The MCP server gains a profiler and code coverage** — one server, one
    engine. Coverage at line level by instrumentation, a hit count for every

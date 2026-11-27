@@ -1869,82 +1869,74 @@ Without it, a BPL whose RSM has zero locals for a function — while its TD32 ha
 them — shows empty locals and `Self: not found`. Regression test:
 `Test_Bpl_Td32Only_LocalsVisible`.
 
-## A breakpoint on a line record that is not code is accepted — STOPGAP in 0.9.3, real fix open
+## Breakpoints still planted where there is no code, or missing where there is — after increment 4
 
-**0.9.3:** `PlantInt3` refuses a source breakpoint whose address holds `$00`,
-and the session reports the line unverified (`DAP_DEBUGGER_ARCHITECTURE.md`,
-"A source breakpoint on data is refused"). That closes the case reproduced
-below and the zero-byte records of generic instantiations on x64. What stays
-open is everything the zero byte does not catch: a record in the middle of an
-instruction (130 on x64 and 1 173 on x86 in one large image) or on a non-zero
-data byte. Those need the boundary proof of the profiler plan's increment 4.
-The text below is the defect as found in 0.9.2.
+The profiler plan's increment 4 (2026-11-27, on `feat/profiler-coverage`, not
+in a release) replaced the 0.9.3 stopgap: a source breakpoint is refused where
+the routine analysis shows there is no instruction, and a unit's final `end.`
+is recognised without looking at bytes (`DAP_DEBUGGER_ARCHITECTURE.md`,
+"Breakpoints"). Releases up to 0.9.3 refuse only an address whose byte is
+zero: on one large x86 image that is 827 of the 1 421 records on a unit's
+final `end.`; the other 594 are still planted there.
 
-Found 2026-11-27 while measuring for the profiler; it is a defect of the
-debugger as released, independent of the profiler.
+What the analysis does not close:
 
-On a 32-bit target the line record of a unit's final `end.` points at a data
-byte after the unit's last routine (`TD32_FORMAT_NOTES.md`, "What a line record
-points at"). A breakpoint set on that line binds, is reported `verified`, and
-its `$CC` is written into the data. When the program reads that data it loops
-on an access violation.
+- **An unconfirmed record is planted, good or bad.** The analysis cannot tell
+  which it is: 2 108 records on a large x64 image and 34 682 on the x86 one,
+  nearly all good code (on x86 without a MAP, mostly the bodies of anonymous
+  methods). A record that is skewed but happens to land on an instruction
+  boundary is planted too, and stops at the wrong place.
+- **The `end;` of an x64 routine with an implicit finally stops on the plain
+  path only.** A source line inside a written `finally` block now gets a
+  breakpoint in the funclet as well; the implicit one has no line record in
+  its funclet to plant on.
+- **A stop inside an x64 funclet shows wrong locals.** There the frame is
+  addressed through `rdx`, not `rbp`. Reachable since increment 4, which is
+  what first made a breakpoint stop inside a funclet.
+- **A fixed-base module that had to move and has no entry point is never
+  analysed** (its relocation has no observable end), so it keeps the zero-byte
+  fallback. A module already loaded at attach is taken as relocated at once;
+  that path has no test.
+- **The first source breakpoint in a very large module costs about half a
+  second and 100 MB**, on the pump thread: it builds that module's whole code
+  map. Measured with `DevTools\BreakpointPlanProbe`. Building the map for the
+  asked routine only would remove it; not done.
+- **No fixture has a line record inside an instruction**, so that refusal is
+  tested on the decision function, not through a live breakpoint.
 
-Reproduced with the engine as it stands (no engine change since 0.9.2):
+## Three defects met while testing breakpoint placement — OPEN
 
-```
-DevTools\Win64\Debug\LiveSessionProbe.exe DebuggerTests\TestTarget\Win32\Debug\TestTarget.exe DebuggerTests\TestTarget TestTargetUsesA.pas:38 -seconds 8 -targetargs "-run-uses-scope"
-```
+Found 2026-11-27; none is caused by that work, none is fixed. The first two
+are also in `TRAPS.md`, because a test that trips on them fails for a reason
+that has nothing to do with what it tests.
 
-Line 38 is the unit's `end.`: `verified=True`, and the target never ends (the
-same command with the breakpoint on line 30 stops there and the target exits
-0). Without `-run-uses-scope` the data is never read and the run is normal,
-which is why nobody met it.
+- **No source line at a stop in a module mapped BELOW the main image.**
+  `TWinDebugger.VAToRva` returns 0 for an address under the image base. A
+  relocated DLL lands low on x64. `VAToRva` has 35 call sites; what a
+  module-relative or wrapped RVA would do to each has not been reviewed.
+- **x64: a parameter of a frameless routine evaluates to a constant wrong
+  value.** `Evaluate('Depth')` in a routine whose prologue is only `sub rsp`
+  (fixture `BreakpointSample`, `Recurse`). Cause not established.
+- **A `TMapFile` over a file that does not exist reports its index as pending
+  for ever.** In a session that now means the module is never analysed (it
+  used to mean a 15 s wait).
 
-Not yet measured: whether a source breakpoint on a line of generic code binds
-to one of the x64 records that land on zero or undecodable bytes (878 of them
-in one large image). `SourceLineToRvaCandidates` returns every record of the
-line, so it may.
-
-The fix is not "reject a record outside every TD32 procedure range": the
-bodies of anonymous methods are outside every range too (TD32 has no procedure
-record for them) and breakpoints in them must keep working. What separates the
-two is whether the address is a proven instruction boundary, which is what the
-routine analysis of the profiler plan (increment 4) computes. Candidates: wait
-for that and let it gate user breakpoints as well; or ship a stopgap first
-(refuse to plant where the byte to be saved is `$00`, which no compiled
-statement starts with and which covers both observed cases). Not decided.
-
-## Two breakpoint defects found by the routine-analysis tests — OPEN, in 0.9.3
-
-Found 2026-11-27 while writing the dynamic oracle of the profiler plan's
-increment 4. Both are in the engine as released.
-
-- **Removing a breakpoint restores the byte even when another breakpoint
-  shares the address.** `PlantInt3` handles two records on one address (it
-  adopts the first planter's original byte); `RemoveInt3` does not look. Every
-  `SetAddressBreakpoint` re-posts the address set, so a source breakpoint that
-  shares an address with an address breakpoint silently stops firing.
-  Measured: the `on` block of the sample's `ExceptWithOn` ran through without a
-  stop.
-- **On x64 a source breakpoint inside a `finally` block fires only on the
-  normal path.** dcc64 emits the block twice: inline, for a plain pass through
-  `try..finally`, and as a funclet the exception dispatch calls. The line has a
-  record in each. `SourceLineToRvaCandidates` returns one address per provider,
-  so the breakpoint is planted on the inline copy (`$CC`) and not on the
-  funclet (`$55` there): when an exception runs the block the breakpoint does
-  not stop. Applies as well to the `end;` of a routine with an implicit
-  finally.
-
-Both are to be fixed in the second half of that increment, where breakpoint
-planting is revisited anyway.
-
+Read from the code, not reproduced: the single step that re-arms a persistent
+breakpoint drives the step machinery whatever thread it comes from. The
+single-step case of `HandleException`, after `RearmInt3At`, goes on to
+`HandleSmOverStep(Ev.dwThreadId, ...)` or sets the trap flag for `smInto`
+without comparing the thread with `FStepTid`. A logpoint or a false-condition
+breakpoint hit by thread B while thread A is in a step-over whose isolation
+was released (a call running to its return) would then have B's stack pointer
+compared with A's and B treated as the stepper. The gate was the same before
+the re-arm became per thread. A test first, then the one-line guard.
 ## Profiler and code coverage — what the plan still assumes
 
-No engine code of `PROFILER_COVERAGE_PLAN.md` is built yet. Its table
-"Assumptions to measure" is the full list, each with the increment that settles
-it. Increments 0 and 1, the measurements, have run (2026-11-26 and -27); the
-numbers are in the plan under "Verified in increment 0" and "Verified in
-increment 1", and the format facts in `TD32_FORMAT_NOTES.md` and
+`PROFILER_COVERAGE_PLAN.md` is built up to its increment 4 (code map, scope,
+routine analysis); nothing that patches code for a collection exists yet. Its
+table "Assumptions to measure" is the full list, each with the increment that
+settles it. The numbers of each finished increment are in the plan under
+"Verified in increment N", and the format facts in `TD32_FORMAT_NOTES.md` and
 `EH_FORMAT_NOTES.md`. What is still open and can change the design:
 
 - **Do the loader and unwinder results hold on a released Windows?** Everything
@@ -1961,9 +1953,11 @@ increment 1", and the format facts in `TD32_FORMAT_NOTES.md` and
   a `finally` continuation. A `$CC` there is a debug event per call. The
   candidates are in the plan ("The runtime in the target"); none is chosen.
   Needed by increment 14.
-- **What proves the entry of an anonymous method's body on x86?** TD32 has no
-  procedure record for it and there is no `.pdata`. The MAP names it. Without
-  a MAP those lines get no probe. Increment 4.
+- **What proves the entry of an anonymous method's body on x86 when there is
+  no MAP?** TD32 has no procedure record for it and there is no `.pdata`. With
+  a MAP the code map now takes its range from there (increment 4) and the
+  records are confirmed. Without one they stay unconfirmed: a breakpoint
+  works, a probe is not placed, so those lines are missing from coverage.
 - **Why does the loader map a colliding fixed-base image twice?** Mapped,
   unmapped, mapped again at the same address, before the entry point, on both
   bitnesses, in every run. The plan only needs the consequence (purge at

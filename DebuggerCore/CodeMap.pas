@@ -23,6 +23,14 @@ unit CodeMap;
 //   * The length of each record's code: the distance to the next record or to
 //     the end of its routine, whichever is nearer.
 //   * Lookups: RVA -> line record, RVA -> routine, (file, line) -> its records.
+//   * Optionally, the ranges a SECOND routine provider knows for line records
+//     the first one leaves outside every range. TD32 has no procedure record
+//     for the body of an anonymous method; a MAP names it. Such a range is added
+//     only where it changes nothing for a record the first provider covers, only
+//     when a line record of the same unit sits exactly on its first byte (a MAP
+//     also names class data that lies between routines, and data has no line
+//     record at its start), and it is flagged
+//     (TCodeMapRoutine.FromSecondProvider).
 //
 // The unit depends on DebugInfoTypes and nothing else of the engine: no
 // session, no process, no front end. Source paths are resolved through a
@@ -72,6 +80,10 @@ type
     UnitIndex: Integer;
     /// <summary>True when <c>EndRva</c> was derived rather than recorded.</summary>
     EndIsApproximate: Boolean;
+    /// <summary>True when the range comes from the second routine provider: the
+    /// first one has no range for the line records it holds. Its end is always
+    /// approximate, and never reaches into a range of the first provider.</summary>
+    FromSecondProvider: Boolean;
     /// <summary>Index of the routine's first line record, or -1 when it has
     /// none. Its records are contiguous in <c>TModuleCodeMap.Lines</c>.</summary>
     FirstLine: Integer;
@@ -122,6 +134,8 @@ type
     FDroppedRoutineCount: Integer;
     FLinesComplete:       Boolean;
     FRoutinesComplete:    Boolean;
+    FSecondRoutineCount:  Integer;
+    FSecondRoutinesRefused: Integer;
     FBuildMs:             Double;
     function  ToModuleRva(ProviderRva: UInt64; out Rva: Cardinal): Boolean;
     function  ToModuleEnd(ProviderEndRva: UInt64; StartRva: Cardinal): Cardinal;
@@ -133,6 +147,9 @@ type
     procedure SortRoutinesByStart;
     procedure SortLinesByRva;
     procedure LinkLinesToRoutines;
+    procedure AddRoutinesOfSecondProvider(const Provider: IRoutineRangeProvider;
+      UnitIds: TDictionary<string, Integer>);
+    function  NearestRoutineAtOrBelow(Rva: Cardinal): Integer;
     procedure SpreadUnits;
     procedure IndexByFileAndLine;
     function  InternUnit(UnitIds: TDictionary<string, Integer>; const UnitName: string): Integer;
@@ -152,6 +169,15 @@ type
     class function PickProviders(const Candidates: array of IInterface;
       out LineProvider: ILineRecordProvider;
       out RoutineProvider: IRoutineRangeProvider): Boolean; static;
+    /// <summary>Picks, from the same list, a second routine provider: the first
+    /// candidate that enumerates routine ranges and is not the one already
+    /// chosen.</summary>
+    /// <param name="Candidates">The module's providers, most trusted first.
+    /// Nil entries are skipped.</param>
+    /// <param name="First">The routine provider <c>PickProviders</c> returned.</param>
+    /// <returns>The provider, or nil when the module has no other.</returns>
+    class function PickSecondRoutineProvider(const Candidates: array of IInterface;
+      const First: IRoutineRangeProvider): IRoutineRangeProvider; static;
     /// <summary>Builds the code map of one module.</summary>
     /// <param name="ModuleName">Name of the module, kept for reports.</param>
     /// <param name="LineProvider">Source of the line records.</param>
@@ -162,13 +188,23 @@ type
     /// <param name="ImageSize">The module's SizeOfImage, or 0 when unknown.
     /// Records and routines that do not fall inside it are dropped and counted.</param>
     /// <param name="Resolver">Optional; fills <c>TCodeMapFile.ResolvedPath</c>.</param>
+    /// <param name="SecondRoutineProvider">Optional. Asked only when some line
+    /// record lies outside every range of <c>RoutineProvider</c>, and only for
+    /// those records. A range of it that holds such a record becomes a routine
+    /// of the map when it starts outside every range of the first provider AND
+    /// a line record of the range's own unit starts exactly at its first byte;
+    /// it is cut at the next routine of the first provider and flagged
+    /// <c>FromSecondProvider</c> and <c>EndIsApproximate</c>. Nothing changes
+    /// for a record the first provider covers. It must answer in the same RVA
+    /// space as the other two.</param>
     /// <returns>The map; the caller owns it.</returns>
     /// <exception cref="EArgumentNilException">A provider is nil.</exception>
     class function Build(const ModuleName: string;
       const LineProvider: ILineRecordProvider;
       const RoutineProvider: IRoutineRangeProvider;
       RvaShift, ImageSize: UInt64;
-      const Resolver: TCodeMapPathResolver = nil): TModuleCodeMap; static;
+      const Resolver: TCodeMapPathResolver = nil;
+      const SecondRoutineProvider: IRoutineRangeProvider = nil): TModuleCodeMap; static;
 
     /// <summary>Index of the line record AT an address.</summary>
     /// <param name="Rva">Module-relative address.</param>
@@ -203,6 +239,18 @@ type
     /// <param name="FileIndex">Index into <c>Files</c>.</param>
     /// <returns>Indexes into <c>Lines</c>, ordered by line and then address.</returns>
     function LinesOfFile(FileIndex: Integer): TArray<Integer>;
+    /// <summary>The highest source line of a file that has a line record, when
+    /// NO record on that line lies inside a routine.</summary>
+    /// <remarks>That is the shape of a unit's final <c>end.</c> when the unit
+    /// has no initialization code: nothing comes after it in the file, and its
+    /// record points past the unit's last routine, at whatever follows. The
+    /// body of an anonymous method, which can lie outside every routine range
+    /// as well, never qualifies: the <c>end;</c> of the routine that encloses
+    /// it is on a later line, or on the same line and inside a routine.</remarks>
+    /// <param name="FileIndex">Index into <c>Files</c>.</param>
+    /// <returns>The line, or -1 when the file has no record or its highest
+    /// line carries a record inside a routine.</returns>
+    function LastLineOutsideRoutines(FileIndex: Integer): Integer;
     /// <summary>Name of a unit.</summary>
     /// <param name="UnitIndex">Index into <c>Units</c>, or -1.</param>
     /// <returns>The name, or an empty string for -1.</returns>
@@ -244,6 +292,13 @@ type
     property RoutinesComplete: Boolean read FRoutinesComplete;
     /// <summary>Both providers enumerated everything.</summary>
     property Complete: Boolean read GetComplete;
+    /// <summary>Routines taken from the second routine provider.</summary>
+    property SecondProviderRoutineCount: Integer read FSecondRoutineCount;
+    /// <summary>Ranges of the second routine provider that hold a record the
+    /// first one leaves out and were NOT taken: they start inside a range of the
+    /// first provider, or no line record of their own unit starts at their
+    /// first byte, so nothing says their start is the entry of a routine.</summary>
+    property SecondProviderRefusedCount: Integer read FSecondRoutinesRefused;
     /// <summary>Wall time <c>Build</c> took, in milliseconds, including the
     /// providers' own enumeration.</summary>
     property BuildMs: Double read FBuildMs;
@@ -296,11 +351,26 @@ begin
   Result := (LineProvider <> nil) and (RoutineProvider <> nil);
 end;
 
+class function TModuleCodeMap.PickSecondRoutineProvider(const Candidates: array of IInterface;
+  const First: IRoutineRangeProvider): IRoutineRangeProvider;
+begin
+  for var Candidate in Candidates do begin
+    if Candidate = nil then
+      Continue;
+    if not Supports(Candidate, IRoutineRangeProvider, Result) then
+      Continue;
+    if Result <> First then
+      Exit;
+  end;
+  Result := nil;
+end;
+
 class function TModuleCodeMap.Build(const ModuleName: string;
   const LineProvider: ILineRecordProvider;
   const RoutineProvider: IRoutineRangeProvider;
   RvaShift, ImageSize: UInt64;
-  const Resolver: TCodeMapPathResolver): TModuleCodeMap;
+  const Resolver: TCodeMapPathResolver;
+  const SecondRoutineProvider: IRoutineRangeProvider): TModuleCodeMap;
 begin
   if LineProvider = nil then
     raise EArgumentNilException.Create('TModuleCodeMap.Build: no line record provider');
@@ -319,10 +389,12 @@ begin
     try
       Result.LoadRoutines(RoutineProvider, UnitIds);
       Result.LoadLines(LineProvider, UnitIds, Resolver);
+      Result.LinkLinesToRoutines;
+      if (SecondRoutineProvider <> nil) and (SecondRoutineProvider <> RoutineProvider) then
+        Result.AddRoutinesOfSecondProvider(SecondRoutineProvider, UnitIds);
     finally
       UnitIds.Free;
     end;
-    Result.LinkLinesToRoutines;
     Result.SpreadUnits;
     Result.IndexByFileAndLine;
     Result.FBuildMs := Clock.Elapsed.TotalMilliseconds;
@@ -401,6 +473,7 @@ begin
     FRoutines[Count].Name             := Ranges[I].Name;
     FRoutines[Count].UnitIndex        := InternUnit(UnitIds, Ranges[I].UnitName);
     FRoutines[Count].EndIsApproximate := Ranges[I].EndIsApproximate;
+    FRoutines[Count].FromSecondProvider := False;
     FRoutines[Count].FirstLine        := -1;
     FRoutines[Count].LineCount        := 0;
     Inc(Count);
@@ -550,7 +623,13 @@ var
 begin
   Nearest := -1;
   FOutsideRoutineCount := 0;
+  // The pass runs a second time when routines of a second provider were added.
+  for var I := 0 to High(FRoutines) do begin
+    FRoutines[I].FirstLine := -1;
+    FRoutines[I].LineCount := 0;
+  end;
   for var I := 0 to High(FLines) do begin
+    FLines[I].CodeLength := 0;
     var Rva := FLines[I].Rva;
     while (Nearest < High(FRoutines)) and (FRoutines[Nearest + 1].StartRva <= Rva) do
       Inc(Nearest);
@@ -567,6 +646,184 @@ begin
     if Bound > Rva then
       FLines[I].CodeLength := Cardinal(Bound - Rva);
   end;
+end;
+
+function TModuleCodeMap.NearestRoutineAtOrBelow(Rva: Cardinal): Integer;
+// The routine with the nearest start at or below an address, whether or not its
+// range reaches the address; -1 when every routine starts above it.
+begin
+  Result := -1;
+  var Lo := 0;
+  var Hi := High(FRoutines);
+  while Lo <= Hi do begin
+    var Mid := (Lo + Hi) shr 1;
+    if FRoutines[Mid].StartRva <= Rva then begin
+      Result := Mid;
+      Lo     := Mid + 1;
+    end else
+      Hi := Mid - 1;
+  end;
+end;
+
+procedure TModuleCodeMap.AddRoutinesOfSecondProvider(const Provider: IRoutineRangeProvider;
+  UnitIds: TDictionary<string, Integer>);
+// TD32 has no procedure record for the body of an anonymous method, so its line
+// records lie outside every routine; a MAP beside the binary names that body.
+// For each record the first provider leaves out, the second provider's range
+// that holds it becomes a routine -- under three conditions that keep every
+// record the first provider covers exactly as it was:
+//
+//   * the range STARTS in the gap between two routines of the first provider.
+//     A range that starts inside one of them would take over the records behind
+//     its start (an address belongs to the routine with the nearest start at or
+//     below it), and its start would be no proven entry either;
+//   * a line record of the range's OWN UNIT starts exactly at the range's first
+//     byte. A compiled routine has one there, for its `begin`. What a MAP lists
+//     between routines is not all code: the class data of a unit is a public in
+//     the code segment too (`Unit..TClass`), and the record of the previous
+//     unit's final `end.` typically lands a few bytes into it. Taking such a
+//     range would have the routine analysis decode data as instructions and
+//     "confirm" a record that 0.9.3 already knew to refuse;
+//   * it is cut at the next routine of the first provider;
+//   * its end is flagged approximate, whatever the second provider says: it
+//     was just cut, or it is a MAP's "next public".
+type
+  TSecondRange = record
+    StartRva, EndRva: Cardinal;
+    Source: Integer;
+  end;
+var
+  Second: TArray<TSecondRange>;
+
+  function RangeHolding(Rva: Cardinal): Integer;
+  begin
+    Result := -1;
+    var Lo := 0;
+    var Hi := High(Second);
+    while Lo <= Hi do begin
+      var Mid := (Lo + Hi) shr 1;
+      if Second[Mid].StartRva <= Rva then begin
+        Result := Mid;
+        Lo     := Mid + 1;
+      end else
+        Hi := Mid - 1;
+    end;
+    if (Result >= 0) and (Rva >= Second[Result].EndRva) then
+      Result := -1;
+  end;
+
+  // A line record of the range's own unit sits on the range's first byte.
+  function StartsAtALineOfItsUnit(StartRva: Cardinal; const UnitName: string): Boolean;
+  begin
+    if UnitName = '' then
+      Exit(False);
+    var Entry := FindLine(StartRva);
+    if Entry < 0 then
+      Exit(False);
+    Result := SameText(Self.UnitName(FLines[Entry].UnitIndex), UnitName);
+  end;
+
+begin
+  if FOutsideRoutineCount = 0 then
+    Exit;
+  var Complete: Boolean;
+  var Ranges := Provider.RoutineRanges(Complete);
+  if Length(Ranges) = 0 then
+    Exit;
+
+  SetLength(Second, Length(Ranges));
+  var Count := 0;
+  var InOrder := True;
+  for var I := 0 to High(Ranges) do begin
+    var StartRva: Cardinal;
+    if not ToModuleRva(Ranges[I].StartRva, StartRva) then
+      Continue;
+    if (Count > 0) and (StartRva <= Second[Count - 1].StartRva) then
+      InOrder := False;
+    Second[Count].StartRva := StartRva;
+    Second[Count].EndRva   := ToModuleEnd(Ranges[I].EndRva, StartRva);
+    Second[Count].Source   := I;
+    Inc(Count);
+  end;
+  SetLength(Second, Count);
+  if not InOrder then
+    TArray.Sort<TSecondRange>(Second, TComparer<TSecondRange>.Construct(
+      function(const A, B: TSecondRange): Integer
+      begin
+        if A.StartRva < B.StartRva then
+          Exit(-1);
+        if A.StartRva > B.StartRva then
+          Exit(1);
+        Result := 0;
+      end));
+
+  var Added := TList<TCodeMapRoutine>.Create;
+  try
+    var LastRefused := -1;
+    for var I := 0 to High(FLines) do begin
+      if FLines[I].RoutineIndex >= 0 then
+        Continue;
+      var Rva := FLines[I].Rva;
+      if (Added.Count > 0) and (Rva < Added.Last.EndRva) then
+        Continue;   // inside the range the previous record brought in
+      var Holder := RangeHolding(Rva);
+      if (Holder < 0) or (Holder = LastRefused) then
+        Continue;
+      // The gap of the first provider's routines the record lies in.
+      var Below := NearestRoutineAtOrBelow(Rva);
+      var GapStart: Cardinal := 0;
+      if Below >= 0 then begin
+        GapStart := FRoutines[Below].EndRva;
+        // An empty routine of the first provider still owns its start address.
+        if GapStart <= FRoutines[Below].StartRva then
+          GapStart := FRoutines[Below].StartRva + 1;
+      end;
+      var GapEnd: UInt64 := FLimit;
+      if Below < High(FRoutines) then
+        GapEnd := FRoutines[Below + 1].StartRva;
+      var Item := Second[Holder];
+      if (Item.StartRva < GapStart) or
+         ((Added.Count > 0) and (Item.StartRva < Added.Last.EndRva)) or
+         not StartsAtALineOfItsUnit(Item.StartRva, Ranges[Item.Source].UnitName) then begin
+        Inc(FSecondRoutinesRefused);
+        LastRefused := Holder;
+        Continue;
+      end;
+      var Routine := Default(TCodeMapRoutine);
+      Routine.StartRva := Item.StartRva;
+      Routine.EndRva   := Item.EndRva;
+      if Routine.EndRva > GapEnd then
+        Routine.EndRva := Cardinal(GapEnd);
+      Routine.Name               := Ranges[Item.Source].Name;
+      Routine.UnitIndex          := InternUnit(UnitIds, Ranges[Item.Source].UnitName);
+      Routine.EndIsApproximate   := True;
+      Routine.FromSecondProvider := True;
+      Routine.FirstLine          := -1;
+      Added.Add(Routine);
+    end;
+    if Added.Count = 0 then
+      Exit;
+
+    // Both lists are sorted by start and share no start: one merge.
+    var Merged: TArray<TCodeMapRoutine>;
+    SetLength(Merged, Length(FRoutines) + Added.Count);
+    var A := 0;
+    var B := 0;
+    for var K := 0 to High(Merged) do
+      if (B >= Added.Count) or ((A < Length(FRoutines)) and
+                                (FRoutines[A].StartRva < Added[B].StartRva)) then begin
+        Merged[K] := FRoutines[A];
+        Inc(A);
+      end else begin
+        Merged[K] := Added[B];
+        Inc(B);
+      end;
+    FRoutines := Merged;
+    FSecondRoutineCount := Added.Count;
+  finally
+    Added.Free;
+  end;
+  LinkLinesToRoutines;
 end;
 
 procedure TModuleCodeMap.SpreadUnits;
@@ -732,6 +989,26 @@ begin
     Exit(nil);
   Result := Copy(FByFileLine, FFileFirst[FileIndex],
     FFileFirst[FileIndex + 1] - FFileFirst[FileIndex]);
+end;
+
+function TModuleCodeMap.LastLineOutsideRoutines(FileIndex: Integer): Integer;
+begin
+  Result := -1;
+  if (FileIndex < 0) or (FileIndex >= Length(FFiles)) then
+    Exit;
+  // The file's run is ordered by line: its last entry is on the highest line.
+  var First := FFileFirst[FileIndex];
+  var Last := FFileFirst[FileIndex + 1] - 1;
+  if Last < First then
+    Exit;
+  var Highest := FLines[FByFileLine[Last]].Line;
+  var At := Last;
+  while (At >= First) and (FLines[FByFileLine[At]].Line = Highest) do begin
+    if FLines[FByFileLine[At]].RoutineIndex >= 0 then
+      Exit;
+    Dec(At);
+  end;
+  Result := Highest;
 end;
 
 function TModuleCodeMap.LinesAt(FileIndex, Line: Integer): TArray<Integer>;

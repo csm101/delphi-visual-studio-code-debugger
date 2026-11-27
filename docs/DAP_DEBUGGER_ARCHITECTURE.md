@@ -121,8 +121,15 @@ The debugger engine is exposed through two frontends:
   for each line record a verdict: confirmed, not code, or unconfirmed. Depends
   on `CodeMap.pas`, `Disassembler.pas` and `ZydisApi.pas` only; bytes come
   through a reader callback, so it runs on a file and on a live process. See
-  "Routine analysis" below. Nothing in the adapter or the MCP server uses it
-  yet.
+  "Routine analysis" below. Its first user is the breakpoint path, through
+  `LiveCodeAnalysis.pas`.
+- `LiveCodeAnalysis.pas` — `TLiveCodeAnalysis`: the code maps and routine
+  analyzers of the modules of a LIVE session, built on demand and owned by
+  `TDebugSession`. It answers the two questions the engine asks before it
+  plants a source breakpoint: may the byte be written at this address, and
+  where else was the line's code emitted within the same routine. Knows no
+  session and no engine class: bytes through a reader, modules through a lookup
+  callback. See "Breakpoints" below.
 - `PeImageFile.pas` — `TPeImageFile`: a PE file mapped read-only and readable
   by virtual address, with the signature of `TDisasmByteReader`. It is what
   lets the routine analysis run on a binary that is never started (the sweep
@@ -143,7 +150,8 @@ The debugger engine is exposed through two frontends:
   module, joined once, in module-relative RVAs. Depends on
   `DebugInfoTypes.pas` and on nothing else of the engine, so it can be built
   from a binary on disk as well as from a module of a live session. See "Code
-  map" below. Nothing in the adapter or the MCP server uses it yet.
+  map" below. A live session builds one per module, lazily, for the breakpoint
+  path (`LiveCodeAnalysis.pas`).
 - `ProfileScope.pas` — `TProfileScope`: the `include` / `exclude` lists of a
   profiling or coverage collection, parsed once and applied to code maps.
   Depends on `CodeMap.pas` only. See "Scope" below. Nothing in the adapter or
@@ -1367,6 +1375,29 @@ is reported as not measurable.
   when one matches), `LinesAt(file, line)` and `LinesOfFile`. The (file, line)
   index is the record indexes ordered by (file, line, RVA), built with two
   stable counting passes over records that are already in RVA order.
+- **A second routine provider** (`Build`'s last argument,
+  `PickSecondRoutineProvider`). TD32 has no procedure record for the body of
+  an anonymous method, so its line records lie outside every routine; a MAP
+  names the body. The second provider is asked only when the first leaves
+  records out, and only about those. One of its ranges becomes a routine
+  (`TCodeMapRoutine.FromSecondProvider`, `EndIsApproximate` always) when all
+  of this holds: it holds such a record; it STARTS in a gap between two
+  routines of the first provider (a range starting inside one would take over
+  the records behind its start, since an address belongs to the routine with
+  the nearest start at or below it); and a line record of the range's own unit
+  starts exactly on its first byte. It is cut at the next routine of the first
+  provider. Nothing changes for a record the first provider covers
+  (`SecondProviderRoutineCount`, `SecondProviderRefusedCount`).
+  The last condition is not caution for its own sake. A MAP lists the class
+  data of a unit among the publics of the code segment (`Unit..TClass`), and
+  on x86 the record of the previous unit's final `end.` lands a few bytes into
+  it. Without the condition that data became a "routine", the routine analysis
+  decoded it as instructions from its first byte, and the `end.` record came
+  out as whatever the garbage decode made of it — on a live image, sometimes
+  "confirmed", so the breakpoint 0.9.3 refused was planted again. Measured on
+  the 32-bit fixture: 13 ranges taken without the condition, 10 with it; on a
+  530 MB image 3 818 and 2 694, with the set of "not code" records unchanged
+  (2 607) either way.
 
 A map is immutable once built and can be read from any thread.
 
@@ -1376,11 +1407,17 @@ Measured with `DevTools\CodeMapDump` on a 620 MB x64 and a 530 MB x86 image
 routine, 4 per record for the (file, line) index) plus 40.3 and 34.1 MB of
 routine names, which are shared with the reader while it is alive.
 
-**Not wired yet.** Nothing in the session builds a code map. A live module's
-map is `Build` over the providers in `TModuleSymbols` (`Td32Iface` or
-`TdsIface`, then `MapIface`, then `JclIface`) with `RvaShift` taken from
-`TModuleSymbolLoader.ModuleRvaRange`; the increment that adds the first
-collector adds that call.
+**In a live session.** `TLiveCodeAnalysis` builds the map of a module the
+first time something asks about an address in it — today, the first source
+breakpoint there — from `TModuleSymbolLoader.CodeMapProviders` (`Td32Iface`
+or `TdsIface`, then `MapIface`, then `JclIface`; for the main executable the
+main readers in the same order) with `RvaShift` taken from
+`TModuleSymbolLoader.ModuleRvaRange`. The second routine provider is passed
+for a 32-bit module only (on x64 `.pdata` gives the entry of an anonymous
+method's body), and never waited for: a MAP whose publics are still being
+indexed is left out and the map is built once more when they are ready. A
+module's map is dropped when the module unloads and when its providers change.
+See "Breakpoints", "The analysis decides", for what it costs.
 
 ## Scope
 
@@ -1520,9 +1557,10 @@ does.
 
 `docs/PROFILER_COVERAGE_PLAN.md`, increment 4. `RoutineAnalysis.pas`,
 `TRoutineAnalyzer`: what a patch written into a routine has to know, and which
-line records can be trusted. **Not wired yet**: nothing in the engine calls it;
-breakpoints still use the 0.9.3 stopgap (a source breakpoint on a zero byte is
-refused).
+line records can be trusted. Its first user is the breakpoint path: a source
+breakpoint is refused on an address the analysis shows not to be the start of
+an instruction, and on x64 its copies in the funclets of the same routine are
+found through it ("Breakpoints", below).
 
 ### Input and output
 
@@ -1560,7 +1598,7 @@ An analyzer keeps scratch buffers between routines: one per thread.
 | verdict | meaning | reasons |
 |---|---|---|
 | `lvConfirmed` | a decode that started at a proven place arrives exactly here | boundary |
-| `lvNotCode` | shown to be something else | inside a proven instruction; inside a jump table; inside a clause table; not reached and the byte is zero; not reached and the bytes are no instruction |
+| `lvNotCode` | shown to be something else | inside a proven instruction; inside a jump table; inside a clause table; not reached and the byte is zero; not reached and the bytes are no instruction; outside every routine on the last line of its unit's own file — the unit's final `end.` ("Breakpoints", "A unit's final `end.`") |
 | `lvUnconfirmed` | not reached, no proof either way | what stands before it (an indirect jump, a `ret` / `jmp`, a trap, a stopped decode, a table, nothing); outside every routine; unreadable; decoder unavailable |
 
 The last two are never merged. A probe needs the first; a breakpoint is to be
@@ -1644,9 +1682,27 @@ every routine of the code map. On x64 `UnmappedFunctions` lists the `.pdata`
 functions that hold such records — a root function plus the funclets that
 directly follow it — and `AnalyzeUnmapped` analyses one from its
 `BeginAddress`. On x86 nothing proves an entry: the records are unconfirmed,
-unless the code map was built with routine ranges from a MAP, which names the
-body and makes it an ordinary routine. `AnalyzeLine(LineIndex)` routes a single
-record to whichever applies.
+unless the code map was built with a MAP as its second routine provider ("Code
+map"), which names the body and makes it an ordinary routine.
+`AnalyzeLine(LineIndex)` routes a single record to whichever applies.
+
+### An address that is not a line record, and the pieces of a routine
+
+Two entry points exist for the breakpoint path.
+
+`AnalyzeAddress(Rva)` gives a verdict for ANY address: the record's own when a
+line record of the code map starts there, otherwise what the flags of the
+routine holding the address say about that byte (a boundary, the inside of an
+instruction, a table, or not reached — with the same zero-byte and
+does-not-decode tests a record gets). A line-table provider other than the one
+the code map was built from can name an address the map has no record for; the
+question "is this the start of an instruction" still has to be answerable.
+
+`CodeRegionOf(Rva, RegionStart, RootStart)` says, on x64, which PIECE of a
+routine an address is in, as `.pdata` divides it: the body
+(`RegionStart = RootStart`) or one of its funclets, through nested funclets.
+Two line records of one source line in two different pieces are the same code
+emitted twice; two in the same piece are not.
 
 ### Cost
 
@@ -1832,6 +1888,9 @@ Stored in `FBreakpoints: TList<TBreakpointRec>`. Each record carries:
 - `OrigByte` — byte saved before planting `0xCC`.
 - `SourceFile`, `SourceLine` — for reporting.
 - `IsOneShot`, `IsPlanted`.
+- `Refused` — a user's source breakpoint the engine declined to write (see "The
+  analysis decides" below); `IsCopy` — the same line emitted a second time in
+  the same routine (see "A line emitted twice").
 
 Plant lifecycle:
 
@@ -1840,11 +1899,12 @@ Plant lifecycle:
    `ckSetBreakpoints` (or queues to `FPendingBps` if launch hasn't
    happened yet).
 2. `DoSetBreakpoints` clears existing breakpoints in the file, then for
-   each line either plants `INT3` immediately (post-startup) or simply
+   each line and each address it resolves to either plants `INT3`
+   immediately and adds the line's copies (post-startup) or simply
    registers the spec (pre-startup).
 3. The OS startup `EXCEPTION_BREAKPOINT` triggers
-   `ApplyAllBreakpoints`, which recomputes VA from `Rva + ImageBase`
-   and plants every registered persistent breakpoint.
+   `ApplyAllBreakpoints`, which recomputes VA from `Rva + ImageBase`,
+   plants every registered persistent breakpoint and adds its copies.
 
 **A breakpoint on `begin` is moved to the body** (`BreakpointBodyRva`). A
 routine's `begin` line resolves to its ENTRY address, where the prologue has not
@@ -1859,35 +1919,336 @@ target has no `.pdata` to consult. A routine whose body shares the entry's line
 record (a one-liner, a frameless `asm` body) has no such address and is left at
 the entry rather than guessed past.
 
-**Planting is duplicate-safe.** Two source lines can resolve to one address (and
-the move above maps `begin` onto the first statement). A second plant would read
-the `$CC` the first wrote and save THAT as its original byte, so unplanting
-would restore a breakpoint instruction and leave the target trapping forever at
-an address no breakpoint owns. `PlantInt3` adopts the first planter's original
-byte and skips the write.
+**One byte, several records.** Two source lines can resolve to one address
+(the move above maps `begin` onto the first statement), a source breakpoint and
+an address breakpoint can sit on the same instruction, and a breakpoint and its
+copy are records of their own. The `$CC` therefore belongs to the ADDRESS, not
+to a record, and there is no "remove the breakpoint byte of this record". There
+are three operations and nothing else touches the byte:
 
-**A source breakpoint on data is refused (0.9.3, a stopgap).** Not every line
-record is code: on a 32-bit image the record of a unit's final `end.` points at
-a data byte after the unit's last routine (`TD32_FORMAT_NOTES.md`, "What a line
-record points at"). A `$CC` written there is never executed and never restored;
-it changes the program's data, and the 32-bit fixture then loops on an access
-violation in the RTL. `PlantInt3` now refuses a user's source breakpoint whose
-address holds `$00` (`SourceBreakpointLandsOnData`): nothing is written, the
-refusal goes to the log and, once per address, to the user as a notice. One-shot
-breakpoints (steps, the entry stop) and address breakpoints are not affected.
+| operation | what it does | used by |
+|---|---|---|
+| `PlantInt3(record)` | the record claims the byte: it writes `$CC`, or adopts the program's byte a planted sibling already saved and writes nothing | every plant |
+| `SuspendInt3At(VA)` / `RearmInt3At(VA)` | TRANSIENT: the program's byte goes back and EVERY record at the address is marked unplanted, so that the instruction can run once; the re-arm plants all of them again | the hit path, `UnpatchBpAtRip`, the skip inside a synthetic call, the clean detach |
+| `DeleteBreakpointRecord(index)` | PERMANENT: the record goes; the byte goes back only when no other planted record at the address needs it | `ClearBreakpointsByFile`, `ClearAddressBreakpointsByModule`, `ClearStepBps`, module unload |
+
+Three defects of 0.9.3 came from one `RemoveInt3(record)` doing both jobs:
+
+- *Deleting a record restored the byte under its siblings.* Every
+  `SetAddressBreakpoint` re-posts the module's whole address set, so a source
+  breakpoint sharing its address with an address breakpoint stopped firing at
+  the next one: the delete put the program's byte back, and the re-plant then
+  adopted a byte that was no longer there.
+- *The hit path suspended one record.* With two records on an address the
+  re-arm found the second still flagged "planted", adopted its byte and skipped
+  the write. Breakpoints on `begin` and on the first statement of the same
+  routine fired twice and never again.
+- *Resuming looked at one record.* A breakpoint added on the very address the
+  thread is stopped at is planted at once, while the record that stopped the
+  thread is still suspended. `UnpatchBpAtRip` looked at that suspended record,
+  left the new `$CC` in place and ran the thread onto it, and the re-arm branch
+  of `HandleException` continued one byte into the instruction. It now asks
+  whether ANY persistent record at the address is planted. (On x64 the
+  instruction happened to decode from its second byte as another instruction
+  of the same length, so the program carried on with a wrong value and nothing
+  else showed.)
+
+The transient removal is never suppressed because a sibling shares the byte:
+the thread is parked on it and must run the real instruction next.
+
+Which record takes a hit (`FindBreakpointByVA`): with one record at an address
+— every case but the ones above — that record. Where a one-shot and a
+persistent record share an address (a user breakpoint set on a step's target
+while the step was in flight) the persistent one answers, and the one-shot is
+spent by the hit: the persistent path already knows how to be a step's landing,
+which is what `PlantStepBp` relies on when the user breakpoint was there first.
+`ClearStepBps` deletes the ONE-SHOT at an address, never whatever record is
+found there. A hit on an address with several persistent records is one hit for
+each (`PersistentHitStops`): each is put to the host's condition / hit count /
+logpoint, and the hit stops when any of them says so. An address breakpoint
+counts its own hits. A SOURCE breakpoint counts per line: every record of the
+same file and line -- its other addresses and its copies, see below -- carries
+one count, raised once by a hit on any of them, because a hit condition such
+as `>= 2` is about passes through the line. Counted per record, a breakpoint
+with `>= 2` in a `finally` block that runs once plainly and once for an
+exception saw one hit in each copy and never stopped
+(`HitCondition_OnALineWithACopy_CountsPassesThroughTheLine`).
+
+**The analysis decides whether a source breakpoint is planted.** Not every line
+record is code. On a 32-bit image the record of a unit's final `end.` points at
+a data byte after the unit's last routine; a few records of generic
+instantiations land on zero bytes on x64; others lie in the middle of an
+instruction or inside a table (`TD32_FORMAT_NOTES.md`, "What a line record
+points at"). A `$CC` written there is never executed and never restored: it
+changes a constant or a table of the program. The 32-bit fixture then loops on
+an access violation in the RTL; the 64-bit one dies with one when the patched
+entry of a jump table is used.
+
+`PlantInt3` asks before it writes (`SourcePlantIsRefused`). The question goes
+to the session's `TLiveCodeAnalysis` through `IBreakpointPlacement` — a small
+interface of its own beside `IDebugTarget`, which `TWinDebugger` implements and
+the session obtains with `Supports`; the engine class knows no session. The
+answer is one of three (`TPlantVerdict`):
+
+| answer | when | effect |
+|---|---|---|
+| `pvRefuse` | the routine analysis SHOWS the address to be something else than the start of an instruction: inside a decoded instruction, inside a jump table or a clause table, not reached and the byte is `$00`, not reached and the bytes are no instruction, or the final `end.` of a unit (below) | nothing is written; the record is flagged `Refused` |
+| `pvPlant` | a proven instruction boundary, or an address the analysis could not confirm either way | planted as before |
+| `pvNoAnalysis` | no decoder (`Zydis.dll` missing), no code map for the module (only `.rsm` or `.dcp`), a provider that is still indexing or cannot enumerate everything, or an image not known to be relocated ("When the analysis cannot answer yet", below) | the test of 0.9.3 applies unchanged: refused when the byte is `$00` |
+
+"Could not confirm" is not "refused", and that is the whole difference from the
+rule a probe will need. On x86 without a MAP the body of an anonymous method is
+unconfirmed — nothing proves its entry — and breakpoints there work.
+
+A refusal goes to the log and, once per address and per load of its module, to
+the user as a notice that names the reason the analysis gave. One-shot
+breakpoints (steps, the entry stop) and address breakpoints are never refused:
+those are addresses the engine or the user chose on purpose. A refused record
+owns no byte and takes no hit, so `FindBreakpointByVA` does not return it and
+it cannot shadow a step's target.
 
 The session keeps the reported state in step (`SourceLineIsBindable`): a line
-whose every address holds a zero byte is unverified. That is decided at once for
-a breakpoint set while the process exists, and at the first module event
-(`HandleDllLoaded`, once) for one set before it did, which is the first moment
-the executable's bytes can be read; the usual `OnBreakpointChanged` event
-carries the flip to the client.
+is unverified when the engine would refuse EVERY address it would use for it.
+The addresses are asked of the engine (`SourceBreakpointAddresses`: after the
+move off `begin`, with the copies), the verdict of the same analysis. That is
+decided at once for a breakpoint set while the process exists, and at the first
+module event (`HandleDllLoaded`, once) for one set before it did, which is the
+first moment the executable's bytes can be read; the usual
+`OnBreakpointChanged` event carries the flip to the client.
 
-It is a stopgap because the real question is whether the address is a proven
-instruction boundary, and only the zero byte is checked. No statement dcc32 or
-dcc64 compiles starts with `$00`, so nothing legitimate is refused, but a bad
-record on any other byte is not caught. The routine analysis planned in
-`PROFILER_COVERAGE_PLAN.md` (increment 4) replaces the test.
+What is built, and when (`LiveCodeAnalysis.pas`):
+
+- Per module, on the first question about an address in it: the code map (with
+  a MAP as second routine provider on a 32-bit module, see "Code map") and a
+  `TRoutineAnalyzer` that reads through `IDebugTarget.ReadCodeMemoryAt`, so it
+  sees the program's bytes under planted breakpoints.
+- Per address, on the first question about it: the analysis of the ONE routine
+  that holds it. The verdict is kept, so re-arming a breakpoint after a hit is
+  a dictionary lookup and never an analysis.
+- A module's map, analyzer and verdicts go when the module unloads and when its
+  providers change; everything goes when the process exits. Anything keyed by
+  address must not survive an unload (`TRAPS.md`).
+- A module the analysis cannot read yet -- a provider still indexing, an image
+  not known to be relocated -- is not analysed and not remembered, and
+  `pvNoAnalysis` is the answer until it can be ("When the analysis cannot
+  answer yet", below).
+- Where the proof is weakest there is a floor: in a routine known only from a
+  MAP (its entry is a name, which nothing in the binary proves to be code) a
+  record whose byte is `$00` is refused whatever the decode says.
+
+Measured with `DevTools\BreakpointPlanProbe` (the same class over a file; the
+debug information is loaded when the session starts, breakpoint or not, and is
+not part of these figures):
+
+| image | first source breakpoint in the module | of which the code map | memory |
+|---|---|---|---|
+| fixtures (1.3 MB) | 1 to 4 ms | 0.1 to 3 ms | 0.1 MB |
+| x64, 620 MB, 2.88 million line records | 485 ms | 425 ms | 103 MB |
+| x86, 530 MB, 2.79 million line records, no MAP | 438 ms | 413 ms | 88 MB |
+| the same with its MAP (145 MB) as second routine provider | 648 ms | 623 ms | 87 MB |
+
+That is half a second, once per module and per load, on the thread that
+dispatches debug events: at the first breakpoint set in a stopped session, or
+at the first module event when breakpoints were set before the launch. It is
+the code map, not the analysis (a routine is milliseconds), and it is not
+hidden behind a thread. Every later breakpoint in the module costs the analysis
+of its routine; the same address again costs a microsecond.
+
+What is still planted that should not be: a record the analysis cannot confirm
+and cannot refute (34 682 of 2.79 million on the large x86 image, 2 108 of 2.88
+million on the x64 one — mostly the bodies of anonymous methods without a MAP
+and code behind an unexplained indirect jump, which are good code), and a
+skewed record that happens to land on an instruction boundary, which no static
+test tells from a good one. What 0.9.3 planted and is refused now: 1 415 records
+on the x86 image and 500 on the x64 one (inside an instruction, in a table,
+undecodable), beside the 1 192 and 682 zero-byte records it already refused.
+
+**A unit's final `end.`.** On a 32-bit image the line record of a unit's final
+`end.` points a few bytes past the unit's last routine, at nothing the program
+executes. Most of those bytes are `$00` and were refused already. The rest
+happen to decode -- `4F` is `dec edi` -- and a decode that nothing leads to
+proves nothing either way: the record was "unconfirmed", and planted. It is
+recognised by what it IS instead (`TRoutineAnalyzer.IsFinalEndOfUnit`, reason
+`lvrFinalEndOfUnit`, verdict "not code"). All three conditions are needed:
+
+1. the record lies outside every routine, after BOTH routine providers;
+2. its line is the highest line of its source file among the module's records,
+   and no record of that line lies inside a routine
+   (`TModuleCodeMap.LastLineOutsideRoutines`);
+3. the file is the unit's OWN source (`UnitA.pas` for a record of `UnitA`), and
+   on x64 no record of the line lies in a function `.pdata` lists.
+
+Condition 3 is what the large images added. The compiler numbers some
+synthesised code of an instantiated generic PAST the end of the file it names
+(`System.Generics.Defaults.pas:65506`, recorded in `System.Net.Mime`): the
+highest "line" of that file, outside every routine without a MAP, and real
+code. It is never in the unit's own file. On x64 one such record sits inside a
+`.pdata` function, which has a proven entry and is analysed from it.
+
+Why a refusal there cannot hide code: a statement of a unit's initialization or
+finalization section, the section's closing `end.` included, lies INSIDE the
+routine named after the unit on both bitnesses, so condition 1 excludes it; the
+body of an anonymous method outside every routine is never on the last line of
+the file that declares it, because the unit's `end.` follows it. What is
+refused is a line on which the user can only have meant "the end of the unit",
+and where the alternative is a `$CC` written into the bytes between two units.
+
+Measured over the files with `DevTools\BreakpointPlanProbe -lastlines`:
+
+| image | records outside every routine | last line of their file | taken by the rule | byte `$00` / no instruction / decodes |
+|---|---|---|---|---|
+| `TestTarget.exe` x86, with its MAP / without | 4 / 32 | 4 | 4 | 4 / 0 / 0 |
+| `TestSubject.bpl` x64 | 29, 28 of them in a `.pdata` function | 1 | 1 | 1 / 0 / 0 |
+| the other fixtures | 0 on x86; 0 to 28 on x64, all in a `.pdata` function | 0 | 0 | |
+| x86, 530 MB, with its MAP | 2 075 | 1 425 | 1 421 | 827 / 17 / 577 |
+| the same without the MAP | 14 740 | 1 427 | 1 421 | 827 / 17 / 577 |
+| x64, 620 MB | 14 468, 13 388 of them in a `.pdata` function | 3, and 1 more in a `.pdata` function | 0 | |
+
+So the rule adds 577 refusals on the large x86 image -- the records on bytes
+that decode, which were planted -- and none anywhere else: on x64 a unit's
+final `end.` has no record of this kind, and the three candidates there are
+generic code under another unit's file, on zero bytes, refused as such. The six
+x86 records on the last line of a file that the rule does NOT take are all
+under another unit's file; two of them are the code numbered past the end of
+the file (`Winapi.EdgeUtils.pas:65462`, `System.Generics.Defaults.pas:65506`),
+which only the run without the MAP leaves outside every routine.
+
+Checked against the sources: of the 1 421, the line reads `end.` in 1 201; the
+source was not found for 102; in 2 it reads `finalization`, an empty
+finalization section whose keyword line carries the unit's last record
+(`Soap.WebServExp.pas:1944`, `JvThemes.pas:2207`) and which has no code either;
+in 116 it reads something else, in sources edited after the binary was built
+(six sampled: every one modified later than the executable and 9 to 24 lines
+longer than the recorded line).
+
+No fixture has such a record on bytes that decode, so the tests change the
+byte -- in the reader for the decision function, in the live process for the
+session (`FinalEndOfAUnit_OnBytesThatDecode_IsRefused`) -- and a hand-built
+table holds the cases that must NOT be refused
+(`FinalEndOfAUnit_Synthetic_OnlyTheLastLineOfTheUnitsOwnFileOutsideEveryRoutine`).
+
+**When the analysis cannot answer yet.** Three situations, one behaviour: no
+answer now (`pvNoAnalysis`, the fallback applies), nothing kept that would have
+to be thrown away, and the breakpoints judged again when the answer exists.
+
+- *A provider is still indexing.* A MAP builds its index on a thread of its
+  own, and asked for its tables before that it WAITS, up to fifteen seconds
+  (`TMapFile.RoutineRanges`). The analysis runs on the thread that dispatches
+  debug events and must not: `BuildState` asks `IBackgroundIndexProvider`
+  first, for the first provider and for the second alike, and does not touch
+  the tables of one that is pending. With the second provider pending the map
+  is built without it; with the first pending nothing is built.
+- *The tables are incomplete.* A provider that is not indexing and still says
+  it could not enumerate everything gives a map in which a missing record reads
+  as "outside every routine". That map is not used. The module's state is kept
+  WITHOUT it, so the tables are not read again for every breakpoint; the next
+  change of the module's providers drops the state.
+- *The image is not known to be relocated.* See the next paragraph.
+
+`TLiveCodeAnalysis` remembers the modules it declined (`DeferredCount`). While
+the session is stopped, `TDebugSession.Pump` asks every 250 ms whether one of
+them can be analysed now (`TakeModulesThatBecameReady`, which looks at the
+providers and builds nothing) and re-posts the breakpoints when one can -- only
+while stopped, like the publication of prefetched symbols, because a re-post
+rewrites planted bytes.
+
+*The prefetcher's providers.* A module's analysis is built from the providers
+it has at that moment, and a verdict given is answered again without looking.
+The prefetcher registers a module's readers later, from the dispatch thread
+(`PublishPrefetch`); `TModuleSymbolLoader.OnProvidersPublished` fires per module
+that gained one, and the session forgets what the analysis built for it BEFORE
+the re-post that follows. Without that, a module whose MAP a load hook had read
+early kept the map built from the MAP alone
+(`Analysis_ProvidersPublishedByThePrefetcher_AreUsedAtTheNextQuestion`).
+
+**A module relocated after its load event.** An image with a dynamic base is
+relocated when it is mapped. A fixed-base image mapped at its preferred base
+needs no relocation. A fixed-base image whose preferred base is TAKEN is mapped
+elsewhere and relocated by the loader after the debugger has seen its load
+event and before its entry point runs: at the load event the absolute addresses
+in its code -- every jump-table entry among them -- still assume the preferred
+base. The analysis must not read it then, so the breakpoints planted at the
+load event get the fallback: no copy in a funclet, and a record inside a table
+of addresses (bytes that are not zero) is planted.
+
+Two measured facts shape the fix:
+
+- At the load event such an image is recognisable: the `ImageBase` field of its
+  mapped header names another address than the one it is mapped at.
+- That field is NEVER rewritten. It says the preferred base at the entry point
+  and at every later stop, on both bitnesses. Nothing read from the image tells
+  "not yet relocated" from "relocated".
+
+So the engine watches (`TWinDebugger.WatchModuleRelocation`): for such a module
+it plants a one-shot on the entry point, the first moment at which the image is
+relocated and none of its code has run. When it fires
+(`ModuleReachedItsEntryPoint`) the session is told (`TOnModuleRelocated`, the
+third hook of `IBreakpointPlacement.SetSourcePlantAdvice`): it marks the module
+relocated (`TLiveCodeAnalysis.MarkRelocated`), forgets what was concluded about
+it and re-posts the breakpoints, which the engine plants before the thread is
+continued -- as at a load event. The thread is not reported stopped. Costs one
+debug event per such module and load; an image with a dynamic base, which is
+every image a current toolchain produces by default, pays nothing.
+
+A module of that kind that was already loaded when the session ATTACHED is
+relocated by definition and is marked at once. One with no entry point is never
+marked: there is no moment to hang the check on, and it keeps the fallback.
+The mark goes with the unload (`ModuleUnloaded`), not with a mere change of
+providers. Fixture: `BreakpointSampleLib.dll` (`{$IMAGEBASE $3A000000}`,
+`{$DYNAMICBASE OFF}`), loaded by `BreakpointSample -lib` after it has reserved
+that address; `ModuleRelocatedAfterItsLoadEvent_IsJudgedAgainAtItsEntryPoint`.
+
+**A line emitted twice gets a breakpoint in each copy (x64).** dcc64 emits a
+`finally` block twice: inline, for a plain pass through `try..finally`, and as
+a funclet the exception dispatch (and `Exit`) calls. The line has a record in
+each, and a line-table provider answers with ONE address per line, so a
+breakpoint in a `finally` block stopped on one path only — and a block that
+only an exception ever runs had a verified breakpoint that never fired.
+
+The rule (`TLiveCodeAnalysis.CopiesOf`, registered by
+`TWinDebugger.AddCopiesOfSourceBreakpoint`): `.pdata` divides a routine into
+its body and its funclets. For the record a provider answered with, each OTHER
+piece of the SAME routine that holds records of the same file and line
+contributes one more breakpoint, on its lowest record. Three things follow:
+
+- Records in the same piece are never copies of each other. A `for` line has
+  two records as well — the initialisation and the loop-back test — both in
+  the body, and a breakpoint on it keeps stopping once per entry into the loop.
+- Only the lowest record of a piece. A `for` line inside a `finally` block has
+  four records, two in each copy; the breakpoint goes on the initialisation of
+  each.
+- Another routine holding the same line (a generic instantiated twice) is not
+  a copy. That is the old behaviour, unchanged: one instantiation is bound.
+
+A copy is a record of its own (`TBreakpointRec.IsCopy`): same file, line,
+condition and log message, and one hit count with the record it copies (see
+"One byte, several records"). Copies come from the analysis of the live image,
+so a breakpoint registered before the startup break gets them when
+`ApplyAllBreakpoints` plants it.
+
+A line never gets two records on one address. `DoSetBreakpoints` receives one
+candidate per line-table provider, and a second provider can name the very
+record that was just registered as the first one's copy (a MAP that answers
+with the funclet where TD32 answers with the inline block). A candidate for
+which a record of the same file, line and address exists is skipped
+(`SourceRecordExists`); comparing candidates with each other, as before, missed
+it, and the second record logged every logpoint twice
+(`SecondProviderNamingTheCopy_DoesNotGiveTheLineASecondRecord`).
+
+On x86 there is nothing to copy: dcc32 emits a `finally` block once, the plain
+path falls into it and `System.@HandleFinally` calls the same code
+(`Win32_FinallyBlock_StopsOnBothPathsAtOneAddress`).
+
+Two limits, both measured on `BreakpointSample`:
+
+- The cleanup of managed locals (an implicit `finally`, whose line is the
+  routine's `end;`) has a funclet too, but the funclet has NO line record of
+  its own: the `end;` line has one record, in the body. A breakpoint on such an
+  `end;` still stops on the plain path only.
+- A stop in a funclet is a stop in a function of its own: the routine's locals
+  are addressed there through `rdx`, the frame the dispatcher passes, and not
+  through `rbp`. The stop is named correctly (routine, file, line); the locals
+  shown at it are read from the funclet's frame and are not the routine's.
 
 ### A condition that will not evaluate STOPS, and says why
 
@@ -2006,16 +2367,18 @@ Hit lifecycle:
 
 1. `EXCEPTION_BREAKPOINT` at `ExceptionAddress = VA`. `RIP` is already
    `VA + 1`.
-2. If `FPendingReactivateVA = VA`, the prior single-step came back —
-   replant `INT3` and resume silently. (See "Persistent breakpoint
-   re-arming" below.)
-3. Otherwise, find the breakpoint, `RemoveInt3`, set `RIP := VA`,
-   record `FStoppedTid`.
+2. If the thread owes exactly this address a re-arm, it trapped on it
+   before its single step: see "Persistent breakpoint re-arming" below for
+   the two cases.
+3. Otherwise, find the breakpoint, `SuspendInt3At(VA)` (the program's
+   byte back for every record at the address), set `RIP := VA`, record
+   `FStoppedTid`.
 4. One-shot: delete from list. If it matched a pending step-over /
    step-out target, fire `srStep`; if `FStopAtEntry`, fire `srEntry`.
-5. Persistent: set `FPendingReactivateVA := VA`, set TF, fire
-   `srBreakpoint`. The next single-step landing at the same site
-   replants.
+5. Persistent: arm the thread's pending re-arm (`ArmPendingRearm`, which
+   sets TF), count the hit and put every persistent record at the address
+   to the host, fire `srBreakpoint` when one of them stops. That thread's
+   next single step replants (`RearmInt3At`).
 
 ## Stepping
 
@@ -2102,9 +2465,9 @@ initial import. Fixtures: `RunStepWaitFixture`, `RunStepCpuFixture`,
 `RunStepCsFixture` in `TestTargetCore.pas`; tests `StepOver_*` in
 `DebugSessionTests.pas` (x64 and Win32).
 
-The persistent-BP re-arm carries the owning thread
-(`FReactivateTid`) and both re-arm checks are gated on it, so stepping a different
-thread neither steals nor drops another thread's pending re-arm. After the step,
+The persistent-BP re-arm is kept per thread (`FPendingRearms`, keyed by thread
+id), so stepping a different thread neither steals nor drops another thread's
+pending re-arm, and neither does a hit on another thread. After the step,
 the single-step handler sets `FStoppedTid := StepTid`, so run control keeps
 targeting the stepped thread. (`ResumeTid` — the thread whose pending event is
 released — stays the event thread, not `StepTid`.)
@@ -2166,7 +2529,7 @@ Three modes plus a none state:
 
   `FStepBpVAs` tracks the transient one-shot BPs (resume + raise-catch);
   `ClearStepBps` drops them on the landing, on a user BP that pre-empts the step,
-  or on an exception. The `FPendingReactivateVA` re-arm path re-enables TF for
+  or on an exception. The pending re-arm path re-enables TF for
   `smOver` as well as `smInto` — otherwise stepping off a line that carried a
   persistent BP would consume the trap-step and run free. Fallback when the
   function range is unavailable (import thunk, publics not yet parsed): the
@@ -2340,11 +2703,13 @@ resumes, forever. Measured as an unbounded `BP hit / PlantInt3 OK` loop in
 defect was latent in the source-level `smOver` guard and is fixed with it.
 
 `RearmStepBpAfterForeignHit` does the dance a persistent breakpoint hit already
-does: re-add the record UNPLANTED, set `FPendingReactivateVA` / `FReactivateTid`,
-arm the trap flag, and let the re-arm path plant it after one step.
-`FSteppingOffStepBp` marks that trap as one that DECIDES NOTHING, so the re-arm
-path resumes the in-flight step untouched instead of letting `HandleSmOverStep`
-(or the instruction step) read it as progress.
+does: re-add the record UNPLANTED, arm the thread's pending re-arm
+(`ArmPendingRearm`, which sets the trap flag), and let the re-arm path plant it
+after one step. The entry's `StepOffOnly` flag marks that trap as one that
+DECIDES NOTHING, so the re-arm path resumes the in-flight step untouched instead
+of letting `HandleSmOverStep` (or the instruction step) read it as progress.
+The flag lives in the thread's entry and ends with it; it used to be a field of
+the engine (`FSteppingOffStepBp`) that every reported stop had to reset.
 
 ## Instruction granularity (ASSEMBLY_LEVEL_DEBUGGING.md increment 1)
 
@@ -3745,19 +4110,88 @@ reaches the pump.
 
 ## Persistent breakpoint re-arming
 
-The single-step dance is necessary because we can't both leave `0xCC`
-in place and execute the original instruction. Sequence:
+A thread cannot execute the instruction under a `$CC`, so the byte is taken
+away for ONE thread and ONE instruction:
 
-1. INT3 hits → `RemoveInt3`, set `RIP := VA`, fire `srBreakpoint`,
-   record `FPendingReactivateVA := VA`, set TF.
+1. INT3 hits → `SuspendInt3At(VA)`, set `RIP := VA`, arm the thread's
+   pending re-arm (`ArmPendingRearm`: `FPendingRearms[tid] := VA`, TF set),
+   fire `srBreakpoint`.
 2. User issues continue → `ContinueDebugEvent`, the original byte
-   executes one step, single-step exception fires.
-3. In `EXCEPTION_SINGLE_STEP`, see `FPendingReactivateVA <> 0`,
-   replant `INT3`, clear pending, resume.
+   executes one step, the single-step exception arrives on that thread.
+3. In `EXCEPTION_SINGLE_STEP`: the thread's entry is removed,
+   `RearmInt3At(VA)`, resume.
+
+Both halves work on the ADDRESS: every record there is suspended and every
+record there is planted again ("One byte, several records", under
+"Breakpoints").
 
 When the user requested `stepInto` while a reactivation is pending,
 the rearm consumes the trap step, so we re-enable TF before resuming
 so the actual step still fires.
+
+**The pending re-arm is per THREAD** (`FPendingRearms: thread id -> address`).
+A thread executes one instruction between two of its traps, so it owes at most
+one address; the process can owe as many as it has threads. It was one slot
+for the whole process (`FPendingReactivateVA` / `FReactivateTid`): with two
+threads hitting two breakpoints close together the second hit overwrote the
+first, the first thread's single step found nothing to re-arm, and that
+breakpoint stayed without its byte until something re-posted it
+(`Rearm_TwoLogpointsOnTwoThreads_BothLogEveryPass`: one of two logpoints
+stopped logging after a few passes).
+
+What completes or drops an entry, besides the single step:
+
+- **A thread resumed from a planted address** (`UnpatchBpAtRip`, before every
+  continue and step). The thread did not hit that breakpoint -- it was stepped
+  onto the line, or the breakpoint was set on the line it stands on -- so it
+  owes nothing yet. The byte is suspended and the re-arm ARMED, so that it goes
+  back after one instruction. It used to go back at the next reported stop:
+  in a loop the remaining passes ran straight through
+  (`Rearm_BreakpointOnTheLineAThreadResumesFrom_StopsTheNextPass`), and a
+  step-out whose return address is the thread's own PC -- recursion -- never
+  landed, since no one-shot is planted on an address a breakpoint owns
+  (`Rearm_StepOutToTheAddressTheThreadIsAt_LandsInTheCaller`).
+- **Resuming with `DBG_EXCEPTION_NOT_HANDLED`** (the first-chance exception
+  stop). The thread does not execute the instruction at its PC next: the
+  exception is delivered. Nothing is suspended and nothing armed -- a trap flag
+  does not survive the dispatch, and a byte taken away for an instruction that
+  is not about to run would stay away. The `$CC` stays in place, as it does on
+  any other instruction of the faulting routine, and fires if the handler
+  resumes there (`Rearm_ExceptionStopOnAPlantedAddress_DoesNotLoseTheBreakpoint`).
+- **An exception on a thread that owes a re-arm** (any code but breakpoint and
+  single step, first thing in `HandleException`). The instruction under the
+  breakpoint faulted: the dispatch discards the trap flag and the single step
+  never comes. The address is planted again at once (`CompletePendingRearm`);
+  left pending, the breakpoint stopped once and never again
+  (`Rearm_InstructionUnderTheBreakpointFaults_TheBreakpointStopsTheNextPass`).
+- **The thread exits** → planted again. **The module unloads** → entries inside
+  it are dropped with its records.
+- **The owning thread traps ON the address it owes**, before its single step.
+  Two cases, told apart by whether a planted record of ours is there. If one
+  is, the `$CC` is OURS: the address was planted again while the thread was
+  parked on it (the file's breakpoints edited at the stop, a re-post at a
+  module load) and another thread was resumed first, so nothing looked at this
+  thread's PC. The byte is suspended again, the thread put back on the
+  instruction, the trap flag set, the entry kept, and no hit is reported -- the
+  thread already reported this one. If none is, the program's own byte there
+  is an `int3` and it has just executed: plant and continue. This branch used
+  to be the second case only, and continued the first one byte into the
+  instruction (`Rearm_BreakpointRecreatedUnderAParkedThread_ThenAnotherThreadStepped`).
+- **Inside a synthetic call** (`RunMethodCall` pumps debug events itself). A
+  thread that executed the `$CC` just before the stop has its event still
+  queued, with its PC one byte in, and the address is suspended by the time
+  the pump sees it. "No planted record there" used to mean "not ours" and the
+  thread was continued where it stood. A hit on an address that has a record
+  and whose byte is currently NOT `$CC` is such a stale hit and is treated like
+  a hit on a planted one: rewound, stepped off, re-planted. The byte test keeps
+  a program's own `int3` under a suspended record out of it. A single step
+  that completes ANOTHER thread's pending re-arm is honoured in the pump too
+  (`Rearm_HitQueuedBehindAStop_SurvivesAFunctionCallAtThatStop`).
+- **A clean detach** clears the trap flag of EVERY thread that owes a re-arm,
+  not of the stopped one only: a thread that hit a breakpoint and was left
+  parked while another was stepped still carries it, and raises a single-step
+  exception in a process nobody is debugging any more
+  (`Rearm_CleanDetach_ClearsTheTrapFlagOfEveryThreadThatOwesOne`).
 
 ## Hardware watchpoints and the single-step branch
 

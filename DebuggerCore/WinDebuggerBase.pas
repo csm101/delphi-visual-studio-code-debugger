@@ -88,7 +88,22 @@ type
     Bytes:    TBytes;
   end;
 
-  TWinDebugger = class(TInterfacedObject, IDebugTarget)
+  // A breakpoint address whose $CC was taken away so that ONE thread can run
+  // the instruction there, and which goes back when that thread's single step
+  // arrives. One per thread: two threads at two breakpoints are two pending
+  // re-arms, and one slot for the process let the second overwrite the first,
+  // whose address then stayed unplanted until the next repost.
+  TPendingRearm = record
+    VA: UInt64;
+    // The step exists ONLY to move the thread off a transient step breakpoint
+    // that fired for someone else (see RearmStepBpAfterForeignHit). That trap
+    // advances one instruction but decides nothing: whichever step is in
+    // flight must resume exactly as it was, or the trap it did not ask for is
+    // mistaken for progress.
+    StepOffOnly: Boolean;
+  end;
+
+  TWinDebugger = class(TInterfacedObject, IDebugTarget, IBreakpointPlacement)
   private
     FProcess:      THandle;
     FProcessId:    DWORD;
@@ -110,10 +125,23 @@ type
     FPreferredBase: UInt64;
     FDebugInfo:    TDebugInfoSet;
     FBreakpoints:  TList<TBreakpointRec>;
-    // Addresses PlantInt3 refused because they hold data, not code. Kept only so
-    // the refusal is announced once per address: a breakpoint record is planted
-    // again at every re-arm and every ApplyAllBreakpoints.
+    // Addresses PlantInt3 refused because they are not the start of an
+    // instruction. Kept only so the refusal is announced once per address and
+    // per load of its module: a breakpoint record is planted again at every
+    // repost and every ApplyAllBreakpoints.
     FRefusedPlantVAs: TList<UInt64>;
+    // The two questions asked about a user's source breakpoint (see
+    // IBreakpointPlacement). Nil until the session installs them.
+    FOnJudgePlant:  TOnJudgePlant;
+    FOnPlantCopies: TOnPlantCopies;
+    FOnModuleRelocated: TOnModuleRelocated;
+    // Entry points of modules that were NOT yet relocated at their load event
+    // (a fixed-base image that had to move), each carrying a one-shot: entry
+    // VA -> module base. The hit is the first moment the image can be analysed.
+    FRelocationWatch: TDictionary<UInt64, UInt64>;
+    // The session attached to a process that was already running: the modules
+    // reported before its first breakpoint event were loaded long ago.
+    FAttached: Boolean;
     // smInstr is instruction granularity (docs/ASSEMBLY_LEVEL_DEBUGGING.md increment
     // 1) and is deliberately a MODE of its own rather than a flag on smInto /
     // smOver: those two terminate on a new SOURCE LINE, which is not a condition
@@ -145,12 +173,6 @@ type
     FStepResumeSP:  UInt64;
     FStepPrevSP:    UInt64;         // RSP at the previous single-step (for call/ret delta)
     FStepRaiseArmed: Boolean;       // in-function line BPs planted to catch an unwinding raise
-    // True while a single step exists ONLY to move the thread off a transient
-    // step breakpoint that fired for someone else (see
-    // RearmStepBpAfterForeignHit). That trap advances one instruction but
-    // decides nothing: whichever step is in flight must resume exactly as it
-    // was, or the trap it did not ask for is mistaken for progress.
-    FSteppingOffStepBp: Boolean;
     // Instruction-granularity stepping (smInstr). The resume address lives in
     // FStepOverVA and the recursion guard in FStepResumeSP, reusing the
     // step-over machinery rather than duplicating it; only what is genuinely
@@ -220,12 +242,13 @@ type
     FCachedFramesRIP: UInt64;              // RIP the cached frames belong to (0 = none)
     FCachedFramesRSP: UInt64;              // RSP too: same RIP at a different recursion depth
     FCachedFramesRev: UInt64;              // DebugInfoSet revision for the cached frames
-    FPendingReactivateVA:   UInt64; // after INT3 hit, re-arm after single-step
-    FReactivateTid:         DWORD;  // thread that owns the pending re-arm (the one
-                                    // that hit the persistent BP). The re-arm single-
-                                    // step belongs to THIS thread; another thread's
-                                    // step/hit must not consume it (per-thread stepping)
-    FRearmAfterStopVA:     UInt64; // re-plant INT3 at next ReportStopped (step landed on BP)
+    // After an INT3 hit, or a resume from an address that carries a planted
+    // breakpoint: the address whose byte was put back for ONE thread, keyed by
+    // that thread. Its single step re-arms the address; another thread's step
+    // or hit never consumes it. See TPendingRearm, and the three ways an entry
+    // ends: the thread's single step, an exception raised by the instruction
+    // itself (CompletePendingRearm), the thread's exit.
+    FPendingRearms: TDictionary<DWORD, TPendingRearm>;
     FPendingContinueStatus: DWORD; // DBG_CONTINUE or DBG_EXCEPTION_NOT_HANDLED for next resume
     FIsStopped:            Boolean; // True between ReportStopped and resume command
     FPauseRequested:       Boolean; // True after ckPause, until injected BP fires
@@ -418,7 +441,28 @@ type
     // the debug-info set or doing its own RVA arithmetic.
     function  FunctionEntryOf(VA: UInt64; out EntryVA: UInt64): Boolean;
   private
+    // The record that takes a hit at VA: a persistent one when the address has
+    // one, else a one-shot. Refused records own no byte and are never returned.
     function  FindBreakpointByVA(VA: UInt64): Integer;
+    function  FindOneShotByVA(VA: UInt64): Integer;
+    // A record at VA whose $CC is in place, other than ExceptIndex; -1 if none.
+    function  PlantedRecordAt(VA: UInt64; ExceptIndex: Integer = -1): Integer;
+    // A user's (persistent) record at VA has its $CC in place.
+    function  PersistentRecordIsPlantedAt(VA: UInt64): Boolean;
+    // A user's source breakpoint on that file, line and address is registered.
+    function  SourceRecordExists(const SourceFile: string; Line: Integer; VA: UInt64): Boolean;
+    // The pending re-arm of a thread: armed (with the trap flag) when the byte
+    // at VA was taken away for it, completed at once when its single step will
+    // not come.
+    procedure ArmPendingRearm(Tid: DWORD; VA: UInt64; StepOffOnly: Boolean);
+    procedure CompletePendingRearm(Tid: DWORD; ThreadIsAlive: Boolean; const Why: string);
+    // The module at Base is mapped but not yet relocated: watch its entry point.
+    procedure WatchModuleRelocation(const Name: string; Base: UInt64);
+    // A one-shot at a watched entry point fired: tell the host, and plant what
+    // it re-posts before the module's first instruction runs.
+    procedure ModuleReachedItsEntryPoint(EntryVA: UInt64);
+    function  ReadMappedImageBaseAndEntry(Base: UInt64; out HeaderBase: UInt64;
+                out EntryRva: Cardinal): Boolean;
     function  ReadFrameSize(EntryVA: UInt64): UInt32;
   protected
     // Recognised=False means "the prologue was not understood", which is NOT
@@ -439,13 +483,36 @@ type
     function  CollectLocalsForFrame(FrameRBP: UInt64; FuncEntryVA: UInt64;
                 const FuncName, NamePrefix: string;
                 FramePcRva: UInt64): TArray<TLocalValue>;
+    // The byte at an address belongs to the ADDRESS, not to one record: several
+    // records can share it (two source lines on one instruction, a source and
+    // an address breakpoint, a breakpoint and its copy). So there is no
+    // "remove the $CC of this record". There are exactly three operations:
+    //   PlantInt3            one record claims the byte (writes it, or adopts
+    //                        the byte a sibling already wrote);
+    //   SuspendInt3At        TRANSIENT: the original byte goes back for every
+    //                        record at the address so the instruction can run
+    //                        once; RearmInt3At puts the $CC back for all;
+    //   DeleteBreakpointRecord  PERMANENT: the record goes, and the byte goes
+    //                        back only when no other planted record needs it.
     procedure PlantInt3(var BP: TBreakpointRec);
-    procedure RemoveInt3(var BP: TBreakpointRec);
-    // True when BP is a user's source breakpoint whose address holds a zero
-    // byte, i.e. data. BP.OrigByte must already hold the byte read at BP.VA.
-    function  SourceBreakpointLandsOnData(const BP: TBreakpointRec): Boolean;
+    procedure SuspendInt3At(VA: UInt64);
+    procedure RearmInt3At(VA: UInt64);
+    procedure DeleteBreakpointRecord(Index: Integer);
+    // True when BP is a user's source breakpoint that must not be written at
+    // its address, with the reason. BP.OrigByte must already hold the program's
+    // byte at BP.VA. One-shots and address breakpoints are never refused.
+    function  SourcePlantIsRefused(const BP: TBreakpointRec; out Reason: string): Boolean;
     // Logs, and tells the user once per address, that BP was not planted.
-    procedure AnnounceRefusedPlant(const BP: TBreakpointRec);
+    procedure AnnounceRefusedPlant(const BP: TBreakpointRec; const Reason: string);
+    // The other places the line of a source breakpoint was emitted within the
+    // same routine (asked of the session's analysis; empty without one).
+    function  PlantCopiesOf(VA: UInt64): TArray<UInt64>;
+    // Registers (and, once the process runs, plants) a record for each copy of
+    // a user's source breakpoint that does not have one yet.
+    procedure AddCopiesOfSourceBreakpoint(const Primary: TBreakpointRec);
+    // Every persistent record at VA counts the hit; with AskHost each is put to
+    // the host's condition / hit count / logpoint. True when the hit must stop.
+    function  PersistentHitStops(VA: UInt64; AskHost: Boolean): Boolean;
     // Thread-context funnel: the single place that opens a thread context to
     // read or mutate a ROLE. A WOW64 target swaps these three implementations
     // rather than eleven scattered TContext sites. Callers that need the raw
@@ -645,7 +712,7 @@ type
     // the first address of its body, where the parameters are actually spilled.
     function  BreakpointBodyRva(Rva: UInt64): UInt64;
     procedure ClearBreakpointsByFile(const SourceFile: string);
-    procedure UnpatchBpAtRip(Tid: DWORD = 0);
+    procedure UnpatchBpAtRip(Tid: DWORD = 0; ContinueStatus: DWORD = DBG_CONTINUE);
     // Freeze every thread except StepTid for the duration of a step; thaw them
     // at the next reported stop. Idempotent-safe (never stacks two freezes).
     procedure FreezeThreadsForStep(StepTid: DWORD);
@@ -910,6 +977,10 @@ type
     function  GetOnDllLoaded:   TOnDllLoaded;   procedure SetOnDllLoaded(const V: TOnDllLoaded);
     function  GetOnDllUnloaded: TOnDllUnloaded; procedure SetOnDllUnloaded(const V: TOnDllUnloaded);
     function  GetOnBpHit:       TOnBpHit;       procedure SetOnBpHit(const V: TOnBpHit);
+    // IBreakpointPlacement.
+    procedure SetSourcePlantAdvice(const Judge: TOnJudgePlant; const Copies: TOnPlantCopies;
+                const Relocated: TOnModuleRelocated);
+    function  SourceBreakpointAddresses(const SourceFile: string; Line: Integer): TArray<UInt64>;
     function  GetOnExceptionLogged: TOnExceptionLogged; procedure SetOnExceptionLogged(const V: TOnExceptionLogged);
     // Method-style accessors for the read-only properties -- needed for
     // IDebugTarget. Declared as functions; the field-backed property
@@ -1327,6 +1398,8 @@ begin
   FStepFrozenTids := TList<DWORD>.Create;
   FBreakpoints   := TList<TBreakpointRec>.Create;
   FRefusedPlantVAs := TList<UInt64>.Create;
+  FPendingRearms   := TDictionary<DWORD, TPendingRearm>.Create;
+  FRelocationWatch := TDictionary<UInt64, UInt64>.Create;
   FCommandQueue  := TQueue<TCommand>.Create;
   FDllBases      := TDictionary<string, UInt64>.Create;
   FDllSizes      := TDictionary<string, UInt64>.Create;
@@ -1362,6 +1435,8 @@ begin
     TWctProbe(FWctProbe).Shutdown;   // the helper frees the probe when it is done with it
   FWctProbeRef := nil;
   FBreakpoints.Free;
+  FRelocationWatch.Free;
+  FPendingRearms.Free;
   FRefusedPlantVAs.Free;
   FCommandQueue.Free;
   FDllBases.Free;
@@ -2064,32 +2139,136 @@ begin
 end;
 
 function TWinDebugger.FindBreakpointByVA(VA: UInt64): Integer;
+// With one record at an address -- every case but the ones below -- this is
+// that record. Where a one-shot and a persistent record share an address (a
+// user breakpoint set on a step's target while the step was in flight) the
+// persistent one answers: its hit path already knows how to be a step's
+// landing, which is the design PlantStepBp relies on when the user breakpoint
+// was there first. A refused record was never written and takes no hit.
+begin
+  Result := -1;
+  for var I := 0 to FBreakpoints.Count - 1 do begin
+    if (FBreakpoints[I].VA <> VA) or FBreakpoints[I].Refused then
+      Continue;
+    if not FBreakpoints[I].IsOneShot then
+      Exit(I);
+    if Result < 0 then
+      Result := I;
+  end;
+end;
+
+function TWinDebugger.FindOneShotByVA(VA: UInt64): Integer;
 begin
   for var I := 0 to FBreakpoints.Count - 1 do
-    if FBreakpoints[I].VA = VA then
+    if (FBreakpoints[I].VA = VA) and FBreakpoints[I].IsOneShot then
       Exit(I);
   Result := -1;
 end;
 
+function TWinDebugger.PlantedRecordAt(VA: UInt64; ExceptIndex: Integer): Integer;
+begin
+  for var I := 0 to FBreakpoints.Count - 1 do
+    if (I <> ExceptIndex) and FBreakpoints[I].IsPlanted and (FBreakpoints[I].VA = VA) then
+      Exit(I);
+  Result := -1;
+end;
+
+function TWinDebugger.PersistentRecordIsPlantedAt(VA: UInt64): Boolean;
+begin
+  for var I := 0 to FBreakpoints.Count - 1 do
+    if (FBreakpoints[I].VA = VA) and FBreakpoints[I].IsPlanted and
+       not FBreakpoints[I].IsOneShot then
+      Exit(True);
+  Result := False;
+end;
+
+function TWinDebugger.SourceRecordExists(const SourceFile: string; Line: Integer;
+  VA: UInt64): Boolean;
+begin
+  for var I := 0 to FBreakpoints.Count - 1 do begin
+    var Other := FBreakpoints[I];
+    if (Other.VA = VA) and (not Other.IsOneShot) and (Other.Kind = bkSource) and
+       (Other.SourceLine = Line) and SameText(Other.SourceFile, SourceFile) then
+      Exit(True);
+  end;
+  Result := False;
+end;
+
+procedure TWinDebugger.ArmPendingRearm(Tid: DWORD; VA: UInt64; StepOffOnly: Boolean);
+begin
+  // A thread executes one instruction between two of its traps, so it cannot
+  // owe two addresses. Should an entry for another address ever be found, it
+  // is completed rather than dropped: dropping it is how a breakpoint dies.
+  var Old: TPendingRearm;
+  if FPendingRearms.TryGetValue(Tid, Old) and (Old.VA <> VA) then
+    RearmInt3At(Old.VA);
+  var Pending: TPendingRearm;
+  Pending.VA          := VA;
+  Pending.StepOffOnly := StepOffOnly;
+  FPendingRearms.AddOrSetValue(Tid, Pending);
+  SetTrapFlag(Tid, True);
+end;
+
+// The single step a pending re-arm waits for will not come: the instruction
+// itself raised an exception (the dispatch discards the trap flag,
+// docs/EH_FORMAT_NOTES.md), or the thread is gone. The address is planted
+// again NOW. Left pending, it would stay without its $CC until the next
+// repost -- with a hit on another thread in between it used to be forgotten
+// altogether.
+procedure TWinDebugger.CompletePendingRearm(Tid: DWORD; ThreadIsAlive: Boolean;
+  const Why: string);
+begin
+  var Pending: TPendingRearm;
+  if not FPendingRearms.TryGetValue(Tid, Pending) then
+    Exit;
+  FPendingRearms.Remove(Tid);
+  if ThreadIsAlive then
+    SetTrapFlag(Tid, False);
+  RearmInt3At(Pending.VA);
+  DapLog(Format('Pending re-arm of $%x on tid %d completed without its single step: %s',
+    [Pending.VA, Tid, Why]));
+end;
+
 // Call before any step/continue command. If RIP has a planted persistent BP,
-// restore the original byte so the real instruction executes (not INT3).
-// FRearmAfterStopVA ensures the BP is replanted at the next ReportStopped.
-procedure TWinDebugger.UnpatchBpAtRip(Tid: DWORD = 0);
+// restore the original byte so the real instruction executes (not INT3), and
+// arm the thread's pending re-arm so that the byte goes back after that ONE
+// instruction.
+//
+// It used to go back only at the next reported stop (FRearmAfterStopVA): a
+// breakpoint on the line a thread was resumed from -- stepped onto, or set on
+// the current line -- was dead until something else stopped the program. In a
+// loop the next pass ran straight through it; a step-out whose return address
+// is the current PC (recursion) planted no one-shot there, because a
+// breakpoint already owns the address, and never landed.
+//
+// ContinueStatus is how the pending debug event will be continued. With
+// DBG_EXCEPTION_NOT_HANDLED the thread does NOT execute the instruction at its
+// PC next: the exception is delivered and the handler runs, and a trap flag
+// does not survive that. Nothing is taken away then. The $CC stays where it
+// is while the exception is dispatched, exactly as it does when a breakpoint
+// sits on any other instruction of the faulting routine, and fires if the
+// handler resumes at that address.
+procedure TWinDebugger.UnpatchBpAtRip(Tid: DWORD = 0; ContinueStatus: DWORD = DBG_CONTINUE);
 var
   RIP: UInt64;
-  BpIdx: Integer;
 begin
   if Tid = 0 then
     Tid := FStoppedTid;
   RIP := CurrentRIP(Tid);
-  BpIdx := FindBreakpointByVA(RIP);
-  if (BpIdx < 0) or FBreakpoints[BpIdx].IsOneShot or not FBreakpoints[BpIdx].IsPlanted then
+  // ANY planted persistent record, not "the" record at the address: a
+  // breakpoint added on the very address the thread is parked on is planted
+  // while the one that stopped it is still suspended, and looking at that one
+  // alone would resume the thread onto the new $CC.
+  if not PersistentRecordIsPlantedAt(RIP) then
     Exit;
-  var BP := FBreakpoints[BpIdx];
-  RemoveInt3(BP);
-  FBreakpoints[BpIdx] := BP;
-  FRearmAfterStopVA := RIP;
-  DapLog(Format('UnpatchBpAtRip: removed INT3 at $%x, will rearm at next stop', [RIP]));
+  if ContinueStatus = DBG_EXCEPTION_NOT_HANDLED then begin
+    DapLog(Format('UnpatchBpAtRip: INT3 at $%x left in place, the exception is being delivered', [RIP]));
+    Exit;
+  end;
+  SuspendInt3At(RIP);
+  ArmPendingRearm(Tid, RIP, False);
+  DapLog(Format('UnpatchBpAtRip: removed INT3 at $%x, re-armed after one instruction on tid %d',
+    [RIP, Tid]));
 end;
 
 { TWctProbe }
@@ -2534,23 +2713,30 @@ begin
   if BP.IsPlanted then
     Exit;
   // Two breakpoints can legitimately resolve to ONE address: two source lines
-  // mapping to the same code, or the same unit answering from two providers.
-  // Planting twice would read the $CC the first one wrote and save THAT as the
-  // original byte, so unplanting would restore a breakpoint instruction and
-  // leave the target trapping forever at an address no breakpoint owns any more.
-  // Adopt the first planter's original byte and skip the write.
-  for var I := 0 to FBreakpoints.Count - 1 do
-    if FBreakpoints[I].IsPlanted and (FBreakpoints[I].VA = BP.VA) then begin
-      BP.OrigByte  := FBreakpoints[I].OrigByte;
-      BP.IsPlanted := True;
-      Exit;
-    end;
-  if not ReadByte(BP.VA, BP.OrigByte) then begin
+  // mapping to the same code, the same unit answering from two providers, a
+  // source and an address breakpoint. Planting twice would read the $CC the
+  // first one wrote and save THAT as the original byte, so unplanting would
+  // restore a breakpoint instruction and leave the target trapping forever at
+  // an address no breakpoint owns any more. The program's byte is the one the
+  // first planter saved.
+  var Sibling := PlantedRecordAt(BP.VA);
+  if Sibling >= 0 then
+    BP.OrigByte := FBreakpoints[Sibling].OrigByte
+  else if not ReadByte(BP.VA, BP.OrigByte) then begin
     DapLog(Format('PlantInt3 FAIL ReadByte VA=$%x LastError=%d', [BP.VA, GetLastError]));
     Exit;
   end;
-  if SourceBreakpointLandsOnData(BP) then begin
-    AnnounceRefusedPlant(BP);
+  // Asked even when a sibling already holds the byte: an address breakpoint
+  // there was the user's own choice, a source line resolving there is not.
+  var Reason: string;
+  if SourcePlantIsRefused(BP, Reason) then begin
+    BP.Refused := True;
+    AnnounceRefusedPlant(BP, Reason);
+    Exit;
+  end;
+  BP.Refused := False;
+  if Sibling >= 0 then begin
+    BP.IsPlanted := True;
     Exit;
   end;
   if not WriteByte(BP.VA, $CC) then
@@ -2562,51 +2748,219 @@ begin
 end;
 
 // Not every line record is code. On a 32-bit image the record of a unit's final
-// `end.` points at a data byte after the unit's last routine, and a few records
-// of generic instantiations land on zero bytes on x64 (docs/TD32_FORMAT_NOTES.md,
-// "What a line record points at"). A $CC written there is never executed and
-// never restored: it changes the program's data, and the 32-bit fixture then
-// loops on an access violation in the RTL.
+// `end.` points at a data byte after the unit's last routine, a few records of
+// generic instantiations land on zero bytes on x64, and some records lie in the
+// middle of an instruction or inside a table (docs/TD32_FORMAT_NOTES.md, "What
+// a line record points at"). A $CC written there is never executed and never
+// restored: it changes a constant or a table of the program, and the 32-bit
+// fixture then loops on an access violation in the RTL.
 //
-// STOPGAP, deliberately narrow. The real test is whether the address is a proven
-// instruction boundary, which needs the routine analysis planned in
-// docs/PROFILER_COVERAGE_PLAN.md (increment 4). Until that exists the one thing
-// checked is the byte itself: no statement dcc32 or dcc64 compiles starts with
-// $00 (`add r/m8, r8`), and both observed kinds of bad record sit on one. A bad
-// record on any other byte is not caught.
+// Who decides: the session's routine analysis, asked through FOnJudgePlant
+// (docs/DAP_DEBUGGER_ARCHITECTURE.md, "Breakpoints"). It refuses only an
+// address it can SHOW to be something else than the start of an instruction.
+// An address it merely could not confirm is planted: on x86 without a MAP the
+// body of an anonymous method is exactly that, and breakpoints there work.
+//
+// When the analysis has nothing to say (no decoder, no code map for the module,
+// a module not analysable yet) the test of 0.9.3 applies unchanged: the byte
+// must not be $00 (`add r/m8, r8`), which no statement dcc32 or dcc64 compiles
+// starts with.
 //
 // Only a user's source breakpoint is refused. A one-shot (a step, the entry
 // stop) and an address breakpoint name an address the engine or the user chose
 // on purpose.
-function TWinDebugger.SourceBreakpointLandsOnData(const BP: TBreakpointRec): Boolean;
+function TWinDebugger.SourcePlantIsRefused(const BP: TBreakpointRec;
+  out Reason: string): Boolean;
 begin
+  Reason := '';
   if BP.IsOneShot then
     Exit(False);
   if BP.Kind <> bkSource then
     Exit(False);
+  var Verdict := pvNoAnalysis;
+  if Assigned(FOnJudgePlant) then
+    try
+      Verdict := FOnJudgePlant(BP.VA, Reason);
+    except
+      // The question is asked inside the event loop: a defect in the analysis
+      // must cost the analysis, never the session.
+      on E: Exception do begin
+        DapLog(Format('PlantInt3: the plant verdict for $%x raised %s: %s',
+          [BP.VA, E.ClassName, E.Message]));
+        Verdict := pvNoAnalysis;
+      end;
+    end;
+  case Verdict of
+    pvPlant:
+      Exit(False);
+    pvRefuse:
+      Exit(True);
+  end;
   Result := BP.OrigByte = 0;
+  if Result then
+    Reason := 'it holds data, not code (the byte there is $00; no routine analysis was available ' +
+              'for a closer look; typically the final "end." of a unit)';
 end;
 
-procedure TWinDebugger.AnnounceRefusedPlant(const BP: TBreakpointRec);
+procedure TWinDebugger.AnnounceRefusedPlant(const BP: TBreakpointRec; const Reason: string);
 begin
-  DapLog(Format('PlantInt3 REFUSED VA=$%x %s:%d: the byte there is $00 (data, not code)',
-    [BP.VA, BP.SourceFile, BP.SourceLine]));
+  DapLog(Format('PlantInt3 REFUSED VA=$%x %s:%d: %s',
+    [BP.VA, BP.SourceFile, BP.SourceLine, Reason]));
   if FRefusedPlantVAs.Contains(BP.VA) then
     Exit;
   FRefusedPlantVAs.Add(BP.VA);
   if not Assigned(FOnNotice) then
     Exit;
-  FOnNotice(Format('Breakpoint at %s:%d was not set: its address $%x holds data, not code. ' +
-    'The line has no instruction of its own there (typically the final "end." of a unit).',
-    [BP.SourceFile, BP.SourceLine, BP.VA]));
+  FOnNotice(Format('Breakpoint at %s:%d was not set: its address $%x is not the start of an ' +
+    'instruction: %s.', [BP.SourceFile, BP.SourceLine, BP.VA, Reason]));
 end;
 
-procedure TWinDebugger.RemoveInt3(var BP: TBreakpointRec);
+// TRANSIENT removal: the program's byte goes back so the instruction at VA can
+// execute once, and RearmInt3At restores the breakpoint for everyone. Every
+// record at the address is marked unplanted -- leaving a sibling flagged
+// "planted" over a byte that is not there would make the re-arm adopt it and
+// skip the write, and the breakpoint would never fire again.
+//
+// This one is NEVER suppressed because another record shares the address: the
+// thread is parked on the byte and must run the real instruction next.
+procedure TWinDebugger.SuspendInt3At(VA: UInt64);
 begin
+  var Holder := PlantedRecordAt(VA);
+  if Holder < 0 then
+    Exit;
+  WriteByte(VA, FBreakpoints[Holder].OrigByte);
+  for var I := 0 to FBreakpoints.Count - 1 do begin
+    if (FBreakpoints[I].VA <> VA) or not FBreakpoints[I].IsPlanted then
+      Continue;
+    var BP := FBreakpoints[I];
+    BP.IsPlanted := False;
+    FBreakpoints[I] := BP;
+  end;
+end;
+
+// The counterpart: every record at VA claims the byte again. The first one
+// writes, the others adopt; a refused record is asked again and stays refused.
+procedure TWinDebugger.RearmInt3At(VA: UInt64);
+begin
+  for var I := 0 to FBreakpoints.Count - 1 do begin
+    if (FBreakpoints[I].VA <> VA) or FBreakpoints[I].IsPlanted then
+      Continue;
+    var BP := FBreakpoints[I];
+    PlantInt3(BP);
+    FBreakpoints[I] := BP;
+  end;
+end;
+
+// PERMANENT removal of one record. The $CC stays while another planted record
+// at the same address needs it: restoring the byte here used to silence that
+// other breakpoint (a source breakpoint sharing its address with an address
+// breakpoint stopped firing at the next repost of the address set).
+procedure TWinDebugger.DeleteBreakpointRecord(Index: Integer);
+begin
+  var BP := FBreakpoints[Index];
+  FBreakpoints.Delete(Index);
   if not BP.IsPlanted then
     Exit;
+  if PlantedRecordAt(BP.VA) >= 0 then
+    Exit;
   WriteByte(BP.VA, BP.OrigByte);
-  BP.IsPlanted := False;
+end;
+
+function TWinDebugger.PlantCopiesOf(VA: UInt64): TArray<UInt64>;
+begin
+  Result := nil;
+  if not Assigned(FOnPlantCopies) then
+    Exit;
+  try
+    Result := FOnPlantCopies(VA);
+  except
+    on E: Exception do begin
+      DapLog(Format('PlantCopiesOf $%x raised %s: %s', [VA, E.ClassName, E.Message]));
+      Result := nil;
+    end;
+  end;
+end;
+
+// On x64 dcc64 emits a `finally` block twice: inline, for a plain pass through
+// try..finally, and as a funclet the exception dispatch calls. The line has a
+// record in each, and a line-table provider answers with one of them, so a
+// breakpoint used to stop on one path only. Which records are copies is the
+// analysis's knowledge (it has the funclets from .pdata); this only registers
+// them. A copy is a record of its own: same file, line, condition and log
+// message, its own hit count.
+procedure TWinDebugger.AddCopiesOfSourceBreakpoint(const Primary: TBreakpointRec);
+begin
+  if Primary.IsOneShot or (Primary.Kind <> bkSource) or Primary.IsCopy then
+    Exit;
+  for var CopyVA in PlantCopiesOf(Primary.VA) do begin
+    if SourceRecordExists(Primary.SourceFile, Primary.SourceLine, CopyVA) then
+      Continue;
+    var BP := Primary;
+    BP.VA        := CopyVA;
+    // Same RVA space as the primary's, whatever module it is in.
+    {$Q-}
+    BP.Rva       := Primary.Rva + (CopyVA - Primary.VA);
+    {$Q+}
+    BP.OrigByte  := 0;
+    BP.IsPlanted := False;
+    BP.Refused   := False;
+    BP.HitCount  := 0;
+    BP.IsCopy    := True;
+    PlantInt3(BP);
+    FBreakpoints.Add(BP);
+    DapLog(Format('Breakpoint %s:%d: copy of $%x registered at $%x (planted=%s)',
+      [BP.SourceFile, BP.SourceLine, Primary.VA, CopyVA, BoolToStr(BP.IsPlanted, True)]));
+  end;
+end;
+
+function TWinDebugger.PersistentHitStops(VA: UInt64; AskHost: Boolean): Boolean;
+// Several persistent records can sit on one address, each with its own
+// condition, hit count and log message. Every one of them was hit: each counts
+// it, each is put to the host, and the hit stops when any of them says so.
+// The list is walked by index and re-read each time, because the host's
+// evaluation can run code in the debuggee and so come back into the engine.
+//
+// A SOURCE breakpoint counts its hits per line, not per record: the line's
+// copies (the funclet of a `finally` block) and its other addresses are one
+// breakpoint to the user, and a hit condition such as `>= 2` is about passes
+// through the line. Every record of the line carries the same count.
+  function CountHitOnTheLine(const Hit: TBreakpointRec): Integer;
+  begin
+    Result := Hit.HitCount;
+    for var K := 0 to FBreakpoints.Count - 1 do begin
+      var Other := FBreakpoints[K];
+      if (not Other.IsOneShot) and (Other.Kind = bkSource) and (Other.SourceLine = Hit.SourceLine) and
+         SameText(Other.SourceFile, Hit.SourceFile) and (Other.HitCount > Result) then
+        Result := Other.HitCount;
+    end;
+    Inc(Result);
+    for var K := 0 to FBreakpoints.Count - 1 do begin
+      var Other := FBreakpoints[K];
+      if Other.IsOneShot or (Other.Kind <> bkSource) or (Other.SourceLine <> Hit.SourceLine) or
+         not SameText(Other.SourceFile, Hit.SourceFile) then
+        Continue;
+      Other.HitCount := Result;
+      FBreakpoints[K] := Other;
+    end;
+  end;
+
+begin
+  Result := not AskHost;
+  var I := 0;
+  while I < FBreakpoints.Count do begin
+    var BP := FBreakpoints[I];
+    if (BP.VA = VA) and (not BP.IsOneShot) and (not BP.Refused) then begin
+      if BP.Kind = bkSource then
+        BP.HitCount := CountHitOnTheLine(BP)
+      else begin
+        Inc(BP.HitCount);
+        FBreakpoints[I] := BP;
+      end;
+      if AskHost and FOnBpHit(BP) then
+        Result := True;
+    end;
+    Inc(I);
+  end;
 end;
 
 { ---------------------------------------------------------------------------
@@ -3164,10 +3518,7 @@ begin
   if not AlreadyTracked then
     FStepBpVAs := FStepBpVAs + [BpVA];
 
-  FPendingReactivateVA := BpVA;
-  FReactivateTid       := Tid;
-  FSteppingOffStepBp   := True;
-  SetTrapFlag(Tid, True);
+  ArmPendingRearm(Tid, BpVA, True);
 end;
 
 // Remove every still-planted step BP. Called when a step-over completes or is
@@ -3175,11 +3526,11 @@ end;
 procedure TWinDebugger.ClearStepBps;
 begin
   for var VA in FStepBpVAs do begin
-    var Idx := FindBreakpointByVA(VA);
+    // The ONE-SHOT at that address, never whatever record is found there: a
+    // user breakpoint can share the address, and it is not this step's to take.
+    var Idx := FindOneShotByVA(VA);
     if Idx < 0 then Continue;
-    var BP := FBreakpoints[Idx];
-    if BP.IsPlanted then RemoveInt3(BP);
-    FBreakpoints.Delete(Idx);
+    DeleteBreakpointRecord(Idx);
   end;
   SetLength(FStepBpVAs, 0);
 end;
@@ -3428,9 +3779,7 @@ begin
   // and the PC already rewound by the hit handler; this covers the remaining
   // case -- a step that LANDED on an address carrying a persistent breakpoint --
   // and is the same call the step command itself makes on the Run thread.
-  var PcBpIdx := FindBreakpointByVA(CurrentRIP(Tid));
-  if (PcBpIdx >= 0) and FBreakpoints[PcBpIdx].IsPlanted and
-     (not FBreakpoints[PcBpIdx].IsOneShot) then
+  if PersistentRecordIsPlantedAt(CurrentRIP(Tid)) then
     UnpatchBpAtRip(Tid);
 
   var Plan: TInstrStepPlan;
@@ -3901,7 +4250,8 @@ begin
   if Tid = 0 then
     Tid := FStoppedTid;
   FIsStopped := False;
-  UnpatchBpAtRip(Tid);
+  // The exception is delivered: nothing at the faulting address runs next.
+  UnpatchBpAtRip(Tid, DBG_EXCEPTION_NOT_HANDLED);
   ClearStepBps;
 
   FStepMode        := smToHandler;
@@ -4036,6 +4386,115 @@ end;
 // SizeOfImage out of the PE header of an image already mapped in the debuggee.
 // 0 when it cannot be read, which callers must treat as "extent unknown" rather
 // than "empty".
+function TWinDebugger.ReadMappedImageBaseAndEntry(Base: UInt64; out HeaderBase: UInt64;
+  out EntryRva: Cardinal): Boolean;
+// The ImageBase field and the entry point of a MAPPED image's header. An image
+// mapped at the address its header names needs no relocation or was relocated
+// when it was mapped (dynamic base). A header that names ANOTHER address is a
+// fixed-base image that had to move: the loader relocates that one after its
+// load event, and leaves the field as it was.
+var
+  Head: array[0..$3FF] of Byte;
+  R: NativeUInt;
+begin
+  HeaderBase := 0;
+  EntryRva   := 0;
+  Result := False;
+  if (FProcess = 0) or (Base = 0) then
+    Exit;
+  if not (ReadProcessMemory(FProcess, Pointer(Base), @Head[0], SizeOf(Head), R) and (R = SizeOf(Head))) then
+    Exit;
+  if (Head[0] <> Ord('M')) or (Head[1] <> Ord('Z')) then
+    Exit;
+  var PeOfs := PCardinal(@Head[$3C])^;
+  if UInt64(PeOfs) + 24 + 32 > SizeOf(Head) then
+    Exit;
+  if PCardinal(@Head[PeOfs])^ <> $00004550 then
+    Exit;
+  var Optional := PeOfs + 24;
+  EntryRva := PCardinal(@Head[Optional + 16])^;
+  case PWord(@Head[Optional])^ of
+    $010B: HeaderBase := PCardinal(@Head[Optional + 28])^;
+    $020B: HeaderBase := PUInt64(@Head[Optional + 24])^;
+  else
+    Exit;
+  end;
+  Result := True;
+end;
+
+// A fixed-base image that had to move is relocated AFTER its load event and
+// before its entry point. Until then nothing that reads absolute addresses out
+// of its code can be trusted, so the session's routine analysis declines the
+// module -- and with it the refusal of a breakpoint on a record that is not
+// code, and the copies of a line. Both are worked out when a breakpoint is
+// planted, which for such a module is its load event: without a second chance
+// they would stay as the load event left them until some unrelated repost.
+// The entry point is that second chance, and the first safe moment: the image
+// is relocated and none of its code has run. A one-shot there costs one debug
+// event per such module and load.
+//
+// It is also the ONLY sign there is. The header field that identifies such an
+// image at its load event (ImageBase <> the address it is mapped at) is never
+// rewritten by the loader, so reading the image later does not tell "not yet
+// relocated" from "relocated".
+procedure TWinDebugger.WatchModuleRelocation(const Name: string; Base: UInt64);
+begin
+  var HeaderBase: UInt64;
+  var EntryRva: Cardinal;
+  if not ReadMappedImageBaseAndEntry(Base, HeaderBase, EntryRva) then
+    Exit;
+  if HeaderBase = Base then
+    Exit;
+  // A module that was already there when the session attached finished
+  // loading long ago.
+  if FAttached and not FFirstBreak then begin
+    DapLog(Format('LoadDll: %s was moved off its base $%x before the attach: relocated', [Name, HeaderBase]));
+    if Assigned(FOnModuleRelocated) then
+      try
+        FOnModuleRelocated(Base);
+      except
+        on E: Exception do
+          DapLog(Format('OnModuleRelocated host exception for %s: %s: %s', [Name, E.ClassName, E.Message]));
+      end;
+    Exit;
+  end;
+  if EntryRva = 0 then begin
+    DapLog(Format('LoadDll: %s is not relocated yet and has no entry point to watch', [Name]));
+    Exit;
+  end;
+  var EntryVA := Base + EntryRva;
+  if FindOneShotByVA(EntryVA) < 0 then begin
+    var BP := Default(TBreakpointRec);
+    BP.VA        := EntryVA;
+    BP.IsOneShot := True;
+    PlantInt3(BP);
+    FBreakpoints.Add(BP);
+  end;
+  FRelocationWatch.AddOrSetValue(EntryVA, Base);
+  DapLog(Format('LoadDll: %s is not relocated yet (header base $%x): watching its entry point $%x',
+    [Name, HeaderBase, EntryVA]));
+end;
+
+procedure TWinDebugger.ModuleReachedItsEntryPoint(EntryVA: UInt64);
+begin
+  var Base: UInt64;
+  if not FRelocationWatch.TryGetValue(EntryVA, Base) then
+    Exit;
+  FRelocationWatch.Remove(EntryVA);
+  DapLog(Format('Module at $%x reached its entry point $%x: relocated', [Base, EntryVA]));
+  if not Assigned(FOnModuleRelocated) then
+    Exit;
+  try
+    FOnModuleRelocated(Base);
+  except
+    on E: Exception do
+      DapLog(Format('OnModuleRelocated host exception for $%x: %s: %s', [Base, E.ClassName, E.Message]));
+  end;
+  // What the host re-posted is planted before the module's first instruction
+  // runs, as at a load event.
+  DrainBreakpointCommands;
+end;
+
 function TWinDebugger.ReadImageSizeOf(Base: UInt64): UInt64;
 var
   R: NativeUInt;
@@ -4465,6 +4924,11 @@ begin
     PlantInt3(BP);
     FBreakpoints[I] := BP;
   end;
+  // The breakpoints registered before the process existed could not be given
+  // their copies then: those come from the analysis of the live image.
+  var Registered := FBreakpoints.Count;
+  for var I := 0 to Registered - 1 do
+    AddCopiesOfSourceBreakpoint(FBreakpoints[I]);
 end;
 
 procedure TWinDebugger.ClearBreakpointsByFile(const SourceFile: string);
@@ -4475,11 +4939,9 @@ begin
   Upper := UpperCase(ExtractFileName(SourceFile));
   I := 0;
   while I < FBreakpoints.Count do begin
-    if UpperCase(ExtractFileName(FBreakpoints[I].SourceFile)) = Upper then begin
-      var BP := FBreakpoints[I];
-      RemoveInt3(BP);
-      FBreakpoints.Delete(I);
-    end else
+    if UpperCase(ExtractFileName(FBreakpoints[I].SourceFile)) = Upper then
+      DeleteBreakpointRecord(I)
+    else
       Inc(I);
   end;
 end;
@@ -4548,7 +5010,17 @@ begin
     // fired or stopped in the other file while the UI highlighted the user's.
     for var Candidate in FDebugInfo.SourceLineToRvaCandidates(Spec.SourceFile, Line) do begin
       var Rva := BreakpointBodyRva(Candidate);
-      var BP: TBreakpointRec;
+      // One line, one record per address: a second one would count every hit
+      // twice and log every logpoint twice. The line can reach an address
+      // twice in two ways. Two providers name different records that the move
+      // above brings together; or a second provider names the very record
+      // that was just registered as a COPY of the first one's (a MAP that
+      // answers with the funclet where TD32 answers with the inline block).
+      // The records of the file were cleared above, so one found here was
+      // registered for this line a moment ago.
+      if SourceRecordExists(ExtractFileName(Spec.SourceFile), Line, RvaToVA(Rva)) then
+        Continue;
+      var BP := Default(TBreakpointRec);
       BP.Rva          := Rva;
       BP.VA           := RvaToVA(Rva);  // may be wrong if FImageBase not yet known
       BP.OrigByte     := 0;
@@ -4568,8 +5040,44 @@ begin
       if FFirstBreak then
         PlantInt3(BP);
       FBreakpoints.Add(BP);
+      // The line's code emitted a second time in the same routine (x64: the
+      // funclet of a `finally`). Before the startup break the analysis has no
+      // image to read; ApplyAllBreakpoints adds the copies then.
+      if FFirstBreak then
+        AddCopiesOfSourceBreakpoint(BP);
     end;
   end;
+end;
+
+function TWinDebugger.SourceBreakpointAddresses(const SourceFile: string;
+  Line: Integer): TArray<UInt64>;
+
+  procedure Add(VA: UInt64);
+  begin
+    for var Existing in Result do
+      if Existing = VA then
+        Exit;
+    Result := Result + [VA];
+  end;
+
+begin
+  Result := nil;
+  if FImageBase = 0 then
+    Exit;
+  for var Candidate in FDebugInfo.SourceLineToRvaCandidates(SourceFile, Line) do begin
+    var VA := RvaToVA(BreakpointBodyRva(Candidate));
+    Add(VA);
+    for var CopyVA in PlantCopiesOf(VA) do
+      Add(CopyVA);
+  end;
+end;
+
+procedure TWinDebugger.SetSourcePlantAdvice(const Judge: TOnJudgePlant;
+  const Copies: TOnPlantCopies; const Relocated: TOnModuleRelocated);
+begin
+  FOnJudgePlant      := Judge;
+  FOnPlantCopies     := Copies;
+  FOnModuleRelocated := Relocated;
 end;
 
 procedure TWinDebugger.ClearAddressBreakpointsByModule(const ModuleName: string);
@@ -4579,12 +5087,9 @@ begin
   I := 0;
   while I < FBreakpoints.Count do begin
     if (FBreakpoints[I].Kind = bkAddress) and
-       SameText(FBreakpoints[I].ModuleName, ModuleName) then begin
-      var BP := FBreakpoints[I];
-      if BP.IsPlanted then
-        RemoveInt3(BP);
-      FBreakpoints.Delete(I);
-    end else
+       SameText(FBreakpoints[I].ModuleName, ModuleName) then
+      DeleteBreakpointRecord(I)
+    else
       Inc(I);
   end;
 end;
@@ -4625,7 +5130,7 @@ begin
   if not TryResolveModuleBase(ModBase) then
     Exit;
   for var I := 0 to High(Spec.Rvas) do begin
-    var BP: TBreakpointRec;
+    var BP := Default(TBreakpointRec);
     BP.Rva          := Spec.Rvas[I];
     BP.VA           := ModBase + Spec.Rvas[I];
     BP.OrigByte     := 0;
@@ -4779,7 +5284,7 @@ begin
           FIsStopped             := False;
           FPendingContinueStatus := DBG_CONTINUE;
           FLastStepNote          := '';
-          UnpatchBpAtRip;
+          UnpatchBpAtRip(0, ContStatus);
           ReleasePendingEvent(ContStatus);
         end;
       ckStepToHandler:
@@ -4803,7 +5308,7 @@ begin
         FIsStopped             := False;
         FPendingContinueStatus := DBG_CONTINUE;
         FLastStepNote          := '';
-        UnpatchBpAtRip(StepTid);
+        UnpatchBpAtRip(StepTid, ContStatus);
         FStepMode        := smInto;
         FStepSafetyCount := 0;
         FStepMinSP       := 0;
@@ -4827,7 +5332,7 @@ begin
         FIsStopped             := False;
         FPendingContinueStatus := DBG_CONTINUE;
         FLastStepNote          := '';
-        UnpatchBpAtRip(StepTid);
+        UnpatchBpAtRip(StepTid, ContStatus);
         FreezeThreadsForStep(StepTid);
         var RIP := CurrentRIP(StepTid);
         var Rva := VAToRva(RIP);
@@ -4922,7 +5427,7 @@ begin
         FIsStopped             := False;
         FPendingContinueStatus := DBG_CONTINUE;
         FLastStepNote          := '';
-        UnpatchBpAtRip(StepTid);
+        UnpatchBpAtRip(StepTid, ContStatus);
         FreezeThreadsForStep(StepTid);
         var RetAddr := CallerReturnAddress(StepTid);
         // Without unwind info StackWalk64 falls back to the AMD64 leaf convention
@@ -4935,7 +5440,7 @@ begin
           FStepOverVA := RetAddr;
           FStepMinSP  := 0;
           if FindBreakpointByVA(RetAddr) < 0 then begin
-            var BP: TBreakpointRec;
+            var BP := Default(TBreakpointRec);
             BP.VA         := RetAddr;
             BP.OrigByte   := 0;
             BP.SourceFile := '';
@@ -5037,7 +5542,6 @@ begin
     [ReasonStr, VA, SF, SL]));
   FStepMinSP             := 0;
   FStepMode              := smNone;
-  FSteppingOffStepBp     := False;
   FIsStopped             := True;
   FPendingContinueStatus := DBG_CONTINUE;
   // A new stop, a new stack. The frames cache is keyed by TID+RIP+RSP, and two
@@ -5047,16 +5551,6 @@ begin
   // named the first call site as its caller.
   FCachedFrames    := nil;
   FCachedFramesTID := 0;
-  if FRearmAfterStopVA <> 0 then begin
-    var RearmIdx := FindBreakpointByVA(FRearmAfterStopVA);
-    if (RearmIdx >= 0) and not FBreakpoints[RearmIdx].IsOneShot and
-       not FBreakpoints[RearmIdx].IsPlanted then begin
-      var RearmBP := FBreakpoints[RearmIdx];
-      PlantInt3(RearmBP);
-      FBreakpoints[RearmIdx] := RearmBP;
-    end;
-    FRearmAfterStopVA := 0;
-  end;
   if Assigned(FOnStopped) then
     FOnStopped(Reason, SF, SL);
 end;
@@ -5195,6 +5689,8 @@ begin
   // Thread ids are recycled by the OS: a stale announced name would otherwise
   // be inherited by an unrelated future thread.
   FThreadNames.Remove(Ev.dwThreadId);
+  // So would a pending re-arm, and the address it owes would stay unplanted.
+  CompletePendingRearm(Ev.dwThreadId, False, 'the thread exited');
   ContinueDebugEvent(Ev.dwProcessId, Ev.dwThreadId, DBG_CONTINUE);
 end;
 
@@ -5292,6 +5788,7 @@ begin
     FDllBases.AddOrSetValue(Name, Base);
     FDllSizes.AddOrSetValue(Name, ImageSize);
     DapLog(Format('LoadDll: %s base=$%x size=$%x', [Name, Base, ImageSize]));
+    WatchModuleRelocation(Name, Base);
     // Wrap callback so an exception in the host (e.g. exotic MAP/RSM in a
     // third-party BPL) doesn't tear down the whole debug loop. The host is
     // responsible for logging causes; the loop must keep dispatching events.
@@ -5334,13 +5831,26 @@ begin
   var I := FBreakpoints.Count - 1;
   while I >= 0 do begin
     var BP := FBreakpoints[I];
-    if (BP.VA >= DllBase) and ((DllEnd = DllBase) or (BP.VA < DllEnd)) then begin
-      if BP.IsPlanted then
-        RemoveInt3(BP);
-      FBreakpoints.Delete(I);
-    end;
+    if (BP.VA >= DllBase) and ((DllEnd = DllBase) or (BP.VA < DllEnd)) then
+      DeleteBreakpointRecord(I);
     Dec(I);
   end;
+  // A refusal is announced once per address and per LOAD: the same module can
+  // come back at the same base, and its breakpoints are judged afresh then.
+  for var R := FRefusedPlantVAs.Count - 1 downto 0 do
+    if (FRefusedPlantVAs[R] >= DllBase) and ((DllEnd = DllBase) or (FRefusedPlantVAs[R] < DllEnd)) then
+      FRefusedPlantVAs.Delete(R);
+  // The entry-point watch of this mapping, and whatever re-arm a thread owed
+  // an address in it: keyed by address, gone with the module.
+  for var Watched in FRelocationWatch.ToArray do
+    if Watched.Value = Base then
+      FRelocationWatch.Remove(Watched.Key);
+  for var Owing in FPendingRearms.ToArray do
+    if (Owing.Value.VA >= DllBase) and ((DllEnd = DllBase) or (Owing.Value.VA < DllEnd)) then begin
+      FPendingRearms.Remove(Owing.Key);
+      if FThreads.ContainsKey(Owing.Key) then
+        SetTrapFlag(Owing.Key, False);
+    end;
 
   FDllBases.Remove(Name);
   FDllSizes.Remove(Name);
@@ -5489,6 +5999,11 @@ begin
   ContinueStatus := DBG_CONTINUE;
   Code    := Ev.Exception.ExceptionRecord.ExceptionCode;
   ExcAddr := UInt64(Ev.Exception.ExceptionRecord.ExceptionAddress);
+  // A thread that owes a re-arm runs ONE instruction and traps. Any other
+  // exception from it first means that instruction raised it, and the single
+  // step is not coming.
+  if (not IsBreakpointExceptionCode(Code)) and (not IsSingleStepExceptionCode(Code)) then
+    CompletePendingRearm(Ev.dwThreadId, True, Format('exception $%x at $%x', [Code, ExcAddr]));
   case Code of
     EXCEPTION_BREAKPOINT, STATUS_WX86_BREAKPOINT:
     begin
@@ -5505,17 +6020,31 @@ begin
       // ExceptionAddress IS the address of the INT3; RIP is already ExcAddr+1
       var BpVA := ExcAddr;
 
-      if (FPendingReactivateVA = BpVA) and (Ev.dwThreadId = FReactivateTid) then begin
-        // Re-arm: single-step fired, now re-plant INT3. Gated on the owning
-        // thread: while stepping another thread, a DIFFERENT thread hitting this
-        // VA is a genuine breakpoint, not this thread's pending re-arm.
-        BpIdx := FindBreakpointByVA(BpVA);
-        if BpIdx >= 0 then begin
-          var BP := FBreakpoints[BpIdx];
-          PlantInt3(BP);
-          FBreakpoints[BpIdx] := BP;
+      var OwnPending: TPendingRearm;
+      if FPendingRearms.TryGetValue(Ev.dwThreadId, OwnPending) and (OwnPending.VA = BpVA) then begin
+        // The thread that owes this address a re-arm trapped ON it, before its
+        // single step: it has not run the instruction yet. Gated on the owning
+        // thread: a DIFFERENT thread hitting this VA is a genuine breakpoint.
+        if PlantedRecordAt(BpVA) >= 0 then begin
+          // The $CC it executed is OURS: something planted the address again
+          // while the thread was parked on it (a breakpoint of that file
+          // edited at the stop, a repost at a module load, a hit skipped
+          // inside a synthetic call). Continuing as below would resume one
+          // byte into the instruction. Take the byte away again, put the
+          // thread back on the instruction, and let the same pending re-arm
+          // finish the job: not a new hit, the thread reported this one.
+          SuspendInt3At(BpVA);
+          SetRIP(Ev.dwThreadId, BpVA);
+          SetTrapFlag(Ev.dwThreadId, True);
+          DapLog(Format('BP at $%x re-planted under tid %d before its re-arm step: stepped again',
+            [BpVA, Ev.dwThreadId]));
+          ContinueDebugEvent(Ev.dwProcessId, Ev.dwThreadId, DBG_CONTINUE);
+          Exit;
         end;
-        FPendingReactivateVA := 0;
+        // Not ours: the program's own byte there is an `int3`, and it has just
+        // executed. That was the one instruction; re-plant and go on.
+        FPendingRearms.Remove(Ev.dwThreadId);
+        RearmInt3At(BpVA);
         ContinueDebugEvent(Ev.dwProcessId, Ev.dwThreadId, DBG_CONTINUE);
         Exit;
       end;
@@ -5545,14 +6074,22 @@ begin
       end;
 
       var BP := FBreakpoints[BpIdx];
-      // Restore original byte and rewind RIP
-      RemoveInt3(BP);
-      FBreakpoints[BpIdx] := BP;
+      // Restore the original byte and rewind RIP. The removal is transient and
+      // covers every record at the address: the thread is parked on the byte
+      // and runs the real instruction next, whoever else shares it.
+      SuspendInt3At(BpVA);
       SetRIP(Ev.dwThreadId, BpVA);
       FStoppedTid := Ev.dwThreadId;
 
       if BP.IsOneShot then begin
         FBreakpoints.Delete(BpIdx);
+        // The entry point of a module that was not relocated at its load
+        // event: it is now, and none of its code has run.
+        if FRelocationWatch.ContainsKey(BpVA) then begin
+          ModuleReachedItsEntryPoint(BpVA);
+          ContinueDebugEvent(Ev.dwProcessId, Ev.dwThreadId, DBG_CONTINUE);
+          Exit;
+        end;
         // Instruction granularity: the one-shot planted past a `call` / a
         // `rep`-prefixed instruction, or at a step-out's return address.
         if (FStepMode = smInstr) and (BpVA = FStepOverVA) then begin
@@ -5669,17 +6206,20 @@ begin
           Exit;
         end;
       end else begin
-        FPendingReactivateVA := BpVA;
-        FReactivateTid       := Ev.dwThreadId;
-        SetTrapFlag(Ev.dwThreadId, True);
-        // Conditional / hit-count / log-point support: bump the BP's hit
-        // counter then ask the host (DapServer) whether this hit should
-        // actually surface as a user-visible stop. The callback may emit
-        // an `output` event (log-points) and/or evaluate the condition.
-        // When it returns False, we keep the trap-step / re-arm machinery
-        // running but bypass ReportStopped so VS Code never sees the stop.
-        Inc(BP.HitCount);
-        FBreakpoints[BpIdx] := BP;
+        ArmPendingRearm(Ev.dwThreadId, BpVA, False);
+        // A one-shot that shares the address (a user breakpoint set on a
+        // step's target while the step was in flight) is spent by this hit:
+        // the persistent record decides the landing below, exactly as when it
+        // was there first and PlantStepBp planted nothing.
+        var Spent := FindOneShotByVA(BpVA);
+        while Spent >= 0 do begin
+          FBreakpoints.Delete(Spent);
+          Spent := FindOneShotByVA(BpVA);
+        end;
+        // The same for the one-shot on a watched entry point, when a user
+        // breakpoint sits on that very address.
+        if FRelocationWatch.ContainsKey(BpVA) then
+          ModuleReachedItsEntryPoint(BpVA);
         // A persistent breakpoint already occupied an instruction step's resume
         // address, so PlantStepBp left it alone and the hit arrives here instead
         // of on the one-shot path. Same landing, same guards.
@@ -5693,10 +6233,15 @@ begin
         // thread's breakpoint and goes through the ordinary path.
         var StepTargetLanded := (FStepMode in [smOver, smOut]) and (BpVA = FStepOverVA) and
           not StepTargetHitByOtherThread(Ev.dwThreadId);
-        var ShouldStop := True;
-        if Assigned(FOnBpHit) and not InstrStepLanded and not ExcStepLanded and
-           not StepTargetLanded then
-          ShouldStop := FOnBpHit(BP);
+        // Conditional / hit-count / log-point support: bump the hit counter of
+        // every breakpoint at this address, then ask the host (DapServer)
+        // whether this hit should actually surface as a user-visible stop. The
+        // callback may emit an `output` event (log-points) and/or evaluate the
+        // condition. When it returns False, we keep the trap-step / re-arm
+        // machinery running but bypass ReportStopped so VS Code never sees the
+        // stop. A step that landed here is never put to the host.
+        var ShouldStop := PersistentHitStops(BpVA, Assigned(FOnBpHit) and
+          not InstrStepLanded and not ExcStepLanded and not StepTargetLanded);
         if not ShouldStop then begin
           // A condition or log message that called a function left its result
           // behind exactly like an evaluation at a real stop, and this hit
@@ -5781,23 +6326,19 @@ begin
       end;
       SetTrapFlag(Ev.dwThreadId, False);
 
-      if (FPendingReactivateVA <> 0) and (Ev.dwThreadId = FReactivateTid) then begin
+      var StepPending: TPendingRearm;
+      if FPendingRearms.TryGetValue(Ev.dwThreadId, StepPending) then begin
         // Re-arm persistent BP (only the owning thread's trap-step re-arms; a
         // single-step from a different thread being stepped must fall through to
-        // its own step handling and leave this pending re-arm intact).
-        BpIdx := FindBreakpointByVA(FPendingReactivateVA);
-        if BpIdx >= 0 then begin
-          var BP := FBreakpoints[BpIdx];
-          PlantInt3(BP);
-          FBreakpoints[BpIdx] := BP;
-        end;
-        FPendingReactivateVA := 0;
+        // its own step handling and leave every other thread's pending re-arm
+        // intact).
+        FPendingRearms.Remove(Ev.dwThreadId);
+        RearmInt3At(StepPending.VA);
         // The trap existed ONLY to move the thread off a transient step
         // breakpoint that fired for someone else; it decided nothing. Whatever
         // step is in flight still owns the thread through its own (now
         // re-planted) breakpoint, so resume without touching its state.
-        if FSteppingOffStepBp then begin
-          FSteppingOffStepBp := False;
+        if StepPending.StepOffOnly then begin
           ContinueDebugEvent(Ev.dwProcessId, Ev.dwThreadId, DBG_CONTINUE);
           Exit;
         end;
@@ -5885,7 +6426,7 @@ begin
             FStepOverVA := BodyVA;
             FStepMinSP  := 0;
             if FindBreakpointByVA(BodyVA) < 0 then begin
-              var BP: TBreakpointRec;
+              var BP := Default(TBreakpointRec);
               BP.VA         := BodyVA;
               BP.OrigByte   := 0;
               BP.SourceFile := '';
@@ -5918,7 +6459,7 @@ begin
             // If a persistent BP already exists at the return address, rely on
             // the BP hit handler to report srStep -- don't plant a duplicate.
             if FindBreakpointByVA(RetAddr) < 0 then begin
-              var BP: TBreakpointRec;
+              var BP := Default(TBreakpointRec);
               BP.VA         := RetAddr;
               BP.OrigByte   := 0;
               BP.SourceFile := '';
@@ -6347,6 +6888,7 @@ begin
   // for it.
   FStopAtEntry  := False;
   FFirstBreak   := False;
+  FAttached     := True;
   FKillOnDetach := KillOnDetach;
   EnableDebugPrivilege;
   if not DebugActiveProcess(DWORD(ProcessId)) then
@@ -7620,11 +8162,19 @@ begin
       if (Ev.dwDebugEventCode = EXCEPTION_DEBUG_EVENT) and
          IsBreakpointExceptionCode(Ev.Exception.ExceptionRecord.ExceptionCode) then begin
         var HitVA := UInt64(Ev.Exception.ExceptionRecord.ExceptionAddress);
-        var BpIdx := FindBreakpointByVA(HitVA);
-        if (BpIdx >= 0) and FBreakpoints[BpIdx].IsPlanted then begin
-          var BP := FBreakpoints[BpIdx];
-          RemoveInt3(BP);
-          FBreakpoints[BpIdx] := BP;
+        // "Ours" is not only an address whose $CC is in place now. Two threads
+        // can execute the same $CC almost together: the first one's stop is
+        // reported and the address suspended, and the second one's event is
+        // still queued when a watch or a condition makes this call. Its PC is
+        // one byte into the instruction. Treated as "not ours" it was
+        // continued there; it must be put back on the instruction like any
+        // other. The byte test keeps a program's own `int3` under a suspended
+        // record out of this: that one really did execute.
+        var CurrentByte: Byte := $CC;
+        var StaleHit := (PlantedRecordAt(HitVA) < 0) and (FindBreakpointByVA(HitVA) >= 0) and
+          ReadByte(HitVA, CurrentByte) and (CurrentByte <> $CC);
+        if (PlantedRecordAt(HitVA) >= 0) or StaleHit then begin
+          SuspendInt3At(HitVA);
           SetRIP(Ev.dwThreadId, HitVA);
           SetTrapFlag(Ev.dwThreadId, True);
           PendingSkips.AddOrSetValue(Ev.dwThreadId, HitVA);
@@ -7670,12 +8220,26 @@ begin
         if PendingSkips.TryGetValue(Ev.dwThreadId, SkipVA) then begin
           PendingSkips.Remove(Ev.dwThreadId);
           SetTrapFlag(Ev.dwThreadId, False);
-          var BpIdx := FindBreakpointByVA(SkipVA);
-          if BpIdx >= 0 then begin
-            var BP := FBreakpoints[BpIdx];
-            PlantInt3(BP);
-            FBreakpoints[BpIdx] := BP;
-          end;
+          RearmInt3At(SkipVA);
+          // The same step also settles a re-arm this thread owed that address
+          // from before the call.
+          var Owed: TPendingRearm;
+          if (Ev.dwThreadId <> FStoppedTid) and FPendingRearms.TryGetValue(Ev.dwThreadId, Owed) and
+             (Owed.VA = SkipVA) then
+            FPendingRearms.Remove(Ev.dwThreadId);
+          ContinueDebugEvent(Ev.dwProcessId, Ev.dwThreadId, DBG_CONTINUE);
+          Continue;
+        end;
+        // The single step of ANOTHER thread's pending re-arm (a logpoint it hit
+        // just before the stop this call is made at). The main loop is not
+        // running to see it, and swallowing it here left that address without
+        // its $CC for good. The calling thread's own entry is not touched: its
+        // trap flag is part of the context saved above and comes back with it.
+        if (Ev.dwThreadId <> FStoppedTid) and FPendingRearms.ContainsKey(Ev.dwThreadId) then begin
+          var Other := FPendingRearms[Ev.dwThreadId];
+          FPendingRearms.Remove(Ev.dwThreadId);
+          SetTrapFlag(Ev.dwThreadId, False);
+          RearmInt3At(Other.VA);
           ContinueDebugEvent(Ev.dwProcessId, Ev.dwThreadId, DBG_CONTINUE);
           Continue;
         end;
@@ -7778,14 +8342,8 @@ begin
     // while another thread was mid-skip): re-plant now. The skipped thread's
     // RIP is still AT the BP, so the re-planted INT3 fires again on resume
     // and the regular BP machinery handles it -- the breakpoint is not lost.
-    for var KV in PendingSkips do begin
-      var BpIdx := FindBreakpointByVA(KV.Value);
-      if BpIdx >= 0 then begin
-        var BP := FBreakpoints[BpIdx];
-        PlantInt3(BP);
-        FBreakpoints[BpIdx] := BP;
-      end;
-    end;
+    for var KV in PendingSkips do
+      RearmInt3At(KV.Value);
     PendingSkips.Free;
     AtomicExchange(FInRemoteCall, 0);
     // What the callee wrote last is in the pipe already, the debuggee frozen.
@@ -8049,9 +8607,9 @@ begin
     // deliver any further event -- including the kill's EXIT_PROCESS -- until that
     // event is released. Continue it now so DrainUntilExit can actually observe the
     // exit promptly instead of spinning the whole timeout on every disconnect.
+    FPendingRearms.Clear;
     if FIsStopped and (FStoppedTid <> 0) then begin
       SetTrapFlag(FStoppedTid, False);
-      FPendingReactivateVA := 0;
       FIsStopped := False;
       ContinueDebugEvent(FProcessId, FStoppedTid, DBG_CONTINUE);
     end;
@@ -8089,13 +8647,17 @@ begin
       for var Slot := 0 to 3 do
         if FWatchSlots[Slot].InUse then
           ClearDataWatchpoint(Slot);
-    for var I := 0 to FBreakpoints.Count - 1 do begin
-      var BP := FBreakpoints[I];
-      if BP.IsPlanted then begin
-        RemoveInt3(BP);
-        FBreakpoints[I] := BP;
-      end;
-    end;
+    for var I := 0 to FBreakpoints.Count - 1 do
+      if FBreakpoints[I].IsPlanted then
+        SuspendInt3At(FBreakpoints[I].VA);
+    // EVERY thread that owes a re-arm has the trap flag set, not only the one
+    // the stop is on: a thread that hit a breakpoint and was then left parked
+    // while another thread was stepped still carries it. Left set, it raises a
+    // single-step exception in a process nobody is debugging any more.
+    for var PendingTid in FPendingRearms.Keys do
+      if FThreads.ContainsKey(PendingTid) then
+        SetTrapFlag(PendingTid, False);
+    FPendingRearms.Clear;
     if FIsStopped and (FStoppedTid <> 0) then begin
       // Clear the trap flag BEFORE the final continue. After a BP hit
       // HandleException sets TF=1 (line ~1097) for the re-arm single-step.
@@ -8104,7 +8666,6 @@ begin
       // catch it, the RTL surfaces it as External exception 80000004 in a modal
       // dialog and the process hangs (also blocks any later re-attach BPs).
       SetTrapFlag(FStoppedTid, False);
-      FPendingReactivateVA := 0;
       FIsStopped := False;
       ContinueDebugEvent(FProcessId, FStoppedTid, DBG_CONTINUE);
     end;
