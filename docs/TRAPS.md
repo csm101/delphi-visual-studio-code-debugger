@@ -758,6 +758,25 @@ absurdly.
 - **Suspending and resuming a thread advances its cycle counter** by a few
   microseconds' worth. "The counter did not move, so the thread did not run"
   needs a threshold.
+- **Never write a `jmp` at a return address on x64, nor over an epilogue that
+  starts at one.** The system unwinder reads it as a tail call and an
+  exception raised below reaches no handler at all: no crash in our code, just
+  a second-chance event that looks like the program's own bug. A `$CC` or a
+  `call` there is safe. `EH_FORMAT_NOTES.md`, "what the system unwinder reads
+  at a return address".
+- **Anything keyed by address must be purged at `UNLOAD_DLL`, even when the
+  program never unloads anything.** The loader maps a colliding fixed-base
+  image, unmaps it and maps it again at the SAME address before its entry
+  point runs, and maps some system DLLs twice in passing. A table that still
+  holds the first mapping's entries reports bytes as planted that are not
+  there; the first version of `LoaderTimingProbe` lost its entry-point
+  breakpoint exactly so.
+- **A 32-bit fixture must not be named after an installer.** Without a
+  manifest, a 32-bit executable whose name contains `patch`, `setup`,
+  `install` or `update` fails `CreateProcess` with error 740 (elevation
+  required): Windows' installer detection. The 64-bit build of the same source
+  starts normally, so it looks like a bitness defect of the tool that launches
+  it.
 
 ## Diagnosing a report
 

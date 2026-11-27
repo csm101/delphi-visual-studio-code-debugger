@@ -280,6 +280,38 @@ $000D8835  5B 8B E5 5D C3         pop ebx; mov esp,ebp; pop ebp; ret   ; the con
   `@HandleAutoException` 289. A `push imm32` of an address inside the routine
   is a string literal far more often than a stub (57 201 times).
 
+## x64 — what the system unwinder reads at a return address
+
+Measured 2026-11-27 with `DevTools\PatchFeasibilityProbe` on Windows 11 build
+26300 (one build only). When an exception travels through a frame,
+`RtlVirtualUnwind` reads the code at that frame's return address to decide
+whether the frame is in its epilogue: an optional `add rsp` / `lea rsp`, any
+number of `pop`, then a `ret` or a `jmp` that leaves the function.
+
+- A relative `jmp` out of the function written at a return address, or over an
+  epilogue that begins at one, is taken for a tail call. The exception then
+  reaches **no handler at all** — not that routine's, not an outer one, not the
+  RTL's last-chance handler — and comes back as a second-chance event. Same
+  result with the raise two calls below and with no handler in the patched
+  frame.
+- A `$CC` or a `call` in the same place changes nothing: neither matches, and
+  the unwind codes are used.
+- dbghelp applies the same test when it walks: with such a `jmp` in place
+  `StackWalk64` returned three frames, the last one garbage, instead of seven.
+  It reads the code from the live process (through the read routine it is
+  given), not from the image file, at every return address and byte by byte at
+  the top frame's own address.
+- Epilogues dcc64 emits: `lea rsp,[rbp+N]; pop rbp; ret` unoptimised;
+  `lea rsp,[rbp+N]; pop ...; pop rbp; ret` when registers are saved;
+  `add rsp,N; ret` for a frameless routine.
+- dcc64 never leaves a call's return address on the boundary of a `try` range:
+  it pads with a `nop`, inside the range after the last call of a `try` body
+  and outside it before a `try` begins.
+
+The published description of epilogues admits a `ret` or an indirect `jmp`
+only; the relative `jmp` is the implementation's behaviour. A user breakpoint
+has always been safe here because it is a `$CC`.
+
 ## Two traps
 
 - **Never decode a scope entry's `Handler` as a Delphi clause table without
