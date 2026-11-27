@@ -1992,6 +1992,146 @@ point lookups, not from hand-written values. Mechanism in
       (`DevTools\CodeMapDump`).
 - [ ] A MAP enumerated while its index is still building (`Complete = False`).
 
+## AB. Scope and PACKAGEINFO (PROFILER_COVERAGE_PLAN.md increment 3)
+
+`DebuggerTests\ProfileScopeTests.pas`, fixture `TProfileScopeTests`, and
+`DebuggerTests\PackageInfoReaderTests.pas`, fixture `TPackageInfoReaderTests`.
+No debug session. The grammar is pinned on a hand-built code map, where the
+expectations are the specification written out; the tests on the fixture
+binaries (`TestTarget.exe`, `TestSubject.bpl`, both bitnesses, failures
+collected across the four) compute theirs from the code map, the file system
+and PACKAGEINFO. Mechanism in `DAP_DEBUGGER_ARCHITECTURE.md`, "Scope" and
+"DLL / BPL candidate detection".
+
+The grammar:
+
+- [x] **Each kind, the bare pattern, the kind ending at the first colon**
+      (`ProfileScopeTests.Grammar_EachKindAndTheBarePattern_Parse`): kinds
+      without regard to case, blanks dropped, a drive letter left in the
+      pattern, a routine pattern qualified by a dot outside brackets only.
+- [x] **Malformed entries are rejected by name**
+      (`ProfileScopeTests.Grammar_MalformedEntries_AreRejectedByName`): unknown
+      kind, empty pattern, empty entry, a path with no kind; a scope names the
+      list and every offending entry in one error; a relative source root; a
+      reference file that is neither an absolute path nor a bare name.
+- [x] **`*` and `?`, without regard to case**
+      (`ProfileScopeTests.Wildcards_StarAndQuestionMark_IgnoreCase`), including
+      a star that must give characters back and that nothing else is special.
+- [x] **The routine name split, as each provider spells it**
+      (`ProfileScopeTests.SplitRoutineName_AsEachProviderSpellsIt`, hand-written
+      names of TD32 on both bitnesses, MAP and JDBG;
+      `ProfileScopeTests.SplitRoutineName_ReassemblesEveryFixtureRoutine`, every
+      TD32 routine name of the four binaries: the two parts rebuild the name).
+- [x] **Each kind selects its records**
+      (`ProfileScopeTests.Patterns_EachKindSelectsItsRecords`): `module:` with
+      and without the extension; `unit:` by the whole name; `file:` by name, by
+      resolved path, by recorded path when unresolved, with either separator;
+      `class:` including nested and generic classes and a routine with no class
+      part; `routine:` by routine part and by whole name; entries of one list
+      as alternatives.
+- [x] **Exclusion wins** (`ProfileScopeTests.Exclusion_WinsOverInclusion`):
+      every kind on the exclude side, the same entry on both sides, an
+      excluded module.
+- [x] **On real names: a method, every `Create`, a nested routine, a generic
+      instantiation** (`ProfileScopeTests.ClassAndRoutinePatterns_FollowTheProvidersNames`):
+      the expected records computed from the routine names in the code map. It
+      also pins that TD32 spells a generic instantiation `TList__1<Integer>` in
+      the 64-bit images and keeps the mangled `%TList__1` in the 32-bit ones.
+- [x] **`unit:` follows the instantiating unit, `file:` the file the generic
+      was written in** (`ProfileScopeTests.UnitPattern_TakesGenericCodeTheFilePatternLeavesOut`).
+
+The defaults:
+
+- [x] **Default scope on the mono fixture: own sources in, others out**
+      (`ProfileScopeTests.DefaultScope_Executable_OwnSourcesInOthersOut`, both
+      bitnesses). Source root `DebuggerTests\TestTarget\`, injected resolver.
+      Expected: a record is in scope when it lies in a routine and its file
+      EXISTS in that directory (the file system decides, not a path
+      comparison); at least ten own files and one foreign file must have code.
+      Also: the main-module flag plays no part, the parent directory as root
+      gives the same answer, a root that is only a text prefix (`TestTar`) or
+      a sibling (`TestHost`) selects nothing, and an excluded unit is removed
+      from the default.
+- [x] **Default scope on the package fixture**
+      (`ProfileScopeTests.DefaultScope_Package_OwnSourcesInOthersOut`, both
+      bitnesses): the same checks on `TestSubject.bpl`.
+- [x] **"Under the root" is a path prefix, not a text prefix**
+      (`ProfileScopeTests.IsPathUnder_IsAPathPrefixNotATextPrefix`,
+      `ProfileScopeTests.SourceRoot_SelectsFilesResolvedUnderIt`): `C:\src2`
+      against `C:\src`, case, either separator, a trailing one, `.` and `..`,
+      a drive root, a share, a path that is not absolute; an unresolved file
+      is under nothing even when its recorded path is.
+- [x] **No source root: every record of the main module, nothing of the
+      others** (`ProfileScopeTests.NoSourceRoot_SelectsTheMainModuleOnly`,
+      `ProfileScopeTests.NoSourceRoot_OnTheFixtures_EveryRecordOfTheMainModule`);
+      exclusion still applies.
+- [x] **The reference set replaces the default**
+      (`ProfileScopeTests.ReferenceSet_ReplacesTheDefault`: by path, by name,
+      by recorded path, an empty set selecting nothing, the root and the
+      main-module flag ignored, exclusion applied, an include list replacing
+      it; `ProfileScopeTests.ReferenceSet_OnTheFixtures_ThePackageSourcesInTheExecutable`:
+      the package's source files as the reference for the executable built
+      from the same sources, by resolved path and by name, on both bitnesses
+      -- the executable's own program file stays out).
+- [x] **Records outside every routine are never in scope**
+      (`ProfileScopeTests.RecordsOutsideEveryRoutine_AreNeverInScope`, the four
+      binaries, six ways of selecting a whole module): the flags equal "in a
+      routine" record by record, and `SelectedOutsideRoutineCount` equals the
+      map's `OutsideRoutineCount`.
+- [x] **A routine without line records is never in scope, and the counts are
+      the flags counted** (`ProfileScopeTests.RoutineWithoutLineRecords_IsNeverInScope`).
+
+The module-level question:
+
+- [x] **Rules out only what it can**
+      (`ProfileScopeTests.ModuleQuestion_RulesOutOnlyWhatItCan`): the main
+      module default; a known unit list with and without a matching unit; an
+      unknown list; `module:` entries; `file:` / `class:` / `routine:` entries
+      and file-based defaults never ruling a module out; exclusion by module
+      and by every unit.
+- [x] **On the package, with its own PACKAGEINFO as the unit list**
+      (`ProfileScopeTests.ModuleQuestion_OnThePackage_AgreesWithPackageInfoAndTheCodeMap`,
+      both bitnesses): every unit the code map has records of is listed by
+      PACKAGEINFO and is not ruled out; over twelve scopes of every shape, a
+      "no" never coincides with records in scope.
+
+PACKAGEINFO (`PackageInfoReader.pas`):
+
+- [x] **Units and requires of `TestSubject.bpl` equal what the RTL reads**
+      (`PackageInfoReaderTests.TestSubject_UnitsAndRequires_AreWhatTheRtlReads`,
+      both bitnesses): `System.SysUtils.GetPackageInfo` over the same file
+      mapped as data is the oracle, for flags, units and requires, in order.
+- [x] **The lookup keys equal what the DAP front end built before the move**
+      (`PackageInfoReaderTests.TestSubject_LookupKeys_AreWhatTheFormerDapParserBuilt`,
+      both bitnesses): the former in-line parser, kept verbatim in the test
+      unit, against the dictionary `TDllModule` now builds from the reader;
+      also the requires list in the front end's spelling.
+- [x] **An executable carries the resource too**
+      (`PackageInfoReaderTests.Executable_CarriesTheResourceToo`, `TestTarget.exe`
+      on both bitnesses, same oracle).
+- [x] **A resource cut short anywhere is incomplete, keeps what it read and is
+      never read past its size**
+      (`PackageInfoReaderTests.Parse_ResourceCutShortAnywhere_IsIncompleteAndKeepsWhatItRead`,
+      a hand-built resource cut at every length, with a name outside ASCII);
+      negative counts and empty names
+      (`PackageInfoReaderTests.Parse_NegativeCount_IsIncomplete`).
+- [x] **A missing file and a file that is not an image**
+      (`PackageInfoReaderTests.Read_MissingFileOrNotAnImage_ReturnsFalse`).
+- [x] **The lookup key rule** (`PackageInfoReaderTests.LookupKeys_FullNameAndLastSegment`).
+- [ ] `TDllModule.ContainsSourceFile` itself after the move has no unit test of
+      its own: it lives in `DapServer.pas`, which `RunTests.exe` does not link.
+      It is exercised end to end by every `TDebuggerTestsBpl` case (a
+      breakpoint in a package unit binds only if the membership test says
+      yes), and the key equality above covers the part that moved.
+- [ ] The scope applied to a module of a LIVE session. Nothing creates one yet.
+- [ ] `class:` / `routine:` patterns against MAP and JDBG names on a fixture.
+      Their spellings are covered by hand-written names only: a second test
+      loading the fixture MAP would race on its index sidecar (see the note on
+      `Map_Tables_MarkersRoutineEndsAndUnits`).
+- [ ] A package or executable whose PACKAGEINFO holds a name outside ASCII, as
+      a real file. The reader decodes both lists as UTF-8, as the RTL does; the
+      former in-line parser decoded the requires list as ANSI.
+
 ## What the suite does NOT prove (2026-08-08)
 
 Coverage-honesty notes. Each records a place where a green run is weaker evidence

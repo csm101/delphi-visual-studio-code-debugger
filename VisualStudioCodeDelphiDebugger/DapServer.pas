@@ -14,7 +14,7 @@ uses
   DapProtocol, DebugInfoTypes, DebugInfoSet, DebugTarget, ExceptionRules, ExceptionRuleFiles,
   MapFileReader, TD32FileReader, RsmFileReader, WinDebuggerBase, DelphiRtti, DebugSourceIndex,
   DelphiValueReaders, SourceResolver, DebugSessionTypes, DebugSession, VariableExpander,
-  BreakpointEval, PeSymbolSupport, ModuleSymbolLoader,
+  BreakpointEval, PeSymbolSupport, ModuleSymbolLoader, PackageInfoReader,
   // For NoStockMemoryViewSwitch: the unit that owns which command-line switches
   // this program recognises also owns their spelling.
   ProcessListJson,
@@ -789,31 +789,10 @@ begin
 end;
 
 function TDllModule.ContainsUnitByPackageInfo(const UnitName: string): Boolean;
-
-  function ReadAnsiZLen(P, PEnd: PByte; out Len: Integer): Boolean;
-  begin
-    Len := 0;
-    while (P + Len) < PEnd do begin
-      if PByte(P + Len)^ = 0 then
-        Exit(True);
-      Inc(Len);
-    end;
-    Result := False;
-  end;
-
-type
-  PPackageInfoHeader = ^TPackageInfoHeader;
-  TPackageInfoHeader = packed record
-    Flags: Cardinal;
-    RequiresCount: Integer;
-  end;
-
-var
-  ModuleHandle: HMODULE;
-  ResInfo: HRSRC;
-  ResData: HGLOBAL;
-  Cur, Stop: PByte;
-  Header: PPackageInfoHeader;
+// The resource itself is read by PackageInfoReader.ReadPackageInfo (DebuggerCore),
+// which the profiling scope shares. What stays here is this front end's use of
+// it: the lookup dictionary, the read-once latch, and the requires list in the
+// spelling the ranged-global providers use.
 begin
   if FPackageUnitsLoaded then begin
     Result := (FPackageUnits <> nil) and FPackageUnits.ContainsKey(UnitName);
@@ -821,95 +800,28 @@ begin
   end;
 
   FPackageUnitsLoaded := True;
-  Result := False;
+  var Info: TPackageInfo;
+  if not ReadPackageInfo(FullPath, Info) then
+    Exit(False);
 
-  if (FullPath = '') or not FileExists(FullPath) then
-    Exit;
+  FPackageUnits := TDictionary<string, Boolean>.Create;
+  // PACKAGEINFO stores requires as the BPL filename (e.g. 'rtl290.bpl');
+  // strip the extension to match the extension-less ModuleName used by
+  // the ranged-global providers. Lowercase, for the uses-graph global tier.
+  FRequiredPackages := nil;
+  for var Required in Info.RequiredPackages do
+    FRequiredPackages := FRequiredPackages + [LowerCase(ChangeFileExt(Required, ''))];
+  // Both the full unit name and its last segment (`vcl.forms` and `forms`).
+  for var ContainedUnit in Info.ContainedUnits do
+    for var Key in PackageUnitLookupKeys(ContainedUnit) do
+      FPackageUnits.AddOrSetValue(Key, True);
 
-  ModuleHandle := LoadLibraryEx(PChar(FullPath), 0, LOAD_LIBRARY_AS_DATAFILE);
-  if ModuleHandle = 0 then
-    Exit;
-  try
-    ResInfo := FindResource(ModuleHandle, 'PACKAGEINFO', RT_RCDATA);
-    if ResInfo = 0 then
-      Exit;
-    ResData := LoadResource(ModuleHandle, ResInfo);
-    if ResData = 0 then
-      Exit;
-
-    Cur := LockResource(ResData);
-    if Cur = nil then
-      Exit;
-    Stop := Cur + SizeofResource(ModuleHandle, ResInfo);
-    if Stop <= Cur then
-      Exit;
-    if (Stop - Cur) < SizeOf(TPackageInfoHeader) then
-      Exit;
-
-    if FPackageUnits = nil then
-      FPackageUnits := TDictionary<string, Boolean>.Create
-    else
-      FPackageUnits.Clear;
-
-    Header := PPackageInfoHeader(Cur);
-    Inc(Cur, SizeOf(TPackageInfoHeader));
-
-    if Header.RequiresCount < 0 then
-      Exit;
-
-    // Required-package name list: Flags(1) + AnsiZ name, one per requirement.
-    // Capture the base names (lowercase) for the uses-graph global tier.
-    FRequiredPackages := nil;
-    for var I := 0 to Header.RequiresCount - 1 do begin
-      if Cur + 2 > Stop then
-        Exit;
-      var NameLen := 0;
-      if not ReadAnsiZLen(Cur + 1, Stop, NameLen) then
-        Exit;
-      if NameLen > 0 then begin
-        var ReqName: AnsiString;
-        SetString(ReqName, PAnsiChar(Cur + 1), NameLen);
-        // PACKAGEINFO stores requires as the BPL filename (e.g. 'rtl290.bpl');
-        // strip the extension to match the extension-less ModuleName used by
-        // the ranged-global providers.
-        FRequiredPackages := FRequiredPackages +
-          [LowerCase(ChangeFileExt(string(ReqName), ''))];
-      end;
-      Inc(Cur, NameLen + 2);
-    end;
-
-    if Cur + SizeOf(Integer) > Stop then
-      Exit;
-    var ContainsCount := PInteger(Cur)^;
-    if ContainsCount < 0 then
-      Exit;
-    Inc(Cur, SizeOf(Integer));
-
-    // Unit entries: Flags(1) + Hash(1) + UTF8 unit name + #0.
-    for var I := 0 to ContainsCount - 1 do begin
-      if Cur + 3 > Stop then
-        Exit;
-      var NameLen := 0;
-      if not ReadAnsiZLen(Cur + 2, Stop, NameLen) then
-        Exit;
-
-      var Utf8Unit: UTF8String;
-      SetString(Utf8Unit, PAnsiChar(Cur + 2), NameLen);
-      var FullUnit := LowerCase(UTF8ToString(Utf8Unit));
-      if FullUnit <> '' then begin
-        FPackageUnits.AddOrSetValue(FullUnit, True);
-        var DotPos := LastDelimiter('.', FullUnit);
-        if DotPos > 0 then
-          FPackageUnits.AddOrSetValue(Copy(FullUnit, DotPos + 1, MaxInt), True);
-      end;
-
-      Inc(Cur, NameLen + 3);
-    end;
-  finally
-    FreeLibrary(ModuleHandle);
-  end;
-
-  Result := (FPackageUnits <> nil) and FPackageUnits.ContainsKey(UnitName);
+  // A resource that stops early keeps what was read for the calls that follow,
+  // and answers False on this first one. It always did (the old in-line parser
+  // left through its `finally` with the result still False); kept as it was.
+  if not Info.Complete then
+    Exit(False);
+  Result := FPackageUnits.ContainsKey(UnitName);
 end;
 
 function TDllModule.RequiredPackages: TArray<string>;

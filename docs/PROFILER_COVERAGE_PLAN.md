@@ -1338,6 +1338,50 @@ of 0.9.3). Not done: the code map of a module of a live session is not wired
 yet (the first collector does that), and MAP and JDBG were not run on a large
 real binary.
 
+## Verified in increment 3
+
+2026-11-27. `ProfileScope.pas` (`TProfileScope`) and `PackageInfoReader.pas`.
+Mechanism in `DAP_DEBUGGER_ARCHITECTURE.md`, "Scope"; tests in
+`TEST_CATALOG.md`, "AB". Suite: 1474 found / 1470 pass / 0 fail / 4 ignored
+(28 new); extension tests pass.
+
+The grammar as built, where the section "Scope" left it open:
+
+- A routine's name carries no unit: it is split into a class part and a routine
+  part at the last dot outside `<...>` and `{...}`. `class:` matches the class
+  part, `routine:` the routine part, or the whole name when the pattern has a
+  dot. A routine with no class part matches no `class:` pattern.
+- A routine is in scope exactly when one of its line records is.
+- "Resolves under the source root" is read strictly: a file the resolver did
+  not find is not in the default scope, even if its recorded path is under the
+  root.
+- A reference set replaces the default: an absolute path matches the resolved
+  path, a bare name every file of that name. An empty set selects nothing.
+- A malformed entry is an error naming every offending entry at once.
+
+What it cannot express, all consequences of the names the providers give: a
+routine of one unit when another unit has a routine of the same name; one
+overload; a nested routine through its parent; a generic instantiation by one
+spelling on both bitnesses (TD32 mangles them on x86 and not on x64).
+
+PACKAGEINFO: the reading and decoding moved to the core; the DAP front end
+calls it and keeps its own cache and its "authoritative for a package" rule.
+One deliberate difference: the list of required packages is decoded as UTF-8,
+as the RTL does, where the old code used the ANSI code page. Executables carry
+PACKAGEINFO as well, so the main module's unit list is as cheap as a package's.
+
+**One statement of the plan does not hold.** "A module that cannot contain
+anything in scope is never parsed, and for a package that decision comes from
+PACKAGEINFO" is true only for a scope made of `unit:` and `module:` entries.
+Under the default, under a reference, and with `file:`, `class:` or `routine:`
+entries the question "can this module hold anything in scope" must answer yes
+for every module, because generic code written in a file in scope is compiled
+into whichever module instantiates it. So with the default scope every module
+that has debug information is loaded and mapped at its load event. What that
+costs on a host with a hundred packages is measured when the first collector
+is wired (increment 7); the way out, if it is needed, is to decide by unit
+list and accept that generics instantiated in a module outside it are missed.
+
 ## Assumptions to measure
 
 After increment 0: 1, 2, 8, 15, 17 and 18 are settled as stated under

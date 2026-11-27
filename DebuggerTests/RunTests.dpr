@@ -64,7 +64,11 @@ uses
   ExceptionStepTests in 'ExceptionStepTests.pas',
   DataBpExpressionTests in 'DataBpExpressionTests.pas',
   CodeMap         in '..\DebuggerCore\CodeMap.pas',
-  CodeMapTests    in 'CodeMapTests.pas';
+  CodeMapTests    in 'CodeMapTests.pas',
+  PackageInfoReader in '..\DebuggerCore\PackageInfoReader.pas',
+  PackageInfoReaderTests in 'PackageInfoReaderTests.pas',
+  ProfileScope    in '..\DebuggerCore\ProfileScope.pas',
+  ProfileScopeTests in 'ProfileScopeTests.pas';
 
 const
   // Tests that cannot run while another RunTests worker is executing, because

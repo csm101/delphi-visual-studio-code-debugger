@@ -781,7 +781,10 @@ patches (four DevTools: `LineSiteSurvey`, `ProbeCostProbe`,
 held; what it rests on was measured on one Windows build only. Increment 2,
 the code map (`CodeMap.pas`, `ILineRecordProvider`, `IRoutineRangeProvider`),
 is the first engine code: it enumerates every routine and line record of a
-module and nothing uses it yet. Next: increment 3, the scope.
+module and nothing uses it yet. Increment 3, the scope (`ProfileScope.pas`:
+which lines of a code map an `include` / `exclude` request selects; the
+PACKAGEINFO reader now in the core as `PackageInfoReader.pas`), is done too.
+Next: increment 4, decoding and routine analysis.
 
 1. **The MCP server gains a profiler and code coverage** — one server, one
    engine. Coverage at line level by instrumentation, a hit count for every

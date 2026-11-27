@@ -125,6 +125,16 @@ The debugger engine is exposed through two frontends:
   `DebugInfoTypes.pas` and on nothing else of the engine, so it can be built
   from a binary on disk as well as from a module of a live session. See "Code
   map" below. Nothing in the adapter or the MCP server uses it yet.
+- `ProfileScope.pas` — `TProfileScope`: the `include` / `exclude` lists of a
+  profiling or coverage collection, parsed once and applied to code maps.
+  Depends on `CodeMap.pas` only. See "Scope" below. Nothing in the adapter or
+  the MCP server uses it yet.
+- `PackageInfoReader.pas` — `ReadPackageInfo` / `ParsePackageInfo`: the unit
+  list and the requires list of a binary's `PACKAGEINFO` resource, read from
+  the file mapped as data. RTL and Windows API only. The DAP front end's
+  `TDllModule` reads its package membership through it (see "DLL / BPL
+  candidate detection"), and the scope's module-level question takes its unit
+  list from it.
 - `ModuleSymbolLoader.pas` — the shared, SYNCHRONOUS symbol/module loader
   (`TModuleSymbolLoader`) both frontends delegate to. Owns the runtime-module
   registry (`TModuleSymbols`; the DAP subclasses it as `TDllModule` for the
@@ -1353,6 +1363,140 @@ map is `Build` over the providers in `TModuleSymbols` (`Td32Iface` or
 `TModuleSymbolLoader.ModuleRvaRange`; the increment that adds the first
 collector adds that call.
 
+## Scope
+
+`docs/PROFILER_COVERAGE_PLAN.md`, increment 3. `ProfileScope.pas`,
+`TProfileScope`: what a collection measures, as a decision over a code map. It
+depends on `CodeMap.pas` and on nothing else of the engine, is created from a
+`TProfileScopeOptions` (include list, exclude list, source root, reference
+set), and is immutable afterwards.
+
+### Grammar
+
+An entry is `kind:pattern`. The kind is the text before the FIRST colon, so a
+pattern may hold a drive letter (`file:C:\src\*.pas`); a path with no kind is
+therefore not a unit but an unknown kind. An entry with no colon is a unit.
+`*` matches any run of characters, `?` exactly one, nothing else is special,
+and everything is compared without regard to case. An unknown kind or an empty
+pattern is an error (`EProfileScopeError`, or `TryCreate`'s `Error`) that names
+the list and the entry, for every offender at once; so are a source root that
+is not an absolute path and a reference file that is neither an absolute path
+nor a bare name.
+
+| kind | matched against |
+|---|---|
+| `module:` | the module's file name, with or without its extension |
+| `unit:`, or no kind | the full unit name of the line record (`System.SysUtils`; the last segment alone does not match). For a generic instantiated in another unit this is the INSTANTIATING unit |
+| `file:` with a path separator | the file's path: resolved, else recorded, else the bare name; `/` equals `\`; the whole path must match |
+| `file:` without one | the file name alone |
+| `class:` | the class part of the routine name; a routine without one matches no `class:` pattern, not even `*` |
+| `routine:` with a class part | the whole routine name (`TWidget.Create`, `*.Create`) |
+| `routine:` without one | the routine part alone (`Create` is every Create) |
+
+### The routine name
+
+The name is taken as the provider spells it (`TCodeMapRoutine.Name`, which is
+what `RvaToFunctionName` returns), and no provider puts the unit in it. It is
+split at the LAST dot outside `<...>` and `{...}`: class part before, routine
+part after (`TProfileScope.SplitRoutineName`). The TD32 rows are measured on
+the fixtures (`DevTools\CodeMapDump -lines`, and pinned by
+`ClassAndRoutinePatterns_FollowTheProvidersNames`). The MAP rows are the
+publics of the fixture `.map` with the reader's strip of the first segment
+applied by hand, not the output of a run; JDBG is listed with the MAP because
+JCL builds its names from the same publics and `TJclFileReader` joins its two
+words with a dot — inferred from the reader, not measured.
+
+| provider | name | class part | routine part |
+|---|---|---|---|
+| TD32 | `TWidget.Create` | `TWidget` | `Create` |
+| TD32 | `InnerNested` (nested routine: its own name only) | | `InnerNested` |
+| TD32, 64-bit | `TDictionary__2<Integer, System.UnicodeString>.Create` | `TDictionary__2<Integer, System.UnicodeString>` | `Create` |
+| TD32, 32-bit | `%TList__1.Add$qqrxp40System@Generics@Collections@%TList__1$i%` | `%TList__1` | `Add$qqrxp40...` |
+| TD32, 32-bit | `%TDictionary__2.$bctr$qqrv` (constructor; `$bdtr` is the destructor) | `%TDictionary__2` | `$bctr$qqrv` |
+| MAP, JDBG | `{System.Generics.Collections}TList<System.Integer>.Add` | `{System.Generics.Collections}TList<System.Integer>` | `Add` |
+| MAP, JDBG | `RunTypeSampler$ActRec.$0$Body` (anonymous method) | `RunTypeSampler$ActRec` | `$0$Body` |
+
+What the grammar cannot express, as a consequence:
+
+- A routine of ONE unit when another unit has a routine of the same name. The
+  name carries no unit, and the entries of a list are alternatives, never a
+  conjunction. Include the unit and exclude what is not wanted.
+- One overload; a nested routine through its parent (TD32 names it by its own
+  name only).
+- An anonymous method under TD32: its body has no procedure record, so its
+  line records lie outside every routine and are never in scope.
+- A generic instantiation by one spelling. TD32 writes `TList__1<Integer>` in
+  a 64-bit image and keeps the mangled name in a 32-bit one, where the class
+  part is `%TList__1` with no type arguments (two instantiations of one generic
+  cannot be told apart by class) and the routine part carries the mangled
+  signature (`routine:Add` does not match, `routine:Add$*` does). MAP and JDBG
+  write a third form. `class:*TList*` matches all three.
+- A class nested in another by the outer name alone: its class part is
+  `TOuter.TInner`.
+- With the MAP as the routine provider, a routine of a unit with a dotted name
+  keeps what follows the unit's first segment (`SysUtils.TEncoding.GetBytes`),
+  which ends up in the class part. The MAP reader strips one segment only.
+
+### Decision
+
+Exclusion wins: a record that matches any `exclude` entry is out, and an
+excluding `module:` entry empties the module. Otherwise, with at least one
+`include` entry, a record is in when it matches any of them. With no `include`
+the default applies (`TProfileScope.Basis` says which):
+
+1. **Reference set** (`HasReferenceFiles`): the record's file is in it. An
+   entry that is an absolute path matches the file whose resolved path (the
+   recorded one, for a file that did not resolve) is that path; an entry that
+   is a bare name matches every file of that name. An empty reference set is
+   still a reference set and selects nothing. It replaces the two defaults
+   below; a later increment fills it from the reference binaries of a
+   coverage session.
+2. **Source root**: the record's file RESOLVES to a path under the root. A
+   file that did not resolve is under nothing — a recorded path says where the
+   file was when it was compiled. "Under" is a prefix test on normalised
+   absolute paths (`TProfileScope.IsPathUnder`: lowercase, `/` as `\`, `.` and
+   `..` folded, no trailing separator) that ends at a separator, so
+   `C:\src2\a.pas` is not under `C:\src`. Short (8.3) names, links and
+   substituted drives are not resolved.
+3. **Neither**: every record of the main module, nothing of any other.
+
+Two rules hold whatever the lists say:
+
+- A line record outside every routine range is never in scope. Those the lists
+  would have selected are counted (`SelectedOutsideRoutineCount`).
+- A routine is in scope exactly when one of its line records is. A routine
+  without line records never is, even when a `routine:` entry names it:
+  nothing measured on it could be keyed by source (rule 2 of the plan).
+
+`Evaluate(Map, IsMainModule)` returns a `TModuleScope`: one Boolean per line
+record and per routine of the map, and the counts. Patterns are matched once
+per file, unit and routine, so the pass over the line records is a few array
+reads each.
+
+### The module-level question
+
+`ModuleMayHoldScope(ModuleName, IsMainModule, UnitNames, UnitNamesKnown)` is
+asked before a module's debug information is parsed, and answers True whenever
+it cannot rule the module out. It rules out:
+
+- a module an excluding `module:` entry matches;
+- a module with a known, non-empty unit list every unit of which is excluded;
+- under an include list of `module:` and `unit:` entries only: a module that
+  no `module:` entry matches and that has no unit both included and not
+  excluded (with an unknown unit list, only when the list has no `unit:` entry
+  at all);
+- under the main-module default: every module but the main one.
+
+It never rules a module out by its units when the scope is decided by source
+files (source root, reference set, a `file:` entry) or by routine names
+(`class:`, `routine:`): generic code written in a file is compiled into
+whichever module instantiates it, and no unit list says where. The unit list of
+a package is `TPackageInfo.ContainedUnits` (`PackageInfoReader.pas`); a Delphi
+executable carries the same resource.
+
+**Not wired yet.** Nothing in the session creates a scope; the first collector
+does.
+
 ## Main loop
 
 `TDapServer.Run`:
@@ -1476,15 +1620,28 @@ During `LOAD_DLL_DEBUG_EVENT` storms, the adapter must decide quickly whether
 the newly loaded module can host any pending source breakpoint.
 
 - For Delphi packages (`.bpl`), `TDllModule.ContainsSourceFile` uses the
-  standard package metadata (`PACKAGEINFO` resource, `RT_RCDATA`) and parses
+  standard package metadata (`PACKAGEINFO` resource, `RT_RCDATA`) and reads
   the contained unit list once per module. This is the same metadata surfaced
   by RTL `System.SysUtils.GetPackageInfo`.
+- The resource is read by `PackageInfoReader.ReadPackageInfo` in
+  `DebuggerCore` (the file mapped with `LOAD_LIBRARY_AS_DATAFILE`, so nothing
+  runs and the file's bitness does not matter), which returns the contained
+  units and the required packages as recorded, and whether the resource was
+  read to its end. What stays in `TDllModule` is the front end's use of it:
+  the read-once latch, the lookup dictionary, the requires list lowercased and
+  without extension for the uses-graph global tier, and the membership rule
+  below. `ContainsSourceFile` itself did not move: the base
+  `TModuleSymbols.ContainsSourceFile` keeps its conservative answer, so the
+  MCP front end behaves as before.
 - Lookup key is the source basename without extension (`Foo.pas -> foo`), with
   support for namespaced units by indexing both the full unit name and the last
-  segment (`Vcl.Forms` and `Forms`).
+  segment (`Vcl.Forms` and `Forms`): `PackageInfoReader.PackageUnitLookupKeys`.
 - For BPLs, `PACKAGEINFO` is authoritative: if the unit is not present (or
   package metadata cannot be read), the module is rejected immediately with no
   MAP fallback.
+- A resource that stops early keeps the units read before that point for later
+  lookups, and answers False on the first one. That is the behaviour the
+  in-line parser had before the move, kept as it was.
 - Fallback (non-BPL only): MAP sidecar membership index, then TD32 source-file
   list.
 
