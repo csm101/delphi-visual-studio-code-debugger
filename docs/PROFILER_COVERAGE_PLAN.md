@@ -1718,12 +1718,14 @@ replaced by the cost of the local walk, to be measured at the end of increment
    trampoline work (increments 12 and 13 moved ahead of 9)? It is independent
    and small.
 4. **Share the schema with the reference profiler**, so its Delphi viewer
-   (`gui\NapGui.dpr` there) can open a native session? This plan assumes yes
-   for table and column names; reading a native database there is a change in
-   that repository.
+   (`gui\NapGui.dpr` there) can open a native session? **Decided 2026-11-27:
+   yes.** Table and column names are shared; the native tables (modules, source
+   files, coverage lines, reference) are additions. Reading a native database
+   in that viewer is a change in that repository.
 5. **SQLite from Windows (`winsqlite3.dll`)** rather than FireDAC in the server.
-   This plan assumes yes: no build dependency and nothing added to the
-   executable.
+   **Decided 2026-11-27: yes.** No build dependency, nothing added to the
+   executable; `sqlite3.dll` beside the server only if a supported Windows
+   turns out to lack it (assumption 11).
 6. **Text tables for query tools** while the rest of the server answers in
    JSON. This plan assumes yes.
 7. **The runtime as a DLL loaded into the target**, as now preferred, or mapped

@@ -793,7 +793,9 @@ only where the analysis shows there is no instruction, which replaces the
 exception runs the block; and seven defects of the released engine in how a
 breakpoint is suspended, re-armed and deleted are fixed (list in the plan,
 "Verified in increment 4, second half"). These fixes are on
-`feat/profiler-coverage` only; none is in a release yet. So is increment 5:
+`feat/profiler-coverage` only; none is in a release yet. The owner decided
+(2026-11-27) to bring the debugger fixes to `main` as 0.9.4 after some days of
+use from the branch on real projects. Increment 5 is done too:
 the patch map (`CodePatchMap.pas`) and one-shot line probes (`LineProbes.pas`),
 a `$CC` on every confirmed line that records the line's first execution and
 lets the program run on without a stop; every reader of code sees the
