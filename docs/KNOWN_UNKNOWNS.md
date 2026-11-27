@@ -1871,12 +1871,20 @@ them — shows empty locals and `Self: not found`. Regression test:
 
 ## Profiler and code coverage — what the plan still assumes
 
-Nothing of `PROFILER_COVERAGE_PLAN.md` is built (2026-11-26). Its table
+No engine code of `PROFILER_COVERAGE_PLAN.md` is built yet. Its table
 "Assumptions to measure" is the full list, each with the increment that settles
-it. Increment 0 has run (2026-11-26) and answered what it could; the numbers
-are in the plan under "Verified in increment 0" and the format facts in
-`TD32_FORMAT_NOTES.md` and `EH_FORMAT_NOTES.md`. What is still open and can
-change the design:
+it. Increments 0 and 1, the measurements, have run (2026-11-26 and -27); the
+numbers are in the plan under "Verified in increment 0" and "Verified in
+increment 1", and the format facts in `TD32_FORMAT_NOTES.md` and
+`EH_FORMAT_NOTES.md`. What is still open and can change the design:
+
+- **Do the loader and unwinder results hold on a released Windows?** Everything
+  about relocation timing, loader breakpoints and what the x64 unwinder takes
+  for an epilogue was measured on ONE build, an Insider one (26300), with
+  mandatory ASLR off. The design's rule 6, its install points and its fault
+  redirect rest on them. `DevTools\LoaderTimingProbe` and
+  `DevTools\PatchFeasibilityProbe` rerun in about a minute; they have to be run
+  on a released Windows 10 and 11 before the first release that patches code.
 
 - **How does routine-level profiling catch the exit of a routine on x86?**
   45 % of the exits of a large 32-bit image cannot take a cheap probe: the
@@ -1887,24 +1895,11 @@ change the design:
 - **What proves the entry of an anonymous method's body on x86?** TD32 has no
   procedure record for it and there is no `.pdata`. The MAP names it. Without
   a MAP those lines get no probe. Increment 4.
-- **Does the x64 system unwinder read a jump patch near a return address as an
-  epilogue?** `RtlVirtualUnwind` reads the code at each frame's return address:
-  an optional `add rsp` / `lea rsp`, any pops, then a `ret` or a `jmp` leaving
-  the function. If a patch anywhere in that run is taken for the final `jmp`,
-  every exception raised below the call mis-unwinds the frame. The plan
-  forbids a jump there and uses a `call` or a `$CC` instead (rule 6). That a
-  relative `jmp` counts is from the implementation, not from documentation.
-  Increment 1.
-- **When does the loader apply base relocations to a module mapped away from
-  its preferred address: before or after `LOAD_DLL_DEBUG_EVENT`?** A one-byte
-  patch on an instruction's first byte does not care; a five-byte patch written
-  before the relocation is damaged by it. The plan waits for the module's
-  entry point either way; the answer says whether it must. Only an x86 module
-  without a dynamic base that collides can show it. Increment 1.
-- **Does a fault sent back from a trampoline to its original address dispatch
-  exactly as in an uninstrumented run**, through `try..except` and
-  `try..finally`, on both bitnesses? The whole fault handling of the counting
-  probes rests on it. Increment 1.
+- **Why does the loader map a colliding fixed-base image twice?** Mapped,
+  unmapped, mapped again at the same address, before the entry point, on both
+  bitnesses, in every run. The plan only needs the consequence (purge at
+  unload, plant again at load), but an unexplained event order is one that can
+  change.
 - **Is a WOW64 thread's 32-bit context valid after a plain `SuspendThread`?**
   It is 18 µs cheaper per sample than `Wow64SuspendThread`. Not measured.
   Increment 12.

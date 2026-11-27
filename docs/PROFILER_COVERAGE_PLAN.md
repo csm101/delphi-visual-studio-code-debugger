@@ -325,23 +325,35 @@ R: 48 8D 65 28      lea rsp,[rbp+28h]         ; left alone
                        pops nothing, and takes a saved register for the address
 ```
 
-In both, an exception raised below the call unwinds the frame wrongly and the
-process dies in the dispatcher. The second shape (review) is the exit of every
-routine whose last statement is a call or that finalizes managed locals. A
-`$CC` or a `call` in the same place is harmless: neither matches the pattern,
-so the unwinder falls back to the unwind codes, which are right there because
-nothing of the epilogue has run. The published description of epilogues admits
-a `ret` or an indirect `jmp`; that a relative `jmp` out of the function counts
-too is knowledge of the implementation, not documentation. Measured in
-increment 1, on both shapes, before anything depends on it. On x86 there is no
-table unwinder and rule 6 does not apply.
+Measured in increment 1, and it is as bad as feared and quieter: with a jump
+in a window, an exception raised below the call reaches no handler at all —
+not the routine's, not an outer one, not the RTL's last-chance one — and comes
+back as a second-chance event. It makes no difference whether the patched
+frame has a handler or how many calls below the raise is. A `$CC` or a `call`
+in the same place behaves exactly as the unpatched program: neither matches
+the pattern, so the unwinder falls back to the unwind codes, which are right
+there because nothing of the epilogue has run.
+
+The second shape (review) needs a routine that saves registers. An unoptimised
+dcc64 epilogue is `lea rsp,[rbp+N]; pop rbp; ret`, six bytes with only two
+after the `lea`, so there the hazard is the first shape at an exit: a span
+that starts at R and takes the whole epilogue. That is every routine whose
+last statement is a call or that finalizes managed locals, 44 % of all exits.
+A third shape breaks the same way: the frameless `add rsp,N; ret`. The
+published description of epilogues admits a `ret` or an indirect `jmp`; that a
+relative `jmp` out of the function counts too is the implementation's
+behaviour, now measured. On x86 there is no table unwinder, rule 6 does not
+apply, and the same patches behave as the plain run.
 
 **The call form.** A five-byte `call` to the trampoline, whose first act is to
 drop the address the call pushed, in a way that leaves the processor's return
 prediction paired. It may sit inside a window, so it is the form for an exit
 whose epilogue starts at a return address and for a line start in the same
 position with nowhere better to put the probe. It costs a mispredicted return
-per hit, tens of cycles against the hundred thousand of a debug event.
+per hit, tens of cycles against the hundred thousand of a debug event. As
+built in increment 1 the trampoline overwrites the pushed address with its own
+next instruction and returns to it (`mov dword [rsp],lo; mov dword [rsp+4],hi;
+ret`), which touches no register and no flag.
 
 **The probe may sit anywhere in the line's first straight-line block.** Every
 instruction from the line start up to its first branch, its first call, or the
@@ -370,10 +382,12 @@ dispatch, which compares return addresses against `try` ranges; the program's
 own stack tracers, which keep a stack word only when a call precedes it (JCL's
 `ValidCallSite` does exactly this, and a Delphi application that logs its
 exceptions usually has one); and the engine's x86 walker, which proves return
-addresses the same way. A six-byte indirect call through memory could be
-re-encoded as a five-byte call and a `nop`, at the price of a return address
-one byte earlier; that is tried in increment 1 and used only if dispatch does
-not notice.
+addresses the same way. A six-byte indirect call through memory is retargeted
+too, re-encoded as a `nop` followed by a five-byte call to a trampoline that
+jumps through the same operand: the return address stays where it was and the
+program cannot tell (increment 1). What must never happen is a trampoline that
+itself calls the callee: on x64 the unwinder stops at the trampoline's address
+and the exception reaches no handler.
 
 **The two forms that start with a `$CC`.** A site that can take none of the
 patches above still has two options, and which one is used is the collector's
@@ -402,7 +416,12 @@ expects it: at the original address of the relocated instruction that faulted,
 or, for a fault in the payload, at the site with the stack pointer the payload
 found. The instruction then runs, and faults if it must, at the address the
 program's exception tables, its error messages and its own stack traces
-expect. The site stays withdrawn and is reported.
+expect. The site stays withdrawn and is reported. Increment 1 measured both
+halves. Sent back, the program is indistinguishable from the plain run on both
+bitnesses, payload faults included. Passed on instead, x64 is worse than a
+crash: in one case the exception is unhandled, in another a `finally` is
+silently skipped and the program carries on with exit code 0. Sending back is
+a requirement of correctness, not a refinement.
 
 **One map of patched bytes.** Breakpoints stay in `FBreakpoints`. Everything
 else that is not the program's own code is in one map (`TCodePatchMap`):
@@ -438,15 +457,23 @@ else that is not the program's own code is in one map (`TCodePatchMap`):
 - A record whose own first byte is already `$CC` is the program's breakpoint
   instruction, not a place for ours: restore, rewind and "already fired" would
   loop on it for ever.
-- Every restore compares first, in every form: a byte that is no longer ours
-  was overwritten by the program and is left alone.
+- Every restore compares first, in every form, and decides per span, not per
+  byte: after a program hooked a patched routine, five bytes of a six-byte
+  span were the program's and the sixth still ours (increment 1). A span that
+  is no longer wholly ours is left alone. If the program's hook relocated what
+  it copied, its gateway now runs through our trampoline for good, and that
+  site can never be withdrawn.
 - A one-shot hit caused by the debugger's own synthetic call is consumed, not
   recorded, and the byte is planted again when the call ends: evaluating a
   getter is not the program executing that line. Counters cannot make that
   distinction; the session records that evaluations happened.
 - Module unload drops the module's patches without writing. Results are kept by
   (module, RVA), so a package that is unloaded and loaded again is patched
-  afresh and keeps what it had already counted.
+  afresh and keeps what it had already counted. This is not only for packages
+  the program unloads: the loader itself maps an image, unmaps it and maps it
+  again at the same address when a fixed-base module collides, and maps some
+  system DLLs twice in passing (increment 1). A table keyed by address that is
+  not purged at the unload believes its bytes are still there.
 - Clean detach restores every patched byte before `DebugActiveProcessStop`, in
   the block of `TWinDebugger.Terminate` that already restores breakpoints, with
   the threads suspended and the queued breakpoint events drained first.
@@ -481,6 +508,16 @@ On a WOW64 target that first event is the 64-bit loader's, with the 32-bit
 imports not yet mapped, which is why "everything at the loader breakpoint" is
 not the rule. Trampolines are never freed while the process lives, because a
 thread or a foreign hook may still pass through one.
+
+Increment 1 measured the loader's side of this on both bitnesses. An image
+with a dynamic base, the executable included, is already relocated at its load
+event; a fixed-base image that had to move is relocated after the event and
+before its entry point, and a jump written at the event came back with the
+loader's delta added to its fifth byte. The mapped header tells the two apart
+in one read: its `ImageBase` field equals the real base exactly when the image
+is already relocated. No line of a module ran before that module's entry
+point, in any of six modules. On attach the target's threads do not run
+between the synthesised events.
 
 **Payloads.**
 
@@ -679,6 +716,12 @@ aggregation has to happen where the events are.
   runtime that enters it again records nothing. That is what happens when the
   debugger pauses a thread there and then evaluates an expression on it: the
   evaluation runs instrumented code over a half-updated shadow stack.
+- **While a thread is in the runtime, a trampoline address is on its stack**,
+  and on x64 that address has no unwind data: an exception or a stack capture
+  that met it would stop there (increment 1 measured exactly that with a
+  trampoline that called program code). So the runtime never calls back into
+  the program and never raises, and if that ever stops being enough, a runtime
+  that is a loaded DLL can register unwind data for the arena itself.
 - Time is `rdtsc`, converted with a frequency the debugger measures between the
   start and the end of the collection. It is elapsed time; see "Accepted
   limits".
@@ -1187,12 +1230,83 @@ coverage state; sampling does not go through dbghelp at all but through a
 walker of its own on each bitness (increment 12), with dbghelp as the oracle;
 routine exits on x86 are an open problem.
 
+## Verified in increment 1
+
+2026-11-27. Two DevTools with their own fixtures, no engine change:
+`LoaderTimingProbe` (fixtures in `DevTools\Fixtures\LoaderTiming\`) and
+`PatchFeasibilityProbe` (`DevTools\Fixtures\TrampolineFixture.dpr`). Their
+entries in `DevTools\README.md` carry the command lines. Same machine as
+increment 0. **One Windows build only, and an Insider one (26300)**: the
+loader's and the unwinder's behaviour are the operating system's, so these
+results want repeating on a released Windows 10 and 11 before a release.
+
+**Patches** (108 variant rows over both bitnesses, two identical runs; 70
+confirm the plan, none refutes it, 20 had no stated expectation, 18 could not
+be built because the compiled code was too short for the patch):
+
+| experiment | x64 | x86 |
+|---|---|---|
+| `jmp` at a return address, or over an epilogue that starts at one (three epilogue shapes) | exception reaches no handler, second-chance | as plain |
+| `$CC` in the same places | as plain | as plain |
+| call form in the same places | as plain | as plain |
+| `jmp` on the statement's second instruction | as plain | as plain |
+| fault in a relocated instruction or in the payload, sent back | as plain: same handler, same `ExceptAddr`, `finally` ran | as plain |
+| the same fault passed on | unhandled, or a `finally` skipped and exit code 0 | right handlers, wrong `ExceptAddr` |
+| direct call retargeted to a counting trampoline | as plain; 1000 calls counted 1000; the callee's own stack trace identical | as plain; call-site test passes |
+| trampoline that calls the callee instead of jumping to it | stack capture stops at the trampoline, raise unhandled | handler fine, tracer loses the call site |
+| `FF 15` indirect call as `90, E8 rel32` | as plain | as plain |
+| the same as `E8 rel32, 90` | same handler; the program's stack trace shows the return address one byte early | the same |
+| program hooks a patched routine, copying bytes verbatim | breaks (wild jump) | breaks |
+| the same with a hook that re-bases the jump it copies | as plain, through our trampoline from then on | as plain |
+| armed `$CC` copied by a hook | traps in the program's gateway; `EExternalException` | the same |
+
+dbghelp (assumption 16): with no read routine it reads the live, patched
+memory, at every return address and byte by byte at the top frame's own
+address. With a `jmp` at a return address its walk stops after three frames,
+the third one garbage; given the program's bytes it finds all seven. A `$CC`
+or the call form in the same place walks correctly as it is.
+
+Bytes as compiled, for the record: unoptimised x64 epilogue `48 8D 65 20 5D
+C3`; with saved registers `48 8D 65 28 5B 5E 5F 41 5D 41 5E 5D C3`; frameless
+`48 83 C4 28 C3`. x86: `59 5D C3`, `5F 5E 5B 59 59 5D C2 04 00`, `C3`. dcc64
+never puts a call's return address on the boundary of a `try` range: it pads
+with a `nop`.
+
+**The loader** (both bitnesses give the same answers):
+
+| question | measured |
+|---|---|
+| relocation of an image with a dynamic base, executable included | done before its load event |
+| relocation of a fixed-base image that had to move | after the load event, before the entry point |
+| a `$CC` planted at the load event of such an image | survives, and the saved byte stays right (41 of 41) — on the mapping that stays |
+| a `jmp` written at the load event over a relocated operand | corrupted: the loader added its delta to the fifth byte |
+| x64 compiled Pascal instructions with a relocated operand | none (0 in an executable and two packages) |
+| loader breakpoints | x64: one. WOW64: two, a native one in the 64-bit ntdll with no 32-bit import mapped yet, then `$4000001F` in the 32-bit ntdll with all of them mapped |
+| Delphi code run before either | none |
+| run at the executable's entry point | every static import's entry point; the `initialization` of a statically imported plain DLL; no `initialization` of the executable or of a static package |
+| a line of a module run before that module's entry point | never, in six modules |
+| attach | the target's threads stand still through the synthesised events and run for about 5 µs before the break-in breakpoint; one native breakpoint, no `$4000001F` |
+
+A fixed-base image that collides is mapped, unmapped and mapped again at the
+same address before its entry point runs; what was planted at the first event
+is gone. System DLLs are sometimes mapped twice in passing. Why the loader does
+either was not determined. Not measured: mandatory ASLR, a DLL with no entry
+point, TLS callbacks, the cost of the call form's mispredicted return, a
+trampoline above 4 GB, more than one thread.
+
+**What this changed in the plan:** nothing in the design. The texts under
+"Line probes" now say what was measured where they said what was expected; an
+indirect call is retargeted as `nop` plus call, not call plus `nop`; restores
+are decided per span.
+
 ## Assumptions to measure
 
-After increment 0: 1, 2, 8, 15, 17 and 18 are settled as stated in the section
-above. 9 holds for lines and is refuted for routine exits on x86. 10 is refuted
-(the existing walk is too slow on both bitnesses) and replaced by the cost of
-the local walk, to be measured at the end of increment 12.
+After increment 0: 1, 2, 8, 15, 17 and 18 are settled as stated under
+"Verified in increment 0". 9 holds for lines and is refuted for routine exits
+on x86. 10 is refuted (the existing walk is too slow on both bitnesses) and
+replaced by the cost of the local walk, to be measured at the end of increment
+12. After increment 1: 3, 4, 5, 6, 7, 14 and 16 are settled as stated under
+"Verified in increment 1", on one Windows build.
 
 | # | assumption | settled in | if it is false |
 |---|---|---|---|
