@@ -1396,6 +1396,29 @@ would restore a breakpoint instruction and leave the target trapping forever at
 an address no breakpoint owns. `PlantInt3` adopts the first planter's original
 byte and skips the write.
 
+**A source breakpoint on data is refused (0.9.3, a stopgap).** Not every line
+record is code: on a 32-bit image the record of a unit's final `end.` points at
+a data byte after the unit's last routine (`TD32_FORMAT_NOTES.md`, "What a line
+record points at"). A `$CC` written there is never executed and never restored;
+it changes the program's data, and the 32-bit fixture then loops on an access
+violation in the RTL. `PlantInt3` now refuses a user's source breakpoint whose
+address holds `$00` (`SourceBreakpointLandsOnData`): nothing is written, the
+refusal goes to the log and, once per address, to the user as a notice. One-shot
+breakpoints (steps, the entry stop) and address breakpoints are not affected.
+
+The session keeps the reported state in step (`SourceLineIsBindable`): a line
+whose every address holds a zero byte is unverified. That is decided at once for
+a breakpoint set while the process exists, and at the first module event
+(`HandleDllLoaded`, once) for one set before it did, which is the first moment
+the executable's bytes can be read; the usual `OnBreakpointChanged` event
+carries the flip to the client.
+
+It is a stopgap because the real question is whether the address is a proven
+instruction boundary, and only the zero byte is checked. No statement dcc32 or
+dcc64 compiles starts with `$00`, so nothing legitimate is refused, but a bad
+record on any other byte is not caught. The routine analysis planned in
+`PROFILER_COVERAGE_PLAN.md` (increment 4) replaces the test.
+
 ### A condition that will not evaluate STOPS, and says why
 
 `TBpEvaluator.Decide` (`BreakpointEval.pas`) gates a fired breakpoint on

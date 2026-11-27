@@ -159,6 +159,9 @@ type
     FOnDllLoadedHook:           TSessionDllLoadedEvent;
     FOnModuleSymbolsLoadedHook: TSessionModuleSymbolsEvent;
     FOnBreakpointChanged:       TSessionBpChangedEvent;
+    // Set once the breakpoints placed before the process existed have been
+    // re-evaluated against its memory (HandleDllLoaded).
+    FInitialBindabilityChecked: Boolean;
     FOnDataBpRemoved:           TSessionDataBpRemovedEvent;
     FOnSymbolsArrived:          TNotifyEvent;
 
@@ -348,6 +351,12 @@ type
     // for each line that flipped to verified.
     procedure NotifyBreakpointFlips;
     procedure StoreVerifiedState(const BpId: string; Verified: Boolean);
+    // True when the line resolves and every address it resolves to holds a zero
+    // byte in the live process: the engine will refuse to plant there. False
+    // when that cannot be established yet (no process, module not mapped).
+    function  SourceLineLandsOnlyOnData(const SourceFile: string; Line: Integer): Boolean;
+    // The verified state of a source line: it resolves, and not only to data.
+    function  SourceLineIsBindable(const SourceFile: string; Line: Integer): Boolean;
     // Address breakpoints (docs/DISASSEMBLY_PLAN.md increment 5). Identity is
     // (ModuleName, Rva), resolved from the caller's absolute address at SET
     // time against GetModules -- never a bare VA, which is meaningless across
@@ -1361,12 +1370,11 @@ begin
     Spec.HitConditions[I] := Specs[I].HitCondition;
     Spec.LogMessages[I]   := Specs[I].LogMessage;
 
-    var Rva: UInt64;
     var Bp := Default(TSessionBreakpoint);   // Kind = bkSource
     Bp.Id           := LowerCase(ExtractFileName(SourceFile)) + '|' + IntToStr(Specs[I].Line);
     Bp.SourceFile   := SourceFile;
     Bp.Line         := Specs[I].Line;
-    Bp.Verified     := FDebugInfo.SourceLineToRva(SourceFile, Specs[I].Line, Rva);
+    Bp.Verified     := SourceLineIsBindable(SourceFile, Specs[I].Line);
     Bp.Condition    := Specs[I].Condition;
     Bp.HitCondition := Specs[I].HitCondition;
     Bp.LogMessage   := Specs[I].LogMessage;
@@ -2661,6 +2669,47 @@ begin
   end;
 end;
 
+// The session-side half of the engine's refusal in TWinDebugger.PlantInt3 (see
+// SourceBreakpointLandsOnData there for what is refused and why it is a
+// stopgap). The engine keeps the program safe on its own; this only keeps the
+// reported state honest, and only when the bytes can already be read -- which
+// is the case for a breakpoint set at a stop, the way the MCP front end sets
+// them. A breakpoint set before the process exists is reported from the symbols
+// alone, as before, and the engine's notice says what happened to it.
+function TDebugSession.SourceLineLandsOnlyOnData(const SourceFile: string;
+  Line: Integer): Boolean;
+begin
+  Result := False;
+  if (FDebugger = nil) or (FDebugInfo = nil) then
+    Exit;
+  var Base := FDebugger.ImageBase;
+  if Base = 0 then
+    Exit;
+  var Candidates := FDebugInfo.SourceLineToRvaCandidates(SourceFile, Line);
+  if Length(Candidates) = 0 then
+    Exit;
+  for var Rva in Candidates do begin
+    var FirstByte: Byte := 0;
+    {$Q-}
+    var VA := Base + Rva;
+    {$Q+}
+    if FDebugger.ReadCodeMemoryAt(VA, @FirstByte, 1) <> 1 then
+      Exit(False);   // not mapped (yet): nothing is known about this address
+    if FirstByte <> 0 then
+      Exit(False);
+  end;
+  Result := True;
+end;
+
+function TDebugSession.SourceLineIsBindable(const SourceFile: string;
+  Line: Integer): Boolean;
+begin
+  var Rva: UInt64;
+  if not FDebugInfo.SourceLineToRva(SourceFile, Line, Rva) then
+    Exit(False);
+  Result := not SourceLineLandsOnlyOnData(SourceFile, Line);
+end;
+
 procedure TDebugSession.NotifyBreakpointFlips;
 begin
   if FDebugInfo = nil then
@@ -2669,8 +2718,7 @@ begin
     var Spec := KV.Value;
     for var Line in Spec.Lines do begin
       var Key := LowerCase(ExtractFileName(Spec.SourceFile)) + '|' + IntToStr(Line);
-      var Rva: UInt64;
-      var Verified := FDebugInfo.SourceLineToRva(Spec.SourceFile, Line, Rva);
+      var Verified := SourceLineIsBindable(Spec.SourceFile, Line);
       var Prev := False;
       FBpVerified.TryGetValue(Key, Prev);
       if Verified = Prev then
@@ -2698,6 +2746,17 @@ procedure TDebugSession.HandleDllLoaded(const Name, Path: string;
 begin
   var M := FLoader.RegisterModuleRecord(Name, Path, Base, ImageSize);
   ApplyModuleConfig(M, Name, Path);
+
+  // A breakpoint set before the process existed was reported from the symbols
+  // alone. The first module event is the first moment the executable's bytes can
+  // be read, so re-evaluate once here: a line that lands only on data (see
+  // SourceLineLandsOnlyOnData) flips to unverified before the program runs,
+  // instead of staying a solid marker on a breakpoint the engine refused.
+  if (not FInitialBindabilityChecked) and HaveBreakpoints and
+     (FDebugger <> nil) and (FDebugger.ImageBase <> 0) then begin
+    FInitialBindabilityChecked := True;
+    NotifyBreakpointFlips;
+  end;
 
   // Eagerly load a newly-loaded module's symbols ONLY when it actually owns a
   // pending breakpoint's source (so the breakpoint resolves + plants once the

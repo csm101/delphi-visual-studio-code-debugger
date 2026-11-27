@@ -1869,7 +1869,16 @@ Without it, a BPL whose RSM has zero locals for a function — while its TD32 ha
 them — shows empty locals and `Self: not found`. Regression test:
 `Test_Bpl_Td32Only_LocalsVisible`.
 
-## A breakpoint on a line record that is not code is accepted — OPEN DEFECT, in 0.9.2
+## A breakpoint on a line record that is not code is accepted — STOPGAP in 0.9.3, real fix open
+
+**0.9.3:** `PlantInt3` refuses a source breakpoint whose address holds `$00`,
+and the session reports the line unverified (`DAP_DEBUGGER_ARCHITECTURE.md`,
+"A source breakpoint on data is refused"). That closes the case reproduced
+below and the zero-byte records of generic instantiations on x64. What stays
+open is everything the zero byte does not catch: a record in the middle of an
+instruction (130 on x64 and 1 173 on x86 in one large image) or on a non-zero
+data byte. Those need the boundary proof of the profiler plan's increment 4.
+The text below is the defect as found in 0.9.2.
 
 Found 2026-11-27 while measuring for the profiler; it is a defect of the
 debugger as released, independent of the profiler.

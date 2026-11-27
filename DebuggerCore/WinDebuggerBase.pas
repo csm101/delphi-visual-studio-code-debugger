@@ -110,6 +110,10 @@ type
     FPreferredBase: UInt64;
     FDebugInfo:    TDebugInfoSet;
     FBreakpoints:  TList<TBreakpointRec>;
+    // Addresses PlantInt3 refused because they hold data, not code. Kept only so
+    // the refusal is announced once per address: a breakpoint record is planted
+    // again at every re-arm and every ApplyAllBreakpoints.
+    FRefusedPlantVAs: TList<UInt64>;
     // smInstr is instruction granularity (docs/ASSEMBLY_LEVEL_DEBUGGING.md increment
     // 1) and is deliberately a MODE of its own rather than a flag on smInto /
     // smOver: those two terminate on a new SOURCE LINE, which is not a condition
@@ -437,6 +441,11 @@ type
                 FramePcRva: UInt64): TArray<TLocalValue>;
     procedure PlantInt3(var BP: TBreakpointRec);
     procedure RemoveInt3(var BP: TBreakpointRec);
+    // True when BP is a user's source breakpoint whose address holds a zero
+    // byte, i.e. data. BP.OrigByte must already hold the byte read at BP.VA.
+    function  SourceBreakpointLandsOnData(const BP: TBreakpointRec): Boolean;
+    // Logs, and tells the user once per address, that BP was not planted.
+    procedure AnnounceRefusedPlant(const BP: TBreakpointRec);
     // Thread-context funnel: the single place that opens a thread context to
     // read or mutate a ROLE. A WOW64 target swaps these three implementations
     // rather than eleven scattered TContext sites. Callers that need the raw
@@ -1317,6 +1326,7 @@ begin
   FThreadNames   := TDictionary<DWORD, string>.Create;
   FStepFrozenTids := TList<DWORD>.Create;
   FBreakpoints   := TList<TBreakpointRec>.Create;
+  FRefusedPlantVAs := TList<UInt64>.Create;
   FCommandQueue  := TQueue<TCommand>.Create;
   FDllBases      := TDictionary<string, UInt64>.Create;
   FDllSizes      := TDictionary<string, UInt64>.Create;
@@ -1352,6 +1362,7 @@ begin
     TWctProbe(FWctProbe).Shutdown;   // the helper frees the probe when it is done with it
   FWctProbeRef := nil;
   FBreakpoints.Free;
+  FRefusedPlantVAs.Free;
   FCommandQueue.Free;
   FDllBases.Free;
   FDllSizes.Free;
@@ -2538,12 +2549,56 @@ begin
     DapLog(Format('PlantInt3 FAIL ReadByte VA=$%x LastError=%d', [BP.VA, GetLastError]));
     Exit;
   end;
+  if SourceBreakpointLandsOnData(BP) then begin
+    AnnounceRefusedPlant(BP);
+    Exit;
+  end;
   if not WriteByte(BP.VA, $CC) then
     DapLog(Format('PlantInt3 FAIL WriteByte VA=$%x LastError=%d', [BP.VA, GetLastError]))
   else begin
     BP.IsPlanted := True;
     DapLog(Format('PlantInt3 OK VA=$%x OrigByte=$%x', [BP.VA, BP.OrigByte]));
   end;
+end;
+
+// Not every line record is code. On a 32-bit image the record of a unit's final
+// `end.` points at a data byte after the unit's last routine, and a few records
+// of generic instantiations land on zero bytes on x64 (docs/TD32_FORMAT_NOTES.md,
+// "What a line record points at"). A $CC written there is never executed and
+// never restored: it changes the program's data, and the 32-bit fixture then
+// loops on an access violation in the RTL.
+//
+// STOPGAP, deliberately narrow. The real test is whether the address is a proven
+// instruction boundary, which needs the routine analysis planned in
+// docs/PROFILER_COVERAGE_PLAN.md (increment 4). Until that exists the one thing
+// checked is the byte itself: no statement dcc32 or dcc64 compiles starts with
+// $00 (`add r/m8, r8`), and both observed kinds of bad record sit on one. A bad
+// record on any other byte is not caught.
+//
+// Only a user's source breakpoint is refused. A one-shot (a step, the entry
+// stop) and an address breakpoint name an address the engine or the user chose
+// on purpose.
+function TWinDebugger.SourceBreakpointLandsOnData(const BP: TBreakpointRec): Boolean;
+begin
+  if BP.IsOneShot then
+    Exit(False);
+  if BP.Kind <> bkSource then
+    Exit(False);
+  Result := BP.OrigByte = 0;
+end;
+
+procedure TWinDebugger.AnnounceRefusedPlant(const BP: TBreakpointRec);
+begin
+  DapLog(Format('PlantInt3 REFUSED VA=$%x %s:%d: the byte there is $00 (data, not code)',
+    [BP.VA, BP.SourceFile, BP.SourceLine]));
+  if FRefusedPlantVAs.Contains(BP.VA) then
+    Exit;
+  FRefusedPlantVAs.Add(BP.VA);
+  if not Assigned(FOnNotice) then
+    Exit;
+  FOnNotice(Format('Breakpoint at %s:%d was not set: its address $%x holds data, not code. ' +
+    'The line has no instruction of its own there (typically the final "end." of a unit).',
+    [BP.SourceFile, BP.SourceLine, BP.VA]));
 end;
 
 procedure TWinDebugger.RemoveInt3(var BP: TBreakpointRec);
