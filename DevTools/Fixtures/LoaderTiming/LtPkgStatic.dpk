@@ -1,0 +1,15 @@
+package LtPkgStatic;
+
+// DevTools\LoaderTimingProbe fixture: a runtime package that LtHost.exe requires statically.
+
+{$RUNONLY}
+{$IMPLICITBUILD OFF}
+{$DESCRIPTION 'LoaderTimingProbe fixture'}
+
+requires
+  rtl;
+
+contains
+  LtPkgStaticUnit in 'LtPkgStaticUnit.pas';
+
+end.

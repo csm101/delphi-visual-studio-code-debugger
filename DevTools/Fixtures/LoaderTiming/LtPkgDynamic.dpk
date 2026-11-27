@@ -1,0 +1,15 @@
+package LtPkgDynamic;
+
+// DevTools\LoaderTimingProbe fixture: a runtime package that LtHost.exe loads with LoadPackage (-pkg).
+
+{$RUNONLY}
+{$IMPLICITBUILD OFF}
+{$DESCRIPTION 'LoaderTimingProbe fixture'}
+
+requires
+  rtl;
+
+contains
+  LtPkgDynamicUnit in 'LtPkgDynamicUnit.pas';
+
+end.

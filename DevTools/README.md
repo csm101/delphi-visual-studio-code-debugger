@@ -1376,17 +1376,175 @@ few `.rsm` files to a scratch directory and pass `-verify -j 1`: it rebuilds
 every sidecar and compares hashes, so its exit code says whether the probed run
 produced the same bytes (`-force` on a fresh sidecar only reloads it).
 
+#### LoaderTimingProbe
+
+```bat
+rem static: PE flags, .reloc, fixups, the instruction the tool would watch
+DevTools\Win64\Debug\LoaderTimingProbe.exe -pe [-zydisdll <path>] <image> [<image>...]
+
+rem launch: every debug event in order, one-shot $CC bytes planted as modules are mapped
+DevTools\Win64\Debug\LoaderTimingProbe.exe -run [-entries all|own|none] [-lines <module>]... ^
+  [-reloc <module>]... [-plantsite] [-jmppatch] [-anyrecord] [-baseline] [-quiet] ^
+  [-path <dir>]... [-timeout <s>] <exe> [args...]
+
+rem attach: the synthesised events and the break-in, with a counter of the target read at each
+DevTools\Win64\Debug\LoaderTimingProbe.exe -attach [-quiet] [-path <dir>]... [-timeout <s>] <exe> [args...]
+
+rem everything, against the fixtures, both bitnesses; one report per run in %TEMP%\LoaderTimingProbe
+DevTools\build_loader_fixtures.bat
+DevTools\run_loader_timing.bat
+```
+
+What the Windows loader has done, and what code has run, at each debug event of
+a process start or of an attach: "Increment 1" of
+`docs/PROFILER_COVERAGE_PLAN.md`, assumptions 3, 4 and 5. A raw debug loop with
+no engine in it; a 64-bit tool that drives 64-bit and 32-bit (WOW64) targets.
+Line records come from `TTD32FileReader`, instruction lengths from Zydis, the
+rest from the PE file and from the target's memory.
+
+| mode / option | what it does |
+|---|---|
+| `-pe` | per image: `DYNAMIC_BASE`, `HIGH_ENTROPY_VA`, `RELOCS_STRIPPED`, the `.reloc` section, fixups by kind and by section, and the instruction it would watch: one reached from a TD32 line record whose operand is a relocated absolute address |
+| `-run` | lists module loads (preferred and actual base, the `ImageBase` field of the mapped header), thread starts, breakpoint exceptions (native `$80000003` and WOW64 `$4000001F`) with the module they belong to and the modules mapped at that moment, debug strings, and its own one-shots |
+| `-entries` | one-shot on the entry point of every module (default), of the modules in the executable's directory (`own`), or of none. Planted when the module is mapped: the executable at `CREATE_PROCESS_DEBUG_EVENT`, a DLL at its `LOAD_DLL_DEBUG_EVENT` |
+| `-lines <module>` | a one-shot on every TD32 line record of the module that lies in a routine, so the listing shows the order in which its lines first ran, and flags anything that ran before its entry point |
+| `-reloc <module>` | reads an instruction with a relocated operand, one relocated slot in a code section and one in a data section at the load event, at the entry-point one-shot and at process exit, next to the file's bytes and to what a relocated image must hold |
+| `-plantsite` | with `-reloc`: a one-shot on the first byte of the watched instruction, planted at the load event |
+| `-jmppatch` | with `-reloc`: writes `E9 00 01 00 00` over the watched instruction at the load event, reads it back at the entry point, repairs it before anything runs it |
+| `-anyrecord` | with `-lines`: also the records in no TD32 routine. Negative control; the target is expected to fault |
+| `-baseline` | runs the target first with nothing planted and compares exit code, stdout and debug strings |
+| `-attach` | starts the target without a debugger, waits for `counter=<hex> release=<hex>` on its stdout, attaches, lists the events with the counter read at each, and writes 1 to the release flag 300 ms after the break-in. Plants nothing |
+
+At process exit every code section of a module that carried one-shots or a
+`-reloc` watch is compared with the file relocated by the actual delta, and every
+saved byte with the file's byte.
+
+The fixtures are in `Fixtures\LoaderTiming\` (`build_loader_fixtures.bat`):
+`LtHost.exe` requires `rtl` and its own package `LtPkgStatic.bpl`, imports
+`LtDllStatic.dll`, and loads what `-pkg <bpl>` / `-dll <dll>` name, in order;
+`-wait` makes it spin on a counter for the attach. `LtFixA.dll` / `LtFixB.dll`
+share one fixed image base with no dynamic base, so the second one loaded must
+move; `LtDynA.dll` / `LtDynB.dll` are the same with a dynamic base. Every unit
+`initialization`, DLL `begin..end` block and `DllProc` notification announces
+itself with `OutputDebugString`. `LtHost.exe` needs `rtl290.bpl`: pass
+`-path <BDS>\bin64` or `-path <BDS>\bin`.
+
+What the first runs established (2026-11-27, Windows build 26300, Delphi 12):
+
+- **A colliding image without a dynamic base is relocated in user mode, after
+  its `LOAD_DLL_DEBUG_EVENT` and before its entry point**, on both bitnesses.
+  With a dynamic base the bytes are already relocated at the event, and the
+  mapped header's `ImageBase` field already holds the actual base.
+- **That same image is mapped twice.** The debugger sees `LOAD_DLL`, `UNLOAD_DLL`
+  and `LOAD_DLL` again at the same address, with or without anything planted. A
+  `$CC` written at the first event goes with the first mapping. The parallel
+  loader does the like with system DLLs: a second mapping of the same file at
+  another address, unmapped at once.
+- A `$CC` planted at the load event of the mapping that stays survives the
+  relocation, and so does the saved byte. A five-byte jump planted there does
+  not: the loader adds its delta to the fixup field under it. The delta is a
+  multiple of 64K, so only the bytes of the field above its low two change.
+- dcc64 code has no instruction with a relocated operand; the fixture carries a
+  hand-written `mov rax, offset` so that x64 has one to watch.
+- The record of a unit's final `end.` lies in no TD32 routine and points at data.
+  A `$CC` there (`-anyrecord`) makes `LoadPackage` fault inside `rtl290.bpl`.
+
+#### PatchFeasibilityProbe
+
+```bat
+rem build the fixture for both bitnesses, then run every experiment on both
+DevTools\build_trampoline_fixture.bat
+DevTools\Win64\Debug\PatchFeasibilityProbe.exe ^
+  DevTools\Fixtures\Win64\Debug\TrampolineFixture.exe DevTools\Fixtures\Win32\Debug\TrampolineFixture.exe
+
+rem one experiment, one bitness
+DevTools\Win64\Debug\PatchFeasibilityProbe.exe -only e3 DevTools\Fixtures\Win32\Debug\TrampolineFixture.exe
+```
+
+Hand-built code patches in a live debuggee, to settle whether the line probes of
+`docs\PROFILER_COVERAGE_PLAN.md` are feasible as designed (increment 1,
+assumptions 6, 7, 14 and 16). No engine: a raw debug loop, memory allocated in
+the target with `VirtualAllocEx` (on x64 in the first free region within rel32
+reach of the image, found with `VirtualQueryEx`) and trampolines written by
+hand. Both fixtures are driven from the one 64-bit probe.
+
+| Flag | Meaning |
+|---|---|
+| `-only e1,e3,...` | run the listed experiments only (`e1` .. `e7`) |
+| `-timeout <s>` | seconds one launch may take before it is killed (default 15) |
+| `-floodlimit <n>` | exceptions one launch may produce before it is killed (default 300) |
+| `-src <file>` | the fixture's source; default `<exe name>.dpr` in the executable's directory or one of its three parents |
+| `-zydisdll <path>` | `Zydis.dll` to load |
+
+**How a result is decided.** Every experiment first runs the fixture PLAIN,
+under the same loop, and keeps its transcript: the fixture's `PF: ...`
+`OutputDebugString` lines (addresses in them are module relative, so two
+launches compare equal under ASLR) and its exit code. A patched run "behaves as
+plain" exactly when both are equal. A run that crashes or loops is an expected
+outcome: the debuggee is killed and waited for, and the report says how it
+ended (second-chance exception with code and address, timeout, flood).
+
+**Where the addresses come from.** `DevTools\Fixtures\TrampolineFixture.dpr` has
+one small routine per experiment with `{BP:NAME}` markers; the probe resolves
+them through `TTD32FileReader`, decodes the code there with Zydis out of the
+live process, and REFUSES a variant, saying why, when the bytes are not the
+shape it needs (a row then reads `not run: ...`).
+
+| Experiment | What is patched | Question |
+|---|---|---|
+| `e1` | the return address R of a call whose callee raises: `jmp rel32`, one-shot `$CC`, the call form, a `jmp` on the second instruction after R; also with the raise two calls below and with the patched frame having no handler | does the x64 unwinder take a `jmp` at R for a tail call (rule 6) |
+| `e2` | an epilogue that starts at R, in three compiled shapes: `jmp` behind the stack adjustment, over the last pops and the `ret`, at R; the same as a call; a `$CC` | the second shape of rule 6, and the call form at an exit |
+| `e3` | a statement that faults in its first bytes, displaced into a trampoline; then a payload that itself faults | a fault "sent back" to the original address, or to the site with the payload's stack pointer undone, against passing it on |
+| `e4` | the rel32 of a direct call, to a trampoline that counts and jumps on; as a contrast a trampoline that CALLS the callee | handler, hit count and the program's own stack trace |
+| `e5` | `FF 15` re-encoded as `E8 rel32, 90` and as `90, E8 rel32`, the call being the last instruction of a `try` body, in its middle, and the last instruction before it | does dispatch or a tracer's call-site test notice |
+| `e6` | R of `e1` (`jmp`, call form, `$CC`), stop in the callee | three `StackWalk64` walks: read routine `nil`, one serving memory as it is, one serving the original bytes; which code dbghelp reads through the routine |
+| `e7` | the first line of a routine the program then hooks with its own detour | a `jmp` and an armed `$CC` under a hook that copies the first bytes |
+
+**Baseline (2026-11-27, Ryzen 9 5950X, Windows 11 build 26300.10075):** 108 rows,
+70 confirmed, none refuted, 20 measured without a stated expectation, 18 not
+run because the compiled shape does not allow the variant (an x86 epilogue of
+one or three bytes takes neither a jump nor a call). The whole run takes three
+seconds. `docs\PROFILER_COVERAGE_PLAN.md` owns the conclusions (increment 1);
+the ones that are easy to get wrong:
+
+- x64, a `jmp rel32` anywhere in the window of a return address (at R, behind
+  `lea rsp`, behind three pops, over `add rsp; ret`): the exception is never
+  handled, by any frame, and comes back as a second-chance event. A `$CC`, an
+  `E8` and a `jmp` one instruction later are indistinguishable from plain. On
+  x86 the same `jmp` is harmless.
+- x64, a fault in a trampoline that is passed on does three different things
+  depending on the frame: the process dies; a `finally` is skipped and the outer
+  handler runs; or the right handler runs with a foreign `ExceptAddr`. Sent
+  back, all of them are identical to plain, on both bitnesses.
+- x64: dbghelp reads the code at every frame's PC through the read routine it
+  is given, a byte at a time, and with `nil` reads the patched memory: only a
+  routine that serves the original bytes walks past a `jmp` at a return address
+  (three frames instead of seven). On x86 it reads the eight bytes in front of
+  candidate return addresses instead, and the three walks agree.
+- `90, E8 rel32` keeps the return address of a re-encoded indirect call where it
+  was; `E8 rel32, 90` moves it one byte back, which only the program's own stack
+  trace can see.
+
+**A 32-bit fixture may not be called "PatchFixture".** A 32-bit executable
+without a manifest whose file name contains `patch`, `setup`, `install` or
+`update` is taken for an installer: `CreateProcess` fails with error 740 and
+nothing is launched. This fixture hit it; the 64-bit build is not affected.
+
 ## Source layout
 
 | File | Purpose |
 |------|---------|
-| `<Tool>.dpr` | One self-contained entry point per tool; there are 55 of them and no shared units other than `RsmReader.pas` |
+| `<Tool>.dpr` | One self-contained entry point per tool; there are 57 of them and no shared units other than `RsmReader.pas` |
 | `ProbeCostProbe.cfg` | Adds `-V` to that one tool, which is also its own debuggee and needs TD32 line records in its executable |
 | `Fixtures\*.dpr` | Debuggees, not tools. In a subfolder so `build_all.bat`'s `*.dpr` discovery does not pick them up, and built with their own script because they need full debug info |
 | `RsmReader.pas` | Standalone binary RSM analyzer, used only by `RsmAnalyzer` (separate from `DebuggerCore\RsmFileReader.pas`, which is the parser the adapter actually ships) |
 | `build_all.bat` | Builds every `*.dpr` in this folder |
 | `build_one.bat` | Builds a single tool, optionally into a private output directory |
 | `build_exc_fixture.bat` | Builds `Fixtures\ExcNestFixture.dpr` for both bitnesses with full debug info, for `ExcHandlerProbe` |
+| `build_trampoline_fixture.bat` | Builds `Fixtures\TrampolineFixture.dpr` for both bitnesses with full debug info, for `PatchFeasibilityProbe` |
+| `Fixtures\LoaderTiming\` | The debuggees of `LoaderTimingProbe`: a host, two packages and six plain DLLs sharing one unit |
+| `build_loader_fixtures.bat` | Builds `Fixtures\LoaderTiming\` for both bitnesses with TD32 debug info in every image |
+| `run_loader_timing.bat` | Runs every `LoaderTimingProbe` measurement against those fixtures, one report per run in `%TEMP%\LoaderTimingProbe` |
 | `build_wow64stackprobe.bat` | Builds only `Wow64StackProbe` (64-bit by construction: the probe *is* the 64-bit debugger side) |
 | `run_wow64probe.bat` | Runs `Wow64StackProbe` with its output tee'd to a log file |
 | `run_disasm_coverage.bat` | Runs `DisasmCoverage` with the Visual Studio toolset initialised first, so `dumpbin.exe` is on `PATH` |
