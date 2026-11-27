@@ -116,7 +116,15 @@ The debugger engine is exposed through two frontends:
   `ILocalSymbolProvider` and `IGlobalSymbolProvider`.
 - `DebugInfoSet.pas` / `DebugInfoTypes.pas` — aggregate provider
   registry plus the shared types (`TSourceLocation`, `TLocalSymbol`,
-  `TGlobalSymbol`, `TLocalKind`).
+  `TGlobalSymbol`, `TLocalKind`). `DebugInfoTypes.pas` also declares the two
+  whole-table interfaces, `ILineRecordProvider` and `IRoutineRangeProvider`,
+  which the aggregate registry does not route: their only consumer is the code
+  map, which is handed the providers of one module.
+- `CodeMap.pas` — `TModuleCodeMap`: the routines and line records of ONE
+  module, joined once, in module-relative RVAs. Depends on
+  `DebugInfoTypes.pas` and on nothing else of the engine, so it can be built
+  from a binary on disk as well as from a module of a live session. See "Code
+  map" below. Nothing in the adapter or the MCP server uses it yet.
 - `ModuleSymbolLoader.pas` — the shared, SYNCHRONOUS symbol/module loader
   (`TModuleSymbolLoader`) both frontends delegate to. Owns the runtime-module
   registry (`TModuleSymbols`; the DAP subclasses it as `TDllModule` for the
@@ -1214,6 +1222,136 @@ Rules, each of which is load-bearing:
   would pass every DAP test and never register anything under MCP.
 
 On by default; `SYMBOL_PREFETCH=0` turns it off.
+
+## Code map
+
+`docs/PROFILER_COVERAGE_PLAN.md`, increment 2. Coverage needs every line record
+of a module, sampling needs to name any address, instrumentation needs routine
+boundaries. The providers answer point lookups; asking them once per address
+for 2.8 million records is not a plan. The code map is the whole of one
+module's routines and line records, joined once.
+
+### The two provider interfaces
+
+`ILineRecordProvider.LineRecordTable(out Complete)` returns a
+`TLineRecordTable`: the records sorted by RVA, one per distinct address, each
+with a file index, a line and a unit index, plus the file table (name and
+path as recorded) and the unit table those indexes point into.
+`IRoutineRangeProvider.RoutineRanges(out Complete)` returns the routines
+sorted by start, one per distinct start: start, exclusive end, name, unit
+name, and `EndIsApproximate`. Both answer in the RVA space every other method
+of the same provider uses, and both build a fresh result on every call:
+nothing is cached, because a published reader must stay immutable.
+
+| | TD32 and `.tds` (`TTD32FileReader`) | MAP (`TMapFile`) | JDBG (`TJclFileReader`) |
+|---|---|---|---|
+| line records | the reader's frozen row table | every "Line numbers for" section, parsed on the calling thread | the stream's (address, line) pairs |
+| file path | name only (the reader drops the directory at parse time) | as written in the section header | as stored in the stream |
+| unit of a record | the module of its SOURCE_MODULE table | the unit named by the section header | the unit segment holding the address |
+| routines | procedure records, range as recorded | publics outside DATA/BSS/TLS | named symbols |
+| routine end | exact | approximate | approximate |
+| unit of a routine | not supplied (the map fills it, see below) | the unit of the detailed map of segments holding its start | the unit segment holding its start |
+| `Complete` | always True | False until the section index (lines) or the publics (routines) are ready; waits up to 15 s | True when the stream is valid |
+
+Mechanisms worth knowing:
+
+- **TD32 line rows do not hold their module.** A row is (RVA, file, line), 16
+  bytes. `LineRowModules` reads the module back by walking the mapped
+  SOURCE_MODULE tables a second time, pair for pair in the order
+  `ParseSourceModule` walks them, so that where two pairs share an address the
+  module assigned is that of the pair the parse kept. Measured at 140 ms for
+  2 880 014 records. The module's unit is `FModIndexUnit`, the base name of the
+  module's first source file. The check that this names the right unit is
+  independent of it: the unit-scoped procedure index is built from the SYMBOL
+  streams, and `Td32_LineRecordUnit_IsTheUnitThatDeclaresTheRoutine` requires
+  the two to agree.
+- **TD32 procedure rows can repeat a start address.** Of the rows sharing a
+  start the last is reported, because that is the one `FindProcIndex`, and so
+  `RvaToFunctionStart` / `RvaToFunctionName`, answers with.
+- **A MAP enumeration does not load the MAP into the reader.** The lazy
+  per-unit tables (`FRvaToLoc`, `FLineToRva`) are neither read nor filled: the
+  sections are parsed straight into the result. Those tables are confined to
+  the thread that drives the lookups, so the enumeration is also the only
+  whole-table path that is safe from another thread, and a reader asked for
+  its table once does not hold millions of line strings afterwards. The two
+  rules of the lazy path are applied here too: a record outside the code of
+  its section's own unit is left out, and of two sections with a record at one
+  address the later one wins.
+- **A MAP routine's end** is the next public, capped by the end of the unit's
+  code in the detailed map of segments and by `MAX_FUNC_SPAN` (256 KB), the
+  same limit `PublicCanContain` applies to a point lookup.
+- **A JDBG routine's end** is the next symbol or the start of the next unit
+  segment. That is what `ProcNameFromAddr` implements by refusing a symbol
+  that lies below the start of the unit holding the address.
+- **The JDBG table knows more than the JCL lookup.**
+  `TJclBinDebugScanner.SourceNameFromAddr` reports a source name only when it
+  meets a LATER entry of the source table, so `RvaToSourceLine` has no answer
+  for the addresses of the last source file of an image (on `TestTarget.exe`,
+  the 40 records of the program's main block). The enumeration reads the table
+  directly and has them. `Jdbg_Markers_AreLineRecordsInTheRoutineJclNames`
+  pins the difference to exactly that shape.
+
+### `TModuleCodeMap`
+
+`TModuleCodeMap.Build(ModuleName, LineProvider, RoutineProvider, RvaShift,
+ImageSize, Resolver)`. `PickProviders` chooses the two providers from a
+module's list in order of preference, and prefers one provider that supplies
+both tables over an earlier one that supplies one: lines and ranges read from
+the same format agree by construction. It returns False when the module's
+formats cannot supply both, which is how a module with only `.rsm` or `.dcp`
+is reported as not measurable.
+
+- **Module-relative RVAs.** The engine's RVA space is anchored at the main
+  executable and a DLL/BPL's providers answer shifted by `Base - exeImageBase`
+  (`ModuleRvaRange`). `RvaShift` is that value (0 for a reader opened on the
+  file, and for the main executable); the map subtracts it with wrap-around,
+  because the shift of a module loaded BELOW the executable is the difference
+  modulo 2^64. A map built from the file and one built through a shifted
+  provider are identical, which is what lets a stored result outlive the load
+  address. RVAs are 32-bit: a PE image is smaller than 4 GB.
+- **Records and routines outside the image are dropped and counted**
+  (`DroppedLineCount`, `DroppedRoutineCount`), as are a repeated address and a
+  record without a valid file. A provider's table is verified sorted and
+  re-sorted if it is not, since every lookup bisects.
+- **Which routine a record is in.** The routine with the nearest start at or
+  below the record, and only if the record is below that routine's end — the
+  rule `FindProcIndex` applies, so the map and `RvaToFunctionStart` agree
+  record by record even where ranges overlap. A routine's records are
+  therefore contiguous (`FirstLine`, `LineCount`).
+- **A record outside every routine range is kept, flagged and counted**
+  (`RoutineIndex = -1`, `OutsideRoutineCount`), never dropped and never to be
+  patched: some of them point at data (`TD32_FORMAT_NOTES.md`, "What a line
+  record points at").
+- **`CodeLength`** is the distance to the next record or to the end of the
+  record's routine, whichever is nearer; for a record outside every routine,
+  to the next record or the next routine. Where ranges overlap a routine stops
+  owning addresses at the next routine's start.
+- **Units.** One table for both sides. A provider may know the unit of its
+  records and not of its routines (TD32) or the reverse, so a routine without
+  a unit takes that of its first record and a record without one takes its
+  routine's.
+- **Source paths** go through the `Resolver` callback, once per file at build
+  time, so the unit does not depend on `TSourceResolver` and a map can be
+  built with no session at all.
+- **Lookups:** `FindLine` (the record AT an address), `FindLineCovering`,
+  `FindRoutine`, `FindFiles` (by name, narrowed by a recorded or resolved path
+  when one matches), `LinesAt(file, line)` and `LinesOfFile`. The (file, line)
+  index is the record indexes ordered by (file, line, RVA), built with two
+  stable counting passes over records that are already in RVA order.
+
+A map is immutable once built and can be read from any thread.
+
+Measured with `DevTools\CodeMapDump` on a 620 MB x64 and a 530 MB x86 image
+(2 880 014 and 2 791 210 line records, 422 648 and 407 064 routines): built in
+436 and 401 ms; tables 90.1 and 87.2 MB (24 bytes per line record, 32 per
+routine, 4 per record for the (file, line) index) plus 40.3 and 34.1 MB of
+routine names, which are shared with the reader while it is alive.
+
+**Not wired yet.** Nothing in the session builds a code map. A live module's
+map is `Build` over the providers in `TModuleSymbols` (`Td32Iface` or
+`TdsIface`, then `MapIface`, then `JclIface`) with `RvaShift` taken from
+`TModuleSymbolLoader.ModuleRvaRange`; the increment that adds the first
+collector adds that call.
 
 ## Main loop
 
@@ -4189,8 +4327,8 @@ was measured when it was written; none is restated elsewhere in this document.
   declared in this Delphi's `Winapi.Windows`** and are imported manually in
   `ProcessEnum`, following the pattern already in `DapServer.pas`.
 - **Provider-interface GUIDs share a prefix differing only in the last suffix**;
-  the last allocated is `...0013` (`ISourceFileListProvider`) and the NEXT FREE is
-  `0014`. A duplicate makes `Supports` hand back the wrong vtable silently — a
+  the last allocated are `...0014` (`ILineRecordProvider`) and `...0015`
+  (`IRoutineRangeProvider`), and the NEXT FREE is `0016`. A duplicate makes `Supports` hand back the wrong vtable silently — a
   `...0011` clash with `IThreadLocalNameProvider` wrote a `TArray` result through
   the address of a `Boolean` and errored 13 tests far from the cause.
   `TProviderInterfaceTests.ProviderInterfaceGuids_AreUnique` pins pairwise

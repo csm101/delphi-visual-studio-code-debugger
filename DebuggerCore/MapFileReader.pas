@@ -50,7 +50,8 @@ type
 
   TMapFile = class(TInterfacedObject,
     ISourceLineProvider, IFunctionNameProvider, IBackgroundIndexProvider,
-    IThreadLocalNameProvider, ISymbolExtentProvider, ISourceFileListProvider)
+    IThreadLocalNameProvider, ISymbolExtentProvider, ISourceFileListProvider,
+    ILineRecordProvider, IRoutineRangeProvider)
   private
     // Memory-mapped file
     FFileHandle:     THandle;
@@ -188,6 +189,7 @@ type
     procedure AddUnitSection(const UnitKey: string; const Info: TUnitSectionInfo);
     function  LoadUnitIndexFromSidecar(const SidecarPath: string): Boolean;
     procedure SaveUnitIndexToSidecar(const SidecarPath: string);
+    procedure WaitForPublicsUpTo(BudgetMs: Cardinal);
 
   public
     constructor Create;
@@ -223,6 +225,32 @@ type
     function    BackgroundIndexingPending: Boolean;
     // ISourceFileListProvider
     function    SourceFileList(out Complete: Boolean): TArray<TSourceFileEntry>;
+    /// <summary>ILineRecordProvider: every line record of the MAP, one per
+    /// distinct address, with its source file and unit.</summary>
+    /// <remarks>The line sections are normally parsed one unit at a time, on
+    /// demand. This parses ALL of them, on the calling thread, into the
+    /// returned table only: the reader's own lazy tables are neither used nor
+    /// filled, so asking does not make the reader hold the whole MAP and is
+    /// safe from any thread. It applies the two rules of the lazy path: a
+    /// record outside the code of its section's unit is left out, and of two
+    /// sections with a record at one address the later one wins. Waits up to
+    /// 15 s for the section index.</remarks>
+    /// <param name="Complete">False when the section index was not ready in
+    /// time (or there is no MAP); the table is then empty.</param>
+    /// <returns>The table; a fresh copy on every call.</returns>
+    function    LineRecordTable(out Complete: Boolean): TLineRecordTable;
+    /// <summary>IRoutineRangeProvider: every public outside the data segments
+    /// as a routine.</summary>
+    /// <remarks>A MAP records where a public STARTS and nothing else, so every
+    /// end is approximate: the next public, the end of the unit's code in the
+    /// detailed map of segments, or the span limit <c>RvaToFunctionStart</c>
+    /// applies, whichever comes first. A few publics in code segments are not
+    /// routines. Names are spelled as <c>RvaToFunctionName</c> returns them.
+    /// Waits up to 15 s for the publics.</remarks>
+    /// <param name="Complete">False when the publics were not parsed in time
+    /// (or there is no MAP); the result is then empty.</param>
+    /// <returns>The ranges, sorted by start; a fresh copy on every call.</returns>
+    function    RoutineRanges(out Complete: Boolean): TArray<TRoutineRange>;
   end;
 
 function ReadPEPreferredBase(const ExePath: string): UInt64;
@@ -1477,6 +1505,257 @@ begin
   end;
 end;
 
+{ --------------------------------------------------------------------------- }
+{  Whole-table enumeration (ILineRecordProvider, IRoutineRangeProvider)        }
+{ --------------------------------------------------------------------------- }
+
+const
+  // How long an explicit enumeration waits for the background indexer. The
+  // section index of a 359 MB MAP is ready in under 3 s (see BINDING_WAIT_MS).
+  ENUMERATION_WAIT_MS = 15000;
+  // No Delphi routine approaches this; a larger gap means Rva sits in a region
+  // this MAP has no symbol for (padding, a stripped routine, another segment).
+  // Shared by PublicCanContain and RoutineRanges so that a range read from the
+  // table and a point lookup agree.
+  MAX_FUNC_SPAN = UInt64($40000);   // 256 KB
+
+procedure TMapFile.WaitForPublicsUpTo(BudgetMs: Cardinal);
+begin
+  var Deadline := GetTickCount64 + BudgetMs;
+  while BackgroundIndexingPending do begin
+    // No worker, or one that ended without publishing: waiting cannot help.
+    if (FIndexThread = nil) or FIndexThread.Finished then
+      Exit;
+    if GetTickCount64 > Deadline then
+      Exit;
+    Sleep(1);
+  end;
+end;
+
+function TMapFile.LineRecordTable(out Complete: Boolean): TLineRecordTable;
+type
+  // A record as read, before the "one per address" rule is applied.
+  TReadRecord = record
+    Rva:           UInt64;
+    SectionOffset: Int64;    // position of its section in the MAP
+    Sequence:      Integer;  // position among everything read
+    FileIndex:     Integer;
+    UnitIndex:     Integer;
+    Line:          Integer;
+  end;
+  TSectionToRead = record
+    UnitKey: string;
+    Info:    TUnitSectionInfo;
+  end;
+var
+  Found:      TArray<TReadRecord>;
+  FoundCount: Integer;
+  Ranges:    TArray<TUnitCodeRange>;
+  UnitsWithCode: TArray<string>;
+
+  procedure ReadSection(const Section: TUnitSectionInfo; FileIndex, UnitIndex: Integer);
+  begin
+    var UnitPosition: Integer;
+    var CheckOwnership := TArray.BinarySearch<string>(UnitsWithCode, UpperCase(Section.UnitName), UnitPosition);
+    var P    := FMapData + Section.DataOffset;
+    var PEnd := FMapData + FMapSize;
+    var Line: string;
+    while ScanLine(P, PEnd, Line) do begin
+      var DataLine := Line.Trim;
+      if EndsLineNumberSection(DataLine) then
+        Break;
+      var Tokens := DataLine.Split([' ', #9], TStringSplitOptions.ExcludeEmpty);
+      var T := 0;
+      while T + 1 < Length(Tokens) do begin
+        var LineNum := StrToIntDef(Tokens[T], 0);
+        var RvaStr  := Tokens[T + 1];
+        Inc(T, 2);
+        if LineNum <= 0 then
+          Continue;
+        var Rva: UInt64;
+        if not SegmentRvaFromToken(RvaStr, Rva) then
+          Continue;
+        if CheckOwnership then begin
+          var Range: TUnitCodeRange;
+          if not TryUnitCodeRangeAt(Ranges, Rva, Range) or
+             not SameText(Range.UnitName, Section.UnitName) then
+            Continue;
+        end;
+        if FoundCount = Length(Found) then
+          SetLength(Found, FoundCount * 2 + 4096);
+        Found[FoundCount].Rva           := Rva;
+        Found[FoundCount].SectionOffset := Section.DataOffset;
+        Found[FoundCount].Sequence      := FoundCount;
+        Found[FoundCount].FileIndex     := FileIndex;
+        Found[FoundCount].UnitIndex     := UnitIndex;
+        Found[FoundCount].Line          := LineNum;
+        Inc(FoundCount);
+      end;
+    end;
+  end;
+
+begin
+  Result := Default(TLineRecordTable);
+  Complete := False;
+  if FMapData = nil then
+    Exit;
+  WaitForIndexUpTo(ENUMERATION_WAIT_MS);
+
+  var Sections: TArray<TSectionToRead>;
+  FLock.Acquire;
+  try
+    if not FIndexReady then
+      Exit;
+    Ranges        := FUnitCodeRanges;
+    UnitsWithCode := FUnitsWithCode;
+    var SectionCount := 0;
+    for var List in FUnitSections.Values do
+      Inc(SectionCount, List.Count);
+    SetLength(Sections, SectionCount);
+    SectionCount := 0;
+    for var KV in FUnitSections do
+      for var Info in KV.Value do begin
+        Sections[SectionCount].UnitKey := KV.Key;
+        Sections[SectionCount].Info    := Info;
+        Inc(SectionCount);
+      end;
+  finally
+    FLock.Release;
+  end;
+  Complete := True;
+
+  // In MAP order, so the result does not depend on the order of a dictionary.
+  TArray.Sort<TSectionToRead>(Sections, TComparer<TSectionToRead>.Construct(
+    function(const A, B: TSectionToRead): Integer
+    begin
+      if A.Info.DataOffset < B.Info.DataOffset then
+        Exit(-1);
+      if A.Info.DataOffset > B.Info.DataOffset then
+        Exit(1);
+      Result := 0;
+    end));
+
+  var FileIds := TDictionary<string, Integer>.Create;
+  var UnitIds := TDictionary<string, Integer>.Create;
+  var Files := TList<TLineRecordFile>.Create;
+  var Units := TList<string>.Create;
+  try
+    FoundCount := 0;
+    for var Section in Sections do begin
+      // One file per recorded path; the file key alone would merge two files
+      // of the same name in different directories.
+      var FileKey := UpperCase(IfThen(Section.Info.FullPath <> '', Section.Info.FullPath, Section.UnitKey));
+      var FileIndex: Integer;
+      if not FileIds.TryGetValue(FileKey, FileIndex) then begin
+        var FileEntry := Default(TLineRecordFile);
+        FileEntry.Name := ExtractFileName(Section.Info.FullPath);
+        if FileEntry.Name = '' then
+          FileEntry.Name := Section.UnitKey;
+        if FileEntry.Name <> Section.Info.FullPath then
+          FileEntry.FullPath := Section.Info.FullPath;
+        FileIndex := Files.Add(FileEntry);
+        FileIds.Add(FileKey, FileIndex);
+      end;
+      var UnitIndex := -1;
+      if (Section.Info.UnitName <> '') and
+         not UnitIds.TryGetValue(UpperCase(Section.Info.UnitName), UnitIndex) then begin
+        UnitIndex := Units.Add(Section.Info.UnitName);
+        UnitIds.Add(UpperCase(Section.Info.UnitName), UnitIndex);
+      end;
+      ReadSection(Section.Info, FileIndex, UnitIndex);
+    end;
+    Result.Files := Files.ToArray;
+    Result.Units := Units.ToArray;
+  finally
+    Units.Free;
+    Files.Free;
+    UnitIds.Free;
+    FileIds.Free;
+  end;
+  SetLength(Found, FoundCount);
+
+  // By address; at one address the later section first, and within a section
+  // the record read first -- the order StoreLineRecord resolves a clash in.
+  TArray.Sort<TReadRecord>(Found, TComparer<TReadRecord>.Construct(
+    function(const A, B: TReadRecord): Integer
+    begin
+      if A.Rva < B.Rva then
+        Exit(-1);
+      if A.Rva > B.Rva then
+        Exit(1);
+      if A.SectionOffset > B.SectionOffset then
+        Exit(-1);
+      if A.SectionOffset < B.SectionOffset then
+        Exit(1);
+      Result := A.Sequence - B.Sequence;
+    end));
+
+  SetLength(Result.Records, FoundCount);
+  var Count := 0;
+  for var I := 0 to FoundCount - 1 do begin
+    if (I > 0) and (Found[I].Rva = Found[I - 1].Rva) then
+      Continue;
+    Result.Records[Count].Rva       := Found[I].Rva;
+    Result.Records[Count].FileIndex := Found[I].FileIndex;
+    Result.Records[Count].Line      := Found[I].Line;
+    Result.Records[Count].UnitIndex := Found[I].UnitIndex;
+    Inc(Count);
+  end;
+  SetLength(Result.Records, Count);
+end;
+
+function TMapFile.RoutineRanges(out Complete: Boolean): TArray<TRoutineRange>;
+begin
+  Result := nil;
+  Complete := False;
+  if FMapData = nil then
+    Exit;
+  WaitForPublicsUpTo(ENUMERATION_WAIT_MS);
+
+  // Under the lock throughout: FDataRvas is read under it everywhere else, and
+  // the pass is memory-only.
+  FLock.Acquire;
+  try
+    if not FPubsReady then
+      Exit;
+    Complete := True;
+    var Publics := FSortedPubRvas;
+    SetLength(Result, Length(Publics));
+    var Count := 0;
+    for var I := 0 to High(Publics) do begin
+      var StartRva := Publics[I];
+      // A data public is no routine, but it still ends the one before it.
+      if FDataRvas.ContainsKey(StartRva) then
+        Continue;
+      var Name: string;
+      if not FRvaToPubName.TryGetValue(StartRva, Name) then
+        Continue;
+      // Lengths, not addresses: the RVAs of a module loaded below the main
+      // executable sit at the top of the 64-bit range.
+      var Span := MAX_FUNC_SPAN;
+      if (I < High(Publics)) and (Publics[I + 1] - StartRva < Span) then
+        Span := Publics[I + 1] - StartRva;
+      Result[Count] := Default(TRoutineRange);
+      var Range: TUnitCodeRange;
+      if TryUnitCodeRangeAt(FUnitCodeRanges, StartRva, Range) then begin
+        Result[Count].UnitName := Range.UnitName;
+        if Range.EndRva - StartRva < Span then
+          Span := Range.EndRva - StartRva;
+      end;
+      {$Q-}
+      Result[Count].StartRva := StartRva;
+      Result[Count].EndRva   := StartRva + Span;
+      {$Q+}
+      Result[Count].Name     := Name;
+      Result[Count].EndIsApproximate := True;
+      Inc(Count);
+    end;
+    SetLength(Result, Count);
+  finally
+    FLock.Release;
+  end;
+end;
+
 function TMapFile.BackgroundIndexingPending: Boolean;
 begin
   FLock.Acquire;
@@ -1671,10 +1950,6 @@ begin
 end;
 
 function TMapFile.PublicCanContain(PubRva, Rva: UInt64): Boolean;
-const
-  // No Delphi routine approaches this; a larger gap means Rva sits in a region
-  // this MAP has no symbol for (padding, a stripped routine, another segment).
-  MAX_FUNC_SPAN = UInt64($40000);   // 256 KB
 begin
   Result := False;
   if Rva < PubRva then Exit;

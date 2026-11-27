@@ -830,6 +830,30 @@ What the first runs established, and what to look for when a number moves:
   1 579 records), and on x86 the static functions of linked C objects, which
   share one TD32 range with the public symbol in front of them.
 
+#### CodeMapDump
+
+Builds the code map of one binary from its TD32 (`DebuggerCore\CodeMap.pas`,
+`TModuleCodeMap`) and prints what it holds: routines, line records, the records
+that lie outside every routine range, files, units, the time the build took and
+the memory the map keeps. Static: the binary is read as a file and never run.
+
+```powershell
+DevTools\Win64\Debug\CodeMapDump.exe <exe-or-bpl> [-tds <file.tds>] [-shift <hex>]
+                                     [-lines <source file>] [-routine <name>]
+```
+
+- `-lines <source file>` lists the line records of one source file, `-routine
+  <name>` those of one routine.
+- `-shift <hex>` loads the reader with that RVA shift, as a runtime module of a
+  session is loaded; the map must come out the same, which is what makes it
+  comparable across runs.
+
+Baseline, 2026-11-27 (records outside every routine in brackets): the x64
+fixture executable 1 904 line records [28], the x86 one 1 974 [32]; a 620 MB
+x64 image 2 880 014 [14 468], built in 0.43 s after a 5.2 s TD32 load, 90 MB of
+tables. The bracketed numbers are the ones `LineSiteSurvey` reports for the
+same binaries.
+
 #### HexDump
 
 ```bat
@@ -1534,7 +1558,7 @@ nothing is launched. This fixture hit it; the 64-bit build is not affected.
 
 | File | Purpose |
 |------|---------|
-| `<Tool>.dpr` | One self-contained entry point per tool; there are 57 of them and no shared units other than `RsmReader.pas` |
+| `<Tool>.dpr` | One self-contained entry point per tool; there are 58 of them and no shared units other than `RsmReader.pas` |
 | `ProbeCostProbe.cfg` | Adds `-V` to that one tool, which is also its own debuggee and needs TD32 line records in its executable |
 | `Fixtures\*.dpr` | Debuggees, not tools. In a subfolder so `build_all.bat`'s `*.dpr` discovery does not pick them up, and built with their own script because they need full debug info |
 | `RsmReader.pas` | Standalone binary RSM analyzer, used only by `RsmAnalyzer` (separate from `DebuggerCore\RsmFileReader.pas`, which is the parser the adapter actually ships) |

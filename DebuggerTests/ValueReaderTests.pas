@@ -1222,6 +1222,8 @@ begin
     Entry('ISourceLineProvider',       TypeInfo(ISourceLineProvider)),
     Entry('IFunctionNameProvider',     TypeInfo(IFunctionNameProvider)),
     Entry('ISourceFileListProvider',   TypeInfo(ISourceFileListProvider)),
+    Entry('ILineRecordProvider',       TypeInfo(ILineRecordProvider)),
+    Entry('IRoutineRangeProvider',     TypeInfo(IRoutineRangeProvider)),
     Entry('IBackgroundIndexProvider',  TypeInfo(IBackgroundIndexProvider)),
     Entry('ILocalSymbolProvider',      TypeInfo(ILocalSymbolProvider)),
     Entry('IUnitScopedLocalProvider',  TypeInfo(IUnitScopedLocalProvider)),

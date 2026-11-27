@@ -55,7 +55,8 @@ implementation
 {$IFDEF JCL_DEBUG}
 
 uses
-  System.Classes, System.Generics.Collections, System.SyncObjs,
+  System.Classes, System.Generics.Collections, System.Generics.Defaults,
+  System.SyncObjs,
   Winapi.Windows,
   DebugInfoTypes, JclDebug;
 
@@ -69,8 +70,20 @@ const
 type
   PJclDbgHeaderLocal = ^TJclDbgHeader; // TJclDbgHeader is public in JclDebug
 
+  // Opens the scanner's protected stream primitives (varint reader, word table)
+  // to this unit. Its public lookups walk a table from the start on every call,
+  // which is fine for one address and quadratic for "every record".
+  TJclScannerAccess = class(TJclBinDebugScanner);
+
+  // One entry of the Units or SourceNames table: where a name starts to apply.
+  TJclNameStart = record
+    Addr:   DWORD;
+    NameId: Integer;
+  end;
+
   TJclFileReader = class(TInterfacedObject,
-    ISourceLineProvider, IFunctionNameProvider)
+    ISourceLineProvider, IFunctionNameProvider,
+    ILineRecordProvider, IRoutineRangeProvider)
   private
     FStream:  TMemoryStream;   // kept alive for the scanner's lifetime
     FScanner: TJclBinDebugScanner;
@@ -92,6 +105,9 @@ type
     function InModuleCodeRange(Rva: UInt64): Boolean;
     function ExeRvaToScannerAddr(Rva: UInt64): DWORD;
     procedure BuildSortedRvas;
+    function  ReadNameStarts(TableOffset: Integer): TArray<TJclNameStart>;
+    function  NameText(NameId: Integer): string;
+    function  ScannerAddrToRva(Addr: DWORD): UInt64;
   public
     constructor Create(AStream: TMemoryStream; OutputRvaShift, ImageSize: UInt64);
     destructor Destroy; override;
@@ -107,6 +123,24 @@ type
     function GetEnclosingProcedure(const Inner: string; out Parent: string): Boolean;
     function GetEnclosingProcedureByRva(InnerRva: UInt64; out Parent: string): Boolean;
     function GetEnclosingProcedureRvaByRva(InnerRva: UInt64; out ParentRva: UInt64): Boolean;
+    /// <summary>ILineRecordProvider: every (address, line) pair of the JCL
+    /// stream, one per distinct address, with its source file and unit.</summary>
+    /// <remarks>The stream holds the MAP's line numbers for CODE and ICODE
+    /// segments. A pair the stream gives no source name for is left out, as
+    /// <c>RvaToSourceLine</c> refuses it. Where several pairs share an address
+    /// the last is kept, which is the one the scanner's own lookup returns.</remarks>
+    /// <param name="Complete">True when the stream is valid and was walked whole.</param>
+    /// <returns>The table; a fresh copy on every call.</returns>
+    function LineRecordTable(out Complete: Boolean): TLineRecordTable;
+    /// <summary>IRoutineRangeProvider: every named symbol of the JCL stream as
+    /// a routine, each with its unit.</summary>
+    /// <remarks>JCL records where a symbol STARTS and nothing else, so every
+    /// end is approximate: the next symbol, or the start of the next unit,
+    /// whichever comes first. The symbols are the MAP's publics in code
+    /// segments, so a few of them are not routines.</remarks>
+    /// <param name="Complete">True when the stream is valid and was walked whole.</param>
+    /// <returns>The ranges, sorted by start; a fresh copy on every call.</returns>
+    function RoutineRanges(out Complete: Boolean): TArray<TRoutineRange>;
   end;
 
 { PE section extraction (on disk, no loaded module) }
@@ -392,6 +426,270 @@ function TJclFileReader.GetEnclosingProcedureRvaByRva(InnerRva: UInt64;
 begin
   ParentRva := 0;
   Result := False;
+end;
+
+{ Whole-table enumeration (ILineRecordProvider, IRoutineRangeProvider)
+
+  The stream is four delta-encoded tables (TJclBinDebugGenerator.CreateData):
+    Units        (start address, unit name)       one per CODE/ICODE unit segment
+    SourceNames  (start address, source name)     a new entry where the file changes
+    Symbols      (address, first word, second word)
+    LineNumbers  (address, line)
+  each ascending by address and closed by a MaxInt value. The scanner's lookups
+  apply two rules that the enumeration reproduces, so that a table read here
+  agrees with a point lookup:
+    * an entry answers for an address only if it lies in the same unit segment
+      (its own address is not below the start of the unit holding the address);
+    * of several entries at one address the last wins.
+  Everything below reads the immutable stream only, so it needs no lock. }
+
+function TJclFileReader.ReadNameStarts(TableOffset: Integer): TArray<TJclNameStart>;
+begin
+  var P: Pointer := TJclScannerAccess(FScanner).MakePtr(TableOffset);
+  var Count := 0;
+  var Addr: DWORD := 0;
+  var NameId := 0;
+  var Value := 0;
+  {$Q-}{$R-}
+  while TJclScannerAccess.ReadValue(P, Value) do begin
+    Inc(Addr, DWORD(Value));
+    TJclScannerAccess.ReadValue(P, Value);
+    Inc(NameId, Value);
+    if Count = Length(Result) then
+      SetLength(Result, Count * 2 + 64);
+    Result[Count].Addr   := Addr;
+    Result[Count].NameId := NameId;
+    Inc(Count);
+  end;
+  {$Q+}{$R+}
+  SetLength(Result, Count);
+end;
+
+function TJclFileReader.NameText(NameId: Integer): string;
+begin
+  Result := TJclScannerAccess(FScanner).DataToStr(NameId);
+end;
+
+function TJclFileReader.ScannerAddrToRva(Addr: DWORD): UInt64;
+begin
+  {$Q-}{$R-}
+  Result := UInt64(Addr) + MODULE_CODE_OFFSET + FShift;
+  {$Q+}{$R+}
+end;
+
+// Index of the last entry starting at or below Addr, continuing from Cursor
+// (the callers walk addresses in ascending order); -1 when none does.
+function AdvanceTo(const Starts: TArray<TJclNameStart>; Addr: DWORD; var Cursor: Integer): Integer;
+begin
+  while (Cursor < High(Starts)) and (Starts[Cursor + 1].Addr <= Addr) do
+    Inc(Cursor);
+  if (Cursor < 0) or (Cursor > High(Starts)) or (Starts[Cursor].Addr > Addr) then
+    Exit(-1);
+  Result := Cursor;
+end;
+
+function TJclFileReader.LineRecordTable(out Complete: Boolean): TLineRecordTable;
+type
+  TPair = record
+    Addr: DWORD;
+    Line: Integer;
+  end;
+var
+  Pairs: TArray<TPair>;
+
+  procedure ReadPairs;
+  begin
+    var P: Pointer := TJclScannerAccess(FScanner).MakePtr(PJclDbgHeaderLocal(FStream.Memory)^.LineNumbers);
+    var Count := 0;
+    var Addr: DWORD := 0;
+    var Line := 0;
+    var Value := 0;
+    var Ascending := True;
+    {$Q-}{$R-}
+    while TJclScannerAccess.ReadValue(P, Value) do begin
+      var Previous := Addr;
+      Inc(Addr, DWORD(Value));
+      TJclScannerAccess.ReadValue(P, Value);
+      Inc(Line, Value);
+      if Addr < Previous then
+        Ascending := False;
+      if Count = Length(Pairs) then
+        SetLength(Pairs, Count * 2 + 1024);
+      Pairs[Count].Addr := Addr;
+      Pairs[Count].Line := Line;
+      Inc(Count);
+    end;
+    {$Q+}{$R+}
+    SetLength(Pairs, Count);
+    if Ascending then
+      Exit;
+    // Never seen: the generator writes the pairs sorted. A stable sort keeps
+    // "the last pair at an address wins" meaningful if a stream ever is not.
+    var Order: TArray<Integer>;
+    SetLength(Order, Count);
+    for var I := 0 to Count - 1 do
+      Order[I] := I;
+    var Unsorted := Pairs;
+    TArray.Sort<Integer>(Order, TComparer<Integer>.Construct(
+      function(const A, B: Integer): Integer
+      begin
+        if Unsorted[A].Addr < Unsorted[B].Addr then Exit(-1);
+        if Unsorted[A].Addr > Unsorted[B].Addr then Exit(1);
+        Result := A - B;
+      end));
+    var Sorted: TArray<TPair>;
+    SetLength(Sorted, Count);
+    for var I := 0 to Count - 1 do
+      Sorted[I] := Unsorted[Order[I]];
+    Pairs := Sorted;
+  end;
+
+begin
+  Result := Default(TLineRecordTable);
+  Complete := (FStream.Memory <> nil) and FScanner.ValidFormat;
+  if not Complete then
+    Exit;
+  var Hdr := PJclDbgHeaderLocal(FStream.Memory);
+  var UnitStarts   := ReadNameStarts(Hdr^.Units);
+  var SourceStarts := ReadNameStarts(Hdr^.SourceNames);
+  ReadPairs;
+
+  var FileOfName := TDictionary<Integer, Integer>.Create;   // word id -> Files index
+  var UnitOfName := TDictionary<Integer, Integer>.Create;   // word id -> Units index
+  try
+    SetLength(Result.Records, Length(Pairs));
+    var Count := 0;
+    var UnitCursor := 0;
+    var SourceCursor := 0;
+    for var I := 0 to High(Pairs) do begin
+      // The last pair at an address is the one the scanner answers with.
+      if (I < High(Pairs)) and (Pairs[I + 1].Addr = Pairs[I].Addr) then
+        Continue;
+      var Addr := Pairs[I].Addr;
+      var UnitAt := AdvanceTo(UnitStarts, Addr, UnitCursor);
+      if (UnitAt < 0) or (UnitStarts[UnitAt].NameId = 0) then
+        Continue;
+      var SourceAt := AdvanceTo(SourceStarts, Addr, SourceCursor);
+      if (SourceAt < 0) or (SourceStarts[SourceAt].NameId = 0) or
+         (SourceStarts[SourceAt].Addr < UnitStarts[UnitAt].Addr) then
+        Continue;
+
+      var FileIndex: Integer;
+      if not FileOfName.TryGetValue(SourceStarts[SourceAt].NameId, FileIndex) then begin
+        var Recorded := NameText(SourceStarts[SourceAt].NameId);
+        var FileEntry := Default(TLineRecordFile);
+        FileEntry.Name := ExtractFileName(Recorded);
+        if FileEntry.Name <> Recorded then
+          FileEntry.FullPath := Recorded;
+        FileIndex := Length(Result.Files);
+        Result.Files := Result.Files + [FileEntry];
+        FileOfName.Add(SourceStarts[SourceAt].NameId, FileIndex);
+      end;
+      var UnitIndex: Integer;
+      if not UnitOfName.TryGetValue(UnitStarts[UnitAt].NameId, UnitIndex) then begin
+        UnitIndex := Length(Result.Units);
+        Result.Units := Result.Units + [NameText(UnitStarts[UnitAt].NameId)];
+        UnitOfName.Add(UnitStarts[UnitAt].NameId, UnitIndex);
+      end;
+
+      Result.Records[Count].Rva       := ScannerAddrToRva(Addr);
+      Result.Records[Count].FileIndex := FileIndex;
+      Result.Records[Count].Line      := Pairs[I].Line;
+      Result.Records[Count].UnitIndex := UnitIndex;
+      Inc(Count);
+    end;
+    SetLength(Result.Records, Count);
+  finally
+    UnitOfName.Free;
+    FileOfName.Free;
+  end;
+end;
+
+function TJclFileReader.RoutineRanges(out Complete: Boolean): TArray<TRoutineRange>;
+type
+  TSymbol = record
+    Addr:       DWORD;
+    FirstWord:  Integer;
+    SecondWord: Integer;
+  end;
+var
+  Symbols: TArray<TSymbol>;
+
+  procedure ReadSymbols;
+  begin
+    var P: Pointer := TJclScannerAccess(FScanner).MakePtr(PJclDbgHeaderLocal(FStream.Memory)^.Symbols);
+    var Count := 0;
+    var Current := Default(TSymbol);
+    var Value := 0;
+    {$Q-}{$R-}
+    while TJclScannerAccess.ReadValue(P, Value) do begin
+      Inc(Current.Addr, DWORD(Value));
+      TJclScannerAccess.ReadValue(P, Value);
+      Inc(Current.FirstWord, Value);
+      TJclScannerAccess.ReadValue(P, Value);
+      Inc(Current.SecondWord, Value);
+      if Count = Length(Symbols) then
+        SetLength(Symbols, Count * 2 + 1024);
+      Symbols[Count] := Current;
+      Inc(Count);
+    end;
+    {$Q+}{$R+}
+    SetLength(Symbols, Count);
+  end;
+
+  // Where the code of the symbol at Index stops being its own: the next symbol
+  // above it, capped by the start of the next unit segment and, for the last
+  // symbol of all, by the end of the image when that is known.
+  function EndAfter(Index: Integer; const UnitStarts: TArray<TJclNameStart>; UnitAt: Integer): UInt64;
+  begin
+    var Addr := Symbols[Index].Addr;
+    var Bound: UInt64 := 0;
+    var Next := Index + 1;
+    while (Next <= High(Symbols)) and (Symbols[Next].Addr = Addr) do
+      Inc(Next);
+    if Next <= High(Symbols) then
+      Bound := Symbols[Next].Addr;
+    if (UnitAt < High(UnitStarts)) and
+       ((Bound = 0) or (UnitStarts[UnitAt + 1].Addr < Bound)) then
+      Bound := UnitStarts[UnitAt + 1].Addr;
+    if Bound > 0 then
+      Exit(ScannerAddrToRva(DWORD(Bound)));
+    if FHiRva > FLoRva then
+      Exit(FHiRva);
+    Result := ScannerAddrToRva(Addr) + 1;
+  end;
+
+begin
+  Result := nil;
+  Complete := (FStream.Memory <> nil) and FScanner.ValidFormat;
+  if not Complete then
+    Exit;
+  var UnitStarts := ReadNameStarts(PJclDbgHeaderLocal(FStream.Memory)^.Units);
+  ReadSymbols;
+  SetLength(Result, Length(Symbols));
+  var Count := 0;
+  var UnitCursor := 0;
+  for var I := 0 to High(Symbols) do begin
+    // The last symbol at an address is the one the scanner answers with; an
+    // unnamed one names nothing but still ends the routine before it.
+    if (I < High(Symbols)) and (Symbols[I + 1].Addr = Symbols[I].Addr) then
+      Continue;
+    if Symbols[I].FirstWord = 0 then
+      Continue;
+    var UnitAt := AdvanceTo(UnitStarts, Symbols[I].Addr, UnitCursor);
+    if (UnitAt < 0) or (UnitStarts[UnitAt].NameId = 0) then
+      Continue;
+    Result[Count] := Default(TRoutineRange);
+    Result[Count].StartRva := ScannerAddrToRva(Symbols[I].Addr);
+    Result[Count].EndRva   := EndAfter(I, UnitStarts, UnitAt);
+    Result[Count].Name     := NameText(Symbols[I].FirstWord);
+    if Symbols[I].SecondWord <> 0 then
+      Result[Count].Name := Result[Count].Name + '.' + NameText(Symbols[I].SecondWord);
+    Result[Count].UnitName := NameText(UnitStarts[UnitAt].NameId);
+    Result[Count].EndIsApproximate := True;
+    Inc(Count);
+  end;
+  SetLength(Result, Count);
 end;
 
 { Factory }

@@ -214,7 +214,8 @@ type
                           IClassMemberProvider, IEnumInfoProvider,
                           ITypeSizeProvider, IClassHierarchyProvider,
                           ITypePointeeKindProvider,
-                          IMethodSignatureProvider, ISourceFileListProvider)
+                          IMethodSignatureProvider, ISourceFileListProvider,
+                          ILineRecordProvider, IRoutineRangeProvider)
   private
     FFileHandle:    THandle;
     FMappingHandle: THandle;
@@ -485,6 +486,7 @@ type
     function  FindProcIndex(Rva: UInt64): Integer;
     procedure RebuildSortedRvas;
     function  FindLineRow(Rva: UInt64): Integer;
+    function  LineRowModules: TArray<Integer>;
     procedure NotePhase(const Name: string; var Clock: TStopwatch);
     class function LineKey(FileId, Line: Integer): UInt64; static;
     function  InternSourceFile(const BaseName: string): Integer;
@@ -617,6 +619,25 @@ type
     function    GetSourceFiles: TArray<string>;
     // ISourceFileListProvider
     function    SourceFileList(out Complete: Boolean): TArray<TSourceFileEntry>;
+    /// <summary>ILineRecordProvider: every line record the reader kept (one per
+    /// distinct address), sorted by RVA, in the reader's RVA space.</summary>
+    /// <remarks>Always complete: the line table is parsed in full at load. The
+    /// file table carries names only (the reader drops the directory at parse
+    /// time). The unit of each record is recovered by walking the mapped
+    /// SOURCE_MODULE tables once more, because the rows the reader keeps do not
+    /// hold their module index; that walk is the cost of a call.</remarks>
+    /// <param name="Complete">Always True.</param>
+    /// <returns>The table; a fresh copy on every call.</returns>
+    function    LineRecordTable(out Complete: Boolean): TLineRecordTable;
+    /// <summary>IRoutineRangeProvider: every procedure record, sorted by start,
+    /// one per distinct start address, with the range the record states.</summary>
+    /// <remarks>Ends are exact (start + the record's length), never
+    /// approximate. <c>UnitName</c> is left empty: the procedure rows the reader
+    /// keeps do not carry their module. Anonymous-method bodies have no
+    /// procedure record on either bitness and are therefore absent.</remarks>
+    /// <param name="Complete">Always True.</param>
+    /// <returns>The ranges; a fresh copy on every call.</returns>
+    function    RoutineRanges(out Complete: Boolean): TArray<TRoutineRange>;
     // Diagnostic: returns the raw bytes (payload only, after cb+leaf) of
     // a type record. Used by probes when reverse-engineering new leaf
     // kinds. Returns nil + Len=0 if TypeId is out of range or below the
@@ -3273,6 +3294,130 @@ begin
     Entry.Name := Name;
     Result := Result + [Entry];
   end;
+end;
+
+function TTD32FileReader.LineRowModules: TArray<Integer>;
+// TD32 module index of every FLineRows row, or -1.
+//
+// The rows hold (RVA, file, line) and nothing else, so the module a record came
+// from has to be read back from the mapped SOURCE_MODULE tables. This walk
+// mirrors ParseSourceModule pair for pair and in the same order ON PURPOSE:
+// where two pairs share an address the parse kept the last one
+// (AddOrSetValue), and assigning in the same order leaves the module of that
+// same pair. It reads the mapping and the frozen row array only, so it is safe
+// from any thread, like every other lookup of a published reader.
+begin
+  SetLength(Result, Length(FLineRows));
+  for var I := 0 to High(Result) do
+    Result[I] := -1;
+  for var DirIdx := 0 to Integer(FDirCount) - 1 do begin
+    var Entry: TTD32DirectoryEntry;
+    if not ReadDirectoryEntry(DirIdx, Entry) then Continue;
+    if Entry.SubType <> SST_SOURCE_MODULE then Continue;
+    var SecBase := FTd32Base + Entry.Offset;
+    if (SecBase < FDebugBase) or (SecBase + Entry.Size > FDebugEnd) then Continue;
+    if Entry.Size < 4 then Continue;
+    var SegCount:  Word := PWord(SecBase)^;
+    var FileCount: Word := PWord(SecBase + 2)^;
+    if (SegCount = 0) or (FileCount = 0) then Continue;
+    if 4 + 4 * Integer(SegCount) > Integer(Entry.Size) then Continue;
+    for var FileIdx := 0 to FileCount - 1 do begin
+      var BaseSrcFile: Cardinal := PCardinal(SecBase + 4 + 4 * FileIdx)^;
+      var FileEntry := SecBase + BaseSrcFile;
+      if (FileEntry < SecBase) or (FileEntry + 6 > SecBase + Entry.Size) then
+        Continue;
+      var FSegCount: Word := PWord(FileEntry)^;
+      if FSegCount = 0 then Continue;
+      var BaseSrcLinesOff := FileEntry + 6;
+      if BaseSrcLinesOff + 4 * Integer(FSegCount) > SecBase + Entry.Size then
+        Continue;
+      for var Seg := 0 to FSegCount - 1 do begin
+        var LineMapOff: Cardinal := PCardinal(BaseSrcLinesOff + 4 * Seg)^;
+        var LineTbl := SecBase + LineMapOff;
+        if (LineTbl < SecBase) or (LineTbl + 4 > SecBase + Entry.Size) then
+          Continue;
+        var SegIdx: Word := PWord(LineTbl)^;
+        var PairCount: Word := PWord(LineTbl + 2)^;
+        if PairCount = 0 then Continue;
+        var OffsetsArr := LineTbl + 4;
+        var LinesArr   := LineTbl + 4 + 4 * Integer(PairCount);
+        if LinesArr + 2 * Integer(PairCount) > SecBase + Entry.Size then
+          Continue;
+        if (SegIdx = 0) or (SegIdx > Cardinal(Length(FSegmentVAs))) then
+          Continue;
+        for var P := 0 to PairCount - 1 do begin
+          var Offs: Cardinal := PCardinal(OffsetsArr + 4 * P)^;
+          var LineNum: Word := PWord(LinesArr + 2 * P)^;
+          if (Offs = 0) or (LineNum = 0) then Continue;
+          var Row := FindLineRow(SegOffsetToRva(SegIdx, Offs));
+          if Row >= 0 then
+            Result[Row] := Entry.ModIndex;
+        end;
+      end;
+    end;
+  end;
+end;
+
+// ILineRecordProvider. Complete for the same reason SourceFileList is: the
+// line table is parsed in full at load.
+function TTD32FileReader.LineRecordTable(out Complete: Boolean): TLineRecordTable;
+begin
+  Complete := True;
+  Result := Default(TLineRecordTable);
+  SetLength(Result.Files, Length(FSourceFiles));
+  for var I := 0 to High(FSourceFiles) do
+    Result.Files[I].Name := FSourceFiles[I];
+
+  // Module index -> position in Result.Units, filled as modules are met.
+  var UnitOfModule := TDictionary<Integer, Integer>.Create;
+  try
+    var RowModules := LineRowModules;
+    SetLength(Result.Records, Length(FLineRows));
+    var LastModule := -1;
+    var LastUnit := -1;
+    for var I := 0 to High(FLineRows) do begin
+      Result.Records[I].Rva       := FLineRows[I].Rva;
+      Result.Records[I].FileIndex := FLineRows[I].FileId;
+      Result.Records[I].Line      := FLineRows[I].Line;
+      var Module := RowModules[I];
+      // Neighbouring rows nearly always share a module: skip the dictionary.
+      if Module <> LastModule then begin
+        LastModule := Module;
+        LastUnit   := -1;
+        var UnitName: string;
+        if (Module >= 0) and not UnitOfModule.TryGetValue(Module, LastUnit) and
+           FModIndexUnit.TryGetValue(Word(Module), UnitName) and (UnitName <> '') then begin
+          LastUnit := Length(Result.Units);
+          Result.Units := Result.Units + [UnitName];
+          UnitOfModule.Add(Module, LastUnit);
+        end;
+      end;
+      Result.Records[I].UnitIndex := LastUnit;
+    end;
+  finally
+    UnitOfModule.Free;
+  end;
+end;
+
+// IRoutineRangeProvider. FProcs is sorted by start but not de-duplicated: the
+// same procedure can be recorded by more than one symbol stream. Of the rows
+// sharing a start the LAST is kept, because that is the one FindProcIndex --
+// and so RvaToFunctionName / RvaToFunctionStart -- answers with.
+function TTD32FileReader.RoutineRanges(out Complete: Boolean): TArray<TRoutineRange>;
+begin
+  Complete := True;
+  SetLength(Result, Length(FProcs));
+  var Count := 0;
+  for var I := 0 to High(FProcs) do begin
+    if (I < High(FProcs)) and (FProcs[I + 1].StartRva = FProcs[I].StartRva) then
+      Continue;
+    Result[Count] := Default(TRoutineRange);
+    Result[Count].StartRva := FProcs[I].StartRva;
+    Result[Count].EndRva   := FProcs[I].EndRva;
+    Result[Count].Name     := FProcs[I].Name;
+    Inc(Count);
+  end;
+  SetLength(Result, Count);
 end;
 
 function TTD32FileReader.GetSourceFiles: TArray<string>;

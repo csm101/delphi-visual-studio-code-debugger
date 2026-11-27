@@ -150,14 +150,104 @@ type
   // a partial list is indistinguishable from a short one: without the flag, a
   // caller cannot tell "this module has three units" from "three so far".
   ISourceFileListProvider = interface
-    // NEXT FREE SUFFIX IS 0014. Reusing one is silent and catastrophic: this
+    // NEXT FREE SUFFIX IS 0016 (0014 and 0015 went to ILineRecordProvider and
+    // IRoutineRangeProvider below). Reusing one is silent and catastrophic: this
     // interface first shipped with 0011, already held by IThreadLocalNameProvider,
     // and `Supports` handed out that vtable instead -- so every evaluation that
     // asked whether a name was thread-local called SourceFileList and wrote its
     // array result through the Boolean's address. Thirteen tests died with
-    // "Write of address 0". ProviderInterfaceGuids_AreUnique now pins it.
+    // "Write of address 0". ProviderInterfaceGuids_AreUnique now pins it; a new
+    // interface must be added to that test's list as well.
     ['{2F5A6C01-1111-4A42-8C3D-53ABAABB0013}']
     function SourceFileList(out Complete: Boolean): TArray<TSourceFileEntry>;
+  end;
+
+  /// <summary>One source file named by a provider's line table.</summary>
+  /// <remarks>Both fields are reported as the debug information recorded them:
+  /// nothing is lowercased and nothing is resolved against this machine.</remarks>
+  TLineRecordFile = record
+    /// <summary>File name without a directory, e.g. <c>Unit1.pas</c>.</summary>
+    Name: string;
+    /// <summary>Full path as recorded at compile time; empty when the format
+    /// (or the reader) keeps the name only.</summary>
+    FullPath: string;
+  end;
+
+  /// <summary>One line record: an address the debug information ties to a
+  /// source line.</summary>
+  /// <remarks>A record is NOT guaranteed to be the first byte of an instruction,
+  /// nor to lie inside a routine: see "What a line record points at" in
+  /// <c>docs/TD32_FORMAT_NOTES.md</c>.</remarks>
+  TLineRecord = record
+    /// <summary>Address, in the same RVA space every other method of the
+    /// provider answers in (shifted for a relocated DLL/BPL).</summary>
+    Rva: UInt64;
+    /// <summary>Index into <c>TLineRecordTable.Files</c>.</summary>
+    FileIndex: Integer;
+    /// <summary>1-based source line.</summary>
+    Line: Integer;
+    /// <summary>Index into <c>TLineRecordTable.Units</c> of the unit whose code
+    /// holds the record, or -1 when the format does not say. For a generic
+    /// instantiated in another unit this is the instantiating unit, while
+    /// <c>FileIndex</c> names the file the generic was written in.</summary>
+    UnitIndex: Integer;
+  end;
+
+  /// <summary>Every line record of one provider, with the file and unit tables
+  /// its records index.</summary>
+  TLineRecordTable = record
+    /// <summary>Source files, in the provider's own order.</summary>
+    Files: TArray<TLineRecordFile>;
+    /// <summary>Unit names as recorded; empty when the format knows no units.</summary>
+    Units: TArray<string>;
+    /// <summary>The records, sorted by <c>Rva</c> ascending, one per distinct
+    /// address.</summary>
+    Records: TArray<TLineRecord>;
+  end;
+
+  /// <summary>Optional: a provider that can hand out its WHOLE line table, for
+  /// consumers that must visit every line of a module (coverage, profiling)
+  /// instead of asking about one address at a time.</summary>
+  ILineRecordProvider = interface
+    ['{2F5A6C01-1111-4A42-8C3D-53ABAABB0014}']
+    /// <summary>Builds and returns the whole table. The result belongs to the
+    /// caller: nothing is cached, so the cost is paid on every call.</summary>
+    /// <param name="Complete">False when the provider could not enumerate
+    /// everything (an index still building, a table it could not read). A
+    /// partial table is indistinguishable from a short one without it.</param>
+    /// <returns>The table; empty when the provider has no line information.</returns>
+    function LineRecordTable(out Complete: Boolean): TLineRecordTable;
+  end;
+
+  /// <summary>The address range of one routine.</summary>
+  TRoutineRange = record
+    /// <summary>First byte, in the provider's RVA space.</summary>
+    StartRva: UInt64;
+    /// <summary>One past the last byte (exclusive).</summary>
+    EndRva: UInt64;
+    /// <summary>Routine name, spelled as the provider's
+    /// <c>RvaToFunctionName</c> spells it.</summary>
+    Name: string;
+    /// <summary>Owning unit, or empty when the provider does not know it.</summary>
+    UnitName: string;
+    /// <summary>True when <c>EndRva</c> is not recorded by the format but
+    /// derived from what follows the routine (the next symbol, the end of the
+    /// unit's code): it may include padding or data.</summary>
+    EndIsApproximate: Boolean;
+  end;
+
+  /// <summary>Optional: a provider that can enumerate every routine it knows
+  /// with its address range.</summary>
+  IRoutineRangeProvider = interface
+    ['{2F5A6C01-1111-4A42-8C3D-53ABAABB0015}']
+    /// <summary>Builds and returns every routine range, sorted by
+    /// <c>StartRva</c> ascending, one per distinct start address. Ranges are
+    /// reported as recorded and may overlap. The result belongs to the caller:
+    /// nothing is cached.</summary>
+    /// <param name="Complete">False when the provider could not enumerate
+    /// everything (for example an index that is still building).</param>
+    /// <returns>The ranges; empty when the provider has no routine information.</returns>
+    function RoutineRanges(out Complete: Boolean): TArray<TRoutineRange>;
   end;
 
   // Optional: a provider that builds its name/symbol index on a background

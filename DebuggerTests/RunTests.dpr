@@ -62,7 +62,9 @@ uses
   PlaceholderDisassemblyTests in 'PlaceholderDisassemblyTests.pas',
   WinDebuggerX86  in '..\DebuggerCore\WinDebuggerX86.pas',
   ExceptionStepTests in 'ExceptionStepTests.pas',
-  DataBpExpressionTests in 'DataBpExpressionTests.pas';
+  DataBpExpressionTests in 'DataBpExpressionTests.pas',
+  CodeMap         in '..\DebuggerCore\CodeMap.pas',
+  CodeMapTests    in 'CodeMapTests.pas';
 
 const
   // Tests that cannot run while another RunTests worker is executing, because

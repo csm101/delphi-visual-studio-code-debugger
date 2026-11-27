@@ -778,8 +778,10 @@ plan, its increments and the assumptions it still has to measure are in
 Done so far: increments 0 and 1, the measurements and the feasibility of the
 patches (four DevTools: `LineSiteSurvey`, `ProbeCostProbe`,
 `LoaderTimingProbe`, `PatchFeasibilityProbe`; no engine code yet). The design
-held; what it rests on was measured on one Windows build only. Next: increment
-2, the code map, the first change to `DebuggerCore`.
+held; what it rests on was measured on one Windows build only. Increment 2,
+the code map (`CodeMap.pas`, `ILineRecordProvider`, `IRoutineRangeProvider`),
+is the first engine code: it enumerates every routine and line record of a
+module and nothing uses it yet. Next: increment 3, the scope.
 
 1. **The MCP server gains a profiler and code coverage** — one server, one
    engine. Coverage at line level by instrumentation, a hit count for every

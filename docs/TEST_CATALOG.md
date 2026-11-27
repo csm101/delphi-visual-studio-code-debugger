@@ -1921,6 +1921,77 @@ handles".
       came and answered at the timeout. Found while diagnosing the stdio report,
       whose `pause_execution` calls took 30 s each.
 
+## AA. Code map (PROFILER_COVERAGE_PLAN.md increment 2)
+
+`DebuggerTests\CodeMapTests.pas`, fixture `TCodeMapTests`. No debug session:
+the fixture binaries are read as files. Unless a line says otherwise a test
+runs on `TestTarget.exe` and `TestSubject.bpl`, both bitnesses, and collects
+its failures across the four. The expectations come from the providers' own
+point lookups, not from hand-written values. Mechanism in
+`DAP_DEBUGGER_ARCHITECTURE.md`, "Code map".
+
+- [x] **TD32 line table = the reader's point lookups**
+      (`CodeMapTests.Td32_LineRecordTable_AgreesWithThePointLookups`): one
+      record per `SortedRvas` entry, strictly ascending, same file and line as
+      `RvaToSourceLine`, every record with a unit, no file with a path.
+- [x] **TD32 routine ranges = the reader's point lookups**
+      (`CodeMapTests.Td32_RoutineRanges_AgreeWithThePointLookups`): start and
+      name as `RvaToFunctionStart` / `RvaToFunctionName` give them, the last
+      byte inside, the end exclusive, no approximate end.
+- [x] **The unit of a line record is the unit that declares the routine**
+      (`CodeMapTests.Td32_LineRecordUnit_IsTheUnitThatDeclaresTheRoutine`): the
+      unit read back from SOURCE_MODULE against `FindFuncRvaInUnit`, which is
+      built from the symbol streams.
+- [x] **External `.tds`** (`CodeMapTests.Td32_ExternalTds_SuppliesBothTables`,
+      `TdsSample.exe`, x64 only): both tables, every record as the lookups say.
+- [x] **Every `{BP:...}` marker line of `TestTargetCore.pas` is a line record
+      in the routine the providers name**
+      (`CodeMapTests.Markers_AreLineRecordsInTheRoutineTheProvidersName`): a
+      record at the address `SourceLineToRva` binds the line to; routine start
+      and name from `RvaToFunctionStart` / `RvaToFunctionName`; a marker in an
+      anonymous-method body, which has no procedure record, must be flagged
+      outside every routine; a marker with no code in a binary must have no
+      record there.
+- [x] **Records outside every routine, record by record**
+      (`CodeMapTests.RecordsOutsideEveryRoutine_MatchTheProvidersRecordByRecord`):
+      the count `DevTools\LineSiteSurvey` reports (28 on the x64 executable, 32
+      on the x86 one), computed from the reader's lookups rather than
+      hardcoded, and the same verdict and routine start for every record.
+- [x] **Module-relative RVAs do not depend on the load address**
+      (`CodeMapTests.ModuleRelativeRvas_AreTheSameFromTheFileAndThroughAShiftedProvider`,
+      the package on both bitnesses): the map from the file against the map
+      through a reader loaded with an `OutputRvaShift` above the executable and
+      with one below it (the shift modulo 2^64), field by field.
+- [x] **Code length** (`CodeMapTests.CodeLength_ReachesTheNextRecordOrTheRoutineEnd`).
+- [x] **Lookups** (`CodeMapTests.Lookups_RoundTripOverEveryRecord`): `FindLine`,
+      `FindLineCovering`, `FindRoutine`, `LinesAt`, `LinesOfFile`, `FindFiles`
+      over every record and routine.
+- [x] **Source paths go through the injected resolver**
+      (`CodeMapTests.Resolver_IsAskedOncePerFile`, x64 executable).
+- [x] **Overlapping ranges, unsorted input, dropped rows, units filled from the
+      other table** (`CodeMapTests.Synthetic_OverlapsUnsortedInputAndDroppedRows`,
+      hand-built tables).
+- [x] **Provider choice and the not-measurable module**
+      (`CodeMapTests.PickProviders_PrefersOneProviderForBothTables`,
+      `CodeMapTests.PickProviders_WithoutBothTables_ReportsNotMeasurable`,
+      `CodeMapTests.Build_WithoutAProvider_Raises`).
+- [x] **MAP tables** (`CodeMapTests.Map_Tables_MarkersRoutineEndsAndUnits`): the
+      marker test with the MAP's own lookups as the oracle, at least one
+      address per marker line in common with TD32, every routine end
+      approximate and non-overlapping, every record with a unit.
+- [x] **JDBG tables** (`CodeMapTests.Jdbg_Markers_AreLineRecordsInTheRoutineJclNames`,
+      x64 executable only -- the only `.jdbg` fixture; self-skips without JCL):
+      the marker test with JCL's lookups as the oracle, and every record
+      against them, except the records of the image's last source file, which
+      the JCL lookup cannot name.
+- [x] **The two new provider interfaces have GUIDs of their own**
+      (`ValueReaderTests.ProviderInterfaceGuids_AreUnique`, extended).
+- [ ] The code map of a module of a LIVE session. Nothing builds one yet; the
+      shifted-reader test above covers the arithmetic, not the wiring.
+- [ ] MAP and JDBG on a large real binary. Only TD32 was run on one
+      (`DevTools\CodeMapDump`).
+- [ ] A MAP enumerated while its index is still building (`Complete = False`).
+
 ## What the suite does NOT prove (2026-08-08)
 
 Coverage-honesty notes. Each records a place where a green run is weaker evidence

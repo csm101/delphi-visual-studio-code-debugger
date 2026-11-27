@@ -945,12 +945,15 @@ not confirmed.
 - `RoutineAnalysis.pas`: boundaries, branch targets, jump tables, handler
   entries on both bitnesses, call sites and return-address windows, exits,
   confirmed records.
-- The same confirmation gates ordinary breakpoints. Today a source breakpoint
-  on a record that is not code binds and is reported verified; on a 32-bit
-  target the final `end.` of a unit is such a record and the program then
-  loops on an access violation (`KNOWN_UNKNOWNS.md`, open defect in 0.9.2). A
-  breakpoint that resolves only to unconfirmed records is reported unverified,
-  with the reason.
+- The analysis also replaces the stopgap of 0.9.3 for ordinary breakpoints
+  (`KNOWN_UNKNOWNS.md`: a breakpoint on a record that is not code, such as the
+  final `end.` of a unit on a 32-bit image, used to be planted into data; 0.9.3
+  refuses it only when the byte is zero). The rule for a breakpoint is NOT the
+  rule for a probe. A probe needs a confirmed record. A breakpoint is refused
+  only on a record the analysis shows to be something else — inside an
+  instruction, in a table, on data — because an unconfirmed record can be
+  perfectly good code: on x86 without a MAP the body of an anonymous method is
+  unconfirmed, and breakpoints there work today and must keep working.
 - DevTool `RoutineAnalysisSweep`: over a whole binary, no two decoded
   instructions overlap, and the unconfirmed records and unfinished routines are
   listed with the reason.
@@ -1304,6 +1307,36 @@ trampoline above 4 GB, more than one thread.
 "Line probes" now say what was measured where they said what was expected; an
 indirect call is retargeted as `nop` plus call, not call plus `nop`; restores
 are decided per span.
+
+## Verified in increment 2
+
+2026-11-27. The first change to `DebuggerCore`: `ILineRecordProvider` and
+`IRoutineRangeProvider` (`DebugInfoTypes.pas`, GUID suffixes 0014 and 0015),
+implemented by the TD32 / `.tds`, MAP and JDBG readers, and `CodeMap.pas` with
+`TModuleCodeMap`. DevTool `CodeMapDump`. Mechanism in
+`DAP_DEBUGGER_ARCHITECTURE.md`, "Code map"; tests in `TEST_CATALOG.md`, "AA".
+
+- Every reader change is an addition: no parsing, storage or sidecar code
+  moved. `RsmFileReader.pas` is untouched.
+- TD32 supplies both tables with exact routine ends and a unit for every line
+  record. MAP supplies both with every routine end approximate. JDBG supplies
+  both through JCL's scanner.
+- The map is in module-relative RVAs: built from the file and built through a
+  reader shifted above or below the executable it is identical, field by field.
+- A map is built from a file with no process, which is what the coverage
+  reference needs.
+- Records outside every routine: 28 and 32 on the fixtures, 14 468 and 14 740
+  on the large images, the same numbers `LineSiteSurvey` found independently.
+
+| large image | routines | line records | TD32 load | map build | map memory |
+|---|---|---|---|---|---|
+| x64, 620 MB | 422 648 | 2 880 014 | 5.2 s | 0.43 s | 90 MB of tables, 130 MB with the names |
+| x86, 530 MB | 407 064 | 2 791 210 | 4.5 s | 0.41 s | 87 MB of tables, 121 MB with the names |
+
+Suite: 1446 found / 1442 pass / 0 fail / 4 ignored (16 new tests over the 1430
+of 0.9.3). Not done: the code map of a module of a live session is not wired
+yet (the first collector does that), and MAP and JDBG were not run on a large
+real binary.
 
 ## Assumptions to measure
 
