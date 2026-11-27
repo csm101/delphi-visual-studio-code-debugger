@@ -784,7 +784,12 @@ is the first engine code: it enumerates every routine and line record of a
 module and nothing uses it yet. Increment 3, the scope (`ProfileScope.pas`:
 which lines of a code map an `include` / `exclude` request selects; the
 PACKAGEINFO reader now in the core as `PackageInfoReader.pas`), is done too.
-Next: increment 4, decoding and routine analysis.
+So is the first half of increment 4: `RoutineAnalysis.pas` decodes a routine
+by following control flow and says of each line record whether it is a proven
+instruction boundary, proven not to be code, or neither. Nothing in the engine
+uses it yet. Next: the second half, where it replaces the 0.9.3 stopgap for
+breakpoints and two breakpoint defects it exposed are fixed
+(`KNOWN_UNKNOWNS.md`).
 
 1. **The MCP server gains a profiler and code coverage** — one server, one
    engine. Coverage at line level by instrumentation, a hit count for every

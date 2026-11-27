@@ -1382,6 +1382,72 @@ costs on a host with a hundred packages is measured when the first collector
 is wired (increment 7); the way out, if it is needed, is to decide by unit
 list and accept that generics instantiated in a module outside it are missed.
 
+## Verified in increment 4, first half: the analysis
+
+2026-11-27. `ZydisApi.ZydisDecodeDetail` (displacement, immediates and the
+kind of an instruction at measured offsets, `ThirdParty\Zydis\PROVENANCE.md`),
+`RoutineAnalysis.pas` (`TRoutineAnalyzer`), `PeImageFile.pas`, DevTool
+`RoutineAnalysisSweep`, fixture `AnalysisSample.dpr`. Mechanism in
+`DAP_DEBUGGER_ARCHITECTURE.md`, "Routine analysis"; tests in `TEST_CATALOG.md`,
+"AC". Nothing in the engine uses the analysis yet: that is the second half.
+Suite: 1503 found / 1499 pass / 0 fail / 4 ignored (29 new).
+
+Each line record gets one of three verdicts, never merged: confirmed as an
+instruction boundary; shown to be something else; unconfirmed.
+
+| image | instructions | confirmed | not code | unconfirmed | routines not completed | time |
+|---|---|---|---|---|---|---|
+| large x64 | 21.6 million | 2 876 724 | 1 182 | 2 108 | 27 | 3.1 s |
+| large x86 | 18.9 million | 2 753 921 | 2 607 | 34 682 | 14 | 2.6 s |
+
+About 145 ns per instruction, against a TD32 load of 5 s for the same image.
+Inside routines the sweep and `LineSiteSurvey`, written independently, agree
+to the record on all eight binaries; every difference outside them is
+explained in `DevTools\README.md`.
+
+**The dynamic oracle.** The sample program single-stepped under the engine, on
+both bitnesses and loaded away from its preferred base: 631 and 660 stops at
+425 and 422 distinct addresses, in every analysed routine. Every address the
+processor stopped at is a boundary the analysis found, every executed line
+record is confirmed, every arrival that was not a fall-through is a known
+target, and the analysis of the live process equals that of the file flag for
+flag. Seven mutations of the analysis each failed at least three tests.
+
+What was built differently from what the sections above say, or decided where
+they were silent:
+
+- A jump through one fixed slot outside the routine (an import thunk) is an
+  exit, not an unresolved indirect jump.
+- "On data" means: not reached, and the first byte is zero or the bytes are no
+  instruction. An `end.` record on a decodable non-zero byte stays unconfirmed.
+- After a call to `System.@Halt0` the decode stops. Without that rule the x86
+  main block decodes into data.
+- On x86 every handler reaches its block at `stub + 5`: `_HandleFinally` calls
+  it, `_HandleAnyException` jumps to it, `_HandleOnException` reads the clause
+  table there (read from the RTL source and confirmed by planting).
+- An x64 function is analysed together with the funclets that directly follow
+  it. A plain pass through `try..finally` does not go through the funclet: the
+  block is emitted a second time inline.
+- The window of a return address is taken slightly wide (the real unwinder
+  skips a `lea rsp` only when its base is the frame register). Wide is the
+  safe side.
+- A conditional jump out of a routine is an exit; the `jmp` of an x86 handler
+  stub leaves the routine without being one.
+- Without relocation data, on x86 every immediate or displacement whose value
+  falls in the routine counts as an address reference: a superset.
+- Without the decoder no record is ever "not code", so the zero-byte test of
+  0.9.3 stays as the fallback.
+
+Two defects of the engine as released surfaced while the oracle was being
+written; both are in `KNOWN_UNKNOWNS.md` and both are for the second half:
+removing a breakpoint restores the byte even when another breakpoint shares
+the address, and on x64 a breakpoint inside a `finally` is planted on the
+inline copy only, so it does not fire when an exception runs the block.
+
+One thing the code map has to change for x86: with TD32 present it takes both
+tables from TD32, so the MAP's range for an anonymous method never reaches the
+analysis even when a MAP is there.
+
 ## Assumptions to measure
 
 After increment 0: 1, 2, 8, 15, 17 and 18 are settled as stated under

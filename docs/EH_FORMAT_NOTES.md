@@ -73,11 +73,38 @@ on disk, so a relocated module is described correctly):
    | `Handler` | construct | where the block is |
    |---|---|---|
    | `0` | `try .. finally` | `Target` is the finally funclet |
-   | `1` or `2` | bare `except` (no `on` clause) | `Target` is the block |
+   | `1` | the handler the compiler wraps a `safecall` routine in | `Target` is a funclet too |
+   | `2` | bare `except` (no `on` clause) | `Target` is the block, inside the body |
    | `> 2` | `except` with `on` clauses | `Handler` is the RVA of a **clause table**; `Target` is 0 |
 
    The clause table is `DWORD Count; Count x { DWORD ClassVmtRva; DWORD BlockRva }`,
    where each `BlockRva` is the address of that `on <Class> do` block.
+
+   **A funclet is a function of its own**: it has a `RUNTIME_FUNCTION` entry
+   whose `BeginAddress` is the `Target`, it lies inside the routine's debug
+   range, and its `ret` goes back to whoever called it — the unwinder or the
+   RTL — never to the routine's caller. A plain pass through a `try..finally`
+   does not go through the funclet at all: the compiler emits the block's code a
+   second time inline (measured on `AnalysisSample`: with a breakpoint on the
+   funclet's first byte, `TryFinally` runs to its end without stopping there).
+   Measured over all 185 674 scope entries of a 620 MB image (2026-11-27), with
+   no exception in any row:
+
+   | `Handler` | entries | `Target` is a `.pdata` function start | `Target` = the entry's `End` |
+   |---|---|---|---|
+   | `0` | 157 489 | always | never |
+   | `1` | 289 | always | never |
+   | `2` | 24 485 | never | always |
+   | `> 2` | 3 411 | — (`Target` is 0) | — |
+
+   The 289 with `Handler = 1` are all `safecall` methods (COM interface
+   implementations: `TMSDOMNode.get_firstChild`, ADO). The funclet stores
+   `$8000FFFF`, calls `SafeCallException` through the object's VMT when there
+   is an object, loads the continuation address into `RAX` and returns.
+   Consequences: a `ret` inside a funclet is not an exit of the routine; and a
+   source line inside a `finally` has TWO line records, one in the body and one
+   in the funclet, of which a debugger that plants one address per line misses
+   the one an exception runs.
 
 **Frame selection.** Verified on four routines: only the scope entry whose
 `[Begin, End)` contains the frame's own PC can receive this exception. For
@@ -271,14 +298,63 @@ $000D8835  5B 8B E5 5D C3         pop ebx; mov esp,ebp; pop ebp; ret   ; the con
   follows control flow through a routine has to know it and take the pushed
   continuation as the target.
 - In this shape the bytes at `stub + 5` are a jump back to the block's first
-  instruction. That would make the block address derivable for `@HandleFinally`
-  after all. It is an observation of the bytes, on every finally of the
-  fixtures; it has not been checked against the RTL source nor confirmed by
-  planting, and `PlanExceptionStep` does not rely on it.
+  instruction, and `stub + 5` is exactly where `@HandleFinally` enters the
+  routine (next section). So the block address IS derivable for
+  `@HandleFinally` after all: it is the target of the jump at `stub + 5`.
+  `PlanExceptionStep` does not use this yet.
 - Stubs found through their `push imm32`, same image: `@HandleFinally`
   123 009, `@HandleAnyException` 3 831, `@HandleOnException` 3 306,
   `@HandleAutoException` 289. A `push imm32` of an address inside the routine
   is a string literal far more often than a stub (57 201 times).
+
+### Where the RTL's x86 handlers enter the routine — read from the RTL source
+
+`rtl\sys\System.pas`, Delphi 12 Athens (`STACK_BASED_EXCEPTIONS`, CPU386),
+2026-11-27. The registration record's `Handler` field is what the RTL calls
+`TExcFrame.desc`, a pointer to a `TExcDesc`:
+
+```pascal
+TExcDesc = packed record
+  jmp: JmpInstruction;                       // the 5-byte stub: E9 rel32
+  case Integer of
+  0:      (instructions: array [0..0] of Byte);                       // stub + 5 is code
+  1{...}: (cnt: Integer; excTab: array [0..0{cnt-1}] of TExcDescEntry); // stub + 5 is a table
+end;
+TExcDescEntry = record vTable: Pointer; handler: Pointer; end;
+```
+
+So `TExcDesc.instructions` and `TExcDesc.cnt` are both the address `stub + 5`,
+and each handler says which of the two it is by what it does with it:
+
+| handler | what it does at `stub + 5` | the code |
+|---|---|---|
+| `_HandleFinally` (and `_HandleFinallyInternal`) | **calls** it | `ADD ECX,TExcDesc.instructions` … `CALL ECX` |
+| `_HandleAnyException` | **jumps** to it | `ADD EBX,TExcDesc.instructions` … `JMP EBX` |
+| `_HandleAutoException` (safecall) | **jumps** to it | `LEA EDX,[EDX].TExcDesc.instructions` … `JMP EDX` |
+| `_HandleOnException` | reads it as `cnt` + `excTab`, **jumps** to the matching clause | `JMP [EBX].TExcDescEntry.handler` |
+
+Nothing else of the routine is entered by the RTL. Consequences:
+
+- For a `try..finally` the compiler puts `jmp <finally code>` at `stub + 5`, and
+  the RTL *calls* that jump. The finally code therefore ends the same way in
+  both cases: `pop eax; jmp eax` pops the continuation the `try` pushed when the
+  block is left normally, and the RTL's own return address when it was called
+  during an unwind. That is why the block cannot end in a `ret` to the
+  continuation, and why the shape is in a fifth of all routines.
+- For a bare `except`, `stub + 5` IS the first instruction of the block.
+- For `on` clauses, the 4 + 8 × count bytes at `stub + 5` are data, and the
+  blocks are the `handler` fields.
+- The complete set of addresses of a routine the exception machinery can enter
+  is therefore: the stub itself (called by the system dispatcher in the search
+  pass and again in the unwind pass), `stub + 5` when it is code, and the clause
+  blocks. `DebuggerCore\RoutineAnalysis.pas` treats exactly these as handler
+  entries.
+
+Confirmed by planting, not only read: `RoutineAnalysisTests` runs
+`AnalysisSample` (32-bit) with a breakpoint on every one of those addresses and
+the processor stops on the stub (twice: search, unwind), then on `stub + 5` of a
+`finally` an exception passes through, on the `on` block, and on `stub + 5` of a
+bare `except`.
 
 ## x64 — what the system unwinder reads at a return address
 

@@ -106,8 +106,27 @@ The debugger engine is exposed through two frontends:
   `TDisasmByteReader`. No third-party reference — see "Disassembly seam"
   below.
 - `ZydisDisassembler.pas` — `TZydisDisassembler`, the Zydis-backed
-  `IDisassembler` implementation. The only unit besides `ZydisApi.pas` itself
-  allowed to reference Zydis.
+  `IDisassembler` implementation. Everything that wants disassembly TEXT goes
+  through it and never through `ZydisApi.pas`.
+- `ZydisApi.pas` — the dynamic-load import unit for `Zydis.dll`. Two ways to
+  decode one instruction: `ZydisDecodeOne` (length and text) and
+  `ZydisDecodeDetail` (class, displacement and immediates with their byte
+  offsets, branch target; no text and no operand decode, about 80 ns an
+  instruction). The fields are read at offsets measured against the pinned
+  headers (`ThirdParty\Zydis\PROVENANCE.md`, "Measured struct layout"). Fails
+  closed without the DLL.
+- `RoutineAnalysis.pas` — `TRoutineAnalyzer`: the analysis of one routine's
+  code by following control flow from proven places. Boundaries, branch
+  targets, tables, handler entries, call sites and unwinder windows, exits, and
+  for each line record a verdict: confirmed, not code, or unconfirmed. Depends
+  on `CodeMap.pas`, `Disassembler.pas` and `ZydisApi.pas` only; bytes come
+  through a reader callback, so it runs on a file and on a live process. See
+  "Routine analysis" below. Nothing in the adapter or the MCP server uses it
+  yet.
+- `PeImageFile.pas` — `TPeImageFile`: a PE file mapped read-only and readable
+  by virtual address, with the signature of `TDisasmByteReader`. It is what
+  lets the routine analysis run on a binary that is never started (the sweep
+  tool, the static tests). Depends on nothing of the engine.
 - `MapFileReader.pas` — parses the Delphi `.map`. Supplies
   `ISourceLineProvider` (RVA ↔ source line), `IFunctionNameProvider`
   (RVA ↔ public symbol, lookup by name, enclosing-procedure mapping
@@ -1496,6 +1515,162 @@ executable carries the same resource.
 
 **Not wired yet.** Nothing in the session creates a scope; the first collector
 does.
+
+## Routine analysis
+
+`docs/PROFILER_COVERAGE_PLAN.md`, increment 4. `RoutineAnalysis.pas`,
+`TRoutineAnalyzer`: what a patch written into a routine has to know, and which
+line records can be trusted. **Not wired yet**: nothing in the engine calls it;
+breakpoints still use the 0.9.3 stopgap (a source breakpoint on a zero byte is
+refused).
+
+### Input and output
+
+A `TRoutineAnalysisInput` names the machine mode, a byte reader
+(`TDisasmByteReader`: a file through `TPeImageFile.Read`, or a live process
+through `IDebugTarget.ReadCodeMemoryAt`), the address of the module's first
+byte in that reader's address space, and the module's `TModuleCodeMap`. The
+base is also what absolute addresses stored in the image are relative to: the
+preferred base for a file, the load address for a live module — so a relocated
+live image and its file give the same result (pinned by the dynamic test).
+On x64 the exception directory is read from the PE header through the same
+reader unless the input names it.
+
+`Analyze(RoutineIndex)` returns a `TRoutineAnalysis`:
+
+- `Flags`: one word per byte of the routine. `rbfBoundary` / `rbfInterior`
+  (a proven instruction), `rbfTarget` (control arrives other than by falling
+  through), `rbfAddressRef` (the address appears as an immediate or a
+  displacement: a possible target, never a place decoding started from),
+  `rbfJumpTable` / `rbfClauseTable`, `rbfReturnAddr`, `rbfWindow` (x64),
+  `rbfHandlerEntry`, `rbfStub` (x86), `rbfTableEntry`, `rbfLine`; the top four
+  bits hold the instruction kind at a boundary. `rbfBarrier` is what may not
+  sit strictly inside a patched span.
+- `Lines`: each line record with a verdict and its reason, and for a confirmed
+  one the end of its first straight-line block.
+- `CallSites` (call, return address, direct target, x64 window end), `Exits`
+  (every `ret` and leaving jump, with its role), `JumpTables`,
+  `HandlerEntries`, `ClauseTables`.
+- `Complete`, and when not, why and where the first break was.
+
+An analyzer keeps scratch buffers between routines: one per thread.
+
+### The three verdicts
+
+| verdict | meaning | reasons |
+|---|---|---|
+| `lvConfirmed` | a decode that started at a proven place arrives exactly here | boundary |
+| `lvNotCode` | shown to be something else | inside a proven instruction; inside a jump table; inside a clause table; not reached and the byte is zero; not reached and the bytes are no instruction |
+| `lvUnconfirmed` | not reached, no proof either way | what stands before it (an indirect jump, a `ret` / `jmp`, a trap, a stopped decode, a table, nothing); outside every routine; unreadable; decoder unavailable |
+
+The last two are never merged. A probe needs the first; a breakpoint is to be
+refused only on the second, because an unconfirmed record can be perfectly good
+code — the body of an anonymous method on x86 is one.
+
+The zero-byte rule is the 0.9.3 stopgap's, kept as one reason among several: no
+statement dcc32 or dcc64 compiles starts with `$00`. It applies only to a
+record the decode did NOT reach.
+
+### Proven places
+
+Decoding never starts at a line record. It follows control flow from:
+
+1. the routine's entry, every direct branch target and every in-routine call
+   target;
+2. x64: every function `.pdata` lists inside the routine's range, and every
+   block the scope and clause tables behind `_DelphiExceptionHandler` name
+   (`EH_FORMAT_NOTES.md`): finally funclets (`Handler` 0), the handler funclet
+   of a `safecall` routine (1), bare `except` blocks (2), clause blocks. The
+   language handler is identified by NAME — the code map's,
+   or, in a package, the name of the import its thunk jumps through — never by
+   shape: under another language handler the same fields mean something else;
+3. the entries of recognised jump tables: `jmp [reg*4+T]` with `T` inside the
+   routine (dcc32's table directly after the jump, and its second form with a
+   byte index table between the jump and `T`), and for anything else every
+   routine address the eight instructions before the jump name, tried as a
+   table of absolute addresses and, on x64, of offsets from each candidate
+   base;
+4. x86: what a `push imm32` of an address of the routine leads to. An `E9`
+   jump out of the routine that fits before the routine's end is a handler
+   stub; `stub + 5` is the clause table when the stub goes to
+   `@HandleOnException` and code otherwise; an address directly behind
+   `stub; jmp` is the continuation a `try..finally` pushed. Any other pushed
+   address of the routine is data (a string literal far more often than code)
+   and only gets `rbfAddressRef`.
+
+A path ends at a `ret`, an unconditional jump, a trap, an instruction already
+decoded, the routine's end, or a call to a routine that never returns
+(`System.@Halt0` by the code map's name, or through an import thunk when the
+module imports it): what follows the call that ends a program's main block is
+data.
+
+### Indirect jumps
+
+| shape | what it is | effect |
+|---|---|---|
+| `jmp [disp32]` / `jmp [rip+disp32]`, slot outside the routine | a jump through one fixed slot: an import thunk, a procedure variable | an exit; the routine stays complete |
+| x86 `pop reg; jmp reg` directly in front of an `E9` jump out of the routine | the end of a finally block | not an exit; the routine stays complete |
+| through a recognised table | a `case`, or hand-written dispatch | the entries are followed |
+| anything else | unknown | the routine is NOT complete |
+
+### What "not complete" means
+
+A byte on a proven path that does not decode, two proven decodes that disagree
+about boundaries, an instruction that crosses the routine's end, an unexplained
+indirect jump, or an exception table that cannot be read. The records confirmed
+before the break stay confirmed; nothing else of the routine is trusted, and no
+multi-byte patch may go anywhere in it.
+
+### Windows and exits
+
+On x64 each call site carries the window of its return address — the
+instructions `RtlVirtualUnwind` may read there when it tests for an epilogue:
+an optional `add rsp, imm` (`48 83 C4` / `48 81 C4`) or `lea rsp, [..]`
+(`48`/`49 8D` with `rsp` as destination), any number of `pop r64`, and the one
+instruction after them. A return address is always in its own window.
+
+An exit has a kind (`ret`, direct jump, conditional jump, jump through a slot,
+unexplained indirect jump) and a role. Not every `ret` is an exit of the
+routine: on x64 a `ret` inside a funclet returns to the unwinder or the RTL
+(`rerFuncletReturn`; a funclet is a `.pdata` function a scope entry with
+`Handler` 0 or 1 names); on x86 the `pop reg; jmp reg` or `ret` directly in
+front of a found stub ends a finally block (`rerFinallyExit`), and the stub's
+own jump is never executed by the routine (`rerHandlerStub`).
+
+### Anonymous methods
+
+Their bodies have no TD32 procedure record, so their line records lie outside
+every routine of the code map. On x64 `UnmappedFunctions` lists the `.pdata`
+functions that hold such records — a root function plus the funclets that
+directly follow it — and `AnalyzeUnmapped` analyses one from its
+`BeginAddress`. On x86 nothing proves an entry: the records are unconfirmed,
+unless the code map was built with routine ranges from a MAP, which names the
+body and makes it an ordinary routine. `AnalyzeLine(LineIndex)` routes a single
+record to whichever applies.
+
+### Cost
+
+Each instruction is decoded once, through `ZydisDecodeDetail`; nothing on the
+path builds a string. A routine's bytes are read in one call; exception tables
+through a small cache of 64 KB chunks. Measured with
+`DevTools\RoutineAnalysisSweep` on a 620 MB x64 and a 530 MB x86 image, every
+routine that owns a line record (411 229 and 398 810 routines, 21.6 and 18.9
+million instructions): 3.1 and 2.6 s, about 145 and 140 ns an instruction, of
+which the decoder alone is 75 to 90 (the tool's `-decodebench`). Setting an
+analyzer up (names, imports, `.pdata`, funclet links) takes 60 and 25 ms. For
+scale: loading the TD32 of the same image takes 5 s.
+
+### How it is proved
+
+`DebuggerTests\RoutineAnalysisTests.pas`. The static tests compare every claim
+with a second decode whose facts come from the instruction's text. The dynamic
+test single-steps `AnalysisSample` under the engine and requires every address
+the processor stopped at to be a boundary the analysis found, every executed
+line record to be confirmed, and every transfer of control to arrive at an
+address flagged as a target. `RoutineAnalysisSweep` asserts over whole binaries
+that no two decoded instructions overlap and that confirmed records and
+boundaries are the same set, and its `-without` option switches one source of
+proven places off to show what it buys.
 
 ## Main loop
 

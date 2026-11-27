@@ -76,6 +76,18 @@ dcc64 -$O- -V -VN -VR -GD -E.\Win64\Debug -NU.\Win64\Debug CallResultSample.dpr 
 set CALLRES64_ERR=%errorlevel%
 dcc32 -$O- -V -VN -VR -GD -E.\Win32\Debug -NU.\Win32\Debug CallResultSample.dpr 2>&1
 set CALLRES32_ERR=%errorlevel%
+rem Routine-analysis fixture: the shapes a control-flow decode has to get right
+rem (both dcc32 `case` table forms, try..finally, try..except with and without
+rem `on`, nested routines, an anonymous method, a routine that ends in a call, a
+rem frameless leaf, hand-written asm with a table, a one-line loop). Read as a
+rem file by the static tests and single-stepped by the dynamic one
+rem (docs/PROFILER_COVERAGE_PLAN.md increment 4). Both bitnesses: the tables and
+rem the exception data are different formats on each. Separate target, same
+rem reason as above.
+dcc64 -$O- -V -VN -VR -GD -E.\Win64\Debug -NU.\Win64\Debug AnalysisSample.dpr 2>&1
+set ANALYSIS64_ERR=%errorlevel%
+dcc32 -$O- -V -VN -VR -GD -E.\Win32\Debug -NU.\Win32\Debug AnalysisSample.dpr 2>&1
+set ANALYSIS32_ERR=%errorlevel%
 rem Stdio fixtures: a CONSOLE-subsystem debuggee and its GUI twin, both writing
 rem through their standard handles (StdioSampleCore.pas). The console one is the
 rem only console fixture, on purpose: a console child receives its parent's
@@ -122,6 +134,8 @@ if not "%LONGSTR64_ERR%"=="0" exit /b %LONGSTR64_ERR%
 if not "%LONGSTR32_ERR%"=="0" exit /b %LONGSTR32_ERR%
 if not "%CALLRES64_ERR%"=="0" exit /b %CALLRES64_ERR%
 if not "%CALLRES32_ERR%"=="0" exit /b %CALLRES32_ERR%
+if not "%ANALYSIS64_ERR%"=="0" exit /b %ANALYSIS64_ERR%
+if not "%ANALYSIS32_ERR%"=="0" exit /b %ANALYSIS32_ERR%
 if not "%STDIOCON_ERR%"=="0" exit /b %STDIOCON_ERR%
 if not "%STDIOGUI_ERR%"=="0" exit /b %STDIOGUI_ERR%
 exit /b %TT32_ERR%

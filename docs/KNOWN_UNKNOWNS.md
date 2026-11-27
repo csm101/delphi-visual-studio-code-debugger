@@ -1914,6 +1914,30 @@ for that and let it gate user breakpoints as well; or ship a stopgap first
 (refuse to plant where the byte to be saved is `$00`, which no compiled
 statement starts with and which covers both observed cases). Not decided.
 
+## Two breakpoint defects found by the routine-analysis tests — OPEN, in 0.9.3
+
+Found 2026-11-27 while writing the dynamic oracle of the profiler plan's
+increment 4. Both are in the engine as released.
+
+- **Removing a breakpoint restores the byte even when another breakpoint
+  shares the address.** `PlantInt3` handles two records on one address (it
+  adopts the first planter's original byte); `RemoveInt3` does not look. Every
+  `SetAddressBreakpoint` re-posts the address set, so a source breakpoint that
+  shares an address with an address breakpoint silently stops firing.
+  Measured: the `on` block of the sample's `ExceptWithOn` ran through without a
+  stop.
+- **On x64 a source breakpoint inside a `finally` block fires only on the
+  normal path.** dcc64 emits the block twice: inline, for a plain pass through
+  `try..finally`, and as a funclet the exception dispatch calls. The line has a
+  record in each. `SourceLineToRvaCandidates` returns one address per provider,
+  so the breakpoint is planted on the inline copy (`$CC`) and not on the
+  funclet (`$55` there): when an exception runs the block the breakpoint does
+  not stop. Applies as well to the `end;` of a routine with an implicit
+  finally.
+
+Both are to be fixed in the second half of that increment, where breakpoint
+planting is revisited anyway.
+
 ## Profiler and code coverage — what the plan still assumes
 
 No engine code of `PROFILER_COVERAGE_PLAN.md` is built yet. Its table

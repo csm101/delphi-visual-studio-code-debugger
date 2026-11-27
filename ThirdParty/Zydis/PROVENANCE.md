@@ -128,6 +128,127 @@ every DevTools consumer (`DevTools\build_all.bat`) and re-ran
 effectively no external runtime dependency — a machine with nothing but a
 stock Windows install can load it.
 
+## Measured struct layout
+
+`ZydisApi.pas` does not transcribe Zydis's structs. It reads a handful of
+fields at byte offsets that were **measured** with a throwaway C program
+compiled against the pinned headers, because `ZydisDecodedInstruction` is full
+of nested unions and bitfields and one wrong field shifts every offset behind
+it — silently: a wrong offset returns a plausible number from a neighbouring
+field. `DebuggerTests\ZydisDetailTests.pas` pins every field below against
+known encodings in both machine modes.
+
+Measured 2026-11-27, commit `a2278f1d2`, `cl.exe` 19.51 x64 (the toolset the
+DLL is built with). `ZYDIS_STATIC_BUILD` / `ZYCORE_STATIC_BUILD` only silence
+the import declarations; nothing is linked.
+
+| what | value |
+|---|---|
+| `sizeof(ZydisDisassembledInstruction)` | 1232 |
+| `sizeof(ZydisDecodedInstruction)` | 328 |
+| `sizeof(ZydisDecodedOperand)` | 80 |
+| `sizeof(ZydisDecoder)` | 12 |
+| `offsetof(ZydisDisassembledInstruction, info)` | 8 |
+| `offsetof(ZydisDisassembledInstruction, operands)` | 336 |
+| `offsetof(ZydisDisassembledInstruction, text)` | 1136 |
+
+Fields of `ZydisDecodedInstruction`. The first column is the offset inside
+`ZydisDisassembledInstruction` as the probe prints it; the second is relative
+to the start of `info` (first column minus 8), which is what `ZydisApi.pas`
+uses so that one table serves both the struct `ZydisDisassembleIntel` fills and
+the one `ZydisDecoderDecodeInstruction` fills:
+
+| field | in the disassembled struct | in `info` | type |
+|---|---|---|---|
+| `machine_mode` | 8 | 0 | 4-byte enum |
+| `mnemonic` | 12 | 4 | 4-byte enum |
+| `length` | 16 | 8 | `ZyanU8` |
+| `encoding` | 20 | 12 | 4-byte enum |
+| `opcode_map` | 24 | 16 | 4-byte enum |
+| `opcode` | 28 | 20 | `ZyanU8` |
+| `stack_width` | 29 | 21 | `ZyanU8` |
+| `operand_width` | 30 | 22 | `ZyanU8`, bits |
+| `address_width` | 31 | 23 | `ZyanU8`, bits |
+| `operand_count` | 32 | 24 | `ZyanU8` |
+| `operand_count_visible` | 33 | 25 | `ZyanU8` |
+| `attributes` | 40 | 32 | `ZyanU64` |
+| `meta.category` | 100 | 92 | 4-byte enum |
+| `meta.branch_type` | 112 | 104 | 4-byte enum |
+| `raw.prefix_count` | 120 | 112 | `ZyanU8` |
+| `raw.modrm.mod` / `.reg` / `.rm` / `.offset` | 263 / 264 / 265 / 266 | 255 / 256 / 257 / 258 | `ZyanU8` each |
+| `raw.sib.scale` / `.index` / `.base` / `.offset` | 267 / 268 / 269 / 270 | 259 / 260 / 261 / 262 | `ZyanU8` each |
+| `raw.disp.value` | 272 | 264 | `ZyanI64` |
+| `raw.disp.size` | 280 | 272 | `ZyanU8`, bits |
+| `raw.disp.offset` | 281 | 273 | `ZyanU8` |
+| `raw.imm[0].is_signed` | 288 | 280 | `ZyanBool` (1 byte) |
+| `raw.imm[0].is_relative` | 289 | 281 | `ZyanBool` |
+| `raw.imm[0].value` | 296 | 288 | `ZyanU64` / `ZyanI64` |
+| `raw.imm[0].size` | 304 | 296 | `ZyanU8`, bits |
+| `raw.imm[0].offset` | 305 | 297 | `ZyanU8` |
+| `raw.imm[1]` | 312 | 304 | `sizeof(raw.imm[0])` = 24 |
+
+Constants read by the same program: `ZYDIS_ATTRIB_HAS_MODRM` = 1,
+`ZYDIS_ATTRIB_HAS_SIB` = 2, `ZYDIS_ATTRIB_IS_RELATIVE` = 128;
+`ZYDIS_OPCODE_MAP_DEFAULT` / `_0F` / `_0F38` / `_0F3A` = 0 / 1 / 2 / 3;
+`ZYDIS_BRANCH_TYPE_NONE` / `_SHORT` / `_NEAR` / `_FAR` = 0 / 1 / 2 / 3;
+`ZYDIS_STACK_WIDTH_16` / `_32` / `_64` = 0 / 1 / 2;
+`ZYDIS_MAX_INSTRUCTION_LENGTH` = 15, `ZYDIS_MAX_OPERAND_COUNT` = 10.
+
+Not every measured field is read: `mnemonic`, `meta.category` and
+`meta.branch_type` are listed so that a later need does not start with a new
+measurement, but `ZydisApi.pas` classifies an instruction from `opcode`,
+`opcode_map` and `raw.modrm.reg`, which need no table of generated enum values.
+
+**To measure again** (after repinning the submodule, or changing the toolset):
+a C file that includes `<Zydis/Zydis.h>` and prints
+`offsetof(ZydisDisassembledInstruction, <field>)` for each row above —
+
+```c
+#include <stdio.h>
+#include <stddef.h>
+#include <Zydis/Zydis.h>
+#define OFS(expr) printf("%-44s %5u\n", #expr, (unsigned)offsetof(ZydisDisassembledInstruction, expr))
+#define SZ(type)  printf("sizeof(%-36s) %5u\n", #type, (unsigned)sizeof(type))
+int main(void) {
+    SZ(ZydisDisassembledInstruction); SZ(ZydisDecodedInstruction); SZ(ZydisDecoder);
+    OFS(info.length); OFS(info.opcode_map); OFS(info.opcode); OFS(info.attributes);
+    OFS(info.raw.modrm.mod); OFS(info.raw.sib.scale); OFS(info.raw.disp.value);
+    OFS(info.raw.disp.size); OFS(info.raw.disp.offset);
+    OFS(info.raw.imm[0].is_signed); OFS(info.raw.imm[0].value);
+    OFS(info.raw.imm[0].size); OFS(info.raw.imm[0].offset); OFS(info.raw.imm[1].value);
+    OFS(operands); OFS(text);   /* ... one line per field of the table */
+    return 0;
+}
+```
+
+— compiled and run in a scratch directory, never in the repository:
+
+```bat
+call "C:\Program Files\Microsoft Visual Studio\18\Community\Common7\Tools\VsDevCmd.bat" -arch=x64 -host_arch=x64
+set ZY=<repo>\ThirdParty\Zydis\zydis.submodule
+cl /nologo /DZYDIS_STATIC_BUILD /DZYCORE_STATIC_BUILD /I"%ZY%\include" /I"%ZY%\dependencies\zycore\include" /I"<repo>\ThirdParty\Zydis\build" /I"<repo>\ThirdParty\Zydis\build\zycore" offsets.c /Fe:offsets.exe
+offsets.exe
+```
+
+The two `build` include directories hold the export-configuration headers CMake
+generates (`ZydisExportConfig.h`, `ZycoreExportConfig.h`); they exist once
+`build_zydis.bat` has run. Then update the constants in `ZydisApi.pas` and this
+table together, and run `ZydisDetailTests`.
+
+## The decode-only entry points
+
+`ZydisApi.ZydisDecodeDetail` without text does not go through
+`ZydisDisassembleIntel`, which decodes every operand and formats the
+instruction's text on each call. It keeps one `ZydisDecoder` per machine mode,
+set up once with `ZydisDecoderInit` (stack width 64 for `LONG_64`, 32 for the
+32-bit modes, 16 for the 16-bit ones — the same mapping `ZydisDisassembleIntel`
+applies internally), and calls `ZydisDecoderDecodeInstruction` with a null
+context. Both are among the DLL's 43 exports. Measured on 21.5 million
+instructions of a 620 MB image: about 80 ns per instruction.
+
+They are optional: when either export is missing the unit falls back to
+`ZydisDisassembleIntel` and returns the same facts.
+
 ## Verification questions answered (docs/DISASSEMBLY_PLAN.md, increment 1)
 
 1. **Version and API shape** — `ZydisDisassembleIntel` exists exactly as the

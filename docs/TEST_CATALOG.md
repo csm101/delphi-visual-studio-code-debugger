@@ -2132,6 +2132,149 @@ PACKAGEINFO (`PackageInfoReader.pas`):
       a real file. The reader decodes both lists as UTF-8, as the RTL does; the
       former in-line parser decoded the requires list as ANSI.
 
+## AC. Routine analysis and the decoder's facts (PROFILER_COVERAGE_PLAN.md increment 4)
+
+`DebuggerTests\ZydisDetailTests.pas` (fixture `TZydisDetailTests`) and
+`DebuggerTests\RoutineAnalysisTests.pas` (fixtures `TRoutineAnalysisTests`,
+static, and `TRoutineAnalysisDynamicTests`). Debuggee
+`DebuggerTests\TestTarget\AnalysisSample.dpr`, built for both bitnesses by
+`build_target.bat`. Mechanism in `DAP_DEBUGGER_ARCHITECTURE.md`, "Routine
+analysis".
+
+The decoder's facts (`ZydisApi.ZydisDecodeDetail`):
+
+- [x] **Every field, on known encodings, x64**
+      (`ZydisDetailTests.Long64_KnownEncodings_EveryFieldIsWhereTheEncodingPutsIt`):
+      26 encodings; kind, length, opcode and map, ModRM and SIB fields with the
+      ModRM offset, displacement value / size / offset, both immediates,
+      RIP-relative target, branch target. The offsets inside Zydis's struct are
+      measured, and a wrong one returns a plausible neighbour, not an error.
+- [x] **The same on 32-bit code**
+      (`ZydisDetailTests.Legacy32_KnownEncodings_EveryFieldIsWhereTheEncodingPutsIt`):
+      21 encodings, including what differs from 64-bit mode — `FF 25` is an
+      absolute slot, a branch wraps at 4 GB, a `66`-prefixed branch is truncated
+      to 16 bits, far transfers and `into` exist.
+- [x] **The decode-only path and the path with text agree, and the text is
+      `ZydisDecodeOne`'s**
+      (`ZydisDetailTests.BothEntryPoints_AgreeOnEveryField_AndTheTextIsDecodeOnes`).
+- [x] **Bytes that are no instruction are refused, and the record is zeroed**
+      (`ZydisDetailTests.BytesThatAreNotAnInstruction_AreRefused`).
+- [x] **No DLL, no facts**
+      (`ZydisDetailTests.Unavailable_WhenDllMissing_DetailIsRefused`).
+
+The analysis, static (binaries read as files; expectations derived by decoding
+the same bytes a second time, never from a hand-written address):
+
+- [x] **Every `{BP:...}` marker line is a confirmed record**
+      (`RoutineAnalysisTests.Markers_AreConfirmedRecords_InEveryFixture`): the
+      sample, `TestTarget.exe` and `TestSubject.bpl`, both bitnesses. The one
+      stated exception: a marker in an anonymous method on x86 must be
+      UNCONFIRMED with reason "outside every routine", never "not code".
+- [x] **Everything the analysis claims is what the bytes say**
+      (`RoutineAnalysisTests.EveryRoutine_IsWhatTheBytesSay_Sample`,
+      `..._TestTargetAndPackage`): for every analysed range of six binaries —
+      no two instructions overlap; each is as long as a second decode says and
+      of the kind its TEXT says; every call is in `CallSites` with the return
+      address behind it; every `ret` and leaving jump is in `Exits` and no
+      staying jump is; every in-routine branch target is flagged and is a
+      boundary; on x64 the window of each return address is the one read off
+      the instructions' text and the window flags are exactly those
+      instructions; every confirmed record's first block is whole proven
+      instructions with nothing a branch can reach after the first and only the
+      last one transferring control; table entries and clause tables are what
+      the image holds.
+- [x] **dcc32's `case` table directly after the jump**
+      (`RoutineAnalysisTests.Sample_X86_DenseCase_TableDirectlyAfterTheJump`):
+      entry N of the table is the line of arm N.
+- [x] **dcc32's byte-index form**
+      (`RoutineAnalysisTests.Sample_X86_IndexedCase_ByteIndexTableBeforeTheAddressTable`):
+      value → index byte → entry → the arm's line, looked up in the file's bytes.
+- [x] **dcc64 emits no table for the same sources**
+      (`RoutineAnalysisTests.Sample_X64_CaseStatements_CompileToNoTableAtAll`).
+- [x] **A hand-written table, and the three verdicts in one routine**
+      (`RoutineAnalysisTests.Sample_AsmTable_HandWrittenTableIsFoundAndItsLineIsNotCode`,
+      both bitnesses): entry N leads to `mov eax, 100 + N`; the `DD` / `DQ`
+      line is NOT CODE, the alignment and the `end` around it are UNCONFIRMED.
+- [x] **x64 handler entries from the scope and clause tables**
+      (`RoutineAnalysisTests.Sample_X64_ExceptionBlocks_AreNamedByTheScopeAndClauseTables`):
+      the finally funclet, both copies of a finally body, the clause table and
+      its first block on the `on` line, the bare except block.
+- [x] **x86 handler entries through their stubs**
+      (`RoutineAnalysisTests.Sample_X86_ExceptionBlocks_AreFoundThroughTheirStubs`):
+      the stub of each RTL handler, `stub + 5` as code or as a clause table, the
+      finally exit directly in front of the stub, the continuation right behind
+      the jump at `stub + 5`.
+- [x] **A `safecall` routine**
+      (`RoutineAnalysisTests.Sample_Safecall_HandlerIsAFuncletOnX64AndAStubOnX86`):
+      x64 handler funclet whose `ret` is not an exit; x86 stub to
+      `@HandleAutoException`.
+- [x] **The epilogue behind a last call is in the unwinder window on x64 only**
+      (`RoutineAnalysisTests.Sample_RoutineEndingInACall_ItsEpilogueIsInTheWindowOnX64Only`).
+- [x] **A one-line loop: the first block stops before the loop head**
+      (`RoutineAnalysisTests.Sample_OneLineLoop_FirstBlockStopsBeforeTheLoopBody`).
+- [x] **A frameless leaf, nested routines**
+      (`RoutineAnalysisTests.Sample_FramelessLeaf_IsOneBlockEndingInItsRet`,
+      `RoutineAnalysisTests.Sample_NestedRoutines_AreRoutinesOfTheirOwn`).
+- [x] **An anonymous method: confirmed from `.pdata` on x64; on x86 unconfirmed
+      with TD32 alone and confirmed with routine ranges from the MAP**
+      (`RoutineAnalysisTests.Sample_AnonymousMethod_X64FromPdata_X86OnlyWithAMap`).
+- [x] **A record outside every routine is "not code" only when its own bytes
+      show it** (`RoutineAnalysisTests.StrayRecords_AreNotCodeOnlyWhenTheBytesSaySo`):
+      the `end.` records of the 32-bit executable sit on a zero byte.
+- [x] **No decoder: nothing confirmed and nothing refused**
+      (`RoutineAnalysisTests.Unavailable_WhenDllMissing_NothingIsConfirmedAndNothingIsRefused`).
+
+Negative controls, the same binaries with one rule switched off
+(`TRoutineAnalysisInput.DisabledRules`):
+
+- [x] **Without the x86 finally exit every routine that has one goes
+      incomplete, and no other**
+      (`RoutineAnalysisTests.Without_TheX86FinallyExit_RoutinesGoIncomplete`;
+      87 of 425 routines of `TestTarget.exe`).
+- [x] **Without jump tables the `case` arms are unconfirmed**
+      (`RoutineAnalysisTests.Without_JumpTables_TheCaseArmsAreNotConfirmed`).
+- [x] **Without the x86 stubs / the x64 exception tables the handler blocks are
+      unconfirmed**
+      (`RoutineAnalysisTests.Without_X86HandlerStubs_TheHandlerBlocksAreNotConfirmed`,
+      `RoutineAnalysisTests.Without_X64ExceptionTables_TheHandlerBlocksAreNotConfirmed`).
+- [x] **Without the no-return rule the main block runs into data**
+      (`RoutineAnalysisTests.Without_NoReturnCalls_TheMainBlockRunsIntoData`).
+
+Seven mutations of `RoutineAnalysis.pas` were run against these tests when they
+were written (2026-11-27) — conditional-branch targets not followed, the last
+instruction of a window dropped, a wrong instruction length, table entries not
+flagged as targets, a block not stopped at a branch target, x86 continuations
+not found, x64 bare except blocks not seeded. Each one failed at least three
+tests.
+
+The analysis, dynamic — the strong one, independent of the analysis' decoding:
+
+- [x] **Every address the processor stopped at is a boundary the analysis
+      found** (`RoutineAnalysisTests.X64_EveryAddressTheProcessorStoppedAt_IsABoundaryTheAnalysisFound`,
+      `Win32_...`): `AnalysisSample` is run under the engine and stepped with
+      `TDebugSession.StepInstruction` — into everything that stays in the
+      analysed code, over calls that leave it — with breakpoints on the marker
+      lines and on the handler entries to resume after an excursion into the
+      RTL or the exception dispatch. Required of each stop inside an analysed
+      range: a boundary; the same length as the process's own bytes decode to;
+      a confirmed record when it is a line record; and, when control arrived by
+      a step and not by falling through, an address flagged as a target (or a
+      return address after a `ret`). Measured 2026-11-27: x64 631 stops at 425
+      distinct addresses in 18 of 18 ranges, 41 transfers; x86 660 stops at 422
+      distinct addresses in 17 of 17 ranges, 34 transfers. The run must reach
+      the last statement, execute every range, and stop on handler entries.
+- [x] **The analysis of the live process is the analysis of the file**
+      (same tests, `CompareLiveWithFile`): through
+      `IDebugTarget.ReadCodeMemoryAt`, on an image loaded at another base and
+      with breakpoints planted in it — flags byte for byte, verdicts, blocks.
+
+Not proved: the x64 window definition against the operating system's unwinder
+(it follows the plan's wording and `PatchFeasibilityProbe`'s measurements);
+`rep`-prefixed and far instructions on a live path; a module that reaches
+`System.@Halt0` or `_DelphiExceptionHandler` through an import thunk in a LIVE
+process whose import lookup table is gone (the file case is covered by
+`TestSubject.bpl`).
+
 ## What the suite does NOT prove (2026-08-08)
 
 Coverage-honesty notes. Each records a place where a green run is weaker evidence

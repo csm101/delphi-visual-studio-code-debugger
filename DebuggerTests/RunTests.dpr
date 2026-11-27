@@ -68,7 +68,11 @@ uses
   PackageInfoReader in '..\DebuggerCore\PackageInfoReader.pas',
   PackageInfoReaderTests in 'PackageInfoReaderTests.pas',
   ProfileScope    in '..\DebuggerCore\ProfileScope.pas',
-  ProfileScopeTests in 'ProfileScopeTests.pas';
+  ProfileScopeTests in 'ProfileScopeTests.pas',
+  ZydisDetailTests in 'ZydisDetailTests.pas',
+  PeImageFile     in '..\DebuggerCore\PeImageFile.pas',
+  RoutineAnalysis in '..\DebuggerCore\RoutineAnalysis.pas',
+  RoutineAnalysisTests in 'RoutineAnalysisTests.pas';
 
 const
   // Tests that cannot run while another RunTests worker is executing, because

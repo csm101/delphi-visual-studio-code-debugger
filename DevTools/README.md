@@ -830,6 +830,117 @@ What the first runs established, and what to look for when a number moves:
   1 579 records), and on x86 the static functions of linked C objects, which
   share one TD32 range with the public symbol in front of them.
 
+#### RoutineAnalysisSweep
+
+```bat
+DevTools\Win64\Debug\RoutineAnalysisSweep.exe <exe-or-bpl> [-all] [-out <dir>] [-maxlist N] [-routine <name>] [-without <rules>] [-decodebench] [-zydisdll <path>]
+
+rem examples
+DevTools\Win64\Debug\RoutineAnalysisSweep.exe DebuggerTests\TestTarget\Win32\Debug\AnalysisSample.exe -routine IndexedCase
+DevTools\Win64\Debug\RoutineAnalysisSweep.exe DebuggerTests\TestTarget\Win32\Debug\TestTarget.exe -without finally
+```
+
+Runs the routine analysis (`DebuggerCore\RoutineAnalysis.pas`,
+`docs/PROFILER_COVERAGE_PLAN.md` increment 4) over a whole binary and prints
+what it found. Static: the binary is read as a file through `TPeImageFile` and
+never executed. A 64-bit tool for both bitnesses. The code map comes from the
+binary's TD32, so the numbers describe what the engine would see.
+
+For the routines of the code map, then for the x64 functions only `.pdata`
+knows (anonymous-method bodies), then for the records in neither:
+
+- line records **confirmed** as an instruction boundary, shown to be **not
+  code**, and **unconfirmed**, each with its reasons;
+- ranges **not analysed completely**, by reason, and the records they hold;
+- bytes that are proven instructions, tables, never reached;
+- what ends the first straight-line block of each confirmed record;
+- call sites; exits by kind; the `ret`s and jumps that are NOT exits (x86
+  finally exits and handler stubs, x64 funclet returns);
+- **indirect jumps by kind**: through a fixed slot (an import or another slot),
+  through a recognised table (entries, byte-index form, directly after the
+  jump), the x86 finally exit, unexplained;
+- exception-handler entries by kind, x86 stubs by RTL handler, clause tables;
+- the time: TD32 load, code map, analyzer set-up, **analysis**, checks.
+
+Probe forms are not its job; `LineSiteSurvey` has those.
+
+**It is also the analysis' consistency check.** For every analysed range it
+asserts that no two decoded instructions overlap (each boundary is followed by
+exactly the interior bytes of an instruction whose length a second decode
+reports, and no analysed range overlaps another), that confirmed records and
+boundary bytes are the same set, and that a "not code" record is on an interior
+byte, a table byte, or an unreached zero or undecodable byte. A violation is
+printed and the exit code is 1.
+
+| option | effect |
+|---|---|
+| `-all` | analyse every routine of the code map, not only the ones that own a line record |
+| `-out <dir>` | detail listings: the records that are not confirmed, the ranges not analysed completely, and (x64) the functions inside a routine range that are not funclets |
+| `-routine <name>` | print the analysis of the routines of that name byte by byte: instructions with their flags, line records with verdict and block, call sites and windows, tables, handler entries, exits. `.pdata` prints the functions known from `.pdata` only |
+| `-without <rules>` | switch off sources of proven places, comma separated, to see what each buys: `noreturn`, `tables`, `finally` (x86), `stubs` (x86), `ehtables` (x64) |
+| `-decodebench` | also time the decoder alone over the instructions the analysis decoded |
+
+**Baseline (2026-11-27, Delphi 12 Athens, compiler 36.0).** Every routine that
+owns a line record; "ranges" adds the x64 `.pdata`-only functions after the
+plus sign. The three verdict columns cover ALL line records of the module.
+
+| module | ranges | instructions | records | confirmed | not code | unconfirmed | not completed | analysis |
+|---|---|---|---|---|---|---|---|---|
+| `AnalysisSample.exe` x64 | 17 + 1 | 557 | 130 | 127 | 1 | 2 | 0 | — |
+| `AnalysisSample.exe` x86 | 17 | 469 | 123 | 117 | 1 | 5 | 0 | — |
+| `TestTarget.exe` x64 | 301 + 10 | 12 464 | 1 904 | 1 904 | 0 | 0 | 0 | 2 ms |
+| `TestTarget.exe` x86 | 425 | 15 602 | 1 974 | 1 938 | 4 | 32 | 0 | 2 ms |
+| `TestSubject.bpl` x64 | 300 + 10 | 12 160 | 1 863 | 1 862 | 1 | 0 | 0 | 2 ms |
+| `TestSubject.bpl` x86 | 440 | 15 701 | 1 953 | 1 921 | 0 | 32 | 0 | 2 ms |
+| `Hydra2SingleEXE.exe` x64 (620 MB) | 411 229 + 2 723 | 21 568 704 | 2 880 014 | 2 876 724 (99.89 %) | 1 182 | 2 108 | 27 (51 records) | 3.1 s |
+| `Hydra2SingleEXE.exe` x86 (530 MB) | 398 810 | 18 934 941 | 2 791 210 | 2 753 921 (98.66 %) | 2 607 | 34 682 | 14 (608 records) | 2.6 s |
+
+The analysis costs 140 to 145 ns an instruction on the large images, of which
+the decoder alone is 75 to 90 (`-decodebench`); loading the TD32 of the same
+image takes 5 s. Inside the routines of the code map the share confirmed is
+99.92 % (x64) and 99.19 % (x86), as `LineSiteSurvey` measured.
+
+Indirect jumps on the large images: x64 1 279 — 1 251 through a fixed slot,
+one table (hand-written, `System._FillChar`), 27 unexplained; x86 127 875 —
+1 222 through a fixed slot, 3 628 tables (59 050 entries; 2 719 directly after
+the jump, 839 with a byte index table), 123 008 finally exits, 17 unexplained.
+The routines left incomplete are hand-written assembly that jumps through a
+register: on x86 RTL routines (`@System@@CallDynaInst`,
+`@System@@HandleAnyException`, `@System@@LStrCatN`, `TObject.Dispatch`), on x64
+the delay-load helper stubs (`user32_dll`, `kernel32_dll`, …: `pop; pop; pop;
+jmp rax`), `_ExitDllLongJump` and one event thunk.
+
+**What each rule buys** (`-without`, `TestTarget.exe`): without `finally`, 87
+of the 425 x86 routines are not completed; without `stubs` the confirmed x86
+records fall from 1 938 to 1 798; without `ehtables` the x64 ones from 1 876 to
+1 767; without `noreturn` the x86 main block decodes two instructions into
+data and stops on a byte that is not one.
+
+**Reconciled with `LineSiteSurvey`**, which is the prototype this analysis was
+built from. On all eight binaries the two agree to the record on what matters:
+ranges analysed, instructions decoded in them, proven / table / unreached
+bytes, records confirmed, tables and their entries, finally exits, stubs by
+handler, continuations, return-address records. They differ here, and only
+here:
+
+| | `LineSiteSurvey` | `RoutineAnalysisSweep` | why |
+|---|---|---|---|
+| unconfirmed records | one state (x64 2 203, x86 22 549 inside routines) | two: not code (669 / 1 618) and unconfirmed (1 534 / 20 931) | an unreached record whose own byte is zero (216 / 224) or whose bytes are no instruction (322 / 206) is shown to be data; the survey filed them under "follows a ret / jmp" |
+| x64 `.pdata`-only functions | 3 315 ranges, 146 252 instructions | 2 723 ranges, 155 649 instructions | the survey analysed each `.pdata` function that holds a record from its own start; the analysis takes a function TOGETHER with the funclets that follow it (1 343), whether they hold a record or not. Same 13 388 records, same 13 381 confirmed |
+| records in no routine and no `.pdata` function | x64 392 zero / 486 data / 202 code; x86 923 / 187 / 13 630 | x64 466 zero byte / 47 undecodable / 567 unconfirmed; x86 968 / 21 / 13 751 | the survey guessed: two zero bytes, or a linear decode of up to 48 instructions that fails. The analysis calls a record "not code" only on its own bytes — one zero byte (the 0.9.3 rule) or no instruction — because a later step refuses breakpoints on that verdict |
+| x86 ranges not completed | 22 | 14 | seven are `jmp [slot]` through a slot that is not an import: an exit through a pointer, not a break. One is a pushed address whose five bytes cross the routine's end: the survey took it for a stub ("unnamed target") and then reported an instruction crossing the end; a stub must fit in its routine, so it is data (pushed data 57 202 against 57 201, stubs 130 435 against 130 436) |
+| jumps through an import slot | x64 1 251, x86 1 215 | "fixed slot" 1 251 / 1 222, of which an import 1 247 / 1 211 | the survey also reads the delay-load directory (4 on each); the analysis needs no import table for this rule — any fixed slot outside the routine is an exit — and the tool names only ordinary imports |
+| routine exits | x64 411 250, x86 404 557 | 411 259, 404 594 | conditional jumps out of the routine (9 / 37) are exits here and were listed apart there |
+| x64 records inside a window | 721 749 | 721 746 | the stack-adjust test is exact (`48 83/81 C4`, `48`/`49 8D` with `rsp` as destination); the survey accepted any REX.W prefix |
+| block ending in a direct call / "retargeted call" | 1 189 903, 1 029 191 | 1 189 928, 1 029 233 | the survey's is a probe form: a five-byte call in a completed routine. The sweep reports what ends the block |
+| handler entries | over every `.pdata` entry of the image | over the routines that own a line record | — |
+
+One difference was a defect of the first version of the analysis, found by this
+reconciliation: 289 x64 `ret`s were counted as routine exits. They are in the
+handler funclets of `safecall` routines, which a scope entry names with
+`Handler` = 1 (`docs/EH_FORMAT_NOTES.md`); the funclet rule now covers them and
+the exits agree.
+
 #### CodeMapDump
 
 Builds the code map of one binary from its TD32 (`DebuggerCore\CodeMap.pas`,

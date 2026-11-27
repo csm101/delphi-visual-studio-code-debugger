@@ -1,11 +1,13 @@
 unit ZydisDisassembler;
 
 // The Zydis-backed implementation of IDisassembler (docs/DISASSEMBLY_PLAN.md
-// increment 2). This is the ONLY unit besides ZydisApi.pas itself allowed to
-// reference ZydisApi -- everything else in the debugger, including DevTools
-// and any future MCP/DAP surface, must go through IDisassembler
-// (Disassembler.pas), never through this unit's implementation details. Same
-// discipline the codebase already applies to IDebugTarget/TWinDebugger.
+// increment 2). Everything that wants DISASSEMBLY -- text for a view, in the
+// debugger, DevTools or any MCP/DAP surface -- must go through IDisassembler
+// (Disassembler.pas), never through ZydisApi or this unit's implementation
+// details. Same discipline the codebase already applies to
+// IDebugTarget/TWinDebugger. The one other unit that references ZydisApi is
+// RoutineAnalysis.pas, which needs instruction FACTS by the million and no
+// text at all (ZydisApi.ZydisDecodeDetail).
 //
 // Symbolication is OPTIONAL: pass a TDebugInfoSet + the main exe's ImageBase
 // to get per-instruction "nearest function + offset" / source file+line, and

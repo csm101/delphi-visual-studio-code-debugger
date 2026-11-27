@@ -237,6 +237,20 @@ record is NOT always the first byte of an instruction.
 - **A procedure range is not all code**: 16 to 20 % of its bytes are never
   reached. On x64 it contains the routine's funclets and clause tables; on x86
   its handler stubs, clause tables and trailing literals.
+- **A hand-written `asm` routine has a record for every source line, data
+  directives included** (measured 2026-11-27 on `AnalysisSample.dpr`, both
+  bitnesses): the record of a `DD` / `DQ` line points at the first byte of the
+  table it emits, the record of a `.ALIGN` line at the padding, and the closing
+  `end` at a byte behind the table that nothing reaches. Inside a procedure
+  range, and none of them an instruction that runs. The routine analysis
+  (`DAP_DEBUGGER_ARCHITECTURE.md`, "Routine analysis") reports the first as
+  "not code" and the other two as unconfirmed.
+- **On x64 a source line inside a `finally` block has two records**: one in
+  the routine's body and one in the finally funclet, which is where an
+  exception runs the block (`EH_FORMAT_NOTES.md`). `SourceLineToRva` answers
+  with one address per provider, so a breakpoint on such a line is planted on
+  one of the two only (measured on `AnalysisSample`: the inline copy got the
+  `$CC`, the funclet copy did not).
 - The reader keeps one row per distinct address (`AddOrSetValue`), so two
   lines that share an address leave one record.
 - The same unit compiled into a package and into an executable has the same
