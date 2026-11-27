@@ -383,6 +383,14 @@ real implementation. Run summary shows the live count
 - [x] The verified-state event reports the transition DOWN as well as up: a
       source breakpoint in a package unit goes unverified when the package
       unloads (`Bpl_BreakpointGoesUnverified_WhenItsModuleUnloads`)
+- [x] A source breakpoint on a line record that holds data, not code (the final
+      `end.` of a unit on a 32-bit image) is refused, announced, listed as
+      unverified, and the program runs to its end
+      (`Win32_BreakpointOnAUnitsFinalEnd_SetAtAStop_IsRefusedAndTheProgramRuns`,
+      `Win32_BreakpointOnAUnitsFinalEnd_SetBeforeTheProcess_IsRefusedAndTheProgramRuns`).
+      Negative control run: with the refusal disabled both fail with "the
+      program did not run to its end". Only the zero-byte case is covered; a
+      bad record on any other byte is not detected (`KNOWN_UNKNOWNS.md`).
 - [x] Step over (`Test_Step_Over_StaysInProc`,
       `Test_Step_Over_FromFunctionEntry_LandsNextLine`,
       `Test_Step_Over_NotTakenBranch_LandsNextLine`)

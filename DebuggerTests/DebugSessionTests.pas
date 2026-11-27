@@ -37,6 +37,15 @@ type
     // A breakpoint on a 32-bit target must bind and fire, and report the line
     // the user asked for.
     [Test] procedure Win32_Breakpoint_BindsAndFires;
+    // The final `end.` of a unit is a line record that points at DATA on a
+    // 32-bit image. A breakpoint there used to bind, report verified and write
+    // its $CC into the data; the program then looped on an access violation.
+    // It must be refused, say so, and leave the program able to run to its end.
+    // Twice, because the verified state is decided on two different paths: at
+    // once for a breakpoint set at a stop, and at the first module event for one
+    // set before the process exists.
+    [Test] procedure Win32_BreakpointOnAUnitsFinalEnd_SetAtAStop_IsRefusedAndTheProgramRuns;
+    [Test] procedure Win32_BreakpointOnAUnitsFinalEnd_SetBeforeTheProcess_IsRefusedAndTheProgramRuns;
     // Handler-scoped `$exception` is x64-only, and the 32-bit answer has to be
     // a stated limitation rather than an empty Locals row. A row that simply
     // never appears is indistinguishable from a bug from the outside, so the
@@ -4902,6 +4911,109 @@ end;
 const
   W32_SOURCE = 'TestTargetEdge.pas';
   W32_MARKER = 'RECURSION_BASE_BODY';
+
+// 1-based number of the last line of the file that is exactly `end.`, or 0.
+function FinalEndLineIn(const SourcePath: string): Integer;
+begin
+  Result := 0;
+  var Lines := TStringList.Create;
+  try
+    Lines.LoadFromFile(SourcePath);
+    for var I := Lines.Count - 1 downto 0 do
+      if SameText(Trim(Lines[I]), 'end.') then
+        Exit(I + 1);
+  finally
+    Lines.Free;
+  end;
+end;
+
+// A breakpoint on the final `end.` of TestTargetUsesA.pas, in the scenario that
+// reads the data that record points at. Before the fix the target never ended.
+procedure RunBreakpointOnAUnitsFinalEnd(const ExePath, MapPath, RsmPath,
+  SourceDir: string; SetAtEntryStop: Boolean);
+const
+  UNIT_FILE = 'TestTargetUsesA.pas';
+  ARGS      = '-run-uses-scope';
+  REFUSAL   = 'holds data, not code';
+begin
+  Assert.IsTrue(FileExists(ExePath),
+    '32-bit target missing -- build_target.bat should have produced ' + ExePath);
+  var EndLine := FinalEndLineIn(SourceDir + UNIT_FILE);
+  Assert.IsTrue(EndLine > 0, 'no final "end." line found in ' + UNIT_FILE);
+
+  var Session := TDebugSession.Create;
+  try
+    var Opts := Default(TLaunchOptions);
+    Opts.ExePath     := ExePath;
+    Opts.MapPath     := MapPath;
+    Opts.RsmPath     := RsmPath;
+    Opts.SourceRoot  := SourceDir;
+    Opts.Args        := ARGS;
+    Opts.StopAtEntry := SetAtEntryStop;
+    // Without the fix the target loops on an access violation. With the default
+    // filters the session would stop on the first one and the failure would read
+    // "stopped on an exception"; silenced, it reads what it is: never ended.
+    Opts.ExceptionFilters    := Default(TExceptionFilters);
+    Opts.ExceptionFiltersSet := True;
+    Assert.IsTrue(Session.Launch(Opts), 'Launch returned False');
+
+    if SetAtEntryStop then begin
+      PumpUntilStop(Session, 30000);
+      Assert.AreEqual(Ord(dsStopped), Ord(Session.State), 'did not stop at entry');
+    end;
+
+    var Spec := Default(TBpLineSpec);
+    Spec.Line := EndLine;
+    var Bps := Session.SetBreakpoints(UNIT_FILE, [Spec]);
+    Assert.AreEqual<NativeInt>(1, Length(Bps), 'SetBreakpoints did not answer for the line');
+    if SetAtEntryStop then begin
+      // The bytes are readable at a stop, so the answer must already be honest.
+      Assert.IsFalse(Bps[0].Verified,
+        Format('a breakpoint on %s:%d, which maps only to data, was reported verified',
+          [UNIT_FILE, EndLine]));
+      Session.ContinueExecution;
+    end;
+
+    var Deadline := GetTickCount64 + 30000;
+    while (not Session.HasExited) and (GetTickCount64 < Deadline) do begin
+      Session.Pump;
+      Assert.AreNotEqual(Ord(dsStopped), Ord(Session.State),
+        'the session stopped although the only breakpoint was on a line that is not code');
+    end;
+    Assert.IsTrue(Session.HasExited,
+      'the program did not run to its end: the breakpoint on "end." was planted into data');
+
+    // Not vacuous: the refusal must have been announced, which only happens when
+    // the line really resolved to an address holding a zero byte. If the fixture
+    // or the compiler stops producing that record, this fails rather than passing
+    // on a breakpoint that simply never resolved.
+    var Announced := False;
+    for var Line in Session.DrainDebuggerOutput do
+      if Line.Contains(REFUSAL) then
+        Announced := True;
+    Assert.IsTrue(Announced,
+      'the engine never announced a refused breakpoint: the "end." record of ' + UNIT_FILE +
+      ' no longer points at data, so this test proves nothing');
+
+    for var Bp in Session.ListBreakpoints do
+      if Bp.Line = EndLine then
+        Assert.IsFalse(Bp.Verified,
+          'the refused breakpoint is still listed as verified after the run');
+  finally
+    Session.Terminate;
+    Session.Free;
+  end;
+end;
+
+procedure TWin32RunControlTests.Win32_BreakpointOnAUnitsFinalEnd_SetAtAStop_IsRefusedAndTheProgramRuns;
+begin
+  RunBreakpointOnAUnitsFinalEnd(Win32Exe, Win32Map, Win32Rsm, TargetDir, True);
+end;
+
+procedure TWin32RunControlTests.Win32_BreakpointOnAUnitsFinalEnd_SetBeforeTheProcess_IsRefusedAndTheProgramRuns;
+begin
+  RunBreakpointOnAUnitsFinalEnd(Win32Exe, Win32Map, Win32Rsm, TargetDir, False);
+end;
 
 procedure TWin32RunControlTests.Win32_Breakpoint_BindsAndFires;
 begin
