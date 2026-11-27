@@ -247,7 +247,38 @@ pass**: it fires before that frame is known to receive the exception and before
 the block runs, unlike x64 where the block executes only if it really executes.
 The stub's address does resolve to the `finally`/`except` line through the line
 table, which makes stopping there *look* right; it names the wrong execution
-phase.
+phase. (As the nearest line, that is: measured later on a large image, a stub
+is itself the start of a line record 8 times in 130 435.)
+
+### The code around an x86 `try..finally` — shape, measured statically
+
+`DevTools\LineSiteSurvey`, 2026-11-26. dcc32 ends every `finally` block,
+written or implicit, the same way, and the block is not left by a `ret`:
+
+```
+$000D8819  68 35 88 4D 00         push 0x4D8835               ; the continuation
+$000D881E  8D 45 F4               lea eax, [ebp-0x0C]         ; finally code starts
+$000D8826  E8 ED 19 F3 FF         call ...
+$000D882B  58                     pop eax
+$000D882C  FF E0                  jmp eax                     ; leaves the block
+$000D882E  E9 8D 0F F3 FF         jmp @HandleFinally          ; the stub
+$000D8833  EB E9                  jmp 0x000D881E              ; stub + 5: back to the finally code
+$000D8835  5B 8B E5 5D C3         pop ebx; mov esp,ebp; pop ebp; ret   ; the continuation
+```
+
+- `pop eax; jmp eax` is an indirect jump in about a fifth of all routines
+  (123 008 in one large image, against 3 628 real jump tables). Anything that
+  follows control flow through a routine has to know it and take the pushed
+  continuation as the target.
+- In this shape the bytes at `stub + 5` are a jump back to the block's first
+  instruction. That would make the block address derivable for `@HandleFinally`
+  after all. It is an observation of the bytes, on every finally of the
+  fixtures; it has not been checked against the RTL source nor confirmed by
+  planting, and `PlanExceptionStep` does not rely on it.
+- Stubs found through their `push imm32`, same image: `@HandleFinally`
+  123 009, `@HandleAnyException` 3 831, `@HandleOnException` 3 306,
+  `@HandleAutoException` 289. A `push imm32` of an address inside the routine
+  is a string literal far more often than a stub (57 201 times).
 
 ## Two traps
 

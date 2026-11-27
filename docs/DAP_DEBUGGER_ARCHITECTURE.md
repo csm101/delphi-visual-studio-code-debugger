@@ -2193,8 +2193,9 @@ code address lying on the stack, and the test for that is exact:
 - `X86Decode.CallSiteEndsAt` decodes FORWARD from a known instruction boundary
   and reports whether a boundary lands on the candidate with a `call` ending
   there. x86 is not self-synchronising, so reading backwards cannot answer this.
-- The boundary comes from the line table (every line record starts an
-  instruction), restricted to the routine that contains the byte **before** the
+- The boundary comes from the line table (a line record inside a routine starts
+  an instruction, with the rare exceptions measured in `TD32_FORMAT_NOTES.md`,
+  "What a line record points at"), restricted to the routine that contains the byte **before** the
   candidate — which is where the instruction ENDING at the candidate lives. The
   routine entry is the fallback when the module has symbols but no lines.
 - That `-1` is load-bearing. Anchoring on the routine containing the candidate

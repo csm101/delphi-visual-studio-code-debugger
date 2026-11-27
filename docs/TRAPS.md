@@ -738,6 +738,26 @@ absurdly.
   reproduce emission-order values.
 - **When driving the MCP server, set breakpoints while parked at entry, before
   `continue_and_wait`** — the Run loop pumps continuously.
+- **Never plant on a line record without checking it is inside a routine.**
+  On a 32-bit image the record of a unit's final `end.` points at a data byte
+  after the unit's code. One `$CC` there and the program loops on an access
+  violation at an RTL address that says nothing about the cause (138 259
+  exceptions in 5 s before it was understood). `ProbeCostProbe -hits -bisect`
+  finds the offending record. See `TD32_FORMAT_NOTES.md`, "What a line record
+  points at".
+- **A decode that starts AT an address does not prove the address is an
+  instruction boundary.** x86 decoding falls back into step within a few
+  instructions, so "the decode reaches the next known boundary" passes for an
+  address in the middle of an instruction. Prove it from the other side: a
+  decode from an earlier proven boundary must arrive exactly there.
+- **`StackWalk64` with no read routine reads the target about 43 times per
+  frame**, four or five bytes at a time: a millisecond for thirty frames on
+  x64, five on x86 where the engine walks twice. Fine at a stop, ruinous in
+  anything periodic. A read routine with a page cache makes it ten times
+  cheaper.
+- **Suspending and resuming a thread advances its cycle counter** by a few
+  microseconds' worth. "The counter did not move, so the thread did not run"
+  needs a threshold.
 
 ## Diagnosing a report
 

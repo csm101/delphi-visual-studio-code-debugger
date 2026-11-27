@@ -213,6 +213,39 @@ Nothing became lazy and no cache was introduced: the tables are still built
 eagerly and are still immutable once the reader is published, which is the
 property the whole reader depends on (see the NAMES section above).
 
+### What a line record points at — measured
+
+Measured 2026-11-26 with `DevTools\LineSiteSurvey` on the fixtures and on a
+530 / 620 MB real image of each bitness (2.8 million records each). A line
+record is NOT always the first byte of an instruction.
+
+- **About 0.5 % of the records lie outside every procedure range.** Most are
+  the bodies of anonymous methods, which have no procedure record at all on
+  either bitness (the MAP names them `...$ActRec.$0$Body`). The rest point at
+  data: on x86 the record of a unit's final `end.` points at a zero byte just
+  after the unit's last routine; on x64 some records of generic instantiations
+  land on zero or undecodable bytes. A `$CC` planted on one of the x86 `end.`
+  records sends the program into an endless access violation
+  (`DevTools\ProbeCostProbe -hits -bisect`).
+- **Inside a procedure range, 99.92 % (x64) and 99.19 % (x86) of the records
+  are confirmed** as instruction boundaries by a decode that starts at proven
+  places. A few are provably inside an instruction (130 and 1 173), nearly all
+  in generic instantiations. The others are unreached: data compiled as a
+  procedure (`System.Character.inc`), dead code after a `raise`, and on x86
+  the static functions of linked C objects, which share one procedure range
+  with the public symbol before them.
+- **A procedure range is not all code**: 16 to 20 % of its bytes are never
+  reached. On x64 it contains the routine's funclets and clause tables; on x86
+  its handler stubs, clause tables and trailing literals.
+- The reader keeps one row per distinct address (`AddOrSetValue`), so two
+  lines that share an address leave one record.
+- The same unit compiled into a package and into an executable has the same
+  lines with code in every routine both contain (fixtures, both bitnesses).
+
+So "every line record starts an instruction" holds only for a record inside a
+procedure range, and there only almost. A breakpoint on a line the user picked
+has never met the exceptions; anything that touches every record does.
+
 ## Type table (`SST_TYPES` / `SST_GLOBAL_TYPES`)
 
 Both subsections share the same layout. `SST_TYPES` is emitted per

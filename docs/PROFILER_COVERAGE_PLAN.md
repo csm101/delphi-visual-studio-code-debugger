@@ -263,6 +263,26 @@ A routine the analysis cannot finish — a byte that does not decode, an indirec
 jump that is not a recognised jump table — keeps the records confirmed before
 the break and loses the rest, and none of its sites gets a jump or call patch.
 
+What increment 0 measured about this, and the analysis has to know:
+
+- dcc64 emits no jump tables at all. dcc32 emits two forms, both of absolute
+  addresses: the table directly after the `jmp`, and a byte index table
+  between the `jmp` and the address table.
+- dcc32 ends every `finally` block, written or implicit, with `pop eax;
+  jmp eax`, the continuation having been pushed as an immediate earlier in the
+  routine. It is not a table and it is in a fifth of all routines: without
+  this shape 87 of 425 routines of a fixture came out unfinished.
+- A procedure range is not all code: 16 to 20 % of its bytes are never
+  reached (literals, tables, stubs), and on x86 an in-range address pushed as
+  an immediate is a string literal far more often than a code address. It
+  stays a possible target for rule 3 and is never a place to start decoding.
+- An anonymous method's body has no TD32 procedure record (about 0.5 % of all
+  records). On x64 `.pdata` gives its entry and it analyses like any routine.
+  On x86 nothing in TD32 proves its entry; the MAP names it, so a MAP is what
+  gives those lines a probe there.
+- A record that is skewed but happens to land on a boundary is confirmed. No
+  static test tells it from a good one.
+
 **The jump rule.** A site at `A` takes a jump only when all of these hold:
 
 1. the routine was analysed completely;
@@ -543,15 +563,15 @@ and takes the counters' current values as the new zero.
 **What a line's state means.** A source line is `covered` when any of its
 records ran, in any instantiation, module or accumulated run, and its `hits`
 are the sum over its records. The store also keeps, per line and routine, how
-many records the line has and how many ran. Whether "some but not all" is shown
-as a third state is decided after increment 0 has shown which constructs give
-one line several records: a `for` is one, where it would mean a body that never
-ran; the exception-path copy of a `finally` block may be another, where it
-would mark nearly every `finally` in a codebase and say little. One kind of
-record is never probed: on x86 the handler stub of a `try` is a line record
-that runs only while an exception is being dispatched, and it is machinery, not
-a statement. This is line coverage. It is not branch or condition coverage, and
-reports say so.
+many records the line has and how many ran. "Some but not all" is not shown as
+a third state. Increment 0 measured why: on x64 every statement inside a
+`finally`, and the `end;` of every routine with an implicit one, has a second
+record in the funclet the exception dispatch calls (62 542 of the 100 440
+multi-record lines of a large binary), so the state would mark nearly every
+`finally` in a codebase and say only that no exception passed. On x86 there
+are no such copies and the multi-record lines are loop headers. The counts stay
+in the store for a tool that wants them. This is line coverage. It is not
+branch or condition coverage, and reports say so.
 
 ### Sampling
 
@@ -561,18 +581,32 @@ and where is it.
 - **Which threads to look at.** A thread that has not run since the last tick
   need not be suspended: its stack is the one captured before. With fifty idle
   threads that is the difference between fifty queries and fifty suspensions
-  per tick. The candidate test is the thread's cycle counter. Whether that
-  counter moves for a thread that is running on another core between two
-  context switches is not documented (review); if it does not, the test skips
-  exactly the busiest thread. It is the first thing increment 12 measures, and
-  the fallback is to suspend every thread whose last sample was not a wait.
+  per tick. The test is the thread's cycle counter. The review asked whether
+  it moves for a thread running on another core between two context switches;
+  increment 0 measured that it does, on every reading at 1 ms and at 50 µs,
+  while a blocked thread's never moves. `GetThreadTimes` cannot do the job: it
+  moves in 15.6 ms steps. One trap: suspending and resuming a thread advances
+  its own counter by a few microseconds' worth, so "did not move" is a
+  threshold, not an equality.
 - A thread that ran is suspended, its context read, its raw stack captured, and
   resumed. Raw means addresses: a sample is stored as (module, RVA) frames in
   an aggregated tree, and named when the collection is finalized or
   snapshotted. A sample whose stack pointer lies outside the thread's own stack
   is discarded and counted: a WOW64 thread caught between its 32-bit and 64-bit
   halves can report a stale one.
-- **x64** captures through the existing `WalkRawFrames`.
+- **x64 gets a walker of its own, and dbghelp is only its oracle** (owner,
+  2026-11-27). The stack is copied with one read and unwound locally from the
+  module's `.pdata` and unwind codes, read once and cached. Why not dbghelp:
+  as the engine calls it today, `StackWalk64` asks the target for memory about
+  43 times per frame, 31 µs per frame, a millisecond for thirty frames
+  (increment 0); given a read routine with a page cache it still costs about
+  20 µs plus 2 µs per frame of its own. Table-driven unwinding over memory
+  that is already local is far cheaper: the same machine captures a stack in
+  its own process with `RtlCaptureStackBackTrace` in 1.2 µs (measured in JCL's
+  `TJclStackInfoList`, 2026-10-30). That call only walks the thread that makes
+  it, so it cannot be used from a debugger, but it is the mechanism this
+  walker reimplements, and it says the walk should cost a few microseconds,
+  leaving the suspend and the one read as the whole sample.
 - **x86 needs a walk of its own from the start** (review). The existing one is
   built for stops: it runs dbghelp on every call and asks the symbol providers,
   and with a frameless routine on top — the usual shape of a hot sample, think
@@ -580,6 +614,8 @@ and where is it.
   address of a frameless or not-yet-framed top routine near the stack pointer,
   with the call-site test the engine already has, then follows the EBP chain,
   validating each link against the module table. No dbghelp per sample.
+  Measured in increment 0: the engine's walk costs 177 µs per frame, a bare
+  EBP chain over one read of the stack a flat 13 to 15 µs.
 - Figures are sample counts with the measured mean interval beside them, in
   four columns as in the reference profiler: inclusive, exclusive, and the
   `_cpu` variants that count only ticks in which the thread consumed CPU.
@@ -587,22 +623,26 @@ and where is it.
   for display.
 - Ticks while the session is stopped, and while a synthetic call is in flight,
   are not taken.
-- The pump's wait is a field, shortened while a sampling collection runs, and
-  the collection raises the system timer resolution for its duration: without
-  that a shortened wait still returns on 15.6 ms ticks.
+- The collection raises the system timer resolution for its duration: without
+  that a 1 ms wait returns on 15.6 ms ticks. With it, a 1 ms wait delivers a
+  tick about every 1.5 ms (increment 0); the session records the interval it
+  really got.
+- The fixed part of a sample is suspend, context, resume: 16 µs on x64. On a
+  WOW64 thread `Wow64SuspendThread` costs 18 µs more than `SuspendThread`;
+  whether the 32-bit context is valid after the cheaper one is not measured.
 - A native target gives what MonoVM could not: samples per line. The exclusive
   samples of a routine are split by the line of the program counter, and the
   inclusive ones by the line of each call site.
 
-Two increments, because the walker decides the achievable interval:
+Neither walker touches dbghelp or a symbol provider, so the sampler runs on a
+thread of its own rather than on the pump thread, where a slow tool handler
+would open gaps in the samples. The pump thread tells it about threads and
+modules coming and going, and when the session is stopped.
 
-1. Sampling on the pump thread. The interval is whatever the measured cost of
-   a walk allows.
-2. A sampler thread with a walker of its own on x64 as well: one bulk read of
-   the stack, the module's `.pdata` and unwind information read once and
-   cached, unwinding done locally. This is what makes a 1 ms interval
-   affordable, and it stops a slow tool handler from opening gaps in the
-   samples.
+Two increments: the walkers first, proven against an oracle before anything
+depends on them, then the sampler and its tools. An intermediate sampler on
+dbghelp with a read routine was planned and dropped: it would have been written
+to be replaced.
 
 Sampling depends on nothing in "Line probes". It is scheduled after coverage
 has its counts because that is what the owner asked for first; it can be pulled
@@ -622,6 +662,15 @@ aggregation has to happen where the events are.
   ends in one too. The exit probe therefore sits on every `ret` and on every
   jump that leaves the routine, and closes the frame only when the stack
   pointer equals the one recorded at entry.
+- **Exits on x86 are an open problem** (increment 0). On x64 54 % of routine
+  exits take a jump and 44 % the call form, so nearly all are cheap. On x86
+  45 % can take neither: dcc32 epilogues are often shorter than five bytes and
+  the bytes before them are a line start or the continuation of a `finally`.
+  A `$CC` there is a debug event per call of the routine. Candidates, to be
+  chosen before increment 14: replacing the return address at entry, which
+  x86 dispatch does not read but the program's stack tracers and our walker
+  do; merged spans, which bring 45 % down to 40 % and are not enough; timing
+  those routines at their call sites.
 - An exception that unwinds past instrumented frames skips their exit probes.
   The next entry or exit event reconciles: every shadow frame whose recorded
   stack pointer is no longer above the current one is closed and counted as an
@@ -962,34 +1011,45 @@ The coverage the owner asked for.
 - Exit: overhead measured on the real workloads and recorded, with the share of
   lines in each form.
 
-### Increment 12 — Sampling
+### Increment 12 — The sampling walkers
 
-- First, the measurement the design waits for: a spinning thread pinned to a
-  core, its cycle counter read from another at 1 ms; how many readings do not
-  move (assumption 15).
-- `IStackSampleTarget` (capture a raw stack from a running thread, the x86
-  sampling walk), the pump's wait as a field and the timer resolution,
-  `TSamplingProfiler`, the sample tables, `profile_hotspots`, `profile_flat`,
-  `profile_tree`, `profile_callers`, `profile_callees`, `profile_threads`,
-  per-line samples in `profile_annotate_source`.
+No sampler yet: the two walks, as units that take a thread context and a way
+to read memory, and the proof that they are right.
+
+- x64: unwind from `.pdata` and the unwind codes over a copied stack — the
+  prologue and epilogue cases, chained entries, frames in modules loaded and
+  unloaded while the collection runs, a frame with no function entry treated
+  as a leaf. The patch map's view of code, so that an epilogue under a patch
+  is read as the program's.
+- x86: the walk described under "Sampling".
+- `IStackSampleTarget`: capture a raw stack from a running thread, callable
+  off the pump thread.
+- Tests:
+  - x64, differential against `StackWalk64`, at every instruction of
+    single-stepped runs through the fixtures: prologues, epilogues and leaves
+    are where samples land and where stops never do. Then on a real program,
+    at many random suspensions;
+  - x86 has no independent oracle (the engine's own walk drops the caller of a
+    frameless leaf): fixtures whose call chains are known, a frameless leaf
+    called in a loop among them;
+  - whether a WOW64 thread's context is valid after a plain `SuspendThread`.
+- Exit: the cost of one sample on each bitness, measured with `ProbeCostProbe`
+  against the figures of increment 0.
+
+### Increment 13 — Sampling
+
+- The sampler thread, the cycle-counter test with its threshold, the timer
+  resolution, `TSamplingProfiler`, the sample tables, `profile_hotspots`,
+  `profile_flat`, `profile_tree`, `profile_callers`, `profile_callees`,
+  `profile_threads`, per-line samples in `profile_annotate_source`.
 - Tests, both bitnesses:
   - two busy routines in a known ratio, within a stated tolerance, never
     absolute counts;
   - one spinning thread has `excl_cpu` close to `excl`: the test that fails if
     the busiest thread is being skipped;
   - a blocked thread has wall samples and no CPU samples;
-  - a frameless leaf called in a loop shows its framed caller above it;
-  - no samples during a stop; a package frame is named.
-
-### Increment 13 — Sampling at 1 ms
-
-- The x64 walker and the sampler thread described under "Sampling". Built only
-  if increment 12's numbers say the pump-thread sampler cannot hold the
-  interval.
-- Tests: differential against `StackWalk64` on x64, at every instruction of
-  single-stepped runs through the fixtures — prologues, epilogues and leaves
-  are where samples land and where stops never do. x86 has no independent
-  oracle; its walk is checked against fixtures whose call chains are known.
+  - no samples during a stop; a thread and a package that come and go during
+    the collection; a package frame is named.
 
 ### Increment 14 — Runtime, routine-level profiling
 
@@ -1013,7 +1073,126 @@ an attached process uses one-shots); routine-bound triggers; compensation of
 the probes' own cost; merged spans or short-jump islands if increment 11 shows
 too many lines left without a count.
 
+## Verified in increment 0
+
+2026-11-26. Two DevTools, no engine change: `LineSiteSurvey` (static) and
+`ProbeCostProbe` (dynamic). Their entries in `DevTools\README.md` carry the
+command lines and the baseline tables. Machine: Ryzen 9 5950X, Windows 11
+build 26300. Binaries: the mono and package fixtures on both bitnesses, and
+`Hydra2SingleEXE` on both (530 and 620 MB, analysed as files in 20 s each,
+never run).
+
+**Line records** (Hydra x64 / x86):
+
+| | x64 | x86 |
+|---|---|---|
+| line records (one per distinct address) | 2 880 014 | 2 791 210 |
+| outside every TD32 procedure range | 14 468 (0.50 %) | 14 740 (0.53 %) |
+| inside a range and confirmed as a boundary | 99.92 % | 99.19 % |
+| unconfirmed | 2 203 | 22 549 |
+| of which inside an instruction the proven decode reached | 130 | 1 173 |
+
+- Records outside every range are mostly anonymous-method bodies. The rest
+  point at data: on x86 the final `end.` of a unit points at a zero byte after
+  its last routine (1 065 in Hydra), on x64 878 records of generic
+  instantiations land on zero or undecodable bytes.
+- **The rule "inside a routine range" is load-bearing, measured dynamically:**
+  with a `$CC` on every record the 32-bit fixture dies in an endless access
+  violation; bisection found three records, all `end.` of a unit, each on a
+  data byte. With the rule the run is correct.
+- Records inside an instruction are real (one is a byte into a `cmp`), nearly
+  all in generic instantiations. Most other unconfirmed records are data
+  compiled as a procedure (`System.Character.inc`), dead code after a `raise`,
+  and on x86 the static functions of linked C objects, which share one TD32
+  range with the public symbol in front of them (17 775 of the 22 549).
+- The reader keeps one row per distinct address; the raw number of (file,
+  line, address) triples in the debug information was not obtained.
+
+**Probe forms**, share of the records inside procedure ranges (after the
+slash: if a span may also swallow later line starts):
+
+| | retargeted call | jump | call form | left to a `$CC` |
+|---|---|---|---|---|
+| fixture x64 | 40.0 % | 50.4 / 53.4 % | 6.5 % | 3.1 / 0.3 % |
+| fixture x86 | 33.7 % | 57.3 / 60.7 % | — | 8.8 / 5.5 % |
+| Hydra x64 | 41.5 % | 48.9 / 51.6 % | 5.6 % | 3.9 / 1.2 % |
+| Hydra x86 | 37.1 % | 52.0 / 55.1 % | — | 10.1 / 7.0 % |
+
+A quarter of all records are return addresses (25 % in Hydra, 30 % in the
+fixtures), and on x64 "inside a window" is the same set. What leaves a record
+to a `$CC` is, in order: a line start within five bytes, a branch target or
+address reference, and on x86 the short epilogue of `end;`.
+
+**Routine exits:**
+
+| | jump | call form | left to a `$CC` |
+|---|---|---|---|
+| Hydra x64 (411 250) | 54.5 % | 44.1 % | 1.4 % |
+| Hydra x86 (404 557) | 55.4 / 60.3 % | — | 44.6 / 39.7 % |
+
+**Indirect jumps:** none compiler-generated on x64 (one hand-written table in
+21 million instructions). On x86, 3 628 jump tables in the two forms described
+under "Routine analysis", 123 008 `finally` exits, and 24 others in hand-written
+assembly.
+
+**x64 handler entries** (assumption 17): funclets, `except` blocks, `on` blocks
+and clause tables are inside their routine's TD32 range (156 146, 24 683,
+3 654, 3 390 against none in another routine's). The ones in no range all
+belong to anonymous methods. x86 handler stubs are a line record 8 times in
+130 435.
+
+**The same unit in two binaries** (assumption 18): package against executable,
+both bitnesses: no line differs in a routine present in both. The lines found
+only in the package are routines the executable's linker dropped, which is the
+case the reference exists for. Fixtures only; not yet run on a real library.
+
+**A hit through a debug event** (assumption 2), raw debug loop, ten
+repetitions:
+
+| | µs per hit |
+|---|---|
+| fixture x64 | 56.7 (54.8..59.0) |
+| fixture x86 | 66.0 (53.2..72.3) |
+| a real multi-unit program, x64 | 60.6 between consecutive hits |
+
+Half of it is rewinding the program counter (reading and writing the thread
+context, 26 µs on x64, 34 to 38 on x86); restoring the byte is 8 µs, 4 if the
+pages are left writable, so the protection pair is not where the time goes.
+Planting 2 000 records takes half a millisecond. Verified, not only timed: same
+exit codes, patched pages byte-identical to their originals at exit, sidecars
+rebuilt under probes with the same SHA-256, and 132 to 308 stale hits per run
+with four threads handled without damage.
+
+**A stack capture** (assumption 10), µs per walk:
+
+| frames | x64, engine | x64, with a caching read routine | x86, engine | x86, bare EBP chain, one stack read |
+|---|---|---|---|---|
+| 10 | 349 | 40 | 1 483 | 15 |
+| 30 | 961 | 89 | 5 319 | 16 |
+| 60 | 1 976 | 140 | 10 246 | 14 |
+| 125 | 3 922 | 266 | 21 750 | 15 |
+
+Suspend, context and resume on a running thread: 16 µs on x64, 43 µs on WOW64
+with `Wow64SuspendThread`, 23 with `SuspendThread`.
+
+**The cycle counter** (assumption 15): for a thread spinning on another core it
+moved on every reading, at 1 ms and at 50 µs, at default and at raised timer
+resolution; for a blocked thread it never did. `GetThreadTimes` moves in
+15.6 ms steps. Suspending and resuming a thread advances its counter by about
+6 µs worth. A 1 ms wait yields a tick about every 1.5 ms.
+
+**What this changed in the plan:** the analysis must know the x86 `finally`
+exit; anonymous methods need `.pdata` on x64 and a MAP on x86; no third
+coverage state; sampling does not go through dbghelp at all but through a
+walker of its own on each bitness (increment 12), with dbghelp as the oracle;
+routine exits on x86 are an open problem.
+
 ## Assumptions to measure
+
+After increment 0: 1, 2, 8, 15, 17 and 18 are settled as stated in the section
+above. 9 holds for lines and is refuted for routine exits on x86. 10 is refuted
+(the existing walk is too slow on both bitnesses) and replaced by the cost of
+the local walk, to be measured at the end of increment 12.
 
 | # | assumption | settled in | if it is false |
 |---|---|---|---|
@@ -1026,12 +1205,12 @@ too many lines left without a count.
 | 7 | a retargeted call is indistinguishable from the original, to dispatch and to a stack tracer's call-site test; a re-encoded indirect call may or may not be | 1 | indirect calls are never touched |
 | 8 | the jump tables dcc32 and dcc64 emit are all recognised | 0, 4 | routines with a `case` lose the records after the table |
 | 9 | lines that can take a retargeted call, a jump or the call form are the large majority, and so are routine exits | 0, 11 | merged spans, short-jump islands; until then more lines read `1+` |
-| 10 | a stack capture on the pump thread is cheap enough for the first interval | 0, 12 | increment 13 moves ahead of the sampling release |
+| 10 | a sample with the local walk costs little more than the suspend and one read of the stack (tens of microseconds) | 12 | a longer default interval |
 | 11 | `winsqlite3.dll` is present and sufficient on every supported Windows | 6 | ship `sqlite3.dll` beside the server |
 | 12 | executable memory can always be had within 2 GB of a module | 10 | that module's lines use the `$CC` forms |
 | 13 | `rdtsc` is invariant and consistent across cores on supported machines | 14 | refuse timed modes with the reason |
 | 14 | on x64 a `jmp` patch inside the window of a return address makes the system unwinder take the frame for one in its epilogue; a `$CC` or a `call` there does not | 1 | if a jump is harmless after all, rule 6 goes and the call form is not needed |
-| 15 | a thread's cycle counter moves while the thread runs on another core between context switches | 12 | suspend every thread whose last sample was not a wait |
+| 15 | a thread's cycle counter moves while the thread runs on another core between context switches | 0 | suspend every thread whose last sample was not a wait |
 | 16 | dbghelp reads code through the read routine it is given, not from the image file | 1 | nothing to do if it reads the file: it then never sees a patch |
 | 17 | a TD32 procedure range covers the routine's funclets and clause tables | 0 | attribute them through the scope tables |
 | 18 | a unit compiled into two binaries has the same lines with code in both, so hits in one match the reference lines of the other | 0 | match by routine as well and report the lines that differ instead of counting them |

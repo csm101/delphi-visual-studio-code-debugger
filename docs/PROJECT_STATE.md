@@ -772,9 +772,12 @@ by RSM's name-keyed format (see `KNOWN_UNKNOWNS.md`).
 
 ## Open milestones (roadmap)
 
-**Next, in this order: profiler and code coverage (decided 2026-11-26).** Nothing
-is built yet. The plan, its increments and the assumptions it still has to
-measure are in `PROFILER_COVERAGE_PLAN.md`.
+**Next, in this order: profiler and code coverage (decided 2026-11-26).** The
+plan, its increments and the assumptions it still has to measure are in
+`PROFILER_COVERAGE_PLAN.md`. Work is on the branch `feat/profiler-coverage`.
+Done so far: increment 0, the measurements (two DevTools, `LineSiteSurvey` and
+`ProbeCostProbe`; no engine code yet). Next: increment 1, the feasibility
+probes for the patches.
 
 1. **The MCP server gains a profiler and code coverage** — one server, one
    engine. Coverage at line level by instrumentation, a hit count for every

@@ -1873,18 +1873,20 @@ them — shows empty locals and `Self: not found`. Regression test:
 
 Nothing of `PROFILER_COVERAGE_PLAN.md` is built (2026-11-26). Its table
 "Assumptions to measure" is the full list, each with the increment that settles
-it. Six of them can change the design rather than a number, and none has been
-measured:
+it. Increment 0 has run (2026-11-26) and answered what it could; the numbers
+are in the plan under "Verified in increment 0" and the format facts in
+`TD32_FORMAT_NOTES.md` and `EH_FORMAT_NOTES.md`. What is still open and can
+change the design:
 
-- **How many TD32 line records are not the first byte of an instruction, and
-  how many point at a table?** Coverage puts a probe on every record, not only
-  on the lines a user picks, so the plan probes a record only when a forward
-  decode from a proven place arrives exactly at it. A decode started AT the
-  record proves nothing: x86 decoding falls back into step. Code sections hold
-  clause tables on both bitnesses. The same survey has to say what the records
-  OUTSIDE every routine range are, because the plan drops them, and how many
-  lines can take a counting probe at all, because that is how much of a
-  coverage run gets real hit counts. Increments 0 and 4.
+- **How does routine-level profiling catch the exit of a routine on x86?**
+  45 % of the exits of a large 32-bit image cannot take a cheap probe: the
+  epilogue is shorter than five bytes and what precedes it is a line start or
+  a `finally` continuation. A `$CC` there is a debug event per call. The
+  candidates are in the plan ("The runtime in the target"); none is chosen.
+  Needed by increment 14.
+- **What proves the entry of an anonymous method's body on x86?** TD32 has no
+  procedure record for it and there is no `.pdata`. The MAP names it. Without
+  a MAP those lines get no probe. Increment 4.
 - **Does the x64 system unwinder read a jump patch near a return address as an
   epilogue?** `RtlVirtualUnwind` reads the code at each frame's return address:
   an optional `add rsp` / `lea rsp`, any pops, then a `ret` or a `jmp` leaving
@@ -1903,15 +1905,13 @@ measured:
   exactly as in an uninstrumented run**, through `try..except` and
   `try..finally`, on both bitnesses? The whole fault handling of the counting
   probes rests on it. Increment 1.
-- **Which shapes do `case` jump tables take in dcc32 and dcc64 output**, and is
-  every one recognisable? A routine with an indirect jump the analysis cannot
-  resolve loses the records after it. Increments 0 and 4.
-- **Does a thread's cycle counter move while the thread runs on another core
-  between two context switches?** The sampler wants to skip threads that have
-  not run without suspending them. If the counter is only brought up to date
-  at a switch, that test skips exactly the busiest thread and the profile
-  under-counts it without any sign. Increment 12, before the sampler is
-  written.
+- **Is a WOW64 thread's 32-bit context valid after a plain `SuspendThread`?**
+  It is 18 µs cheaper per sample than `Wow64SuspendThread`. Not measured.
+  Increment 12.
+- **Does a unit compiled into a real library's package and into its test
+  executables have the same lines with code?** It does on the fixtures. A
+  reference for coverage depends on it. To be run on a real library before
+  increment 8.
 
 Each answer moves into `DAP_DEBUGGER_ARCHITECTURE.md` with the increment that
 produced it, and its entry leaves this file.
