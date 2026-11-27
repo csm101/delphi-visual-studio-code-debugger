@@ -945,6 +945,12 @@ not confirmed.
 - `RoutineAnalysis.pas`: boundaries, branch targets, jump tables, handler
   entries on both bitnesses, call sites and return-address windows, exits,
   confirmed records.
+- The same confirmation gates ordinary breakpoints. Today a source breakpoint
+  on a record that is not code binds and is reported verified; on a 32-bit
+  target the final `end.` of a unit is such a record and the program then
+  loops on an access violation (`KNOWN_UNKNOWNS.md`, open defect in 0.9.2). A
+  breakpoint that resolves only to unconfirmed records is reported unverified,
+  with the reason.
 - DevTool `RoutineAnalysisSweep`: over a whole binary, no two decoded
   instructions overlap, and the unconfirmed records and unfinished routines are
   listed with the reason.
