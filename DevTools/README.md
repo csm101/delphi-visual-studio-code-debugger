@@ -61,9 +61,10 @@ set DUNITX_ROOT=D:\src\DUnitX\Source
 
 No target a probe starts may show a dialog (`CLAUDE.md`, "A test never opens a
 dialog and never takes the focus"). Every tool that starts one -- directly, or
-through the engine, the adapter or the MCP server (`DapSessionTiming`,
-`DataBpProbe`, `Disasm`, `ExcHandlerProbe`, `ExceptionStopProbe`,
-`LiveSessionProbe`, `LoaderTimingProbe`, `McpStdioProbe`,
+through the engine, the adapter or the MCP server (`BreakpointHitCost`,
+`DapSessionTiming`, `DataBpProbe`, `Disasm`, `ExcHandlerProbe`,
+`ExceptionStopProbe`, `LineProbeCost`, `LiveSessionProbe`, `LoaderTimingProbe`,
+`McpStdioProbe`,
 `PatchFeasibilityProbe`, `ProbeCostProbe`, `SessionEndLockProbe`, `StepPerf`,
 `Win32SessionProbe`, `Wow64RegWriteProbe`, `Wow64StackProbe`) -- calls
 `SetErrorMode(GetErrorMode or SEM_FAILCRITICALERRORS or SEM_NOGPFAULTERRORBOX or
@@ -1601,6 +1602,64 @@ here are built without them; build a private copy with the fixtures' flags
 few `.rsm` files to a scratch directory and pass `-verify -j 1`: it rebuilds
 every sidecar and compares hashes, so its exit code says whether the probed run
 produced the same bytes (`-force` on a fresh sidecar only reloads it).
+
+#### LineProbeCost
+
+```bat
+rem nothing launched: which line records would carry a one-shot probe, and what arming them costs
+DevTools\Win64\Debug\LineProbeCost.exe -file <exe-or-bpl> [-map <file.map>] [-zydis <Zydis.dll>]
+
+rem one first hit, measured on a running program: every confirmed line armed at the entry stop
+DevTools\Win64\Debug\LineProbeCost.exe -live -n 7 DebuggerTests\TestTarget\Win64\Debug\ProfilerSample.exe
+
+rem the writes alone at scale: a probe every <stride> bytes of code, the program never runs again
+DevTools\Win64\Debug\LineProbeCost.exe -synthetic 4 DebuggerTests\Win64\Debug\RunTests.exe
+```
+
+The measurements of `docs\PROFILER_COVERAGE_PLAN.md`, increment 5 (the patch map
+and the one-shot form; `DebuggerCore\CodePatchMap.pas`, `LineProbes.pas`). In
+`-live` and `-synthetic` the first word that is not an option is the program and
+everything after it is passed to it; in `-file` every option may follow the
+binary. Set `DAP_LOG=0` first: the engine's log costs more than a hit.
+
+| Mode | What it does | What it reports |
+|---|---|---|
+| `-file <binary>` | Reads the binary's TD32 (and the MAP, the second routine provider on x86), calls `TLiveCodeAnalysis.ConfirmedLineRecords` for every record -- the call a session makes, over the file -- and arms the confirmed records in a `TCodePatchMap` whose reads come from the file and whose writes are counted and dropped. A region is a section: a live `VirtualQueryEx` merges neighbouring sections of equal protection, so this can count more runs than a process would, never fewer. | Records, confirmed / not code / unconfirmed, routines analysed and not completed, the verdict time with and without building the code map, the probes armed, the program's own `int 3` refused, runs, write calls, bytes the writes cover, pages they would make private, the map's time, and the lookup cost of a hit address. |
+| `-live <exe> [args]` | Runs the program to its end under `TDebugSession`, alternately unprobed and with a whole-module request (`TLineProbeHost`) armed at the entry stop. | Records and verdicts, probes armed, analysis and write time, hits recorded, late traps, both median run times, and `(probed - plain) / hits`: one first hit. |
+| `-synthetic <stride> <exe> [args]` | Stops the program at its entry point, arms a probe every `<stride>` bytes of every executable section through `ICodePatchTarget` (not instruction boundaries: the program is killed without running), then takes them all away. | Probes armed, runs and write calls, bytes covered, the time in the map and on the wall clock (threads held), and the disarm. |
+
+Measured on 2026-11-27 (16C/32T, Windows build 26300):
+
+| | x64 | x86 |
+|---|---|---|
+| `ProfilerSample`, `-live -n 7`: armed / first hits / one first hit | 498 / 350 / 54-62 µs | 488 / 348 / 54-62 µs |
+| the same: analysis + writes at the entry stop | 3.3 ms + 0.1 ms in 1 write | 1.3 ms + 0.1 ms in 2 writes |
+| `Hydra2SingleEXE.exe`, `-file`: records / armed | 2 880 014 / 2 876 724 | 2 791 210 / 2 766 575 (with its MAP; 4 own `int 3` refused) |
+| the same: verdicts for all of them | 3.4 s (4.0 s with the code map) | 2.9 s (3.6 s with the code map) |
+| the same: runs = write calls / bytes covered / pages made private | 4 781 / 106.7 MB / 31 519 (123 MB) | 3 643 / 73.8 MB / 22 194 (87 MB) |
+| the same: time in the map / lookup of a hit address | 288 ms / 81 ns | 288 ms / 88 ns |
+| `RunTests.exe` (8.9 MB of code), `-synthetic 4`: 2 287 727 probes | armed in 215 ms with 142 write calls (0.09 µs a probe), taken away in 34 ms | |
+
+#### BreakpointHitCost
+
+```bat
+DevTools\Win64\Debug\BreakpointHitCost.exe -count 20000 -n 5 ^
+  DebuggerTests\TestTarget\ProfilerSample.dpr:PS_SPIN_BODY ^
+  DebuggerTests\TestTarget\Win64\Debug\ProfilerSample.exe -spin 20000
+```
+
+What a breakpoint that does not stop costs per pass: the program runs to its
+end under `TDebugSession`, alternately without a breakpoint and with one whose
+hit condition never holds (`>= 2000000000`), so every pass is a debug event, the
+host's decision, the restore and the single step that plants the byte again.
+`(median with - median without) / passes`. It uses nothing a released
+`DebuggerCore` lacks, so that it can be built against two versions of the
+engine and the two compared: that is how increment 5 showed that a session
+without probes pays nothing measurable in the breakpoint path (per pass, x64:
+140 and 141 µs before, 137 and 148 µs after; x86: 204 and 171 µs before, 176
+and 202 µs after -- the spread of one build between two rounds is larger than
+the difference between the builds). `-count` is the number of passes the
+program makes through the line (`ProfilerSample -spin <n>` makes `n`).
 
 #### LoaderTimingProbe
 

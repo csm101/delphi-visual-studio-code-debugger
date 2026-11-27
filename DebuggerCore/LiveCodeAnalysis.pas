@@ -96,6 +96,38 @@ type
     VerdictCount: Integer;
   end;
 
+  /// <summary>What a sweep for the CONFIRMED line records of a module found
+  /// (<c>TLiveCodeAnalysis.ConfirmedLineRecords</c>).</summary>
+  TConfirmedLineTally = record
+    /// <summary>Line records looked at: the addresses asked about, or every
+    /// record of the module.</summary>
+    Asked: Integer;
+    /// <summary>Confirmed as the first byte of an instruction, and returned.</summary>
+    Confirmed: Integer;
+    /// <summary>Shown to be something else (inside an instruction, a table,
+    /// data, a unit's final <c>end.</c>).</summary>
+    NotCode: Integer;
+    /// <summary>Neither confirmed nor refuted: not returned.</summary>
+    Unconfirmed: Integer;
+    /// <summary>Addresses asked about at which no line record starts.</summary>
+    NotALineRecord: Integer;
+    /// <summary>Confirmed, yet left out: a zero byte in a routine whose entry
+    /// only a MAP names.</summary>
+    ZeroByteInMapNamedRoutine: Integer;
+    /// <summary>Routines analysed.</summary>
+    RoutinesAnalysed: Integer;
+    /// <summary>Of those, not analysed completely.</summary>
+    RoutinesIncomplete: Integer;
+    /// <summary>Time the sweep took, in milliseconds, the code map included
+    /// when this call had to build it.</summary>
+    Milliseconds: Double;
+    /// <summary>x86: the module's second routine provider (a MAP, which
+    /// names the bodies of anonymous methods) was still indexing. The answer
+    /// is complete for everything else; those bodies are unconfirmed until it
+    /// is ready (<c>TLiveCodeAnalysis.SecondProviderPending</c>).</summary>
+    SecondProviderPending: Boolean;
+  end;
+
   /// <summary>Code maps and routine analyzers of a live session's modules,
   /// built on demand.</summary>
   TLiveCodeAnalysis = class
@@ -170,6 +202,37 @@ type
     /// first block.</param>
     /// <returns>False when the address is in no analysable module.</returns>
     function TryAnalyzeAddress(VA: UInt64; out Line: TRoutineLine): Boolean;
+    /// <summary>The line records of a module that the routine analysis
+    /// CONFIRMS as instruction boundaries: the only places a code patch may
+    /// go. Stricter than <c>JudgeAddress</c>, which refuses a breakpoint only
+    /// where the analysis shows something else.</summary>
+    /// <remarks>Each routine is analysed once. Nothing is remembered per
+    /// record (a module can have millions), so the sweep costs the same every
+    /// time: about a second per million records.</remarks>
+    /// <param name="ModuleBase">Load address of the module.</param>
+    /// <param name="Wanted">Module-relative addresses to judge; ignored with
+    /// <c>WholeModule</c>.</param>
+    /// <param name="WholeModule">True for every line record of the module.</param>
+    /// <param name="Confirmed">The confirmed ones, module-relative, ascending.</param>
+    /// <param name="Tally">Counts by verdict.</param>
+    /// <param name="WhyNot">When the result is False: why the module cannot be
+    /// analysed now.</param>
+    /// <returns>False when the module cannot be analysed NOW: it is not
+    /// loaded, its image is not known to be relocated, a provider is still
+    /// indexing, its debug information has no line records with routine
+    /// ranges, or the decoder is missing. Nothing is confirmed then.</returns>
+    function ConfirmedLineRecords(ModuleBase: UInt64; const Wanted: TArray<Cardinal>;
+      WholeModule: Boolean; out Confirmed: TArray<Cardinal>; out Tally: TConfirmedLineTally;
+      out WhyNot: string): Boolean;
+    /// <summary>Whether the analysis of a module was built without its second
+    /// routine provider because that one was still indexing, and still is.</summary>
+    /// <remarks>Cheap: builds nothing. Once it answers False, the next
+    /// <c>ConfirmedLineRecords</c> rebuilds the module's map with the provider
+    /// and confirms what it adds.</remarks>
+    /// <param name="ModuleBase">Load address of the module.</param>
+    /// <returns>False when nothing was built for the module, or when it was
+    /// built complete, or when the provider is ready now.</returns>
+    function SecondProviderPending(ModuleBase: UInt64): Boolean;
     /// <summary>The copies of a source line's code within the same routine.</summary>
     /// <remarks>x64 only. <c>.pdata</c> divides a routine into its body and
     /// its funclets. For the line record at <c>VA</c>, each OTHER piece of the
@@ -655,6 +718,196 @@ begin
       end;
     end;
     Result := pvPlant;
+  finally
+    FLock.Leave;
+  end;
+end;
+
+function TLiveCodeAnalysis.ConfirmedLineRecords(ModuleBase: UInt64;
+  const Wanted: TArray<Cardinal>; WholeModule: Boolean; out Confirmed: TArray<Cardinal>;
+  out Tally: TConfirmedLineTally; out WhyNot: string): Boolean;
+var
+  State: TModuleState;
+  Found: TList<Cardinal>;
+  LocalTally: TConfirmedLineTally;
+  Judged: TArray<Boolean>;
+
+  // A confirmed record is taken, with one floor: in a routine whose entry only
+  // a MAP names, a decode can run through data and "arrive" anywhere, and the
+  // rule that no statement starts with $00 still holds on its own there.
+  procedure Judge(const Line: TRoutineLine);
+  begin
+    if (Line.LineIndex >= 0) and (Line.LineIndex < Length(Judged)) then begin
+      if Judged[Line.LineIndex] then
+        Exit;
+      Judged[Line.LineIndex] := True;
+    end;
+    case Line.Verdict of
+      lvNotCode: begin
+        Inc(LocalTally.NotCode);
+        Exit;
+      end;
+      lvUnconfirmed: begin
+        Inc(LocalTally.Unconfirmed);
+        Exit;
+      end;
+    end;
+    if EntryIsUnproven(State, Line) then begin
+      var FirstByte: Byte := $FF;
+      if (FReader(State.Base + Line.Rva, @FirstByte, 1) = 1) and (FirstByte = 0) then begin
+        Inc(LocalTally.ZeroByteInMapNamedRoutine);
+        Exit;
+      end;
+    end;
+    Inc(LocalTally.Confirmed);
+    Found.Add(Line.Rva);
+  end;
+
+  procedure Count(const Analysis: TRoutineAnalysis);
+  begin
+    Inc(LocalTally.RoutinesAnalysed);
+    if not Analysis.Complete then
+      Inc(LocalTally.RoutinesIncomplete);
+  end;
+
+  procedure SweepTheModule;
+  begin
+    var Map := State.Map;
+    LocalTally.Asked := Length(Map.Lines);
+    SetLength(Judged, Length(Map.Lines));
+    for var R := 0 to High(Map.Routines) do begin
+      if Map.Routines[R].LineCount = 0 then
+        Continue;
+      var Analysis := State.Analyzer.Analyze(R);
+      Count(Analysis);
+      for var Line in Analysis.Lines do
+        Judge(Line);
+    end;
+    // x64: the bodies of anonymous methods, which only .pdata knows.
+    for var U := 0 to High(State.Analyzer.UnmappedFunctions) do begin
+      var Analysis := State.Analyzer.AnalyzeUnmapped(U);
+      Count(Analysis);
+      for var Line in Analysis.Lines do
+        Judge(Line);
+    end;
+    // What neither kind of routine holds: judged one by one (never confirmed,
+    // since nothing proves an entry there; some are shown not to be code).
+    for var I := 0 to High(Judged) do
+      if not Judged[I] then
+        Judge(State.Analyzer.AnalyzeLine(I));
+  end;
+
+  procedure JudgeTheWanted;
+  begin
+    var Map := State.Map;
+    var Sorted := Copy(Wanted);
+    TArray.Sort<Cardinal>(Sorted);
+    var LastRoutine := -1;
+    var Analysis := Default(TRoutineAnalysis);
+    for var I := 0 to High(Sorted) do begin
+      if (I > 0) and (Sorted[I] = Sorted[I - 1]) then
+        Continue;
+      var LineIndex := Map.FindLine(Sorted[I]);
+      if LineIndex < 0 then begin
+        Inc(LocalTally.NotALineRecord);
+        Continue;
+      end;
+      Inc(LocalTally.Asked);
+      var Routine := Map.Lines[LineIndex].RoutineIndex;
+      if Routine < 0 then begin
+        Judge(State.Analyzer.AnalyzeLine(LineIndex));
+        Continue;
+      end;
+      // Sorted addresses: the records of one routine come together, and the
+      // routine is analysed once for all of them.
+      if Routine <> LastRoutine then begin
+        Analysis := State.Analyzer.Analyze(Routine);
+        Count(Analysis);
+        LastRoutine := Routine;
+      end;
+      var InRoutine := Analysis.FindLine(Sorted[I]);
+      if InRoutine < 0 then begin
+        Inc(LocalTally.Unconfirmed);
+        Continue;
+      end;
+      Judge(Analysis.Lines[InRoutine]);
+    end;
+  end;
+
+begin
+  Confirmed := nil;
+  Tally  := Default(TConfirmedLineTally);
+  WhyNot := '';
+  LocalTally := Default(TConfirmedLineTally);
+  var Clock := TStopwatch.StartNew;
+  FLock.Enter;
+  try
+    State := StateFor(ModuleBase);
+    if State = nil then begin
+      if FDeferred.Contains(ModuleBase) then
+        WhyNot := 'its image is not known to be relocated yet, or a provider of its line records is still indexing'
+      else
+        WhyNot := 'no module with a readable image is loaded at that address';
+      Exit(False);
+    end;
+    if State.Base <> ModuleBase then begin
+      WhyNot := 'that address is inside a module, not the start of one';
+      Exit(False);
+    end;
+    if State.Map = nil then begin
+      WhyNot := 'its debug information cannot supply line records together with routine ranges';
+      Exit(False);
+    end;
+    if not State.Analyzer.Available then begin
+      WhyNot := 'the decoder is not available: ' + State.Analyzer.StatusText;
+      Exit(False);
+    end;
+    Found := TList<Cardinal>.Create;
+    try
+      if WholeModule then
+        SweepTheModule
+      else
+        JudgeTheWanted;
+      Found.Sort;
+      // A record is judged in the one routine that holds it, so it cannot
+      // come twice; the guard costs one pass and keeps the answer a set even
+      // if a routine and a .pdata function ever overlapped.
+      var Distinct := 0;
+      SetLength(Confirmed, Found.Count);
+      for var I := 0 to Found.Count - 1 do begin
+        if (Distinct > 0) and (Confirmed[Distinct - 1] = Found[I]) then
+          Continue;
+        Confirmed[Distinct] := Found[I];
+        Inc(Distinct);
+      end;
+      SetLength(Confirmed, Distinct);
+    finally
+      Found.Free;
+    end;
+    LocalTally.SecondProviderPending := State.SecondPending;
+    LocalTally.Milliseconds := Clock.Elapsed.TotalMilliseconds;
+    Tally := LocalTally;
+    Result := True;
+  finally
+    FLock.Leave;
+  end;
+end;
+
+function TLiveCodeAnalysis.SecondProviderPending(ModuleBase: UInt64): Boolean;
+begin
+  FLock.Enter;
+  try
+    var State := FindState(ModuleBase);
+    if (State = nil) or (State.Base <> ModuleBase) or not State.SecondPending then
+      Exit(False);
+    var Info: TLiveModuleInfo;
+    if not FLookup(ModuleBase, Info) then
+      Exit(False);
+    var Line: ILineRecordProvider;
+    var First: IRoutineRangeProvider;
+    if not TModuleCodeMap.PickProviders(Info.Providers, Line, First) then
+      Exit(False);
+    Result := IsIndexing(TModuleCodeMap.PickSecondRoutineProvider(Info.Providers, First));
   finally
     FLock.Leave;
   end;

@@ -1535,6 +1535,93 @@ the x86 one are unconfirmed, nearly all good code); the `end;` of an x64
 routine with an implicit finally, whose funclet has no line record. Both, and
 three unrelated defects met on the way, are in `KNOWN_UNKNOWNS.md`.
 
+## Verified in increment 5: the patch map and one-shot probes
+
+2026-11-27. `CodePatchMap.pas` (`TCodePatchMap`, `ICodePatchTarget`),
+`LineProbes.pas` (`TLineProbeHost`: when each module's probes go in),
+`TDebugSession.LineProbes`, fixture `ProfilerSample.dpr`, DevTools
+`LineProbeCost` and `BreakpointHitCost`. Mechanism in
+`DAP_DEBUGGER_ARCHITECTURE.md`, "Code patches"; tests in `TEST_CATALOG.md`,
+"AF". Suite: 1577 found / 1573 pass / 0 fail / 4 ignored (33 new). Every hook
+of "In the event pump" has a test, and removing the hook makes it fail. An
+independent review of the change found the path without probes unchanged in
+behaviour, and seven defects around it, all fixed with a test each except two
+that no test can build (a WOW64 address folding in the stack-walk read routine,
+and waiting for a thread to be really suspended before the writes).
+
+**The probes agree with the program.** The fixture keeps its own record of
+which marked lines ran; with every confirmed line armed, the probes' record
+equals it line for line on both bitnesses, stepping across unfired lines
+behaves as without probes, and an evaluation that runs probed lines leaves them
+unrecorded and armed.
+
+| | x64 | x86 |
+|---|---|---|
+| probes armed on the fixture, analysis + writes | 498, 3.3 ms + 0.1 ms | 488, 1.3 ms + 0.1 ms |
+| one first hit | 54-62 µs | 54-62 µs |
+| large image, from the file: records that would be armed | 2 876 724 of 2 880 014 | 2 766 575 of 2 791 210 |
+| verdicts for all of them | 3.4 s | 2.9 s |
+| arming them: time in the map, writes | 288 ms, 4 781 | 288 ms, 3 643 |
+| image pages made private by the writes | 31 519 (123 MB) | 22 194 (87 MB) |
+
+Writes go per run of up to 64 KB inside one memory region: made writable,
+written once, the old protection given back, the instruction cache flushed;
+threads suspended unless the process is already stopped. 2.3 million probes in
+a 9 MB test image were armed in 215 ms with 142 writes. The verdicts, not the
+writes, are the cost of arming a large module, and they run on the thread that
+dispatches debug events: about 3.5 s for the largest image there is.
+
+Without probes the breakpoint path was measured against the previous build:
+the difference is below the spread between two runs of one build.
+
+What was built differently from the sections above:
+
+- The main executable is armed at the first module event (the `ntdll` load),
+  earlier than "the first breakpoint event", and before any of its code runs.
+  Other modules at their load event; a fixed-base module that had to move at
+  its entry point; a module present at attach at the request.
+- A tombstone lives as long as the mapping, not the process: after an unload
+  the address may belong to another module.
+- At a clean detach the threads are held while the bytes are restored, then
+  released; the queue is drained and traps already in flight are awaited, the
+  single steps of pending re-arms included (up to 1.5 s per silent thread, 4 s
+  in all). Only a trap at an address that held a byte of ours is rewound;
+  anything else goes to the program. Draining only what was already queued, or
+  waiting only for the bytes this detach took away, were both measured to let
+  a crash through.
+- A program that rewrites a probed byte (a hooking library patching a routine
+  entry) takes the line over: the probe is given up at the first read that sees
+  the program's byte. A hooking library that copies a routine's first bytes
+  copies a probe with them; for a whole-executable request that is certain for
+  every routine it hooks. The debugger output says so when it happens.
+- Not in the plan, built: a memory write by the user over a probe gives the
+  probe up; a request that arrives while the MAP index is still being built is
+  armed partially and completed when the index is ready; two result keys for
+  one module address are refused rather than silently replaced.
+- Readers of code moved onto the overlay beyond the plan's list: the x64
+  prologue matcher, the `on`-clause block test, the adjustor-thunk read of the
+  RTTI evaluator. `StackWalk64` has its read routine; a `$CC` does not change
+  dbghelp's answer, so this is for the later jump and call forms. With a page
+  cache it is also faster: a 35-frame x64 walk went from 1.1 ms to 0.1 ms.
+- The re-arm single step of a breakpoint no longer drives a step in flight on
+  another thread: reproduced (the step landed on the logging thread), fixed,
+  kept as a test. It was a defect of the released engine.
+- Two more defects of the released engine, fixed: a detach (or an end of the
+  session) at a pause stop continued the held event on the wrong thread, so no
+  further event arrived and queued breakpoint traps reached the detached
+  program one byte into an instruction; and a thread whose breakpoint re-arm
+  single step was still in flight at a detach received that step with no
+  debugger attached. A third: a module unloaded by code the debugger's own call
+  ran (an evaluation) was never reported to the session, which kept its old
+  module record; when the module came back at another address the session had
+  two. The unload is now delivered at the next turn of the main loop. Under
+  parallel load a package does come back at another address, which is how this
+  surfaced.
+
+Limits: a line run by another thread while the debugger's own call is running
+on a thread that suspended that line's probe is not recorded; lines that run
+before a module's debug information is ready are not recorded.
+
 ## Assumptions to measure
 
 After increment 0: 1, 2, 8, 15, 17 and 18 are settled as stated under

@@ -119,9 +119,18 @@ type
     HasGetter:        Boolean; // False when GetProc was nil
   end;
 
+  /// <summary>Reads CODE of the target with the program's own bytes where the
+  /// debugger has written a breakpoint or a code patch.</summary>
+  /// <param name="VA">First address.</param>
+  /// <param name="Buf">Destination.</param>
+  /// <param name="Size">Bytes wanted.</param>
+  /// <returns>True when every byte was read.</returns>
+  TRttiCodeReader = reference to function(VA: UInt64; Buf: Pointer; Size: NativeUInt): Boolean;
+
   TDelphiRtti = class
   private
     FProcess: THandle;
+    FCodeReader: TRttiCodeReader;
     // Layout of the DEBUGGEE's address space. This class reads through a raw
     // process handle rather than IDebugTarget, so it cannot ask the target and
     // must be told.
@@ -175,6 +184,11 @@ type
     // behaviour; a 32-bit target must pass its own.
     constructor Create(AProcess: THandle); overload;
     constructor Create(AProcess: THandle; const ALayout: TTargetLayout); overload;
+    /// <summary>How the one code read of this class (the adjustor thunk of an
+    /// interface method) reaches the target. Unset, it reads the process raw,
+    /// and a breakpoint or a code patch on the thunk makes the thunk
+    /// unrecognisable.</summary>
+    property CodeReader: TRttiCodeReader read FCodeReader write FCodeReader;
 
     // Element count of a dynamic array, from the header below its data
     // pointer. Bitness-dependent in both offset and width, so it cannot go
@@ -741,10 +755,17 @@ begin
   var M0: UInt64;
   if not ReadTargetPointer(Imt, M0) or (M0 < 65536) then
     Exit;
-  var Read: SIZE_T;
-  if not ReadProcessMemory(FProcess, Pointer(M0), @Code[0], SizeOf(Code), Read) or
-     (Read < SizeOf(Code)) then
-    Exit;
+  // CODE, so through the engine when there is one: it shows the program's
+  // bytes under a breakpoint or a code patch.
+  if Assigned(FCodeReader) then begin
+    if not FCodeReader(M0, @Code[0], SizeOf(Code)) then
+      Exit;
+  end else begin
+    var Read: SIZE_T;
+    if not ReadProcessMemory(FProcess, Pointer(M0), @Code[0], SizeOf(Code), Read) or
+       (Read < SizeOf(Code)) then
+      Exit;
+  end;
 
   // Gated on the TARGET's pointer size rather than tried in turn: an x86
   // encoding is a valid (different) x64 instruction and vice versa, so

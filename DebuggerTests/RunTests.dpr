@@ -76,7 +76,10 @@ uses
   RoutineAnalysisTests in 'RoutineAnalysisTests.pas',
   LiveCodeAnalysis in '..\DebuggerCore\LiveCodeAnalysis.pas',
   BreakpointPlacementTests in 'BreakpointPlacementTests.pas',
-  FixtureQuietTests in 'FixtureQuietTests.pas';
+  FixtureQuietTests in 'FixtureQuietTests.pas',
+  CodePatchMap    in '..\DebuggerCore\CodePatchMap.pas',
+  LineProbes      in '..\DebuggerCore\LineProbes.pas',
+  CodePatchTests  in 'CodePatchTests.pas';
 
 const
   // Tests that cannot run while another RunTests worker is executing, because

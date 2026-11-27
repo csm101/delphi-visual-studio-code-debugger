@@ -1728,6 +1728,303 @@ that no two decoded instructions overlap and that confirmed records and
 boundaries are the same set, and its `-without` option switches one source of
 proven places off to show what it buys.
 
+## Code patches
+
+`docs/PROFILER_COVERAGE_PLAN.md`, increment 5. Everything the engine writes into
+the target's code that is not a breakpoint. One form exists: the **one-shot line
+probe**, a `$CC` on the first byte of a line record that is taken away at its
+first hit and recorded by (module, RVA). It says that a line ran, not how often.
+
+| unit | what | who uses it |
+|---|---|---|
+| `CodePatchMap.pas` | `TCodePatchMap` (the patched bytes of one process) and `ICodePatchTarget` (the engine's entry points) | `TWinDebugger` owns the map and implements the interface; callers reach it with `Supports`, like `IBreakpointPlacement` |
+| `LineProbes.pas` | `TLineProbeHost`: standing requests by module NAME, armed on the records the routine analysis confirms, at the right moment of each mapping | `TDebugSession.LineProbes` |
+| `LiveCodeAnalysis.pas` | `ConfirmedLineRecords` (the records a probe may take), `SecondProviderPending` | the host |
+
+Nothing above the session uses it yet: no store, no MCP tool, no report. A
+request names a module and a set of module-relative addresses, or "every line
+record"; the results are a sorted array of module-relative addresses, readable
+while the process runs and after it has ended.
+
+### A hit
+
+The first thread that executes the `$CC` traps. The hook at the top of the
+breakpoint case of `HandleException` -- ahead of the breakpoint list and of the
+log line there -- finds the address armed, records the hit, compares the byte
+(still `$CC`?) and writes the program's byte back, puts the thread back on the
+instruction and continues it. No stop is reported, nothing is single-stepped,
+and no stepping state is touched: not `FStoppedTid`, not `FStepMode`, not a
+pending re-arm. The thread's trap flag survives the breakpoint trap -- the
+processor saves `EFLAGS` before it clears `TF` for the handler, and Windows
+hands that saved value back -- so a thread that was being single-stepped gets
+its single step after the real instruction, one debug event later than
+without the probe. Measured on both bitnesses: clearing `TF` in the hook makes
+`Steps_AcrossLinesThatHaveNotFired_LandWhereTheyLandWithoutProbes` run free
+after the second step.
+
+### The map
+
+Per mapped module a table of entries sorted by RVA: `Rva`, `State`, `Kind`,
+`Len`, `Saved` (eight bytes). The states are armed, fired, suspended (for a
+synthetic call), withdrawn and lost (the byte was no longer ours when it was to
+be restored). Hits of a mapping that went are kept by result key, so a module
+unloaded and loaded again is patched afresh -- minus what already ran, which a
+one-shot has nothing more to say about -- and keeps what it had recorded.
+
+Arming sorts the addresses and writes them in **runs**: consecutive addresses
+less than a page apart, inside one `VirtualQueryEx` region, at most 64 KB. A run
+is one read and at most one write: the probes and the program's bytes between
+them, rewritten unchanged (a planted breakpoint's `$CC` among them is read and
+written back as it is). The write makes the run's pages execute-read-write,
+writes, restores the protection `VirtualProtectEx` returned -- exact, since one
+region has one protection -- and flushes the instruction cache. Every image page
+written becomes private to the process. While the process is not stopped its
+threads are suspended for the writes -- and each `SuspendThread` is followed by
+a `GetThreadContext`, because `SuspendThread` returns before the thread has
+stopped (`HoldEveryThread`); at a stop or inside a debug event it is frozen
+anyway. Taking probes away works the same way, comparing each byte before it
+is given back. A run write that fails can still have written a prefix
+(`WriteProcessMemory` stops at the first page it cannot write): the run is read
+again, and every `$CC` that arrived is tracked as an armed probe
+(`Map_AWriteThatFailsPartWay_TracksTheBytesItWrote`).
+
+A module's table stays once it has been armed, even with nothing left armed in
+it: it is what says that this mapping has been dealt with
+(`ICodePatchTarget.ModuleIsArmed`). It goes at the module's unload.
+
+**An unload inside a synthetic call.** The pump of `RunMethodCall` sees the
+module events of the call (an evaluation that frees a library, a getter that
+unloads a package). It drops the mapping's code patches at once and keeps the
+base; at the next turn of the main loop, before its commands and its next event,
+`DeliverUnloadsSeenInCalls` does everything else an unload does
+(`ForgetUnloadedModule`, shared with `HandleUnloadDll`): the engine's module
+tables, the breakpoints in the range, and the session's `HandleDllUnloaded`
+(module record, analysis, line-probe requests). A load at the same base inside
+the same call cancels the pending unload. Before this the session never heard
+of such an unload: it kept the first mapping's module record, a reload got a
+second one, and a lookup by name found the stale one -- an arming attempt at an
+address nothing was mapped at ("no module is mapped at ..."). That only shows
+when the reload lands at another address, and where an image lands depends on
+what else on the machine has it mapped: the test passed alone and failed under
+the parallel suite. `ProfilerSample -pkgeval -pkgmove` takes the first address
+before the reload and makes it deterministic
+(`Package_UnloadedByAnEvaluationThenReloaded_IsArmedAgain`). The loads a
+synthetic call makes are still not reported to the session (existing limit).
+`TLineProbeHost` also re-arms a request whose mapping the engine no longer
+holds (`ModuleIsArmed`); with the unload delivered, that is a guard.
+
+**Bytes the program writes over a probe.** Only the debugger's own writes tell
+the map (`WriteMemoryAt`, `WriteMemoryPartial`). A program that patches its own
+code -- a hooking library (DDetours, madExcept, EurekaLog) writing a jump over a
+routine's entry, an unpacker -- replaces a probe's `$CC` without telling anyone.
+Two places notice: the overlay sees a byte that is not `$CC` under an armed
+entry, leaves it as it is (it is the program's) and gives the entry up; and
+`PlantInt3` adopts a probe's byte only while the `$CC` is really there
+(`ProgramRewritesAProbedByte_ReadersShowItsByte_AndABreakpointPlantedThereFires`).
+
+Shaped for the forms still to come: an entry has a length, and the overlay,
+the restore and the purge work on spans. What a five-byte patch adds is storage
+for more saved bytes and a table that maps a trampoline address back to its
+entry.
+
+### One byte, two owners
+
+A breakpoint and a probe can sit on one address. The rule both sides keep:
+
+    the byte is $CC  <=>  a breakpoint record is planted there OR a probe is armed there
+
+| operation | with a probe armed on the address |
+|---|---|
+| `PlantInt3` | saves the PROGRAM's byte, which the map holds (`HoldsInt3At`), and writes nothing -- while the probe's `$CC` is really there; a byte the program wrote over it gives the probe up and the breakpoint plants as anywhere else |
+| `SuspendInt3At` (transient: the thread runs the instruction once) | leaves the `$CC`: the thread traps once more, for the probe, which records the line and gives the byte back itself |
+| `DeleteBreakpointRecord` | leaves the `$CC` to the probe |
+| arming a probe where a breakpoint is planted | takes the program's byte from the breakpoint and writes nothing |
+| taking probes away | leaves the bytes the breakpoints hold |
+| a hit | both owners: the hook records the probe (no restore while a breakpoint is planted) and hands the event on; the breakpoint path does what it always did |
+
+### The hooks
+
+| hook | test | negative control |
+|---|---|---|
+| ahead of the breakpoint list in `HandleException` | `Probes_AgreeWithTheProgramsOwnRecord_LineForLine` | removed: both bitnesses die on the first probe ($80000003 / $4000001F) |
+| ahead of the breakpoint handling in `RunMethodCall`'s pump: a probe the CALLING thread meets is suspended, not recorded, and armed again when the call ends; another thread's hit is recorded | `Evaluation_ThatRunsProbedLines_LeavesThemUnrecordedAndArmed` | hook removed: the call fails with an access violation; recorded instead of suspended: four hits recorded and four probes lost; not re-armed: four probes lost and the program's own call unrecorded |
+| tombstones: an address once patched is remembered for the life of its mapping, and a breakpoint trap there whose byte is no longer `$CC` is rewound and continued (a second thread at a one-shot, a probe taken away while its trap was queued) | `SeveralThreadsThroughLinesNeverExecuted_EveryThreadRunsEveryLineOnce`, `TrapQueuedBeforeTheProbesAreTakenAway_IsRewoundNotHandedToTheProgram` | removed: x64 dies with $C0000005 / exit code 1; x86 survives (see `TRAPS.md`), and only the late-trap counter shows it |
+| compare before restore, in a hit and in taking probes away | `Map_RestoreComparesFirst_AByteTheProgramChangedIsLeftAlone` | each compare removed: the program's byte is overwritten |
+| a record whose own byte is `$CC` (the program's `int 3`) is refused | `ProgramsOwnInt3_IsNeverArmed_AndIsAnnouncedOnlyWhileProbesAreArmed`, `Map_TheProgramsOwnBreakpointInstruction_IsRefused` | removed: armed, and the program's `int 3` recorded as a hit (the byte test of the late-trap path keeps it from looping) |
+| module unload drops the mapping's entries without writing; in the main loop and in the synthetic call's pump | `Package_LoadedUnloadedLoadedAgain_IsArmedAtEachLoadAndKeepsItsHits`, `Map_UnloadDropsWithoutWriting_KeepsTheHits_AndDoesNotArmThemAgain` | removed: the second mapping is not armed and the map still lists the first |
+| clean detach: every probe restored in the block of `Terminate` that restores breakpoints, then the queued breakpoint events dealt with | `AttachArmDetach_RefusedWithoutAcceptance_ThenTheProgramRunsOnThroughArmedLines`, `Detach_WithTrapsQueued_PutsEveryThreadBackOnItsInstruction` | no restore: exit code 1 on both bitnesses; no drain: 3 runs of 3 fail; draining only what is already queued: 5 runs of 5 fail on at least one bitness |
+| the held event released under the EVENT thread's id (`ReleasePendingEvent`), in the detach and in the kill: at a pause stop that is the injected break-in thread, not the thread reported | `Detach_AtAPauseStop_ReleasesTheHeldEvent_AndTheQueuedTrapsAreRewound`, `Terminate_AtAPauseStop_EndsTheProcessWithoutWaiting` | released under the reported thread: the detached program dies on a queued trap (3 runs of 3, 4 to 6 attempts of 6); the kill waits out its 3 s drain (3 000 / 3 047 ms) |
+| the drain waits for the single step of a thread that owes a re-arm and is past its instruction | `Detach_AtAPauseStop_...` (four threads round a logpoint) | not awaited: 7 attempts of 24 crash |
+| the drain rewinds only a trap on an address that held a byte of OURS; any other breakpoint exception is the program's | `Detach_WithASoftwareBreakpointExceptionQueued_HandsItToTheProgram` | rewinding any byte that is not `$CC`: the program's `RaiseException(EXCEPTION_BREAKPOINT)` is swallowed (exit code 3), 3 runs of 3, both bitnesses |
+| a thread that owes a re-arm and traps on a byte of ours that went back since (a probe written under it, given back by another thread's hit or taken away while its trap was queued) is put back on the instruction, its re-arm kept | `ParkedOnAProbeAnotherThreadGaveBack_TheThreadRunsTheInstructionOnce` | taken for the program's own `int 3`: x64 resumes one byte in and dies (exit code 1); x86 runs on in this fixture, and only the late-trap counter shows it |
+| attach with `killOnDetach` false refuses arming unless the request accepts the risk | `AttachArmDetach_...` | removed: arming accepted |
+| the notice for a breakpoint instruction nobody planted, while probes are armed | `ProgramsOwnInt3_...` | removed: no notice |
+| a memory write over a probe makes the byte the program's (`WriteMemoryAt`, `WriteMemoryPartial`) | `MemoryWrittenOverAProbe_IsTheProgramsAndABreakpointPlantedThereFires` | removed: a breakpoint planted there later adopts a `$CC` that is not in the target and never fires |
+| `PlantInt3`, `SuspendInt3At`, `DeleteBreakpointRecord`, arming and disarming under a breakpoint (table above) | `ProbeThenBreakpoint_...`, `BreakpointThenProbe_...`, `ResumedFromALineWithBreakpointAndProbe_...`, `BreakpointRemovedBeforeTheProbeFires_...`, `ProbeTakenAwayUnderABreakpoint_...` | each removed: a stray `$CC`, a lost hit, or a breakpoint that stops firing |
+
+**The detach.** After every byte is back (written with the threads held when
+the process runs), a thread that executed one of ours just before still owes a
+breakpoint event: queued, or still being raised in the kernel. So does a thread
+that owes a breakpoint its re-arm and has run the instruction: its single step.
+`DebugActiveProcessStop` completes such an event as "not handled": the thread,
+one byte into an instruction whose first byte is the program's again, takes a
+breakpoint exception nobody planted, or a single step nobody asked for. So the
+engine (`ThreadsBehindARestoredByte`) finds every thread whose program counter
+is one past an address that held a byte of ours, and every thread that owes a
+re-arm and stands past its instruction, without keeping it suspended (a thread
+suspended while it raises would queue its event after the detach, to nobody).
+The held event is released -- under the event thread's id -- and
+`DrainQueuedEventsBeforeDetach` reads events until each of those threads has
+delivered its event and the queue is empty, for at most 1.5 s per silent thread
+(one that ran a one-byte instruction there) and 4 s in all. A breakpoint trap is
+rewound only at an address that held a byte of ours and holds no `$CC` now;
+every other breakpoint exception (a `CD 03`, a `RaiseException`) is the
+program's. Queued single steps are completed with `DBG_CONTINUE` and their trap
+flag cleared, every other exception is handed to the program as the detach
+would have. It runs on every clean detach, probes or not; with nothing in
+flight it reads an empty queue.
+
+"Held a byte of ours" is any address that did, not only the bytes the detach
+itself takes away. A byte given back just before the stop the detach starts
+from -- the breakpoint a thread was continued over, a probe another thread
+fired -- can have a trap in flight on a thread the stop froze half-way: with the
+narrower set, a detach at a pause stop with four threads round a logpoint
+crashed the program in 1 attempt of 24. The price is the grace period for a
+thread that happens to stand right after a one-byte instruction that once
+carried a byte of ours (a `push rbp` whose probe fired); never met in the
+suite.
+
+**The foreign `int 3`.** A breakpoint instruction at an address the debugger did
+not plant is handed to the program, as always. While probes are armed the
+debugger output also says so, once per address (and per mapping; eight at most):
+a program that copies its own code (a hooking library relocating a routine's
+first bytes) copies a probe's `$CC` with it, to an address no table knows. A
+breakpoint instruction in a module nothing was armed in (the loader's, a
+`DebugBreak`) is not announced.
+
+### Readers of code
+
+Every reader of code sees the program's bytes, never a probe or a breakpoint:
+
+| reader | how |
+|---|---|
+| `ReadCodeMemoryAt` (the disassembler, the routine analysis, DAP `disassemble`, the session's code reads) | overlay of planted breakpoints and armed probes (`OverlayProgramBytes`) |
+| `ReadProcessMemoryAt` (every value reader, DAP `readMemory`) | overlay of armed probes, one comparison while none is; a planted breakpoint is still visible there, as before |
+| x86 call-site proof (`CallSiteVerdictAt`) and the recovery pass of the walker | `ReadCodeExact` |
+| x86 prologue probe (`TWin32Debugger` prologue decode) | `ReadCodeExact` |
+| x86 handler-stub test of a step at an exception stop (`PlanExceptionStep`) | `ReadCodeExact` |
+| x64 prologue matcher (strategy 2 of the frame-size probe) | `ReadCodeMemoryAt` |
+| import-thunk test of a step over (`FF 25`) | `ReadCodeExact` |
+| the `mov rax,[rip+..]` test of an x64 `on` clause block | `ReadCodeExact` |
+| the adjustor thunk of an interface method (`TDelphiRtti`) | the session sets `TDelphiRtti.CodeReader` to `ReadCodeMemoryAt` |
+| `StackWalk64` | a read routine instead of `nil` (below) |
+
+Not readers of code, and left raw: the PE header and export reads, the exception
+class and message, the debug string, unwind data, stacks, TEBs, the engine's own
+allocations. `ReadByte` stays raw on purpose: it answers "is a `$CC` physically
+there".
+
+**`StackWalk64` gets a read routine.** dbghelp reads the code at every return
+address to test for an epilogue, and must see the program there. For a `$CC`
+it makes no difference -- a `$CC` is not an epilogue, and the unwind codes it
+falls back to are right (increment 1) -- so no test can fail on it today; it is
+in place for the jump and call forms. It also serves reads from whole pages
+cached for one walk, with the overlay applied, which is what `TRAPS.md` asked
+for: `ProbeCostProbe -walk` on a 35-frame x64 stack, `WalkRawFrames` took 1 121
+and 1 130 µs per walk before and 97 and 102 µs after, same frames. For a
+32-bit target an address with its upper 32 bits all set and bit 31 set is
+folded back to 32 bits before it is read: dbghelp's i386 walker carries
+addresses sign-extended (`GetStackFrames` met `$FFFFFFFFB5C34A23` for
+`$B5C34A23`), and such a read would otherwise fail for every address from
+`$80000000` up of a large-address-aware target. Any other address above 4 GB
+fails as it should. Not tested: no fixture is large-address-aware with code or
+stack above 2 GB, and whether dbghelp hands sign-extended addresses to the read
+routine (rather than only returning them as frame PCs) was not measured.
+
+### When a module's probes go in
+
+A `$CC` could be written the moment a module is mapped, but the analysis that
+confirms a record reads absolute addresses out of the code, and those are only
+right once the module is relocated. `TLineProbeHost` arms a request:
+
+| module | moment |
+|---|---|
+| the main executable, asked for before the process exists | at the first module event of the process (the load of `ntdll`), when the executable is mapped and relocated and none of its code has run. The plan names the first breakpoint event; both precede the executable's first instruction, and this one is the earlier |
+| the main executable, or any loaded module, asked for at a stop | at the request |
+| a DLL or package that loads later | at its load event, before its entry point (its initialization) runs |
+| a fixed-base image the loader had to move | at the one-shot on its entry point (`ModuleReachedItsEntryPoint` -> `HandleModuleRelocated`): relocated, and none of its code has run |
+| a module present at attach | at the request; a request made before the attach is armed at the synthesized load events (the program's threads do not run between them) |
+| a module loaded while probes are armed elsewhere | as any module that loads later; an already armed module is not touched |
+| a module whose debug information was not ready (a provider still indexing) | at a paced retry from `Pump` (every 250 ms, running or stopped); lines that ran before it are not recorded |
+
+The symbols of a module that has a request are loaded synchronously at its load
+event, as for a module that owns a pending breakpoint. On x86 a MAP is the
+second routine provider (it names the bodies of anonymous methods); armed while
+it is still indexing, a request is armed for everything else, says it is
+partial, and the retry arms the rest once the index is ready -- checking that
+cheaply first, without analysing anything while it is not. A request the engine
+refuses as a whole (`killOnDetach`, no process) is not retried at module events.
+
+### Stepping, and the debugger's own calls
+
+| situation | what happens |
+|---|---|
+| step into, step over within a line, an instruction step (trap flag) reaching an unfired probe on the stepped thread | the probe's trap is consumed; the trap flag survives it; the single step arrives after the real instruction, exactly where it would have |
+| a step lands on a line start whose probe has not fired | it lands there (the single step stops before the instruction); the probe fires when the thread resumes, so the line is recorded when it runs |
+| step over / out running a callee to a one-shot | every probe the callee meets is consumed; a step one-shot on a probed address shares the byte (table above) |
+| another thread's probe hit during a step (isolation released or off) | consumed; no step state is read or written |
+| a thread that owes a breakpoint its re-arm meets the probe on the same address | the probe fires and gives the byte back; the thread runs the instruction with its trap flag (set again by the hook, belt and braces) and the re-arm plants the breakpoint |
+| `StepOffOnly` (a step one-shot hit by another thread) on a probed address | the probe fires (no restore while the one-shot is planted); the step-off proceeds as before |
+| a step at an exception stop on x86 whose handler stub carries a probe | the planner reads the stub as code (`jmp rel32`), and the dispatch executes the stub's `$CC`: consumed, the dispatch goes on (`StepAtAnExceptionStop_WithAProbeOnTheHandlerStub_LandsInTheHandler`; with the stub read raw the step is refused) |
+| the debugger's synthetic call (an evaluation, a condition) runs a probed line | suspended (byte back, not recorded) and armed again when the call ends; meanwhile another thread can run that line unrecorded |
+
+The single step that re-arms a persistent breakpoint used to drive the step
+machinery whatever thread it came from (`KNOWN_UNKNOWNS.md`, "Read from the
+code, not reproduced"). Reproduced: a logpoint on a line a second thread runs
+while the main thread steps over a call that waits for it
+(`StepOver_WhileAnotherThreadRunsThroughALogpoint_LandsOnItsOwnThread`, isolation
+released after 200 ms and none, both bitnesses): without a guard the step
+landed on the other thread, at the logpoint's line, 3 runs of 3. The re-arm
+branch of the single-step case now continues a thread that is not the
+stepper's (`StepTargetHitByOtherThread`) without touching the step.
+
+### Cost
+
+Measured with `DevTools\LineProbeCost` and `DevTools\BreakpointHitCost`
+(numbers in `DevTools\README.md`): one first hit 54 to 62 µs on both bitnesses;
+deciding which of the 2.88 million records of a 590 MB x64 image take a probe,
+3.4 s (4.0 s with the code map), on the thread that dispatches debug events;
+arming them, 288 ms in the map, 4 781 writes covering 107 MB, 123 MB of pages
+made private; 2.29 million probes armed in a live process in 215 ms with 142
+writes. Without probes the engine pays one integer comparison per breakpoint
+event, a call that returns at once in `PlantInt3` / `SuspendInt3At` /
+`DeleteBreakpointRecord`, and one comparison per `ReadProcessMemoryAt`; a
+breakpoint that does not stop cost the same per pass before and after the
+change, within the noise between two rounds of one build.
+
+### Limits
+
+- A probe goes only where the routine analysis CONFIRMS the record; the
+  interface itself trusts its caller (the tests arm handler stubs and routine
+  entries through it directly).
+- Lines another thread runs while a synthetic call has their probes suspended
+  are not recorded.
+- Hits are counted by address; a line is recorded once (stage 1 of coverage).
+- Arming a whole large module costs seconds of analysis at its load event.
+- **A hooking library inside the program copies probes, for certain.** A
+  library that relocates the first bytes of a routine before it writes its
+  jump (DDetours, madExcept, EurekaLog) copies whatever is there. A request for
+  a whole executable is armed at the first module event, before any of the
+  program's code runs, so every routine such a library hooks later carries a
+  probe on its entry: the copied `$CC` lands in the library's trampoline, at an
+  address no table knows, and the first call through the hook raises a
+  breakpoint exception that is handed to the program (as any `int 3` the
+  debugger did not plant), which normally ends it. Not occasionally -- for
+  every hooked routine whose entry line had not run before the hook was
+  installed. The notice about a foreign breakpoint
+  instruction says what happened; the remedy is to leave such routines (or the
+  units that hook them) out of the request.
+
 ## Main loop
 
 `TDapServer.Run`:
@@ -1954,7 +2251,10 @@ Three defects of 0.9.3 came from one `RemoveInt3(record)` doing both jobs:
   else showed.)
 
 The transient removal is never suppressed because a sibling shares the byte:
-the thread is parked on it and must run the real instruction next.
+the thread is parked on it and must run the real instruction next. A line
+probe armed on the address is the one exception: its `$CC` stays, the thread
+traps once more for the probe, and the probe gives the byte back ("Code
+patches", "One byte, two owners").
 
 Which record takes a hit (`FindBreakpointByVA`): with one record at an address
 — every case but the ones above — that record. Where a one-shot and a
@@ -2021,7 +2321,7 @@ What is built, and when (`LiveCodeAnalysis.pas`):
 - Per module, on the first question about an address in it: the code map (with
   a MAP as second routine provider on a 32-bit module, see "Code map") and a
   `TRoutineAnalyzer` that reads through `IDebugTarget.ReadCodeMemoryAt`, so it
-  sees the program's bytes under planted breakpoints.
+  sees the program's bytes under planted breakpoints and armed line probes.
 - Per address, on the first question about it: the analysis of the ONE routine
   that holds it. The verdict is kept, so re-arming a breakpoint after a hit is
   a dictionary lookup and never an analysis.

@@ -432,7 +432,10 @@ begin
   Result := CallSiteEndsAt(
     function(At: UInt64; Buf: Pointer; Size: Integer): Boolean
     begin
-      Result := ReadProcessMemoryAt(At, Buf, Size);
+      // Read as CODE: the program's bytes under a breakpoint or a probe. A
+      // breakpoint planted on a `call` otherwise made its return address
+      // fail the very test that proves it.
+      Result := ReadCodeExact(At, Buf, NativeUInt(Size));
     end,
     StartVA, VA);
 end;
@@ -525,7 +528,7 @@ const
     var ReadCode: TReadCodeProc :=
       function(At: UInt64; Buf: Pointer; Size: Integer): Boolean
       begin
-        Result := ReadProcessMemoryAt(At, Buf, Size);
+        Result := ReadCodeExact(At, Buf, NativeUInt(Size));   // code: the program's bytes
       end;
 
     var I := 1;
@@ -1029,7 +1032,9 @@ begin
     end;
 
     var Stub: array[0..4] of Byte;
-    if not ReadProcessMemoryAt(HandlerVA, @Stub[0], SizeOf(Stub)) then begin
+    // Read as CODE: a breakpoint or a probe on the stub's first byte must not
+    // turn the `jmp rel32` this test looks for into a refusal.
+    if not ReadCodeExact(HandlerVA, @Stub[0], SizeOf(Stub)) then begin
       RefusalReason := Format('a step at an exception stop runs to the handler that ' +
         'receives it. The first frame that can receive this one -- %s -- has an ' +
         'fs:[0] handler at $%x whose bytes could not be read.',
@@ -1151,7 +1156,9 @@ begin
   ExtraPushBytes := 0;
   Recognised := False;
   FillChar(Bytes, SizeOf(Bytes), 0);
-  if not ReadProcessMemoryAt(EntryVA, @Bytes, SizeOf(Bytes)) then
+  // Read as CODE: the entry of a routine is the start of a line, where a
+  // breakpoint or a probe sits.
+  if not ReadCodeExact(EntryVA, @Bytes, SizeOf(Bytes)) then
     Exit;
   var Avail := SizeOf(Bytes);
   if Bytes[0] <> $55 then           // push ebp

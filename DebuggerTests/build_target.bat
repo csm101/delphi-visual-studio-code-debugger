@@ -107,6 +107,17 @@ dcc64 -$O- -V -VN -VR -GD -E.\Win64\Debug -NU.\Win64\Debug BreakpointSampleLib.d
 set BPLIB64_ERR=%errorlevel%
 dcc32 -$O- -V -VN -VR -GD -E.\Win32\Debug -NU.\Win32\Debug BreakpointSampleLib.dpr 2>&1
 set BPLIB32_ERR=%errorlevel%
+rem Line-probe fixture: a program that keeps its OWN record of which marked
+rem lines ran, so that what the one-shot probes recorded can be compared with it
+rem line for line; a long run of never-executed lines for two threads to meet
+rem on; the program's own `int 3`; and the scenarios that load TestPackage.bpl
+rem twice and BreakpointSampleLib.dll off its base (both are beside it: built by
+rem build_package.bat and just above). Both bitnesses. Separate target, same
+rem reason as above.
+dcc64 -$O- -V -VN -VR -GD -E.\Win64\Debug -NU.\Win64\Debug ProfilerSample.dpr 2>&1
+set PROFSAMPLE64_ERR=%errorlevel%
+dcc32 -$O- -V -VN -VR -GD -E.\Win32\Debug -NU.\Win32\Debug ProfilerSample.dpr 2>&1
+set PROFSAMPLE32_ERR=%errorlevel%
 rem Stdio fixtures: a CONSOLE-subsystem debuggee and its GUI twin, both writing
 rem through their standard handles (StdioSampleCore.pas). The console one is the
 rem only console fixture, on purpose: a console child receives its parent's
@@ -180,6 +191,8 @@ if not "%BPSAMPLE64_ERR%"=="0" exit /b %BPSAMPLE64_ERR%
 if not "%BPSAMPLE32_ERR%"=="0" exit /b %BPSAMPLE32_ERR%
 if not "%BPLIB64_ERR%"=="0" exit /b %BPLIB64_ERR%
 if not "%BPLIB32_ERR%"=="0" exit /b %BPLIB32_ERR%
+if not "%PROFSAMPLE64_ERR%"=="0" exit /b %PROFSAMPLE64_ERR%
+if not "%PROFSAMPLE32_ERR%"=="0" exit /b %PROFSAMPLE32_ERR%
 if not "%STDIOCON_ERR%"=="0" exit /b %STDIOCON_ERR%
 if not "%STDIOGUI_ERR%"=="0" exit /b %STDIOGUI_ERR%
 if not "%QUIETGUI64_ERR%"=="0" exit /b %QUIETGUI64_ERR%

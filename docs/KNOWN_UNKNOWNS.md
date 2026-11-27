@@ -1921,19 +1921,36 @@ that has nothing to do with what it tests.
   for ever.** In a session that now means the module is never analysed (it
   used to mean a 15 s wait).
 
-Read from the code, not reproduced: the single step that re-arms a persistent
-breakpoint drives the step machinery whatever thread it comes from. The
-single-step case of `HandleException`, after `RearmInt3At`, goes on to
-`HandleSmOverStep(Ev.dwThreadId, ...)` or sets the trap flag for `smInto`
-without comparing the thread with `FStepTid`. A logpoint or a false-condition
-breakpoint hit by thread B while thread A is in a step-over whose isolation
-was released (a call running to its return) would then have B's stack pointer
-compared with A's and B treated as the stepper. The gate was the same before
-the re-arm became per thread. A test first, then the one-line guard.
+## Five more defects met while building line probes — OPEN
+
+Found 2026-11-27 in the profiler plan's increment 5; none is caused by it, none
+is fixed.
+
+- **A memory write over a planted breakpoint leaves its record stale.**
+  `WriteMemoryAt` / `WriteMemoryPartial` now tell the patch map that a probe
+  was overwritten; nothing tells the breakpoint list. The record keeps the
+  `OrigByte` it saved and restores it later over what the user wrote.
+- **`HandleUnloadDll` writes into memory that is already unmapped.** The
+  write fails silently, so nothing visible happens today; it is a write that
+  should not be attempted.
+- **The `{$Q-} ... {$Q+}` pairs in `WinDebuggerBase.pas` switch overflow
+  checking ON for the rest of the unit** in a build that compiles with it off.
+  The pattern should save and restore the state (`{$IFOPT Q+}`).
+- **A detach at a first-chance exception stop swallows the exception.**
+  `Terminate` continues the held event with `DBG_CONTINUE` instead of
+  `FPendingContinueStatus`, so a Delphi `raise` the program was about to
+  handle is dismissed and the program carries on after the `raise` as if it
+  had not happened. Read from the code; no test yet.
+- **A module LOADED by code the debugger's own call runs (an evaluation) is
+  not reported to the session.** Its unload now is (increment 5); its load is
+  not, so its symbols, breakpoints and probes wait for something else to make
+  the session look. Not measured what a user sees.
+
 ## Profiler and code coverage — what the plan still assumes
 
-`PROFILER_COVERAGE_PLAN.md` is built up to its increment 4 (code map, scope,
-routine analysis); nothing that patches code for a collection exists yet. Its
+`PROFILER_COVERAGE_PLAN.md` is built up to its increment 5 (code map, scope,
+routine analysis, the patch map with one-shot line probes); the probes are not
+yet reachable from MCP and no results store exists. Its
 table "Assumptions to measure" is the full list, each with the increment that
 settles it. The numbers of each finished increment are in the plan under
 "Verified in increment N", and the format facts in `TD32_FORMAT_NOTES.md` and

@@ -18,7 +18,8 @@ uses
   TargetLayout, DelphiValueReaders,
   Disassembler,        // IDisassembler: exact instruction lengths for stepping
   ZydisDisassembler,   // the only backend today; reached ONLY through the seam
-  X86Decode;   // TCallSiteAnswer: the call-site verdict seam (x86 supplies it)
+  X86Decode,   // TCallSiteAnswer: the call-site verdict seam (x86 supplies it)
+  CodePatchMap;        // TCodePatchMap, ICodePatchTarget: what is written into code besides breakpoints
 
 type
   // One unwound frame before symbolication: where the code is and where its
@@ -103,7 +104,21 @@ type
     StepOffOnly: Boolean;
   end;
 
-  TWinDebugger = class(TInterfacedObject, IDebugTarget, IBreakpointPlacement)
+  /// <summary>One page of the target, read once for the duration of a stack
+  /// walk (TWinDebugger.StackWalkRead), with the program's bytes where a
+  /// breakpoint is planted or a probe is armed.</summary>
+  TStackWalkPage = record
+    /// <summary>Address of the page.</summary>
+    Tag:    UInt64;
+    /// <summary>Tag is meaningful.</summary>
+    Loaded: Boolean;
+    /// <summary>The page could be read.</summary>
+    Valid:  Boolean;
+    /// <summary>Its bytes.</summary>
+    Data:   array[0..$FFF] of Byte;
+  end;
+
+  TWinDebugger = class(TInterfacedObject, IDebugTarget, IBreakpointPlacement, ICodePatchTarget)
   private
     FProcess:      THandle;
     FProcessId:    DWORD;
@@ -389,10 +404,74 @@ type
     FActiveFrameName:    string;
     FActiveFramePC:      UInt64;  // selected frame's instruction pointer (VA),
                                   // for lexical-block scope filtering of locals
+    // Everything written into the target's code that is not a breakpoint
+    // (CodePatchMap.pas): the one-shot probes of a collection. Empty, and one
+    // integer comparison per breakpoint event, until something arms a probe.
+    FPatchMap:           TCodePatchMap;
+    // Load addresses of modules unloaded while a synthetic call ran: handled
+    // in full (session included) at the next turn of the main loop.
+    FUnloadsSeenInCall:  TList<UInt64>;
+    // Addresses already named in the notice about a breakpoint instruction the
+    // debugger did not plant (NoticeForeignBreakpointInstruction).
+    FForeignInt3Noticed: TList<UInt64>;
+    // The pages a stack walk has read, direct-mapped by page number. Valid for
+    // ONE walk: the target does not run during it, and nothing else is assumed.
+    FWalkPages:          TArray<TStackWalkPage>;
+    FWalkDepth:          Integer;
 
+    // The byte in the target as it IS: a planted $CC reads as $CC. For the two
+    // places that need exactly that (what a breakpoint saves when nothing else
+    // holds the byte; whether a $CC is physically there). Code is read through
+    // ReadCodeMemoryAt / ReadCodeExact.
     function  ReadByte(VA: UInt64; out B: Byte): Boolean;
     function  WriteByte(VA: UInt64; B: Byte): Boolean;
+    // The three ways the patch map reaches the target.
+    function  PatchMemoryAccess: TCodePatchMemory;
+    // The addresses whose $CC a planted breakpoint record holds, with the
+    // program's byte each saved: what the patch map must not write over.
+    function  PlantedBreakpointBytes: TArray<TCodePatchForeignByte>;
+    // In a buffer read raw from the target, puts the program's bytes where a
+    // breakpoint is planted or a patch is armed.
+    procedure OverlayProgramBytes(VA: UInt64; Buf: Pointer; Size: NativeUInt);
+    // A breakpoint event: True when it was a probe's and has been dealt with
+    // completely (recorded or recognised as late, thread rewound and resumed).
+    function  ConsumeCodePatchTrap(const Ev: TDebugEvent): Boolean;
+    // The same inside the pump of a synthetic call, where a hit of the calling
+    // thread is the debugger's own doing.
+    function  ConsumeCodePatchTrapInCall(const Ev: TDebugEvent): Boolean;
+    // A breakpoint instruction nobody here planted was executed while probes
+    // are armed: said once per address.
+    procedure NoticeForeignBreakpointInstruction(VA: UInt64);
+    // Clean detach, after every byte of ours is back: the threads that stand
+    // one byte behind an address that held one (each has a breakpoint event on
+    // its way, unless it ran a one-byte instruction there), and the threads
+    // that owe a re-arm and are past its instruction (a single step on its
+    // way).
+    function  ThreadsBehindARestoredByte: TArray<DWORD>;
+    // Clean detach: reads the debug events of those threads (and whatever else
+    // is queued) and puts each thread that trapped on a byte of ours back on
+    // its instruction.
+    procedure DrainQueuedEventsBeforeDetach(const Trapped: TArray<DWORD>);
+    // Whether the debugger ever put a byte at an address that it still knows
+    // about: a breakpoint record (planted or not, refused ones excepted) or an
+    // entry of the patch map (armed or a tombstone).
+    function  HeldAByteOfOurs(VA: UInt64): Boolean;
+    // Suspends every thread of a running process and waits until each has
+    // really stopped (SuspendThread only asks: the GetThreadContext that
+    // follows returns once the thread is suspended). The handles of the
+    // threads it suspended; ReleaseHeldThreads resumes them.
+    function  HoldEveryThread: TArray<THandle>;
+    procedure ReleaseHeldThreads(const Held: TArray<THandle>);
+    // Stack walks read the target through a page cache that shows the
+    // program's bytes (StackWalkRead). Begin / End bracket one walk.
+    procedure BeginStackWalkReads;
+    procedure EndStackWalkReads;
+    function  StackWalkRead(VA: UInt64; Buf: Pointer; Size: DWORD; out Got: DWORD): Boolean;
   protected
+    // Code of the target, with the program's own bytes where a breakpoint is
+    // planted or a patch is armed; True only when every byte was read. What
+    // every reader of CODE in the engine uses (never ReadProcessMemoryAt).
+    function  ReadCodeExact(VA: UInt64; Buf: Pointer; Size: NativeUInt): Boolean;
     // Visible to a per-architecture descendant: the virtual seam below plus the
     // handful of helpers it needs. Everything else stays private.
     function  ThreadHandle(TID: DWORD): THandle;
@@ -781,6 +860,11 @@ type
     procedure HandleException(const Ev: TDebugEvent; out ContinueStatus: DWORD);
     procedure HandleLoadDll(const Ev: TDebugEvent);
     procedure HandleUnloadDll(const Ev: TDebugEvent);
+    // Everything an unload does, by base: HandleUnloadDll, and the unloads a
+    // synthetic call's pump saw (DeliverUnloadsSeenInCalls, at the next turn
+    // of the main loop).
+    procedure ForgetUnloadedModule(Base: UInt64);
+    procedure DeliverUnloadsSeenInCalls;
     procedure ReportStopped(Reason: TStopReason; VA: UInt64);
     // Thread whose pending event must be released to resume (see FStopEventTid).
     function  ResumeTid: DWORD;
@@ -981,6 +1065,29 @@ type
     procedure SetSourcePlantAdvice(const Judge: TOnJudgePlant; const Copies: TOnPlantCopies;
                 const Relocated: TOnModuleRelocated);
     function  SourceBreakpointAddresses(const SourceFile: string; Line: Integer): TArray<UInt64>;
+    // ICodePatchTarget (CodePatchMap.pas; see the interface for the contracts).
+    // All of it runs on the thread that pumps the debug events.
+    /// <summary>ICodePatchTarget: writes a one-shot probe on each address of a
+    /// request, in runs; refused as a whole without a process, without a
+    /// module at the base, under another result key, and for an attach with
+    /// killOnDetach false unless the request accepts the risk.</summary>
+    function  ArmOneShotProbes(const Request: TCodePatchArmRequest;
+                out Outcome: TCodePatchArmOutcome; out Refusal: string): Boolean;
+    /// <summary>ICodePatchTarget: takes the armed probes of a module away (0:
+    /// every module), comparing each byte first; bytes a breakpoint holds stay.</summary>
+    function  DisarmProbes(ModuleBase: UInt64): TCodePatchDisarmOutcome;
+    /// <summary>ICodePatchTarget: module-relative addresses recorded as hit
+    /// under a result key, in this and earlier mappings.</summary>
+    function  ProbeHits(const ResultKey: string): TArray<Cardinal>;
+    /// <summary>ICodePatchTarget: module-relative addresses armed now.</summary>
+    function  ArmedProbes(ModuleBase: UInt64): TArray<Cardinal>;
+    /// <summary>ICodePatchTarget: whether the mapping at an address has been
+    /// armed and is still there.</summary>
+    function  ModuleIsArmed(ModuleBase: UInt64): Boolean;
+    /// <summary>ICodePatchTarget: forgets every recorded hit.</summary>
+    procedure ClearProbeHits;
+    /// <summary>ICodePatchTarget: the map's counters.</summary>
+    function  CodePatchStats: TCodePatchStats;
     function  GetOnExceptionLogged: TOnExceptionLogged; procedure SetOnExceptionLogged(const V: TOnExceptionLogged);
     // Method-style accessors for the read-only properties -- needed for
     // IDebugTarget. Declared as functions; the field-backed property
@@ -1260,6 +1367,35 @@ function SymLoadModuleExW(hProcess, hFile: THandle;
   Data: Pointer; Flags: DWORD): UInt64; stdcall; external 'dbghelp.dll';
 function SymUnloadModule64(hProcess: THandle; BaseOfDll: UInt64): BOOL;
   stdcall; external 'dbghelp.dll';
+
+threadvar
+  // The engine whose target the stack walk in flight on this thread reads
+  // (TWinDebugger.BeginStackWalkReads): dbghelp's read callback carries no
+  // context argument.
+  GStackWalkEngine: TWinDebugger;
+
+// The read routine handed to StackWalk64 in place of nil. Two reasons, both
+// measured (docs/PROFILER_COVERAGE_PLAN.md, increment 1; docs/TRAPS.md):
+// dbghelp reads the code at every return address to test for an epilogue and
+// must see the PROGRAM's bytes there, never a breakpoint or a code patch; and
+// left to itself it reads the target about 43 times per frame, four or five
+// bytes at a time, where a page cache needs a handful of reads per walk.
+function StackWalkReadMemory(hProcess: THandle; lpBaseAddress: UInt64; lpBuffer: Pointer;
+  nSize: DWORD; lpNumberOfBytesRead: PDWORD): BOOL; stdcall;
+begin
+  var Got: DWORD := 0;
+  var Engine := GStackWalkEngine;
+  if Engine <> nil then
+    Result := Engine.StackWalkRead(lpBaseAddress, lpBuffer, nSize, Got)
+  else begin
+    // No walk of ours is in flight on this thread: what dbghelp does by itself.
+    var Read: SIZE_T := 0;
+    Result := ReadProcessMemory(hProcess, Pointer(lpBaseAddress), lpBuffer, nSize, Read);
+    Got := DWORD(Read);
+  end;
+  if lpNumberOfBytesRead <> nil then
+    lpNumberOfBytesRead^ := Got;
+end;
 function SymSetOptions(SymOptions: DWORD): DWORD; stdcall; external 'dbghelp.dll';
 function SymGetOptions: DWORD; stdcall; external 'dbghelp.dll';
 
@@ -1408,6 +1544,9 @@ begin
   FCallResults   := TList<TRetainedCallResult>.Create;
   FStringArenas  := TList<UInt64>.Create;
   FFinalizerCache := TDictionary<string, UInt64>.Create;
+  FPatchMap := TCodePatchMap.Create(PatchMemoryAccess);
+  FForeignInt3Noticed := TList<UInt64>.Create;
+  FUnloadsSeenInCall := TList<UInt64>.Create;
   InitializeCriticalSection(FQueueLock);
   FFirstBreak             := False;
   FRunning                := False;
@@ -1446,6 +1585,9 @@ begin
   FCallResults.Free;
   FStringArenas.Free;
   FFinalizerCache.Free;
+  FForeignInt3Noticed.Free;
+  FUnloadsSeenInCall.Free;
+  FPatchMap.Free;
   DeleteCriticalSection(FQueueLock);
   inherited;
 end;
@@ -2046,6 +2188,90 @@ begin
   Result := WriteProcessMemory(FProcess, Pointer(VA), @B, 1, Written) and (Written = 1);
   VirtualProtectEx(FProcess, Pointer(VA), 1, OldProt, Dummy);
   FlushInstructionCache(FProcess, Pointer(VA), 1);
+end;
+
+function TWinDebugger.PatchMemoryAccess: TCodePatchMemory;
+// The patch map knows no process. A write covers a run of patches inside ONE
+// protection region (the map never lets a run cross one), so one
+// VirtualProtectEx before and one after is exact: the old protection it
+// returns is that of every page of the span. Execute-read-write, as WriteByte
+// uses: the code must stay executable for the threads that may be running
+// through it.
+begin
+  Result.Read :=
+    function(VA: UInt64; Buf: Pointer; Size: NativeUInt): Boolean
+    var
+      Got: SIZE_T;
+    begin
+      Result := (FProcess <> 0) and
+        Winapi.Windows.ReadProcessMemory(FProcess, Pointer(VA), Buf, Size, Got) and (Got = Size);
+    end;
+  Result.Write :=
+    function(VA: UInt64; Buf: Pointer; Size: NativeUInt): Boolean
+    var
+      Written: SIZE_T;
+      OldProt, Dummy: DWORD;
+    begin
+      if FProcess = 0 then
+        Exit(False);
+      // Code pages of an image are execute-read: they are made writable for
+      // the write (the first write makes each page private to the process),
+      // and get their own protection back. A failed change of protection
+      // leaves nothing to put back.
+      var Unprotected := VirtualProtectEx(FProcess, Pointer(VA), Size, PAGE_EXECUTE_READWRITE, OldProt);
+      Result := WriteProcessMemory(FProcess, Pointer(VA), Buf, Size, Written) and (Written = Size);
+      if Unprotected then
+        VirtualProtectEx(FProcess, Pointer(VA), Size, OldProt, Dummy);
+      FlushInstructionCache(FProcess, Pointer(VA), Size);
+    end;
+  Result.Query :=
+    function(VA: UInt64; out Region: TCodePatchRegion): Boolean
+    begin
+      Region := Default(TCodePatchRegion);
+      var Mbi := Default(MEMORY_BASIC_INFORMATION);
+      if (FProcess = 0) or
+         (VirtualQueryEx(FProcess, Pointer(VA), Mbi, SizeOf(Mbi)) <> SizeOf(Mbi)) then
+        Exit(False);
+      Region.Base := UInt64(Mbi.BaseAddress);
+      Region.Size := Mbi.RegionSize;
+      Region.Accessible := (Mbi.State = MEM_COMMIT) and
+        (Mbi.Protect and (PAGE_NOACCESS or PAGE_GUARD) = 0);
+      Result := True;
+    end;
+end;
+
+function TWinDebugger.PlantedBreakpointBytes: TArray<TCodePatchForeignByte>;
+begin
+  Result := nil;
+  for var I := 0 to FBreakpoints.Count - 1 do begin
+    if not FBreakpoints[I].IsPlanted then
+      Continue;
+    var Item: TCodePatchForeignByte;
+    Item.VA          := FBreakpoints[I].VA;
+    Item.ProgramByte := FBreakpoints[I].OrigByte;
+    Result := Result + [Item];
+  end;
+end;
+
+procedure TWinDebugger.OverlayProgramBytes(VA: UInt64; Buf: Pointer; Size: NativeUInt);
+begin
+  // The patch map first: it tells its own $CC from a byte the program wrote
+  // over it by looking at the bytes AS READ, which the breakpoints' overlay
+  // would already have changed where the two share an address.
+  FPatchMap.Overlay(VA, Buf, Size);
+  for var I := 0 to FBreakpoints.Count - 1 do begin
+    var BP := FBreakpoints[I];
+    if not BP.IsPlanted then
+      Continue;
+    if (BP.VA < VA) or (BP.VA >= VA + Size) then
+      Continue;
+    PByte(NativeUInt(Buf) + NativeUInt(BP.VA - VA))^ := BP.OrigByte;
+  end;
+end;
+
+function TWinDebugger.ReadCodeExact(VA: UInt64; Buf: Pointer; Size: NativeUInt): Boolean;
+begin
+  Result := ReadCodeMemoryAt(VA, Buf, Size) = Size;
 end;
 
 function TWinDebugger.ThreadHandle(TID: DWORD): THandle;
@@ -2720,8 +2946,29 @@ begin
   // an address no breakpoint owns any more. The program's byte is the one the
   // first planter saved.
   var Sibling := PlantedRecordAt(BP.VA);
+  // The same holds for a probe armed on the address (CodePatchMap.pas): its
+  // $CC is in the target already, and the byte to save is the PROGRAM's,
+  // which the patch map kept. Nothing is written then either: the byte is $CC
+  // while a breakpoint is planted there OR a probe is armed there.
+  var ProbeByte: Byte := 0;
+  var UnderProbe := (Sibling < 0) and FPatchMap.HoldsInt3At(BP.VA, ProbeByte);
+  if UnderProbe then begin
+    // Only while the probe's $CC is really there. A program that patches its
+    // own code (a hooking library writing a jump over a routine's entry, an
+    // unpacker) replaces it without telling anyone: the byte is the program's
+    // then, the probe is given up, and the breakpoint saves and writes as it
+    // would anywhere else. Adopting the probe would leave a breakpoint that
+    // shows verified and never fires.
+    var Current: Byte := 0;
+    if ReadByte(BP.VA, Current) and (Current <> $CC) then begin
+      FPatchMap.Overwritten(BP.VA, 1);
+      UnderProbe := False;
+    end;
+  end;
   if Sibling >= 0 then
     BP.OrigByte := FBreakpoints[Sibling].OrigByte
+  else if UnderProbe then
+    BP.OrigByte := ProbeByte
   else if not ReadByte(BP.VA, BP.OrigByte) then begin
     DapLog(Format('PlantInt3 FAIL ReadByte VA=$%x LastError=%d', [BP.VA, GetLastError]));
     Exit;
@@ -2735,7 +2982,7 @@ begin
     Exit;
   end;
   BP.Refused := False;
-  if Sibling >= 0 then begin
+  if (Sibling >= 0) or UnderProbe then begin
     BP.IsPlanted := True;
     Exit;
   end;
@@ -2828,7 +3075,14 @@ begin
   var Holder := PlantedRecordAt(VA);
   if Holder < 0 then
     Exit;
-  WriteByte(VA, FBreakpoints[Holder].OrigByte);
+  // A probe armed on the same address keeps the $CC: the thread about to run
+  // the instruction traps on it once more, the probe records that hit and
+  // gives the byte back itself (ConsumeCodePatchTrap). Writing the program's
+  // byte here would let the line run unrecorded under a probe that still
+  // believes its byte is in place.
+  var ProbeByte: Byte;
+  if not FPatchMap.HoldsInt3At(VA, ProbeByte) then
+    WriteByte(VA, FBreakpoints[Holder].OrigByte);
   for var I := 0 to FBreakpoints.Count - 1 do begin
     if (FBreakpoints[I].VA <> VA) or not FBreakpoints[I].IsPlanted then
       Continue;
@@ -2862,6 +3116,10 @@ begin
   if not BP.IsPlanted then
     Exit;
   if PlantedRecordAt(BP.VA) >= 0 then
+    Exit;
+  // Nor while a probe is armed there: the $CC is the probe's now.
+  var ProbeByte: Byte;
+  if FPatchMap.HoldsInt3At(BP.VA, ProbeByte) then
     Exit;
   WriteByte(BP.VA, BP.OrigByte);
 end;
@@ -4901,15 +5159,20 @@ begin
   SF.AddrStack.Offset := SeedSp;
   SF.AddrStack.Mode   := AddrModeFlat;
 
-  // Consume the current frame.
-  if not StackWalk64(StackWalkMachineType, FProcess, TH, SF, @Ctx,
-      nil, @SymFunctionTableAccess64, @SymGetModuleBase64, nil) then
-    Exit;
-  // Caller frame: AddrPC.Offset is the RIP we'll return to.
-  if not StackWalk64(StackWalkMachineType, FProcess, TH, SF, @Ctx,
-      nil, @SymFunctionTableAccess64, @SymGetModuleBase64, nil) then
-    Exit;
-  Result := SF.AddrPC.Offset;
+  BeginStackWalkReads;
+  try
+    // Consume the current frame.
+    if not StackWalk64(StackWalkMachineType, FProcess, TH, SF, @Ctx,
+        @StackWalkReadMemory, @SymFunctionTableAccess64, @SymGetModuleBase64, nil) then
+      Exit;
+    // Caller frame: AddrPC.Offset is the RIP we'll return to.
+    if not StackWalk64(StackWalkMachineType, FProcess, TH, SF, @Ctx,
+        @StackWalkReadMemory, @SymFunctionTableAccess64, @SymGetModuleBase64, nil) then
+      Exit;
+    Result := SF.AddrPC.Offset;
+  finally
+    EndStackWalkReads;
+  end;
 end;
 
 procedure TWinDebugger.ApplyAllBreakpoints;
@@ -5343,9 +5606,11 @@ begin
         // Stepping over it must use the caller's return address (like step-out),
         // not the "next line in same file" heuristic, which would plant the BP
         // at an unrelated function in the same unit.
-        var B0, B1: Byte;
-        var IsImportThunk := ReadByte(RIP, B0) and ReadByte(RIP + 1, B1) and
-                             (B0 = $FF) and (B1 = $25);
+        // Read as CODE: a breakpoint or a probe on the thunk's first byte must
+        // not make it look like something else.
+        var Thunk: array[0..1] of Byte;
+        var IsImportThunk := ReadCodeExact(RIP, @Thunk[0], SizeOf(Thunk)) and
+                             (Thunk[0] = $FF) and (Thunk[1] = $25);
 
         if not IsImportThunk and FDebugInfo.RvaToSourceLine(Rva, Loc) then begin
           // Range-based step-over: single-step within the current function's
@@ -5704,6 +5969,9 @@ begin
   FStepFreezeActive := False;
   FStepTid          := 0;
   DiscardSyntheticCallLeftovers;
+  // Every patched mapping is gone; what the probes recorded stays readable.
+  FPatchMap.ProcessGone;
+  FUnloadsSeenInCall.Clear;
   ContinueDebugEvent(Ev.dwProcessId, Ev.dwThreadId, DBG_CONTINUE);
   // The program's last output goes out before the exit is reported.
   DrainDebuggeeStdio;
@@ -5804,17 +6072,55 @@ begin
 end;
 
 procedure TWinDebugger.HandleUnloadDll(const Ev: TDebugEvent);
+begin
+  ForgetUnloadedModule(UInt64(Ev.UnloadDll.lpBaseOfDll));
+end;
+
+// A module unloaded while a synthetic call ran (an evaluation that frees a
+// library, a getter that unloads a package). The call's pump only drops the
+// mapping's code patches; everything else an unload does -- the engine's module
+// tables, the breakpoints in its range, the session's module record, its
+// analysis and line-probe requests -- happens here, at the next turn of the
+// main loop and before its next event. Without it the session kept a record of
+// a mapping that was gone: a reload at another address got a second record,
+// and a lookup by name found the stale one (an arming attempt at an address
+// nothing was mapped at, measured under parallel load).
+procedure TWinDebugger.DeliverUnloadsSeenInCalls;
+begin
+  var Bases := FUnloadsSeenInCall.ToArray;
+  FUnloadsSeenInCall.Clear;
+  for var Base in Bases do begin
+    DapLog(Format('UnloadDll seen inside a synthetic call, handled now: base=$%x', [Base]));
+    ForgetUnloadedModule(Base);
+  end;
+end;
+
+procedure TWinDebugger.ForgetUnloadedModule(Base: UInt64);
 var
-  Base: UInt64;
   Name: string;
   DllBase, DllEnd: UInt64;
 begin
-  Base := UInt64(Ev.UnloadDll.lpBaseOfDll);
   // Drop the dbghelp registration even for a module we never tracked ourselves,
   // so a later module reusing this base cannot inherit stale unwind info.
   if FSymInitialized and (Base <> 0) then
     SymUnloadModule64(FProcess, Base);
+  // The code patches of this mapping go WITHOUT a write: the memory is no
+  // longer there. What they recorded stays, by (result key, RVA), and the
+  // module is patched afresh if it comes back. Done for every unload, tracked
+  // module or not: the loader maps an image, unmaps it and maps it again at the
+  // same address, and a table that still held the first mapping's entries
+  // would believe its bytes were in place.
+  FPatchMap.ModuleUnloaded(Base);
   Name := '';
+  // The notice about a foreign breakpoint instruction is given once per
+  // address and per mapping, like everything else keyed by address.
+  var UnloadedSize: UInt64 := 0;
+  for var KV in FDllBases do
+    if KV.Value = Base then
+      FDllSizes.TryGetValue(KV.Key, UnloadedSize);
+  for var N := FForeignInt3Noticed.Count - 1 downto 0 do
+    if (FForeignInt3Noticed[N] >= Base) and (FForeignInt3Noticed[N] - Base < UnloadedSize) then
+      FForeignInt3Noticed.Delete(N);
   for var KV in FDllBases do
     if KV.Value = Base then begin
       Name := KV.Key;
@@ -5989,6 +6295,141 @@ begin
   DapLog(Format('ThreadName announcement: tid %d is now "%s"', [TargetTid, Name]));
 end;
 
+{ ---------------------------------------------------------------------------
+  Code patches in the event pump (docs/DAP_DEBUGGER_ARCHITECTURE.md, "Code
+  patches"; CodePatchMap.pas).
+
+  A one-shot probe is a $CC that is not a breakpoint: its hit is recorded, the
+  program's byte put back, the thread put back on the instruction and resumed.
+  Nothing is reported and nothing is single-stepped, and no stepping state is
+  touched -- not FStoppedTid, not FStepMode, not a pending re-arm -- so a step
+  in flight on this thread or on another one continues exactly as it would
+  have without the probe. The thread's trap flag survives the breakpoint trap
+  (the processor saves EFLAGS before it clears TF for the handler), so a
+  single-stepping thread that ran onto a probe gets its single step after the
+  real instruction, one debug event later than without the probe.
+
+  Where a breakpoint record is PLANTED on the same address the hit belongs to
+  both: the probe is recorded here and the event is passed on, and the
+  breakpoint path takes the byte away, rewinds and re-arms as it always does.
+  --------------------------------------------------------------------------- }
+
+function TWinDebugger.ConsumeCodePatchTrap(const Ev: TDebugEvent): Boolean;
+begin
+  var VA := UInt64(Ev.Exception.ExceptionRecord.ExceptionAddress);
+  case FPatchMap.TrapAt(VA) of
+    cptNone:
+      Exit(False);
+    cptArmed: begin
+      var Shared := PlantedRecordAt(VA) >= 0;
+      FPatchMap.Fire(VA, not Shared);
+      if Shared then
+        Exit(False);
+    end;
+  else
+    // The map patched this address once and the byte is back in the program:
+    // this thread executed the $CC before the restore (a second thread at a
+    // one-shot, a probe taken away while its trap was queued) and its event
+    // arrives now. Handed on as "not our breakpoint" it would reach the
+    // program as an exception at an address that holds no breakpoint.
+    //
+    // A breakpoint record on the address, planted or suspended, takes it
+    // instead: that path already knows a hit queued behind a stop. And a $CC
+    // that IS there now and that nobody here owns is not ours to rewind.
+    if FindBreakpointByVA(VA) >= 0 then
+      Exit(False);
+    var Current: Byte := CODE_PATCH_INT3;
+    if (not ReadByte(VA, Current)) or (Current = CODE_PATCH_INT3) then
+      Exit(False);
+    FPatchMap.CountLateTrap;
+  end;
+  SetRIP(Ev.dwThreadId, VA);
+  // A thread that owes a breakpoint its re-arm (it was resumed from an address
+  // that carries both a breakpoint and this probe) still has to make its
+  // single step: over the real instruction, now.
+  if FPendingRearms.ContainsKey(Ev.dwThreadId) then
+    SetTrapFlag(Ev.dwThreadId, True);
+  ContinueDebugEvent(Ev.dwProcessId, Ev.dwThreadId, DBG_CONTINUE);
+  Result := True;
+end;
+
+// Inside the pump of a synthetic call. A probe hit by the CALLING thread is the
+// debugger's own doing -- evaluating a getter is not the program executing
+// that line -- so it is consumed without a record and the probe goes back when
+// the call ends (RunMethodCall's finally). Another thread reaching a probe
+// while the call runs is the program, and is recorded as in the main loop.
+// False leaves the event to the pump's own breakpoint handling, which is what
+// happens when a breakpoint record shares the address.
+function TWinDebugger.ConsumeCodePatchTrapInCall(const Ev: TDebugEvent): Boolean;
+begin
+  var VA := UInt64(Ev.Exception.ExceptionRecord.ExceptionAddress);
+  var ByTheCall := Ev.dwThreadId = FStoppedTid;
+  case FPatchMap.TrapAt(VA) of
+    cptNone:
+      Exit(False);
+    cptArmed: begin
+      var Shared := PlantedRecordAt(VA) >= 0;
+      if ByTheCall then
+        FPatchMap.SuspendForCall(VA, not Shared)
+      else
+        FPatchMap.Fire(VA, not Shared);
+      if Shared then
+        Exit(False);
+    end;
+  else
+    if FindBreakpointByVA(VA) >= 0 then
+      Exit(False);
+    var Current: Byte := CODE_PATCH_INT3;
+    if (not ReadByte(VA, Current)) or (Current = CODE_PATCH_INT3) then
+      Exit(False);
+    // Suspended for this call and reached by a thread of the program: that
+    // thread is about to run the line for real.
+    if not ByTheCall then
+      FPatchMap.RecordSuspendedHit(VA);
+    FPatchMap.CountLateTrap;
+  end;
+  SetRIP(Ev.dwThreadId, VA);
+  ContinueDebugEvent(Ev.dwProcessId, Ev.dwThreadId, DBG_CONTINUE);
+  Result := True;
+end;
+
+// A breakpoint instruction at an address the debugger did not plant is handed
+// to the program, as it always was. While probes are armed it can also be one
+// of OURS: a program that copies its own code (a hooking library relocating the
+// first bytes of a routine) copies a probe's $CC with it, to an address no
+// table knows, and dies there. The two places that can be are a module that
+// carries probes and memory outside every module; a breakpoint instruction in
+// a module nothing was armed in (ntdll's loader breakpoint, DebugBreak) says
+// nothing about probes and is not announced.
+procedure TWinDebugger.NoticeForeignBreakpointInstruction(VA: UInt64);
+const
+  MAX_NOTICES = 8;
+begin
+  if FForeignInt3Noticed.Contains(VA) or (FForeignInt3Noticed.Count >= MAX_NOTICES) then
+    Exit;
+  var Base, Size: UInt64;
+  var InModule := ModuleRangeFor(VA, Base, Size);
+  if InModule and (Length(FPatchMap.ArmedRvas(Base)) = 0) then
+    Exit;
+  if (not InModule) and AddressInLoadedModule(VA) then
+    Exit;
+  FForeignInt3Noticed.Add(VA);
+  var Where := 'outside every loaded module';
+  if InModule then begin
+    var ModuleName := ModuleNameForBase(Base);
+    if ModuleName = '' then
+      ModuleName := 'the main executable';
+    Where := 'in ' + ModuleName + ', which carries line probes';
+  end;
+  var Text := Format('A breakpoint instruction at $%x (%s) was executed and was not planted by the ' +
+    'debugger; it is handed to the program as an exception. Line probes are armed: if the program ' +
+    'copies its own code (a hooking library relocating the first bytes of a routine), it has copied ' +
+    'one of the debugger''s probe bytes there. Exclude that routine from the collection.', [VA, Where]);
+  DapLog(Text);
+  if Assigned(FOnNotice) then
+    FOnNotice(Text);
+end;
+
 procedure TWinDebugger.HandleException(const Ev: TDebugEvent;
   out ContinueStatus: DWORD);
 var
@@ -6007,6 +6448,12 @@ begin
   case Code of
     EXCEPTION_BREAKPOINT, STATUS_WX86_BREAKPOINT:
     begin
+      // A code patch first, ahead of the breakpoint list and of the log line
+      // below: a collection can put a probe on every line of a module, and a
+      // first hit must cost a debug event and nothing else. One comparison
+      // while no probe was ever armed.
+      if FPatchMap.Active and ConsumeCodePatchTrap(Ev) then
+        Exit;
       DapLog(Format('EXCEPTION_BREAKPOINT ($%x) at $%x FirstBreak=%s',
         [Code, ExcAddr, BoolToStr(FFirstBreak, True)]));
       if not FFirstBreak then begin
@@ -6041,6 +6488,24 @@ begin
           ContinueDebugEvent(Ev.dwProcessId, Ev.dwThreadId, DBG_CONTINUE);
           Exit;
         end;
+        // No breakpoint planted, and the byte is not $CC any more: the $CC the
+        // thread executed was ours and has gone since -- a line probe written
+        // on the address while the thread was parked on it, given back by
+        // another thread's hit (whose event came first) or by taking the
+        // probes away while this trap was queued. The thread has not run the
+        // instruction: back onto it, and the same pending re-arm finishes.
+        // Taken for the program's own `int3`, it resumed one byte in.
+        var Current: Byte := $CC;
+        if ReadByte(BpVA, Current) and (Current <> $CC) then begin
+          if FPatchMap.TrapAt(BpVA) <> cptNone then
+            FPatchMap.CountLateTrap;
+          SetRIP(Ev.dwThreadId, BpVA);
+          SetTrapFlag(Ev.dwThreadId, True);
+          DapLog(Format('BP at $%x: tid %d trapped on a byte of ours that went back before its re-arm step: ' +
+            'stepped again', [BpVA, Ev.dwThreadId]));
+          ContinueDebugEvent(Ev.dwProcessId, Ev.dwThreadId, DBG_CONTINUE);
+          Exit;
+        end;
         // Not ours: the program's own byte there is an `int3`, and it has just
         // executed. That was the one instruction; re-plant and go on.
         FPendingRearms.Remove(Ev.dwThreadId);
@@ -6068,7 +6533,11 @@ begin
       end;
 
       if BpIdx < 0 then begin
-        // Not our BP -- let the process handle it
+        // Not our BP -- let the process handle it. While probes are armed the
+        // user is also told, once per address: it can be one of OUR bytes that
+        // the program copied somewhere no table knows.
+        if FPatchMap.ArmedCount > 0 then
+          NoticeForeignBreakpointInstruction(BpVA);
         ContinueDebugEvent(Ev.dwProcessId, Ev.dwThreadId, DBG_EXCEPTION_NOT_HANDLED);
         Exit;
       end;
@@ -6339,6 +6808,16 @@ begin
         // step is in flight still owns the thread through its own (now
         // re-planted) breakpoint, so resume without touching its state.
         if StepPending.StepOffOnly then begin
+          ContinueDebugEvent(Ev.dwProcessId, Ev.dwThreadId, DBG_CONTINUE);
+          Exit;
+        end;
+        // The step in flight belongs to ANOTHER thread: this trap was only the
+        // re-arm of a breakpoint this thread ran through (a logpoint, a false
+        // condition) while that step's isolation was off or released. Driving
+        // the step machinery with it compared this thread's stack pointer with
+        // the stepper's and ended the step on the wrong thread, or planted its
+        // resume breakpoint at whatever this thread's stack top held.
+        if StepTargetHitByOtherThread(Ev.dwThreadId) then begin
           ContinueDebugEvent(Ev.dwProcessId, Ev.dwThreadId, DBG_CONTINUE);
           Exit;
         end;
@@ -6909,6 +7388,11 @@ var
   Ev: TDebugEvent;
   ContStatus: DWORD;
 begin
+  // Unloads a synthetic call saw, before anything else: before the commands
+  // (a repost they cause is planted below) and before the next event (the
+  // module may be loaded again).
+  if FUnloadsSeenInCall.Count > 0 then
+    DeliverUnloadsSeenInCalls;
   ProcessCommandQueue;
 
   if not WaitForDebugEvent(Ev, 10) then begin
@@ -6973,25 +7457,102 @@ begin
   SF.AddrStack.Offset := SeedSp;
   SF.AddrStack.Mode   := AddrModeFlat;
 
-  while StackWalk64(StackWalkMachineType, FProcess, TH, SF, @Ctx,
-      nil, @SymFunctionTableAccess64, @SymGetModuleBase64, nil) do begin
-    if SF.AddrPC.Offset = 0 then
-      Break;
-    var Raw: TRawStackFrame;
-    Raw.Origin := foDbgHelpWhole;
-    Raw.PC := SF.AddrPC.Offset;
-    // StackWalk64 updates Ctx to the unwound register state for THIS frame;
-    // Ctx.Rbp is the frame's actual RBP, which the BPREL local / param offset
-    // decode is relative to. SF.AddrFrame is unwind-defined and not a reliable
-    // RBP for Delphi frames, so prefer Ctx.Rbp.
-    if Ctx.Rbp <> 0 then
-      Raw.FramePtr := Ctx.Rbp
-    else
-      Raw.FramePtr := SF.AddrFrame.Offset;
-    Result := Result + [Raw];
-    if Length(Result) >= MaxFrames then
-      Break;
+  BeginStackWalkReads;
+  try
+    while StackWalk64(StackWalkMachineType, FProcess, TH, SF, @Ctx,
+        @StackWalkReadMemory, @SymFunctionTableAccess64, @SymGetModuleBase64, nil) do begin
+      if SF.AddrPC.Offset = 0 then
+        Break;
+      var Raw: TRawStackFrame;
+      Raw.Origin := foDbgHelpWhole;
+      Raw.PC := SF.AddrPC.Offset;
+      // StackWalk64 updates Ctx to the unwound register state for THIS frame;
+      // Ctx.Rbp is the frame's actual RBP, which the BPREL local / param offset
+      // decode is relative to. SF.AddrFrame is unwind-defined and not a reliable
+      // RBP for Delphi frames, so prefer Ctx.Rbp.
+      if Ctx.Rbp <> 0 then
+        Raw.FramePtr := Ctx.Rbp
+      else
+        Raw.FramePtr := SF.AddrFrame.Offset;
+      Result := Result + [Raw];
+      if Length(Result) >= MaxFrames then
+        Break;
+    end;
+  finally
+    EndStackWalkReads;
   end;
+end;
+
+procedure TWinDebugger.BeginStackWalkReads;
+const
+  WALK_PAGE_SLOTS = 64;
+begin
+  Inc(FWalkDepth);
+  if FWalkDepth > 1 then
+    Exit;
+  if Length(FWalkPages) = 0 then
+    SetLength(FWalkPages, WALK_PAGE_SLOTS);
+  // A cache for ONE walk: between two walks the target may have run, and the
+  // debugger may have written to it.
+  for var I := 0 to High(FWalkPages) do
+    FWalkPages[I].Loaded := False;
+  GStackWalkEngine := Self;
+end;
+
+procedure TWinDebugger.EndStackWalkReads;
+begin
+  Dec(FWalkDepth);
+  if FWalkDepth = 0 then
+    GStackWalkEngine := nil;
+end;
+
+// What dbghelp reads during a stack walk: stack words, and the code at each
+// return address. Served from whole pages read once per walk, with the
+// program's bytes where a breakpoint is planted or a code patch is armed. A
+// page that cannot be read fails the request at that page, with the bytes
+// before it delivered -- what ReadProcessMemory itself does.
+function TWinDebugger.StackWalkRead(VA: UInt64; Buf: Pointer; Size: DWORD;
+  out Got: DWORD): Boolean;
+const
+  PAGE_SIZE = UInt64($1000);
+begin
+  Got := 0;
+  if (FProcess = 0) or (Length(FWalkPages) = 0) then
+    Exit(False);
+  // dbghelp's i386 walker carries 32-bit addresses SIGN-extended to 64 bits
+  // (a PC of $B5C34A23 came back as $FFFFFFFFB5C34A23, see GetStackFrames).
+  // Read as it is, every address from $80000000 up of a large-address-aware
+  // 32-bit target would fail. Only that exact pattern is folded back: any
+  // other address above 4 GB is no address of a 32-bit process, and its read
+  // fails as it should.
+  if (TargetLayout.PointerSize = 4) and ((VA shr 32) = $FFFFFFFF) and (VA and $80000000 <> 0) then
+    VA := VA and $FFFFFFFF;
+  while Got < Size do begin
+    {$Q-}
+    var At := VA + Got;
+    {$Q+}
+    var PageVA := At and not (PAGE_SIZE - 1);
+    var Slot := Integer((PageVA shr 12) and UInt64(High(FWalkPages)));
+    if (not FWalkPages[Slot].Loaded) or (FWalkPages[Slot].Tag <> PageVA) then begin
+      var Read: SIZE_T := 0;
+      FWalkPages[Slot].Tag    := PageVA;
+      FWalkPages[Slot].Loaded := True;
+      FWalkPages[Slot].Valid  :=
+        Winapi.Windows.ReadProcessMemory(FProcess, Pointer(PageVA), @FWalkPages[Slot].Data[0],
+          PAGE_SIZE, Read) and (Read = PAGE_SIZE);
+      if FWalkPages[Slot].Valid then
+        OverlayProgramBytes(PageVA, @FWalkPages[Slot].Data[0], PAGE_SIZE);
+    end;
+    if not FWalkPages[Slot].Valid then
+      Exit(False);
+    var Ofs := Integer(At - PageVA);
+    var Count := DWORD(PAGE_SIZE) - DWORD(Ofs);
+    if Count > Size - Got then
+      Count := Size - Got;
+    Move(FWalkPages[Slot].Data[Ofs], PByte(NativeUInt(Buf) + Got)^, Count);
+    Inc(Got, Count);
+  end;
+  Result := True;
 end;
 
 // Walk the call stack of an arbitrary thread. While stopped at a debug event the
@@ -7513,6 +8074,13 @@ begin
   Result := (FProcess <> 0) and
     Winapi.Windows.ReadProcessMemory(FProcess, Pointer(VA), Buf, Size, R) and
     (R = Size);
+  // No reader, of data or of code, is ever shown a code patch: a collection
+  // can have a probe on every line of a module, and a memory view or a value
+  // reader that met one would show a byte the program does not contain. One
+  // integer comparison while nothing is armed. (A planted BREAKPOINT byte is
+  // still visible here, as it always was; ReadCodeMemoryAt hides both.)
+  if Result and (FPatchMap.ArmedCount > 0) then
+    FPatchMap.Overlay(VA, Buf, Size);
 end;
 
 // Walks the regions VirtualQueryEx reports across [VA, VA + Size). Bounded: a
@@ -7587,13 +8155,9 @@ begin
     Exit;
   Result := BytesRead;
 
-  // Restore any of OUR planted breakpoints inside [VA, VA+Result) -- trap 1.
-  for var I := 0 to FBreakpoints.Count - 1 do begin
-    var BP := FBreakpoints[I];
-    if not BP.IsPlanted then Continue;
-    if (BP.VA < VA) or (BP.VA >= VA + Result) then Continue;
-    PByte(NativeUInt(Buf) + NativeUInt(BP.VA - VA))^ := BP.OrigByte;
-  end;
+  // The program's bytes wherever something of OURS is written inside
+  // [VA, VA+Result): planted breakpoints (trap 1) and armed code patches.
+  OverlayProgramBytes(VA, Buf, Result);
 end;
 
 function TWinDebugger.WriteMemoryAt(VA: UInt64; Buf: Pointer;
@@ -7605,9 +8169,16 @@ begin
   if FProcess = 0 then Exit(False);
   // Make the page writable, even if it was read-only.
   VirtualProtectEx(FProcess, Pointer(VA), Size, PAGE_READWRITE, OldProt);
+  W := 0;
   Result := WriteProcessMemory(FProcess, Pointer(VA), Buf, Size, W) and
     (W = Size);
   VirtualProtectEx(FProcess, Pointer(VA), Size, OldProt, Dummy);
+  // A write over code that carries probes replaces their bytes: from now on
+  // those bytes are the program's, and the patch map must not believe it
+  // still holds them (a breakpoint planted there later would adopt a $CC that
+  // is not in the target).
+  if (W > 0) and (FPatchMap.ArmedCount > 0) then
+    FPatchMap.Overwritten(VA, W);
 end;
 
 // See IDebugTarget.WriteMemoryPartial: same mechanism as WriteMemoryAt (make
@@ -7630,6 +8201,9 @@ begin
   WriteProcessMemory(FProcess, Pointer(VA), Buf, Size, W);
   VirtualProtectEx(FProcess, Pointer(VA), Size, OldProt, Dummy);
   Result := NativeUInt(W);
+  // As in WriteMemoryAt: the bytes written are the program's now.
+  if (W > 0) and (FPatchMap.ArmedCount > 0) then
+    FPatchMap.Overwritten(VA, W);
 end;
 
 // Build an immortal Delphi-style string buffer in the debuggee's memory and
@@ -8151,6 +8725,15 @@ begin
         Exit;
       end;
 
+      // A code patch, ahead of the breakpoint handling below as in the main
+      // loop. A probe the CALL ran through is not a line the program
+      // executed: it is consumed without a record and armed again when the
+      // call ends (the finally below).
+      if FPatchMap.Active and (Ev.dwDebugEventCode = EXCEPTION_DEBUG_EVENT) and
+         IsBreakpointExceptionCode(Ev.Exception.ExceptionRecord.ExceptionCode) and
+         ConsumeCodePatchTrapInCall(Ev) then
+        Continue;
+
       // A planted breakpoint (user BP or transient step BP) fired inside the
       // injected call. Plain DBG_CONTINUE would resume at VA+1 with the 0xCC
       // still in place: the patched-out instruction never executes and the
@@ -8329,6 +8912,23 @@ begin
         FThreadNames.Remove(Ev.dwThreadId);
       end;
 
+      // A module unloaded by the call. The patches of that mapping are bytes
+      // that are gone: dropped now. The rest of what an unload does -- the
+      // engine's tables, the session's module record -- is the main loop's,
+      // at its next turn (DeliverUnloadsSeenInCalls). A module the call loads
+      // again at the same address before it ends is still there: its pending
+      // unload is cancelled, and the records of the first mapping, which say
+      // the same, stay.
+      if Ev.dwDebugEventCode = UNLOAD_DLL_DEBUG_EVENT then begin
+        FPatchMap.ModuleUnloaded(UInt64(Ev.UnloadDll.lpBaseOfDll));
+        FUnloadsSeenInCall.Add(UInt64(Ev.UnloadDll.lpBaseOfDll));
+      end
+      else if Ev.dwDebugEventCode = LOAD_DLL_DEBUG_EVENT then begin
+        FUnloadsSeenInCall.Remove(UInt64(Ev.LoadDll.lpBaseOfDll));
+        if Ev.LoadDll.hFile <> 0 then
+          CloseHandle(Ev.LoadDll.hFile);
+      end;
+
       // The injected call exited the whole process: nothing to restore.
       if Ev.dwDebugEventCode = EXIT_PROCESS_DEBUG_EVENT then begin
         Result := False;
@@ -8345,6 +8945,11 @@ begin
     for var KV in PendingSkips do
       RearmInt3At(KV.Value);
     PendingSkips.Free;
+    // The probes the call ran through go back, after the breakpoints: where a
+    // breakpoint holds the byte again the probe takes the program's byte from
+    // it and writes nothing.
+    if FPatchMap.Active and (FProcess <> 0) and not FHasExited then
+      FPatchMap.RearmSuspended(PlantedBreakpointBytes);
     AtomicExchange(FInRemoteCall, 0);
     // What the callee wrote last is in the pipe already, the debuggee frozen.
     DrainDebuggeeStdio;
@@ -8608,10 +9213,12 @@ begin
     // event is released. Continue it now so DrainUntilExit can actually observe the
     // exit promptly instead of spinning the whole timeout on every disconnect.
     FPendingRearms.Clear;
-    if FIsStopped and (FStoppedTid <> 0) then begin
+    if FIsStopped and (ResumeTid <> 0) then begin
+      // The held event is the event thread's (ResumeTid): at a pause stop
+      // that is the injected break-in thread, not the thread reported.
       SetTrapFlag(FStoppedTid, False);
       FIsStopped := False;
-      ContinueDebugEvent(FProcessId, FStoppedTid, DBG_CONTINUE);
+      ReleasePendingEvent(DBG_CONTINUE);
     end;
     // Consume the kill's debug events so the debug object reaps the process
     // instead of leaving a locked zombie behind (see DrainUntilExit).
@@ -8647,9 +9254,34 @@ begin
       for var Slot := 0 to 3 do
         if FWatchSlots[Slot].InUse then
           ClearDataWatchpoint(Slot);
-    for var I := 0 to FBreakpoints.Count - 1 do
-      if FBreakpoints[I].IsPlanted then
-        SuspendInt3At(FBreakpoints[I].VA);
+    // A running process is held while its code is rewritten.
+    var Held: TArray<THandle> := nil;
+    if not FIsStopped then
+      Held := HoldEveryThread;
+    try
+      for var I := 0 to FBreakpoints.Count - 1 do
+        if FBreakpoints[I].IsPlanted then
+          SuspendInt3At(FBreakpoints[I].VA);
+      // Every code patch goes back as well (the breakpoints no longer hold a
+      // byte, so nothing is left to them). Each restore compares first.
+      if FPatchMap.ArmedCount > 0 then begin
+        var Restored := FPatchMap.Disarm(0, nil);
+        DapLog(Format('Detach: %d code patch(es) restored in %d write(s), %d no longer ours',
+          [Restored.Restored, Restored.WriteCalls, Restored.Lost]));
+      end;
+    finally
+      ReleaseHeldThreads(Held);
+    end;
+    // Every byte of ours is back, so no thread can trap on one from here on.
+    // A thread that executed one BEFORE that still has its breakpoint event to
+    // deliver: queued already, or -- while it is inside the kernel raising the
+    // exception -- about to be. The detach completes such an event as "not
+    // handled", and the thread, one byte into an instruction whose first byte
+    // is the program's again, takes a breakpoint exception nobody planted. The
+    // same holds for the single step of a thread that owes a re-arm and has
+    // run its instruction already. Those threads are found by where they
+    // stand, and their events awaited.
+    var Trapped := ThreadsBehindARestoredByte;
     // EVERY thread that owes a re-arm has the trap flag set, not only the one
     // the stop is on: a thread that hit a breakpoint and was then left parked
     // while another thread was stepped still carries it. Left set, it raises a
@@ -8658,7 +9290,7 @@ begin
       if FThreads.ContainsKey(PendingTid) then
         SetTrapFlag(PendingTid, False);
     FPendingRearms.Clear;
-    if FIsStopped and (FStoppedTid <> 0) then begin
+    if FIsStopped and (ResumeTid <> 0) then begin
       // Clear the trap flag BEFORE the final continue. After a BP hit
       // HandleException sets TF=1 (line ~1097) for the re-arm single-step.
       // Detaching with TF still set leaves the thread armed for a single-step
@@ -8667,13 +9299,310 @@ begin
       // dialog and the process hangs (also blocks any later re-attach BPs).
       SetTrapFlag(FStoppedTid, False);
       FIsStopped := False;
-      ContinueDebugEvent(FProcessId, FStoppedTid, DBG_CONTINUE);
+      // The event held is the event thread's. At a pause stop that is the
+      // injected break-in thread, not the one reported (FStoppedTid): a
+      // ContinueDebugEvent for the reported thread fails, the event stays
+      // outstanding, nothing more is delivered, the drain below reads nothing
+      // and every trap queued behind the stop reaches the detached program.
+      ReleasePendingEvent(DBG_CONTINUE);
     end;
+    DrainQueuedEventsBeforeDetach(Trapped);
     if not DebugActiveProcessStop(FProcessId) then
       // If detach fails (process already exited, etc.) fall back to terminate.
       TerminateProcess(FProcess, 0);
   end;
   CloseTargetHandles;
+end;
+
+// Called once every breakpoint byte and every code patch has been taken back.
+// Two kinds of thread may still owe the debugger an event that is queued, or
+// still being raised inside the kernel:
+//
+//   * a thread whose program counter is one past an address that held a byte
+//     of ours, now the program's again: it executed the $CC -- or the
+//     instruction there is one byte long (`push rbp`) and it ran it, which
+//     its context cannot tell apart and which costs the drain's grace period;
+//   * a thread that owes a breakpoint its re-arm and stands past that
+//     instruction: its single step is on its way.
+//
+// "Held a byte of ours" is ANY such address, not only the bytes this detach
+// takes away. A byte given back shortly before the stop the detach starts
+// from (the breakpoint a thread was just continued over, a probe another
+// thread fired) can have a trap in flight on a thread the stop froze
+// half-way: measured, a detach at a pause stop with four threads round a
+// logpoint crashed the program in one attempt of 24 with the narrower set.
+//
+// Every other thread is known not to owe an event, which is what lets a detach
+// with nothing in flight cost no wait at all. The threads are NOT kept
+// suspended: a thread suspended while it raises its exception would queue the
+// event only when it is resumed -- after the detach, to nobody.
+function TWinDebugger.ThreadsBehindARestoredByte: TArray<DWORD>;
+
+  // The trap of a byte of ours that is back.
+  function OwesABreakpointTrap(Pc: UInt64): Boolean;
+  begin
+    var Behind := Pc - 1;
+    if not HeldAByteOfOurs(Behind) then
+      Exit(False);
+    var Current: Byte := CODE_PATCH_INT3;
+    Result := ReadByte(Behind, Current) and (Current <> CODE_PATCH_INT3);
+  end;
+
+  // The single step of a re-arm: the thread was continued with the trap flag
+  // over the instruction of a breakpoint and is past it already. (Still on
+  // it, it has not run it, and clearing the flag is enough.)
+  function OwesAReArmStep(Tid: DWORD; Pc: UInt64): Boolean;
+  begin
+    var Pending: TPendingRearm;
+    Result := FPendingRearms.TryGetValue(Tid, Pending) and (Pc <> Pending.VA);
+  end;
+
+begin
+  Result := nil;
+  if (FBreakpoints.Count = 0) and (not FPatchMap.Active) and (FPendingRearms.Count = 0) then
+    Exit;
+  // The thread a stop is held on has its event in our hands already.
+  var HeldTid: DWORD := 0;
+  if FIsStopped then
+    HeldTid := ResumeTid;
+  for var KV in FThreads do begin
+    if (KV.Value = 0) or (KV.Key = HeldTid) then
+      Continue;
+    // A context is only meaningful while the thread does not run.
+    var Suspended := SuspendThread(KV.Value) <> DWORD(-1);
+    try
+      var Regs: TRegisterSnapshot;
+      if (not ReadThreadRegisters(KV.Key, Regs)) or (Regs.Pc = 0) then
+        Continue;
+      if OwesABreakpointTrap(Regs.Pc) or OwesAReArmStep(KV.Key, Regs.Pc) then
+        Result := Result + [KV.Key];
+    finally
+      if Suspended then
+        ResumeThread(KV.Value);
+    end;
+  end;
+end;
+
+function TWinDebugger.HeldAByteOfOurs(VA: UInt64): Boolean;
+begin
+  if FPatchMap.Active and (FPatchMap.TrapAt(VA) <> cptNone) then
+    Exit(True);
+  for var I := 0 to FBreakpoints.Count - 1 do
+    if (FBreakpoints[I].VA = VA) and not FBreakpoints[I].Refused then
+      Exit(True);
+  Result := False;
+end;
+
+function TWinDebugger.HoldEveryThread: TArray<THandle>;
+begin
+  Result := nil;
+  for var KV in FThreads do begin
+    if (KV.Value = 0) or (SuspendThread(KV.Value) = DWORD(-1)) then
+      Continue;
+    Result := Result + [KV.Value];
+    // SuspendThread returns before the thread has stopped; reading its
+    // context waits until it has.
+    var Ctx := Default(TContext);
+    Ctx.ContextFlags := CONTEXT_CONTROL;
+    GetThreadContext(KV.Value, Ctx);
+  end;
+end;
+
+procedure TWinDebugger.ReleaseHeldThreads(const Held: TArray<THandle>);
+begin
+  for var TH in Held do
+    ResumeThread(TH);
+end;
+
+// Reads debug events until every thread in Trapped has delivered its
+// breakpoint event and the queue is empty. A breakpoint trap at an address
+// that held a byte of ours (HeldAByteOfOurs) and holds no breakpoint
+// instruction any more is put back on its instruction. Every other exception
+// read here is handed to the program. (Not covered: a trap on the one-shot of
+// a step that finished before the detach, whose record is gone -- the main
+// loop does not recognise that one either.)
+//
+// With nobody in Trapped this returns as soon as the queue is empty. A thread
+// in Trapped that delivers nothing within the grace period had run a one-byte
+// instruction; the detach then goes ahead.
+procedure TWinDebugger.DrainQueuedEventsBeforeDetach(const Trapped: TArray<DWORD>);
+const
+  POLL_MS  = 15;
+  GRACE_MS = 1500;
+  LIMIT_MS = 4000;   // a program that raises without end must not hold the detach
+var
+  Ev: TDebugEvent;
+begin
+  var Waiting := TList<DWORD>.Create;
+  try
+    Waiting.AddRange(Trapped);
+    var Started := GetTickCount64;
+    while GetTickCount64 - Started < LIMIT_MS do begin
+      var Timeout: DWORD := 0;
+      if Waiting.Count > 0 then
+        Timeout := POLL_MS;
+      if not WaitForDebugEvent(Ev, Timeout) then begin
+        if (Waiting.Count = 0) or (GetTickCount64 - Started >= GRACE_MS) then
+          Break;
+        Continue;
+      end;
+      var Status: DWORD := DBG_CONTINUE;
+      case Ev.dwDebugEventCode of
+        EXCEPTION_DEBUG_EVENT: begin
+          var Code := Ev.Exception.ExceptionRecord.ExceptionCode;
+          var Addr := UInt64(Ev.Exception.ExceptionRecord.ExceptionAddress);
+          if IsBreakpointExceptionCode(Code) then begin
+            Waiting.Remove(Ev.dwThreadId);
+            // Rewound only at an address that held a byte of OURS which is no
+            // longer there. Anything else is the program's: an `int 3` it
+            // still contains, a two-byte `CD 03` (reported one byte in, on a
+            // byte that is not $CC), or RaiseException(EXCEPTION_BREAKPOINT),
+            // reported at an address inside RaiseException. Each of those is
+            // the program's exception and goes to it.
+            var Current: Byte := CODE_PATCH_INT3;
+            if HeldAByteOfOurs(Addr) and ReadByte(Addr, Current) and (Current <> CODE_PATCH_INT3) then begin
+              SetRIP(Ev.dwThreadId, Addr);
+              DapLog(Format('Detach: tid %d had trapped at $%x before its byte went back: rewound',
+                [Ev.dwThreadId, Addr]));
+            end else
+              Status := DBG_EXCEPTION_NOT_HANDLED;
+          end
+          else if IsSingleStepExceptionCode(Code) then begin
+            // A step of ours (a re-arm, a step in flight) that completed just
+            // before the detach: consumed, and no trap flag left for a process
+            // nobody will be debugging.
+            Waiting.Remove(Ev.dwThreadId);
+            SetTrapFlag(Ev.dwThreadId, False);
+          end
+          else
+            Status := DBG_EXCEPTION_NOT_HANDLED;
+        end;
+        CREATE_THREAD_DEBUG_EVENT:
+          FThreads.AddOrSetValue(Ev.dwThreadId, Ev.CreateThread.hThread);
+        EXIT_THREAD_DEBUG_EVENT: begin
+          Waiting.Remove(Ev.dwThreadId);
+          FThreads.Remove(Ev.dwThreadId);
+        end;
+        LOAD_DLL_DEBUG_EVENT:
+          if Ev.LoadDll.hFile <> 0 then
+            CloseHandle(Ev.LoadDll.hFile);
+        EXIT_PROCESS_DEBUG_EVENT: begin
+          FHasExited := True;
+          FRunning   := False;
+        end;
+      end;
+      ContinueDebugEvent(Ev.dwProcessId, Ev.dwThreadId, Status);
+      if FHasExited then
+        Break;
+    end;
+    if Waiting.Count > 0 then
+      DapLog(Format('Detach: %d thread(s) stood one byte behind a restored breakpoint byte and delivered ' +
+        'no event in %d ms: taken to have run a one-byte instruction there', [Waiting.Count, GRACE_MS]));
+  finally
+    Waiting.Free;
+  end;
+end;
+
+{ ICodePatchTarget }
+
+function TWinDebugger.ArmOneShotProbes(const Request: TCodePatchArmRequest;
+  out Outcome: TCodePatchArmOutcome; out Refusal: string): Boolean;
+begin
+  Outcome := Default(TCodePatchArmOutcome);
+  Refusal := '';
+  if (FProcess = 0) or FHasExited then begin
+    Refusal := 'there is no live process';
+    Exit(False);
+  end;
+  // A debugger that dies cannot take its $CC bytes back. A launched process
+  // dies with it; so does an attached one unless the attach asked Windows to
+  // let it live (killOnDetach false), and that one would then stop at its next
+  // unexecuted line. Whoever asks has to say that this is acceptable.
+  if FAttached and (not FKillOnDetach) and
+     not Request.AcceptBreakpointBytesLeftBehindIfTheDebuggerDies then begin
+    Refusal := 'this process was attached to with killOnDetach false, so Windows lets it live if the ' +
+      'debugger dies, and a debugger that dies cannot take its probe bytes back: the process would ' +
+      'then crash on a breakpoint instruction at its next unexecuted line. A clean detach restores ' +
+      'every byte. Ask again accepting that risk explicitly ' +
+      '(AcceptBreakpointBytesLeftBehindIfTheDebuggerDies), or attach with killOnDetach true';
+    Exit(False);
+  end;
+  var Base, Size: UInt64;
+  if (not ModuleRangeFor(Request.ModuleBase, Base, Size)) or (Base <> Request.ModuleBase) then begin
+    Refusal := Format('no module is mapped at $%x', [Request.ModuleBase]);
+    Exit(False);
+  end;
+  var HeldKey: string;
+  if FPatchMap.ConflictsWith(Request.ResultKey, Base, Size, HeldKey) then begin
+    Refusal := Format('the module at $%x carries probes under the result key "%s", not "%s": ' +
+      'one module must keep one key', [Base, HeldKey, Request.ResultKey]);
+    Exit(False);
+  end;
+  var Foreign := PlantedBreakpointBytes;
+  // The writes cover runs of bytes: the probes and the program's own bytes
+  // between them, read a moment earlier and written back unchanged. While the
+  // target is frozen at a stop or at a debug event that is exact. While it
+  // RUNS, a thread could change code in between (a hooking library, a loader
+  // relocating another module never touches this one), so its threads are
+  // held for the duration -- stopped for certain, not merely asked to stop.
+  var Held: TArray<THandle> := nil;
+  if not FIsStopped then
+    Held := HoldEveryThread;
+  try
+    FPatchMap.Arm(Request.ResultKey, Base, Size, Request.Rvas, Foreign, Outcome);
+  finally
+    ReleaseHeldThreads(Held);
+  end;
+  DapLog(Format('ArmOneShotProbes %s at $%x: %d asked, %d armed (%d under a breakpoint), ' +
+    '%d already there, %d already hit, %d own int3, %d unreadable, %d write failures; ' +
+    '%d run(s), %d write(s), %d bytes, %.1f ms',
+    [Request.ResultKey, Base, Outcome.Requested, Outcome.Armed, Outcome.SharedWithBreakpoint,
+     Outcome.AlreadyPresent, Outcome.AlreadyHit, Outcome.OwnBreakpointInstruction,
+     Outcome.Unreadable, Outcome.WriteFailed, Outcome.Runs, Outcome.WriteCalls,
+     Outcome.BytesWritten, Outcome.Milliseconds]));
+  Result := True;
+end;
+
+function TWinDebugger.DisarmProbes(ModuleBase: UInt64): TCodePatchDisarmOutcome;
+begin
+  Result := Default(TCodePatchDisarmOutcome);
+  if (FProcess = 0) or FHasExited or (FPatchMap.ArmedCount = 0) then
+    Exit;
+  var Held: TArray<THandle> := nil;
+  if not FIsStopped then
+    Held := HoldEveryThread;
+  try
+    Result := FPatchMap.Disarm(ModuleBase, PlantedBreakpointBytes);
+  finally
+    ReleaseHeldThreads(Held);
+  end;
+  DapLog(Format('DisarmProbes $%x: %d restored in %d write(s), %d left to a breakpoint, %d no longer ours',
+    [ModuleBase, Result.Restored, Result.WriteCalls, Result.LeftToBreakpoint, Result.Lost]));
+end;
+
+function TWinDebugger.ProbeHits(const ResultKey: string): TArray<Cardinal>;
+begin
+  Result := FPatchMap.Hits(ResultKey);
+end;
+
+function TWinDebugger.ArmedProbes(ModuleBase: UInt64): TArray<Cardinal>;
+begin
+  Result := FPatchMap.ArmedRvas(ModuleBase);
+end;
+
+function TWinDebugger.ModuleIsArmed(ModuleBase: UInt64): Boolean;
+begin
+  Result := FPatchMap.HoldsModule(ModuleBase);
+end;
+
+procedure TWinDebugger.ClearProbeHits;
+begin
+  FPatchMap.ClearHits;
+end;
+
+function TWinDebugger.CodePatchStats: TCodePatchStats;
+begin
+  Result := FPatchMap.Stats;
 end;
 
 { IDebugTarget event accessors }
@@ -9157,9 +10086,10 @@ begin
     end;
   end;
 
-  // Strategy 2: byte-pattern matcher (Delphi-standard prolog shape).
-  if not ReadProcessMemory(FProcess, Pointer(EntryVA), @Bytes, SizeOf(Bytes), R) then
-    Exit;
+  // Strategy 2: byte-pattern matcher (Delphi-standard prolog shape). Read as
+  // CODE: a routine's entry is the start of a line, and a breakpoint or a probe
+  // there would otherwise turn `push rbp` into "prologue not recognised".
+  R := ReadCodeMemoryAt(EntryVA, @Bytes, SizeOf(Bytes));
   if R < 5 then
     Exit;
   if Bytes[0] <> $55 then // push rbp
@@ -9873,7 +10803,9 @@ begin
   if Blk.Kind <> ehbOnClause then Exit;
 
   var Code: array[0 .. MOV_RIPREL_LEN - 1] of Byte;
-  if not ReadProcessMemoryAt(Blk.StartVA, @Code[0], SizeOf(Code)) then Exit;
+  // Read as CODE: the block starts a source line, so its first byte is where a
+  // breakpoint or a probe sits.
+  if not ReadCodeExact(Blk.StartVA, @Code[0], SizeOf(Code)) then Exit;
   for var I := Low(MOV_RIPREL_RAX) to High(MOV_RIPREL_RAX) do
     if Code[I] <> MOV_RIPREL_RAX[I] then Exit;
   // Until that store has retired the slot still holds whatever the previous

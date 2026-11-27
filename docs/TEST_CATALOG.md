@@ -2560,6 +2560,248 @@ mode it inherits from the runner is exactly what the dynamic test removes);
 that a launcher sets the error mode (`RunTests.dpr`, `RunTestsParallel.dpr`, the
 DevTools probes: reviewed, not tested).
 
+## AF. Line probes: the patch map and the one-shot form (PROFILER_COVERAGE_PLAN.md increment 5)
+
+`DebuggerTests\CodePatchTests.pas`, fixture `TCodePatchTests`. Protocol-free:
+`TDebugSession` is driven directly. Debuggee
+`DebuggerTests\TestTarget\ProfilerSample.dpr` (both bitnesses, built by
+`build_target.bat`), with the existing `TestPackage.bpl` and
+`BreakpointSampleLib.dll` beside it. Mechanism in `DAP_DEBUGGER_ARCHITECTURE.md`,
+"Code patches". Every test runs on both bitnesses unless noted and collects
+its failures instead of asserting per binary.
+
+`ProfilerSample` keeps its OWN record: every `Ran(n)` stands alone on its line
+and sets a flag, written to the file named by `-out` with a checksum (`sink`)
+that a statement run twice, not at all or from its second byte changes. A run
+is checked against an undebugged run of the same binary: same checksum, same
+flags. With a switch it runs one other scenario (`-race [n]`, `-pkg`, `-lib`,
+`-steprace`, `-spin <n>`, `-hot`, `-softbreak`, `-rewrite`, `-pkgeval`);
+`-wait-debugger` and `-wait-detach` change when things run.
+
+Each negative control below was run: the hook removed, the runner rebuilt, the
+test failed with the message quoted, the hook restored.
+
+The map, without a process (`TFakeMemory`):
+
+- [x] **Runs, not bytes; the overlay** (`Map_ArmsInRunsNotByteByByte_AndTheOverlayShowsTheProgram`):
+      3 002 probes in two runs, two writes, the megabyte between them never
+      rewritten; any window reads as the program; a hit takes one byte back
+      and the address stays remembered.
+- [x] **Compare before restore** (`Map_RestoreComparesFirst_AByteTheProgramChangedIsLeftAlone`).
+      Negative controls: without the compare in a hit, "a hit wrote over a byte
+      the program had changed"; in the disarm, "the disarm wrote over ...".
+- [x] **Unload drops without writing, keeps the hits, does not re-arm them**
+      (`Map_UnloadDropsWithoutWriting_KeepsTheHits_AndDoesNotArmThemAgain`).
+- [x] **The program's own `int 3` is refused** (`Map_TheProgramsOwnBreakpointInstruction_IsRefused`).
+- [x] **A byte a breakpoint holds is shared, not written** (`Map_AByteABreakpointHolds_IsSharedNotWritten`).
+- [x] **A run write that fails part-way** (`Map_AWriteThatFailsPartWay_TracksTheBytesItWrote`):
+      the fake target takes the first $100 bytes and fails; the probe that
+      arrived is tracked and comes back at the disarm, the two that did not are
+      counted as write failures. Negative control (no re-read after the failure):
+      "Expected [1] but got [0] probes the failed write did put in the target".
+
+The probes agree with the program:
+
+- [x] **Line for line** (`Probes_AgreeWithTheProgramsOwnRecord_LineForLine`,
+      with and without the MAP): every confirmed record armed at the entry
+      stop, a few writes for hundreds of probes, no stop reported, exit code 0,
+      every mark the program ran recorded and none it did not; read after the
+      process ended. The one accepted hole: on x86 without a MAP the body of the
+      anonymous method (mark 29) is unconfirmed and carries none. Negative
+      control (the hook in `HandleException` removed): both bitnesses died on
+      the first probe ($80000003, $4000001F).
+- [x] **The main executable asked for before the process exists**
+      (`MainExecutable_AskedForBeforeTheProcess_IsArmedBeforeItsCodeRuns`):
+      armed at the first module event; the program's first line is recorded.
+      Negative control (no arming at module events): "the standing request was
+      never armed".
+- [x] **The program's own `int 3`** (`ProgramsOwnInt3_IsNeverArmed_AndIsAnnouncedOnlyWhileProbesAreArmed`):
+      refused by what its byte is, handed to the program (which catches it),
+      announced once with probes armed and never without. Negative controls:
+      refusal removed, "the record at the program's own int 3 was armed" and
+      "recorded as a probe hit"; notice removed, "0 notice(s)".
+
+One address, two owners:
+
+- [x] **Probe first, then a breakpoint; the breakpoint removed after the probe
+      fired** (`ProbeThenBreakpoint_BothGetTheHit_AndRemovingTheBreakpointLeavesNoByte`).
+      Negative control (`PlantInt3` saving the byte it reads): "the next line did
+      not stop", "with the probe fired and the breakpoint removed the byte is $CC".
+- [x] **Breakpoint first, then the probe** (`BreakpointThenProbe_TheProbeSharesTheByte_AndBothGetTheHit`):
+      five stops in five passes. Negative control (arming ignores the
+      breakpoint's byte): "no probe was armed on a byte a breakpoint holds".
+- [x] **The breakpoint removed before the probe fires** (`BreakpointRemovedBeforeTheProbeFires_TheProbeKeepsTheByteAndFires`).
+      Negative control: "removing the breakpoint took the probe's byte away".
+- [x] **The probes taken away under a breakpoint** (`ProbeTakenAwayUnderABreakpoint_TheBreakpointKeepsStopping`).
+      Negative control: "taking the probes away took the breakpoint's byte",
+      "stopped 0 time(s) on 5 passes".
+- [x] **Resumed from a line with both** (`ResumedFromALineWithBreakpointAndProbe_TheLineRunsOnceAndBothWork`):
+      the transient removal leaves the probe's `$CC`. Negative control: "the
+      line the thread was resumed from ran without its probe recording it".
+- [x] **A thread parked on a probe whose byte went back before its trap was read**
+      (`ParkedOnAProbeAnotherThreadGaveBack_TheThreadRunsTheInstructionOnce`,
+      `-race 1`): the worker stops at a breakpoint, a probe is armed under it,
+      the thread is held across the continue and let go once the debugger has
+      stopped reading, the probes are taken away, then the trap is read.
+      Deterministic. Negative control (taken for the program's own `int 3`):
+      x64 exit code 1; x86 runs on and only "the parked thread's trap did not
+      arrive after the byte went back" fails (the late-trap counter). An
+      attempt built on two threads released together onto the line was
+      dropped: in 16 attempts the second trap never queued behind the stop.
+
+Stepping:
+
+- [x] **Over, into and out across lines that have not fired**
+      (`Steps_AcrossLinesThatHaveNotFired_LandWhereTheyLandWithoutProbes`, with
+      the default isolation and with none, so that a second thread's probe hits
+      arrive in the middle of the steps): the same seven landings as without
+      probes, and the program's record agrees. Negative control (the trap flag
+      cleared at a probe hit): "step "o" after "StepArea:316 StepArea:317" did
+      not land" on both bitnesses -- which also shows that the trap flag
+      survives a breakpoint trap.
+- [x] **A step at an exception stop, a probe on the x86 handler stub**
+      (`StepAtAnExceptionStop_WithAProbeOnTheHandlerStub_LandsInTheHandler`):
+      same landing with and without probes; on x86 the stub's probe fires during
+      the dispatch and its byte is back. Negative control (stub read raw): "the
+      step at the exception stop was refused".
+- [x] **Another thread's re-arm step does not drive the step**
+      (`StepOver_WhileAnotherThreadRunsThroughALogpoint_LandsOnItsOwnThread`,
+      isolation released after 200 ms and none): 20 log lines and a landing on
+      the stepped thread, on the line after the call. Negative control (the
+      guard in the re-arm branch removed): "the step landed on thread N, the
+      stepped thread is M", on both bitnesses and both isolations, 3 runs of 3.
+
+Races:
+
+- [x] **Several threads through lines never executed**
+      (`SeveralThreadsThroughLinesNeverExecuted_EveryThreadRunsEveryLineOnce`):
+      four threads, 160 fresh lines, exit code 0, every line recorded, and at
+      least one late trap (else "the test exercised nothing"). Negative control
+      (late traps not recognised): x64 dies with $C0000005; x86 runs on, and
+      only "no trap arrived after its byte had gone back" fails (`TRAPS.md`).
+      10 of 10 sequential runs passed.
+- [x] **A trap queued while the probes are taken away**
+      (`TrapQueuedBeforeTheProbesAreTakenAway_IsRewoundNotHandedToTheProgram`).
+      Negative control as above: x64 exit code 1, x86 only the counter. 10 of 10.
+
+Modules:
+
+- [x] **A package loaded, unloaded and loaded again** (`Package_LoadedUnloadedLoadedAgain_IsArmedAtEachLoadAndKeepsItsHits`):
+      armed at each load before its initialization runs, hits kept across the
+      unload, the second mapping armed minus what already ran, a routine run in
+      the second mapping only recorded. Negative controls: unload purge removed,
+      "the map still lists probes of a mapping that is gone", "the package was
+      not armed afresh"; arming at load events removed, "the first mapping was
+      not armed".
+- [x] **A module relocated after its load event** (`ModuleRelocatedAfterItsLoadEvent_IsArmedAtItsEntryPoint`):
+      armed at its entry point, the jump-table record without a probe, the
+      library's lines recorded. Negative control (no arming at the entry point):
+      "the relocated module was not armed".
+- [x] **A package an evaluation unloads, reloaded by the program**
+      (`Package_UnloadedByAnEvaluationThenReloaded_IsArmedAgain`, `-pkgeval`,
+      and `-pkgeval -pkgmove`, which takes the first address so that the reload
+      lands elsewhere): the unload is seen by the synthetic call's pump; the
+      session must list the package once, at the second mapping's address, the
+      request must be armed there, and the routine run in the second mapping
+      recorded. The first version ran without `-pkgmove`, assumed the reload
+      lands at the same address, and failed under the parallel suite as
+      load-sensitive when it did not ("no module is mapped at $5DD40000"). Negative
+      control (the pump's unload not delivered to the session): the `-pkgmove`
+      runs fail with exactly that refusal, every run, both bitnesses, and both
+      variants list the package twice. Before the fix: 16 of 16 stress runs
+      failed (8 runner copies at once, mixed with `-pkg` runs); after it, 56 of 56
+      (8 copies at once, 7 rounds) and 16 of 16 mixed passed. With the unload
+      delivered, the request's own guard (`ModuleIsArmed`) no longer changes
+      the outcome: its negative control passes.
+
+The debugger's own calls:
+
+- [x] **An evaluation that runs probed lines** (`Evaluation_ThatRunsProbedLines_LeavesThemUnrecordedAndArmed`).
+      Negative controls: pump hook removed, "Twice raised access violation";
+      hits recorded, "the evaluation recorded 4 hit(s)"; not re-armed, "the
+      probe at $... was not put back after the call".
+
+Attach and detach:
+
+- [x] **Refused without acceptance, then a clean detach**
+      (`AttachArmDetach_RefusedWithoutAcceptance_ThenTheProgramRunsOnThroughArmedLines`):
+      the second half of the program runs through lines that were armed, after
+      the detach, and ends with code 0 and the reference checksum. Negative
+      controls: refusal removed, "arming was accepted on a process that would
+      survive a dead debugger"; no restore at the detach, "the detached program
+      ended with code 1".
+- [x] **Traps queued at the detach** (`Detach_WithTrapsQueued_PutsEveryThreadBackOnItsInstruction`):
+      four threads racing through probed lines when the debugger stops reading
+      and detaches. Negative controls: no drain, exit code 1, 3 runs of 3;
+      draining only what is already queued, exit code 1 on at least one
+      bitness, 5 runs of 5. 10 of 10 sequential runs passed.
+- [x] **A detach at a pause stop** (`Detach_AtAPauseStop_ReleasesTheHeldEvent_AndTheQueuedTrapsAreRewound`,
+      `-hot`: four threads round a line carrying a logpoint, three attempts per
+      bitness; the logpoint's lines prove the threads were running before the
+      pause). Negative controls: the held event released under the reported
+      thread's id, the detached program died in 4 to 6 attempts of 6, 3 runs of
+      3; re-arm single steps not awaited, 7 attempts of 24 died; only the bytes
+      the detach itself took away awaited, 1 attempt of 24 died. With every
+      part, 36 of 36 attempts passed.
+- [x] **Ending a launched session at a pause stop** (`Terminate_AtAPauseStop_EndsTheProcessWithoutWaiting`):
+      under 2 s. Negative control (released under the reported thread): 3 000
+      and 3 047 ms, the whole drain.
+- [x] **A breakpoint exception the program raises itself, queued at a detach**
+      (`Detach_WithASoftwareBreakpointExceptionQueued_HandsItToTheProgram`,
+      `-softbreak`): every `RaiseException(EXCEPTION_BREAKPOINT)` the program
+      raised reaches its handler. Negative control (the drain rewinds any
+      breakpoint exception on a byte that is not `$CC`): exit code 3 on both
+      bitnesses, 3 runs of 3.
+
+Readers and writers of code:
+
+- [x] **Readers see the program** (`CodeReaders_SeeTheProgramUnderAnArmedProbe`):
+      probes on the entries of the routines on the stack and on the `call` the
+      stopped frame returns to; the code reader, the memory reader, the call
+      stack, the raw stack scan and a parameter's value are what they were
+      without them. Negative controls: overlay removed from the code reader and
+      the memory reader, both report `$CC`; x86 prologue read raw, "X evaluates
+      to <X: not found>"; x86 call-site proof read raw, the raw stack scan
+      loses the `StepArea` frame.
+- [x] **A memory write over a probe** (`MemoryWrittenOverAProbe_IsTheProgramsAndABreakpointPlantedThereFires`).
+      Negative control: "the breakpoint on the written byte is not planted",
+      "stopped 0 time(s) on 5 passes".
+- [x] **The program writes over a probed byte itself**
+      (`ProgramRewritesAProbedByte_ReadersShowItsByte_AndABreakpointPlantedThereFires`,
+      `-rewrite`: two one-byte `CLC` lines become `STC`). An ADDRESS breakpoint
+      on the first, planted before anything reads that code, must be planted
+      and stop (a source breakpoint would not do: the routine analysis that
+      judges it reads the code first, and that read gives the stale probe up by
+      itself); the code reader and the memory reader must show the program's
+      `$F9` on the second, and the map must no longer list it. Negative
+      controls: `PlantInt3` without the byte check, "the breakpoint on the
+      rewritten byte is not planted (the byte is $F9)"; the overlay without it,
+      "the code reader shows $F8".
+
+The requests:
+
+- [x] **Armed while the MAP indexes** (`Request_ArmedWhileTheMapIndexes_ArmsTheAnonymousBodiesOnceItIsReady`,
+      x86 only, no process: `TLiveCodeAnalysis` over the file, a second routine
+      provider whose "indexing" the test switches, a recording engine). Partial
+      first, nothing re-armed while the index builds, the anonymous body armed
+      once it is ready. Negative controls: no retry of a partial request, "the
+      anonymous body was not armed once the MAP was ready"; no check of the
+      index before the retry, "the retry armed again while the MAP was still
+      indexing".
+
+Not proved here: the x64 prologue matcher and the x86 recovery pass under a
+probe (the fixture's x64 locals do not reach the matcher, its stacks need no
+recovery); the import-thunk test of a step over, the `on`-clause block test and
+the adjustor thunk of `TDelphiRtti` (moved onto the overlay, no fixture reaches
+them with a probe); `StackWalk64`'s read routine (a `$CC` does not change
+dbghelp's answer, so no negative control can fail -- measured for cost only);
+a late trap inside a synthetic call; a module present at attach that loads its
+probes at the synthesized load events; a request refused as a whole at a module
+event; the races on a single core; the 32-bit fold of a sign-extended address
+in the stack walk's read routine (no large-address-aware fixture);
+`HoldEveryThread`'s `GetThreadContext` after each `SuspendThread` (the window it
+closes is far below anything a test can arrange).
+
 ## What the suite does NOT prove (2026-08-08)
 
 Coverage-honesty notes. Each records a place where a green run is weaker evidence

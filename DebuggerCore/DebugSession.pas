@@ -30,7 +30,7 @@ uses
   DelphiRtti, DelphiValueReaders, ExprEval, WinDebuggerBase, WinDebuggerX86,
   SourceResolver, SafeCallPolicy,
   VariableExpander, BreakpointEval, ExceptionRules, ValueEncoders, DapProtocol,
-  LiveCodeAnalysis, ZydisDisassembler;
+  LiveCodeAnalysis, ZydisDisassembler, CodePatchMap, LineProbes;
 
 const
   // Frame index meaning "the caller has no opinion -- use the session's default
@@ -113,6 +113,12 @@ type
     // its symbol providers go away.
     FCodeAnalysis: TLiveCodeAnalysis;
     FLastDeferredCheck: UInt64;   // GetTickCount64 of the last RejudgeBreakpoints... check
+    // The standing requests for line probes (LineProbes.pas): which modules
+    // carry one-shot probes on which line records, armed through the engine's
+    // ICodePatchTarget on the records the analysis above confirms. Empty, and
+    // never consulted beyond a count, until a caller asks for probes.
+    FLineProbes: TLineProbeHost;
+    FLastProbeRetry: UInt64;      // GetTickCount64 of the last RetryWaitingLineProbes
 
     // Data breakpoints (watchpoints; increment 4 of docs/DATA_BREAKPOINTS_PLAN.md).
     // Unlike source breakpoints there is no per-file grouping -- SetDataBreakpoints
@@ -386,6 +392,16 @@ type
     // a provider still indexing) can be analysed now -> judge the breakpoints
     // again. Paced, because the pump calls it on every turn.
     procedure RejudgeBreakpointsOfModulesThatBecameReady;
+    // Line probes: the engine behind the requests (nil without a process), a
+    // loaded module by name with its debug information loaded, and the three
+    // moments the session hands the requests a chance to be armed. Nothing a
+    // request raises leaves these: they run inside the engine's event loop.
+    function  LineProbeEngine: ICodePatchTarget;
+    function  LookupModuleForLineProbes(const ModuleName: string; out Base: UInt64): Boolean;
+    procedure ArmLineProbesAtModuleLoad(const ModuleName: string);
+    procedure ArmLineProbesAtEntryPoint(Base: UInt64);
+    procedure RetryWaitingLineProbes;
+    procedure KeepLineProbeResults;
     // Address breakpoints (docs/DISASSEMBLY_PLAN.md increment 5). Identity is
     // (ModuleName, Rva), resolved from the caller's absolute address at SET
     // time against GetModules -- never a bare VA, which is meaningless across
@@ -727,6 +743,11 @@ type
     /// <summary>Code maps and routine analyses of the loaded modules, built on
     /// demand. Exposed for diagnostics and tests; the session owns it.</summary>
     property CodeAnalysis:   TLiveCodeAnalysis read FCodeAnalysis;
+    /// <summary>One-shot probes on line records: requests by module name,
+    /// armed on the records the routine analysis confirms, and what they
+    /// recorded (LineProbes.pas). To be used on the thread that calls
+    /// <c>Pump</c>. The session owns it.</summary>
+    property LineProbes:     TLineProbeHost read FLineProbes;
     property Rtti:           TDelphiRtti      read FRtti;
     property SourceResolver: TSourceResolver  read FResolver;
     // Lazily create (if the process handle is available) and return the RTTI
@@ -860,6 +881,17 @@ begin
     begin
       DapLog(Text);
     end;
+  FLineProbes := TLineProbeHost.Create(FCodeAnalysis,
+    function: ICodePatchTarget
+    begin
+      Result := LineProbeEngine;
+    end,
+    LookupModuleForLineProbes);
+  FLineProbes.OnLog :=
+    procedure(const Text: string)
+    begin
+      DapLog(Text);
+    end;
   FDataBreakpoints := TList<TSessionDataBreakpoint>.Create;
   FDebuggeeOutput := TList<string>.Create;
   FDebuggerOutput := TList<string>.Create;
@@ -906,6 +938,7 @@ begin
                ': ' + E.Message);
     end;
   FDebugger := nil;  // release the IDebugTarget refcount (engine teardown)
+  FreeAndNil(FLineProbes);   // before the analysis it asks
   FreeAndNil(FCodeAnalysis);
   FReaders.Free;
   FRtti.Free;
@@ -993,8 +1026,17 @@ end;
 
 function TDebugSession.EnsureRtti: TDelphiRtti;
 begin
-  if (FRtti = nil) and (FDebugger <> nil) and (FDebugger.ProcessHandle <> 0) then
+  if (FRtti = nil) and (FDebugger <> nil) and (FDebugger.ProcessHandle <> 0) then begin
     FRtti := TDelphiRtti.Create(FDebugger.ProcessHandle, FDebugger.TargetLayout);
+    // The one place the RTTI reader looks at CODE (the adjustor thunk of an
+    // interface method): through the engine, which shows the program's bytes
+    // under a breakpoint or a code patch.
+    FRtti.CodeReader :=
+      function(VA: UInt64; Buf: Pointer; Size: NativeUInt): Boolean
+      begin
+        Result := (FDebugger <> nil) and (FDebugger.ReadCodeMemoryAt(VA, Buf, Size) = Size);
+      end;
+  end;
   Result := FRtti;
 end;
 
@@ -1054,6 +1096,8 @@ begin
   // decided by the analysis this session owns. An engine without the
   // interface plants as it always did.
   FCodeAnalysis.Clear;
+  // The requests for line probes stand; what the previous process recorded goes.
+  FLineProbes.NewProcess;
   var Placement: IBreakpointPlacement;
   if Supports(FDebugger, IBreakpointPlacement, Placement) then
     Placement.SetSourcePlantAdvice(HandleJudgePlant, HandlePlantCopies, HandleModuleRelocated);
@@ -1184,6 +1228,7 @@ begin
   // For a detach request the caller must have attached with KillOnDetach=False,
   // so the engine's Terminate performs a clean DebugActiveProcessStop.
   FDebugger.Terminate;
+  KeepLineProbeResults;
   FDebugger := nil;
   SetState(dsDetached);
   ReleaseSymbolProviders;   // unlock the target's symbol files (F17)
@@ -1193,6 +1238,7 @@ procedure TDebugSession.Terminate;
 begin
   if FDebugger <> nil then
     FDebugger.Terminate;
+  KeepLineProbeResults;
   FDebugger := nil;
   SetState(dsTerminated);
   ReleaseSymbolProviders;   // unlock the target's symbol files (F17)
@@ -1229,6 +1275,7 @@ begin
   FDebugger.ProcessOneEvent;
   PublishPrefetchedSymbols;
   RejudgeBreakpointsOfModulesThatBecameReady;
+  RetryWaitingLineProbes;
 end;
 
 procedure TDebugSession.RejudgeBreakpointsOfModulesThatBecameReady;
@@ -1266,6 +1313,102 @@ begin
   FCodeAnalysis.ForgetModule(Base);
   if HaveBreakpoints then
     RepostBreakpoints;
+  // The first moment the module's code can be analysed, and none of it has
+  // run: the probes a request asked for in it go in here.
+  ArmLineProbesAtEntryPoint(Base);
+end;
+
+function TDebugSession.LineProbeEngine: ICodePatchTarget;
+begin
+  Result := nil;
+  if FDebugger <> nil then
+    Supports(FDebugger, ICodePatchTarget, Result);
+end;
+
+function TDebugSession.LookupModuleForLineProbes(const ModuleName: string;
+  out Base: UInt64): Boolean;
+begin
+  Base := 0;
+  if (FDebugger = nil) or (FLoader = nil) then
+    Exit(False);
+  if SameText(ModuleName, ExtractFileName(FExePath)) then begin
+    Base := FDebugger.ImageBase;
+    Exit(Base <> 0);
+  end;
+  for var Module in FLoader.Modules do begin
+    if (Module.Base = 0) or not SameText(Module.Name, ModuleName) then
+      Continue;
+    // Synchronously: the probes have to be in before the module's code runs,
+    // and the prefetcher publishes only at the next stop. Free when the
+    // module's formats were already probed.
+    FLoader.LoadModuleSymbols(Module);
+    Base := Module.Base;
+    Exit(True);
+  end;
+  Result := False;
+end;
+
+procedure TDebugSession.ArmLineProbesAtModuleLoad(const ModuleName: string);
+begin
+  if (FLineProbes = nil) or not FLineProbes.HasRequests then
+    Exit;
+  try
+    FLineProbes.ModuleLoaded(ModuleName);
+  except
+    on E: Exception do
+      DapLog(Format('line probes: arming at the load of %s raised %s: %s',
+        [ModuleName, E.ClassName, E.Message]));
+  end;
+end;
+
+procedure TDebugSession.ArmLineProbesAtEntryPoint(Base: UInt64);
+begin
+  if (FLineProbes = nil) or not FLineProbes.HasRequests then
+    Exit;
+  try
+    FLineProbes.ModuleRelocated(Base);
+  except
+    on E: Exception do
+      DapLog(Format('line probes: arming at the entry point of $%x raised %s: %s',
+        [Base, E.ClassName, E.Message]));
+  end;
+end;
+
+procedure TDebugSession.RetryWaitingLineProbes;
+const
+  RETRY_EVERY_MS = 250;
+begin
+  // A request waits when its module's debug information was not ready at the
+  // module's load event (a MAP still indexing, readers the prefetcher has not
+  // published). Unlike a breakpoint repost this is safe while the program
+  // runs: arming writes single bytes with the threads held, and takes nothing
+  // away. Lines that ran before the retry are not recorded.
+  if (FDebugger = nil) or (FLineProbes = nil) or not FLineProbes.HasWaiting then
+    Exit;
+  if not (FState in [dsRunning, dsStopped]) then
+    Exit;
+  var Now64 := GetTickCount64;
+  if Now64 - FLastProbeRetry < RETRY_EVERY_MS then
+    Exit;
+  FLastProbeRetry := Now64;
+  try
+    FLineProbes.RetryWaiting;
+  except
+    on E: Exception do
+      DapLog('line probes: the retry raised ' + E.ClassName + ': ' + E.Message);
+  end;
+end;
+
+procedure TDebugSession.KeepLineProbeResults;
+begin
+  if (FLineProbes = nil) or (FDebugger = nil) then
+    Exit;
+  try
+    FLineProbes.EngineGoingAway(LineProbeEngine);
+  except
+    on E: Exception do
+      DapLog('line probes: taking the results over raised ' + E.ClassName + ': ' + E.Message);
+  end;
 end;
 
 procedure TDebugSession.HandleProvidersPublished(Module: TModuleSymbols);
@@ -2360,8 +2503,7 @@ begin
   // next step or exception stop.
   if Reason <> srBreakpoint then
     FBpConditionError := '';
-  if (FRtti = nil) and (FDebugger <> nil) and (FDebugger.ProcessHandle <> 0) then
-    FRtti := TDelphiRtti.Create(FDebugger.ProcessHandle, FDebugger.TargetLayout);
+  EnsureRtti;
   if FDebugger <> nil then begin
     FLoader.EnsureModuleForPC(FDebugger.GetRegisters.Pc);  // load DLL/BPL symbols at the stop
     FStopTid := FDebugger.GetStoppedThreadId;
@@ -2421,6 +2563,7 @@ begin
   // Nothing of the process is left to analyse, and the maps below share their
   // routine names with the readers that are about to go.
   FCodeAnalysis.Clear;
+  FLineProbes.ProcessGone;
   // The main exe AND every runtime BPL keep their own binary memory-mapped for
   // the loader's whole life (embedded TD32). On an attach the session outlives
   // the target, so those mappings lock each file on disk and block a rebuild
@@ -2500,8 +2643,7 @@ begin
   // A conditional / logpoint hit can fire before any frontend request has forced
   // the main .rsm to load; the condition/log expression evaluator needs it.
   EnsureMainRsm;
-  if (FRtti = nil) and (FDebugger <> nil) and (FDebugger.ProcessHandle <> 0) then
-    FRtti := TDelphiRtti.Create(FDebugger.ProcessHandle, FDebugger.TargetLayout);
+  EnsureRtti;
   FBpEval.Debugger  := FDebugger;
   FBpEval.Rtti      := FRtti;
   FBpEval.DebugInfo := FDebugInfo;
@@ -2984,6 +3126,14 @@ begin
   if Assigned(FOnDllLoadedHook) then
     FOnDllLoadedHook(Name, Path, Base, ImageSize);
 
+  // Line probes asked for in this module go in NOW, for the reason the
+  // breakpoints above are planted now: its code runs the instant this event
+  // is continued. (A fixed-base image the loader had to move cannot be
+  // analysed yet; its request waits for HandleModuleRelocated.) The same call
+  // arms the main executable when it was asked for before the process
+  // existed: the first module event is the first moment its bytes can be read.
+  ArmLineProbesAtModuleLoad(Name);
+
   // Everything else goes to the background prefetcher. This is the WHEN fix: a
   // module's ~150 ms - 0.65 s of TD32 parsing now happens on a worker at
   // LOAD_DLL time instead of synchronously at the first stop that touches it.
@@ -3081,6 +3231,7 @@ begin
   // Keyed by address, so it must not survive the unload: the loader maps a
   // module, unmaps it and maps it (or another) again at the same address.
   FCodeAnalysis.ModuleUnloaded(Base);
+  FLineProbes.ModuleUnloaded(Name);
   FLoader.RemoveModuleRecord(Name, Base);
   // The engine has already unplanted any breakpoint (of either kind) whose VA
   // fell in this module's range (TWinDebugger.HandleUnloadDll, VA-range based,

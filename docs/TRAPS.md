@@ -174,6 +174,51 @@ absurdly.
   result as proof the mechanism is unnecessary.
 - **Check every defect on BOTH bitnesses.** That is what separates "Win32
   regression" from "always been wrong".
+- **On WOW64 a breakpoint trap the debugger hands back as "not handled" can
+  leave a 32-bit fixture running correctly.** With the late-trap recognition of
+  the line probes switched off, dozens of `int 3` events at bytes that had
+  already been restored went to the program as `DBG_EXCEPTION_NOT_HANDLED`: the
+  x64 fixture died with `$C0000005`, the x86 one ended with code 0 and the right
+  checksum. A negative control for anything that hands a stale breakpoint trap
+  to the program therefore fails on x64 only; on x86 it needs a counter (the
+  map's `LateTraps`) to fail at all. An unrestored `$CC` in a process nobody
+  debugs any more is different: that crashed both bitnesses. The same again for
+  a thread resumed one byte into the first instruction of `LongRun`: x64 died,
+  x86 ran on with the right sum.
+- **A test that attaches to `ProfilerSample -wait-debugger` and pumps for a
+  fixed few hundred milliseconds tests nothing:** the fixture sleeps a second
+  after it sees the debugger, so its threads had not started when the test
+  paused or detached, and the negative control passed. Make the test prove the
+  program reached the state it needs (a logpoint's lines, a recorded hit) before
+  acting on it.
+- **Two threads released together onto one breakpoint line almost never queue
+  a second trap behind the first stop:** the kernel suspends the process when
+  the first thread's event is sent. 0 in 16 attempts. Several threads through
+  many FRESH probes meet often (that is what `SeveralThreads...` relies on);
+  one line rarely. To get a trap queued behind a stop deterministically, hold
+  the thread with `SuspendThread` across the continue and let it go once the
+  test has stopped pumping (`ParkedOnAProbe...` in `CodePatchTests.pas`).
+- **Do not assume a DLL comes back at the address it was unloaded from.** Where
+  an image is mapped depends on what else on the machine has the same image
+  mapped: `TestPackage.bpl` reloaded at the same address in every isolated run
+  and at another under the parallel suite (once even its first mapping took
+  the address `rtl290.bpl` usually gets). A test that only passes when the
+  address repeats is LOAD-SENSITIVE for a reason that is the test's, and it
+  hides a defect for exactly the case it does not cover. Take the address
+  first (`VirtualAlloc(..., MEM_RESERVE)`, `ProfilerSample -pkgmove`) to test
+  the other case on purpose.
+- **A source breakpoint reads the code before it is planted.** The session
+  judges every source breakpoint through the routine analysis, which reads the
+  routine's bytes through the overlay -- so anything the overlay corrects (a
+  stale probe) is corrected before `PlantInt3` runs, and a negative control of
+  `PlantInt3` alone passes. An ADDRESS breakpoint is planted without that read.
+- **A test that collects its problems must not call an asserting helper once the
+  process may be gone.** A byte reader with `Assert.IsTrue` inside, reached after
+  a negative control had killed the fixture, raised "the byte could not be
+  read" and threw away every problem collected before it -- after 120 s of
+  stop timeouts, with a message that said nothing about the defect. Readers
+  used inside such a test return a sentinel (`RawByte`, `CodeByte` in
+  `CodePatchTests.pas`: -1) and let the checks report.
 - **State which half is proven and which is only guarded.** Some fixes cannot be
   reproduced in the fixtures; say so rather than letting a green suite imply
   coverage.

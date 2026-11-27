@@ -793,9 +793,14 @@ only where the analysis shows there is no instruction, which replaces the
 exception runs the block; and seven defects of the released engine in how a
 breakpoint is suspended, re-armed and deleted are fixed (list in the plan,
 "Verified in increment 4, second half"). These fixes are on
-`feat/profiler-coverage` only; none is in a release yet. Suite on the branch:
-1539 found / 1535 pass / 0 fail / 4 ignored. Next: increment 5, the patch map
-and the one-shot form.
+`feat/profiler-coverage` only; none is in a release yet. So is increment 5:
+the patch map (`CodePatchMap.pas`) and one-shot line probes (`LineProbes.pas`),
+a `$CC` on every confirmed line that records the line's first execution and
+lets the program run on without a stop; every reader of code sees the
+program's bytes through the map. Not reachable from MCP yet. The test fixtures
+no longer open dialogs: they write their failures instead (`CLAUDE.md`).
+Suite on the branch: 1577 found / 1573 pass / 0 fail / 4 ignored. Next:
+increment 6, the results store and the session registry.
 
 1. **The MCP server gains a profiler and code coverage** — one server, one
    engine. Coverage at line level by instrumentation, a hit count for every
